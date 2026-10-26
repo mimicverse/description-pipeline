@@ -2,16 +2,12 @@
 
 from __future__ import annotations
 
-import copy
 import unittest
 
 from description_pipeline.sources.solidworks.appearance import (
-    UNRECORDED_APPEARANCE,
     AppearanceError,
-    audit_appearance,
     appearance_groups,
     bind_capture_appearance,
-    require_deliverable_appearance,
     resolve_deliverable_appearance,
 )
 from description_pipeline.geometry.native_tessellation import native_stl_subset
@@ -110,6 +106,31 @@ def _raw(
     }
 
 
+def _empty_state_owner(
+    *,
+    scope: str,
+    document_path: str,
+    configuration: str,
+    display_state: str,
+    display_states=None,
+    display_states_state: str = "not_applicable",
+):
+    return {
+        "owner_document_path": document_path,
+        "owner_scope": scope,
+        "api": "IModelDocExtension.GetRenderMaterials2",
+        "display_state_option": 3,
+        "configuration": configuration,
+        "display_state": display_state,
+        "display_states": display_states,
+        "display_states_state": display_states_state,
+        "call_state": "empty",
+        "materials": [],
+        "mapping_errors": [],
+        "read_errors": {},
+    }
+
+
 def _resolved_raw(values):
     face_rows = []
     for index, face_values in enumerate(values):
@@ -128,16 +149,12 @@ def _resolved_raw(values):
         "native_referenced_display_state": "Display State 1",
         "native_referenced_display_state_error": None,
         "state_render_materials": [
-            {
-                "owner_document_path": DOCUMENT,
-                "owner_scope": "component_document",
-                "api": "IModelDocExtension.GetRenderMaterials2",
-                "display_state_option": 3,
-                "display_state": "Display State 1",
-                "call_state": "empty",
-                "materials": [],
-                "read_errors": {},
-            }
+            _empty_state_owner(
+                scope="component_document",
+                document_path=DOCUMENT,
+                configuration=CONFIGURATION,
+                display_state="Display State 1",
+            )
         ],
         "bodies": [
             {
@@ -155,166 +172,7 @@ def _resolved_raw(values):
     }
 
 
-class AppearanceAuditTests(unittest.TestCase):
-    def _audit(self, raw):
-        return audit_appearance(
-            raw,
-            component=COMPONENT,
-            expected_document_path=DOCUMENT,
-            expected_configuration=CONFIGURATION,
-        )
-
-    def test_unrecorded_or_explicitly_unobserved_owners_are_not_deliverable(self):
-        raw = _raw(
-            occurrence=_layer(
-                owner_configuration=CONFIGURATION,
-                values=[-1.0] * 9,
-                has_values=False,
-            )
-        )
-        audit = self._audit(raw)
-        self.assertEqual(audit.state, "unobserved")
-        self.assertEqual(audit.issues, ())
-        self.assertEqual(audit.claims, ())
-        for candidate in (UNRECORDED_APPEARANCE, raw):
-            with self.subTest(candidate=candidate):
-                with self.assertRaises(AppearanceError) as caught:
-                    require_deliverable_appearance(
-                        candidate,
-                        component=COMPONENT,
-                        expected_document_path=DOCUMENT,
-                        expected_configuration=CONFIGURATION,
-                    )
-                self.assertIn(
-                    "cad_appearance_effective_scope_unproven",
-                    {
-                        issue["code"]
-                        for issue in caught.exception.details["appearance"]["issues"]
-                    },
-                )
-
-    def test_read_failure_is_not_treated_as_absence(self):
-        raw = _raw(
-            document=_layer(
-                owner_configuration=CONFIGURATION,
-                texture_state="unreadable",
-                read_errors={"texture": {"code": "native_read_failed"}},
-            )
-        )
-        with self.assertRaises(AppearanceError) as caught:
-            require_deliverable_appearance(
-                raw,
-                component=COMPONENT,
-                expected_document_path=DOCUMENT,
-                expected_configuration=CONFIGURATION,
-            )
-        issue_paths = {
-            issue["path"] for issue in caught.exception.details["appearance"]["issues"]
-        }
-        self.assertIn(
-            "appearance_raw.document.read_errors.texture",
-            issue_paths,
-        )
-        self.assertIn("appearance_raw.document.texture", issue_paths)
-
-    def test_explicit_missing_record_is_not_treated_as_unrecorded(self):
-        self.assertEqual(
-            self._audit(UNRECORDED_APPEARANCE).state,
-            "unobserved",
-        )
-        audit = self._audit(None)
-        self.assertEqual(audit.state, "invalid")
-        self.assertEqual(
-            audit.issues[0]["code"],
-            "cad_appearance_record_missing",
-        )
-
-    def test_texture_pointer_cannot_be_silently_omitted_from_monochrome_urdf(self):
-        raw = _raw(
-            document=_layer(
-                owner_configuration=CONFIGURATION,
-                texture_state="present",
-                texture_name=r"C:\textures\paint.jpg",
-            )
-        )
-        audit = self._audit(raw)
-        self.assertEqual(audit.state, "unrepresentable")
-        self.assertIn(
-            "cad_appearance_texture_unrepresentable",
-            {issue["code"] for issue in audit.issues},
-        )
-
-    def test_conflicting_owner_vectors_and_incomplete_scope_are_both_reported(self):
-        raw = _raw(
-            document=_layer(
-                owner_configuration=CONFIGURATION,
-                values=[0.1] * 9,
-                has_values=True,
-            ),
-            body=_body_layer(
-                active_configuration=CONFIGURATION,
-                values=[0.7] * 9,
-                has_values=True,
-            ),
-        )
-        audit = self._audit(raw)
-        self.assertEqual(audit.state, "unrepresentable")
-        self.assertEqual(len(audit.claims), 2)
-        self.assertIn(
-            "cad_appearance_owner_conflict",
-            {issue["code"] for issue in audit.issues},
-        )
-        self.assertIn(
-            "cad_appearance_effective_scope_unproven",
-            {issue["code"] for issue in audit.issues},
-        )
-
-    def test_equal_owner_vectors_do_not_prove_the_complete_effective_appearance(self):
-        values = [0.2, 0.3, 0.4, 0.1, 0.2, 0.3, 0.4, 0.0, 0.0]
-        audit = self._audit(
-            _raw(
-                document=_layer(
-                    owner_configuration=CONFIGURATION,
-                    values=values,
-                    has_values=True,
-                ),
-                body=_body_layer(
-                    active_configuration=CONFIGURATION,
-                    values=values,
-                    has_values=True,
-                ),
-            )
-        )
-        codes = {issue["code"] for issue in audit.issues}
-        self.assertNotIn("cad_appearance_owner_conflict", codes)
-        self.assertIn("cad_appearance_effective_scope_unproven", codes)
-
-    def test_wrong_owner_document_or_configuration_is_rejected(self):
-        raw = copy.deepcopy(_raw())
-        raw["component"] = "other-1"
-        raw["source_document_path"] = r"C:\capture\other.SLDPRT"
-        raw["referenced_configuration"] = "Default"
-        audit = self._audit(raw)
-        codes = {issue["code"] for issue in audit.issues}
-        self.assertIn("cad_appearance_object_mismatch", codes)
-        self.assertIn("cad_appearance_owner_mismatch", codes)
-        self.assertIn("cad_appearance_configuration_mismatch", codes)
-
-    def test_body_appearance_inventory_must_match_the_captured_bodies(self):
-        audit = audit_appearance(
-            _raw(),
-            component=COMPONENT,
-            expected_document_path=DOCUMENT,
-            expected_configuration=CONFIGURATION,
-            expected_bodies=[
-                {"body_type": 0, "body_index": 0},
-                {"body_type": 0, "body_index": 1},
-            ],
-        )
-        self.assertIn(
-            "cad_appearance_body_inventory_mismatch",
-            {issue["code"] for issue in audit.issues},
-        )
+class CaptureAppearanceBindingTests(unittest.TestCase):
 
     def test_consumers_bind_appearance_and_scope_from_native_facts(self):
         appearance = _raw()
@@ -429,6 +287,266 @@ class AppearanceResolutionTests(unittest.TestCase):
         self.assertEqual(resolved.faces[0].rgba, (1.0, 0.0, 0.0, 1.0))
         self.assertEqual(resolved.faces[0].source["scopes"], ["face"])
 
+    def test_top_parent_and_leaf_keep_their_own_display_states(self):
+        raw = _resolved_raw(
+            [[1.0, 0.0, 0.0, 1.0, 1.0, 0.5, 0.3125, 0.0, 0.0]]
+        )
+        raw["state_render_materials"] = [
+            _empty_state_owner(
+                scope="top_assembly",
+                document_path=r"C:\capture\robot.SLDASM",
+                configuration="Top Configuration",
+                display_state="Top State",
+                display_states=["Top State", "Other Top State"],
+                display_states_state="observed",
+            ),
+            _empty_state_owner(
+                scope="parent_assembly",
+                document_path=r"C:\capture\parent.SLDASM",
+                configuration="Parent Configuration",
+                display_state="Parent State",
+            ),
+            _empty_state_owner(
+                scope="component_document",
+                document_path=DOCUMENT,
+                configuration=CONFIGURATION,
+                display_state="Display State 1",
+            ),
+        ]
+        resolved = resolve_deliverable_appearance(
+            raw,
+            component=COMPONENT,
+            expected_document_path=DOCUMENT,
+            expected_configuration=CONFIGURATION,
+            face_spans=[
+                {
+                    "body_type": 0,
+                    "body_index": 0,
+                    "face_index": 0,
+                    "triangle_start": 0,
+                    "triangle_count": 1,
+                    "face_reference_sha256": "a" * 64,
+                }
+            ],
+        )
+        self.assertEqual(resolved.faces[0].source["scopes"], ["face"])
+
+    def test_material_linked_state_is_compared_with_its_owner_state(self):
+        raw = _resolved_raw(
+            [[1.0, 0.0, 0.0, 1.0, 1.0, 0.5, 0.3125, 0.0, 0.0]]
+        )
+        top = _empty_state_owner(
+            scope="top_assembly",
+            document_path=r"C:\capture\robot.SLDASM",
+            configuration="Top Configuration",
+            display_state="Top State",
+            display_states=["Top State", "Other Top State"],
+            display_states_state="observed",
+        )
+        top["call_state"] = "observed"
+        top["materials"] = [
+            {
+                "material_index": 0,
+                "linked_display_states": ["Top State"],
+                "entities": ["top-face"],
+                "entities_state": "observed",
+                "entity_records": [
+                    {
+                        "entity_index": 0,
+                        "native_object_type": "IFace2",
+                        "persistent_reference": [4, 5, 6],
+                        "matched_identity": {
+                            "occurrences": [],
+                            "bodies": [],
+                            "faces": [
+                                {
+                                    "component": COMPONENT,
+                                    "body_type": 0,
+                                    "body_index": 0,
+                                    "face_index": 0,
+                                }
+                            ],
+                            "features": [],
+                        },
+                        "read_errors": {},
+                    }
+                ],
+                "primary_color": 0x00AABBCC,
+                "transparency": 0.0,
+                "color_form": 1,
+                "texture_filename": "",
+                "surface_finish_file": "",
+                "read_errors": {},
+            }
+        ]
+        raw["state_render_materials"] = [
+            top,
+            _empty_state_owner(
+                scope="component_document",
+                document_path=DOCUMENT,
+                configuration=CONFIGURATION,
+                display_state="Display State 1",
+            ),
+        ]
+        with self.assertRaises(AppearanceError) as caught:
+            resolve_deliverable_appearance(
+                raw,
+                component=COMPONENT,
+                expected_document_path=DOCUMENT,
+                expected_configuration=CONFIGURATION,
+                face_spans=[
+                    {
+                        "body_type": 0,
+                        "body_index": 0,
+                        "face_index": 0,
+                        "triangle_start": 0,
+                        "triangle_count": 1,
+                        "face_reference_sha256": "a" * 64,
+                    }
+                ],
+            )
+        self.assertEqual(
+            caught.exception.appearance["issues"][0]["code"],
+            "cad_appearance_render_color_encoding_unproven",
+        )
+
+    def test_missing_body_owner_is_absence_not_a_malformed_record(self):
+        raw = _resolved_raw([None])
+        raw["bodies"][0].pop("appearance")
+        raw["bodies"][0]["faces"][0]["appearance"] = _layer(
+            owner_configuration=CONFIGURATION
+        )
+        raw["document"] = _layer(
+            owner_configuration=CONFIGURATION,
+            values=[0.0, 0.0, 1.0, 1.0, 1.0, 0.5, 0.3125, 0.0, 0.0],
+            has_values=True,
+        )
+        resolved = resolve_deliverable_appearance(
+            raw,
+            component=COMPONENT,
+            expected_document_path=DOCUMENT,
+            expected_configuration=CONFIGURATION,
+            face_spans=[
+                {
+                    "body_type": 0,
+                    "body_index": 0,
+                    "face_index": 0,
+                    "triangle_start": 0,
+                    "triangle_count": 1,
+                    "face_reference_sha256": "a" * 64,
+                }
+            ],
+        )
+        self.assertEqual(resolved.faces[0].source["scopes"], ["document"])
+
+    def test_unproven_state_entity_binding_cannot_fall_back_to_document(self):
+        for failure in (
+            "persistent_reference",
+            "identity_map",
+            "unmapped_target",
+        ):
+            with self.subTest(failure=failure):
+                raw = _resolved_raw([None])
+                raw["bodies"][0]["faces"][0]["appearance"] = _layer(
+                    owner_configuration=CONFIGURATION
+                )
+                raw["bodies"][0]["appearance"] = _body_layer(
+                    active_configuration=CONFIGURATION
+                )
+                raw["document"] = _layer(
+                    owner_configuration=CONFIGURATION,
+                    values=[
+                        0.0,
+                        0.0,
+                        1.0,
+                        1.0,
+                        1.0,
+                        0.5,
+                        0.3125,
+                        0.0,
+                        0.0,
+                    ],
+                    has_values=True,
+                )
+                owner = _empty_state_owner(
+                    scope="component_document",
+                    document_path=DOCUMENT,
+                    configuration=CONFIGURATION,
+                    display_state="Display State 1",
+                )
+                owner["call_state"] = "observed"
+                entity = {
+                    "entity_index": 0,
+                    "native_object_type": "_CDispatch",
+                    "persistent_reference": [1, 2, 3],
+                    "matched_identity": {
+                        "occurrences": [],
+                        "bodies": [],
+                        "faces": [],
+                        "features": [],
+                    },
+                    "read_errors": {},
+                }
+                if failure == "persistent_reference":
+                    entity["persistent_reference"] = None
+                    entity["read_errors"] = {
+                        "persistent_reference": {
+                            "code": "cad_appearance_persistent_reference_missing"
+                        }
+                    }
+                elif failure == "identity_map":
+                    owner["mapping_errors"] = [
+                        {
+                            "entity_kind": "faces",
+                            "identity": {
+                                "component": COMPONENT,
+                                "body_type": 0,
+                                "body_index": 0,
+                                "face_index": 0,
+                            },
+                            "error": {
+                                "code": "cad_appearance_persistent_reference_invalid"
+                            },
+                        }
+                    ]
+                owner["materials"] = [
+                    {
+                        "material_index": 0,
+                        "linked_display_states": ["Display State 1"],
+                        "entities": ["unbound-entity"],
+                        "entities_state": "observed",
+                        "entity_records": [entity],
+                        "primary_color": 0x00AABBCC,
+                        "transparency": 0.0,
+                        "color_form": 1,
+                        "texture_filename": "",
+                        "surface_finish_file": "",
+                        "read_errors": {},
+                    }
+                ]
+                raw["state_render_materials"] = [owner]
+                with self.assertRaises(AppearanceError) as caught:
+                    resolve_deliverable_appearance(
+                        raw,
+                        component=COMPONENT,
+                        expected_document_path=DOCUMENT,
+                        expected_configuration=CONFIGURATION,
+                        face_spans=[
+                            {
+                                "body_type": 0,
+                                "body_index": 0,
+                                "face_index": 0,
+                                "triangle_start": 0,
+                                "triangle_count": 1,
+                                "face_reference_sha256": "a" * 64,
+                            }
+                        ],
+                    )
+                self.assertEqual(
+                    caught.exception.appearance["issues"][0]["code"],
+                    "cad_appearance_render_entity_binding_unproven",
+                )
+
     def test_source_render_material_owner_shape_stops_before_unproven_color_decode(self):
         raw = _resolved_raw(
             [[1.0, 0.0, 0.0, 1.0, 1.0, 0.5, 0.3125, 0.0, 0.0]]
@@ -441,6 +559,8 @@ class AppearanceResolutionTests(unittest.TestCase):
                 "display_state_option": 3,
                 "configuration": CONFIGURATION,
                 "display_state": "Display State 1",
+                "display_states": None,
+                "display_states_state": "not_applicable",
                 "call_state": "observed",
                 "materials": [
                     {
@@ -477,6 +597,7 @@ class AppearanceResolutionTests(unittest.TestCase):
                         "read_errors": {},
                     }
                 ],
+                "mapping_errors": [],
                 "read_errors": {},
             }
         ]

@@ -252,6 +252,128 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
         self.assertTrue(appearance["passed"])
         self.assertGreaterEqual(appearance["details"]["groups"], 4)
 
+    def test_independent_appearance_rejects_an_unmapped_state_entity(self):
+        from description_pipeline.verification.native_appearance import _resolved_faces
+
+        raw = hermetic._fixture_appearance_raw(
+            "arm-1",
+            {
+                "source_document_path": "C:/cad/arm.SLDPRT",
+                "referenced_configuration": "Painted",
+            },
+            [
+                {
+                    "body_type": 0,
+                    "body_index": 0,
+                    "face_index": 0,
+                }
+            ],
+        )
+        owner = raw["state_render_materials"][-1]
+        owner["call_state"] = "observed"
+        owner["mapping_errors"] = []
+        owner["materials"] = [
+            {
+                "material_index": 0,
+                "linked_display_states": ["Default_Display_State"],
+                "entities": ["unbound-entity"],
+                "entities_state": "observed",
+                "entity_records": [
+                    {
+                        "entity_index": 0,
+                        "native_object_type": "_CDispatch",
+                        "persistent_reference": [1, 2, 3],
+                        "matched_identity": {
+                            "occurrences": [],
+                            "bodies": [],
+                            "faces": [],
+                            "features": [],
+                        },
+                        "read_errors": {},
+                    }
+                ],
+                "primary_color": 0x00AABBCC,
+                "transparency": 0.0,
+                "color_form": 1,
+                "texture_filename": "",
+                "surface_finish_file": "",
+                "read_errors": {},
+            }
+        ]
+        with self.assertRaisesRegex(
+            PipelineError,
+            "has no proven identity mapping",
+        ):
+            _resolved_faces(
+                raw,
+                configuration="Painted",
+                where="capture",
+            )
+
+    def test_independent_appearance_uses_the_material_owners_display_state(self):
+        from description_pipeline.verification.native_appearance import _resolved_faces
+
+        raw = hermetic._fixture_appearance_raw(
+            "arm-1",
+            {
+                "source_document_path": "C:/cad/arm.SLDPRT",
+                "referenced_configuration": "Painted",
+            },
+            [
+                {
+                    "body_type": 0,
+                    "body_index": 0,
+                    "face_index": 0,
+                }
+            ],
+        )
+        owner = raw["state_render_materials"][0]
+        owner["call_state"] = "observed"
+        owner["materials"] = [
+            {
+                "material_index": 0,
+                "linked_display_states": ["Top Display State"],
+                "entities": ["top-face"],
+                "entities_state": "observed",
+                "entity_records": [
+                    {
+                        "entity_index": 0,
+                        "native_object_type": "IFace2",
+                        "persistent_reference": [4, 5, 6],
+                        "matched_identity": {
+                            "occurrences": [],
+                            "bodies": [],
+                            "faces": [
+                                {
+                                    "component": "arm-1",
+                                    "body_type": 0,
+                                    "body_index": 0,
+                                    "face_index": 0,
+                                }
+                            ],
+                            "features": [],
+                        },
+                        "read_errors": {},
+                    }
+                ],
+                "primary_color": 0x00AABBCC,
+                "transparency": 0.0,
+                "color_form": 1,
+                "texture_filename": "",
+                "surface_finish_file": "",
+                "read_errors": {},
+            }
+        ]
+        with self.assertRaisesRegex(
+            PipelineError,
+            "PrimaryColor byte packing is not proven",
+        ):
+            _resolved_faces(
+                raw,
+                configuration="Painted",
+                where="capture",
+            )
+
     def test_native_face_color_tamper_fails_independent_verify(self):
         source = self.root / "mutated-native-appearance"
         shutil.copytree(self.generate_source, source)
@@ -400,9 +522,13 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                         "owner_scope": "component_document",
                         "api": "IModelDocExtension.GetRenderMaterials2",
                         "display_state_option": 3,
+                        "configuration": configuration,
                         "display_state": "Display State 1",
+                        "display_states": None,
+                        "display_states_state": "not_applicable",
                         "call_state": "empty",
                         "materials": [],
+                        "mapping_errors": [],
                         "read_errors": {},
                     }
                 ],

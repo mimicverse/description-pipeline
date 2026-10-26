@@ -436,6 +436,80 @@ def _owner_color(
     }
 
 
+def _state_owner_display_state(
+    owner: Mapping[str, Any],
+    *,
+    component: str,
+    path: str,
+    expected_configuration: str,
+    expected_display_state: str,
+) -> str:
+    scope = owner.get("owner_scope")
+    configuration = owner.get("configuration")
+    owner_state = owner.get("display_state")
+    display_states = owner.get("display_states")
+    display_states_state = owner.get("display_states_state")
+    if (
+        not isinstance(scope, str)
+        or not isinstance(configuration, str)
+        or not configuration
+        or not isinstance(owner_state, str)
+        or not owner_state
+    ):
+        raise _appearance_resolution_error(
+            component,
+            "cad_appearance_render_owner_state_invalid",
+            path,
+            "a display-state owner has no exact native configuration and state",
+        )
+    if scope == "top_assembly":
+        proven = (
+            display_states_state == "observed"
+            and isinstance(display_states, list)
+            and bool(display_states)
+            and display_states[0] == owner_state
+        )
+    elif scope == "parent_assembly":
+        proven = (
+            display_states_state == "not_applicable"
+            and display_states is None
+        )
+    elif scope == "component_document":
+        proven = (
+            configuration == expected_configuration
+            and owner_state == expected_display_state
+            and display_states_state == "not_applicable"
+            and display_states is None
+        )
+    else:
+        proven = False
+    if not proven:
+        raise _appearance_resolution_error(
+            component,
+            "cad_appearance_render_owner_state_invalid",
+            path,
+            "a display-state owner is not proven from its own native configuration and state",
+            owner_scope=scope,
+            expected_configuration=(
+                expected_configuration
+                if scope == "component_document"
+                else None
+            ),
+            expected_display_state=(
+                expected_display_state
+                if scope == "component_document"
+                else None
+            ),
+            observed={
+                "configuration": configuration,
+                "display_state": owner_state,
+                "display_states": display_states,
+                "display_states_state": display_states_state,
+            },
+        )
+    return owner_state
+
+
 def _target_face_keys(
     target: object,
     *,
@@ -716,7 +790,6 @@ def resolve_deliverable_appearance(
             or not isinstance(owner.get("owner_document_path"), str)
             or owner.get("api") != "IModelDocExtension.GetRenderMaterials2"
             or owner.get("display_state_option") != 3
-            or owner.get("display_state") != display_state
             or owner.get("call_state")
             not in {
                 "observed",
@@ -729,6 +802,7 @@ def resolve_deliverable_appearance(
                 owner.get("materials") is not None
                 and not isinstance(owner.get("materials"), list)
             )
+            or not isinstance(owner.get("mapping_errors"), list)
             or not isinstance(owner.get("read_errors"), Mapping)
         ):
             raise _appearance_resolution_error(
@@ -737,6 +811,13 @@ def resolve_deliverable_appearance(
                 owner_path,
                 "a display-state render-material owner record is malformed",
             )
+        owner_display_state = _state_owner_display_state(
+            owner,
+            component=component,
+            path=owner_path,
+            expected_configuration=configuration,
+            expected_display_state=display_state,
+        )
         if (
             owner.get("call_state") not in {"observed", "empty"}
             or owner.get("read_errors")
@@ -830,6 +911,20 @@ def resolve_deliverable_appearance(
                         "cad_appearance_render_entity_invalid",
                         entity_path,
                         "a display-state render-material entity cannot be bound exactly",
+                    )
+                reference = entity.get("persistent_reference")
+                if (
+                    not isinstance(reference, list)
+                    or not reference
+                    or any(type(value) is not int for value in reference)
+                ):
+                    raise _appearance_resolution_error(
+                        component,
+                        "cad_appearance_render_entity_binding_unproven",
+                        entity_path + ".persistent_reference",
+                        "a display-state render-material entity has no usable native identity",
+                        observed=reference,
+                        errors=dict(entity["read_errors"]),
                     )
                 identity = entity["matched_identity"]
                 occurrences = identity.get("occurrences")
@@ -948,10 +1043,37 @@ def resolve_deliverable_appearance(
             for scoped_faces in faces_by_scope.values():
                 material_faces |= scoped_faces
             if not material_faces:
+                if owner["mapping_errors"] or any(
+                    entity.get("read_errors") for entity in entities
+                ) or any(
+                    not any(
+                        entity["matched_identity"].get(kind)
+                        for kind in (
+                            "occurrences",
+                            "bodies",
+                            "faces",
+                            "features",
+                        )
+                    )
+                    for entity in entities
+                ):
+                    raise _appearance_resolution_error(
+                        component,
+                        "cad_appearance_render_entity_binding_unproven",
+                        path,
+                        "a nonmatching display-state entity has no proven identity mapping",
+                        mapping_errors=list(owner["mapping_errors"]),
+                        entity_errors=[
+                            dict(entity["read_errors"])
+                            for entity in entities
+                            if entity.get("read_errors")
+                        ],
+                    )
                 continue
             if (
                 errors
-                or display_state not in linked
+                or not isinstance(linked, list)
+                or owner_display_state not in linked
                 or any(entity.get("read_errors") for entity in entities)
                 or material.get("color_form") != 1
                 or material.get("texture_filename") not in (None, "")
@@ -1003,14 +1125,18 @@ def resolve_deliverable_appearance(
                 if owner is not None:
                     choices.append({"rgba": owner[0], "source": owner[1]})
             elif scope == "body":
-                owner = _owner_color(
-                    body_owner_raw,
-                    component=component,
-                    path=(
-                        "appearance_raw.bodies"
-                        f"[{body_key[0]}/{body_key[1]}].appearance"
-                    ),
-                    expected_configuration=configuration,
+                owner = (
+                    None
+                    if body_owner_raw is None
+                    else _owner_color(
+                        body_owner_raw,
+                        component=component,
+                        path=(
+                            "appearance_raw.bodies"
+                            f"[{body_key[0]}/{body_key[1]}].appearance"
+                        ),
+                        expected_configuration=configuration,
+                    )
                 )
                 if owner is not None:
                     choices.append({"rgba": owner[0], "source": owner[1]})
@@ -1088,474 +1214,6 @@ def resolve_deliverable_appearance(
         referenced_display_state=display_state,
         faces=tuple(resolved),
     )
-
-
-def _requested_material_call(configuration: str) -> dict[str, Any]:
-    return {
-        "configuration_semantics": "requested_configuration",
-        "configuration_option": 3,
-        "configuration_names": [configuration],
-    }
-
-
-def _active_material_call(configuration: str) -> dict[str, Any]:
-    return {
-        "configuration_semantics": "active_configuration",
-        "active_configuration": configuration,
-    }
-
-
-def _audit_owner(
-    raw: object,
-    *,
-    path: str,
-    owner: str,
-    expected_configuration: str,
-    material_call: dict[str, Any],
-    claims: list[dict[str, Any]],
-    issues: list[dict[str, Any]],
-) -> None:
-    if not isinstance(raw, Mapping):
-        issues.append(
-            _issue(
-                "cad_appearance_owner_missing",
-                path,
-                "the appearance owner record is absent or malformed",
-                owner=owner,
-            )
-        )
-        return
-
-    used_api = raw.get("used_api")
-    if not isinstance(used_api, str) or not used_api:
-        issues.append(
-            _issue(
-                "cad_appearance_api_missing",
-                path + ".used_api",
-                "the appearance owner record names no native API",
-                owner=owner,
-            )
-        )
-
-    raw_material_call = raw.get("material_call")
-    if raw_material_call != material_call:
-        issues.append(
-            _issue(
-                "cad_appearance_configuration_mismatch",
-                path + ".material_call",
-                "the appearance material call is not bound to the expected configuration",
-                owner=owner,
-                expected=material_call,
-                observed=raw_material_call,
-            )
-        )
-
-    presence_call = raw.get("presence_call")
-    if presence_call != {
-        "arguments": [],
-        "configuration_semantics": "native_owner_context",
-    }:
-        issues.append(
-            _issue(
-                "cad_appearance_presence_context_invalid",
-                path + ".presence_call",
-                "the appearance presence call does not retain its native owner context",
-                owner=owner,
-                observed=presence_call,
-            )
-        )
-
-    read_errors = raw.get("read_errors")
-    if not isinstance(read_errors, Mapping):
-        issues.append(
-            _issue(
-                "cad_appearance_errors_malformed",
-                path + ".read_errors",
-                "the appearance error record is not an object",
-                owner=owner,
-            )
-        )
-    else:
-        for field, error in sorted(read_errors.items()):
-            issues.append(
-                _issue(
-                    "cad_appearance_read_failed",
-                    f"{path}.read_errors.{field}",
-                    "an appearance read failed and cannot be treated as absence",
-                    owner=owner,
-                    field=str(field),
-                    error=error,
-                )
-            )
-
-    values = raw.get("material_property_values")
-    has_values = raw.get("has_material_property_values")
-    values_are_valid = _valid_values(values)
-    if values is not None and not values_are_valid:
-        issues.append(
-            _issue(
-                "cad_appearance_values_invalid",
-                path + ".material_property_values",
-                "material values are not the documented nine finite numbers",
-                owner=owner,
-                observed=values,
-            )
-        )
-    if type(has_values) is not bool:
-        issues.append(
-            _issue(
-                "cad_appearance_presence_invalid",
-                path + ".has_material_property_values",
-                "the appearance presence flag is not a native boolean",
-                owner=owner,
-                observed=has_values,
-            )
-        )
-    elif has_values:
-        claims.append(
-            {
-                "owner": owner,
-                "path": path,
-                "kind": "material_property_values",
-                "material_property_values": values,
-                "used_api": used_api,
-            }
-        )
-    elif values_are_valid and any(float(value) != -1.0 for value in values):
-        issues.append(
-            _issue(
-                "cad_appearance_presence_conflict",
-                path,
-                "the presence flag denies material values while the raw vector carries data",
-                owner=owner,
-                material_property_values=values,
-            )
-        )
-
-    texture = raw.get("texture")
-    if not isinstance(texture, Mapping):
-        issues.append(
-            _issue(
-                "cad_appearance_texture_invalid",
-                path + ".texture",
-                "the texture record is absent or malformed",
-                owner=owner,
-            )
-        )
-        return
-    texture_path = path + ".texture"
-    if texture.get("configuration") != expected_configuration:
-        issues.append(
-            _issue(
-                "cad_appearance_configuration_mismatch",
-                texture_path + ".configuration",
-                "the texture record is not bound to the expected configuration",
-                owner=owner,
-                expected=expected_configuration,
-                observed=texture.get("configuration"),
-            )
-        )
-    texture_state = texture.get("state")
-    material_name = texture.get("material_name")
-    if texture_state == "absent":
-        if material_name is not None:
-            issues.append(
-                _issue(
-                    "cad_appearance_texture_state_conflict",
-                    texture_path,
-                    "an absent texture record carries a material name",
-                    owner=owner,
-                    material_name=material_name,
-                )
-            )
-    elif texture_state == "present":
-        claims.append(
-            {
-                "owner": owner,
-                "path": texture_path,
-                "kind": "texture",
-                "material_name": material_name,
-                "used_api": used_api,
-            }
-        )
-        issues.append(
-            _issue(
-                "cad_appearance_texture_unrepresentable",
-                texture_path,
-                "the raw texture pointer has no qualified asset, binding, and UV consumer",
-                owner=owner,
-                material_name=material_name,
-            )
-        )
-    elif texture_state == "unreadable":
-        issues.append(
-            _issue(
-                "cad_appearance_read_failed",
-                texture_path,
-                "the texture state is unreadable and cannot be treated as absent",
-                owner=owner,
-            )
-        )
-    else:
-        issues.append(
-            _issue(
-                "cad_appearance_texture_state_invalid",
-                texture_path + ".state",
-                "the texture state is not absent, present, or unreadable",
-                owner=owner,
-                observed=texture_state,
-            )
-        )
-
-
-def audit_appearance(
-    raw: object,
-    *,
-    component: str,
-    expected_document_path: object,
-    expected_configuration: object,
-    expected_bodies: Sequence[Mapping[str, Any]] | None = None,
-) -> AppearanceAudit:
-    """Audit one raw occurrence without deriving an effective color."""
-
-    component = str(component)
-    expected_configuration_text = (
-        expected_configuration if isinstance(expected_configuration, str) else ""
-    )
-    if raw is UNRECORDED_APPEARANCE:
-        return AppearanceAudit(component, "unobserved", (), ())
-    if raw is None:
-        issue = _issue(
-            "cad_appearance_record_missing",
-            "appearance_raw",
-            "an explicit appearance record is missing and cannot be treated as absence",
-        )
-        return AppearanceAudit(component, "invalid", (issue,), ())
-    if not isinstance(raw, Mapping):
-        issue = _issue(
-            "cad_appearance_record_invalid",
-            "appearance_raw",
-            "the occurrence appearance record is not an object",
-        )
-        return AppearanceAudit(component, "invalid", (issue,), ())
-
-    issues: list[dict[str, Any]] = []
-    claims: list[dict[str, Any]] = []
-    if raw.get("component") != component:
-        issues.append(
-            _issue(
-                "cad_appearance_object_mismatch",
-                "appearance_raw.component",
-                "the appearance record names another occurrence",
-                expected=component,
-                observed=raw.get("component"),
-            )
-        )
-    if not _same_document_path(
-        raw.get("source_document_path"),
-        expected_document_path,
-    ):
-        issues.append(
-            _issue(
-                "cad_appearance_owner_mismatch",
-                "appearance_raw.source_document_path",
-                "the appearance record names another source document",
-                expected=expected_document_path,
-                observed=raw.get("source_document_path"),
-            )
-        )
-    if (
-        not expected_configuration_text
-        or raw.get("referenced_configuration") != expected_configuration_text
-    ):
-        issues.append(
-            _issue(
-                "cad_appearance_configuration_mismatch",
-                "appearance_raw.referenced_configuration",
-                "the appearance record names another referenced configuration",
-                expected=expected_configuration_text,
-                observed=raw.get("referenced_configuration"),
-            )
-        )
-
-    active_error = raw.get("native_active_configuration_error")
-    if active_error is not None:
-        issues.append(
-            _issue(
-                "cad_appearance_read_failed",
-                "appearance_raw.native_active_configuration_error",
-                "the native active configuration is unreadable",
-                error=active_error,
-            )
-        )
-    native_active = raw.get("native_active_configuration")
-    if not isinstance(native_active, str) or not native_active:
-        issues.append(
-            _issue(
-                "cad_appearance_active_configuration_invalid",
-                "appearance_raw.native_active_configuration",
-                "the native active configuration is malformed",
-                observed=native_active,
-            )
-        )
-
-    if expected_configuration_text:
-        _audit_owner(
-            raw.get("document"),
-            path="appearance_raw.document",
-            owner="document",
-            expected_configuration=expected_configuration_text,
-            material_call=_requested_material_call(expected_configuration_text),
-            claims=claims,
-            issues=issues,
-        )
-        _audit_owner(
-            raw.get("occurrence"),
-            path="appearance_raw.occurrence",
-            owner="occurrence",
-            expected_configuration=expected_configuration_text,
-            material_call=_requested_material_call(expected_configuration_text),
-            claims=claims,
-            issues=issues,
-        )
-
-    bodies = raw.get("bodies")
-    body_ids: set[tuple[object, object]] = set()
-    if not isinstance(bodies, list):
-        issues.append(
-            _issue(
-                "cad_appearance_bodies_invalid",
-                "appearance_raw.bodies",
-                "the per-body appearance inventory is not a list",
-            )
-        )
-    else:
-        active_configuration = (
-            native_active if isinstance(native_active, str) and native_active else ""
-        )
-        for index, body in enumerate(bodies):
-            path = f"appearance_raw.bodies[{index}]"
-            if not isinstance(body, Mapping):
-                issues.append(
-                    _issue(
-                        "cad_appearance_body_invalid",
-                        path,
-                        "the body appearance binding is not an object",
-                    )
-                )
-                continue
-            if body.get("component") != component:
-                issues.append(
-                    _issue(
-                        "cad_appearance_object_mismatch",
-                        path + ".component",
-                        "the body appearance record names another occurrence",
-                        expected=component,
-                        observed=body.get("component"),
-                    )
-                )
-            body_type = body.get("body_type")
-            body_index = body.get("body_index")
-            if body_type not in (0, 1) or type(body_index) is not int or body_index < 0:
-                issues.append(
-                    _issue(
-                        "cad_appearance_body_identity_invalid",
-                        path,
-                        "the body appearance record has no exact native body identity",
-                        body_type=body_type,
-                        body_index=body_index,
-                    )
-                )
-            else:
-                identity = (body_type, body_index)
-                if identity in body_ids:
-                    issues.append(
-                        _issue(
-                            "cad_appearance_body_repeated",
-                            path,
-                            "the body appearance record repeats one native body",
-                            body_type=body_type,
-                            body_index=body_index,
-                        )
-                    )
-                body_ids.add(identity)
-            if body.get("enumeration_api") != "IComponent2.GetBodies2":
-                issues.append(
-                    _issue(
-                        "cad_appearance_body_api_mismatch",
-                        path + ".enumeration_api",
-                        "the body appearance record is not bound to the primary body enumeration",
-                        observed=body.get("enumeration_api"),
-                    )
-                )
-            if not active_configuration:
-                continue
-            _audit_owner(
-                body.get("appearance"),
-                path=path + ".appearance",
-                owner=f"body[{body_type}/{body_index}]",
-                expected_configuration=active_configuration,
-                material_call=_active_material_call(active_configuration),
-                claims=claims,
-                issues=issues,
-            )
-
-    if expected_bodies is not None:
-        expected_body_ids = set()
-        malformed_expected = False
-        for body in expected_bodies:
-            if not isinstance(body, Mapping):
-                malformed_expected = True
-                continue
-            body_type = body.get("body_type")
-            body_index = body.get("body_index")
-            if body_type not in (0, 1) or type(body_index) is not int or body_index < 0:
-                malformed_expected = True
-                continue
-            expected_body_ids.add((body_type, body_index))
-        if malformed_expected or expected_body_ids != body_ids:
-            issues.append(
-                _issue(
-                    "cad_appearance_body_inventory_mismatch",
-                    "appearance_raw.bodies",
-                    "appearance owners do not bind exactly the captured native bodies",
-                    expected=sorted(expected_body_ids),
-                    observed=sorted(body_ids),
-                )
-            )
-
-    vectors = {
-        tuple(float(value) for value in claim["material_property_values"])
-        for claim in claims
-        if claim.get("kind") == "material_property_values"
-        and _valid_values(claim.get("material_property_values"))
-    }
-    if len(vectors) > 1:
-        issues.append(
-            _issue(
-                "cad_appearance_owner_conflict",
-                "appearance_raw",
-                "appearance owners expose conflicting material-property values",
-                values=[list(vector) for vector in sorted(vectors)],
-            )
-        )
-    if claims:
-        issues.append(
-            _issue(
-                "cad_appearance_effective_scope_unproven",
-                "appearance_raw",
-                "the current facts do not prove the effective appearance of every delivered face",
-            )
-        )
-
-    state = "unobserved" if not issues else "unrepresentable"
-    return AppearanceAudit(
-        component,
-        state,
-        tuple(issues),
-        tuple(claims),
-    )
-
 
 def bind_capture_appearance(
     raw_scene: object,
@@ -1717,35 +1375,3 @@ def bind_capture_appearance(
             )
         row["source_scope"] = copy.deepcopy(dict(scope))
     return raw, geometry
-
-
-def require_deliverable_appearance(
-    raw: object,
-    *,
-    component: str,
-    expected_document_path: object,
-    expected_configuration: object,
-    expected_bodies: Sequence[Mapping[str, Any]] | None = None,
-) -> AppearanceAudit:
-    """Reject unless the raw facts prove a faithfully renderable appearance."""
-
-    audit = audit_appearance(
-        raw,
-        component=component,
-        expected_document_path=expected_document_path,
-        expected_configuration=expected_configuration,
-        expected_bodies=expected_bodies,
-    )
-    if not audit.issues:
-        unproven = _issue(
-            "cad_appearance_effective_scope_unproven",
-            "appearance_raw",
-            "the current facts do not prove the effective appearance of every delivered face",
-        )
-        audit = AppearanceAudit(
-            audit.component,
-            "unrepresentable",
-            (*audit.issues, unproven),
-            audit.claims,
-        )
-    raise AppearanceError(audit)

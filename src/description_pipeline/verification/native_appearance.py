@@ -123,6 +123,55 @@ def _owner_rgba(
     }
 
 
+def _state_owner_display_state(
+    owner: Mapping,
+    *,
+    expected_configuration: str,
+    expected_display_state: str,
+    where: str,
+) -> str:
+    scope = owner.get("owner_scope")
+    configuration = owner.get("configuration")
+    owner_state = owner.get("display_state")
+    display_states = owner.get("display_states")
+    display_states_state = owner.get("display_states_state")
+    _require(
+        isinstance(scope, str)
+        and bool(scope)
+        and isinstance(configuration, str)
+        and bool(configuration)
+        and isinstance(owner_state, str)
+        and bool(owner_state),
+        f"{where} has no exact native configuration and state",
+    )
+    if scope == "top_assembly":
+        proven = (
+            display_states_state == "observed"
+            and isinstance(display_states, list)
+            and bool(display_states)
+            and display_states[0] == owner_state
+        )
+    elif scope == "parent_assembly":
+        proven = (
+            display_states_state == "not_applicable"
+            and display_states is None
+        )
+    elif scope == "component_document":
+        proven = (
+            configuration == expected_configuration
+            and owner_state == expected_display_state
+            and display_states_state == "not_applicable"
+            and display_states is None
+        )
+    else:
+        proven = False
+    _require(
+        proven,
+        f"{where} is not proven from its own native configuration and state",
+    )
+    return owner_state
+
+
 def _target_faces(
     target: object,
     all_faces: set[tuple[int, int, int]],
@@ -240,12 +289,18 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
             and isinstance(owner.get("owner_document_path"), str)
             and owner.get("api") == "IModelDocExtension.GetRenderMaterials2"
             and owner.get("display_state_option") == 3
-            and owner.get("display_state") == display_state
             and owner.get("call_state") in {"observed", "empty"}
             and isinstance(owner.get("read_errors"), Mapping)
             and not owner.get("read_errors")
+            and isinstance(owner.get("mapping_errors"), list)
             and isinstance(owner.get("materials"), list),
             f"{owner_path} has no successful exact display-state enumeration",
+        )
+        owner_display_state = _state_owner_display_state(
+            owner,
+            expected_configuration=configuration,
+            expected_display_state=display_state,
+            where=owner_path,
         )
         _require(
             (owner["call_state"] == "empty" and not owner["materials"])
@@ -288,6 +343,12 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
                     and isinstance(entity.get("native_object_type"), str)
                     and isinstance(entity.get("matched_identity"), Mapping)
                     and isinstance(entity.get("read_errors"), Mapping)
+                    and isinstance(entity.get("persistent_reference"), list)
+                    and bool(entity.get("persistent_reference"))
+                    and all(
+                        type(value) is int
+                        for value in entity["persistent_reference"]
+                    )
                     ,
                     f"{entity_path} is malformed",
                 )
@@ -341,10 +402,31 @@ def _resolved_faces(raw: object, *, configuration: str, where: str) -> dict:
                     if face_key in all_faces:
                         faces.add(face_key)
             if not faces:
+                _require(
+                    not owner["mapping_errors"]
+                    and not any(
+                        entity.get("read_errors")
+                        for entity in material["entity_records"]
+                    )
+                    and not any(
+                        not any(
+                            entity["matched_identity"].get(kind)
+                            for kind in (
+                                "occurrences",
+                                "bodies",
+                                "faces",
+                                "features",
+                            )
+                        )
+                        for entity in material["entity_records"]
+                    ),
+                    f"{material_path} has no proven identity mapping",
+                )
                 continue
             _require(
                 not material.get("read_errors")
-                and display_state in material["linked_display_states"]
+                and isinstance(material.get("linked_display_states"), list)
+                and owner_display_state in material["linked_display_states"]
                 and not any(
                     entity.get("read_errors")
                     for entity in material["entity_records"]
