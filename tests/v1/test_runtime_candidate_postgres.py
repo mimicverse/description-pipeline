@@ -2378,6 +2378,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
 
         terminal = {}
         manual_ordering = threading.Event()
+        manual_ordering_lock = threading.Lock()
 
         def poll() -> None:
             def observe(view) -> None:
@@ -2387,14 +2388,15 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
                     "cancelled",
                     "unknown",
                 }
-                if manual_ordering.is_set() and not terminal_state:
-                    return
-                self.facts.record_run_activity(
-                    self.admission.run_id,
-                    view.operation_id,
-                    view.activity,
-                    terminal=terminal_state,
-                )
+                with manual_ordering_lock:
+                    if manual_ordering.is_set() and not terminal_state:
+                        return
+                    self.facts.record_run_activity(
+                        self.admission.run_id,
+                        view.operation_id,
+                        view.activity,
+                        terminal=terminal_state,
+                    )
 
             try:
                 terminal["view"] = client.wait_for_terminal(
@@ -2430,10 +2432,11 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
                 "native activity was not projected into run_display_metadata: "
                 f"events={runtime._events(operation_id)!r} terminal={terminal!r}"
             )
-        # The first observation above proves the asynchronous callback path. Thereafter the test
-        # owns nonterminal ordering until it explicitly releases the terminal transition; retain
-        # terminal callbacks so the poller still verifies eventual completion.
-        manual_ordering.set()
+        # Acquiring the same lock drains any callback that observed the open gate before it can
+        # be mistaken for a later observation. Once the gate is set, subsequent nonterminal
+        # callbacks are ignored while terminal callbacks remain accepted.
+        with manual_ordering_lock:
+            manual_ordering.set()
 
         projection = read_run_projection(
             self._connect(),
