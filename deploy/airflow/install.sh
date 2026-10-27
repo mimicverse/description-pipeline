@@ -13,8 +13,6 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-die() { echo "install.sh: $*" >&2; exit 1; }
-
 if [ "$#" -ne 0 ]; then
   echo "usage: $0" >&2
   exit 2
