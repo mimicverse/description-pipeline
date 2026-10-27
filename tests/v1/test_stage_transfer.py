@@ -65,7 +65,7 @@ def upstream_artifacts() -> list[dict]:
     return [
         ArtifactRef(
             artifact_id=f"{stage}-artifact",
-            kind=f"{stage}-output",
+            kind=f"stage_output:{stage}",
             locator=f"cas://artifact/{stage}-artifact",
             manifest_sha256=character * 64,
             set_sha256=character * 64,
@@ -679,6 +679,16 @@ class StageTransferTests(unittest.TestCase):
                 expected_execution=wrong_execution,
             )
 
+        wrong_kind = copy.deepcopy(upstream_artifacts())
+        wrong_kind[0]["kind"] = "not-freeze"
+        wrong_kind[1]["kind"] = "not-discover"
+        with self.assertRaisesRegex(PipelineError, "invalid stage-output kinds"):
+            seal(
+                self.root,
+                self.base / "wrong-upstream-kind.zip",
+                upstream_artifacts=wrong_kind,
+            )
+
     def test_archive_and_in_memory_receipts_use_the_same_manifest_verifier(self) -> None:
         seal(self.root, self.archive)
         with mock.patch.object(native_transfer, "verify_transfer", wraps=native_transfer.verify_transfer) as verify:
@@ -1003,7 +1013,10 @@ class StageTransferTests(unittest.TestCase):
         input_report["passed"] = False
         cases.append(("input-failed", input_report, "input/handoff.json", "Input report did not pass"))
 
-        portable = {**native_tool(), "runtime": {"role": "portable"}}
+        portable = {
+            **native_tool(),
+            "runtime": {**native_tool()["runtime"], "role": "portable"},
+        }
         cases.append(("portable-tool", portable, "reports/native-tool.json", "runtime.role", portable))
 
         wide_scope = stage_view(scope=("capture", "generate"))
@@ -1116,7 +1129,7 @@ class StageTransferTests(unittest.TestCase):
                         "packages": {required_packages("native")[0]: "0.0.1"},
                     }
                 },
-                f"pin {required_packages('native')[0]}",
+                "exactly the native package closure",
             ),
             (
                 "mujoco",
@@ -1126,7 +1139,50 @@ class StageTransferTests(unittest.TestCase):
                         "packages": {**native_tool()["runtime"]["packages"], "mujoco": "3.13.0"},
                     }
                 },
-                "MuJoCo",
+                "exactly the native package closure",
+            ),
+            (
+                "runtime-extra",
+                {
+                    "runtime": {
+                        **native_tool()["runtime"],
+                        "execution_variant": "unexpected",
+                    }
+                },
+                "exact runtime closure",
+            ),
+            (
+                "package-extra",
+                {
+                    "runtime": {
+                        **native_tool()["runtime"],
+                        "packages": {
+                            **native_tool()["runtime"]["packages"],
+                            "unexpected-runtime": "1.0.0",
+                        },
+                    }
+                },
+                "exactly the native package closure",
+            ),
+            (
+                "machine",
+                {
+                    "runtime": {
+                        **native_tool()["runtime"],
+                        "machine": "ARM64",
+                    }
+                },
+                "Windows x86_64",
+            ),
+            (
+                "tool-extra",
+                {"unexpected": True},
+                "exact fields",
+            ),
+            (
+                "unknown-release",
+                {"release": {"schema_version": "unexpected-release/v1"}},
+                "release",
             ),
         )
         for label, overrides, expected in cases:
@@ -1136,6 +1192,34 @@ class StageTransferTests(unittest.TestCase):
                 write_json(root / "reports/native-tool.json", tool)
                 with self.assertRaisesRegex(PipelineError, expected):
                     seal(root, self.base / f"tool-{label}.zip", native_tool=tool)
+
+    def test_installed_native_tool_rejects_top_level_source_drift(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="installed-native-tool-") as directory:
+            package = Path(directory)
+            package_files = {"worker.py": "a" * 64}
+            source_sha256 = digest(package_files)
+            identity = {
+                "schema_version": "solidworks-to-urdf.release/v1",
+                "pipeline_id": PIPELINE_ID,
+                "version": PIPELINE_VERSION,
+                "source_commit": "b" * 40,
+                "source_tree": "c" * 40,
+                "source_sha256": source_sha256,
+                "package_files": package_files,
+                "contract": {},
+                "support": {},
+            }
+            write_json(package / "tool-release.json", identity)
+            tool = {**native_tool(), "source_sha256": source_sha256, "release": identity}
+            with mock.patch.object(
+                native_transfer,
+                "__file__",
+                str(package / "native_transfer.py"),
+            ):
+                native_transfer._validate_native_tool(tool)
+                drifted = {**tool, "source_sha256": "e" * 64}
+                with self.assertRaisesRegex(PipelineError, "release_invalid"):
+                    native_transfer._validate_native_tool(drifted)
 
     def test_neutral_freeze_capture_roundtrip(self) -> None:
         """The evidence identity is validated against a real freeze snapshot, not a hand shape."""

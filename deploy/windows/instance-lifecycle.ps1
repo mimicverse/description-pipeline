@@ -2240,7 +2240,7 @@ function Get-RunningEvidence($State, [switch]$AllowUnready) {
       'the endpoint task state is not Running: ' + [string]$State.projection.state)
   }
   $listener = Get-ListenerEvidence $State.task $State.projection $State.config
-  $health = Read-EndpointHealth $State.config 10
+  $health = Read-EndpointHealth $State.source_config 10
   $identity = Get-IdentityDocument $State
   Assert-HealthIdentity $health $identity
   $identity.target_identity = $health.target_identity

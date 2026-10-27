@@ -650,7 +650,7 @@ class CaptureHandlerTests(unittest.TestCase):
 
     def _native_tool_variant(self, name: str) -> dict:
         tool = copy.deepcopy(self.capture_tool)
-        tool["runtime"]["execution_variant"] = name
+        tool["source_sha256"] = digest({"native-tool-variant": name})
         return tool
 
     def _materialized_workspace(

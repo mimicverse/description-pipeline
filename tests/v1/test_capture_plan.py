@@ -17,6 +17,7 @@ from description_pipeline.sources.solidworks.capture_package import (
     consume_sealed_definition,
 )
 from description_pipeline.sources.solidworks.capture_transaction import (
+    inspect_prepared_package,
     _require_plan_against_capture,
 )
 from tests.sources.selection_support import sealed_selection
@@ -803,6 +804,10 @@ class CapturePlanTests(unittest.TestCase):
 
     def test_a_missing_source_identity_is_refused(self) -> None:
         (self.root / "source.json").unlink()
+        report = inspect_prepared_package(self.root)
+        self.assertIs(report["passed"], False)
+        self.assertEqual(report["warnings"], [])
+        self.assertEqual(report["errors"][0]["code"], "input.source_identity")
         with self.assertRaisesRegex(PipelineError, "no sealed source identity"):
             steps._consume_sealed_definition(self.root)
 

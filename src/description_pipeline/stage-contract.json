@@ -110,7 +110,7 @@
       "name": "Capture evidence",
       "doc": {
         "input": "Verified Freeze and Discover outputs plus the same-release native tool requirement; prepared bytes, source inventory, native tool identities and object ownership agree",
-        "output": "Admitted capture tree with original inputs, complete native evidence and transfer receipts; reconstruction, native reads, temporary-state restoration, geometry coverage and resource settlement pass"
+        "output": "Admitted capture tree with original inputs, complete native evidence and transfer receipts; native reads, source scopes, geometry coverage, input stability and resource settlement pass"
       },
       "inputs": [
         {
@@ -122,7 +122,7 @@
       "input_qc": [
         {
           "id": "input.valid",
-          "label": "Derived definition, native provenance and archive integrity"
+          "label": "Verified prepared package, native provenance and archive integrity"
         }
       ],
       "outputs": [
