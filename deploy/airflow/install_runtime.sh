@@ -51,8 +51,24 @@ fi
 "$AIRFLOW_VENV/bin/python" -m pip install --no-deps --force-reinstall "$PIPELINE_WHEEL"
 "$AIRFLOW_VENV/bin/python" -m pip check
 "$AIRFLOW_VENV/bin/description" doctor
-INSTALLED_AIRFLOW_VERSION="$("$AIRFLOW_VENV/bin/airflow" version 2>/dev/null)"
+
+# Airflow CLI probes may initialize logging under AIRFLOW_HOME. Keep that
+# side effect out of the restored or configured home and remove it on exit.
+PROBE_HOME="$(mktemp -d "$AIRFLOW_VENV/.airflow-probe-home.XXXXXXXX")"
+trap 'rm -rf -- "$PROBE_HOME"' EXIT
+probe_airflow() {
+  (
+    unset AIRFLOW_CONFIG PYTHONHOME PYTHONPATH VIRTUAL_ENV
+    while IFS= read -r name; do
+      case "$name" in
+        AIRFLOW__*) unset "$name" ;;
+      esac
+    done < <(compgen -e)
+    PYTHONNOUSERSITE=1 AIRFLOW_HOME="$PROBE_HOME" "$AIRFLOW_VENV/bin/airflow" "$@"
+  )
+}
+INSTALLED_AIRFLOW_VERSION="$(probe_airflow version 2>/dev/null)"
 [ "$INSTALLED_AIRFLOW_VERSION" = "3.3.2" ] \
   || die "expected Airflow 3.3.2, found: ${INSTALLED_AIRFLOW_VERSION:-unknown}"
-"$AIRFLOW_VENV/bin/airflow" triggerer --help >/dev/null \
+probe_airflow triggerer --help >/dev/null \
   || die "the pinned Airflow runtime has no triggerer command"

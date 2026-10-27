@@ -10919,6 +10919,9 @@ def _recovered_runtime_environment() -> dict[str, str]:
     """Return only the caller environment needed to probe a recovered runtime."""
 
     environment = os.environ.copy()
+    for name in tuple(environment):
+        if name == "AIRFLOW_CONFIG" or name.startswith("AIRFLOW__"):
+            environment.pop(name)
     for name in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV"):
         environment.pop(name, None)
     environment["PYTHONNOUSERSITE"] = "1"
@@ -11120,22 +11123,27 @@ def verify_release_runtime(
         "recovered Python environment fails pip check",
         {"stderr": pip_check.stderr[-2000:]},
     )
-    for entry in ("airflow", "description"):
-        version_args = ["version"] if entry == "airflow" else ["--version"]
-        entry_probe = subprocess.run(
-            [str(venv / "bin" / entry), *version_args],
-            capture_output=True,
-            text=True,
-            timeout=120,
-            check=False,
-            env=runtime_environment,
-        )
-        require(
-            entry_probe.returncode == 0 and bool(entry_probe.stdout.strip()),
-            "recovery_release_missing",
-            f"recovered {entry} entry point does not execute",
-            {"stderr": entry_probe.stderr[-2000:]},
-        )
+    with tempfile.TemporaryDirectory(
+        prefix=".release-runtime-probe-",
+        dir=release_root,
+    ) as probe_home:
+        probe_environment = runtime_environment | {"AIRFLOW_HOME": probe_home}
+        for entry in ("airflow", "description"):
+            version_args = ["version"] if entry == "airflow" else ["--version"]
+            entry_probe = subprocess.run(
+                [str(venv / "bin" / entry), *version_args],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+                env=probe_environment,
+            )
+            require(
+                entry_probe.returncode == 0 and bool(entry_probe.stdout.strip()),
+                "recovery_release_missing",
+                f"recovered {entry} entry point does not execute",
+                {"stderr": entry_probe.stderr[-2000:]},
+            )
     require(
         release_contract["version"] == release["version"]
         and release_contract["source_sha256"] == release["source_sha256"],

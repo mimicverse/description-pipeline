@@ -1184,9 +1184,26 @@ def write_runtime_wheel(path: Path, source_sha: str = "b" * 64) -> dict[str, byt
     return payloads
 
 
-def runtime_installer(venv: Path, source_sha: str = "b" * 64) -> str:
+def runtime_installer(
+    venv: Path,
+    source_sha: str = "b" * 64,
+    *,
+    probe_home_side_effect: bool = False,
+) -> str:
     site = venv / "lib" / "python3.12" / "site-packages"
     package = site / "description_pipeline"
+    airflow_lines = ["#!/bin/sh"]
+    description_lines = ["#!/bin/sh"]
+    if probe_home_side_effect:
+        for script_lines in (airflow_lines, description_lines):
+            script_lines.extend(
+                [
+                    'printf "%s\\n" "$AIRFLOW_HOME" >> "$PROBE_HOMES"',
+                    'mkdir -p "$AIRFLOW_HOME/logs"',
+                ]
+            )
+    airflow_lines.append("echo 3.3.2")
+    description_lines.append("echo 1.0.0")
     lines = [
         "#!/bin/sh",
         "set -eu",
@@ -1205,17 +1222,13 @@ def runtime_installer(venv: Path, source_sha: str = "b" * 64) -> str:
         encoded = base64.b64encode(payload).decode("ascii")
         lines.append(f"printf '%s' '{encoded}' | base64 -d > {str(target)!r}")
     lines.extend(
-        [
-            f"printf '%s' '# airflow' > {str(site / 'airflow' / '__init__.py')!r}",
-            f"printf '%s\\n' '#!/bin/sh' > {str(venv / 'bin' / 'airflow')!r}",
-            f"printf '%s\\n' 'echo 3.3.2' >> {str(venv / 'bin' / 'airflow')!r}",
-            f"chmod +x {str(venv / 'bin' / 'airflow')!r}",
-            f"printf '%s\\n' '#!/bin/sh' > {str(venv / 'bin' / 'description')!r}",
-            f"printf '%s\\n' 'echo 1.0.0' >> {str(venv / 'bin' / 'description')!r}",
-            f"chmod +x {str(venv / 'bin' / 'description')!r}",
-            "",
-        ]
+        [f"printf '%s' '# airflow' > {str(site / 'airflow' / '__init__.py')!r}"]
     )
+    for script_lines, entry in ((airflow_lines, "airflow"), (description_lines, "description")):
+        target = venv / "bin" / entry
+        lines.extend(f"printf '%s\\n' {line!r} >> {str(target)!r}" for line in script_lines)
+        lines.append(f"chmod +x {str(target)!r}")
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -2664,6 +2677,9 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 "PYTHONPATH": "/caller/python-path",
                 "PYTHONHOME": "/caller/python-home",
                 "VIRTUAL_ENV": "/caller/venv",
+                "AIRFLOW_CONFIG": "/caller/airflow.cfg",
+                "AIRFLOW__LOGGING__BASE_LOG_FOLDER": "/caller/logs",
+                "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN": "sqlite:////caller/airflow.db",
                 "PATH": "/runtime/bin",
                 "LD_LIBRARY_PATH": "/runtime/lib",
                 "SSL_CERT_FILE": "/runtime/ca.pem",
@@ -2673,6 +2689,8 @@ class RecoveryControlFlowTests(unittest.TestCase):
             environment = recovery._recovered_runtime_environment()
         for name in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV"):
             self.assertNotIn(name, environment)
+        self.assertNotIn("AIRFLOW_CONFIG", environment)
+        self.assertFalse(any(name.startswith("AIRFLOW__") for name in environment))
         self.assertEqual(environment["PYTHONNOUSERSITE"], "1")
         self.assertEqual(environment["PATH"], "/runtime/bin")
         self.assertEqual(environment["LD_LIBRARY_PATH"], "/runtime/lib")
@@ -2759,7 +2777,10 @@ class RecoveryControlFlowTests(unittest.TestCase):
             archive.writestr("requirements.lock", lock_bytes)
         deployment_zip = release_files / "artifacts" / "description-1.0.0-test-deployment.zip"
         recovery_script = Path(recovery.__file__).read_bytes()
-        runtime_installer_script = runtime_installer(release_root / "airflow-venv")
+        runtime_installer_script = runtime_installer(
+            release_root / "airflow-venv",
+            probe_home_side_effect=True,
+        )
         full_install_marker = self.root / "full-install-called"
         installer = (
             "#!/bin/sh\n"
@@ -2769,6 +2790,22 @@ class RecoveryControlFlowTests(unittest.TestCase):
         )
         airflow_cfg = self.root / "airflow-home" / "airflow.cfg"
         write(airflow_cfg, "restored-config\n")
+        probe_homes = self.root / "entry-probe-homes"
+        self.enterContext(
+            mock.patch.dict(
+                os.environ,
+                {
+                    "AIRFLOW_HOME": str(airflow_cfg.parent),
+                    "AIRFLOW_CONFIG": str(self.root / "foreign-airflow.cfg"),
+                    "AIRFLOW__LOGGING__BASE_LOG_FOLDER": str(self.root / "foreign-logs"),
+                    "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN": "sqlite:////foreign/airflow.db",
+                    "PYTHONPATH": "/foreign/python-path",
+                    "PYTHONHOME": "/foreign/python-home",
+                    "VIRTUAL_ENV": "/foreign/venv",
+                    "PROBE_HOMES": str(probe_homes),
+                },
+            )
+        )
         linux_lock = b"linux-lock\n"
         windows_lock = b"windows-lock\n"
         with zipfile.ZipFile(deployment_zip, "w") as archive:
@@ -2843,6 +2880,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
         self.assertTrue((release_root / "airflow-venv" / "bin" / "python").is_file())
         self.assertFalse(full_install_marker.exists())
         self.assertEqual(airflow_cfg.read_text(encoding="utf-8"), "restored-config\n")
+        self.assertFalse((airflow_cfg.parent / "logs").exists())
         verified = recovery.rehydrate_release_runtime(
             manifest=manifest,
             plan={"roots": {"release_root": str(release_root)}},
@@ -2851,6 +2889,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
             verify_only=True,
         )
         self.assertEqual(verified["identity"]["version"], "1.0.0")
+        self.assertFalse((airflow_cfg.parent / "logs").exists())
         for field in ("tree", "script_sha256"):
             saved = manifest["source_code"][field]
             manifest["source_code"][field] = "0" * len(saved)
@@ -2879,6 +2918,11 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 verify_only=True,
             )
         self.assertEqual(raised.exception.code, "recovery_release_missing")
+        homes = set(probe_homes.read_text().splitlines())
+        self.assertGreaterEqual(len(homes), 2)
+        self.assertNotIn(str(airflow_cfg.parent), homes)
+        self.assertTrue(all(Path(probe_home).is_relative_to(release_root) for probe_home in homes))
+        self.assertTrue(all(not Path(probe_home).exists() for probe_home in homes))
 
     def test_release_archive_rejects_path_traversal(self) -> None:
         archive = self.root / "unsafe-release.zip"

@@ -262,6 +262,15 @@ class InstallGuardsTest(unittest.TestCase):
             airflow = bindir / "airflow"
             airflow.write_text(
                 '#!/bin/bash\necho "$*" >> "$CALLS"\n'
+                'if [ "${1:-}" = "version" ] || [ "$*" = "triggerer --help" ]; then\n'
+                '  for name in AIRFLOW_CONFIG AIRFLOW__LOGGING__BASE_LOG_FOLDER '
+                'AIRFLOW__DATABASE__SQL_ALCHEMY_CONN PYTHONPATH PYTHONHOME VIRTUAL_ENV; do\n'
+                '    [ -z "${!name+x}" ] || echo "leak:$name" >> "$PROBE_ENV"\n'
+                "  done\n"
+                '  echo "python-no-user-site:${PYTHONNOUSERSITE:-}" >> "$PROBE_ENV"\n'
+                '  echo "$AIRFLOW_HOME" >> "$PROBE_HOMES"\n'
+                '  mkdir -p "$AIRFLOW_HOME/logs"\n'
+                "fi\n"
                 'case "$*" in\n'
                 '  "db migrate") ;;\n'
                 '  "dags unpause solidworks_to_urdf") echo false > "$ADMISSION" ;;\n'
@@ -271,7 +280,10 @@ class InstallGuardsTest(unittest.TestCase):
                 "esac\n"
             )
             airflow.chmod(0o755)
-            admission, calls = root / "admission", root / "calls"
+            admission = root / "admission"
+            calls = root / "calls"
+            probe_env = root / "probe-env"
+            probe_homes = root / "probe-homes"
             for initial in ("true", "false"):
                 with self.subTest(initial=initial):
                     admission.write_text(initial)
@@ -281,9 +293,29 @@ class InstallGuardsTest(unittest.TestCase):
                         PIPELINE_WHEEL=str(wheel),
                         ADMISSION=str(admission),
                         CALLS=str(calls),
+                        PROBE_ENV=str(probe_env),
+                        PROBE_HOMES=str(probe_homes),
+                        AIRFLOW_CONFIG=str(root / "foreign-airflow.cfg"),
+                        AIRFLOW__LOGGING__BASE_LOG_FOLDER=str(root / "foreign-logs"),
+                        AIRFLOW__DATABASE__SQL_ALCHEMY_CONN="sqlite:////foreign/airflow.db",
+                        PYTHONPATH="/foreign/python-path",
+                        PYTHONHOME="/foreign/python-home",
+                        VIRTUAL_ENV="/foreign/venv",
                     )
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assertEqual(admission.read_text(), initial)
+                    self.assertFalse((root / "home" / "logs").exists())
+                    self.assertEqual(list((root / "venv").glob(".airflow-probe-home.*")), [])
+            probe_lines = probe_env.read_text().splitlines()
+            self.assertFalse(any(line.startswith("leak:") for line in probe_lines))
+            self.assertEqual(
+                [line for line in probe_lines if line.startswith("python-no-user-site:")],
+                ["python-no-user-site:1"] * 4,
+            )
+            homes = set(probe_homes.read_text().splitlines())
+            self.assertEqual(len(homes), 2)
+            self.assertNotIn(str(root / "home"), homes)
+            self.assertTrue(all(not Path(probe_home).exists() for probe_home in homes))
             # The sign-in state is initialized inside the migration window, after `db migrate`
             # and before the runtime identity takes over (the same entry the CI step runs).
             self.assertEqual(
@@ -298,6 +330,8 @@ class InstallGuardsTest(unittest.TestCase):
                 ADMISSION=str(admission),
                 CALLS=str(calls),
                 DOCTOR_EXIT="1",
+                PROBE_ENV=str(probe_env),
+                PROBE_HOMES=str(probe_homes),
             )
             self.assertNotEqual(rejected.returncode, 0)
             self.assertEqual(calls.read_text().splitlines(), ["doctor"])
@@ -378,11 +412,18 @@ class LockAndScriptsTest(unittest.TestCase):
         self.assertIn("--require-hashes --only-binary=:all:", runtime_installer)
         self.assertIn("-m pip check", runtime_installer)
         self.assertIn(
-            'INSTALLED_AIRFLOW_VERSION="$("$AIRFLOW_VENV/bin/airflow" version',
+            'PROBE_HOME="$(mktemp -d "$AIRFLOW_VENV/.airflow-probe-home.XXXXXXXX")"',
+            runtime_installer,
+        )
+        self.assertIn("trap 'rm -rf -- \"$PROBE_HOME\"' EXIT", runtime_installer)
+        self.assertIn("unset AIRFLOW_CONFIG PYTHONHOME PYTHONPATH VIRTUAL_ENV", runtime_installer)
+        self.assertIn("AIRFLOW__*) unset \"$name\"", runtime_installer)
+        self.assertIn(
+            'INSTALLED_AIRFLOW_VERSION="$(probe_airflow version',
             runtime_installer,
         )
         self.assertIn('[ "$INSTALLED_AIRFLOW_VERSION" = "3.3.2" ]', runtime_installer)
-        self.assertIn('"$AIRFLOW_VENV/bin/airflow" triggerer --help', runtime_installer)
+        self.assertIn("probe_airflow triggerer --help", runtime_installer)
         self.assertNotIn("pip install --upgrade", runtime_installer)
         self.assertNotIn("sed -e", installer)
 
