@@ -291,6 +291,46 @@ if ($StaticOnly) {
 # ---- load the script without running main ----------------------------------
 . $ScriptPath -Verb status -Binding @{}
 
+# ---- listener observation uses successful empty CIM data -------------------
+& {
+  $script:ListenerProbe = [pscustomobject]@{
+    namespace = $null
+    class_name = $null
+    filter = $null
+    error = $null
+    values = @()
+  }
+  function Get-CimInstance {
+    [CmdletBinding()]
+    param(
+      [string]$Namespace,
+      [string]$ClassName,
+      [string]$Filter
+    )
+    $script:ListenerProbe.namespace = $Namespace
+    $script:ListenerProbe.class_name = $ClassName
+    $script:ListenerProbe.filter = $Filter
+    if ($script:ListenerProbe.error) { throw $script:ListenerProbe.error }
+    return $script:ListenerProbe.values
+  }
+
+  $absent = @(Get-ListenerConnections 8765)
+  Check 'listener.cim_empty_is_absent' (
+    $absent.Count -eq 0 -and
+    $script:ListenerProbe.namespace -ceq 'root/StandardCimv2' -and
+    $script:ListenerProbe.class_name -ceq 'MSFT_NetTCPConnection' -and
+    $script:ListenerProbe.filter -ceq 'LocalPort = 8765 AND State = 2')
+
+  $script:ListenerProbe.values = @([pscustomobject]@{OwningProcess=4242})
+  $present = @(Get-ListenerConnections 8765)
+  Check 'listener.cim_present_preserves_owner' (
+    $present.Count -eq 1 -and [int]$present[0].OwningProcess -eq 4242)
+
+  $script:ListenerProbe.error = 'CIM observer failed'
+  $failed = Invoke-Refusal { Get-ListenerConnections 8765 }
+  Check 'listener.cim_failure_propagates' $failed.threw
+}
+
 # SID and ACL APIs require Windows; the Linux matrix keeps its existing stubs.
 if ($env:OS -eq 'Windows_NT') {
   # Exercise the production Resolve-Sid before install fixtures override it below.
