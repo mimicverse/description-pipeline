@@ -130,6 +130,41 @@ function Write-TestRelease(
     (New-Object System.Text.UTF8Encoding($false)))
 }
 
+function Get-TestPosixRelativePath([string]$Root, [string]$Path) {
+  $relative = $Path.Substring($Root.Length).TrimStart('\', '/')
+  return $relative.Replace('\', '/')
+}
+
+function New-TestZipFromDirectory([string]$Source, [string]$Destination) {
+  Add-Type -AssemblyName System.IO.Compression
+  Add-Type -AssemblyName System.IO.Compression.FileSystem
+  $zip = [System.IO.Compression.ZipFile]::Open(
+    $Destination, [System.IO.Compression.ZipArchiveMode]::Create)
+  try {
+    foreach ($file in @(Get-ChildItem -LiteralPath $Source -Recurse -File | Sort-Object FullName)) {
+      $entryName = Get-TestPosixRelativePath $Source $file.FullName
+      if (-not $entryName -or $entryName.Contains('\')) {
+        throw 'the test archive entry is not POSIX-separated'
+      }
+      $entry = $zip.CreateEntry(
+        $entryName, [System.IO.Compression.CompressionLevel]::Optimal)
+      $inputStream = [System.IO.File]::OpenRead($file.FullName)
+      try {
+        $outputStream = $entry.Open()
+        try {
+          $inputStream.CopyTo($outputStream)
+        } finally {
+          $outputStream.Dispose()
+        }
+      } finally {
+        $inputStream.Dispose()
+      }
+    }
+  } finally {
+    $zip.Dispose()
+  }
+}
+
 # ---- static boundaries ------------------------------------------------------
 $tokens = $null
 $parseErrors = $null
@@ -243,10 +278,26 @@ sys.stderr.write("diagnostic " + "x" * 131072)
 sys.exit(7)
 '@
 $capture = Invoke-CapturedProcess $python (@('-I', '-B', '-c', $processProbe) + $processArguments)
-$observedArguments = @($capture.lines[0] | ConvertFrom-Json)
+$observedArguments = $capture.lines[0] | ConvertFrom-Json
+$observedArgumentRows = @($observedArguments)
+$expectedArgumentRows = @($processArguments)
+$argumentsMatch = $observedArgumentRows.Count -eq $expectedArgumentRows.Count
+if ($argumentsMatch) {
+  for ($index = 0; $index -lt $expectedArgumentRows.Count; $index++) {
+    if (-not [string]::Equals(
+        [string]$observedArgumentRows[$index],
+        [string]$expectedArgumentRows[$index],
+        [System.StringComparison]::Ordinal)) {
+      $argumentsMatch = $false
+      break
+    }
+  }
+}
+$argumentDetail = (
+  'expected=' + ($expectedArgumentRows | ConvertTo-Json -Compress) +
+  ' observed=' + ($observedArgumentRows | ConvertTo-Json -Compress))
 Check 'process.argv_preserved' (
-  ($observedArguments | ConvertTo-Json -Compress) -ceq
-  ($processArguments | ConvertTo-Json -Compress))
+  $argumentsMatch) $argumentDetail
 Check 'process.stderr_and_exit_preserved' (
   $capture.exit_code -eq 7 -and $capture.text.Contains('diagnostic ' + ('x' * 131072)))
 $root = Join-Path ([System.IO.Path]::GetTempPath()) (
@@ -456,7 +507,7 @@ foreach ($path in @(
 }
 $inventory = [ordered]@{}
 foreach ($file in @(Get-ChildItem -LiteralPath $archiveSource -Recurse -File)) {
-  $relative = $file.FullName.Substring($archiveSource.Length).TrimStart('\', '/').Replace('\', '/')
+  $relative = Get-TestPosixRelativePath $archiveSource $file.FullName
   $inventory[$relative] = (Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 [System.IO.File]::WriteAllText(
@@ -464,7 +515,15 @@ foreach ($file in @(Get-ChildItem -LiteralPath $archiveSource -Recurse -File)) {
   ($inventory | ConvertTo-Json -Compress),
   (New-Object System.Text.UTF8Encoding($false)))
 $serviceArchive = Join-Path $root 'service.zip'
-Compress-Archive -Path (Join-Path $archiveSource '*') -DestinationPath $serviceArchive
+New-TestZipFromDirectory $archiveSource $serviceArchive
+$serviceZip = [System.IO.Compression.ZipFile]::OpenRead($serviceArchive)
+try {
+  $serviceEntryNames = @($serviceZip.Entries | ForEach-Object { [string]$_.FullName })
+} finally {
+  $serviceZip.Dispose()
+}
+Check 'archive.fixture_posix_entries' (
+  @($serviceEntryNames | Where-Object { $_.Contains('\') }).Count -eq 0)
 $expanded = Join-Path $root 'expanded'
 Expand-ArchiveSafely $serviceArchive $expanded
 $inventoryRefusal = Invoke-Refusal { Assert-ArchiveInventory $expanded }
@@ -501,6 +560,36 @@ Check 'listener.session_mismatch_refused' (
   -not (Test-EndpointSessionIdentity 0 1 2))
 Check 'listener.scheduler_session_nonzero_refused' (
   -not (Test-EndpointSessionIdentity 1 1 1))
+$schedulerStart = '2026-10-27T01:00:00.0000000Z'
+$launcherStart = '2026-10-27T01:00:01.0000000Z'
+$listenerStart = '2026-10-27T01:00:02.0000000Z'
+Check 'listener.creation_order_valid' (
+  Test-ProcessCreationOrder $schedulerStart $launcherStart $listenerStart)
+Check 'listener.scheduler_after_launcher_refused' (
+  -not (Test-ProcessCreationOrder `
+    '2026-10-27T01:00:02.0000000Z' $launcherStart $listenerStart))
+Check 'listener.launcher_after_listener_refused' (
+  -not (Test-ProcessCreationOrder $schedulerStart $listenerStart $launcherStart))
+Check 'listener.creation_order_invalid_time_refused' (
+  -not (Test-ProcessCreationOrder $schedulerStart 'unknown' $listenerStart))
+Check 'listener.creation_order_missing_zone_refused' (
+  -not (Test-ProcessCreationOrder `
+    '2026-10-27T01:00:00' $launcherStart $listenerStart))
+$listenerEvidenceStart = $source.IndexOf('function Get-ListenerEvidence')
+$listenerEvidenceEnd = $source.IndexOf('function Read-EndpointHealth', $listenerEvidenceStart)
+$listenerEvidenceSource = if (
+    $listenerEvidenceStart -ge 0 -and
+    $listenerEvidenceEnd -gt $listenerEvidenceStart) {
+  $source.Substring(
+    $listenerEvidenceStart, $listenerEvidenceEnd - $listenerEvidenceStart)
+} else {
+  ''
+}
+Check 'listener.creation_order_required_by_identity' (
+  $listenerEvidenceSource.Contains('Test-ProcessCreationOrder') -and
+  $listenerEvidenceSource.Contains('$scheduler.start_utc') -and
+  $listenerEvidenceSource.Contains('$launcher.start_utc') -and
+  $listenerEvidenceSource.Contains('$listener.start_utc'))
 
 # ---- drain is a read-only three-way safety gate ----------------------------
 $safeHealth = [pscustomobject]@{
@@ -626,8 +715,24 @@ function Read-EndpointConfigOfficial([string]$Generation) {
     port=8765
   }
 }
-function Set-ProtectedAcl([string]$Path, [string]$ServiceSid) { }
-function Assert-ProtectedAcl([string]$Path, [string]$ServiceSid) { }
+$script:ProtectedAclSetPaths = New-Object 'System.Collections.Generic.List[string]'
+$script:ProtectedAclAssertPaths = New-Object 'System.Collections.Generic.List[string]'
+$script:ProtectedAclEvents = New-Object 'System.Collections.Generic.List[System.Object]'
+function Add-ProtectedAclObservation([string]$Kind, [string]$Path) {
+  $identity = Normalize-PathIdentity ([System.IO.Path]::GetFullPath($Path))
+  $script:ProtectedAclEvents.Add([pscustomobject]@{kind=$Kind; path=$identity})
+  if ($Kind -ceq 'set') {
+    $script:ProtectedAclSetPaths.Add($identity)
+  } else {
+    $script:ProtectedAclAssertPaths.Add($identity)
+  }
+}
+function Set-ProtectedAcl([string]$Path, [string]$ServiceSid) {
+  Add-ProtectedAclObservation 'set' $Path
+}
+function Assert-ProtectedAcl([string]$Path, [string]$ServiceSid) {
+  Add-ProtectedAclObservation 'assert' $Path
+}
 function Get-ScheduledTask {
   [CmdletBinding()]
   param()
@@ -735,11 +840,88 @@ Check 'install.control_bytes_exact' (
   [Convert]::ToBase64String([System.IO.File]::ReadAllBytes(
     (Join-Path $installRoot 'state/bootstrap-managed-root.ps1'))) -ceq
     [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($bootstrapPath)))
+$installGeneration = Join-Path $installRoot 'state/lifecycle/generation'
+$installReceiptPath = Join-Path $installRoot 'state/install-receipt.json'
+$installFixtureConfig = Read-EndpointConfigStrict $installBinding
+$stableManagedPaths = @(Get-StableManagedPaths `
+  $installFixtureConfig $installBinding $installGeneration $installReceiptPath)
+$requiredStablePaths = @(
+  $installRoot,
+  (Join-Path $installRoot '.description-managed-root.json'),
+  (Join-Path $installRoot 'packages'),
+  (Join-Path $installRoot 'results'),
+  (Join-Path $installRoot 'state'),
+  (Join-Path $installRoot 'state/lifecycle'),
+  $installGeneration,
+  (Join-Path $installGeneration 'endpoint.json'),
+  $installConfigPath,
+  $installToken,
+  (Join-Path $installRoot 'state/install-id'),
+  $installReceiptPath,
+  (Join-Path $installRoot 'state/windows-binding.json'),
+  (Join-Path $installRoot 'state/instance-lifecycle.ps1'),
+  (Join-Path $installRoot 'state/bootstrap-managed-root.ps1')
+) | ForEach-Object { Normalize-PathIdentity $_ }
+$missingStablePaths = @(
+  $requiredStablePaths | Where-Object { $_ -cnotin $stableManagedPaths })
+Check 'acl.stable_path_roles' (
+  $missingStablePaths.Count -eq 0) ($missingStablePaths -join ', ')
+$stableManagedPathKeys = @($stableManagedPaths | ForEach-Object { $_.ToLowerInvariant() })
+Check 'acl.stable_paths_case_insensitive_unique' (
+  @($stableManagedPathKeys | Sort-Object -Unique).Count -eq
+    $stableManagedPaths.Count)
+$receiptIdentity = Normalize-PathIdentity $installReceiptPath
+$installAclSets = @($script:ProtectedAclSetPaths)
+$installAclAsserts = @($script:ProtectedAclAssertPaths)
+$missingSetPaths = @(
+  $stableManagedPaths |
+    Where-Object { $_ -cne $receiptIdentity -and $_ -cnotin $installAclSets })
+$missingAssertPaths = @(
+  $stableManagedPaths | Where-Object { $_ -cnotin $installAclAsserts })
+Check 'acl.install_sets_stable_paths' (
+  $missingSetPaths.Count -eq 0) ($missingSetPaths -join ', ')
+Check 'acl.install_asserts_stable_paths' (
+  $missingAssertPaths.Count -eq 0) ($missingAssertPaths -join ', ')
+$receiptPartialSet = @($script:ProtectedAclEvents | Where-Object {
+  $_.kind -ceq 'set' -and
+  $_.path -match '/\.install-receipt\.json\.[0-9a-f]+\.partial$'})
+$receiptPartialAssert = @($script:ProtectedAclEvents | Where-Object {
+  $_.kind -ceq 'assert' -and
+  $_.path -match '/\.install-receipt\.json\.[0-9a-f]+\.partial$'})
+$receiptFinalAssert = @($script:ProtectedAclEvents | Where-Object {
+  $_.kind -ceq 'assert' -and $_.path -ceq $receiptIdentity})
+Check 'acl.receipt_protected_before_atomic_commit' (
+  $receiptPartialSet.Count -gt 0 -and
+  $receiptPartialAssert.Count -gt 0 -and
+  $receiptFinalAssert.Count -gt 0)
+$stateIdentity = Normalize-PathIdentity (Join-Path $installRoot 'state')
+$mutableAclPaths = @(
+  (Join-Path $installRoot 'state/cad-ownership.json'),
+  (Join-Path $installRoot 'state/cad-ownership.json.lease')
+) | ForEach-Object { (Normalize-PathIdentity $_).ToLowerInvariant() }
+$mutableAclViolations = @($stableManagedPaths | Where-Object {
+  $identity = $_.ToLowerInvariant()
+  $identity -in $mutableAclPaths -or
+    $identity.StartsWith(
+      (($stateIdentity + '/native-operations/').ToLowerInvariant()),
+      [System.StringComparison]::Ordinal)
+})
+Check 'acl.mutable_runtime_paths_excluded' (
+  $mutableAclViolations.Count -eq 0) ($mutableAclViolations -join ', ')
 $fixedBinding = Read-Binding $fixedBindingPath
 $script:LifecycleScriptPath = Join-Path $installRoot 'state/instance-lifecycle.ps1'
 
 function Get-ListenerConnections([int]$Port) { return @() }
+$script:ProtectedAclSetPaths.Clear()
+$script:ProtectedAclAssertPaths.Clear()
+$script:ProtectedAclEvents.Clear()
 $statusResult = Invoke-Status $fixedBinding
+$statusAclAsserts = @($script:ProtectedAclAssertPaths)
+$statusMissingAclPaths = @(
+  $stableManagedPaths | Where-Object { $_ -cnotin $statusAclAsserts })
+Check 'status.acl_asserts_stable_paths_read_only' (
+  $script:ProtectedAclSetPaths.Count -eq 0 -and
+  $statusMissingAclPaths.Count -eq 0) ($statusMissingAclPaths -join ', ')
 Check 'status.disabled_is_read_only_and_consistent' (
   $statusResult.passed -eq $true -and
   $statusResult.task.state -eq 'Disabled' -and
@@ -929,7 +1111,7 @@ function Remove-Item {
   Microsoft.PowerShell.Management\Remove-Item @PSBoundParameters
 }
 $originalWriteJsonAtomic = ${function:Write-JsonAtomic}
-function Write-JsonAtomic([string]$Path, $Document) {
+function Write-JsonAtomic([string]$Path, $Document, [string]$ServiceSid = '') {
   throw 'injected receipt commit failure'
 }
 $cleanupDetail = $null
@@ -982,7 +1164,7 @@ $installBinding = Read-Binding $observerBindingPath
 $script:FixtureTask = $null
 $script:TaskObserverFailed = $false
 $script:FailTaskObserverAfterRemove = $true
-function Write-JsonAtomic([string]$Path, $Document) {
+function Write-JsonAtomic([string]$Path, $Document, [string]$ServiceSid = '') {
   throw 'injected receipt commit failure'
 }
 $observerDetail = $null

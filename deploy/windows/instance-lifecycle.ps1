@@ -109,7 +109,10 @@ function Write-Utf8NoBom([string]$Path, [string]$Text) {
   [System.IO.File]::WriteAllText($Path, $Text, $encoding)
 }
 
-function Write-JsonAtomic([string]$Path, $Document) {
+function Write-JsonAtomic(
+    [string]$Path,
+    $Document,
+    [string]$ServiceSid = '') {
   $full = [System.IO.Path]::GetFullPath($Path)
   $parent = [System.IO.Path]::GetDirectoryName($full)
   if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
@@ -120,7 +123,14 @@ function Write-JsonAtomic([string]$Path, $Document) {
     [guid]::NewGuid().ToString('N') + '.partial')
   try {
     Write-Utf8NoBom $partial (Emit $Document)
+    if ($ServiceSid) {
+      Set-ProtectedAcl $partial $ServiceSid
+      Assert-ProtectedAcl $partial $ServiceSid
+    }
     Move-Item -LiteralPath $partial -Destination $full -Force
+    if ($ServiceSid) {
+      Assert-ProtectedAcl $full $ServiceSid
+    }
   } finally {
     if (Test-Path -LiteralPath $partial) {
       Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue
@@ -560,7 +570,6 @@ function Install-BytesOnce([string]$Source, [string]$Target, [string]$ConflictCo
 function Install-ControlFiles(
     $Binding,
     [string]$StateRoot,
-    [string]$ServiceSid,
     $State) {
   $control = Get-ControlPaths $StateRoot
   $State.files.lifecycle = Install-BytesOnce (
@@ -569,10 +578,6 @@ function Install-ControlFiles(
     (Get-BootstrapScriptPath)) $control.bootstrap 'bootstrap_control_conflict'
   $State.files.binding = Install-BytesOnce (
     [string]$script:BindingSourcePath) $control.binding 'binding_control_conflict'
-  foreach ($name in @('lifecycle', 'bootstrap', 'binding')) {
-    Set-ProtectedAcl ([string]$State.files[$name].path) $ServiceSid
-    Assert-ProtectedAcl ([string]$State.files[$name].path) $ServiceSid
-  }
   return $State.files
 }
 
@@ -857,6 +862,46 @@ function Get-ManagedCommonParent($Config, $Binding) {
   }
   Assert-NoReparseAncestor $common
   return $common
+}
+
+function Get-StableManagedPaths(
+    $Config,
+    $Binding,
+    [string]$Generation,
+    [string]$ReceiptPath) {
+  $common = Get-ManagedCommonParent $Config $Binding
+  $control = Get-ControlPaths ([string]$Config.state_root)
+  $candidates = @(
+    $common,
+    (Join-Path $common '.description-managed-root.json'),
+    [string]$Config.package_root,
+    [string]$Config.output_root,
+    [string]$Config.state_root,
+    (Join-Path ([string]$Config.state_root) 'lifecycle'),
+    $Generation,
+    (Config-Path $Generation),
+    [string]$Config.source_path,
+    [string]$Config.token_file,
+    (Join-Path ([string]$Config.state_root) 'install-id'),
+    $ReceiptPath,
+    [string]$control.binding,
+    [string]$control.lifecycle,
+    [string]$control.bootstrap
+  )
+  $seen = @{}
+  $result = @()
+  foreach ($candidate in $candidates) {
+    if ([string]::IsNullOrWhiteSpace([string]$candidate)) {
+      Die 'windows_managed_acl_path_missing' 'a stable managed path is empty'
+    }
+    $identity = Normalize-PathIdentity (
+      [System.IO.Path]::GetFullPath([string]$candidate))
+    if (-not $seen.ContainsKey($identity)) {
+      $seen[$identity] = $true
+      $result += $identity
+    }
+  }
+  return $result
 }
 
 function Get-BootstrapScriptPath {
@@ -1825,6 +1870,37 @@ function Test-EndpointSessionIdentity(
   )
 }
 
+function Test-ProcessCreationOrder(
+    [string]$SchedulerStartUtc,
+    [string]$LauncherStartUtc,
+    [string]$ListenerStartUtc) {
+  $times = @()
+  foreach ($value in @(
+      $SchedulerStartUtc,
+      $LauncherStartUtc,
+      $ListenerStartUtc)) {
+    if ([string]::IsNullOrWhiteSpace([string]$value)) {
+      return $false
+    }
+    try {
+      $parsed = [datetime]::Parse(
+        [string]$value,
+        [System.Globalization.CultureInfo]::InvariantCulture,
+        [System.Globalization.DateTimeStyles]::RoundtripKind)
+    } catch {
+      return $false
+    }
+    if ($parsed.Kind -ne [System.DateTimeKind]::Utc) {
+      return $false
+    }
+    $times += $parsed
+  }
+  return (
+    $times[0] -le $times[1] -and
+    $times[1] -le $times[2]
+  )
+}
+
 function Get-ListenerEvidence($Binding, $Projection, $Config) {
   try {
     $connections = @(Get-ListenerConnections ([int]$Config.port))
@@ -1907,12 +1983,16 @@ function Get-ListenerEvidence($Binding, $Projection, $Config) {
   if ($listener.image -cne [string]$venv.base_interpreter_path -or
       $launcher.user_sid -cne [string]$Projection.principal.sid -or
       $listener.user_sid -cne [string]$Projection.principal.sid -or
+      -not (Test-ProcessCreationOrder `
+        ([string]$scheduler.start_utc) `
+        ([string]$launcher.start_utc) `
+        ([string]$listener.start_utc)) -or
       -not (Test-EndpointSessionIdentity `
         -SchedulerSession ([int]$scheduler.session_id) `
         -LauncherSession ([int]$launcher.session_id) `
         -ListenerSession ([int]$listener.session_id))) {
     Die 'windows_listener_identity_mismatch' (
-      'process account, interpreter, or interactive session differs')
+      'process account, interpreter, session, or creation order differs')
   }
   return [ordered]@{
     schema_version = 'solidworks-to-urdf.windows-listener/v2'
@@ -2059,6 +2139,11 @@ function Get-InstalledState($Binding, [switch]$SkipDoctor, [switch]$SkipPins) {
     Die 'install_receipt_mismatch' 'install-receipt.json does not describe the current install'
   }
   $serviceSid = Resolve-Sid ([string]$Binding.service_account)
+  $stableManagedPaths = @(Get-StableManagedPaths `
+    $sourceConfig $Binding $generation $receiptPath)
+  foreach ($path in $stableManagedPaths) {
+    Assert-ProtectedAcl $path $serviceSid
+  }
   Assert-ProtectedAcl (Get-TaskFilePath $task) $serviceSid
   $runtimeRelease = [ordered]@{
     version = [string]$release.version
@@ -2409,7 +2494,15 @@ function Invoke-Install($Binding) {
     }
     $script:LifecyclePhase = 'install-control'
     $controlFiles = Install-ControlFiles `
-      $Binding $config.state_root $serviceSid $controlState
+      $Binding $config.state_root $controlState
+    $stableManagedPaths = @(Get-StableManagedPaths `
+      $config $Binding $generation $receiptPath)
+    $receiptIdentity = Normalize-PathIdentity $receiptPath
+    foreach ($path in $stableManagedPaths) {
+      if ($path -ceq $receiptIdentity) { continue }
+      Set-ProtectedAcl $path $serviceSid
+      Assert-ProtectedAcl $path $serviceSid
+    }
     $previousPins = Set-DomainPins $pins
     $runtimePython = Runtime-Python $generation
     $receipt = [ordered]@{
@@ -2488,7 +2581,10 @@ function Invoke-Install($Binding) {
         bootstrap = [string]$controlFiles.bootstrap.path
       }
     }
-    Write-JsonAtomic $receiptPath $receipt
+    Write-JsonAtomic $receiptPath $receipt $serviceSid
+    foreach ($path in $stableManagedPaths) {
+      Assert-ProtectedAcl $path $serviceSid
+    }
     return $result
   } catch {
     $primary = $_
