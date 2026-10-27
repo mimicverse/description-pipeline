@@ -80,15 +80,19 @@ fi
 [ -f "$PORTAL_CONFIG" ] && report PASS "portal config: $PORTAL_CONFIG" \
   || report FAIL "portal config missing: $PORTAL_CONFIG"
 
-if [ ! -x "${NGINX_BIN:-/usr/sbin/nginx}" ]; then
-  report FAIL "managed nginx binary missing or not executable: ${NGINX_BIN:-/usr/sbin/nginx}"
-elif "$NGINX_BIN" -t -c "$OPERATOR_NGINX_CONF" -p "$OPERATOR_STATE/nginx" >/dev/null 2>&1; then
+TARGET="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+proxy_issue=""
+if ! proxy_issue="$(
+  NGINX_BIN="${NGINX_BIN:-}" bash "$HERE/scripts/check_proxy_binary.sh" \
+    --unit-file "$TARGET/description-operator-proxy.service" 2>&1
+)"; then
+  report FAIL "$proxy_issue"
+elif "$proxy_issue" -t -c "$OPERATOR_NGINX_CONF" -p "$OPERATOR_STATE/nginx" >/dev/null 2>&1; then
   report PASS "nginx -t"
 else
   report FAIL "nginx -t rejected $OPERATOR_NGINX_CONF"
 fi
 
-TARGET="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 for unit in "${OPERATOR_UNITS[@]}"; do
   [ -f "$TARGET/$unit.service" ] && report PASS "unit rendered: $unit.service" \
     || report FAIL "unit missing: $TARGET/$unit.service"

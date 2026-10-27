@@ -366,7 +366,7 @@ metadata closure。同一 command/effect 恢复复用原 intent 与 outbound；�
 
 派生环境在 shell 加载前必须经非执行解析及所属代的重新派生校验。候选安装包校验复用 `runtime.tool_record()` 的实际文件 inventory，并核对发行 version／source_commit／source_sha256；probe 使用隔离 Python，不能只读取 embedded manifest 声称安装字节一致。
 
-跨代 helper 先按该发行已有 `deployment_files` 验证实际导入闭包，再由绑定的 generation Python 隔离执行；新代静态 environment helper 同样绑定，不要求旧包存在新增文件。运行时不得全量导出 resolved/toolchain 中任意声明，health 与维护使用同一个数据 reader 和各自显式字段投影。
+跨代 helper 先按该发行已有 `deployment_files` 验证实际导入闭包，再由绑定的 generation Python 隔离执行；新代静态 environment helper 同样绑定，不要求旧包存在新增文件。运行时不得全量导出 resolved/toolchain 中任意声明，health 与维护使用同一个数据 reader 和各自显式字段投影。任何公共命令在消费 resolved 前都必须由活动代的 renderer 复算完整 map，包括控制入口与当前代相同的路径；standalone health 在执行 `NGINX_BIN` 前还必须核对其与实际 proxy unit 的绑定。
 
 候选对账要求同一 promotion 的 `close-admission`、`drain`、`stop-services`、`backup`、`schema-migration` 均为已验证的 completed，并消费迁移阶段 evidence-map 唯一绑定的冻结事实边界。对账不执行 DDL，也不新增 reconcile/schema-migration。回滚同样从已验证阶段映射读取冻结边界，不把可变工作文件当作恢复基准。
 

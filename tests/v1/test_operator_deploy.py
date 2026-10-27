@@ -2766,10 +2766,51 @@ class LifecycleTests(unittest.TestCase):
             with resolved.open("a", encoding="utf-8") as stream:
                 stream.write(f"BASH_ENV={shlex.quote(str(hook))}\n")
             result = run(["bash", str(control), "drain", "--config", str(config_path)], env)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertFalse(marker.exists())
             probe = run(["bash", str(HEALTH), "--static"], dict(env, OPERATOR_STATE=str(root / "state")))
             self.assertNotIn("expected KEY=VALUE", probe.stderr)
+            self.assertFalse(marker.exists())
+
+    def test_current_generation_known_resolved_values_are_verified_before_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path, state, config_home, _ = self._render_units(root)
+            marker = root / "known-value-executed"
+            hook = root / "nginx-hook"
+            hook.write_text(
+                f"#!/bin/bash\ntouch {shlex.quote(str(marker))}\nexit 0\n",
+                encoding="utf-8",
+            )
+            hook.chmod(0o755)
+            resolved = state / "resolved.env"
+            original = resolved.read_bytes()
+            resolved.write_text(
+                "\n".join(
+                    f"NGINX_BIN={encode_env_value(str(hook))}"
+                    if line.startswith("NGINX_BIN=")
+                    else line
+                    for line in original.decode("utf-8").splitlines()
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            env = status_env(root, config_home)
+
+            controlled = run(
+                ["bash", str(CONTROL), "status", "--config", str(config_path)],
+                env,
+            )
+            self.assertNotEqual(controlled.returncode, 0, controlled.stdout + controlled.stderr)
+            self.assertIn("source resolved environment differs", controlled.stderr)
+            self.assertFalse(marker.exists())
+
+            standalone = run(
+                ["bash", str(HEALTH), "--static"],
+                dict(env, OPERATOR_STATE=str(state)),
+            )
+            self.assertNotEqual(standalone.returncode, 0, standalone.stdout + standalone.stderr)
+            self.assertIn("does not execute the bound nginx binary", standalone.stdout)
             self.assertFalse(marker.exists())
 
     def test_missing_generation_value_is_refused_before_a_child_side_effect(self) -> None:

@@ -339,6 +339,8 @@ load_active_env() {
   verify_generation_derived_env \
     "$STATE_ROOT/install-record.json" "$ENV_FILE" "$AIRFLOW_VENV" \
     "$GENERATION_DEPLOYMENT_ROOT" "$GENERATION_RELEASE_FILE"
+  verify_generation_resolved_env \
+    "$GENERATION_CONTROL" "$AIRFLOW_VENV/bin/python" "$ENV_FILE"
   load_resolved_env "$STATE_ROOT/resolved.env" || return $?
   load_generation_env || return $?
   VERIFIED_ACTIVE_ID="$(
@@ -373,6 +375,8 @@ load_running_env() {
   verify_generation_derived_env \
     "$STATE_ROOT/install-record.json" "$ENV_FILE" "$AIRFLOW_VENV" \
     "$GENERATION_DEPLOYMENT_ROOT" "$GENERATION_RELEASE_FILE"
+  verify_generation_resolved_env \
+    "$GENERATION_CONTROL" "$AIRFLOW_VENV/bin/python" "$ENV_FILE"
   load_resolved_env "$STATE_ROOT/resolved.env" || return $?
   load_generation_env || return $?
   VERIFIED_ACTIVE_ID="$(
@@ -909,7 +913,6 @@ verify_snapshot_derived_env() {
 import hashlib
 import importlib.util
 import json
-import re
 import sys
 from pathlib import Path
 
@@ -953,25 +956,7 @@ result = platform_env.derive(
     release=release,
     wheel=wheel_file,
 )
-actual = {}
-for number, line in enumerate(env_file.read_text(encoding="utf-8").splitlines(), 1):
-    stripped = line.strip()
-    if not stripped or stripped.startswith("#"):
-        continue
-    key, separator, raw = stripped.partition("=")
-    if (
-        not separator
-        or re.fullmatch(r"[A-Z_][A-Z0-9_]*", key) is None
-    ):
-        raise SystemExit(f"{env_file}:{number}: invalid environment declaration")
-    try:
-        value = "" if raw.strip() == "" else render_operator.decode_env_value(raw.strip())
-    except ValueError as error:
-        raise SystemExit(f"{env_file}:{number}: {error}") from error
-    previous = actual.get(key)
-    if key in actual and previous != value:
-        raise SystemExit(f"{env_file}:{number}: conflicting duplicate declaration for {key}")
-    actual[key] = value
+actual = render_operator.read_env(env_file)
 expected = {key: value for key, value in result["env"].items() if value != ""}
 missing = sorted(set(expected) - set(actual))
 if missing:

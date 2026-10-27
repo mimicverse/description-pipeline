@@ -345,7 +345,7 @@ CAD 和规则输入；固定手工参考仅由独立参考测试读取，测试�
 
 升级先在同一维护锁下由运行代自己的已验证控制入口关闭准入、暂停调度并排空真实源状态，再停止写者和保存数据库基线。候选迁移及有据的 legacy archive/canonical cutover 使用候选运行时，并把归档回执及摘要纳入 promotion 证据；历史事实保全而不冒充新运行。随后仅由候选代启动、核验双端实际身份并开放准入。切换后回滚必须先关闭、停止当前代并恢复和核验原数据库，再由原代控制入口恢复服务。整个过程不修改已部署包、不新增版本特例，失败和确认丢失按真实阶段停留或对账。
 
-跨代 stage/promote 的源配置必须由显式 `--source-config` 或该 promotion 已保全的原件提供。绑定先核验 snapshot 实际 SHA-256 等于安装记录的 `snapshot.digest`，再核验源 `platform.json` 原字节 SHA-256 等于该 snapshot 的 `sources.platform_json_sha256`；候选配置单独消费，不从 resolved 内容重编码，也不以候选配置冒充源原件。源端 public verb 及原 argv 整体委派给源控制入口，`--source-config` 只属于发行编排。维护锁沿用既有 FD 协议和 metadata，以继承 FD/inode/`FLOCK` 证明持有权；不存在环境变量跳板。回滚仅在已有不可变阶段证据表明可能跨过候选 DDL 时打开完整 baseline 并 restore；未到 DDL 边界时保留原数据库并核验源状态，边界不明且无 baseline 时保持关闭／UNKNOWN。
+跨代 stage/promote 的源配置必须由显式 `--source-config` 或该 promotion 已保全的原件提供。绑定先核验 snapshot 实际 SHA-256 等于安装记录的 `snapshot.digest`，再核验源 `platform.json` 原字节 SHA-256 等于该 snapshot 的 `sources.platform_json_sha256`；候选配置单独消费，不从 resolved 内容重编码，也不以候选配置冒充源原件。源端 public verb 及原 argv 整体委派给源控制入口，`--source-config` 只属于发行编排；当前代和跨代 public verb 都在消费 resolved 前按活动代重算完整 map，health 只执行与已安装 proxy unit 一致的 `NGINX_BIN`。维护锁沿用既有 FD 协议和 metadata，以继承 FD/inode/`FLOCK` 证明持有权；不存在环境变量跳板。回滚仅在已有不可变阶段证据表明可能跨过候选 DDL 时打开完整 baseline 并 restore；未到 DDL 边界时保留原数据库并核验源状态，边界不明且无 baseline 时保持关闭／UNKNOWN。
 
 备份维护使用 `stop --keep-database` 停止受支持写者并保留 PostgreSQL，随后核验实际 Linux 服务和 Windows 任务停止状态。备份从 `drain` 前至归档、清单及收据完成一直持有状态根下的 `locks/maintenance.lock`；`start / drain / stop / reconcile / stage / promote / rollback` 使用同一锁。嵌套调用须验证继承的锁及属主，不能仅凭环境变量绕过加锁。
 
