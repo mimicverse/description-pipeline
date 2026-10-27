@@ -1004,7 +1004,7 @@ function Get-AclProjection([string]$Path) {
       { $_.inherited }
     ))
   return [ordered]@{
-    owner_sid = ([System.Security.Principal.SecurityIdentifier]$acl.Owner).Value
+    owner_sid = Resolve-Sid ([string]$acl.Owner)
     protected = [bool]$acl.AreAccessRulesProtected
     sddl = [string]$acl.GetSecurityDescriptorSddlForm(
       [System.Security.AccessControl.AccessControlSections]::All)
