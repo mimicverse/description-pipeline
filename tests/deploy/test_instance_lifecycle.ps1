@@ -249,6 +249,17 @@ $readJsonEnd = $source.IndexOf('function Sha256', $readJsonStart)
 $readJsonSource = if ($readJsonStart -ge 0 -and $readJsonEnd -gt $readJsonStart) {
   $source.Substring($readJsonStart, $readJsonEnd - $readJsonStart)
 } else { '' }
+$aclProjectionStart = $source.IndexOf('function Get-AclProjection')
+$aclProjectionEnd = $source.IndexOf('function New-ManagedAccessRule', $aclProjectionStart)
+$aclProjectionSource = if (
+    $aclProjectionStart -ge 0 -and
+    $aclProjectionEnd -gt $aclProjectionStart) {
+  $source.Substring($aclProjectionStart, $aclProjectionEnd - $aclProjectionStart)
+} else { '' }
+Check 'acl.projection_owner_uses_resolved_sid' (
+  $aclProjectionSource.Contains('owner_sid = Resolve-Sid ([string]$acl.Owner)') -and
+  -not $aclProjectionSource.Contains(
+    '[System.Security.Principal.SecurityIdentifier]$acl.Owner'))
 Check 'json.single_strict_read_path' (
   -not $source.Contains('$script:JsonPython') -and
   $readJsonSource.Contains('Assert-StrictJsonText $text') -and
@@ -269,6 +280,68 @@ if ($StaticOnly) {
 
 # ---- load the script without running main ----------------------------------
 . $ScriptPath -Verb status -Binding @{}
+
+# SID and ACL APIs require Windows; the Linux matrix keeps its existing stubs.
+if ($env:OS -eq 'Windows_NT') {
+  # Exercise the production Resolve-Sid before install fixtures override it below.
+  function New-AclProjectionFixture([string]$Owner) {
+    $acl = [pscustomobject]@{
+      Owner = $Owner
+      AreAccessRulesProtected = $true
+    }
+    $acl | Add-Member -MemberType ScriptMethod -Name GetAccessRules -Value {
+      param($Explicit, $Inherited, $TargetType)
+      return @()
+    }
+    $acl | Add-Member -MemberType ScriptMethod -Name GetSecurityDescriptorSddlForm -Value {
+      param($Sections)
+      return 'O:BAG:SY'
+    }
+    return $acl
+  }
+
+  function Get-Acl {
+    [CmdletBinding()]
+    param([string]$LiteralPath)
+    return $script:FixtureAcl
+  }
+
+  $script:FixtureAcl = $null
+  try {
+    $script:FixtureAcl = New-AclProjectionFixture 'S-1-5-32-544'
+    $sidOwnerProjection = Get-AclProjection 'acl-projection-fixture'
+    Check 'acl.owner_sid_resolves' (
+      $sidOwnerProjection.owner_sid -ceq 'S-1-5-32-544' -and
+      $sidOwnerProjection.protected -eq $true -and
+      @($sidOwnerProjection.rules).Count -eq 0)
+
+    if ($PSVersionTable.PSEdition -eq 'Desktop' -and
+        $PSVersionTable.PSVersion.Major -eq 5) {
+      $administratorsName = (
+        [System.Security.Principal.SecurityIdentifier]'S-1-5-32-544'
+      ).Translate([System.Security.Principal.NTAccount]).Value
+      $script:FixtureAcl = New-AclProjectionFixture $administratorsName
+      $nameOwnerProjection = Get-AclProjection 'acl-projection-fixture'
+      Check 'acl.owner_desktop_name_resolves' (
+        $administratorsName -notmatch '^S-1-' -and
+        $nameOwnerProjection.owner_sid -ceq 'S-1-5-32-544')
+    }
+
+    $unresolvedOwnerName = 'description-unresolvable-' + [guid]::NewGuid().ToString('N')
+    $script:FixtureAcl = New-AclProjectionFixture $unresolvedOwnerName
+    $unresolvedOwner = Invoke-Refusal {
+      Get-AclProjection 'acl-projection-fixture'
+    }
+    Check 'acl.owner_unresolved_fails_closed' (
+      $unresolvedOwner.threw -and
+      $unresolvedOwner.code -ceq 'service_account_invalid')
+  } finally {
+    Remove-Item Function:\Get-Acl -Force
+    $script:FixtureAcl = $null
+  }
+
+}
+
 $python = Get-TestPython
 $processArguments = @('', 'space value', 'embedded"quote', 'C:\space path\', 'slash\"quote', "line`nbreak")
 $processProbe = @'
