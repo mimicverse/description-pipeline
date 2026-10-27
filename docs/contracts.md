@@ -362,6 +362,10 @@ metadata closure。同一 command/effect 恢复复用原 intent 与 outbound；�
 
 跨代回滚先依据不可变 promotion 阶段与实际对账确定是否跨过候选数据库变更边界。尚未生成 baseline 且候选 DDL 未发生时，由源上下文核验后恢复；已经变更时必须先有可验证 baseline，恢复并验明源 schema 后才能启动源代。边界不明且无可用 baseline 时保持关闭／UNKNOWN，不执行无依据 restore，也不因缺少某个日志推定无副作用。
 
+`schema-migration=completed` 后数据库属主为已验证的候选 package／Python／配置，Linux pointer 尚未切换不改变这一归属；停止服务仍核验实际 unit inventory。DDL／cutover 后、候选启动或对账前，在同一迁移 evidence 冻结 canonical 平台持久业务表的一致快照 fingerprint，排除 admission 控制与 `run_display_metadata`。回滚在写者停止后用同一候选包重读，只有事实边界相同才允许 baseline restore。新增 terminal run、decision、effect 或对账事实、边界缺失或无法证明无写者时均不得覆盖当前数据库；保全事实并记录 failed／UNKNOWN、保持关闭，沿用既有 forward／recovery。另存 archive 本身不授予降级资格。恢复后先由源包验证，再恢复源服务。
+
+派生环境在 shell 加载前必须经非执行解析及所属代的重新派生校验。候选安装包校验复用 `runtime.tool_record()` 的实际文件 inventory，并核对发行 version／source_commit／source_sha256；probe 使用隔离 Python，不能只读取 embedded manifest 声称安装字节一致。
+
 `project_stage_status` 与 `project_run_status` 是唯一业务状态投影。它们只消费
 canonical facts 的真实阶段 decision/effect 以及实际 Airflow task/DagRun 关联；
 SQL view、Portal、operator 和 display metadata 均不得另写状态 reducer。正式运行

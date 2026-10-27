@@ -39,7 +39,9 @@ Linux 完成上传与 Freeze 后，Windows 为 Discover 和 Capture 分别物化
 
 代际维护以实际安装代为执行边界：每一代的控制入口、解释器、配置快照和数据库语义共同构成其维护上下文。发行控制器从现有安装记录及发行清单派生并核验上下文，源代自行关闭、排空和对账源状态，候选代自行迁移、启动和验证候选状态；控制器只编排既有锁与证据，不复制另一代业务实现或建立第二份代际状态。源端公共命令通过子进程整件委派，参数由源端契约解释，不按版本号翻译。
 
-源配置原件与派生环境也按代归属。控制器先核验 snapshot 实际 SHA-256 等于安装记录的 `snapshot.digest`，再核验原始 `platform.json` 字节 SHA-256 等于该 snapshot 的 `sources.platform_json_sha256`；两层摘要不得混用。控制器不在候选代码中重编码或重抄源配置推导；`operator.env` 的实际运行值由源代自身现有属主重新派生并核验。继承维护锁以实际 FD、inode 和内核 `FLOCK` 为准，既有 metadata 字段保留，但不以 PID 活性或可由外层污染的环境开关替代锁权与入口身份。
+源配置原件与派生环境也按代归属。控制器先核验 snapshot 实际 SHA-256 等于安装记录的 `snapshot.digest`，再核验原始 `platform.json` 字节 SHA-256 等于该 snapshot 的 `sources.platform_json_sha256`；两层摘要不得混用。控制器不在候选代码中重编码或重抄源配置推导；`operator.env` 先按非执行数据读取，再由源代自身现有属主重新派生并核验，完成后才加载。候选安装身份复用 `runtime.tool_record()` 复算实际包文件，并核对发行的 version、source_commit 和 source_sha256，不另造 inventory。继承维护锁以实际 FD、inode 和内核 `FLOCK` 为准，既有 metadata 字段保留，但不以 PID 活性或可由外层污染的环境开关替代锁权与入口身份。
+
+数据库解释权跟随既有 `schema-migration` 阶段，服务控制权跟随实际安装指针和服务 inventory；两者不能混同。迁移完成即由候选包读库，即使 Linux 指针尚未切换。迁移后、启动或对账候选服务前，复用 recovery 的一致快照与持久业务表 fingerprint 冻结事实边界；回滚停止写者后重读比较。排除准入控制与展示数据，业务增量、边界缺失或不明时保全当前数据库并保持关闭，不能覆盖式恢复 baseline。不存在第二业务模型或通用降级链。
 
 ## 数据权威
 

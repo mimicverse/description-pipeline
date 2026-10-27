@@ -281,21 +281,7 @@ def has_unrecorded_phase_artifacts(receipt_file: Path, document: dict, verb: str
     """Refuse fresh replay when a phase artifact proves that an operation was attempted."""
 
     receipt_dir = receipt_file.parent
-    stage_owned = {
-        "receipt.json",
-        "source-platform.json",
-        "candidate-platform.json",
-        "candidate-wheel",
-        "linux-generation.out",
-        "windows-stage.out",
-        "windows-stage.path",
-        "windows-stage.path.stderr",
-        "evidence",
-        "evidence-immutable",
-    }
     for path in receipt_dir.iterdir():
-        if path.name in stage_owned:
-            continue
         if verb == "promote" and (
             path.name.startswith("windows-promote.")
             or path.name.startswith("windows-health-")

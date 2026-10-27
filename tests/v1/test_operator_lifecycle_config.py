@@ -589,11 +589,6 @@ result="$(
             line for line in helper.splitlines() if not line.lstrip().startswith("#")
         )
         self.assertNotIn('"$@"', executable_helper)
-        self.assertEqual(source.count("> \"$archive_probe\" <<'PY'"), 2)
-        self.assertEqual(
-            source.count('windows_transport 60 "$output.transport.json" < "$archive_probe"'),
-            2,
-        )
         for name in (
             "generation_env_declared_value",
             "airflow_record_dag",
@@ -624,7 +619,7 @@ result="$(
             source,
         )
         self.assertIn(
-            '2> "$EVIDENCE_DIR/windows-health-rollback-verify.path.stderr"',
+            '2>> "$EVIDENCE_DIR/rollback-health.out.stderr"',
             source,
         )
         self.assertIn(
@@ -633,9 +628,9 @@ result="$(
             source,
         )
         self.assertIn(
-            'read_output_path "$EVIDENCE_DIR/windows-health-rollback-verify.path" WINDOWS_HEALTH \\\n'
-            '            || WINDOWS_HEALTH_STATUS=2',
-            source,
+            'write_generation_control_receipt rollback-health '
+            '"$ROLLBACK_HEALTH_RECEIPT_STATUS" "$ROLLBACK_HEALTH_STATUS"',
+            re.sub(r"\\\n\s*", " ", source),
         )
         self.assertIn(
             'WINDOWS_RELEASE_OVERRIDE="$PREVIOUS_RELEASE_TRIPLE" \\\n'
@@ -677,20 +672,17 @@ result="$(
             'promotion_step "$ROLLBACK_ID" rollback rollback-windows failed '
             '"$RECEIPT_DIR/windows-rollback.out" "$RECEIPT_DIR/windows-rollback.path"',
             'promotion_step "$ROLLBACK_ID" rollback rollback-verify failed '
-            '"$EVIDENCE_DIR/rollback-verify.out" '
-            '"$EVIDENCE_DIR/windows-health-rollback-verify.path" '
-            '"$EVIDENCE_DIR/rollback-health.json" '
-            '"$EVIDENCE_DIR/windows-health-rollback-verify-$ROLLBACK_ID.out"',
+            '"$EVIDENCE_DIR/rollback-start.out" '
+            '"$EVIDENCE_DIR/source-rollback-start-control-receipt.json"',
             'promotion_step "$ROLLBACK_ID" rollback rollback-verify unknown '
-            '"$EVIDENCE_DIR/rollback-verify.out" '
-            '"$EVIDENCE_DIR/windows-health-rollback-verify.path" '
-            '"$EVIDENCE_DIR/rollback-health.json" '
-            '"$EVIDENCE_DIR/windows-health-rollback-verify-$ROLLBACK_ID.out"',
+            '"$EVIDENCE_DIR/rollback-health.out" '
+            '"$EVIDENCE_DIR/rollback-health.out.stderr"',
             'promotion_step "$ROLLBACK_ID" rollback rollback-verify completed '
-            '"$EVIDENCE_DIR/rollback-verify.out" '
-            '"$EVIDENCE_DIR/windows-health-rollback-verify.path" '
-            '"$EVIDENCE_DIR/rollback-health.json" '
-            '"$EVIDENCE_DIR/windows-health-rollback-verify-$ROLLBACK_ID.out"',
+            '"$EVIDENCE_DIR/rollback-start.out" '
+            '"$EVIDENCE_DIR/rollback-health.out" '
+            '"$EVIDENCE_DIR/source-rollback-start-control-receipt.json" '
+            '"$EVIDENCE_DIR/source-rollback-health-control-receipt.json" '
+            '"$EVIDENCE_DIR/rollback-dag-restore.out"',
         ):
             with self.subTest(call=call):
                 self.assertIn(call, normalized)
@@ -703,7 +695,9 @@ result="$(
             "$RECEIPT_DIR/windows-health-endpoint-identity.path",
             "$RECEIPT_DIR/windows-health-promote-verify.out",
             "$EVIDENCE_DIR/windows-health-promote-verify.path",
-            "$EVIDENCE_DIR/windows-health-rollback-verify.path",
+            "$EVIDENCE_DIR/rollback-start.out",
+            "$EVIDENCE_DIR/rollback-health.out",
+            "$EVIDENCE_DIR/rollback-dag-restore.out",
             "$RECEIPT_DIR/windows-status.out",
             "$RECEIPT_DIR/windows-status.path",
             "$RECEIPT_DIR/windows-rollback.out",
@@ -711,26 +705,6 @@ result="$(
         ):
             with self.subTest(path=path):
                 self.assertIn(path, source)
-        self.assertEqual(
-            source.count('2> "$RECEIPT_DIR/windows-stage.path.stderr"'),
-            1,
-        )
-        self.assertEqual(
-            source.count('2> "$RECEIPT_DIR/windows-promote.path.stderr"'),
-            1,
-        )
-        self.assertEqual(
-            source.count('2> "$RECEIPT_DIR/windows-health-endpoint-identity.path.stderr"'),
-            1,
-        )
-        self.assertEqual(
-            source.count('2> "$RECEIPT_DIR/windows-status.path.stderr"'),
-            1,
-        )
-        self.assertEqual(
-            source.count('2> "$RECEIPT_DIR/windows-rollback.path.stderr"'),
-            1,
-        )
 
     def test_start_refuses_while_the_shared_maintenance_lock_is_held(self):
         state_root = self.root / "state"

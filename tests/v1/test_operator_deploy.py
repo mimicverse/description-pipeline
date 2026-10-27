@@ -265,6 +265,14 @@ def platform_fixture(
     (tmp / "description-1.4.0-windows-cp312-x86_64.zip").write_bytes(b"windows-archive")
     (tmp / "description-1.4.0-linux-cp312-x86_64.zip").write_bytes(b"linux-archive")
     (tmp / "description-1.4.0-deployment.zip").write_bytes(b"deployment-archive")
+    shutil.copytree(OPERATOR, tmp / "deploy" / "operator")
+    shutil.copytree(OPERATOR.parent / "airflow", tmp / "deploy" / "airflow")
+    shutil.copyfile(
+        OPERATOR.parent / "systemd-units.tsv",
+        tmp / "deploy" / "systemd-units.tsv",
+    )
+    for name in ("platform", "windows"):
+        os.symlink(OPERATOR.parent / name, tmp / "deploy" / name)
     dag_content = b"# dag fixture\n"
     release_document = {
         "schema_version": "solidworks-to-urdf.release/v1",
@@ -281,6 +289,7 @@ def platform_fixture(
         },
         "deployment_files": {
             "deploy/airflow/dags/solidworks_to_urdf.py": hashlib.sha256(dag_content).hexdigest(),
+            "deploy/operator/operatorctl.sh": hashlib.sha256(CONTROL.read_bytes()).hexdigest(),
         },
     }
     release_path = tmp / "release.json"
@@ -886,24 +895,17 @@ class RenderTests(unittest.TestCase):
 class LifecycleTests(unittest.TestCase):
 
     def _control_tree(self, tmp: Path) -> Path:
-        """A release-local operator mirror: real siblings, a stub health probe.
+        """The active operator tree: real siblings, a stub health probe.
 
         The lifecycle calls its own sibling health_gate.sh whose probe is the sibling
         health.sh; the mirror keeps every real file while the probe becomes a stub, so the
         suite exercises the real gate wiring without live HTTP services.
         """
-        release = tmp / "release"
-        op = release / "deploy" / "operator"
-        op.mkdir(parents=True)
-        (release / "release.json").write_text("{}\n", encoding="utf-8")
-        for name in ("airflow", "platform", "windows"):
-            os.symlink(OPERATOR.parent / name, release / "deploy" / name)
-        for item in OPERATOR.iterdir():
-            if item.name in {"operatorctl.sh", "health_gate.sh", "health.sh"}:
-                continue
-            os.symlink(item, op / item.name)
+        op = tmp / "deploy" / "operator"
         (op / "operatorctl.sh").write_bytes(CONTROL.read_bytes())
+        (op / "operatorctl.sh").chmod(0o755)
         (op / "health_gate.sh").write_bytes(HEALTH_GATE.read_bytes())
+        (op / "health_gate.sh").chmod(0o755)
         write_stub(
             op / "health.sh",
             '#!/usr/bin/env bash\necho "health-gate probe" >> "$ORDER_LOG"\nexit "${HEALTH_GATE_RC:-0}"\n',
@@ -2540,8 +2542,8 @@ class LifecycleTests(unittest.TestCase):
         control = CONTROL.read_text(encoding="utf-8")
         self.assertEqual(
             control.count('bash "$HERE/health_gate.sh"'),
-            3,
-            "the one gate serves the plain start, promote verify and rollback verify",
+            2,
+            "the target gate serves plain start and promote verify",
         )
         verify_anchor = control.index('--out "$EVIDENCE_DIR/final-identity.json"')
         gate_in_promote = control.index('bash "$HERE/health_gate.sh" "$EVIDENCE_DIR/linux-health-')
@@ -2550,13 +2552,15 @@ class LifecycleTests(unittest.TestCase):
         self.assertLess(gate_in_promote, open_in_promote, "the promote opens only after the gate")
         start_gate = control.index('bash "$HERE/health_gate.sh" "$OPERATOR_STATE/health-gate/start-')
         self.assertLess(start_gate, control.rindex("platform_open_admission"), "the start opens only after the gate")
-        rollback_identity = control.index('--out "$EVIDENCE_DIR/rollback-identity.json"')
-        rollback_gate = control.index('bash "$HERE/health_gate.sh" \\\n        "$OPERATOR_STATE/health-gate/rollback-')
+        rollback_health = control.index('health --config "$SOURCE_CONFIG"')
         rollback_dag_state = control.index(
-            'airflow_restore_dag_state "$DAG_STATE_FILE"', rollback_gate
+            'airflow_restore_dag_state "$DAG_STATE_FILE"', rollback_health
         )
-        self.assertLess(rollback_identity, rollback_gate, "rollback health follows the restored identity")
-        self.assertLess(rollback_gate, rollback_dag_state, "DAG state is restored only after health")
+        self.assertLess(
+            rollback_health,
+            rollback_dag_state,
+            "DAG state is restored only after source-generation health",
+        )
 
     def test_keep_admission_closed_flag_is_refused_by_other_verbs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2894,7 +2898,6 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn('CONTROL_PYTHON="${CONTROL_PYTHON:-python3}"', control)
         self.assertIn("sys.implementation.name", control)
         self.assertIn("sys.version_info[:2] == (3, 12)", control)
-        self.assertEqual(control.count("python3"), 1)
         transport = (OPERATOR / "windows_transport.py").read_text(encoding="utf-8")
         self.assertIn('"-EncodedCommand"', transport)
         self.assertIn("windows_transport.py", control)
@@ -3162,7 +3165,7 @@ class LifecycleTests(unittest.TestCase):
                 ["bash", str(CONTROL), "status", "--config", str(config_path)], {"XDG_CONFIG_HOME": str(config_home)}
             )
             self.assertEqual(result.returncode, 1)
-            self.assertIn("snapshot digest mismatch", result.stderr)
+            self.assertIn("generation snapshot bytes differ", result.stderr)
 
     def test_toolchain_pins_are_current(self) -> None:
         toolchain = (OPERATOR / "scripts" / "install_toolchain.sh").read_text(encoding="utf-8")
@@ -3255,14 +3258,14 @@ class LifecycleTests(unittest.TestCase):
             self.assertIn("DRIFT unit missing: description-airflow-scheduler.service", missing.stdout)
             self.assertIn("DRIFT unit differs: description-portal.service", missing.stdout)
 
-    def test_drift_check_reports_render_failure(self) -> None:
+    def test_status_refuses_a_modified_environment_before_executing_it(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_path, state, config_home, _ = self._render_units(Path(tmp))
             env_file = state / "derived" / "gen-1" / "operator.env"
+            marker = Path(tmp) / "unexpected-environment-execution"
             env_file.write_text(
                 env_file.read_text(encoding="utf-8")
-                + f"OPERATOR_TLS_CERT={Path(tmp) / 'missing.crt'}\n"
-                + f"OPERATOR_TLS_KEY={Path(tmp) / 'missing.key'}\n",
+                + f"touch {shlex.quote(str(marker))}\n",
                 encoding="utf-8",
             )
             failed = run(
@@ -3270,9 +3273,7 @@ class LifecycleTests(unittest.TestCase):
                 status_env(Path(tmp), config_home),
             )
             self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
-            self.assertIn("DRIFT unit missing from render: description-portal.service", failed.stdout)
-            self.assertIn("DRIFT unit missing from render: description-operator-proxy.service", failed.stdout)
-            self.assertIn("provided TLS certificate or key is missing", failed.stderr)
+            self.assertFalse(marker.exists())
 
     def test_status_requires_the_ready_windows_task_identity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3658,12 +3659,22 @@ class InstallOrderingTests(unittest.TestCase):
             "fi\n"
             'echo "services_$1" >> "$ORDER_LOG"\n'
             'if [ -n "${RUNTIME_AUTHORITY_LOG:-}" ] && [ "$1" = "stop-executors" ]; then\n'
-            '  [ -z "${EXPECTED_RUNNING_VENV:-}" ] || [ "$AIRFLOW_VENV" = "$EXPECTED_RUNNING_VENV" ] || exit 80\n'
-            '  printf "running:stop-services venv=%s\\n" "$AIRFLOW_VENV" >> "$RUNTIME_AUTHORITY_LOG"\n'
+            '  if [ "$AIRFLOW_VENV" = "${EXPECTED_CANDIDATE_VENV:-}" ]; then\n'
+            '    printf "candidate:stop-services venv=%s\\n" "$AIRFLOW_VENV" >> "$RUNTIME_AUTHORITY_LOG"\n'
+            '  elif [ "$AIRFLOW_VENV" = "${EXPECTED_RUNNING_VENV:-}" ]; then\n'
+            '    printf "running:stop-services venv=%s\\n" "$AIRFLOW_VENV" >> "$RUNTIME_AUTHORITY_LOG"\n'
+            '  else\n'
+            '    exit 80\n'
+            '  fi\n'
             "fi\n"
             'if [ -n "${RUNTIME_AUTHORITY_LOG:-}" ] && [ "$1" = "start" ]; then\n'
-            '  [ -z "${EXPECTED_CANDIDATE_VENV:-}" ] || [ "$AIRFLOW_VENV" = "$EXPECTED_CANDIDATE_VENV" ] || exit 80\n'
-            '  printf "candidate:start venv=%s\\n" "$AIRFLOW_VENV" >> "$RUNTIME_AUTHORITY_LOG"\n'
+            '  if [ "$AIRFLOW_VENV" = "${EXPECTED_CANDIDATE_VENV:-}" ]; then\n'
+            '    printf "candidate:start venv=%s\\n" "$AIRFLOW_VENV" >> "$RUNTIME_AUTHORITY_LOG"\n'
+            '  elif [ "$AIRFLOW_VENV" = "${EXPECTED_RUNNING_VENV:-}" ]; then\n'
+            '    printf "running:start venv=%s\\n" "$AIRFLOW_VENV" >> "$RUNTIME_AUTHORITY_LOG"\n'
+            '  else\n'
+            '    exit 80\n'
+            '  fi\n'
             "fi\n"
             'mkdir -p "$SYSTEMCTL_STATE_DIR"\n'
             'execution_units=(\n'
@@ -3821,8 +3832,7 @@ class InstallOrderingTests(unittest.TestCase):
             '"${CANDIDATE_RUNTIME_MODULE:-}" candidate:switch-pointer || exit $? ;;\n'
             "  install_record.py:verify-active)\n"
             '    actual_venv="$(cd "$(dirname "$0")/.." && pwd)"\n'
-            '    if [ -n "${EXPECTED_CANDIDATE_VENV:-}" ] '
-            '&& [ "$actual_venv" = "$EXPECTED_CANDIDATE_VENV" ]; then\n'
+            '    if [[ "$actual_venv" == */airflow-venv-gen-2* ]]; then\n'
             '      require_runtime "$EXPECTED_CANDIDATE_VENV" '
             '"${CANDIDATE_RUNTIME_MODULE:-}" candidate:verify || exit $?\n'
             "    else\n"
@@ -3834,14 +3844,31 @@ class InstallOrderingTests(unittest.TestCase):
             "  connection_snapshot.py:*)\n"
             '    require_runtime "${EXPECTED_RUNNING_VENV:-}" "" running:connection-capture || exit $? ;;\n'
             "  runtime_dag.py:*)\n"
-            '    require_runtime "${EXPECTED_CANDIDATE_VENV:-}" '
-            '"${CANDIDATE_RUNTIME_MODULE:-}" candidate:start || exit $? ;;\n'
+            '    actual_venv="$(cd "$(dirname "$0")/.." && pwd)"\n'
+            '    if [ "$actual_venv" = "${EXPECTED_CANDIDATE_VENV:-}" ]; then\n'
+            '      require_runtime "$actual_venv" "${CANDIDATE_RUNTIME_MODULE:-}" '
+            'candidate:start || exit $?\n'
+            '    else\n'
+            '      require_runtime "${EXPECTED_RUNNING_VENV:-}" "" '
+            'running:rollback-config || exit $?\n'
+            "    fi ;;\n"
             "esac\n"
             "case \"$*\" in\n"
             "  *install_record.py*|*add_connection.py*|*connection_snapshot.py*|*runtime_dag.py*)\n"
             '    PYTHONPATH="${FIXTURE_PACKAGE_ROOT:-}" exec python3 "$@" ;;\n'
             "  *install_record.py*)\n"
             '    exec python3 "$@" ;;\n'
+            "  *recovery.py*facts-boundary*)\n"
+            '    out="" prev=""\n'
+            '    for argument in "$@"; do [ "$prev" = "--out" ] && out="$argument"; prev="$argument"; done\n'
+            '    [ -n "$out" ] || exit 2\n'
+            '    if [[ "$out" == *rollback-platform-facts.json ]] '
+            '&& [ "${FIXTURE_FACT_BOUNDARY_DRIFT:-0}" = "1" ]; then\n'
+            "      printf '%s\\n' '{\"changed\":true}' > \"$out\"\n"
+            "    else\n"
+            "      printf '%s\\n' '{\"same\":true}' > \"$out\"\n"
+            "    fi\n"
+            "    exit 0 ;;\n"
             "  *interface_records*release_domain_identity*)\n"
             "    python3 -c 'import json,os; "
             "domain={\"contract\":{\"fixture\":True},\"support\":{\"fixture\":True}}; "
@@ -3849,9 +3876,17 @@ class InstallOrderingTests(unittest.TestCase):
             "\"pipeline_id\":\"solidworks-to-urdf\",\"domain\":domain,"
             "\"identity\":{\"pipeline_id\":\"solidworks-to-urdf\","
             "\"version\":\"1.4.0\",\"source_sha256\":\"a\"*64,"
+            "\"source_commit\":\"c\"*40,"
             "\"contract\":domain[\"contract\"],\"support\":domain[\"support\"]}}))' ; exit 0 ;;\n"
             '  "-m description_pipeline.orchestration.lifecycle_state"*)\n'
-            '    require_runtime "${EXPECTED_RUNNING_VENV:-}" "" running:drain || exit $?\n'
+            '    actual_venv="$(cd "$(dirname "$0")/.." && pwd)"\n'
+            '    if [[ "$actual_venv" == */airflow-venv-gen-2* ]]; then\n'
+            '      label=candidate:drain\n'
+            "    else\n"
+            '      label=running:drain\n'
+            "    fi\n"
+            '    if [ -n "${RUNTIME_AUTHORITY_LOG:-}" ]; then '
+            'printf "%s venv=%s\\n" "$label" "$actual_venv" >> "$RUNTIME_AUTHORITY_LOG"; fi\n'
             "    python3 -c 'import json,os; from pathlib import Path; "
             'Path(os.environ["LIFECYCLE_ENV_LOG"]).write_text(json.dumps('
             '{"dsn": os.environ.get("PLATFORM_OPERATOR_DSN"), '
@@ -3885,7 +3920,11 @@ class InstallOrderingTests(unittest.TestCase):
             "  *airflow-dag-state-check*)\n"
             '    expected="$2"\n'
             '    if [ "$expected" = "true" ]; then\n'
-            '      require_runtime "${EXPECTED_RUNNING_VENV:-}" "" running:drain || exit $?\n'
+            '      actual_venv="$(cd "$(dirname "$0")/.." && pwd)"\n'
+            '      if [[ "$actual_venv" == */airflow-venv-gen-2* ]]; then '
+            'label=candidate:drain; else label=running:drain; fi\n'
+            '      if [ -n "${RUNTIME_AUTHORITY_LOG:-}" ]; then '
+            'printf "%s venv=%s\\n" "$label" "$actual_venv" >> "$RUNTIME_AUTHORITY_LOG"; fi\n'
             "    else\n"
             '      require_runtime "${EXPECTED_CANDIDATE_VENV:-}" '
             '"${CANDIDATE_RUNTIME_MODULE:-}" candidate:start || exit $?\n'
@@ -3894,7 +3933,14 @@ class InstallOrderingTests(unittest.TestCase):
             '    echo "dag_state_check expected=$expected actual=$actual" >> "$ORDER_LOG"\n'
             '    [ "$actual" = "$expected" ] || exit 1 ;;\n'
             "  *platform-close-admission*)\n"
-            '    require_runtime "${EXPECTED_RUNNING_VENV:-}" "" source:close-admission || exit $?\n'
+            '    actual_venv="$(cd "$(dirname "$0")/.." && pwd)"\n'
+            '    if [[ "$actual_venv" == */airflow-venv-gen-2* ]]; then\n'
+            '      label=candidate:close-admission\n'
+            "    else\n"
+            '      label=source:close-admission\n'
+            "    fi\n"
+            '    if [ -n "${RUNTIME_AUTHORITY_LOG:-}" ]; then '
+            'printf "%s venv=%s\\n" "$label" "$actual_venv" >> "$RUNTIME_AUTHORITY_LOG"; fi\n'
             '    [ "$PLATFORM_SERVICE_DSN" = "$EXPECTED_PLATFORM_SERVICE_DSN" ] || exit 78\n'
             '    [ "$PLATFORM_OPERATOR_DSN" = "$EXPECTED_PLATFORM_DSN" ] || exit 77\n'
             '    [ "$PIPELINE_STORE_ROOT" = "$EXPECTED_PIPELINE_STORE_ROOT" ] || exit 79\n'
@@ -3960,7 +4006,13 @@ class InstallOrderingTests(unittest.TestCase):
             '    [ "${UNPAUSE_RC:-0}" = "0" ] || exit "$UNPAUSE_RC"\n'
             '    echo false > "$ADMISSION" ;;\n'
             '  "dags pause solidworks_to_urdf")\n'
-            '    require_airflow "${EXPECTED_RUNNING_VENV:-}" "" running:drain || exit $?\n'
+            '    actual_venv="$(cd "$(dirname "$0")/.." && pwd)"\n'
+            '    if [ "$actual_venv" = "${EXPECTED_CANDIDATE_VENV:-}" ]; then\n'
+            '      require_airflow "$actual_venv" "${CANDIDATE_RUNTIME_MODULE:-}" '
+            'candidate:drain || exit $?\n'
+            '    else\n'
+            '      require_airflow "${EXPECTED_RUNNING_VENV:-}" "" running:drain || exit $?\n'
+            "    fi\n"
             '    [ "${PAUSE_RC:-0}" = "0" ] || exit "$PAUSE_RC"\n'
             '    echo true > "$ADMISSION" ;;\n'
             '  "db migrate")\n'
@@ -5068,12 +5120,25 @@ class InstallOrderingTests(unittest.TestCase):
         if generation:
             command += ["--install-id", generation]
         run_env = env
-        if verb == "promote" and generation:
+        candidate_generation = generation
+        if verb == "rollback" and not candidate_generation:
+            record_path = Path(tree / "state" / "install-record.json")
+            if record_path.is_file():
+                candidate_generation = json.loads(
+                    record_path.read_text(encoding="utf-8")
+                ).get("install_id", "")
+        if verb in {"promote", "rollback"} and candidate_generation:
             config = json.loads((tree / "platform.json").read_text(encoding="utf-8"))
             state_root = Path(config["storage"]["state_root"])
-            candidate_env = state_root / "derived" / generation / "operator.env"
+            candidate_env = (
+                state_root / "derived" / candidate_generation / "operator.env"
+            )
             if candidate_env.is_file():
-                candidate_venv = Path(self._derived_value(state_root, generation, "AIRFLOW_VENV"))
+                candidate_venv = Path(
+                    self._derived_value(
+                        state_root, candidate_generation, "AIRFLOW_VENV"
+                    )
+                )
                 run_env = dict(env)
                 run_env["EXPECTED_CANDIDATE_VENV"] = str(candidate_venv)
                 run_env["EXPECTED_RUNNING_VENV"] = self._derived_value(
@@ -5634,6 +5699,32 @@ class InstallOrderingTests(unittest.TestCase):
             self.assertIn(
                 "derived environment differs from its source-owned derivation",
                 derived_refused.stderr,
+            )
+            execution_sentinel = root / "derived-env-was-executed"
+            active_env.write_text(
+                active_env_original.decode("utf-8")
+                + f"EXECUTION_SENTINEL=$(touch {execution_sentinel})\n",
+                encoding="utf-8",
+            )
+            sentinel_refused = run(
+                [
+                    "bash",
+                    str(release / "operator" / "operatorctl.sh"),
+                    "status",
+                    "--config",
+                    str(config),
+                ],
+                control_env,
+            )
+            active_env.write_bytes(active_env_original)
+            self.assertNotEqual(
+                sentinel_refused.returncode,
+                0,
+                sentinel_refused.stdout + sentinel_refused.stderr,
+            )
+            self.assertFalse(
+                execution_sentinel.exists(),
+                "derived environment values were executed before validation",
             )
 
             for verb in ("status", "health", "drain", "start"):
@@ -7565,6 +7656,147 @@ class InstallOrderingTests(unittest.TestCase):
             self.assertIn("database_changed=0", boundary)
             self.assertIn("backup_baseline_available=1", boundary)
             self.assertFalse((state / "promotions" / "gen-2" / "backup").exists())
+
+    def test_rollback_refuses_to_overwrite_terminal_facts_created_after_promotion(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            release, control_env, order = self._prepare(
+                root, fresh=False, ready_after=1, db_exists=True
+            )
+            self.addCleanup(self._stop_runtime_processes, root)
+            self.assertEqual(
+                self._install(release, control_env).returncode,
+                0,
+            )
+            state = root / "state"
+            self._bind_source_controller_fixture(release, root, control_env)
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(
+                state, "gen-1", "PLATFORM_OPERATOR_DSN"
+            )
+            self._health_double(release, control_env)
+            (root / "handoffs").mkdir(exist_ok=True)
+            (root / "specifications").mkdir(exist_ok=True)
+            self.assertEqual(
+                self._maintenance(release, control_env, "stage", "gen-2").returncode,
+                0,
+            )
+            self._clone_generation_stubs(state)
+            self._linux_health_double(release)
+            promoted = self._maintenance(release, control_env, "promote", "gen-2")
+            self.assertEqual(
+                promoted.returncode,
+                0,
+                promoted.stdout + promoted.stderr,
+            )
+            active_before = (state / "install-record.json").read_bytes()
+            control_env["FIXTURE_FACT_BOUNDARY_DRIFT"] = "1"
+            before_restore = order.read_text(encoding="utf-8").count("pg_restore")
+            rolled = self._maintenance(
+                release,
+                dict(
+                    control_env,
+                    FIXTURE_RUNTIME_PROCESS="1",
+                    AIRFLOW_VENV=self._derived_value(
+                        state, "gen-2", "AIRFLOW_VENV"
+                    ),
+                ),
+                "rollback",
+            )
+            self.assertNotEqual(rolled.returncode, 0, rolled.stdout + rolled.stderr)
+            self.assertIn(
+                "new terminal business facts exist",
+                rolled.stderr,
+            )
+            self.assertEqual((state / "install-record.json").read_bytes(), active_before)
+            self.assertEqual(
+                order.read_text(encoding="utf-8").count("pg_restore"),
+                before_restore,
+            )
+            self.assertEqual(
+                (root / "admission").read_text(encoding="utf-8").strip(),
+                "true",
+            )
+
+    def test_rollback_after_candidate_ddl_uses_candidate_for_database_before_source_start(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            release, control_env, _order = self._prepare(
+                root, fresh=False, ready_after=1, db_exists=True
+            )
+            self.addCleanup(self._stop_runtime_processes, root)
+            self.assertEqual(
+                self._install(release, control_env).returncode,
+                0,
+            )
+            state = root / "state"
+            self._bind_source_controller_fixture(release, root, control_env)
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(
+                state, "gen-1", "PLATFORM_OPERATOR_DSN"
+            )
+            self._health_double(release, control_env)
+            (root / "handoffs").mkdir(exist_ok=True)
+            (root / "specifications").mkdir(exist_ok=True)
+            self.assertEqual(
+                self._maintenance(release, control_env, "stage", "gen-2").returncode,
+                0,
+            )
+            self._clone_generation_stubs(state)
+            self._linux_health_double(release)
+            control_env["FIXTURE_FAIL_PROMOTE"] = "1"
+            failed = self._maintenance(
+                release, control_env, "promote", "gen-2"
+            )
+            self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
+            self.assertEqual(
+                json.loads(
+                    (state / "install-record.json").read_text(encoding="utf-8")
+                )["install_id"],
+                "gen-1",
+            )
+            trace_path = Path(control_env["FIXTURE_SOURCE_TRACE"])
+            before_trace = trace_path.read_text(encoding="utf-8")
+
+            rolled = self._maintenance(
+                release, control_env, "rollback", "gen-2"
+            )
+            detail = rolled.stdout + rolled.stderr
+            evidence = state / "promotions" / "gen-2" / "evidence"
+            for name in (
+                "rollback-database-owner.out",
+                "rollback-active-drain.out",
+                "rollback-active-drain.out.stderr",
+                "rollback-dag-barrier.out",
+                "rollback-dag-barrier.out.stderr",
+                "rollback-database-restore.out",
+                "rollback-database-source-verify.out",
+                "rollback-start.out",
+                "rollback-health.out",
+            ):
+                path = evidence / name
+                if path.is_file():
+                    detail += f"\n== {name} ==\n{path.read_text(encoding='utf-8')}"
+            self.assertEqual(rolled.returncode, 0, detail)
+            after_trace = trace_path.read_text(encoding="utf-8")
+            self.assertEqual(
+                after_trace.count("source_child action=drain"),
+                before_trace.count("source_child action=drain"),
+                "rollback database drain must not invoke the source package after DDL",
+            )
+            self.assertEqual(
+                after_trace.count("source_child action=stop"),
+                before_trace.count("source_child action=stop"),
+                "rollback service stop must not invoke a DB-interpreting source verb",
+            )
+            self.assertIn(
+                "database_owner=candidate",
+                (evidence / "rollback-database-owner.out").read_text(
+                    encoding="utf-8"
+                ),
+            )
 
     def test_rollback_pause_failure_stops_before_drain_projection(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

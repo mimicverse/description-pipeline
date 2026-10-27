@@ -432,6 +432,8 @@ Windows 候选配置由正式 `stage` 按当前端点 schema 确定性生成。�
 
 `operatorctl rollback` 读取 promotion 的不可变阶段，判断候选数据库变更边界；已跨过时先恢复并核验 promotion baseline，未跨过时保留并核验原数据库。灾难恢复仍通过同版 `recovery.py backup / restore` 执行受控备份和同路径空目标恢复；`backup.py` 的加密归档原语不承担完整恢复判定。备份使用新的输出目录和独立保管的外部密钥，恢复使用显式目标计划；复用既存目录或未取得本次归属的失败请求不得改写旧回执、归档或暂存文件。具体边界遵循[灾难恢复契约](contracts.md#灾难恢复)。
 
+迁移已完成但 Linux pointer 未切时，rollback 仍由 candidate 关闭准入并排空数据库，再按实际 unit inventory 停止写者，不能先让 source 包读取新 schema。`schema-migration` evidence 的 `platform-facts-boundary.json` 在 DDL／cutover 后、候选启动或对账前冻结一致业务事实；restore 前用同一候选包重读并比较，排除 admission 控制与展示 metadata。新增业务事实、边界缺失或读取不明时保全当前库并保持关闭，记录 failed／UNKNOWN，使用既有 forward／recovery，不覆盖 baseline。正常恢复后由 source 包验证源契约再恢复服务。stage/promote 在任何源变更前复用 `runtime.tool_record()` 校验候选实际安装字节与发行三元组；派生环境先验证后加载。
+
 每次发行须绑定该 `main` 提交准备并实际演练恢复步骤，覆盖平台与 Airflow 数据库、原件及其引用、发行与工作区重建、安装记录、配置、密钥、既有 Windows 任务与 ACL、双端身份和未决外部结果。命令只完成其中一部分时，报告逐项注明未完成范围；整体通过必须来自真实双端恢复和随后端到端运行。仅解密成功、代码回滚成功、隔离数据库与服务替身测试或服务健康不能作为完整恢复通过的依据。
 
 恢复 Windows 任务定义不等于可以启动端点。未知锁属主或观察器失败时保持停止；只有取得可启动的锁及属主证据才启动。恢复核验使用切换前绑定的上一代自身发行身份，不能拿候选身份核验旧版；上一代身份缺证时健康结论保持未知，准入保持关闭。

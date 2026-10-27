@@ -2012,6 +2012,59 @@ def _live_database_data(connection) -> dict:
     }
 
 
+def capture_business_fact_boundary(dsn: str) -> dict:
+    """Fingerprint the persistent platform facts without control or display state."""
+
+    parse_pg_dsn(dsn, "platform facts DSN")
+    normalized = dsn
+    if normalized.startswith("postgresql+psycopg2://"):
+        normalized = "postgresql://" + normalized.removeprefix(
+            "postgresql+psycopg2://"
+        )
+    connection = _psycopg2().connect(normalized)
+    try:
+        _begin_exported_snapshot(connection)
+        table_rows = _connection_json(connection, FULL_TABLE_LIST_QUERY)
+        require(
+            isinstance(table_rows, list),
+            "recovery_database_readback_failed",
+            "platform fact table discovery is malformed",
+        )
+        excluded = {"admission", "run_display_metadata"}
+        tables = {}
+        for row in table_rows:
+            require(
+                isinstance(row, dict)
+                and set(row) == {"schema", "table"}
+                and isinstance(row["table"], str)
+                and bool(ROLE_NAME.fullmatch(row["table"])),
+                "recovery_catalog_identifier_unsupported",
+                "unsupported platform fact table identifier",
+                {"table": row},
+            )
+            if row["schema"] != "platform" or row["table"] in excluded:
+                continue
+            tables[row["table"]] = _table_fingerprint(
+                connection,
+                "platform",
+                row["table"],
+                allow_discovered=True,
+            )
+        require(
+            tables,
+            "recovery_database_readback_failed",
+            "platform fact boundary has no business tables",
+        )
+        return {
+            "schema_version": "solidworks-to-urdf.platform-fact-boundary/v1",
+            "excluded_tables": sorted(excluded),
+            "tables": dict(sorted(tables.items())),
+        }
+    finally:
+        connection.rollback()
+        connection.close()
+
+
 def _database_baseline_snapshot(connection) -> tuple[dict, dict, dict]:
     legacy_catalog = _connection_json(connection, CATALOG_QUERY)
     full_catalog = _connection_json(connection, FULL_CATALOG_QUERY)
@@ -13248,6 +13301,9 @@ def build_parser() -> argparse.ArgumentParser:
     plan_parser.add_argument("--host-id", required=True)
     plan_parser.add_argument("--postgres-config", type=Path, required=True)
     plan_parser.add_argument("--out", type=Path, required=True)
+    facts_parser = subparsers.add_parser("facts-boundary")
+    facts_parser.add_argument("--dsn", required=True)
+    facts_parser.add_argument("--out", type=Path, required=True)
     return parser
 
 
@@ -13391,6 +13447,28 @@ def main(argv: list[str] | None = None) -> int:
                 os.fsync(stream.fileno())
             print(f"target_plan={args.out}")
             print(f"target_plan_sha256={sha256_file(args.out)}")
+            return 0
+        if args.action == "facts-boundary":
+            boundary = capture_business_fact_boundary(args.dsn)
+            require_no_links(args.out, "platform fact boundary output")
+            args.out.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            try:
+                descriptor = os.open(
+                    args.out,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+                    0o600,
+                )
+            except FileExistsError as error:
+                raise RecoveryError(
+                    "recovery_write_conflict",
+                    "platform fact boundary output already exists",
+                ) from error
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(canonical_json(boundary))
+                stream.flush()
+                os.fsync(stream.fileno())
+            print(f"boundary={args.out}")
+            print(f"boundary_sha256={sha256_file(args.out)}")
             return 0
         if args.action == "backup":
             result = backup_command(

@@ -301,9 +301,9 @@ resolve_state_root() {
 }
 
 resolve_raw_config_state_root() {
-  local config_file="${1:-$CONFIG_FILE}"
-  STATE_ROOT="$(
-    "$CONTROL_PYTHON" - "$config_file" <<'PY'
+  local config_file="${1:-$CONFIG_FILE}" output
+  output="$(mktemp)"
+  if ! "$CONTROL_PYTHON" - "$config_file" > "$output" <<'PY'
 import json
 import os
 import sys
@@ -319,32 +319,48 @@ if not isinstance(value, str) or not value or not os.path.isabs(value):
     raise SystemExit("the configuration does not name an absolute state root")
 print(value)
 PY
-  )" || die "the configuration state root is unreadable"
+  then
+    rm -f "$output"
+    die "the configuration state root is unreadable"
+  fi
+  read_output_path "$output" STATE_ROOT || {
+    rm -f "$output"
+    die "the configuration state root is not one path"
+  }
+  rm -f "$output"
   [ -f "$STATE_ROOT/resolved.env" ] \
     || die "not installed: $STATE_ROOT/resolved.env is missing (run install first)"
 }
 
 load_active_env() {
   resolve_state_root
-  load_env_file "$STATE_ROOT/resolved.env" || return $?
-  # The operational entry verifies the complete install record, the snapshot digest and the
-  # current-config binding before anything else; the check runs with the deployment interpreter
-  # so it consumes the canonical schema implementation (single owner, no local mirror).
-  ACTIVE_ID="$(AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" \
-    verify-active --config "$CONFIG_FILE" --state-root "$STATE_ROOT" | sed -n 's/^install_id=//p')" || exit $?
-  [ -n "$ACTIVE_ID" ] || die "active install record did not declare a generation"
+  ACTIVE_ID="$(
+    "$CONTROL_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["install_id"])' \
+      "$STATE_ROOT/install-record.json"
+  )" || die "the active install record is unreadable"
   ENV_FILE="$STATE_ROOT/derived/$ACTIVE_ID/operator.env"
   [ -f "$ENV_FILE" ] || die "derived environment missing for generation $ACTIVE_ID; run install"
   AIRFLOW_VENV="$(
     generation_env_declared_value "$ENV_FILE" AIRFLOW_VENV
-  )" || die "the running generation environment has no unambiguous AIRFLOW_VENV"
+  )" || die "the active generation environment has no unambiguous AIRFLOW_VENV"
+  AIRFLOW_HOME="$(
+    generation_env_declared_value "$ENV_FILE" AIRFLOW_HOME
+  )" || die "the active generation environment has no unambiguous AIRFLOW_HOME"
   [ -x "$AIRFLOW_VENV/bin/python" ] \
     || die "the running generation runtime is missing: $AIRFLOW_VENV/bin/python"
   load_generation_control_context "$STATE_ROOT/install-record.json"
   verify_generation_derived_env \
     "$STATE_ROOT/install-record.json" "$ENV_FILE" "$AIRFLOW_VENV" \
     "$GENERATION_DEPLOYMENT_ROOT" "$GENERATION_RELEASE_FILE"
+  load_env_file "$STATE_ROOT/resolved.env" || return $?
   load_generation_env || return $?
+  VERIFIED_ACTIVE_ID="$(
+    AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" \
+      verify-active --config "$CONFIG_FILE" --state-root "$STATE_ROOT" \
+      | sed -n 's/^install_id=//p'
+  )" || exit $?
+  [ "$VERIFIED_ACTIVE_ID" = "$ACTIVE_ID" ] \
+    || die "the active install record changed while its environment was verified"
 }
 
 # The maintenance window (stage/promote/rollback) verifies the RUNNING record and its immutable
@@ -352,13 +368,33 @@ load_active_env() {
 # running generation.  Current-config binding stays with verify-active on the steady-state verbs.
 load_running_env() {
   resolve_state_root
-  load_env_file "$STATE_ROOT/resolved.env" || return $?
-  ACTIVE_ID="$(AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" \
-    verify-running --state-root "$STATE_ROOT" | sed -n 's/^install_id=//p')" || exit $?
-  [ -n "$ACTIVE_ID" ] || die "active install record did not declare a generation"
+  ACTIVE_ID="$(
+    "$CONTROL_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["install_id"])' \
+      "$STATE_ROOT/install-record.json"
+  )" || die "the active install record is unreadable"
   ENV_FILE="$STATE_ROOT/derived/$ACTIVE_ID/operator.env"
   [ -f "$ENV_FILE" ] || die "derived environment missing for generation $ACTIVE_ID; run install"
+  AIRFLOW_VENV="$(
+    generation_env_declared_value "$ENV_FILE" AIRFLOW_VENV
+  )" || die "the running generation environment has no unambiguous AIRFLOW_VENV"
+  AIRFLOW_HOME="$(
+    generation_env_declared_value "$ENV_FILE" AIRFLOW_HOME
+  )" || die "the running generation environment has no unambiguous AIRFLOW_HOME"
+  [ -x "$AIRFLOW_VENV/bin/python" ] \
+    || die "the running generation runtime is missing: $AIRFLOW_VENV/bin/python"
+  load_generation_control_context "$STATE_ROOT/install-record.json"
+  verify_generation_derived_env \
+    "$STATE_ROOT/install-record.json" "$ENV_FILE" "$AIRFLOW_VENV" \
+    "$GENERATION_DEPLOYMENT_ROOT" "$GENERATION_RELEASE_FILE"
+  load_env_file "$STATE_ROOT/resolved.env" || return $?
   load_generation_env || return $?
+  VERIFIED_ACTIVE_ID="$(
+    AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" \
+      verify-running --state-root "$STATE_ROOT" \
+      | sed -n 's/^install_id=//p'
+  )" || exit $?
+  [ "$VERIFIED_ACTIVE_ID" = "$ACTIVE_ID" ] \
+    || die "the running install record changed while its environment was verified"
 }
 
 # A lifecycle transition must execute the environment of the generation named by its verified
@@ -375,7 +411,7 @@ load_generation_env() {
 }
 
 acquire_maintenance_lock() {
-  local state_root="$1" lock_dir lock_path inherited_owner inherited_fd inherited_path
+  local state_root="$1" lock_dir lock_path inherited_owner inherited_fd inherited_path metadata_output
   if [ -n "$MAINTENANCE_LOCK_PATH" ]; then
     [ -n "$LOCKED_STATE_ROOT" ] && [ "$state_root" = "$LOCKED_STATE_ROOT" ] \
       || die "the requested state root differs from the held maintenance lock"
@@ -402,8 +438,8 @@ acquire_maintenance_lock() {
     [ "$inherited_path" = "$lock_path" ] \
       || die "the inherited maintenance lock path does not match the state-root lock"
     [ -f "$lock_path" ] || die "the inherited maintenance lock is missing: $lock_path"
-    MAINTENANCE_LOCK_PID="$(
-      "$CONTROL_PYTHON" - "$inherited_fd" "$lock_path" "$inherited_owner" <<'PY'
+    metadata_output="$(mktemp)"
+    if ! "$CONTROL_PYTHON" - "$inherited_fd" "$lock_path" "$inherited_owner" > "$metadata_output" <<'PY'
 import json
 import os
 import re
@@ -446,7 +482,15 @@ if not re.search(
     raise SystemExit("the inherited descriptor does not itself hold the write lock")
 print(owner_pid)
 PY
-    )" || die "the inherited maintenance lock descriptor is not the held state-root lock"
+    then
+      rm -f "$metadata_output"
+      die "the inherited maintenance lock descriptor is not the held state-root lock"
+    fi
+    read_output_path "$metadata_output" MAINTENANCE_LOCK_PID || {
+      rm -f "$metadata_output"
+      die "the inherited maintenance lock owner did not resolve to one PID"
+    }
+    rm -f "$metadata_output"
     MAINTENANCE_LOCK_FD="$inherited_fd"
     MAINTENANCE_LOCK_OWNER="$inherited_owner"
     MAINTENANCE_LOCK_PATH="$lock_path"
@@ -461,8 +505,8 @@ PY
     || die "another supported lifecycle operation owns the maintenance lock: $lock_path"
   chmod 600 "$lock_path"
   MAINTENANCE_LOCK_PID="$BASHPID"
-  MAINTENANCE_LOCK_OWNER="$(
-    "$CONTROL_PYTHON" - "$MAINTENANCE_LOCK_FD" "$lock_path" "$MAINTENANCE_LOCK_PID" <<'PY'
+  metadata_output="$(mktemp)"
+  if ! "$CONTROL_PYTHON" - "$MAINTENANCE_LOCK_FD" "$lock_path" "$MAINTENANCE_LOCK_PID" > "$metadata_output" <<'PY'
 import json
 import os
 import secrets
@@ -512,32 +556,20 @@ if readback != expected:
     raise SystemExit("the maintenance lock metadata readback differs from the acquired owner")
 print(owner)
 PY
-  )" || die "could not write the maintenance lock owner"
+  then
+    rm -f "$metadata_output"
+    die "could not write the maintenance lock owner"
+  fi
+  read_output_path "$metadata_output" MAINTENANCE_LOCK_OWNER || {
+    rm -f "$metadata_output"
+    die "the maintenance lock owner did not resolve to one identifier"
+  }
+  rm -f "$metadata_output"
   MAINTENANCE_LOCK_PATH="$lock_path"
   export OPERATORCTL_MAINTENANCE_LOCK_OWNER="$MAINTENANCE_LOCK_OWNER"
   export OPERATORCTL_MAINTENANCE_LOCK_FD="$MAINTENANCE_LOCK_FD"
   export OPERATORCTL_MAINTENANCE_LOCK_PATH="$MAINTENANCE_LOCK_PATH"
   echo "maintenance_lock=$lock_path"
-}
-
-# One env contract: platform_env and render_operator write every derived value through the
-# canonical encoding (bare when shell-safe, single-quoted otherwise - the libpq DSNs' "&"
-# above all), so any consumer can simply `source` the file.  This helper reads one generation
-# value back by sourcing it in a subshell and never parses quoting itself - and it clears the
-# key first, so a candidate file that does not define it (missing line, a defeated assignment
-# such as an unquoted "&", a syntax error, an empty file) can never fall back to a value the
-# route shell inherited from another generation.  A missing or empty value is an explicit,
-# human-readable refusal at the read, before any DDL or recovery step.
-generation_env_value() {
-  local file="$1" key="$2" value
-  value="$(
-    set -a
-    unset "$key"
-    source "$file" >/dev/null 2>&1 || exit 3
-    printf '%s' "${!key-}"
-  )" || die "the derived environment $file could not be read for $key"
-  [ -n "$value" ] || die "the derived environment $file does not define $key"
-  printf '%s' "$value"
 }
 
 # The release manifest is a member of the controller release tree, never an external override.
@@ -730,7 +762,7 @@ database_unit_for_record() {
 }
 
 load_generation_control_context() {
-  local record="$1" airflow_here deployment_root control release_file output
+  local record="$1" airflow_here deployment_root control release_file context_output
   local -a context=()
   airflow_here="$(airflow_here_for_record "$record")" \
     || die "the running generation has no usable deployment path"
@@ -743,8 +775,8 @@ load_generation_control_context() {
   [ -x "$control" ] || die "the running generation controller is not executable: $control"
   [ -f "$release_file" ] && [ ! -L "$release_file" ] \
     || die "the running generation release manifest is missing or a link: $release_file"
-  output="$(
-    "$CONTROL_PYTHON" - "$record" "$release_file" "$control" <<'PY'
+  context_output="$(mktemp)"
+  if ! "$CONTROL_PYTHON" - "$record" "$release_file" "$control" > "$context_output" <<'PY'
 import hashlib
 import json
 import sys
@@ -780,8 +812,12 @@ print(control_path.parents[2])
 print(control_path)
 print(release_path)
 PY
-  )" || die "the running generation control identity is invalid"
-  mapfile -t context <<< "$output"
+  then
+    rm -f "$context_output"
+    die "the running generation control identity is invalid"
+  fi
+  mapfile -t context < "$context_output"
+  rm -f "$context_output"
   [ "${#context[@]}" -eq 3 ] || die "the running generation control context is incomplete"
   GENERATION_DEPLOYMENT_ROOT="${context[0]}"
   GENERATION_CONTROL="${context[1]}"
@@ -789,10 +825,10 @@ PY
 }
 
 config_binds_record() {
-  local config_file="$1" record_file="$2" expected_sha actual_sha
+  local config_file="$1" record_file="$2" expected_sha actual_sha expected_output
   [ -f "$config_file" ] && [ ! -L "$config_file" ] || return 1
-  expected_sha="$(
-    "$CONTROL_PYTHON" - "$record_file" <<'PY'
+  expected_output="$(mktemp)"
+  if ! "$CONTROL_PYTHON" - "$record_file" > "$expected_output" <<'PY'
 import json
 import hashlib
 import sys
@@ -814,7 +850,15 @@ if not isinstance(digest, str) or len(digest) != 64:
     raise SystemExit("the install record carries no valid platform configuration digest")
 print(digest)
 PY
-  )" || return 2
+  then
+    rm -f "$expected_output"
+    return 2
+  fi
+  read_output_path "$expected_output" expected_sha || {
+    rm -f "$expected_output"
+    return 2
+  }
+  rm -f "$expected_output"
   actual_sha="$(sha256sum "$config_file" | awk '{print $1}')"
   [ "$actual_sha" = "$expected_sha" ]
 }
@@ -825,11 +869,11 @@ assert_config_binds_record() {
 }
 
 assert_config_binds_snapshot() {
-  local config_file="$1" snapshot_file="$2" expected_sha actual_sha
+  local config_file="$1" snapshot_file="$2" expected_sha actual_sha expected_output
   [ -f "$config_file" ] && [ ! -L "$config_file" ] \
     || die "the candidate configuration is missing or a link"
-  expected_sha="$(
-    "$CONTROL_PYTHON" - "$snapshot_file" <<'PY'
+  expected_output="$(mktemp)"
+  if ! "$CONTROL_PYTHON" - "$snapshot_file" > "$expected_output" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -841,7 +885,15 @@ if not isinstance(digest, str) or len(digest) != 64:
     raise SystemExit("the candidate snapshot carries no configuration digest")
 print(digest)
 PY
-  )" || die "the candidate snapshot configuration identity is unreadable"
+  then
+    rm -f "$expected_output"
+    die "the candidate snapshot configuration identity is unreadable"
+  fi
+  read_output_path "$expected_output" expected_sha || {
+    rm -f "$expected_output"
+    die "the candidate snapshot configuration identity is not one digest"
+  }
+  rm -f "$expected_output"
   actual_sha="$(sha256sum "$config_file" | awk '{print $1}')"
   [ "$actual_sha" = "$expected_sha" ] \
     || die "the current candidate configuration does not bind the staged snapshot"
@@ -854,7 +906,7 @@ verify_snapshot_derived_env() {
   [ -f "$wheel_file" ] || die "the generation wheel is missing: $wheel_file"
   [ -x "$runtime_venv/bin/python" ] || die "the generation interpreter is missing"
   env -u PYTHONPATH -u PYTHONHOME -u PYTHONNOUSERSITE \
-    "$runtime_venv/bin/python" -B - \
+    "$CONTROL_PYTHON" -B - \
     "$deployment_root/deploy/operator/platform_env.py" \
     "$deployment_root/deploy/operator/render_operator.py" \
     "$deployment_root" "$snapshot_file" "$install_id" "$env_file" \
@@ -862,6 +914,7 @@ verify_snapshot_derived_env() {
     || die "the generation derived environment does not match its snapshot and release"
 import importlib.util
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -893,14 +946,45 @@ result = platform_env.derive(
     release=release,
     wheel=wheel_file,
 )
-actual = render_operator.load_env(env_file)
+actual = {}
+optional_empty = {"FEISHU_APP_SECRET_FILE", "FEISHU_TENANT_KEYS"}
+empty_optional_overrides = set()
+for number, line in enumerate(env_file.read_text(encoding="utf-8").splitlines(), 1):
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        continue
+    key, separator, raw = stripped.partition("=")
+    if (
+        not separator
+        or re.fullmatch(r"[A-Z_][A-Z0-9_]*", key) is None
+    ):
+        raise SystemExit(f"{env_file}:{number}: invalid environment declaration")
+    try:
+        value = "" if raw.strip() == "" else render_operator.decode_env_value(raw.strip())
+    except ValueError as error:
+        raise SystemExit(f"{env_file}:{number}: {error}") from error
+    previous = actual.get(key)
+    if key in actual and previous != value:
+        if value == "" and key in optional_empty:
+            actual[key] = value
+            empty_optional_overrides.add(key)
+            continue
+        raise SystemExit(f"{env_file}:{number}: conflicting duplicate declaration for {key}")
+    actual[key] = value
 expected = {key: value for key, value in result["env"].items() if value != ""}
+missing = sorted(set(expected) - set(actual))
+if missing:
+    raise SystemExit(
+        f"the generation environment {env_file} does not define {', '.join(missing)}"
+    )
 actual = {key: value for key, value in actual.items() if value != ""}
-if actual != expected:
+for key in empty_optional_overrides:
+    expected.pop(key, None)
+extra = set(actual) - set(expected) - {"SOLIDWORKS_SSH_BIN"}
+mismatched = [key for key in expected if actual.get(key) != expected[key]]
+if extra or mismatched:
     differing = sorted(
-        key
-        for key in set(actual) | set(expected)
-        if actual.get(key) != expected.get(key)
+        set(mismatched) | extra
     )
     raise SystemExit(
         "the derived environment differs from its source-owned derivation: "
@@ -911,9 +995,9 @@ PY
 
 verify_generation_derived_env() {
   local record_file="$1" env_file="$2" runtime_venv="$3"
-  local deployment_root="$4" release_file="$5" binding
-  binding="$(
-    "$CONTROL_PYTHON" - "$record_file" <<'PY'
+  local deployment_root="$4" release_file="$5" binding_output
+  binding_output="$(mktemp)"
+  if ! "$CONTROL_PYTHON" - "$record_file" > "$binding_output" <<'PY'
 import json
 import hashlib
 import sys
@@ -936,9 +1020,13 @@ if hashlib.sha256(snapshot_path.read_bytes()).hexdigest() != snapshot.get("diges
 print(snapshot_path)
 print(install_id)
 PY
-  )" || die "the generation install record identity is unreadable"
+  then
+    rm -f "$binding_output"
+    die "the generation install record identity is unreadable"
+  fi
   local -a values=()
-  mapfile -t values <<< "$binding"
+  mapfile -t values < "$binding_output"
+  rm -f "$binding_output"
   [ "${#values[@]}" -eq 2 ] \
     || die "the generation install record identity is incomplete"
   verify_snapshot_derived_env \
@@ -949,21 +1037,21 @@ PY
 verify_same_database_authority() {
   local candidate_env="$1" running_env="$2" candidate_python="$3"
   local cand_service cand_operator cand_runtime run_service run_operator run_runtime
-  local run_venv run_python candidate_identity running_identity
-  cand_service="$(generation_env_value "$candidate_env" PLATFORM_SERVICE_DSN)"
-  cand_operator="$(generation_env_value "$candidate_env" PLATFORM_OPERATOR_DSN)"
-  cand_runtime="$(generation_env_value "$candidate_env" AIRFLOW_RUNTIME_DB_URL)"
+  local run_venv run_python candidate_identity_file running_identity_file
+  cand_service="$(generation_env_declared_value "$candidate_env" PLATFORM_SERVICE_DSN)"
+  cand_operator="$(generation_env_declared_value "$candidate_env" PLATFORM_OPERATOR_DSN)"
+  cand_runtime="$(generation_env_declared_value "$candidate_env" AIRFLOW_RUNTIME_DB_URL)"
   run_service="$(generation_env_declared_value "$running_env" PLATFORM_SERVICE_DSN)"
   run_operator="$(generation_env_declared_value "$running_env" PLATFORM_OPERATOR_DSN)"
   run_runtime="$(generation_env_declared_value "$running_env" AIRFLOW_RUNTIME_DB_URL)"
-  run_venv="$(generation_env_value "$running_env" AIRFLOW_VENV)"
+  run_venv="$(generation_env_declared_value "$running_env" AIRFLOW_VENV)"
   run_python="$run_venv/bin/python"
   [ -x "$run_python" ] \
     || die "the running generation interpreter is missing: $run_python"
-  candidate_identity="$(
-    CANDIDATE_SERVICE_DSN="$cand_service" CANDIDATE_OPERATOR_DSN="$cand_operator" \
+  candidate_identity_file="$(mktemp)"
+  if ! CANDIDATE_SERVICE_DSN="$cand_service" CANDIDATE_OPERATOR_DSN="$cand_operator" \
       CANDIDATE_RUNTIME_DSN="$cand_runtime" \
-      "$candidate_python" - <<'GUARD'
+      "$candidate_python" - > "$candidate_identity_file" <<'GUARD'
 import os
 
 import psycopg2
@@ -986,11 +1074,14 @@ if probe("CANDIDATE_RUNTIME_DSN") != first:
     raise SystemExit("the candidate roles reach different database authorities")
 print("\t".join(first))
 GUARD
-  )" || die "the staged generation does not reach its database authority; refused"
-  running_identity="$(
-    RUNNING_SERVICE_DSN="$run_service" RUNNING_OPERATOR_DSN="$run_operator" \
+  then
+    rm -f "$candidate_identity_file"
+    die "the staged generation does not reach its database authority; refused"
+  fi
+  running_identity_file="$(mktemp)"
+  if ! RUNNING_SERVICE_DSN="$run_service" RUNNING_OPERATOR_DSN="$run_operator" \
       RUNNING_RUNTIME_DSN="$run_runtime" \
-      "$run_python" - <<'GUARD'
+      "$run_python" - > "$running_identity_file" <<'GUARD'
 import os
 
 import psycopg2
@@ -1013,9 +1104,15 @@ if probe("RUNNING_RUNTIME_DSN") != first:
     raise SystemExit("the running roles reach different database authorities")
 print("\t".join(first))
 GUARD
-  )" || die "the running generation does not reach its database authority; refused"
-  [ -n "$candidate_identity" ] && [ "$candidate_identity" = "$running_identity" ] \
-    || die "the staged and running generations reach different database authorities; refused"
+  then
+    rm -f "$candidate_identity_file" "$running_identity_file"
+    die "the running generation does not reach its database authority; refused"
+  fi
+  if [ ! -s "$candidate_identity_file" ] || ! cmp -s "$candidate_identity_file" "$running_identity_file"; then
+    rm -f "$candidate_identity_file" "$running_identity_file"
+    die "the staged and running generations reach different database authorities; refused"
+  fi
+  rm -f "$candidate_identity_file" "$running_identity_file"
 }
 
 verify_candidate_stage_identity() {
@@ -1068,14 +1165,17 @@ runtime_env["AIRFLOW_VENV"] = str(venv)
 runtime = subprocess.run(
     [
         str(venv / "bin" / "python"),
+        "-I",
+        "-B",
         "-c",
         "import json, pathlib, description_pipeline as p;"
         "from description_pipeline import interface_records;"
         "from description_pipeline.delivery import PIPELINE_ID;"
+        "from description_pipeline.runtime import tool_record;"
         "root = pathlib.Path(p.__file__).resolve().parent;"
         "print(json.dumps({'root': str(root), 'pipeline_id': PIPELINE_ID,"
         " 'domain': interface_records.release_domain_identity(),"
-        " 'identity': json.loads((root / 'tool-release.json').read_text(encoding='utf-8'))}))",
+        " 'identity': tool_record()['release']}))",
     ],
     capture_output=True,
     text=True,
@@ -1091,6 +1191,7 @@ domain = reported["domain"]
 if (
     identity.get("pipeline_id") != reported["pipeline_id"]
     or identity.get("version") != release["version"]
+    or identity.get("source_commit") != release["source_commit"]
     or identity.get("source_sha256") != release["source_sha256"]
     or identity.get("contract") != domain["contract"]
     or identity.get("support") != domain["support"]
@@ -1104,13 +1205,18 @@ run_generation_control() {
   shift 3
   case "$lock_mode" in
     inherited)
-      [ -n "$MAINTENANCE_LOCK_OWNER" ] \
-        || die "the generation control call requires an owned maintenance lock"
+      if [ -z "$MAINTENANCE_LOCK_OWNER" ]; then
+        echo "operatorctl: the generation control call requires an owned maintenance lock" >&2
+        return 2
+      fi
       ;;
     self) ;;
     *) die "the generation control lock mode is invalid" ;;
   esac
-  [ -x "$interpreter" ] || die "the generation control interpreter is missing: $interpreter"
+  if [ ! -x "$interpreter" ]; then
+    echo "operatorctl: the generation control interpreter is missing: $interpreter" >&2
+    return 2
+  fi
   local -a invocation=(
     env
     -u CONTROL_PYTHON
@@ -1145,7 +1251,7 @@ run_generation_control() {
 }
 
 delegate_active_public_action() {
-  local action="$1" active_id active_env active_venv source_config delegated_args=()
+  local action="$1" active_id active_env active_venv source_config delegated_args=() active_output
   case "$action" in
     start|drain|stop|status|health) ;;
     reconcile) ;;
@@ -1159,8 +1265,8 @@ delegate_active_public_action() {
     resolve_raw_config_state_root
   fi
   [ -f "$STATE_ROOT/install-record.json" ] || return 10
-  active_id="$(
-    "$CONTROL_PYTHON" - "$STATE_ROOT/install-record.json" <<'PY'
+  active_output="$(mktemp)"
+  if ! "$CONTROL_PYTHON" - "$STATE_ROOT/install-record.json" > "$active_output" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -1171,14 +1277,29 @@ if not isinstance(install_id, str) or not install_id:
     raise SystemExit("the active install record has no generation")
 print(install_id)
 PY
-  )" || die "the active install record is unreadable"
+  then
+    rm -f "$active_output"
+    die "the active install record is unreadable"
+  fi
+  read_output_path "$active_output" active_id || {
+    rm -f "$active_output"
+    die "the active install record did not resolve to one generation"
+  }
+  rm -f "$active_output"
+  # A staged candidate is owned by its promotion receipt, not the active source controller.
+  if [ "$action" = "reconcile" ] && [ -n "$INSTALL_ID" ] \
+      && [ "$INSTALL_ID" != "$active_id" ] \
+      && [ -f "$STATE_ROOT/promotions/$INSTALL_ID/receipt.json" ]; then
+    return 10
+  fi
   active_env="$STATE_ROOT/derived/$active_id/operator.env"
   [ -f "$active_env" ] || die "the active generation environment is missing: $active_env"
   active_venv="$(generation_env_declared_value "$active_env" AIRFLOW_VENV)"
   [ -x "$active_venv/bin/python" ] \
     || die "the active generation runtime is missing: $active_venv/bin/python"
   load_generation_control_context "$STATE_ROOT/install-record.json"
-  if [ "$(realpath "$GENERATION_CONTROL")" = "$(realpath "$HERE/operatorctl.sh")" ]; then
+  if [ "$(realpath "$GENERATION_CONTROL")" = "$(realpath "$HERE/operatorctl.sh")" ] \
+      || cmp -s -- "$GENERATION_CONTROL" "$HERE/operatorctl.sh"; then
     return 10
   fi
   if [ -n "$SOURCE_CONFIG_SOURCE_FILE" ]; then
@@ -1319,6 +1440,16 @@ write_generation_control_receipt() {
     "$SOURCE_CONFIG" "$ENV_FILE" "$@"
 }
 
+write_rollback_active_control_receipt() {
+  if [ "${ROLLBACK_DATABASE_OWNER:-source}" != "source" ]; then
+    return 0
+  fi
+  write_generation_control_receipt_at \
+    "$ROLLBACK_ACTIVE_CONTROL" "$ROLLBACK_ACTIVE_RELEASE_FILE" \
+    "$STATE_ROOT/install-record.json" "$ROLLBACK_ACTIVE_CONFIG" "$ROLLBACK_ACTIVE_ENV" \
+    "$@"
+}
+
 write_generation_control_receipt_or_unknown() {
   local generation="$1" verb="$2" step="$3" stdout_file="$4" stderr_file="$5"
   shift 5
@@ -1351,7 +1482,7 @@ airflow_render_generation_config() {
   runtime_dag="$airflow_here/../operator/runtime_dag.py"
   [ -f "$runtime_dag" ] && [ ! -L "$runtime_dag" ] \
     || die "the target generation has no runtime DAG helper: $runtime_dag"
-  runtime_dsn="$(generation_env_value "$env_file" AIRFLOW_RUNTIME_DB_URL)" || return 1
+  runtime_dsn="$(generation_env_declared_value "$env_file" AIRFLOW_RUNTIME_DB_URL)" || return 1
   # Resolve the port through the target controller's own env parser and default, so the
   # generated execution URL cannot fall back to the resident generation's ambient value.
   api_port_output="$(mktemp)"
@@ -2628,7 +2759,7 @@ PY
 }
 
 load_installed() {
-  OPERATOR_STATE_DIR="$(generation_env_value "$ENV_FILE" OPERATOR_STATE)"
+  OPERATOR_STATE_DIR="$(generation_env_declared_value "$ENV_FILE" OPERATOR_STATE)"
   [ -n "$OPERATOR_STATE_DIR" ] || die "OPERATOR_STATE is not set in $ENV_FILE"
   [ -f "$OPERATOR_STATE_DIR/resolved.env" ] \
     || die "not installed: $OPERATOR_STATE_DIR/resolved.env is missing (run install first)"
@@ -2805,10 +2936,9 @@ case "$ACTION" in
     acquire_maintenance_lock "$STATE_ROOT"
     LOCKED_STATE_ROOT="$STATE_ROOT"
     assert_config_unchanged
-    load_env_file "$START_STATE_ROOT/resolved.env"
+    load_active_env
     ensure_postgres_ready
-    platform_close_admission "start-window" "operatorctl start"
-    load_active_env ;;
+    platform_close_admission "start-window" "operatorctl start" ;;
   drain|stop|status|health|reconcile)
     if [ "$ACTION" != "reconcile" ] || [ -z "$INSTALL_ID" ]; then
       load_active_env
@@ -2874,7 +3004,7 @@ case "$ACTION" in
       AIRFLOW_VENV="$CANDIDATE_RUNTIME_VENV"
       load_generation_env || die "the verified candidate environment could not be loaded"
       PLATFORM_OPERATOR_DSN="$(
-        generation_env_value "$CANDIDATE_ENV" PLATFORM_OPERATOR_DSN
+        generation_env_declared_value "$CANDIDATE_ENV" PLATFORM_OPERATOR_DSN
       )" "$CANDIDATE_PYTHON" \
         -m description_pipeline.orchestration.lifecycle_state report \
         --require-admission-closed >/dev/null \
@@ -2911,8 +3041,7 @@ case "$ACTION" in
   stage)
     load_running_env ;;
   promote|rollback)
-    load_running_env
-    load_generation_env ;;
+    load_running_env ;;
   *)
     usage ;;
 esac
@@ -2924,7 +3053,7 @@ case "$ACTION" in
     # The managed proxy binary is decided before any render: whichever binary this
     # installation actually lands (or an already-executable system one) becomes the NGINX_BIN
     # written into resolved.env, the units and health - one path, one source.
-    OPERATOR_STATE="$(generation_env_value "$ENV_FILE" OPERATOR_STATE)"
+    OPERATOR_STATE="$(generation_env_declared_value "$ENV_FILE" OPERATOR_STATE)"
     PROXY_BIN="$(ensure_proxy_binary)" || die "the managed proxy binary is unavailable; nothing was installed"
     "$CONTROL_PYTHON" "$HERE/render_operator.py" --env-file "$ENV_FILE" --nginx-bin "$PROXY_BIN" > "$RENDER_LOG"
     cat "$RENDER_LOG"
@@ -3291,8 +3420,6 @@ PY
       || die "the staged candidate runtime has no Python interpreter; re-run stage"
     RUNNING_RUNTIME_VENV="$AIRFLOW_VENV"
     RUNNING_PYTHON="$RUNNING_RUNTIME_VENV/bin/python"
-    RUNNING_PLATFORM_SERVICE_DSN="${PLATFORM_SERVICE_DSN:-}"
-    RUNNING_PLATFORM_OPERATOR_DSN="${PLATFORM_OPERATOR_DSN:-}"
     [ -x "$RUNNING_PYTHON" ] \
       || die "the running generation runtime has no Python interpreter"
     load_generation_control_context "$STATE_ROOT/install-record.json"
@@ -3315,8 +3442,8 @@ PY
     verify_same_database_authority \
       "$CANDIDATE_ENV" "$ENV_FILE" "$CANDIDATE_PYTHON"
     SOURCE_CONTROLLER="$GENERATION_CONTROL"
-    SOURCE_SERVICES_OUTPUT="$(
-      "$CONTROL_PYTHON" - "$STATE_ROOT/install-record.json" <<'PY'
+    SOURCE_SERVICES_FILE="$(mktemp)"
+    if ! "$CONTROL_PYTHON" - "$STATE_ROOT/install-record.json" > "$SOURCE_SERVICES_FILE" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -3332,8 +3459,12 @@ if (
     raise SystemExit("the source install record has no valid service inventory")
 print("\n".join(services))
 PY
-    )" || die "the source service inventory is unreadable"
-    mapfile -t SOURCE_SERVICES <<< "$SOURCE_SERVICES_OUTPUT"
+    then
+      rm -f "$SOURCE_SERVICES_FILE"
+      die "the source service inventory is unreadable"
+    fi
+    mapfile -t SOURCE_SERVICES < "$SOURCE_SERVICES_FILE"
+    rm -f "$SOURCE_SERVICES_FILE"
     SOURCE_DATABASE_OUTPUT="$(
       bash "$GENERATION_DEPLOYMENT_ROOT/deploy/airflow/services.sh" units database
     )" || die "the source database role is unreadable"
@@ -3666,7 +3797,23 @@ PY
       promotion_step "$CANDIDATE_ID" promote schema-migration failed "$EVIDENCE_DIR/schema-migration.out"
       die "the verified schema migrations failed (the admission stays closed)"
     fi
-    SCHEMA_EVIDENCE=("$EVIDENCE_DIR/schema-migration.out")
+    FACT_BOUNDARY_STATUS=0
+    "$CANDIDATE_PYTHON" "$HERE/recovery.py" facts-boundary \
+      --dsn "$(generation_env_declared_value "$CANDIDATE_ENV" PLATFORM_SERVICE_DSN)" \
+      --out "$EVIDENCE_DIR/platform-facts-boundary.json" \
+      > "$EVIDENCE_DIR/platform-facts-boundary.out" 2>&1 \
+      || FACT_BOUNDARY_STATUS=$?
+    if [ "$FACT_BOUNDARY_STATUS" -ne 0 ]; then
+      promotion_step "$CANDIDATE_ID" promote schema-migration failed \
+        "$EVIDENCE_DIR/schema-migration.out" \
+        "$EVIDENCE_DIR/platform-facts-boundary.out"
+      die "the platform fact boundary could not be frozen after migration (the admission stays closed)"
+    fi
+    SCHEMA_EVIDENCE=(
+      "$EVIDENCE_DIR/schema-migration.out"
+      "$EVIDENCE_DIR/platform-facts-boundary.json"
+      "$EVIDENCE_DIR/platform-facts-boundary.out"
+    )
     for path in "$LEGACY_ARCHIVE_RECEIPT" "$LEGACY_ARCHIVE_RECEIPT.archive.tar.gz"; do
       [ ! -e "$path" ] || SCHEMA_EVIDENCE+=("$path")
     done
@@ -3916,8 +4063,6 @@ PY
     [ -f "$DAG_STATE_FILE" ] || die "the pre-maintenance DAG state is missing; rollback refuses to guess"
     ROLLBACK_RUNNING_VENV="$AIRFLOW_VENV"
     ROLLBACK_RUNNING_PYTHON="$ROLLBACK_RUNNING_VENV/bin/python"
-    ROLLBACK_RUNNING_PLATFORM_SERVICE_DSN="${PLATFORM_SERVICE_DSN:-}"
-    ROLLBACK_RUNNING_PLATFORM_OPERATOR_DSN="${PLATFORM_OPERATOR_DSN:-}"
     [ -x "$ROLLBACK_RUNNING_PYTHON" ] || die "the running generation has no Python interpreter"
     LINUX_SWITCHED=1
     if [ "$ROLLBACK_ID" = "$ACTIVE_ID" ]; then
@@ -3963,8 +4108,8 @@ PY
       || die "could not preserve the active-generation maintenance configuration"
     chmod 600 "$ROLLBACK_ACTIVE_CONFIG"
     assert_config_binds_record "$ROLLBACK_ACTIVE_CONFIG" "$STATE_ROOT/install-record.json"
-    ROLLBACK_ACTIVE_SERVICES_OUTPUT="$(
-      "$CONTROL_PYTHON" - "$STATE_ROOT/install-record.json" <<'PY'
+    ROLLBACK_ACTIVE_SERVICES_FILE="$(mktemp)"
+    if ! "$CONTROL_PYTHON" - "$STATE_ROOT/install-record.json" > "$ROLLBACK_ACTIVE_SERVICES_FILE" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -3980,8 +4125,12 @@ if (
     raise SystemExit("the active install record has no valid service inventory")
 print("\n".join(services))
 PY
-    )" || die "the active service inventory is unreadable"
-    mapfile -t ROLLBACK_ACTIVE_SERVICES <<< "$ROLLBACK_ACTIVE_SERVICES_OUTPUT"
+    then
+      rm -f "$ROLLBACK_ACTIVE_SERVICES_FILE"
+      die "the active service inventory is unreadable"
+    fi
+    mapfile -t ROLLBACK_ACTIVE_SERVICES < "$ROLLBACK_ACTIVE_SERVICES_FILE"
+    rm -f "$ROLLBACK_ACTIVE_SERVICES_FILE"
     ROLLBACK_ACTIVE_DATABASE_OUTPUT="$(
       bash "$ROLLBACK_ACTIVE_DEPLOYMENT_ROOT/deploy/airflow/services.sh" units database
     )" || die "the active database role is unreadable"
@@ -4095,7 +4244,8 @@ PY
       printf 'database_boundary_unknown=%s\n' "$ROLLBACK_DATABASE_BOUNDARY_UNKNOWN"
       printf 'backup_baseline_available=%s\n' "$ROLLBACK_BACKUP_BASELINE"
     } > "$EVIDENCE_DIR/rollback-database-boundary.out"
-    if [ "$ROLLBACK_DATABASE_BOUNDARY_UNKNOWN" = "1" ]; then
+    if [ "$ROLLBACK_DATABASE_BOUNDARY_UNKNOWN" = "1" ] \
+        && [ "$ROLLBACK_BACKUP_BASELINE" != "1" ]; then
       promotion_step "$ROLLBACK_ID" rollback rollback-database unknown \
         "$EVIDENCE_DIR/rollback-database-boundary.out"
       die "the candidate database boundary is failed or unknown; no source package read or baseline restore was attempted"
@@ -4121,14 +4271,30 @@ PY
         "$CANDIDATE_SNAPSHOT" "$ROLLBACK_ID" "$CANDIDATE_ENV" \
         "$CANDIDATE_RUNTIME_VENV" "$HERE/../.." "$RELEASE_FILE"
       CANDIDATE_SERVICE_DSN="$(
-        generation_env_value "$CANDIDATE_ENV" PLATFORM_SERVICE_DSN
+        generation_env_declared_value "$CANDIDATE_ENV" PLATFORM_SERVICE_DSN
       )"
       CANDIDATE_OPERATOR_DSN="$(
-        generation_env_value "$CANDIDATE_ENV" PLATFORM_OPERATOR_DSN
+        generation_env_declared_value "$CANDIDATE_ENV" PLATFORM_OPERATOR_DSN
       )"
       CANDIDATE_AIRFLOW_HOME="$(
         generation_env_declared_value "$CANDIDATE_ENV" AIRFLOW_HOME
       )"
+    elif [ "$ROLLBACK_DATABASE_BOUNDARY_UNKNOWN" = "1" ] \
+        && [ "$ROLLBACK_BACKUP_BASELINE" = "1" ]; then
+      ROLLBACK_DATABASE_OWNER="baseline"
+      for required_phase in close-admission stop-services; do
+        required_phase_rc=0
+        required_phase_state="$(
+          promotion_step_state "$ROLLBACK_ID" promote "$required_phase"
+        )" || required_phase_rc=$?
+        [ "$required_phase_rc" = "0" ] \
+          && [ "$required_phase_state" = "step=completed" ] \
+          || {
+            promotion_step "$ROLLBACK_ID" rollback rollback-database unknown \
+              "$EVIDENCE_DIR/rollback-database-boundary.out"
+            die "the failed database boundary lacks a completed closed/stopped phase; no restore was attempted"
+          }
+      done
     fi
 
     PREVIOUS_GENERATION_DIR=""
@@ -4272,27 +4438,77 @@ PY
     fi
     # Rollback first asks the actual current generation to close, drain, and stop itself.
     ROLLBACK_ACTIVE_DRAIN_STATUS=0
-    run_generation_control \
-      "$ROLLBACK_ACTIVE_CONTROL" "$ROLLBACK_RUNNING_PYTHON" inherited \
-      drain --config "$ROLLBACK_ACTIVE_CONFIG" \
-      > "$EVIDENCE_DIR/rollback-active-drain.out" \
-      2> "$EVIDENCE_DIR/rollback-active-drain.out.stderr" \
-      || ROLLBACK_ACTIVE_DRAIN_STATUS=$?
+    if [ "$ROLLBACK_DATABASE_OWNER" = "candidate" ]; then
+      (
+        ENV_FILE="$CANDIDATE_ENV"
+        AIRFLOW_VENV="$CANDIDATE_RUNTIME_VENV"
+        AIRFLOW_HOME="$CANDIDATE_AIRFLOW_HOME"
+        AIRFLOW_HERE="$HERE/../airflow"
+        load_generation_env || exit $?
+        PLATFORM_SERVICE_DSN="$CANDIDATE_SERVICE_DSN" \
+          platform_close_admission rollback-close "operatorctl rollback" \
+          "$CANDIDATE_PYTHON" || exit $?
+        AIRFLOW_HOME="$AIRFLOW_HOME" \
+          "$AIRFLOW_VENV/bin/airflow" dags pause solidworks_to_urdf || exit $?
+        PLATFORM_OPERATOR_DSN="$CANDIDATE_OPERATOR_DSN" \
+          "$CANDIDATE_PYTHON" \
+          -m description_pipeline.orchestration.lifecycle_state report \
+          --require-no-unresolved || exit $?
+      ) > "$EVIDENCE_DIR/rollback-active-drain.out" \
+        2> "$EVIDENCE_DIR/rollback-active-drain.out.stderr" \
+        || ROLLBACK_ACTIVE_DRAIN_STATUS=$?
+    elif [ "$ROLLBACK_DATABASE_OWNER" = "baseline" ]; then
+      {
+        echo "admission=closed source=phase-evidence"
+        echo '{"in_flight":[],"unresolved":[],"unknown":[],"settled":true}'
+      } > "$EVIDENCE_DIR/rollback-active-drain.out" 2> "$EVIDENCE_DIR/rollback-active-drain.out.stderr"
+    else
+      run_generation_control \
+        "$ROLLBACK_ACTIVE_CONTROL" "$ROLLBACK_RUNNING_PYTHON" inherited \
+        drain --config "$ROLLBACK_ACTIVE_CONFIG" \
+        > "$EVIDENCE_DIR/rollback-active-drain.out" \
+        2> "$EVIDENCE_DIR/rollback-active-drain.out.stderr" \
+        || ROLLBACK_ACTIVE_DRAIN_STATUS=$?
+    fi
     ROLLBACK_ACTIVE_DAG_STATUS=0
-    airflow_wait_dag_state true > "$EVIDENCE_DIR/rollback-dag-barrier.out" \
-      2> "$EVIDENCE_DIR/rollback-dag-barrier.out.stderr" \
-      || ROLLBACK_ACTIVE_DAG_STATUS=$?
+    if [ "$ROLLBACK_DATABASE_OWNER" = "candidate" ]; then
+      (
+        AIRFLOW_VENV="$CANDIDATE_RUNTIME_VENV" \
+          AIRFLOW_HOME="$CANDIDATE_AIRFLOW_HOME" \
+          airflow_wait_dag_state true
+      ) > "$EVIDENCE_DIR/rollback-dag-barrier.out" \
+        2> "$EVIDENCE_DIR/rollback-dag-barrier.out.stderr" \
+        || ROLLBACK_ACTIVE_DAG_STATUS=$?
+    elif [ "$ROLLBACK_DATABASE_OWNER" = "baseline" ]; then
+      echo "DAG pause is proven by the completed close-admission phase" \
+        > "$EVIDENCE_DIR/rollback-dag-barrier.out"
+      : > "$EVIDENCE_DIR/rollback-dag-barrier.out.stderr"
+    else
+      airflow_wait_dag_state true > "$EVIDENCE_DIR/rollback-dag-barrier.out" \
+        2> "$EVIDENCE_DIR/rollback-dag-barrier.out.stderr" \
+        || ROLLBACK_ACTIVE_DAG_STATUS=$?
+    fi
     ROLLBACK_ACTIVE_PROJECTION_STATUS=0
     source_drain_state "$EVIDENCE_DIR/rollback-active-drain.out" \
       || ROLLBACK_ACTIVE_PROJECTION_STATUS=$?
+    ROLLBACK_ACTIVE_DELEGATION_EVIDENCE="$EVIDENCE_DIR/source-rollback-active-drain-control-receipt.json"
+    if [ "$ROLLBACK_DATABASE_OWNER" != "source" ]; then
+      ROLLBACK_ACTIVE_DELEGATION_EVIDENCE="$EVIDENCE_DIR/rollback-database-owner.out"
+      {
+        echo "database_owner=$ROLLBACK_DATABASE_OWNER"
+        if [ "$ROLLBACK_DATABASE_OWNER" = "candidate" ]; then
+          echo "candidate_env=$CANDIDATE_ENV"
+          echo "candidate_interpreter=$CANDIDATE_PYTHON"
+        fi
+        echo "service_inventory_owner=$ROLLBACK_ACTIVE_DEPLOYMENT_ROOT"
+      } > "$ROLLBACK_ACTIVE_DELEGATION_EVIDENCE"
+    fi
     case "$ROLLBACK_ACTIVE_PROJECTION_STATUS" in
       0)
         ROLLBACK_ACTIVE_RECEIPT_STATUS="completed"
         [ "$ROLLBACK_ACTIVE_DRAIN_STATUS" -eq 0 ] && [ "$ROLLBACK_ACTIVE_DAG_STATUS" -eq 0 ] \
           || ROLLBACK_ACTIVE_RECEIPT_STATUS="failed"
-        write_generation_control_receipt_at \
-          "$ROLLBACK_ACTIVE_CONTROL" "$ROLLBACK_ACTIVE_RELEASE_FILE" \
-          "$STATE_ROOT/install-record.json" "$ROLLBACK_ACTIVE_CONFIG" "$ROLLBACK_ACTIVE_ENV" \
+        write_rollback_active_control_receipt \
           rollback-active-drain "$ROLLBACK_ACTIVE_RECEIPT_STATUS" "$ROLLBACK_ACTIVE_DRAIN_STATUS" \
           "$EVIDENCE_DIR/rollback-active-drain.out" \
           "$EVIDENCE_DIR/rollback-active-drain.out.stderr" \
@@ -4305,14 +4521,12 @@ PY
         if [ "$ROLLBACK_ACTIVE_DRAIN_STATUS" -ne 0 ] || [ "$ROLLBACK_ACTIVE_DAG_STATUS" -ne 0 ]; then
           promotion_step "$ROLLBACK_ID" rollback rollback-drain failed \
             "$EVIDENCE_DIR/rollback-active-drain.out" "$EVIDENCE_DIR/rollback-dag-barrier.out" \
-            "$EVIDENCE_DIR/source-rollback-active-drain-control-receipt.json"
+            "$ROLLBACK_ACTIVE_DELEGATION_EVIDENCE"
           die "the active generation did not acknowledge a settled drain (the admission stays closed)"
         fi
         ;;
       10)
-        write_generation_control_receipt_at \
-          "$ROLLBACK_ACTIVE_CONTROL" "$ROLLBACK_ACTIVE_RELEASE_FILE" \
-          "$STATE_ROOT/install-record.json" "$ROLLBACK_ACTIVE_CONFIG" "$ROLLBACK_ACTIVE_ENV" \
+        write_rollback_active_control_receipt \
           rollback-active-drain closed-not-drained "$ROLLBACK_ACTIVE_DRAIN_STATUS" \
           "$EVIDENCE_DIR/rollback-active-drain.out" \
           "$EVIDENCE_DIR/rollback-active-drain.out.stderr" \
@@ -4324,13 +4538,11 @@ PY
           "$EVIDENCE_DIR/rollback-close.out" "$ROLLBACK_ACTIVE_CONFIG"
         promotion_step "$ROLLBACK_ID" rollback rollback-drain failed \
           "$EVIDENCE_DIR/rollback-active-drain.out" "$EVIDENCE_DIR/rollback-dag-barrier.out" \
-          "$EVIDENCE_DIR/source-rollback-active-drain-control-receipt.json"
+          "$ROLLBACK_ACTIVE_DELEGATION_EVIDENCE"
         die "active, unresolved, or unknown work remains (the admission stays closed)"
         ;;
       *)
-        write_generation_control_receipt_at \
-          "$ROLLBACK_ACTIVE_CONTROL" "$ROLLBACK_ACTIVE_RELEASE_FILE" \
-          "$STATE_ROOT/install-record.json" "$ROLLBACK_ACTIVE_CONFIG" "$ROLLBACK_ACTIVE_ENV" \
+        write_rollback_active_control_receipt \
           rollback-active-drain unknown "$ROLLBACK_ACTIVE_DRAIN_STATUS" \
           "$EVIDENCE_DIR/rollback-active-drain.out" \
           "$EVIDENCE_DIR/rollback-active-drain.out.stderr" \
@@ -4340,32 +4552,69 @@ PY
         cp -- "$EVIDENCE_DIR/rollback-active-drain.out.stderr" "$EVIDENCE_DIR/rollback-close.out.stderr"
         promotion_step "$ROLLBACK_ID" rollback rollback-close unknown \
           "$EVIDENCE_DIR/rollback-close.out" "$ROLLBACK_ACTIVE_CONFIG" \
-          "$EVIDENCE_DIR/source-rollback-active-drain-control-receipt.json"
+          "$ROLLBACK_ACTIVE_DELEGATION_EVIDENCE"
         die "the active rollback close/drain result is unreadable (the admission remains UNKNOWN)"
         ;;
     esac
     promotion_step "$ROLLBACK_ID" rollback rollback-drain completed \
       "$EVIDENCE_DIR/rollback-active-drain.out" "$EVIDENCE_DIR/rollback-dag-barrier.out" \
-      "$EVIDENCE_DIR/source-rollback-active-drain-control-receipt.json"
+      "$ROLLBACK_ACTIVE_DELEGATION_EVIDENCE"
 
     ROLLBACK_ACTIVE_STOP_STATUS=0
-    run_generation_control \
-      "$ROLLBACK_ACTIVE_CONTROL" "$ROLLBACK_RUNNING_PYTHON" inherited \
-      stop --config "$ROLLBACK_ACTIVE_CONFIG" --keep-database \
-      > "$EVIDENCE_DIR/rollback-stop.out" \
-      2> "$EVIDENCE_DIR/rollback-stop.out.stderr" \
-      || ROLLBACK_ACTIVE_STOP_STATUS=$?
+    ROLLBACK_ACTIVE_STOP_DELEGATION_EVIDENCE="$EVIDENCE_DIR/source-rollback-active-stop-control-receipt.json"
+    if [ "$ROLLBACK_DATABASE_OWNER" = "candidate" ]; then
+      ROLLBACK_ACTIVE_STOP_DELEGATION_EVIDENCE="$EVIDENCE_DIR/rollback-database-owner.out"
+      (
+        ENV_FILE="$CANDIDATE_ENV"
+        AIRFLOW_VENV="$CANDIDATE_RUNTIME_VENV"
+        AIRFLOW_HOME="$CANDIDATE_AIRFLOW_HOME"
+        AIRFLOW_HERE="$HERE/../airflow"
+        load_generation_env || exit $?
+        airflow_lifecycle stop-executors || exit $?
+        operator_units_disable || exit $?
+        state="$(systemctl --user is-active \
+          "${ROLLBACK_ACTIVE_DATABASE_UNITS[0]}.service" 2>/dev/null || true)"
+        [ "$state" = "active" ] || exit 1
+      ) > "$EVIDENCE_DIR/rollback-stop.out" \
+        2> "$EVIDENCE_DIR/rollback-stop.out.stderr" \
+        || ROLLBACK_ACTIVE_STOP_STATUS=$?
+    elif [ "$ROLLBACK_DATABASE_OWNER" = "baseline" ]; then
+      ROLLBACK_ACTIVE_STOP_DELEGATION_EVIDENCE="$EVIDENCE_DIR/rollback-service-owner-stop.out"
+      (
+        for ((index=${#ROLLBACK_ACTIVE_SERVICES[@]}-1; index>=0; index--)); do
+          unit="${ROLLBACK_ACTIVE_SERVICES[$index]}"
+          unit_base="${unit%.service}"
+          [ "$unit_base" != "${ROLLBACK_ACTIVE_DATABASE_UNITS[0]}" ] || continue
+          systemctl --user disable --now "$unit_base.service" || exit $?
+        done
+        state="$(systemctl --user is-active \
+          "${ROLLBACK_ACTIVE_DATABASE_UNITS[0]}.service" 2>/dev/null || true)"
+        [ "$state" = "active" ] || exit 1
+      ) > "$EVIDENCE_DIR/rollback-stop.out" \
+        2> "$EVIDENCE_DIR/rollback-stop.out.stderr" \
+        || ROLLBACK_ACTIVE_STOP_STATUS=$?
+      {
+        echo "service_owner=active_pointer"
+        echo "database_owner=candidate"
+        echo "database_unit=${ROLLBACK_ACTIVE_DATABASE_UNITS[0]}"
+      } >> "$ROLLBACK_ACTIVE_STOP_DELEGATION_EVIDENCE"
+    else
+      run_generation_control \
+        "$ROLLBACK_ACTIVE_CONTROL" "$ROLLBACK_RUNNING_PYTHON" inherited \
+        stop --config "$ROLLBACK_ACTIVE_CONFIG" --keep-database \
+        > "$EVIDENCE_DIR/rollback-stop.out" \
+        2> "$EVIDENCE_DIR/rollback-stop.out.stderr" \
+        || ROLLBACK_ACTIVE_STOP_STATUS=$?
+    fi
     if [ "$ROLLBACK_ACTIVE_STOP_STATUS" -ne 0 ]; then
-      write_generation_control_receipt_at \
-        "$ROLLBACK_ACTIVE_CONTROL" "$ROLLBACK_ACTIVE_RELEASE_FILE" \
-        "$STATE_ROOT/install-record.json" "$ROLLBACK_ACTIVE_CONFIG" "$ROLLBACK_ACTIVE_ENV" \
+      write_rollback_active_control_receipt \
         rollback-active-stop failed "$ROLLBACK_ACTIVE_STOP_STATUS" \
         "$EVIDENCE_DIR/rollback-stop.out" "$EVIDENCE_DIR/rollback-stop.out.stderr" \
         stop --config "$ROLLBACK_ACTIVE_CONFIG" --keep-database \
         || die "the active rollback stop receipt could not be written"
       promotion_step "$ROLLBACK_ID" rollback rollback-stop failed \
         "$EVIDENCE_DIR/rollback-stop.out" \
-        "$EVIDENCE_DIR/source-rollback-active-stop-control-receipt.json"
+        "$ROLLBACK_ACTIVE_STOP_DELEGATION_EVIDENCE"
       die "the active generation did not stop its writers (the admission stays closed)"
     fi
     ROLLBACK_ACTIVE_STOP_READBACK_STATUS=0
@@ -4391,28 +4640,51 @@ PY
       fi
     done
     if [ "$ROLLBACK_ACTIVE_DATABASE_SEEN" -ne 1 ] || [ "$ROLLBACK_ACTIVE_STOP_READBACK_STATUS" -ne 0 ]; then
-      write_generation_control_receipt_at \
-        "$ROLLBACK_ACTIVE_CONTROL" "$ROLLBACK_ACTIVE_RELEASE_FILE" \
-        "$STATE_ROOT/install-record.json" "$ROLLBACK_ACTIVE_CONFIG" "$ROLLBACK_ACTIVE_ENV" \
+      write_rollback_active_control_receipt \
         rollback-active-stop failed-post-stop-readback "$ROLLBACK_ACTIVE_STOP_STATUS" \
         "$EVIDENCE_DIR/rollback-stop.out" "$EVIDENCE_DIR/rollback-stop.out.stderr" \
         stop --config "$ROLLBACK_ACTIVE_CONFIG" --keep-database \
         || die "the active rollback stop receipt could not be written"
       promotion_step "$ROLLBACK_ID" rollback rollback-stop failed \
         "$EVIDENCE_DIR/rollback-stop.out" "$EVIDENCE_DIR/rollback-stop-readback.out" \
-        "$EVIDENCE_DIR/source-rollback-active-stop-control-receipt.json"
+        "$ROLLBACK_ACTIVE_STOP_DELEGATION_EVIDENCE"
       die "the active service inventory does not prove stopped writers and a live database"
     fi
-    write_generation_control_receipt_at \
-      "$ROLLBACK_ACTIVE_CONTROL" "$ROLLBACK_ACTIVE_RELEASE_FILE" \
-      "$STATE_ROOT/install-record.json" "$ROLLBACK_ACTIVE_CONFIG" "$ROLLBACK_ACTIVE_ENV" \
+    write_rollback_active_control_receipt \
       rollback-active-stop completed "$ROLLBACK_ACTIVE_STOP_STATUS" \
       "$EVIDENCE_DIR/rollback-stop.out" "$EVIDENCE_DIR/rollback-stop.out.stderr" \
       stop --config "$ROLLBACK_ACTIVE_CONFIG" --keep-database \
       || die "the active rollback stop receipt could not be written"
     promotion_step "$ROLLBACK_ID" rollback rollback-stop completed \
       "$EVIDENCE_DIR/rollback-stop.out" "$EVIDENCE_DIR/rollback-stop-readback.out" \
-      "$EVIDENCE_DIR/source-rollback-active-stop-control-receipt.json"
+      "$ROLLBACK_ACTIVE_STOP_DELEGATION_EVIDENCE"
+    if [ "$ROLLBACK_SCHEMA_STATE_RC:$ROLLBACK_SCHEMA_STATE" = "0:step=completed" ]; then
+      ROLLBACK_FACT_BOUNDARY="$EVIDENCE_DIR/platform-facts-boundary.json"
+      ROLLBACK_FACT_CURRENT="$EVIDENCE_DIR/rollback-platform-facts.json"
+      if [ ! -f "$ROLLBACK_FACT_BOUNDARY" ] \
+          || [ -L "$ROLLBACK_FACT_BOUNDARY" ]; then
+        promotion_step "$ROLLBACK_ID" rollback rollback-database unknown \
+          "$EVIDENCE_DIR/rollback-database-boundary.out"
+        die "the promoted platform fact boundary is missing (the admission stays closed)"
+      fi
+      ROLLBACK_FACT_STATUS=0
+      "$CANDIDATE_PYTHON" "$HERE/recovery.py" facts-boundary \
+        --dsn "$CANDIDATE_SERVICE_DSN" \
+        --out "$ROLLBACK_FACT_CURRENT" \
+        > "$EVIDENCE_DIR/rollback-platform-facts.out" 2>&1 \
+        || ROLLBACK_FACT_STATUS=$?
+      if [ "$ROLLBACK_FACT_STATUS" -ne 0 ]; then
+        promotion_step "$ROLLBACK_ID" rollback rollback-database unknown \
+          "$ROLLBACK_FACT_BOUNDARY" "$EVIDENCE_DIR/rollback-platform-facts.out"
+        die "the platform fact boundary could not be re-read after writers stopped (the admission stays closed)"
+      fi
+      if ! cmp -s -- "$ROLLBACK_FACT_BOUNDARY" "$ROLLBACK_FACT_CURRENT"; then
+        promotion_step "$ROLLBACK_ID" rollback rollback-database failed \
+          "$ROLLBACK_FACT_BOUNDARY" "$ROLLBACK_FACT_CURRENT" \
+          "$EVIDENCE_DIR/rollback-platform-facts.out"
+        die "new terminal business facts exist after the promotion boundary; baseline restore was refused"
+      fi
+    fi
     # The Windows end restores exactly the generation this maintenance bound, then verifies its
     # own health against that generation's release identity.
     if [ -n "$PREVIOUS_GENERATION_DIR" ]; then
