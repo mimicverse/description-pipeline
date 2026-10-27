@@ -122,7 +122,7 @@ class ValidationTests(unittest.TestCase):
         )
         self.assertEqual(resolved["windows"]["tunnel_loopback_port"], platform_config.DEFAULT_TUNNEL_LOOPBACK_PORT)
         self.assertEqual(resolved["retention"], {"unreferenced_evidence_days": None})
-        self.assertEqual(resolved["derived"]["store_root"], "/srv/description-e2e/state/runs")
+        self.assertNotIn("store_root", resolved["derived"])
         self.assertEqual(
             resolved["derived"]["repositories"],
             {"owner/model-repository": "/srv/description-e2e/workspaces/model-repository"},

@@ -514,7 +514,6 @@ class CaptureInputs:
     plan: Mapping[str, Any]
     object_names: tuple[str, ...]
     request_evidence: Mapping[str, Any]
-    historical_native_tool: Mapping[str, Any]
     current_native_tool: Mapping[str, Any]
     native_tool_requirement: ArtifactRef
 
@@ -863,7 +862,6 @@ class CaptureInputs:
             plan=plan,
             object_names=tuple(sorted(active)),
             request_evidence=dict(request_evidence),
-            historical_native_tool=dict(native_tool),
             current_native_tool=dict(current_native_tool),
             native_tool_requirement=requirement,
         )

@@ -5,7 +5,7 @@
 #
 # This script never installs, downloads, edits or repairs anything: a missing or mismatched
 # binary is reported as drift by the caller and the operator is sent to the controlled change
-# entry (install / promote / rollback) that owns the side-effectful preparation.
+# first-install entry that owns the side-effectful preparation.
 set -euo pipefail
 
 binary="${NGINX_BIN:-}"

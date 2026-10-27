@@ -6,6 +6,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import sys
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -124,6 +125,7 @@ def build_runtime(
     config: dict,
     *,
     executors: dict[str, NativeOperationExecutor] | None = None,
+    install_id: str | None = None,
 ) -> NativeOperationRuntime:
     """Compose Discover production execution and any explicitly supplied Capture."""
 
@@ -144,11 +146,27 @@ def build_runtime(
         endpoint_port=config.get("port"),
         capacity_root=config.get("output_root"),
         cad_ownership_file=ownership_file,
+        install_id=install_id,
     )
 
 
 def handler(runtime: NativeOperationRuntime, token: str):
     return native_operation_handler(runtime, token)
+
+
+def installed_install_id(state_root: Path) -> str:
+    """Read the one install identity created by the lifecycle before first start."""
+
+    path = Path(state_root) / "install-id"
+    if path.is_symlink() or not path.is_file():
+        raise PipelineError(f"Installed native identity is missing: {path}")
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError as error:
+        raise PipelineError(f"Cannot read installed native identity: {path}") from error
+    if re.fullmatch(r"win-[0-9a-f]{32}", value) is None:
+        raise PipelineError(f"Installed native identity is malformed: {path}")
+    return value
 
 
 def serve(config_path: Path) -> None:
@@ -158,7 +176,10 @@ def serve(config_path: Path) -> None:
         )
     config = read_config(config_path)
     with contextlib.ExitStack() as stack:
-        runtime = build_runtime(config)
+        runtime = build_runtime(
+            config,
+            install_id=installed_install_id(config["state_root"]),
+        )
         stack.callback(runtime.close)
         server = ThreadingHTTPServer(
             (config["host"], config["port"]),
@@ -201,6 +222,7 @@ __all__ = [
     "CONFIG_SCHEMA",
     "build_runtime",
     "handler",
+    "installed_install_id",
     "main",
     "read_config",
     "serve",

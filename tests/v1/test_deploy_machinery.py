@@ -138,25 +138,17 @@ class DeployMachineryTests(unittest.TestCase):
 
     def test_airflow_installer_refuses_arguments_before_migration(self) -> None:
         installer = DEPLOY / "airflow/install.sh"
-        for arguments in (("unknown",), ("--stage", "extra"), ("--staging",)):
+        for arguments in (("unknown",), ("--stage",), ("--stage", "extra"), ("--staging",)):
             result = self.run_script(installer, *arguments)
             self.assertEqual(result.returncode, 2, arguments)
             self.assertIn("usage:", result.stderr)
             self.assertNotIn("AIRFLOW_VENV", result.stderr)
 
-        for arguments in ((), ("--stage",)):
+        for arguments in ((),):
             result = self.run_script(installer, *arguments)
             self.assertEqual(result.returncode, 1, arguments)
             self.assertIn("AIRFLOW_VENV", result.stderr)
             self.assertNotIn("usage:", result.stderr)
-
-    def test_windows_wrapper_has_no_reconcile_verb(self) -> None:
-        control = (DEPLOY / "operator/operatorctl.sh").read_text(encoding="utf-8")
-        self.assertIn(
-            'if verb not in {"health", "resume", "stage", "promote", "rollback", "status"}:',
-            control,
-        )
-        self.assertNotIn('"rollback", "reconcile", "status"', control)
 
     def test_endpoint_templates_never_ask_for_targets(self) -> None:
         # A8 (6fffdfc): the endpoint configuration refuses a targets key, so no deploy template,
@@ -167,51 +159,12 @@ class DeployMachineryTests(unittest.TestCase):
             sample.write_text('{"schema_version": "solidworks-to-urdf.endpoint/v1", "targets": {}}', encoding="utf-8")
             self.assertEqual(endpoint_template_targets_violations(Path(temporary)), ["sample.json"])
 
-    def test_windows_lifecycle_is_one_bound_script(self) -> None:
-        # The isolated instance has one lifecycle script, one explicit managed-root bootstrap,
-        # and the documented minimal configuration example; the legacy candidate harness and
-        # launcher remain gone.
-        self.assertEqual(
-            {path.name for path in WINDOWS.iterdir() if path.is_file()},
-            {
-                "bootstrap-managed-root.ps1",
-                "endpoint.example.json",
-                "instance-lifecycle.ps1",
-            },
-        )
-        script = (WINDOWS / "instance-lifecycle.ps1").read_text(encoding="utf-8")
-        for marker in (
-            "-Binding",
-            "'stage'",
-            "'promote'",
-            "'rollback'",
-            "'health'",
-            "'status'",
-            "Write-Utf8NoBom",
-            "python.exe",
-            "-I -B -m description_pipeline",
-            "serve --config",
-            "launch_contract",
-            "stage-receipt.json",
-        ):
-            self.assertIn(marker, script)
-        for forbidden in ("description-v1-review", "GH_CONFIG", "description-v1-endpoint", "native-product"):
-            self.assertNotIn(forbidden, script)
-        bootstrap = (WINDOWS / "bootstrap-managed-root.ps1").read_text(encoding="utf-8")
-        for marker in (
-            "ManagedRoot",
-            "ServiceAccount",
-            "S-1-5-18",
-            "S-1-5-32-544",
-            "solidworks-to-urdf.managed-root/v1",
-            "user-approved-administrator-runtime",
-            "Get-ManagedTreeSnapshot",
-            "Assert-ServiceInherited",
-            "PostflightScript",
-        ):
-            self.assertIn(marker, bootstrap)
-        for forbidden in ("description-v1-review", "GH_CONFIG", "description-v1-endpoint", "native-product"):
-            self.assertNotIn(forbidden, bootstrap)
+    def test_windows_deployment_does_not_embed_site_identity(self) -> None:
+        for path in WINDOWS.glob("*.ps1"):
+            text = path.read_text(encoding="utf-8")
+            for forbidden in ("description-v1-review", "GH_CONFIG", "description-v1-endpoint", "native-product"):
+                with self.subTest(file=path.name, forbidden=forbidden):
+                    self.assertNotIn(forbidden, text)
 
     def test_endpoint_example_is_the_documented_minimum(self) -> None:
         path = WINDOWS / "endpoint.example.json"

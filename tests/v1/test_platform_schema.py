@@ -177,7 +177,6 @@ class CanonicalFactSchemaTests(unittest.TestCase):
                     text,
                     rf'CREATE TABLE IF NOT EXISTS :"platform_schema"\.{table}\b',
                 )
-                self.assertIn(f'DROP TABLE IF EXISTS :"platform_schema".{table}', text)
         self.assertIn('CREATE TABLE IF NOT EXISTS :"platform_schema".admission', text)
 
     def test_six_stage_decisions_are_unique_and_never_store_unresolved(self) -> None:
@@ -199,14 +198,9 @@ class CanonicalFactSchemaTests(unittest.TestCase):
         self.assertIn("executor_sha256 char(64) NOT NULL", text)
         self.assertIn("CHECK (owner_sha256 <> executor_sha256)", text)
         self.assertIn("scope IN ('execution', 'transfer_resume')", text)
-        self.assertIn("execution_claim_effect_scope_id_fkey", text)
         self.assertIn("UNIQUE (effect_id, seq)", text)
         self.assertIn("yield_effect_id text", text)
         self.assertIn("closure_code IS NOT DISTINCT FROM 'yielded'", text)
-        self.assertIn(
-            'DROP INDEX IF EXISTS :"platform_schema".execution_claim_one_yield_per_effect',
-            text,
-        )
         self.assertIn(
             "REFERENCES :\"platform_schema\".effect_intent (effect_id)",
             text,

@@ -356,19 +356,11 @@ metadata closure。同一 command/effect 恢复复用原 intent 与 outbound；�
 <a id="recovery"></a>
 ## 状态与恢复
 
-跨代维护调用必须保持代码、解释器、配置和数据权威来自同一被验证代。源端活动、未解决或未知工作未收口时不得以候选空模型继续；legacy facts 必须经已验证归档及事务切换才能离开旧权威，不得伪造为新 canonical 历史。候选 DDL 完成后只能由候选包解释当前 schema；需要恢复源代时，必须先恢复并验明源数据库基线。确认丢失或 schema 身份不明保持关闭／UNKNOWN，不能从 fresh 分类或缺少日志推断没有副作用。上述行为复用既有安装记录、配置快照、维护锁与 promotion/archive 证据，不新增权威副本。
+首次安装只接纳当前固定发行，不提供历史包升级、回滚或跨代委派入口。双端安装身份绑定同一 release version／source_commit／source_sha256，各自配置和安装 ID 独立验证。安装不能静默覆盖现有安装或身份不明残留；失败时保全原件、停止本次写者并关闭准入，清理不得删除工程输入和既有业务事实。
 
-源端 `operator.env` 只是派生物。控制器不得仅比较可同时被修改的配置摘要，也不得用候选推导替换源代规则。配置绑定有两层：snapshot 实际字节 SHA-256 必须等于安装记录的 `snapshot.digest`，源 `platform.json` 原字节 SHA-256 必须等于该 snapshot 的 `sources.platform_json_sha256`。源端派生环境由其自身现有代码、解释器和对应发布字节重新核验。没有源原件时在变更前拒绝，不能从 resolved 内容编码出伪原件。公共命令及其原始 argv 整体交给源代解释，环境开关不能跳过自委派校验，维护锁权威来自继承 FD、inode 与内核 `FLOCK`。
+原始 `platform.json` 字节 SHA-256 必须等于 snapshot 的 `sources.platform_json_sha256`，snapshot 文件 SHA-256 必须等于安装记录的 `snapshot.digest`。派生环境先非执行解析并按当前发行重新派生核验，再消费已验证值。运行工具和 standalone health 共用 reader；实际执行路径、端口和配置路径不得直接信任可变 resolved 文件。包身份通过 `runtime.tool_record()` 的实际 inventory 验证，不以 embedded manifest 替代安装字节检查。
 
-跨代回滚先依据不可变 promotion 阶段与实际对账确定是否跨过候选数据库变更边界。尚未生成 baseline 且候选 DDL 未发生时，由源上下文核验后恢复；已经变更时必须先有可验证 baseline，恢复并验明源 schema 后才能启动源代。边界不明且无可用 baseline 时保持关闭／UNKNOWN，不执行无依据 restore，也不因缺少某个日志推定无副作用。
-
-`schema-migration=completed` 后数据库属主为已验证的候选 package／Python／配置，Linux pointer 尚未切换不改变这一归属；停止服务仍核验实际 unit inventory。DDL／cutover 后、候选启动或对账前，在同一迁移 evidence 冻结 canonical 平台持久业务表的一致快照 fingerprint，排除 admission 控制与 `run_display_metadata`。回滚在写者停止后用同一候选包重读，只有事实边界相同才允许 baseline restore，成功比较的冻结边界、当前事实和读取结果一并进入 completed 恢复证据。schema 阶段 failed／UNKNOWN 时即使封存 baseline 可用也不得覆盖当前库。新增 terminal run、decision、effect 或对账事实、边界缺失或无法证明无写者时均不得覆盖当前数据库；保全事实并记录 failed／UNKNOWN、保持关闭，沿用既有 forward／recovery。另存 archive 本身不授予降级资格。恢复后先由源包验证，再恢复源服务。
-
-派生环境在 shell 加载前必须经非执行解析及所属代的重新派生校验。候选安装包校验复用 `runtime.tool_record()` 的实际文件 inventory，并核对发行 version／source_commit／source_sha256；probe 使用隔离 Python，不能只读取 embedded manifest 声称安装字节一致。
-
-跨代 helper 先按该发行已有 `deployment_files` 验证实际导入闭包，再由绑定的 generation Python 隔离执行；新代静态 environment helper 同样绑定，不要求旧包存在新增文件。运行时不得全量导出 resolved/toolchain 中任意声明，health 与维护使用同一个数据 reader 和各自显式字段投影。任何公共命令在消费 resolved 前都必须由活动代的 renderer 复算完整 map，包括控制入口与当前代相同的路径；standalone health 在执行 `NGINX_BIN` 前还必须核对其与实际 proxy unit 的绑定。
-
-候选对账要求同一 promotion 的 `close-admission`、`drain`、`stop-services`、`backup`、`schema-migration` 均为已验证的 completed，并消费迁移阶段 evidence-map 唯一绑定的冻结事实边界。对账不执行 DDL，也不新增 reconcile/schema-migration。回滚同样从已验证阶段映射读取冻结边界，不把可变工作文件当作恢复基准。
+维护命令通过实际文件锁互斥，不使用 PID 活性或环境开关授予控制权。业务 `reconcile` 只观察当前不可变 command/effect，不执行部署迁移、不创建运行、不切换历史数据库。未知结果保持 UNKNOWN 并对账，不能以重装或空数据库冒充恢复。当前版本业务数据备份与灾难恢复保留，删除其中对历史 promotion、previous 和跨代 journal 的依赖。以下业务状态、重试及资源释放约束继续适用。
 
 `project_stage_status` 与 `project_run_status` 是唯一业务状态投影。它们只消费
 canonical facts 的真实阶段 decision/effect 以及实际 Airflow task/DagRun 关联；
@@ -479,9 +471,7 @@ application 按原 intent 的 `effect_kind` 选择。该 registry 不接受
 bytes 只从当前 `by_stage` 的 immutable `ArtifactRef.producer_run_id`、member record
 与 materialized CAS bytes 得到。旧 `platform.storage` filesystem writer/URI
 resolver、discovery reconstruction builder、receipt 与 seal/confirm API 已删除。
-Historical recovery 只保留 `validate_native_discovery_stage` 纯 validator；
-`tools/migrate_historical_capture_input.py` 通过 `ArtifactStore.seal_tree()` 生成受控
-diagnostic artifacts，不读取或写入旧 filesystem checkpoint 表示。
+
 
 三类外部 observer 均只做查询：
 
@@ -511,14 +501,9 @@ command 仅在尚无可复用唯一 `StageDecision` 时作为中断命令由共�
 
 ### 灾难恢复
 
-备份绑定固定发行、配置、安装身份及源目录清单。整个维护窗口持有同一排他锁：先关闭准入、排空并停止受支持的 Linux/Airflow 写者和 Windows 原生任务，再对保持运行的 PostgreSQL 建立一致快照，完成文件封存、加密归档、清单核验和收据。受支持的启动、对账及切代操作不能在该窗口内重新启用写者；前后状态相同或数据库 advisory lock 本身不能证明这一点。
+备份绑定固定发行、配置、安装身份及源目录清单。整个维护窗口持有同一排他锁：先关闭准入、排空并停止受支持的 Linux/Airflow 写者和 Windows 原生任务，再对保持运行的 PostgreSQL 建立一致快照，完成文件封存、加密归档、清单核验和收据。受支持的启动及对账操作不能在该窗口内重新启用写者；前后状态相同或数据库 advisory lock 本身不能证明这一点。
 
-恢复清单只接受 `solidworks-to-urdf.recovery-manifest/v7`，来源选择只接受
-`solidworks-to-urdf.recovery-selection/v2`，目标计划只接受
-`solidworks-to-urdf.recovery-target/v3`，快照工作进程使用 v5 协议。旧恢复清单、
-来源选择、目标计划及更早协议在创建状态目录、解包或写入目标之前明确拒绝；保留原件，
-不迁移、不兼容重解释。目标计划必须绑定清单摘要，以及同一 selection、canonical
-fact-root 和来源范围摘要。
+恢复清单、来源选择和目标计划只接受当前发行声明的精确契约。未知字段、旧格式和不明协议在创建状态目录、解包或写入目标之前拒绝，不提供历史格式转换。
 
 平台与 Airflow 共用数据库的全表、完整目录、角色、成员关系、权限、配置和 sequence
 状态，以及冻结原件、发行、工作区重建材料与秘密文件，均须进入同一可核验恢复计划。
@@ -538,78 +523,7 @@ workspace 和 typed `retained_locations`。每个引用都必须命中原不可�
 candidate、effect ledger 与 claim/fence 身份；未知外部结果仍须经过精确 observation
 或 reconciliation，不能由恢复动作重发。未决活动的排空门仍然有效，不能借归档绕过对账。
 
-旧 `request/run/stage/operation/run_event` 五表的删除只能在维护排空与所有支持写者
-停止形成的一致性边界内执行。切换回执不得由任意文件 hash 或自报 `verified` 代替：
-它须绑定真实 source database、platform schema、精确 DDL/ACL、每张表的完整 rows、
-未决 command/effect/native 关联、逐成员大小与 SHA-256、成员摘要集合的 aggregate
-digest，以及同一回执对应的独立 restore/读取复核结果和切换操作身份。错源、缺表、
-遗漏未决事实、rows/DDL/ACL/digest 不符、维护快照后并发变化、缺失 restore 证据或
-回执自报与原件矛盾均拒绝。
-
-固定 archive schema 与 evidence schema 分别为
-`solidworks-to-urdf.legacy-lifecycle-archive/v3` 和
-`solidworks-to-urdf.legacy-lifecycle-evidence/v3`。receipt 拒绝缺项、额外字段与旧
-v1 数据，精确字段为
-`schema_version/archive_sha256/cluster_system_identifier/database_name/database_oid/
-migration_role/platform_schema/platform_schema_oid/evidence_sha256/manifest_sha256/
-server_version_num/database_encoding/database_locale_metadata_version/
-database_locale_provider/database_locale_provider_source/database_collate/database_ctype/
-database_icu_locale/database_icu_rules/database_collation_binding/
-database_collation_binding_source/database_collation_version/
-database_collation_version_source/database_collation_actual_version/
-database_collation_actual_version_source`。
-cluster 身份取 `pg_control_system().system_identifier`，database 与 schema 身份取 OID，
-host、socket 和 port 只作为连接 locator。archive manifest 逐成员记录 `kind/bytes/sha256`
-并覆盖 `evidence.json/platform.dump/schema.sql/toc.txt`，且 manifest、evidence 和 archive
-分别与 receipt 的对应摘要绑定。
-
-PostgreSQL 14 从源 `pg_database` 读取 encoding、`datcollate` 与 `datctype`，provider
-明确记录为从 PG14 database-default libc 语义推导的 `libc`。非 C locale 必须绑定精确
-`pg_collation` libc 定义，并使 recorded 与 actual collation version 相等；稳定 C-family
-locale 无精确 named row 时，才可使用 PG14 default catalog collation OID 100 并记录该
-推导。PostgreSQL 16 的 provider、ICU locale/rules、binding、recorded version 与 actual
-version 也必须按 catalog 原值记录。未知 provider、缺项、版本漂移、非稳定 C 的缺失版本或
-无法复现的源 locale 均拒绝。
-
-归档和复核使用 `search_path=pg_catalog` 以及固定 UTC、ISO/YMD、postgres interval、
-hex bytea 和三位额外浮点输出。`schema.sql` 是 platform 与 Airflow schema 的完整 plain
-schema-only dump；receipt verification 必须在维护窗口内重新生成 live schema-only SQL，
-与归档逐字节相同，再比较整个 evidence。SQL literal、comment、default、constraint、
-index、trigger、policy 与 view definition 不得经 schema 名替换或普通化；schema 名统一
-由 `pg_control_system` search path 下 PostgreSQL 自身 deparse。PG14 plain dump 外部
-随机 `\restrict`/`\unrestrict` token 只允许在严格配对和文档边界核验后作比较规范化，SQL
-literal、comment、default、constraint、index、trigger、policy、view definition 与 dump
-内容不得改写。独立 restore 的 `initdb` 与
-`createdb --template=template0` 必须使用源 encoding、provider、locale、ctype、ICU
-locale/rules 及版本参数，不能硬编码 UTF8/C 或 `--no-locale`；restored identity 的全部
-locale 字段与 actual version 必须等于源，否则拒绝。比较 schema catalog、functions、
-types、sequences、relations、Airflow relations、unresolved facts 及完整 schema/ACL SQL。
-relation row evidence 使用显式 `COLLATE "C"` 排序以获得稳定摘要；测试另行证明源默认
-collation 与显式 C 排序确实不同且 restore 后源默认顺序恢复，单行、多行与多字节值不得在
-两种环境间改变接受结果。archive 前后 live evidence 变化或 restore 仅在单行/多行之间
-出现不同接受结果均拒绝。
-
-`apply.sh --legacy-archive-receipt <receipt>` 必须先由同一合同验证该 typed receipt，
-再允许 schema 删除；仅检查“receipt 文件 hash 是 64 hex”不构成保全。删除不得使用
-`CASCADE`，任何遗漏 view、grant 或其他依赖必须显式失败并保留目标。该规则不允许为
-迁移方便保留永久旧 Store 或静默遗失未决事实，也不扩大部署及现场权限。
-
-真正切换在一个 serializable 事务内完成：持有维护 `flock`，锁住 PostgreSQL
-catalog、platform/Airflow 全部表以及相关 namespace/rewrite/procedure 行，再次以
-locked live evidence 验证 receipt、archive 与 independent restore。事务把 receipt 身份
-写入本地 `description.legacy_*` settings，只在事务内收窄到 migration role，然后执行
-schema/views/roles 并核对精确 canonical relations、唯一允许函数、无额外 user type 或
-sequence；任一错误整体回滚。archive 创建、receipt 发布和 cutover 均是本次操作的新文件
-与原子替换，不覆盖另一 cluster/database/schema 的已有 receipt。
-
-正式部署数据库版本由 `install_postgres.sh` 和 `recovery.py` 的默认 PostgreSQL 14
-约束决定。PostgreSQL 16 的 CI/pgserver 结果只证明带 `postgres16` 标签的测试范围，
-不扩展正式支持版本；任何仅依赖 16 的 catalog 行为、目录结构或 SQL 必须拒绝。最终
-发行必须在部署目标的 PostgreSQL 14 上重新执行 archive、independent restore、
-wrong-target rejection、fresh apply 与 cutover，并以实际 `PG_VERSION`、server version、
-encoding 和 collation identity 绑定证据。
-
-状态闭包包含固定配置、全部小型 install-records、snapshots 和 derived，以及当前和直接上一代 journal 实际引用的精确文件。journal 必须通过正式记录契约，逐条追踪 promotion receipt、from/to、release manifest、步骤 evidence/digest 和 evidence-map 的 source/snapshot；校验身份、路径、摘要、类型及权限并按原路径恢复。promotions 不递归复制，历史密文 `backup.tar.enc` 不归档。更早代记录仅作为元数据保留，不授予历史运行或回滚资格；缺少证据不得激活，普通回滚需要已排除密文时必须在副作用前拒绝。finalize 启动服务前重新核验完整 typed journal 与清单、目标计划、恢复收据和 marker 的同源绑定。
+状态闭包只包含当前安装记录、其配置 snapshot 和必要派生文件，以及数据库事实引用的原件。恢复绑定同一发行，逐项核验路径、类型、权限与摘要，不保存历史晋升链或历史运行包。启动前复核恢复收据、目标计划与实际双端身份。
 
 MVCC 快照不能代替非事务 sequence 和文件的一致性保护。秘密保存在受控加密归档中，外部解密密钥独立保管；日志不输出秘密值。封存验证逐成员读取完整解密流并校验路径、类型、大小、模式和 SHA-256，不创建第三份完整解密树；重复、缺失、额外、链接、特殊类型、截断及解密失败均拒绝。容量按实际选中数据、数据库估计、目标文件系统及安全余量计算，备份与恢复分别核算，不能写死现场容量。
 

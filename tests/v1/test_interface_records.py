@@ -123,7 +123,6 @@ def config_snapshot() -> dict:
             "specifications": {"record_roots": ["/srv/description/specifications"]},
             "retention": {"unreferenced_evidence_days": None},
             "derived": {
-                "store_root": "/srv/description/state/runs",
                 "repositories": {"owner/model-repository": "/srv/description/workspaces/model-repository"},
                 "discovery": {"record_roots": ["/srv/description/specifications"]},
             },
@@ -132,8 +131,8 @@ def config_snapshot() -> dict:
     }
 
 
-def install_record(*, previous: bool = False, journal: list | None = None) -> dict:
-    generation = "gen-2" if previous else "gen-1"
+def install_record() -> dict:
+    generation = "gen-1"
     _SNAPSHOT_FILE.write_text(json.dumps(config_snapshot()), encoding="utf-8")
     _SNAPSHOT_FILE.chmod(0o600)
     snapshot_digest = hashlib.sha256(_SNAPSHOT_FILE.read_bytes()).hexdigest()
@@ -167,25 +166,6 @@ def install_record(*, previous: bool = False, journal: list | None = None) -> di
                 ).to_record(),
             },
         },
-        "previous": None
-        if not previous
-        else {
-            "release": release(),
-            "config": {"path": "/srv/description/state/snapshots/gen-1.json", "digest": OTHER_HEX},
-            "record": "/srv/description/state/install-record-gen-1.json",
-        },
-        "journal": journal
-        if journal is not None
-        else [
-            {
-                "seq": 1,
-                "verb": "promote",
-                "step": "admission_close",
-                "status": "completed",
-                "at": TS,
-                "evidence": ["receipts/promote-1.json"],
-            }
-        ],
     }
     return record
 
@@ -255,7 +235,6 @@ class B4FixSingleVariableTests(unittest.TestCase):
         ir.validate_health(health(False))
         ir.validate_config_snapshot(config_snapshot())
         ir.validate_delivery_manifest(manifest())
-        ir.validate_install_record(install_record(previous=True), previous_required=True)
         ir.validate_resource_policy(ir.RESOURCE_POLICY_V1)
         self.assertEqual(ir.RESOURCE_POLICY_V1["limits"]["max_upload_bytes"], uploads.MAX_BODY_BYTES)
         self.assertEqual(
@@ -428,7 +407,7 @@ class B4FixSingleVariableTests(unittest.TestCase):
                 self.assert_rejected_by_one_change(ir.validate_delivery_manifest, manifest_positive, mutate, code)
 
     def test_install_and_release_single_variable_negatives(self) -> None:
-        positive = install_record(previous=True)
+        positive = install_record()
         cases = (
             (
                 "windows release commit differs",
@@ -448,11 +427,6 @@ class B4FixSingleVariableTests(unittest.TestCase):
             (
                 "snapshot generation differs from record",
                 lambda r: r["snapshot"].__setitem__("install_id", "other"),
-                "install_record_invalid",
-            ),
-            (
-                "journal step without evidence",
-                lambda r: r["journal"][0].__setitem__("evidence", []),
                 "install_record_invalid",
             ),
         )
@@ -600,6 +574,7 @@ class InterfaceRecordTests(unittest.TestCase):
         all_empty = config_snapshot()
         all_empty["resolved"] = {key: {} for key in all_empty["resolved"]}
         self.reject("config_snapshot_invalid", lambda: ir.validate_config_snapshot(all_empty))
+
     def test_config_identity_shape_legacy_and_file_checks(self) -> None:
         reference = {
             "schema_version": CONFIG_SNAPSHOT_SCHEMA,
@@ -706,9 +681,8 @@ class InterfaceRecordTests(unittest.TestCase):
         bad["generated_at"] = "2026-13-01T09:00:00Z"
         self.reject("config_snapshot_invalid", lambda: ir.validate_config_snapshot(bad))
 
-    def test_install_record_ends_and_journal_rules(self) -> None:
+    def test_install_record_end_identity_rules(self) -> None:
         ir.validate_install_record(install_record())
-        ir.validate_install_record(install_record(previous=True), previous_required=True)
         # Per-end config digests differ and are never compared; the common release
         # identity triple is compared across ends (role excluded).
         different_ends = install_record()
@@ -746,17 +720,8 @@ class InterfaceRecordTests(unittest.TestCase):
         bad["ends"].pop("windows")
         self.reject("install_record_invalid", lambda: ir.validate_install_record(bad))
         bad = install_record()
-        bad["journal"][0]["evidence"] = []
-        self.reject("install_record_invalid", lambda: ir.validate_install_record(bad))
-        bad = install_record()
-        bad["journal"][0]["seq"] = 2
-        self.reject("install_record_invalid", lambda: ir.validate_install_record(bad))
-        bad = install_record()
         bad["snapshot"]["token"] = "secret"
         self.reject("install_record_invalid", lambda: ir.validate_install_record(bad))
-        self.reject(
-            "install_record_invalid", lambda: ir.validate_install_record(install_record(), previous_required=True)
-        )
 
     def test_endpoint_matches_install_record_helper(self) -> None:
         record = install_record()
@@ -817,9 +782,7 @@ class InterfaceRecordTests(unittest.TestCase):
         _SNAPSHOT_FILE.write_text(json.dumps(snapshot), encoding="utf-8")
         port_follow = copy.deepcopy(payload)
         port_follow["endpoint"]["port"] = 9999
-        self.reject(
-            "config_identity_mismatch", lambda: ir.require_endpoint_matches_install_record(port_follow, record)
-        )
+        self.reject("config_identity_mismatch", lambda: ir.require_endpoint_matches_install_record(port_follow, record))
 
         snapshot = json.loads(original)
         snapshot["install_id"] = "gen-9"
@@ -878,7 +841,7 @@ class InterfaceRecordTests(unittest.TestCase):
         }
         self.assertFalse(imported & {"socket", "ssl", "http", "urllib", "subprocess", "requests"})
         with mock.patch("socket.socket", side_effect=AssertionError("no network in validation")):
-            ir.validate_install_record(install_record(previous=True))
+            ir.validate_install_record(install_record())
 
     def test_delivery_manifest_subject_records(self) -> None:
         manifest_value = manifest()
@@ -912,22 +875,19 @@ class InterfaceRecordTests(unittest.TestCase):
         self.reject("delivery_manifest_invalid", lambda: ir.validate_delivery_manifest(bad))
 
     def test_delivery_manifest_policy_reader_boundary(self) -> None:
-        historical = "415813b06c4b379fbbc1b5c6ea4c3fd56cf96c6ad8bfa103eaae03326de2b7c4"
         manifest_value = manifest()
-        manifest_value["policy"]["digest"] = historical
-        self.reject("delivery_manifest_policy_mismatch", lambda: ir.validate_delivery_manifest(manifest_value))
-        ir.validate_recovery_delivery_manifest(manifest_value)
+        ir.validate_delivery_manifest(manifest_value)
         unknown = copy.deepcopy(manifest_value)
         unknown["policy"]["digest"] = OTHER_HEX
         self.reject(
             "delivery_manifest_policy_mismatch",
-            lambda: ir.validate_recovery_delivery_manifest(unknown),
+            lambda: ir.validate_delivery_manifest(unknown),
         )
         wrong_contract = copy.deepcopy(manifest_value)
         wrong_contract["contract"]["digest"] = OTHER_HEX
         self.reject(
             "delivery_manifest_invalid",
-            lambda: ir.validate_recovery_delivery_manifest(wrong_contract),
+            lambda: ir.validate_delivery_manifest(wrong_contract),
         )
 
     def test_source_record_identity_binding(self) -> None:
@@ -1002,9 +962,7 @@ class QualificationKeyTests(unittest.TestCase):
             record = root / "input/handoff.json"
             record.write_bytes(b"sealed input")
             item = self._item(
-                evidence=[
-                    {"record": "input/handoff.json", "sha256": hashlib.sha256(b"sealed input").hexdigest()}
-                ]
+                evidence=[{"record": "input/handoff.json", "sha256": hashlib.sha256(b"sealed input").hexdigest()}]
             )
             ir.validate_qualification(item, resolve=root)
             record.write_bytes(b"tampered input")

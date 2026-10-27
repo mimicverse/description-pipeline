@@ -23,6 +23,7 @@ from description_pipeline.sources.solidworks.scene import (  # noqa: E402
     _PartReading,
     build_scene,
     identity_matrix,
+    material_unverified,
 )
 from . import support  # noqa: E402
 from .support import compose_fixture_link_reads  # noqa: E402
@@ -46,7 +47,14 @@ def _part_payload(mass, com=(0.0, 0.0, 0.0)):
         "mass": mass,
         "com": list(com),
         "inertia": [[1e-6, 0.0, 0.0], [0.0, 1e-6, 0.0], [0.0, 0.0, 1e-6]],
-        "reference": {"used_api": "fixture", "product_convention": "solidworks_standard"},
+        "reference": {
+            "used_api": "fixture",
+            "product_convention": "solidworks_standard",
+            "material_assignment": {
+                "part": {"name": "Alloy Steel", "database": "SolidWorks Materials"},
+                "bodies": [{"material": {}, "effective_source": "part"}],
+            },
+        },
     }
 
 
@@ -58,6 +66,7 @@ def _flags(**active):
 
 def _effective_reading(mass, com, *, role, document_type, name):
     return {
+        "mode": "effective_instance",
         "role": role,
         "document_type": document_type,
         "mass": mass,
@@ -150,6 +159,36 @@ class EffectiveInstanceSceneTests(unittest.TestCase):
             DEV, _placement((0.1, 0.0, 0.0)), _part_payload(0.035, (0.01, 0.0, 0.0)), IDENTITY, (0.0, 0.0, 0.0)
         )
         self.assertEqual(reading.assembly_com, (0.11, 0.0, 0.0))
+
+    def test_part_mass_requires_material_assignment(self):
+        payload = _part_payload(0.035)
+        payload["reference"].pop("material_assignment")
+        with self.assertRaisesRegex(ConfigError, "material assignment"):
+            material_unverified(payload)
+
+    def test_part_mass_requires_material_body_coverage(self):
+        payload = _part_payload(0.035)
+        payload["reference"]["material_assignment"]["bodies"] = []
+        with self.assertRaisesRegex(ConfigError, "body coverage"):
+            material_unverified(payload)
+
+    def test_part_mass_rejects_unknown_unverified_reason(self):
+        payload = _part_payload(0.035)
+        payload["reference"]["material_assignment"] = {
+            "unverified_reason": "cad_material_read_failed",
+        }
+        with self.assertRaisesRegex(ConfigError, "unsupported unverified reason"):
+            material_unverified(payload)
+
+    def test_effective_instance_material_assignment_is_explicitly_exempt(self):
+        payload = _effective_reading(
+            0.026,
+            (0.01, 0.02, 0.03),
+            role="leaf",
+            document_type="part",
+            name=EASYEDA,
+        )
+        self.assertFalse(material_unverified(payload))
 
     def _scene(self, notes):
         dev_payload = _part_payload(0.035, (0.001, 0.0, 0.0))

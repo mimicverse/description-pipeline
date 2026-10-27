@@ -441,7 +441,17 @@ def mass_payload(
         "mass": float(mass),
         "com": [float(value) for value in com],
         "inertia": tensor,
-        "reference": {"used_api": "fixture", "product_convention": "solidworks_standard"},
+        "reference": {
+            "used_api": "fixture",
+            "product_convention": "solidworks_standard",
+            "material_assignment": {
+                "part": {
+                    "name": "Alloy Steel",
+                    "database": "SolidWorks Materials",
+                },
+                "bodies": [{"material": {}, "effective_source": "part"}],
+            },
+        },
     }
 
 

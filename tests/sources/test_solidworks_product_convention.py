@@ -161,9 +161,12 @@ class ProductConventionTests(unittest.TestCase):
             (0.01, -0.02, 0.03) if component == "base-1" else (0.015, 0.005, 0.055),
             entry["tensor"].tolist(),
         )
-        reference: dict = {"used_api": "IMassProperty2.GetMomentOfInertia(0)"}
+        reference = dict(payload["reference"])
+        reference["used_api"] = "IMassProperty2.GetMomentOfInertia(0)"
         if convention is not None:
             reference["product_convention"] = convention
+        else:
+            reference.pop("product_convention", None)
         payload["reference"] = reference
         return payload
 

@@ -160,7 +160,7 @@ class PlatformEnvTests(unittest.TestCase):
         self.assertEqual(env["AIRFLOW_HOME"], str(self.root / "state" / "airflow-home"))
         self.assertEqual(env["POSTGRES_ROOT"], str(self.root / "state" / "airflow-pg"))
         self.assertEqual(env["PIPELINE_WHEEL"], str(self.wheel))
-        self.assertEqual(env["PIPELINE_STORE_ROOT"], str(self.root / "state" / "runs"))
+        self.assertNotIn("PIPELINE_STORE_ROOT", env)
         self.assertEqual(env["FEISHU_TENANT_KEYS"], "tenant-a,tenant-b")
         self.assertEqual(env["FEISHU_ADMIN_OPEN_IDS"], "ou_admin")
         self.assertEqual(env["SOLIDWORKS_ENDPOINT_PORT"], "9765")
@@ -368,9 +368,6 @@ class PlatformEnvTests(unittest.TestCase):
         collision = json.loads(json.dumps(self.snapshot))
         collision["resolved"]["windows"]["tunnel_loopback_port"] = 9443
         cases.append(("origin port collision", collision, "gen-1"))
-        outside = json.loads(json.dumps(self.snapshot))
-        outside["resolved"]["derived"]["store_root"] = "/elsewhere/runs"
-        cases.append(("store root outside state", outside, "gen-1"))
         for label, snapshot, install_id in cases:
             with self.subTest(label):
                 before = tree_digest(state)

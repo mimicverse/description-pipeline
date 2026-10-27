@@ -10,31 +10,22 @@
 #
 # Rerunning is safe: the existing Fernet key and [api_auth] jwt_secret in
 # $AIRFLOW_HOME/airflow.cfg are preserved (see render_config.py).
-#
-#   install.sh --stage:  build and verify the generation's runtime only (venv, hash-locked
-#                        dependencies, doctor); no configuration switch and no migration -
-#                        the stage half of the promote protocol.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 die() { echo "install.sh: $*" >&2; exit 1; }
 
-if [ "$#" -gt 1 ] || { [ "$#" -eq 1 ] && [ "$1" != "--stage" ]; }; then
-  echo "usage: $0 [--stage]" >&2
+if [ "$#" -ne 0 ]; then
+  echo "usage: $0" >&2
   exit 2
 fi
-MODE="${1:-}"
 
 : "${AIRFLOW_VENV:?set AIRFLOW_VENV to the private venv path}"
 : "${AIRFLOW_HOME:?set AIRFLOW_HOME to the Airflow home directory}"
 : "${PIPELINE_WHEEL:?set PIPELINE_WHEEL to the built mimicverse_description wheel}"
-if [ "$MODE" != "--stage" ]; then
-  # Normal installation renders the managed config and migrates the live database; refuse
-  # missing connection/port inputs here, before creating the venv or running pip.
-  : "${AIRFLOW_DB_URL:?set AIRFLOW_DB_URL to the dedicated PostgreSQL DSN}"
-  : "${AIRFLOW_RUNTIME_DB_URL:?set AIRFLOW_RUNTIME_DB_URL to the least-privilege runtime DSN}"
-  : "${AIRFLOW_API_PORT:?set AIRFLOW_API_PORT to the Airflow api-server loopback port}"
-fi
+: "${AIRFLOW_DB_URL:?set AIRFLOW_DB_URL to the dedicated PostgreSQL DSN}"
+: "${AIRFLOW_RUNTIME_DB_URL:?set AIRFLOW_RUNTIME_DB_URL to the least-privilege runtime DSN}"
+: "${AIRFLOW_API_PORT:?set AIRFLOW_API_PORT to the Airflow api-server loopback port}"
 
 for pair in "AIRFLOW_VENV:$AIRFLOW_VENV" "AIRFLOW_HOME:$AIRFLOW_HOME" "PIPELINE_WHEEL:$PIPELINE_WHEEL"; do
   name="${pair%%:*}" value="${pair#*:}"
@@ -78,11 +69,6 @@ INSTALLED_AIRFLOW_VERSION="$("$AIRFLOW_VENV/bin/airflow" version 2>/dev/null)"
   || die "expected Airflow 3.3.2, found: ${INSTALLED_AIRFLOW_VERSION:-unknown}"
 "$AIRFLOW_VENV/bin/airflow" triggerer --help >/dev/null \
   || die "the pinned Airflow runtime has no triggerer command"
-
-if [ "$MODE" = "--stage" ]; then
-  echo "Airflow runtime staged (no configuration switch, no migration): $INSTALLED_AIRFLOW_VERSION"
-  exit 0
-fi
 
 # Atomic 0600 config; preserves previously generated Fernet/JWT secrets on rerun.
 AIRFLOW_DB_URL="$AIRFLOW_DB_URL" AIRFLOW_API_PORT="$AIRFLOW_API_PORT" "$AIRFLOW_VENV/bin/python" "$HERE/render_config.py" \

@@ -102,7 +102,6 @@ class ConfigIdentityIntegrationTests(unittest.TestCase):
                 config.base_url,
                 f"http://127.0.0.1:{document['resolved']['windows']['tunnel_loopback_port']}",
             )
-            self.assertEqual(config.store_root, Path(document["resolved"]["derived"]["store_root"]))
             self.assertEqual(config.targets, document["resolved"]["targets"])
             self.assertEqual(config.handoff_roots, (Path(document["resolved"]["storage"]["handoff_root"]),))
             self.assertEqual(
@@ -171,7 +170,7 @@ class ConfigIdentityIntegrationTests(unittest.TestCase):
                 "host": "127.0.0.1",
                 "port": 18765,
                 "password": "t" * 64,
-                "extra": {"store_root": str(root / "runs")},
+                "extra": {"legacy": True},
             }
             with _patch_connection(legacy), self.assertRaisesRegex(
                 EndpointProtocolError, "config_identity_legacy"

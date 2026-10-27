@@ -361,8 +361,6 @@ class RealSixStageChainTests(unittest.TestCase):
             path = self.root / name
             path.mkdir(exist_ok=True)
             paths[name] = path
-        derived_runs = paths["state"] / "runs"
-        derived_runs.mkdir(exist_ok=True)
         repository = paths["workspace-root"] / "robot"
         if not repository.exists():
             shutil.copytree(self.publish.repo, repository)
@@ -414,7 +412,6 @@ class RealSixStageChainTests(unittest.TestCase):
                 },
                 "retention": {"unreferenced_evidence_days": None},
                 "derived": {
-                    "store_root": str(derived_runs),
                     "repositories": {
                         "mimicverse/robot": str(repository),
                     },
@@ -485,8 +482,6 @@ class RealSixStageChainTests(unittest.TestCase):
                     "target_identity": self.native_target.to_record(),
                 },
             },
-            "previous": None,
-            "journal": [],
         }
         write_json(state_root / "install-record.json", record)
 

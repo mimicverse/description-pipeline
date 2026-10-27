@@ -7,7 +7,6 @@
     "token_file": "@ENDPOINT_TOKEN_FILE@"
   },
   "pipeline": {
-    "store_root": "@PIPELINE_STORE_ROOT@",
     "repositories": @MODEL_REPOSITORIES_JSON@,
     "targets": @MODEL_TARGETS_JSON@,
     "discovery": @DISCOVERY_SETTINGS_JSON@

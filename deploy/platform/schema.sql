@@ -92,6 +92,22 @@ CREATE TABLE IF NOT EXISTS :"platform_schema".command_input_artifact (
     UNIQUE (command_id, position)
 );
 
+CREATE TABLE IF NOT EXISTS :"platform_schema".effect_intent (
+    effect_id text PRIMARY KEY,
+    command_id text NOT NULL REFERENCES :"platform_schema".command (command_id),
+    effect_key text NOT NULL,
+    effect_kind text NOT NULL CHECK (
+        effect_kind IN ('airflow_dispatch', 'native_operation', 'git_ref_update', 'pr_upsert')
+    ),
+    target jsonb NOT NULL,
+    expected_state jsonb NOT NULL,
+    expected_state_digest char(64) NOT NULL CHECK (expected_state_digest ~ '^[0-9a-f]{64}$'),
+    outbound_artifact_id text NOT NULL REFERENCES :"platform_schema".artifact (artifact_id),
+    outbound_digest char(64) NOT NULL CHECK (outbound_digest ~ '^[0-9a-f]{64}$'),
+    created_at timestamptz NOT NULL,
+    UNIQUE (command_id, effect_key)
+);
+
 CREATE TABLE IF NOT EXISTS :"platform_schema".execution_claim (
     claim_id text PRIMARY KEY,
     command_id text NOT NULL REFERENCES :"platform_schema".command (command_id),
@@ -101,7 +117,7 @@ CREATE TABLE IF NOT EXISTS :"platform_schema".execution_claim (
     scope text NOT NULL DEFAULT 'execution' CHECK (
         scope IN ('execution', 'transfer_resume')
     ),
-    effect_scope_id text,
+    effect_scope_id text REFERENCES :"platform_schema".effect_intent (effect_id),
     lane_key text,
     dag_id text,
     dag_run_id text,
@@ -111,7 +127,7 @@ CREATE TABLE IF NOT EXISTS :"platform_schema".execution_claim (
     last_seen_at timestamptz NOT NULL,
     expires_at timestamptz NOT NULL,
     closed_at timestamptz,
-    yield_effect_id text,
+    yield_effect_id text REFERENCES :"platform_schema".effect_intent (effect_id),
     closure_code text CHECK (
         closure_code IS NULL
         OR closure_code IN (
@@ -128,6 +144,7 @@ CREATE TABLE IF NOT EXISTS :"platform_schema".execution_claim (
     CHECK (
         (scope = 'transfer_resume') = (effect_scope_id IS NOT NULL)
     ),
+    CHECK ((closure_code IS NOT DISTINCT FROM 'yielded') = (yield_effect_id IS NOT NULL)),
     CHECK (expires_at >= issued_at)
 );
 
@@ -193,22 +210,6 @@ CREATE TABLE IF NOT EXISTS :"platform_schema".stage_candidate (
     CHECK (outcome = 'completed' OR reason_code IS NOT NULL)
 );
 
-CREATE TABLE IF NOT EXISTS :"platform_schema".effect_intent (
-    effect_id text PRIMARY KEY,
-    command_id text NOT NULL REFERENCES :"platform_schema".command (command_id),
-    effect_key text NOT NULL,
-    effect_kind text NOT NULL CHECK (
-        effect_kind IN ('airflow_dispatch', 'native_operation', 'git_ref_update', 'pr_upsert')
-    ),
-    target jsonb NOT NULL,
-    expected_state jsonb NOT NULL,
-    expected_state_digest char(64) NOT NULL CHECK (expected_state_digest ~ '^[0-9a-f]{64}$'),
-    outbound_artifact_id text NOT NULL REFERENCES :"platform_schema".artifact (artifact_id),
-    outbound_digest char(64) NOT NULL CHECK (outbound_digest ~ '^[0-9a-f]{64}$'),
-    created_at timestamptz NOT NULL,
-    UNIQUE (command_id, effect_key)
-);
-
 CREATE TABLE IF NOT EXISTS :"platform_schema".effect_fact (
     fact_id text PRIMARY KEY,
     effect_id text NOT NULL REFERENCES :"platform_schema".effect_intent (effect_id),
@@ -249,92 +250,6 @@ CREATE TABLE IF NOT EXISTS :"platform_schema".effect_fact (
     CHECK ((claim_id IS NULL) = (fence IS NULL))
 );
 
-ALTER TABLE :"platform_schema".effect_fact
-    ADD COLUMN IF NOT EXISTS resume_phase text;
-
-ALTER TABLE :"platform_schema".effect_fact
-    DROP CONSTRAINT IF EXISTS effect_fact_fact_type_check;
-ALTER TABLE :"platform_schema".effect_fact
-    ADD CONSTRAINT effect_fact_fact_type_check CHECK (
-        fact_type IN (
-            'dispatch_authorized', 'resume_authorized', 'response', 'timeout',
-            'observation', 'reconciled', 'conflict'
-        )
-    );
-
-ALTER TABLE :"platform_schema".effect_fact
-    DROP CONSTRAINT IF EXISTS effect_fact_resume_phase_check;
-ALTER TABLE :"platform_schema".effect_fact
-    ADD CONSTRAINT effect_fact_resume_phase_check CHECK (
-        resume_phase IS NULL
-        OR resume_phase = 'input_transfer_pending'
-    );
-
-ALTER TABLE :"platform_schema".effect_fact
-    DROP CONSTRAINT IF EXISTS effect_fact_resume_phase_observation_check;
-ALTER TABLE :"platform_schema".effect_fact
-    ADD CONSTRAINT effect_fact_resume_phase_observation_check CHECK (
-        resume_phase IS NULL
-        OR (fact_type = 'observation' AND state_class = 'unobservable')
-    );
-
-ALTER TABLE :"platform_schema".execution_claim
-    ADD COLUMN IF NOT EXISTS scope text NOT NULL DEFAULT 'execution';
-ALTER TABLE :"platform_schema".execution_claim
-    ADD COLUMN IF NOT EXISTS effect_scope_id text;
-
-ALTER TABLE :"platform_schema".execution_claim
-    DROP CONSTRAINT IF EXISTS execution_claim_scope_check;
-ALTER TABLE :"platform_schema".execution_claim
-    ADD CONSTRAINT execution_claim_scope_check CHECK (
-        scope IN ('execution', 'transfer_resume')
-    );
-
-ALTER TABLE :"platform_schema".execution_claim
-    DROP CONSTRAINT IF EXISTS execution_claim_transfer_scope_check;
-ALTER TABLE :"platform_schema".execution_claim
-    ADD CONSTRAINT execution_claim_transfer_scope_check CHECK (
-        (scope = 'transfer_resume') = (effect_scope_id IS NOT NULL)
-    );
-
-ALTER TABLE :"platform_schema".execution_claim
-    DROP CONSTRAINT IF EXISTS execution_claim_effect_scope_id_fkey;
-ALTER TABLE :"platform_schema".execution_claim
-    ADD CONSTRAINT execution_claim_effect_scope_id_fkey
-    FOREIGN KEY (effect_scope_id)
-    REFERENCES :"platform_schema".effect_intent (effect_id);
-
-ALTER TABLE :"platform_schema".execution_claim
-    ADD COLUMN IF NOT EXISTS yield_effect_id text;
-
-ALTER TABLE :"platform_schema".execution_claim
-    DROP CONSTRAINT IF EXISTS execution_claim_closure_code_check;
-ALTER TABLE :"platform_schema".execution_claim
-    ADD CONSTRAINT execution_claim_closure_code_check CHECK (
-        closure_code IS NULL
-        OR closure_code IN (
-            'completed', 'definite_failure', 'abandoned_before_effect',
-            'reconciled', 'operator_closed', 'yielded'
-        )
-    );
-
-ALTER TABLE :"platform_schema".execution_claim
-    DROP CONSTRAINT IF EXISTS execution_claim_yield_effect_id_fkey;
-ALTER TABLE :"platform_schema".execution_claim
-    ADD CONSTRAINT execution_claim_yield_effect_id_fkey
-    FOREIGN KEY (yield_effect_id)
-    REFERENCES :"platform_schema".effect_intent (effect_id);
-
-ALTER TABLE :"platform_schema".execution_claim
-    DROP CONSTRAINT IF EXISTS execution_claim_yield_effect_closure_check;
-ALTER TABLE :"platform_schema".execution_claim
-    ADD CONSTRAINT execution_claim_yield_effect_closure_check CHECK (
-        (closure_code IS NOT DISTINCT FROM 'yielded')
-            = (yield_effect_id IS NOT NULL)
-    );
-
-DROP INDEX IF EXISTS :"platform_schema".execution_claim_one_yield_per_effect;
-
 CREATE TABLE IF NOT EXISTS :"platform_schema".run_display_metadata (
     run_id text PRIMARY KEY REFERENCES :"platform_schema".run_admission (run_id),
     display_name text,
@@ -344,9 +259,6 @@ CREATE TABLE IF NOT EXISTS :"platform_schema".run_display_metadata (
     updated_at timestamptz NOT NULL DEFAULT now(),
     CHECK ((hidden_at IS NULL) = (hidden_reason IS NULL))
 );
-
-ALTER TABLE :"platform_schema".run_display_metadata
-    ADD COLUMN IF NOT EXISTS activity jsonb;
 
 CREATE OR REPLACE FUNCTION :"platform_schema".reject_immutable_fact_mutation()
 RETURNS trigger
@@ -458,125 +370,3 @@ DROP TRIGGER IF EXISTS reject_truncate
 CREATE TRIGGER reject_truncate
     BEFORE TRUNCATE ON :"platform_schema".effect_fact
     FOR EACH STATEMENT EXECUTE FUNCTION :"platform_schema".reject_immutable_fact_mutation();
-
-DO $$
-BEGIN
-    IF to_regclass('run') IS NOT NULL
-       AND to_regclass('run_admission') IS NOT NULL
-       AND to_regclass('run_display_metadata') IS NOT NULL THEN
-        EXECUTE $migration$
-            INSERT INTO run_display_metadata (
-                run_id, display_name, hidden_at, hidden_reason, updated_at
-            )
-            SELECT r.run_id, r.display_name, r.hidden_at, r.hidden_reason, r.updated_at
-            FROM run r
-            WHERE (r.display_name IS NOT NULL OR r.hidden_at IS NOT NULL)
-              AND EXISTS (
-                  SELECT 1 FROM run_admission a WHERE a.run_id = r.run_id
-              )
-            ON CONFLICT (run_id) DO UPDATE SET
-                display_name = EXCLUDED.display_name,
-                hidden_at = EXCLUDED.hidden_at,
-                hidden_reason = EXCLUDED.hidden_reason,
-                updated_at = EXCLUDED.updated_at
-        $migration$;
-    END IF;
-END $$;
-
--- One-way legacy cutover. apply.sh must create and independently restore-verify the
--- complete platform plus Airflow schema archive, bind this database/schema/role, and
--- hold relation/catalog locks while this SQL executes in the same transaction. A
--- target that still carries any legacy relation is refused without that receipt.
--- DROP intentionally omits CASCADE: any remaining dependency aborts the migration
--- instead of being silently removed.
-CREATE OR REPLACE FUNCTION pg_temp.guard_legacy_cutover(target_schema text)
-RETURNS void
-LANGUAGE plpgsql
-AS $guard$
-DECLARE
-    archive_receipt text := COALESCE(
-        current_setting('description.legacy_receipt_sha256', true), ''
-    );
-    archive_sha256 text := COALESCE(
-        current_setting('description.legacy_archive_sha256', true), ''
-    );
-    archive_evidence text := COALESCE(
-        current_setting('description.legacy_evidence_sha256', true), ''
-    );
-    archive_cluster_system_identifier text := COALESCE(
-        current_setting(
-            'description.legacy_archive_cluster_system_identifier',
-            true
-        ), ''
-    );
-    archive_database text := COALESCE(
-        current_setting('description.legacy_archive_database', true), ''
-    );
-    archive_database_oid text := COALESCE(
-        current_setting('description.legacy_archive_database_oid', true), ''
-    );
-    archive_schema text := COALESCE(
-        current_setting('description.legacy_archive_platform_schema', true), ''
-    );
-    archive_schema_oid text := COALESCE(
-        current_setting('description.legacy_archive_platform_schema_oid', true), ''
-    );
-    archive_role text := COALESCE(
-        current_setting('description.legacy_archive_migration_role', true), ''
-    );
-    legacy_present boolean;
-BEGIN
-    SELECT EXISTS (
-        SELECT 1
-        FROM pg_catalog.pg_class AS class
-        JOIN pg_catalog.pg_namespace AS namespace
-          ON namespace.oid = class.relnamespace
-        WHERE namespace.nspname = target_schema
-          AND class.relname IN (
-              'request', 'run', 'stage', 'operation', 'run_event'
-          )
-          AND class.relkind IN ('r', 'p', 'v', 'm', 'f')
-    ) INTO legacy_present;
-
-    IF legacy_present THEN
-        IF archive_receipt !~ '^[0-9a-f]{64}$'
-           OR archive_sha256 !~ '^[0-9a-f]{64}$'
-           OR archive_evidence !~ '^[0-9a-f]{64}$'
-           OR archive_cluster_system_identifier !~ '^[0-9]+$'
-           OR archive_database_oid !~ '^[0-9]+$'
-           OR archive_schema_oid !~ '^[0-9]+$'
-           OR archive_schema IS DISTINCT FROM target_schema
-           OR archive_database IS DISTINCT FROM current_database()
-           OR archive_database_oid IS DISTINCT FROM (
-               SELECT oid::text FROM pg_database WHERE datname = current_database()
-           )
-           OR archive_cluster_system_identifier IS DISTINCT FROM (
-               SELECT system_identifier::text FROM pg_control_system()
-           )
-           OR archive_schema_oid IS DISTINCT FROM (
-               SELECT oid::text
-               FROM pg_catalog.pg_namespace
-               WHERE nspname = target_schema
-           )
-           OR archive_role IS DISTINCT FROM session_user THEN
-            RAISE EXCEPTION
-                'legacy_lifecycle_archive_receipt_invalid';
-        END IF;
-    END IF;
-END
-$guard$;
-
-SET search_path TO :"platform_schema";
-
-SELECT pg_temp.guard_legacy_cutover(current_schema());
-
-SET search_path TO :"platform_schema", pg_catalog;
-
-DROP FUNCTION pg_temp.guard_legacy_cutover(text);
-
-DROP VIEW IF EXISTS :"platform_schema".lifecycle_projection;
-DROP TABLE IF EXISTS :"platform_schema".run_event;
-DROP TABLE IF EXISTS :"platform_schema".operation;
-DROP TABLE IF EXISTS :"platform_schema".stage;
-DROP TABLE IF EXISTS :"platform_schema".run;
-DROP TABLE IF EXISTS :"platform_schema".request;

@@ -31,19 +31,17 @@ flowchart LR
 | 共同 stage engine | claim、执行、候选校验、唯一 decision 及失败保全 | 各阶段领域算法 |
 | Linux handlers | 冻结、原生协调、模型生成、独立验证与发布 | Windows 会话所有权 |
 | Windows native runtime | 已保存 CAD 原生事实读取、几何观察、会话管理，以及释放后的原值投影、raw/STL 编码与证据封包 | 完整模型、URDF、独立质量结论、Git 和 PR |
-| deploy/operator/windows_identity.py | operator 与恢复共用的 Windows 进程证据结构及 sealed source 上下文绑定校验；不解释 Windows Task、CIM 或 pyvenv，不持久化第二份模型 |
+| Windows 生命周期脚本 | 当前任务、进程归属、安装身份、ACL 和健康的现场核验 | 业务阶段决定；Linux 控制与恢复只消费其核验结果 |
 | PostgreSQL `FactStore` | 接纳、命令、执行权、effect 与阶段决定 | artifact 文件内容和 Airflow 调度状态 |
 | `ArtifactStore` | 不可变文件集合、manifest、摘要及物化 | 运行成功、阶段决定和业务显示状态 |
 
 Linux 完成上传与 Freeze 后，Windows 为 Discover 和 Capture 分别物化受控输入、建立并释放自己的原生会话。Discover 返回原生观察，Linux 形成 prepared package；Capture 返回原生证据，Linux 接纳并独立核验传输。SourceSet archive 与 prepared archive 是不同对象，分别记录摘要，并证明同一封存原件血缘。等待 Linux 时不占用 CAD 会话，不引入跨 operation 的可变来源缓存。
 
-代际维护以实际安装代为执行边界：每一代的控制入口、解释器、配置快照和数据库语义共同构成其维护上下文。发行控制器从现有安装记录及发行清单派生并核验上下文，源代自行关闭、排空和对账源状态，候选代自行迁移、启动和验证候选状态；控制器只编排既有锁与证据，不复制另一代业务实现或建立第二份代际状态。源端公共命令通过子进程整件委派，参数由源端契约解释，不按版本号翻译。
+部署只维护当前发行的首次安装和运行。双端从固定 main 的离线资产安装同一发行，CPython 3.12 及依赖由角色档案锁定。已存在的安装或身份不明残留不能自动覆盖；安装失败保全诊断、停止本次启动的写者并保持准入关闭，不切换或恢复历史发行。
 
-升级迁移只有 `promote` 一个入口；候选 `reconcile --install-id` 只观察已完成迁移的数据库，不另建迁移、备份或阶段链。可变公共命令从原始配置确定状态根后，先持有维护锁，再读取活动代并选择实际控制入口。派生环境与 `resolved.env` 均按非执行数据读取，不作为 shell 脚本执行；共享 reader 只向 resolved/toolchain 消费者投影其实际依赖的字段。公共命令消费 resolved 前，无论控制入口是否属于当前代，都由该代真实 runtime 和已验摘要的 renderer 在私有临时目录重算 resolved map，按原状态根规范化后完整比较，不扩大为全部配置漂移门。源、目标普通配置字节可以不同，但维护仍在同一个 Linux `storage.state_root` 资源域内。
+Linux 控制入口负责安装、启动、排空、停止、状态、健康和当前业务 effect 对账；Windows 入口负责当前执行端的安装和生命周期。删除 stage/promote/rollback、跨代控制器委派与历史包适配。业务 UNKNOWN 对账、受控重试和资源释放仍由 StageApplication、FactStore 与资源所有权规则决定，部署工具不复制业务恢复逻辑。同版业务数据的备份与灾难恢复保持独立，不依赖历史发行切换记录。
 
-源配置原件与派生环境也按代归属。控制器先核验 snapshot 实际 SHA-256 等于安装记录的 `snapshot.digest`，再核验原始 `platform.json` 字节 SHA-256 等于该 snapshot 的 `sources.platform_json_sha256`；两层摘要不得混用。控制器不在候选代码中重编码或重抄源配置推导；`operator.env` 先按非执行数据读取，再由源代自身现有属主重新派生并核验，完成后才加载。候选安装身份复用 `runtime.tool_record()` 复算实际包文件，并核对发行的 version、source_commit 和 source_sha256，不另造 inventory。继承维护锁以实际 FD、inode 和内核 `FLOCK` 为准，既有 metadata 字段保留，但不以 PID 活性或可由外层污染的环境开关替代锁权与入口身份。
-
-数据库解释权跟随既有 `schema-migration` 阶段，服务控制权跟随实际安装指针和服务 inventory；两者不能混同。迁移完成即由候选包读库，即使 Linux 指针尚未切换。迁移后、启动或对账候选服务前，复用 recovery 的一致快照与持久业务表 fingerprint 冻结事实边界；回滚停止写者后重读比较。排除准入控制与展示数据，业务增量、边界缺失或不明时保全当前数据库并保持关闭，不能覆盖式恢复 baseline。不存在第二业务模型或通用降级链。
+配置原件、不可变 snapshot 与安装记录保持明确绑定：snapshot 文件摘要等于安装记录的摘要，原始配置摘要等于 snapshot 内的来源摘要。派生环境由当前发行校验后作为数据消费，禁止执行环境文件；health 与维护共用 reader，按消费者需要投影字段。实际包身份复用 `runtime.tool_record()`，服务集合复用 systemd inventory，维护互斥依赖实际文件锁，不新增 registry 或状态副本。
 
 ## 数据权威
 
@@ -125,7 +123,7 @@ Linux 与 Windows 使用同一源码发行、各自最小依赖与角色工具�
 
 每个原生 operation 独立管理物化目录和自有会话；Discover 与 Capture 都先核对封存原件、配置和对象归属。虚拟件以所属装配、原生身份、配置与受控会话证明来源，不用临时路径充当上传原件。原生几何 schema、API 读数、失败拒绝及派生规则统一见[原生交换协议](contracts.md#exchange)。
 
-CAD 排他来自实际资源所有权，不来自 Airflow 并发数字。只能关闭可证明属于本操作的会话；未知会话或不明 COM 状态拒绝继续。租约到期不是终止许可。部署、启动、对账和切代共用维护锁，不能开启第二资源域。
+CAD 排他来自实际资源所有权，不来自 Airflow 并发数字。只能关闭可证明属于本操作的会话；未知会话或不明 COM 状态拒绝继续。租约到期不是终止许可。安装、生命周期维护、对账和同版数据备份共用维护锁，不能开启第二资源域。
 
 ## 保留机制的理由与验收
 

@@ -302,70 +302,12 @@ class InstallGuardsTest(unittest.TestCase):
             self.assertNotEqual(rejected.returncode, 0)
             self.assertEqual(calls.read_text().splitlines(), ["doctor"])
 
-    def test_stage_mode_does_not_require_database_or_api_port(self) -> None:
-        """--stage builds the runtime only; normal install still needs the live config inputs."""
-
+    def test_missing_api_port_is_rejected_before_runtime_creation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            bindir = root / "venv/bin"
-            bindir.mkdir(parents=True)
-            wheel = root / "wheels/mimicverse_description-1.0.1-py3-none-any.whl"
-            wheel.parent.mkdir()
-            wheel.write_bytes(b"fixture")
-            calls = root / "calls"
-            python = bindir / "python"
-            python.write_text(
-                "#!/bin/bash\n"
-                'if [ "${1:-}" = "-c" ]; then echo 3.12; exit 0; fi\n'
-                'echo "python $*" >> "$CALLS"\n'
-                "exit 0\n"
-            )
-            python.chmod(0o755)
-            description = bindir / "description"
-            description.write_text('#!/bin/bash\necho doctor >> "$CALLS"\nexit 0\n')
-            description.chmod(0o755)
-            airflow = bindir / "airflow"
-            airflow.write_text(
-                '#!/bin/bash\n'
-                'case "$*" in version) echo 3.3.2 ;; "triggerer --help") ;; '
-                '*) echo "airflow $*" >> "$CALLS" ;; esac\n'
-                'exit 0\n'
-            )
-            airflow.chmod(0o755)
-            env = {
-                "AIRFLOW_VENV": str(root / "venv"),
-                "AIRFLOW_HOME": str(root / "home"),
-                "PIPELINE_WHEEL": str(wheel),
-                "AIRFLOW_PYTHON": str(python),
-                "CALLS": str(calls),
-            }
-            staged = run(["bash", str(DEPLOY / "install.sh"), "--stage"], env)
-            self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
-            self.assertIn("Airflow runtime staged", staged.stdout)
-            recorded = calls.read_text(encoding="utf-8").splitlines()
-            self.assertIn("doctor", recorded)
-            self.assertTrue(any("pip check" in line for line in recorded))
-            self.assertFalse(any("render_config.py" in line for line in recorded))
-            self.assertFalse(any("db migrate" in line for line in recorded))
-            self.assertFalse((root / "home" / "airflow.cfg").exists())
-
-            with tempfile.TemporaryDirectory() as missing_tmp:
-                missing_root = Path(missing_tmp)
-                missing_port = run(
-                    ["bash", str(DEPLOY / "install.sh")],
-                    {
-                        "AIRFLOW_VENV": str(missing_root / "venv"),
-                        "AIRFLOW_HOME": str(missing_root / "home"),
-                        "PIPELINE_WHEEL": str(wheel),
-                        "AIRFLOW_PYTHON": str(python),
-                        "AIRFLOW_DB_URL": DSN,
-                        "AIRFLOW_RUNTIME_DB_URL": DSN,
-                        "AIRFLOW_API_PORT": "",
-                    },
-                )
-                self.assertNotEqual(missing_port.returncode, 0)
-                self.assertIn("AIRFLOW_API_PORT", missing_port.stderr)
-                self.assertFalse((missing_root / "venv").exists())
+            result = self._install(tmp, AIRFLOW_API_PORT="")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("AIRFLOW_API_PORT", result.stderr)
+            self.assertFalse((Path(tmp) / "venv").exists())
 
     def test_rejects_relative_forbidden_and_missing_wheel(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -463,9 +405,6 @@ class LockAndScriptsTest(unittest.TestCase):
                     if keyword.arg == "default":
                         defaults[node.args[0].value] = ast.literal_eval(keyword.value)
         self.assertEqual(defaults.get("--conn-id"), "solidworks_windows")
-        control = (DEPLOY.parent / "operator" / "operatorctl.sh").read_text(encoding="utf-8")
-        self.assertIn('--snapshot "$SNAPSHOT_PATH"', control)
-        self.assertIn('--state-root "$STATE_ROOT"', control)
         source = (DEPLOY / "scripts" / "add_connection.py").read_text(encoding="utf-8")
         self.assertIn("config_identity", source)
         for legacy in ("handoff_roots", "store_root", "repositories", "--token-file", "--port", "--host"):

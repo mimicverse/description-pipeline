@@ -183,7 +183,6 @@ class FreezeHarness:
                 "specifications": {"record_roots": [str(self.records)]},
                 "retention": {"unreferenced_evidence_days": None},
                 "derived": {
-                    "store_root": str(self.state / "runs"),
                     "repositories": {
                         "mimicverse/robot": str(self.checkout),
                     },

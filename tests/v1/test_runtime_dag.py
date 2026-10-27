@@ -70,7 +70,7 @@ class RuntimeDagTests(unittest.TestCase):
         self.write_config(self.root / "historical")
         (self.root / "historical").mkdir()
         with (
-            mock.patch.object(runtime_dag, "verify_running_generation", return_value=self.record()),
+            mock.patch.object(runtime_dag, "read_installed_generation", return_value=(self.record(), {})),
             mock.patch.object(runtime_dag, "effective_dags_folder", return_value=self.root / "historical"),
             self.assertRaisesRegex(RuntimeError, "does not point at"),
         ):
@@ -239,7 +239,7 @@ class RuntimeDagTests(unittest.TestCase):
 
     def test_files_only_check_does_not_require_serialized_state(self) -> None:
         with (
-            mock.patch.object(runtime_dag, "verify_running_generation", return_value=self.record()),
+            mock.patch.object(runtime_dag, "read_installed_generation", return_value=(self.record(), {})),
             mock.patch.object(
                 runtime_dag,
                 "effective_dags_folder",
@@ -261,7 +261,7 @@ class RuntimeDagTests(unittest.TestCase):
             "processor_dags_folder": str(self.dag.parent.resolve()),
         }
         with (
-            mock.patch.object(runtime_dag, "verify_running_generation", return_value=self.record()),
+            mock.patch.object(runtime_dag, "read_installed_generation", return_value=(self.record(), {})),
             mock.patch.object(runtime_dag, "serialized_dag", return_value=serialized),
             mock.patch.object(
                 runtime_dag,

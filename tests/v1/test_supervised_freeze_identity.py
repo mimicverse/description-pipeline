@@ -630,33 +630,56 @@ class SupervisedFreezeIdentityTests(unittest.TestCase):
 
     @classmethod
     def _stop_services(cls, label: str = "cleanup") -> list[dict]:
-        stats = []
-        for process in cls.processes:
-            if process.poll() is None:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(process.pid, signal.SIGTERM)
-        for process in cls.processes:
+        def group_alive(process) -> bool:
+            process.poll()
             try:
-                process.wait(timeout=15)
-            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                return False
+            return True
+
+        def wait_group(process, timeout: float) -> bool:
+            deadline = time.monotonic() + timeout
+            while group_alive(process):
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.05)
+            return True
+
+        stats = []
+        retained = []
+        for process in cls.processes:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGTERM)
+        for process in cls.processes:
+            stopped = wait_group(process, 15)
+            if not stopped:
                 with contextlib.suppress(ProcessLookupError):
                     os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=5)
-            group_alive = False
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, 0)
-                group_alive = True
-            stats.append(
-                {
-                    "pid": process.pid,
-                    "returncode": process.returncode,
-                    "process_group_alive": group_alive,
-                }
-            )
-        for handle in cls.logs:
-            handle.close()
-        cls.processes = []
-        cls.logs = []
+                stopped = wait_group(process, 5)
+            row = {
+                "pid": process.pid,
+                "returncode": process.returncode,
+                "process_group_alive": not stopped,
+            }
+            if not stopped:
+                retained.append(process)
+                snapshot = subprocess.run(
+                    ["ps", "-eo", "pid=,ppid=,pgid=,stat=,args="],
+                    capture_output=True, text=True, check=False,
+                )
+                row["remaining_members"] = [
+                    line.strip() for line in snapshot.stdout.splitlines()
+                    if len(line.split(None, 4)) >= 4
+                    and line.split(None, 4)[2] == str(process.pid)
+                ]
+                row["snapshot_returncode"] = snapshot.returncode
+            stats.append(row)
+        cls.processes = retained
+        if not retained:
+            for handle in cls.logs:
+                handle.close()
+            cls.logs = []
         cls.stop_history.append({"label": label, "processes": stats})
         return stats
 

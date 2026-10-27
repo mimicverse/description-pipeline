@@ -873,9 +873,7 @@ def validate_config_snapshot(snapshot) -> dict:
         {"where": "resolved.retention.unreferenced_evidence_days"},
     )
     derived = resolved["derived"]
-    _exact_keys(derived, {"store_root", "repositories", "discovery"}, code, "resolved.derived")
-    store_root = _absolute_path(derived["store_root"], code, "resolved.derived.store_root")
-    _require(_within(store_root, storage_roots["state_root"]), code, {"rule": "store_root lives under state_root"})
+    _exact_keys(derived, {"repositories", "discovery"}, code, "resolved.derived")
     repositories = derived["repositories"]
     _require(
         isinstance(repositories, dict) and bool(repositories) and set(repositories) >= slugs,
@@ -912,12 +910,6 @@ def validate_config_snapshot(snapshot) -> dict:
                 code,
                 {"rule": "configured roots must not overlap", "left": left_name, "right": right_name},
             )
-        if left_name in PLATFORM_STORAGE_ROOTS and left_name != "state_root":
-            _require(
-                not _within(store_root, left) and not _within(left, store_root),
-                code,
-                {"rule": "store_root must not overlap other roots", "other": left_name},
-            )
     _exact_keys(snapshot["sources"], {"platform_json_sha256"}, code, "sources")
     _hex64(snapshot["sources"]["platform_json_sha256"], code, "sources.platform_json_sha256")
     _reject_secrets(snapshot, code=code)
@@ -930,7 +922,7 @@ def config_snapshot_digest(snapshot) -> str:
     return digest(validate_config_snapshot(snapshot))
 
 
-def validate_install_record(record, *, previous_required: bool = False) -> dict:
+def validate_install_record(record) -> dict:
     """Linux-side active install record (IF-16).
 
     ``ends.linux.config_digest`` is only ever compared with this host;
@@ -952,8 +944,6 @@ def validate_install_record(record, *, previous_required: bool = False) -> dict:
             "paths",
             "dag",
             "ends",
-            "previous",
-            "journal",
         },
         code,
         "record",
@@ -1045,40 +1035,6 @@ def validate_install_record(record, *, previous_required: bool = False) -> dict:
         code,
         {"rule": "Linux end config digest equals the active snapshot digest"},
     )
-    previous = record["previous"]
-    if previous is None:
-        _require(
-            not previous_required,
-            code,
-            {"where": "previous", "reason": "second generation requires its rollback record"},
-        )
-    else:
-        _exact_keys(previous, {"release", "config", "record"}, code, "previous")
-        _require(isinstance(previous["release"], dict), code, {"where": "previous.release"})
-        _check_release_triple(
-            {key: previous["release"].get(key) for key in ("version", "source_commit", "source_sha256")},
-            code,
-            "previous.release",
-        )
-        _exact_keys(previous["config"], {"path", "digest"}, code, "previous.config")
-        _text(previous["config"]["path"], code, "previous.config.path")
-        _hex64(previous["config"]["digest"], code, "previous.config.digest")
-        _text(previous["record"], code, "previous.record")
-    journal = record["journal"]
-    _require(isinstance(journal, list), code, {"where": "journal"})
-    for index, step in enumerate(journal):
-        _exact_keys(step, {"seq", "verb", "step", "status", "at", "evidence"}, code, f"journal[{index}]")
-        _require(step["seq"] == index + 1, code, {"where": f"journal[{index}].seq"})
-        _require(step["verb"] in {"promote", "rollback"}, code, {"where": f"journal[{index}].verb"})
-        _text(step["step"], code, f"journal[{index}].step")
-        _require(step["status"] in {"completed", "failed", "unknown"}, code, {"where": f"journal[{index}].status"})
-        _utc(step["at"], code, f"journal[{index}].at")
-        evidence = step["evidence"]
-        _require(
-            isinstance(evidence, list) and evidence and all(isinstance(item, str) and item for item in evidence),
-            code,
-            {"where": f"journal[{index}].evidence"},
-        )
     _reject_secrets(record, code=code)
     return record
 
@@ -1190,16 +1146,7 @@ def subject_file_records(files, code: str, where: str = "subject.files") -> tupl
     return mapping, paths
 
 
-#: Derived by check_policy_digest() at commit f4d0785c0c6addb9b8f4e090eb3e12eedfe481b8 and
-#: retained unchanged through historical sealed archives. New policies are never inferred.
-RECOVERY_HISTORICAL_POLICY_DIGESTS = frozenset(
-    {
-        "415813b06c4b379fbbc1b5c6ea4c3fd56cf96c6ad8bfa103eaae03326de2b7c4",
-    }
-)
-
-
-def _validate_delivery_manifest(manifest, *, allowed_policy_digests: frozenset[str]) -> dict:
+def validate_delivery_manifest(manifest) -> dict:
     """``manifest.json`` (IF-13): subject inventory, subject digest, identities."""
 
     code = "delivery_manifest_invalid"
@@ -1232,38 +1179,15 @@ def _validate_delivery_manifest(manifest, *, allowed_policy_digests: frozenset[s
     )
     _hex64(manifest["policy"]["digest"], code, "policy.digest")
     _require(
-        manifest["policy"]["digest"] in allowed_policy_digests,
+        manifest["policy"]["digest"] == check_policy_digest(),
         "delivery_manifest_policy_mismatch",
         {
             "rule": "the manifest policy is not allowed by this reader",
             "actual": manifest["policy"]["digest"],
-            "allowed": sorted(allowed_policy_digests),
+            "expected": check_policy_digest(),
         },
     )
     return manifest
-
-
-def validate_delivery_manifest(manifest) -> dict:
-    """Validate a current delivery manifest against this release's exact policy."""
-
-    return _validate_delivery_manifest(
-        manifest,
-        allowed_policy_digests=frozenset({check_policy_digest()}),
-    )
-
-
-def validate_recovery_delivery_manifest(manifest) -> dict:
-    """Validate a sealed archive against the exact recovery policy allowlist."""
-
-    return _validate_delivery_manifest(
-        manifest,
-        allowed_policy_digests=frozenset(
-            {
-                check_policy_digest(),
-                *RECOVERY_HISTORICAL_POLICY_DIGESTS,
-            }
-        ),
-    )
 
 
 def validate_source_record(record) -> dict:
@@ -1446,18 +1370,11 @@ def record_archive_path(package_file: str) -> str:
     from .io import PipelineError, artifact_path_parts
 
     if not (
-        isinstance(package_file, str)
-        and package_file == package_file.replace("\\", "/")
-        and "//" not in package_file
+        isinstance(package_file, str) and package_file == package_file.replace("\\", "/") and "//" not in package_file
     ):
         raise PipelineError("Controlled record path is not canonical POSIX text")
     artifact_path_parts(package_file)
     parts = package_file.split("/")
-    if not (
-        len(parts) == 2
-        and parts[0] == "records"
-        and bool(parts[1])
-        and parts[1] not in {".", ".."}
-    ):
+    if not (len(parts) == 2 and parts[0] == "records" and bool(parts[1]) and parts[1] not in {".", ".."}):
         raise PipelineError("Controlled record path must be records/<file>")
     return package_file

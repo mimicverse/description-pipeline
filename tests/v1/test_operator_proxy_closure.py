@@ -229,8 +229,6 @@ class RenderClosureTests(unittest.TestCase):
                 {path.name.removesuffix(".service") for path in units.iterdir() if path.is_file()},
                 set(load_systemd_units().units_for_role("operator")),
             )
-            health = HEALTH.read_text(encoding="utf-8")
-            self.assertIn("managed nginx binary missing or not executable", health)
 
     def test_missing_binary_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

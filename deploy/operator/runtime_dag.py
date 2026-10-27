@@ -15,7 +15,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from install_record import DAG_ID, verify_running_generation  # noqa: E402
+from install_record import DAG_ID, read_installed_generation  # noqa: E402
 
 MANAGED_MARKER = "# managed-by: description-airflow"
 DAG_BUNDLE_NAME = "dags-folder"
@@ -155,7 +155,7 @@ def serialized_dag(dag_id: str, *, dag_path: Path, dags_folder: Path) -> dict[st
 
 
 def check(state_root: Path, airflow_home: Path, *, files_only: bool = False) -> dict[str, Any]:
-    record = verify_running_generation(Path(state_root))
+    record, _snapshot = read_installed_generation(Path(state_root))
     dag_path, dag_digest = active_dag(record)
     dags_folder, cfg_digest = configured_dags_folder(Path(airflow_home))
     require(dags_folder == dag_path.parent, "airflow.cfg does not point at the active install-record DAG")

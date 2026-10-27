@@ -24,14 +24,13 @@ from .errors import BridgeError, ConfigError
 from .inertia_convention import normalize_capture_inertia
 from .evidence import build_evidence, capture_environment
 from .jsonio import digest_json, read_json, sha256_file, write_json
+from .scene import material_unverified
 
 # The native adapter binds exported bytes; full mesh analysis runs on Linux.
 from ...io import confined, inventory
 from ...schemas import EFFECTIVE_INSTANCES_SCHEMA, LINK_GROUP_MASS_SCHEMA
 
-#: Freeze/capture record ids live in the ``solidworks-to-urdf.*`` family only.
-#: Sealed evidence from before the XC-01 rename is replayed with its era
-#: toolchain instead of being read by current code.
+#: Freeze/capture records use the current solidworks-to-urdf contract.
 FREEZE_SCHEMA = "solidworks-to-urdf.freeze/v1"
 SOURCE_KIND = "solidworks"
 DEFAULT_ALLOWED_SUFFIXES = (".sldasm", ".sldprt")
@@ -933,11 +932,10 @@ def _material_provenance_record(scene: Any, cfg: dict[str, Any]) -> dict[str, An
 
     warnings: list[dict[str, Any]] = []
     for name, payload in sorted((scene.mass_properties or {}).items()):
-        reference = payload.get("reference") if isinstance(payload, dict) else None
-        assignment = reference.get("material_assignment") if isinstance(reference, dict) else None
-        if not isinstance(assignment, dict) or not assignment.get("unverified_reason"):
+        if not material_unverified(payload):
             continue
-        reference = reference if isinstance(reference, dict) else {}
+        reference = payload["reference"]
+        assignment = reference["material_assignment"]
         warnings.append(
             {
                 "code": str(assignment["unverified_reason"]),

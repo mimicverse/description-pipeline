@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The Linux health gate that guards the platform admission open (promote's verify step and the
+# The Linux health gate that guards the platform admission open (start verification and the
 # plain start).  One bounded waiting loop around the deployment's own full health.sh (HTTP
 # included): a failing or late probe never opens; every attempt's output is preserved, and every
 # invocation gets its own evidence run directory (money/inspectable after the fact).

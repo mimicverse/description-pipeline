@@ -1257,12 +1257,6 @@ class NativeOperationRuntimeTests(unittest.TestCase):
             package=package,
             prepared_files=prepared_files,
             request_evidence=REQUEST_EVIDENCE,
-            historical_native_tool={
-                "schema_version": TOOL_SCHEMA,
-                "pipeline_id": "historical-native-operation-test",
-                "source_sha256": "ef" * 32,
-                "runtime": {"role": "native"},
-            },
         )
         calls = 0
         transaction_kwargs = {}

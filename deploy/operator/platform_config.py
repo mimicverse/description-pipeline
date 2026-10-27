@@ -6,7 +6,7 @@ Contract: ``docs/deployment.md`` configuration authority - one private ``platfor
 unknown keys, unsafe paths, incomplete targets and conflicting ports, and secrets travel only as
 file references.  ``install`` renders the immutable generation snapshot
 (``solidworks-to-urdf.config-snapshot/v1``) whose canonical digest the console, Airflow and
-maintenance commands all read (frozen-interfaces-v1.1 IF-11/IF-16).
+current lifecycle commands all read (frozen-interfaces-v1.1 IF-11/IF-16).
 
 Like ``render_operator.py`` this module is standalone (stdlib only): a deployment tree runs it
 with the host interpreter before any virtualenv exists.  ``tests/v1/test_platform_config.py``
@@ -14,9 +14,8 @@ holds the parity guards against the package-side validators
 (``description_pipeline.interface_records``) and the canonical serialization
 (``description_pipeline.io``).
 
-``resolved.windows.instance`` additionally binds the isolated Windows target (task name,
-package/output/state roots, endpoint port) so observation/stop/restore paths can only ever
-address the configured instance; nothing falls back to a production task name or host path.
+``resolved.windows.instance`` additionally binds the isolated Windows target paths needed by
+the current status and lifecycle operations; nothing falls back to a different task or host path.
 
 Exit codes: 0 success; 1 configuration error (message on stderr); 2 usage error.
 """
@@ -243,9 +242,8 @@ def validate_platform(document) -> dict:
         "retention.unreferenced_evidence_days must be null or a positive integer",
     )
 
-    # Derived single-source values: the store root lives under state_root, every target slug has
-    # exactly one checkout under workspace_root, and discovery consumes the specification roots.
-    store_root = storage_paths["state_root"] / "runs"
+    # Derived single-source values: every target slug has exactly one checkout under
+    # workspace_root, and discovery consumes the specification roots.
     repositories: dict[str, str] = {}
     checkouts: dict[str, str] = {}
     for slug in sorted(slugs):
@@ -262,11 +260,6 @@ def validate_platform(document) -> dict:
             require(
                 not _within(left, right) and not _within(right, left),
                 f"configured roots must not overlap: {left_name} vs {right_name}",
-            )
-        if left_name in _STORAGE_KEYS and left_name != "state_root":
-            require(
-                not _within(store_root, left) and not _within(left, store_root),
-                f"the store root must not overlap {left_name}",
             )
 
     return {
@@ -297,7 +290,6 @@ def validate_platform(document) -> dict:
         "specifications": {"record_roots": list(record_roots)},
         "retention": {"unreferenced_evidence_days": days},
         "derived": {
-            "store_root": str(store_root),
             "repositories": repositories,
             "discovery": {"record_roots": list(record_roots)},
         },
