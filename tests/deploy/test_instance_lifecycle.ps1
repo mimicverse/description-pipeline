@@ -282,6 +282,19 @@ $taskReadSource = if ($taskReadStart -ge 0 -and $taskReadEnd -gt $taskReadStart)
 Check 'task_observer.strict_enumeration' (
   $taskReadSource.Contains('Get-ScheduledTask -ErrorAction Stop') -and
   -not $taskReadSource.Contains('SilentlyContinue'))
+$listenerStart = $source.IndexOf('function Get-ListenerConnections')
+$listenerEnd = $source.IndexOf('function Get-ProcessOwnerSid', $listenerStart)
+$listenerSource = if (
+    $listenerStart -ge 0 -and
+    $listenerEnd -gt $listenerStart) {
+  $source.Substring($listenerStart, $listenerEnd - $listenerStart)
+} else { '' }
+Check 'listener.uses_native_cim_filter' (
+  $listenerSource.Contains("-ClassName 'MSFT_NetTCPConnection'") -and
+  $listenerSource.Contains('-Filter "LocalPort = $Port AND State = 2"') -and
+  $listenerSource.Contains('-ErrorAction Stop') -and
+  -not $source.Contains('Test-NetTcpNoMatchError') -and
+  -not $source.Contains('CmdletizationQuery_NotFound'))
 
 if ($StaticOnly) {
   Write-Host ('checks={0} failures={1}' -f $script:checks, $script:failures.Count)
@@ -290,46 +303,6 @@ if ($StaticOnly) {
 
 # ---- load the script without running main ----------------------------------
 . $ScriptPath -Verb status -Binding @{}
-
-# ---- listener observation uses successful empty CIM data -------------------
-& {
-  $script:ListenerProbe = [pscustomobject]@{
-    namespace = $null
-    class_name = $null
-    filter = $null
-    error = $null
-    values = @()
-  }
-  function Get-CimInstance {
-    [CmdletBinding()]
-    param(
-      [string]$Namespace,
-      [string]$ClassName,
-      [string]$Filter
-    )
-    $script:ListenerProbe.namespace = $Namespace
-    $script:ListenerProbe.class_name = $ClassName
-    $script:ListenerProbe.filter = $Filter
-    if ($script:ListenerProbe.error) { throw $script:ListenerProbe.error }
-    return $script:ListenerProbe.values
-  }
-
-  $absent = @(Get-ListenerConnections 8765)
-  Check 'listener.cim_empty_is_absent' (
-    $absent.Count -eq 0 -and
-    $script:ListenerProbe.namespace -ceq 'root/StandardCimv2' -and
-    $script:ListenerProbe.class_name -ceq 'MSFT_NetTCPConnection' -and
-    $script:ListenerProbe.filter -ceq 'LocalPort = 8765 AND State = 2')
-
-  $script:ListenerProbe.values = @([pscustomobject]@{OwningProcess=4242})
-  $present = @(Get-ListenerConnections 8765)
-  Check 'listener.cim_present_preserves_owner' (
-    $present.Count -eq 1 -and [int]$present[0].OwningProcess -eq 4242)
-
-  $script:ListenerProbe.error = 'CIM observer failed'
-  $failed = Invoke-Refusal { Get-ListenerConnections 8765 }
-  Check 'listener.cim_failure_propagates' $failed.threw
-}
 
 # SID and ACL APIs require Windows; the Linux matrix keeps its existing stubs.
 if ($env:OS -eq 'Windows_NT') {
@@ -448,6 +421,62 @@ if ($env:OS -eq 'Windows_NT') {
     if (Test-Path -LiteralPath $aclRoundtripRoot) {
       Remove-Item -LiteralPath $aclRoundtripRoot -Recurse -Force
     }
+  }
+
+  # Exercise the production listener query before install fixtures override it below.
+  $listener = New-Object System.Net.Sockets.TcpListener -ArgumentList @(
+    [System.Net.IPAddress]::Loopback, 0)
+  try {
+    $listener.Start()
+    $listenerPort = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+    $currentProcessId = [System.Diagnostics.Process]::GetCurrentProcess().Id
+    $deadline = [DateTime]::UtcNow.AddSeconds(5)
+    do {
+      $connections = @(Get-ListenerConnections $listenerPort)
+      $owned = @($connections | Where-Object {
+        [int]$_.LocalPort -eq $listenerPort -and
+        [int]$_.State -eq 2 -and
+        [int]$_.OwningProcess -eq $currentProcessId
+      })
+      if ($owned.Count -gt 0) { break }
+      Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+    Check 'listener.production_query_matches_loopback_pid' (
+      $owned.Count -gt 0 -and
+      @($connections | Where-Object {
+        [int]$_.LocalPort -ne $listenerPort -or [int]$_.State -ne 2
+      }).Count -eq 0)
+
+    $listener.Stop()
+    $deadline = [DateTime]::UtcNow.AddSeconds(5)
+    do {
+      $remaining = @(Get-ListenerConnections $listenerPort)
+      if ($remaining.Count -eq 0) { break }
+      Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+    Check 'listener.production_query_empty_after_stop' ($remaining.Count -eq 0)
+  } finally {
+    $listener.Stop()
+  }
+
+  function Get-CimInstance {
+    [CmdletBinding()]
+    param(
+      [string]$Namespace,
+      [string]$ClassName,
+      [string]$Filter
+    )
+    throw 'injected listener query failure'
+  }
+  try {
+    $queryFailure = Invoke-Refusal {
+      Get-ListenerConnections 8765
+    }
+    Check 'listener.cim_query_failure_propagates' (
+      $queryFailure.threw -and
+      $queryFailure.message -ceq 'injected listener query failure')
+  } finally {
+    Remove-Item Function:\Get-CimInstance -Force
   }
 }
 

@@ -1742,10 +1742,11 @@ function Assert-InstallReceipt($Receipt, $Binding, $Release, $Config, $InstallId
 }
 
 function Get-ListenerConnections([int]$Port) {
+  # MSFT_NetTCPConnection State 2 is Listen; no matches return an empty array.
   return @(Get-CimInstance `
     -Namespace 'root/StandardCimv2' `
     -ClassName 'MSFT_NetTCPConnection' `
-    -Filter ('LocalPort = {0} AND State = 2' -f $Port) `
+    -Filter "LocalPort = $Port AND State = 2" `
     -ErrorAction Stop)
 }
 
