@@ -1741,25 +1741,13 @@ function Assert-InstallReceipt($Receipt, $Binding, $Release, $Config, $InstallId
   }
 }
 
-function Test-NetTcpNoMatchError($ErrorRecord) {
-  try {
-    return (
-      [string]$ErrorRecord.CategoryInfo.Category -ceq 'ObjectNotFound' -and
-      [string]$ErrorRecord.FullyQualifiedErrorId -ceq
-        'CmdletizationQuery_NotFound_LocalPort,Get-NetTCPConnection'
-    )
-  } catch {
-    return $false
-  }
-}
-
 function Get-ListenerConnections([int]$Port) {
-  try {
-    return @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop)
-  } catch {
-    if (Test-NetTcpNoMatchError $_) { return @() }
-    throw
-  }
+  # MSFT_NetTCPConnection State 2 is Listen; no matches return an empty array.
+  return @(Get-CimInstance `
+    -Namespace 'root/StandardCimv2' `
+    -ClassName 'MSFT_NetTCPConnection' `
+    -Filter "LocalPort = $Port AND State = 2" `
+    -ErrorAction Stop)
 }
 
 function Get-ProcessOwnerSid($Process) {
