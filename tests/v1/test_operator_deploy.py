@@ -3179,7 +3179,8 @@ class LifecycleTests(unittest.TestCase):
             )
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn(
-                "DRIFT the installed proxy unit does not execute the bound nginx binary", result.stdout
+                "the source resolved environment differs from its renderer: NGINX_BIN",
+                result.stderr,
             )
             self.assertTrue(Path(bound).exists(), "the bound binary must not be touched")
 
