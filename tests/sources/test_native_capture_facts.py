@@ -12,6 +12,7 @@ from description_pipeline.geometry.native_transform import transform_from_solidw
 from description_pipeline.io import PipelineError, write_json
 from description_pipeline.schemas import EFFECTIVE_INSTANCES_SCHEMA
 from description_pipeline.sources.snapshot import verify_snapshot, write_manifest
+from description_pipeline.verification import capture_evidence
 from description_pipeline.verification.native_capture_facts import verify_native_capture_facts
 from description_pipeline.verification.solidworks_physics import verify_urdf_mass_equality
 
@@ -314,6 +315,25 @@ class NativeCaptureFactsTests(unittest.TestCase):
         self.write_capture()
         with self.assertRaisesRegex(PipelineError, "datum matrix differs"):
             verify_native_capture_facts(self.root)
+
+    def test_duplicate_projected_rows_cannot_hide_a_conflicting_first_value(self):
+        component = copy.deepcopy(self.capture["components"][0])
+        conflicting_component = copy.deepcopy(component)
+        conflicting_component["mass_properties"]["mass"] = 99.0
+        self.capture["components"] = [conflicting_component, component]
+        self.write_capture()
+        with self.assertRaisesRegex(PipelineError, "component reading is duplicated"):
+            verify_native_capture_facts(self.root)
+
+        self.capture["components"] = [component]
+        matrix = copy.deepcopy(self.capture["scene"]["coordinate_systems"]["base::Datum"])
+        conflicting_datum = {"name": "base::Datum", "matrix": copy.deepcopy(matrix)}
+        conflicting_datum["matrix"][3] = 99.0
+        correct_datum = {"name": "base::Datum", "matrix": matrix}
+        self.capture["datums"] = [conflicting_datum, correct_datum]
+        self.write_capture()
+        with self.assertRaisesRegex(PipelineError, "datum record is duplicated"):
+            capture_evidence.datums(self.root)
 
     def test_each_projected_mass_surface_rejects_small_tampering(self):
         def inertia(capture):

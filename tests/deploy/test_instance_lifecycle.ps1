@@ -1095,7 +1095,7 @@ function Read-EndpointConfigOfficial([string]$Generation) {
     state_root=(Join-Path $installRoot 'state')
     package_root=(Join-Path $installRoot 'packages')
     output_root=(Join-Path $installRoot 'results')
-    token_file=$installToken
+    host='127.0.0.1'
     port=8765
   }
 }
@@ -1182,9 +1182,21 @@ function Remove-ManagedTask($IgnoredBinding) {
     $script:TaskObserverFailed = $true
   }
 }
+$script:HealthProbeResponse = $null
+$script:HealthProbeCalls = 0
+$script:HealthProbeUri = ''
+$script:HealthProbeAuthorization = ''
+$script:HealthProbeTimeout = 0
 function Invoke-RestMethod {
   param([string]$Uri, [hashtable]$Headers, [int]$TimeoutSec)
-  throw 'install must not probe health'
+  if ($null -eq $script:HealthProbeResponse) {
+    throw 'install must not probe health'
+  }
+  $script:HealthProbeCalls++
+  $script:HealthProbeUri = $Uri
+  $script:HealthProbeAuthorization = [string]$Headers['Authorization']
+  $script:HealthProbeTimeout = $TimeoutSec
+  return $script:HealthProbeResponse
 }
 
 $installResult = Invoke-Install $installBinding
@@ -1321,13 +1333,15 @@ $fakeState = [pscustomobject]@{
   release=[ordered]@{
     version='1.5.0'; source_commit=('a' * 40); source_sha256=('c' * 64); role='native'}
   release_manifest=[ordered]@{}
-  source_config=[ordered]@{
+  source_config=$installFixtureConfig
+  config=[ordered]@{
+    config_digest=('d' * 64)
     state_root=(Join-Path $installRoot 'state')
     package_root=(Join-Path $installRoot 'packages')
     output_root=(Join-Path $installRoot 'results')
-    token_file=$installToken
+    host='127.0.0.1'
+    port=8765
   }
-  config=[ordered]@{config_digest=('d' * 64)}
   generation=Normalize-PathIdentity (Join-Path $installRoot 'state/lifecycle/generation')
   config_path=Normalize-PathIdentity (Join-Path $installRoot 'state/lifecycle/generation/endpoint.json')
   config_sha256=(Sha256 (Join-Path $installRoot 'state/lifecycle/generation/endpoint.json'))
@@ -1336,7 +1350,7 @@ $fakeState = [pscustomobject]@{
   receipt=$installReceipt
   receipt_path=Normalize-PathIdentity (Join-Path $installRoot 'state/install-receipt.json')
   token_sha256=(Sha256 $installToken)
-  port=8765
+  port=[int]$installFixtureConfig.port
   pins=[ordered]@{}
 }
 $fakeIdentity = [ordered]@{
@@ -1369,13 +1383,12 @@ $fakeHealth = [pscustomobject]@{
     external_session_detected=$false; owned_sessions=0; lease_held=$false}
   jobs=[pscustomobject]@{active=0; queued=0; unresolved=0}
 }
-$fakeRunning = [pscustomobject]@{
-  identity=$fakeIdentity
-  listener=[pscustomobject]@{listener_pid=4242}
-  health=$fakeHealth
-}
 function Get-InstalledState($IgnoredBinding, [switch]$SkipDoctor) { return $fakeState }
-function Get-RunningEvidence($State, [switch]$AllowUnready) { return $fakeRunning }
+$script:ListenerEvidenceConfig = $null
+function Get-ListenerEvidence($Binding, $Projection, $Config) {
+  $script:ListenerEvidenceConfig = $Config
+  return [pscustomobject]@{listener_pid=4242}
+}
 function Enable-ScheduledTask {
   [CmdletBinding()] param([string]$TaskName, [string]$TaskPath)
   $script:FixtureTask.State = 'Ready'
@@ -1417,6 +1430,7 @@ function Get-TaskProjection($Task) {
   }
 }
 
+$script:HealthProbeResponse = $fakeHealth
 $startResult = Invoke-Start $fixedBinding
 Check 'start.real_health_identity_required' (
   $startResult.passed -eq $true -and
@@ -1424,11 +1438,27 @@ Check 'start.real_health_identity_required' (
   $startResult.task.state -eq 'Running' -and
   $startResult.identity.install_id -eq $fakeState.install_id -and
   $startResult.health.ready -eq $true)
+Check 'start.listener_official_health_source_config' (
+  $null -ne $script:ListenerEvidenceConfig -and
+  [string]::IsNullOrEmpty([string]$script:ListenerEvidenceConfig.token_file) -and
+  [int]$script:ListenerEvidenceConfig.port -eq 8765 -and
+  $script:HealthProbeCalls -ge 1 -and
+  $script:HealthProbeUri -ceq 'http://127.0.0.1:8765/health' -and
+  $script:HealthProbeAuthorization -ceq (
+    'Bearer ' + (Read-Utf8Text $installFixtureConfig.token_file).Trim()) -and
+  $script:HealthProbeTimeout -eq 3)
 $healthResult = Invoke-Health $fixedBinding
 Check 'health.running_identity' (
   $healthResult.passed -eq $true -and
   $healthResult.task.state -eq 'Running' -and
   $healthResult.listener.listener_pid -eq 4242)
+$wrongHealth = $fakeHealth | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+$wrongHealth.install_id = 'win-' + ('f' * 32)
+$script:HealthProbeResponse = $wrongHealth
+$identityRefusal = Invoke-Refusal { Invoke-Health $fixedBinding }
+$script:HealthProbeResponse = $fakeHealth
+Check 'health.identity_mismatch_refused' (
+  $identityRefusal.code -ceq 'health_identity_mismatch')
 $stopResult = Invoke-Stop $fixedBinding
 Check 'stop.drains_then_proves_exit' (
   $stopResult.passed -eq $true -and

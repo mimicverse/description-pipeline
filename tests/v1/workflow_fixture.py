@@ -296,18 +296,6 @@ def inspect_prepared_input(package: Path) -> dict:
         "cad_revision": None,
     }
     path = package / "source.json"
-    if not path.is_file():
-        report["warnings"].append(
-            {
-                "code": "input.source_identity_pending",
-                "message": (
-                    "CAD administrative identity is incomplete; "
-                    "publication is unavailable"
-                ),
-                "detail": {"publication_blocker": "source_identity"},
-            }
-        )
-        return report
     try:
         source = validate_source_record(read_data(path))
         record_path = package / "discovery/native-discovery.json"

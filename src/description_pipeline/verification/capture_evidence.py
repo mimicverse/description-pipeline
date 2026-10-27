@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import ntpath
 import re
 from pathlib import Path
@@ -666,6 +667,16 @@ def components(root) -> list:
     rows = record.get("components")
     if not isinstance(rows, list):
         raise PipelineError("Capture evidence carries no component readings")
+    names = set()
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict) or set(row) != {"name", "mass_properties"}:
+            raise PipelineError(f"Capture component reading {index} is malformed")
+        name = row.get("name")
+        if not isinstance(name, str) or not name:
+            raise PipelineError(f"Capture component reading {index} has no identity")
+        if name in names:
+            raise PipelineError(f"Capture component reading is duplicated: {name}")
+        names.add(name)
     return rows
 
 
@@ -673,8 +684,14 @@ def mass_properties(root) -> dict:
     """Component-name to mass-property reading, as carried by the capture rows."""
 
     rows = components(root)
-    readings = {str(row.get("name")): row.get("mass_properties") for row in rows}
-    if not readings or any(value is None for value in readings.values()):
+    readings = {}
+    for row in rows:
+        name = row["name"]
+        reading = row["mass_properties"]
+        if not isinstance(reading, dict):
+            raise PipelineError(f"Capture component mass reading is malformed: {name}")
+        readings[name] = reading
+    if not readings:
         raise PipelineError("Component mass-property readings are missing")
     return readings
 
@@ -686,11 +703,32 @@ def datums(root) -> dict:
     rows = record.get("datums")
     if not isinstance(rows, list):
         raise PipelineError("Capture evidence carries no datum records")
-    return {str(row["name"]): row["matrix"] for row in rows}
+    result = {}
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict) or set(row) != {"name", "matrix"}:
+            raise PipelineError(f"Capture datum record {index} is malformed")
+        name = row.get("name")
+        matrix = row.get("matrix")
+        if not isinstance(name, str) or not name:
+            raise PipelineError(f"Capture datum record {index} has no identity")
+        if name in result:
+            raise PipelineError(f"Capture datum record is duplicated: {name}")
+        if (
+            not isinstance(matrix, list)
+            or len(matrix) != 16
+            or any(
+                type(value) not in (int, float)
+                or not math.isfinite(float(value))
+                for value in matrix
+            )
+        ):
+            raise PipelineError(f"Capture datum record is malformed: {name}")
+        result[name] = matrix
+    return result
 
 
 def axes(root) -> list:
-    """Axis re-read records (verbatim entries, plus ``kinds`` for the rebuild)."""
+    """Axis re-read records consumed by independent verification."""
 
     record = capture(root)
     rows = record.get("axes")

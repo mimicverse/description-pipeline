@@ -29,7 +29,7 @@ from .io import (
     read_data,
 )
 from .request_evidence import read_request_evidence
-from .runtime import RUNTIME_VERSIONS, python_version_is_supported, required_packages
+from .runtime import RUNTIME_HOSTS, RUNTIME_VERSIONS, python_version_is_supported, required_packages
 from .schemas import TOOL_SCHEMA, NATIVE_DISCOVERY_SCHEMA
 from .sources.snapshot import verify_snapshot
 from .sources.solidworks.handoff import MAX_HANDOFF_BYTES, MAX_HANDOFF_FILES
@@ -108,6 +108,14 @@ def _capture_upstream(value) -> list[dict]:
     _require(
         len(by_stage) == 2 and set(by_stage) == {"freeze", "discover"},
         "Capture upstream artifacts must contain one Freeze and one Discover producer",
+    )
+    expected_kinds = {
+        "freeze": "stage_output:freeze",
+        "discover": "stage_output:discover",
+    }
+    _require(
+        all(by_stage[stage].kind == kind for stage, kind in expected_kinds.items()),
+        "Capture upstream artifacts have invalid stage-output kinds",
     )
     _require(
         all(ref.producer_run_id for ref in refs),
@@ -195,42 +203,87 @@ def _expected_prepared_assembly(prepared_dir: str, main_assembly: str) -> str:
 def _validate_native_tool(native_tool) -> None:
     """A native tool record must pin its release and the Windows-native runtime closure."""
 
-    _require(isinstance(native_tool, dict) and native_tool, "Native tool record must be a nonempty object")
+    tool_fields = {
+        "schema_version",
+        "pipeline_id",
+        "version",
+        "source_sha256",
+        "release",
+        "runtime",
+    }
+    _require(
+        isinstance(native_tool, dict) and set(native_tool) == tool_fields,
+        "Native tool record must carry its exact fields",
+    )
     _require(native_tool.get("schema_version") == _TOOL_SCHEMA, "Native tool record uses an unknown schema")
     _require(native_tool.get("pipeline_id") == PIPELINE_ID, "Native tool record belongs to another pipeline")
     _require(native_tool.get("version") == __version__, "Native tool record is from another release")
     _require(_is_sha256(native_tool.get("source_sha256")), "Native tool record lacks its source digest")
     runtime = native_tool.get("runtime")
-    _require(isinstance(runtime, dict), "Native tool record lacks its runtime closure")
+    _require(
+        isinstance(runtime, dict)
+        and set(runtime) == {"role", "system", "python", "machine", "packages"},
+        "Native tool record lacks its exact runtime closure",
+    )
     _require(
         runtime.get("role") == "native",
         "Native tool record must declare runtime.role = 'native'",
     )
-    _require(str(runtime.get("system") or "") == "Windows", "Native tool record must come from the Windows host")
+    native_host = RUNTIME_HOSTS["native"]
+    _require(
+        runtime.get("system") == native_host["os"],
+        "Native tool record must come from the Windows host",
+    )
     _require(
         python_version_is_supported(runtime.get("python")),
         "Native tool record must pin Python 3.12",
     )
+    machine = runtime.get("machine")
+    _require(
+        native_host["arch"] == "x86_64"
+        and isinstance(machine, str)
+        and machine.casefold() in {"amd64", "x86_64"},
+        "Native tool record must pin a Windows x86_64 runtime",
+    )
     packages = runtime.get("packages")
     _require(isinstance(packages, dict) and packages, "Native tool record lacks its package pins")
-    pins = {canonicalize_name(str(name)): value for name, value in packages.items()}
-    for name in required_packages("native"):
+    pins = {}
+    for name, version in packages.items():
         _require(
-            pins.get(canonicalize_name(name)) == RUNTIME_VERSIONS.get(name),
+            isinstance(name, str)
+            and bool(name)
+            and isinstance(version, str)
+            and bool(version),
+            "Native tool package pins are malformed",
+        )
+        key = canonicalize_name(name)
+        _require(key not in pins, f"Native tool record repeats package {key}")
+        pins[key] = version
+    required_native = {canonicalize_name(name) for name in required_packages("native")}
+    _require(
+        set(pins) == required_native,
+        f"Native tool record must pin exactly the native package closure: {sorted(required_native)}",
+    )
+    for name in required_native:
+        expected = next(
+            version
+            for package, version in RUNTIME_VERSIONS.items()
+            if canonicalize_name(package) == name
+        )
+        _require(
+            pins[name] == expected,
             f"Native tool record must pin {name} to the release version",
         )
-    _require(
-        canonicalize_name("mujoco") not in pins,
-        "Native tool record must not include the MuJoCo consumer closure",
-    )
-    # Source/PYTHONPATH checkouts embed no tool-release.json, so this local
-    # cross-release comparison is skipped for them; publication refuses without
-    # the embedded identity used by the canonical Publish stage.
+    claimed_release = native_tool["release"]
+    if claimed_release is not None:
+        from .pipeline.ingestion import _formal_release  # noqa: PLC0415
+
+        _formal_release(native_tool, role="native")
     release = Path(__file__).resolve().parent / "tool-release.json"
     if release.is_file():
         identity = read_data(release)
         _require(
-            native_tool["source_sha256"] == identity.get("source_sha256"),
+            claimed_release == identity,
             "Native tool record is from another release than this portable runtime",
         )
 
