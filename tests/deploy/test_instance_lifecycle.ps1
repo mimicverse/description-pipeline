@@ -304,6 +304,241 @@ if ($StaticOnly) {
 # ---- load the script without running main ----------------------------------
 . $ScriptPath -Verb status -Binding @{}
 
+# ---- task definition identity ----------------------------------------------
+$taskDefinitionXml = @'
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Date>2026-10-28T00:00:00</Date>
+    <Author>fixture-author</Author>
+    <Description>URDF endpoint lifecycle task</Description>
+    <URI>\URDF\urdf-endpoint</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>2026-10-28T01:00:00</StartBoundary>
+      <Enabled>true</Enabled>
+      <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>
+    </CalendarTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>S-1-5-21-1-2-3-500</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>false</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>false</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>C:\URDF\state\lifecycle\generation\runtime\Scripts\python.exe</Command>
+      <Arguments>-I -B -m description_pipeline.orchestration.windows serve --config "C:\URDF\state\lifecycle\generation\endpoint.json"</Arguments>
+      <WorkingDirectory>C:\URDF\state</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
+'@
+$runningTaskDefinitionXml = $taskDefinitionXml.Replace(
+  '<Enabled>false</Enabled>', '<Enabled>true</Enabled>')
+$disabledDefinitionXml = Get-TaskDefinitionXml ([xml]$taskDefinitionXml)
+$runningDefinitionXml = Get-TaskDefinitionXml ([xml]$runningTaskDefinitionXml)
+$definitionWithoutEnabled = Get-TaskDefinitionXml ([xml](
+  $taskDefinitionXml.Replace('<Enabled>false</Enabled>', '')))
+Check 'task_definition.enabled_state_is_the_only_normalized_field' (
+  $disabledDefinitionXml -ceq $runningDefinitionXml -and
+  $disabledDefinitionXml -ceq $definitionWithoutEnabled)
+Check 'task_definition.raw_xml_still_observes_enabled_transition' (
+  (Get-TextSha256 $taskDefinitionXml) -cne
+    (Get-TextSha256 $runningTaskDefinitionXml))
+$taskDefinitionSemanticSha256 = Get-TaskSemanticSha256 `
+  '\URDF\' 'urdf-endpoint' ([xml]$taskDefinitionXml)
+$runningDefinitionSemanticSha256 = Get-TaskSemanticSha256 `
+  '\URDF\' 'urdf-endpoint' ([xml]$runningTaskDefinitionXml)
+Check 'task_definition.enabled_transition_preserves_semantic' (
+  $taskDefinitionSemanticSha256 -ceq $runningDefinitionSemanticSha256)
+$repeatedEnabledXml = $taskDefinitionXml.Replace(
+  '<Enabled>false</Enabled>',
+  '<Enabled>false</Enabled><Enabled>true</Enabled>')
+Check 'task_definition.rejects_repeated_settings_enabled' (
+  (Invoke-Refusal {
+    $null = Get-TaskDefinitionXml ([xml]$repeatedEnabledXml)
+  }).code -ceq 'task_definition_invalid')
+
+$definitionMutations = @(
+  @{
+    name='execution_time_limit'
+    old='<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>'
+    new='<ExecutionTimeLimit>PT1H</ExecutionTimeLimit>'
+  },
+  @{
+    name='disallow_start_if_on_batteries'
+    old='<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>'
+    new='<DisallowStartIfOnBatteries>true</DisallowStartIfOnBatteries>'
+  },
+  @{
+    name='stop_if_going_on_batteries'
+    old='<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>'
+    new='<StopIfGoingOnBatteries>true</StopIfGoingOnBatteries>'
+  },
+  @{
+    name='multiple_instances'
+    old='<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>'
+    new='<MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy>'
+  },
+  @{
+    name='action_execute'
+    old='runtime\Scripts\python.exe</Command>'
+    new='runtime\Scripts\foreign.exe</Command>'
+  },
+  @{
+    name='action_arguments'
+    old='orchestration.windows serve --config'
+    new='orchestration.windows status --config'
+  },
+  @{
+    name='action_working_directory'
+    old='<WorkingDirectory>C:\URDF\state</WorkingDirectory>'
+    new='<WorkingDirectory>C:\URDF\results</WorkingDirectory>'
+  },
+  @{
+    name='principal_user'
+    old='<UserId>S-1-5-21-1-2-3-500</UserId>'
+    new='<UserId>S-1-5-21-1-2-3-501</UserId>'
+  },
+  @{
+    name='principal_run_level'
+    old='<RunLevel>HighestAvailable</RunLevel>'
+    new='<RunLevel>LeastPrivilege</RunLevel>'
+  },
+  @{
+    name='trigger'
+    old='<StartBoundary>2026-10-28T01:00:00</StartBoundary>'
+    new='<StartBoundary>2026-10-28T02:00:00</StartBoundary>'
+  },
+  @{
+    name='trigger_enabled'
+    old='<Enabled>true</Enabled>'
+    new='<Enabled>false</Enabled>'
+  },
+  @{
+    name='description'
+    old='<Description>URDF endpoint lifecycle task</Description>'
+    new='<Description>foreign task</Description>'
+  },
+  @{
+    name='registration_uri'
+    old='<URI>\URDF\urdf-endpoint</URI>'
+    new='<URI>\URDF\foreign-endpoint</URI>'
+  },
+  @{
+    name='other_stable_setting'
+    old='<Priority>7</Priority>'
+    new='<Priority>8</Priority>'
+  }
+)
+foreach ($mutation in $definitionMutations) {
+  $mutatedXml = $taskDefinitionXml.Replace(
+    [string]$mutation.old, [string]$mutation.new)
+  $mutatedSha256 = Get-TaskSemanticSha256 `
+    '\URDF\' 'urdf-endpoint' ([xml]$mutatedXml)
+  Check ('task_definition.rejects_' + $mutation.name) (
+    $mutatedSha256 -cne $taskDefinitionSemanticSha256)
+}
+
+$definitionReceipt = [pscustomobject]@{
+  task_xml_sha256=('5' * 64)
+  task_semantic_sha256=$taskDefinitionSemanticSha256
+  task_acl_sha256=('a' * 64)
+}
+$definitionProjection = [pscustomobject]@{
+  xml_sha256=('9' * 64)
+  semantic_sha256=$taskDefinitionSemanticSha256
+  security_descriptor_sha256=('a' * 64)
+}
+Check 'task_receipt.raw_xml_is_install_evidence_only' (
+  -not (Invoke-Refusal {
+    Assert-TaskDefinitionReceipt $definitionReceipt $definitionProjection
+  }).threw)
+$definitionProjection.semantic_sha256 = ('b' * 64)
+Check 'task_receipt.semantic_drift_refused' (
+  (Invoke-Refusal {
+    Assert-TaskDefinitionReceipt $definitionReceipt $definitionProjection
+  }).code -ceq 'install_receipt_mismatch')
+$definitionProjection.semantic_sha256 = $taskDefinitionSemanticSha256
+$definitionProjection.security_descriptor_sha256 = ('b' * 64)
+Check 'task_receipt.acl_drift_refused' (
+  (Invoke-Refusal {
+    Assert-TaskDefinitionReceipt $definitionReceipt $definitionProjection
+  }).code -ceq 'install_receipt_mismatch')
+
+$projectionRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
+  'description-task-projection-' + [guid]::NewGuid().ToString('N'))
+$projectionGeneration = Join-Path $projectionRoot 'state/lifecycle/generation'
+$projectionStateRoot = Join-Path $projectionRoot 'state'
+$projectionBinding = [pscustomobject]@{
+  task_name='urdf-endpoint'
+  task_path='\'
+  service_account='S-1-5-21-1-2-3-500'
+}
+$validTaskProjection = [pscustomobject]@{
+  task_name='urdf-endpoint'
+  task_path='\'
+  principal=[pscustomobject]@{
+    user='S-1-5-21-1-2-3-500'
+    run_level='Highest'
+    logon_type='Interactive'
+  }
+  action=[pscustomobject]@{
+    execute=Runtime-Python $projectionGeneration
+    arguments=Runtime-LauncherArguments $projectionGeneration
+    working_directory=$projectionStateRoot
+  }
+  settings=[pscustomobject]@{
+    multiple_instances='IgnoreNew'
+    execution_time_limit='PT0S'
+    disallow_start_if_on_batteries=$false
+    stop_if_going_on_batteries=$false
+  }
+}
+Check 'task_projection.registered_execution_policy_accepted' (
+  -not (Invoke-Refusal {
+    Assert-TaskProjection $validTaskProjection $projectionBinding
+  }).threw)
+foreach ($setting in @(
+    'multiple_instances',
+    'execution_time_limit',
+    'disallow_start_if_on_batteries',
+    'stop_if_going_on_batteries')) {
+  $mutatedProjection = $validTaskProjection | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+  switch ($setting) {
+    'multiple_instances' { $mutatedProjection.settings.multiple_instances = 'Parallel' }
+    'execution_time_limit' { $mutatedProjection.settings.execution_time_limit = 'PT1H' }
+    'disallow_start_if_on_batteries' {
+      $mutatedProjection.settings.disallow_start_if_on_batteries = $true
+    }
+    'stop_if_going_on_batteries' {
+      $mutatedProjection.settings.stop_if_going_on_batteries = $true
+    }
+  }
+  Check ('task_projection.rejects_' + $setting) (
+    (Invoke-Refusal {
+      Assert-TaskProjection $mutatedProjection $projectionBinding
+    }).code -ceq 'task_identity_mismatch')
+}
+
 # SID and ACL APIs require Windows; the Linux matrix keeps its existing stubs.
 if ($env:OS -eq 'Windows_NT') {
   # Exercise the production Resolve-Sid before install fixtures override it below.
@@ -792,7 +1027,7 @@ Check 'release.nested_duplicate_key_refused' (
 $duplicateReceiptPath = Join-Path $root 'install-receipt-duplicate.json'
 [System.IO.File]::WriteAllText(
   $duplicateReceiptPath,
-  '{"schema_version":"solidworks-to-urdf.windows-install-receipt/v1",' +
+  '{"schema_version":"solidworks-to-urdf.windows-install-receipt/v2",' +
     '"passed":true,"passed":false}',
   (New-Object System.Text.UTF8Encoding($false)))
 $duplicateReceiptBytes = [Convert]::ToBase64String(
@@ -1164,7 +1399,12 @@ function Get-TaskProjection($Task) {
       arguments=Runtime-LauncherArguments $generation
       working_directory=Normalize-PathIdentity (Join-Path $installRoot 'state')
     }
-    settings=[ordered]@{multiple_instances='IgnoreNew'}
+    settings=[ordered]@{
+      multiple_instances='IgnoreNew'
+      execution_time_limit='PT0S'
+      disallow_start_if_on_batteries=$false
+      stop_if_going_on_batteries=$false
+    }
   }
 }
 function Get-DomainPins([string]$StateRoot, [string]$EndpointRoot) {
@@ -1202,6 +1442,36 @@ function Invoke-RestMethod {
 $installResult = Invoke-Install $installBinding
 $installReceipt = Read-InstallReceipt (
   Join-Path $installRoot 'state/install-receipt.json')
+Check 'install.receipt_uses_task_definition_v2' (
+  $installReceipt.schema_version -ceq
+    'solidworks-to-urdf.windows-install-receipt/v2')
+$v1Receipt = $installReceipt | ConvertTo-Json -Depth 16 | ConvertFrom-Json
+$v1Receipt.schema_version = 'solidworks-to-urdf.windows-install-receipt/v1'
+$v1ReceiptPath = Join-Path $root 'v1-install-receipt.json'
+[System.IO.File]::WriteAllText(
+  $v1ReceiptPath,
+  ($v1Receipt | ConvertTo-Json -Depth 16 -Compress),
+  (New-Object System.Text.UTF8Encoding($false)))
+Check 'install.receipt_rejects_unsupported_v1' (
+  (Invoke-Refusal {
+    Read-InstallReceipt $v1ReceiptPath
+  }).code -ceq 'install_receipt_invalid')
+foreach ($digestField in @(
+    'task_xml_sha256',
+    'task_semantic_sha256',
+    'task_acl_sha256')) {
+  $invalidReceipt = $installReceipt | ConvertTo-Json -Depth 16 | ConvertFrom-Json
+  $invalidReceipt.$digestField = 'invalid'
+  $invalidReceiptPath = Join-Path $root ('invalid-' + $digestField + '-receipt.json')
+  [System.IO.File]::WriteAllText(
+    $invalidReceiptPath,
+    ($invalidReceipt | ConvertTo-Json -Depth 16 -Compress),
+    (New-Object System.Text.UTF8Encoding($false)))
+  Check ('install.receipt_rejects_invalid_' + $digestField) (
+    (Invoke-Refusal {
+      Read-InstallReceipt $invalidReceiptPath
+    }).code -ceq 'install_receipt_invalid')
+}
 Check 'install.result_disabled' (
   $installResult.passed -eq $true -and
   $installResult.verb -eq 'install' -and
@@ -1345,7 +1615,7 @@ $fakeState = [pscustomobject]@{
   generation=Normalize-PathIdentity (Join-Path $installRoot 'state/lifecycle/generation')
   config_path=Normalize-PathIdentity (Join-Path $installRoot 'state/lifecycle/generation/endpoint.json')
   config_sha256=(Sha256 (Join-Path $installRoot 'state/lifecycle/generation/endpoint.json'))
-  install_id=('win-' + ('e' * 32))
+  install_id=[string]$installResult.identity.install_id
   install_id_path=Normalize-PathIdentity (Join-Path $installRoot 'state/install-id')
   receipt=$installReceipt
   receipt_path=Normalize-PathIdentity (Join-Path $installRoot 'state/install-receipt.json')
@@ -1383,7 +1653,6 @@ $fakeHealth = [pscustomobject]@{
     external_session_detected=$false; owned_sessions=0; lease_held=$false}
   jobs=[pscustomobject]@{active=0; queued=0; unresolved=0}
 }
-function Get-InstalledState($IgnoredBinding, [switch]$SkipDoctor) { return $fakeState }
 $script:ListenerEvidenceConfig = $null
 function Get-ListenerEvidence($Binding, $Projection, $Config) {
   $script:ListenerEvidenceConfig = $Config
@@ -1392,6 +1661,9 @@ function Get-ListenerEvidence($Binding, $Projection, $Config) {
 function Enable-ScheduledTask {
   [CmdletBinding()] param([string]$TaskName, [string]$TaskPath)
   $script:FixtureTask.State = 'Ready'
+  if ($script:MutateTaskDefinitionOnEnable) {
+    $script:FixtureTask.SemanticSha256 = ('9' * 64)
+  }
 }
 function Stop-ScheduledTask {
   [CmdletBinding()] param([string]$TaskName, [string]$TaskPath)
@@ -1406,13 +1678,24 @@ function Disable-ScheduledTask {
 function Get-WriterResidue($State) { return @() }
 function Get-TaskProjection($Task) {
   $generation = Join-Path $installRoot 'state/lifecycle/generation'
+  $taskState = [string]$Task.State
+  $semanticSha256 = if ($Task.SemanticSha256) {
+    [string]$Task.SemanticSha256
+  } else {
+    ('2' * 64)
+  }
+  $xmlSha256 = if ($taskState -eq 'Disabled') {
+    ('1' * 64)
+  } else {
+    ('5' * 64)
+  }
   return [ordered]@{
     task_name=$installBinding.task_name
     task_path=$installBinding.task_path
-    state=[string]$Task.State
+    state=$taskState
     xml='<Task/>'
-    xml_sha256=('1' * 64)
-    semantic_sha256=('2' * 64)
+    xml_sha256=$xmlSha256
+    semantic_sha256=$semanticSha256
     security_descriptor_sha256=('3' * 64)
     triggers_sha256=('4' * 64)
     principal=[ordered]@{
@@ -1426,7 +1709,12 @@ function Get-TaskProjection($Task) {
       arguments=Runtime-LauncherArguments $generation
       working_directory=Normalize-PathIdentity (Join-Path $installRoot 'state')
     }
-    settings=[ordered]@{multiple_instances='IgnoreNew'}
+    settings=[ordered]@{
+      multiple_instances='IgnoreNew'
+      execution_time_limit='PT0S'
+      disallow_start_if_on_batteries=$false
+      stop_if_going_on_batteries=$false
+    }
   }
 }
 
@@ -1436,6 +1724,9 @@ Check 'start.real_health_identity_required' (
   $startResult.passed -eq $true -and
   $startResult.verb -eq 'start' -and
   $startResult.task.state -eq 'Running' -and
+  $startResult.task.xml_sha256 -ceq ('5' * 64) -and
+  $startResult.task.semantic_sha256 -ceq ('2' * 64) -and
+  $startResult.task.security_descriptor_sha256 -ceq ('3' * 64) -and
   $startResult.identity.install_id -eq $fakeState.install_id -and
   $startResult.health.ready -eq $true)
 Check 'start.listener_official_health_source_config' (
@@ -1447,6 +1738,18 @@ Check 'start.listener_official_health_source_config' (
   $script:HealthProbeAuthorization -ceq (
     'Bearer ' + (Read-Utf8Text $installFixtureConfig.token_file).Trim()) -and
   $script:HealthProbeTimeout -eq 3)
+$runningStatus = Invoke-Status $fixedBinding
+Check 'status.running_after_raw_xml_change_is_consistent' (
+  $runningStatus.passed -eq $true -and
+  $runningStatus.task.state -ceq 'Running' -and
+  $runningStatus.task.xml_sha256 -ceq ('5' * 64) -and
+  $installReceipt.task_xml_sha256 -ceq ('1' * 64) -and
+  $runningStatus.task.semantic_sha256 -ceq ('2' * 64) -and
+  $runningStatus.task.security_descriptor_sha256 -ceq ('3' * 64) -and
+  $runningStatus.status.consistent -eq $true -and
+  $null -eq $runningStatus.status.error -and
+  $runningStatus.identity.install_id -ceq $fakeState.install_id) (
+    $runningStatus.status.error | ConvertTo-Json -Depth 5 -Compress)
 $healthResult = Invoke-Health $fixedBinding
 Check 'health.running_identity' (
   $healthResult.passed -eq $true -and
@@ -1466,6 +1769,24 @@ Check 'stop.drains_then_proves_exit' (
   $null -eq $stopResult.listener -and
   $stopResult.safety.jobs.active -eq 0 -and
   $stopResult.stopped.listener_count -eq 0)
+$stoppedStatus = Invoke-Status $fixedBinding
+Check 'status.disabled_after_stop_is_consistent' (
+  $stoppedStatus.passed -eq $true -and
+  $stoppedStatus.task.state -ceq 'Disabled' -and
+  $stoppedStatus.status.consistent -eq $true -and
+  $null -eq $stoppedStatus.status.error -and
+  $stoppedStatus.identity.install_id -ceq $fakeState.install_id) (
+    $stoppedStatus.status.error | ConvertTo-Json -Depth 5 -Compress)
+
+$script:FixtureTask.SemanticSha256 = $null
+$script:MutateTaskDefinitionOnEnable = $true
+$startCallsBeforeDefinitionDrift = $script:StartCalls
+$definitionDriftRefusal = Invoke-Refusal { Invoke-Start $fixedBinding }
+$script:MutateTaskDefinitionOnEnable = $false
+Check 'start.rejects_definition_drift_before_launch' (
+  $definitionDriftRefusal.code -ceq 'install_receipt_mismatch' -and
+  $script:StartCalls -eq $startCallsBeforeDefinitionDrift -and
+  $script:FixtureTask.State -ceq 'Disabled')
 
 # ---- install cleanup reports attempted work, not assumed success -----------
 $savedTaskName = [string]$script:FixtureTask.TaskName

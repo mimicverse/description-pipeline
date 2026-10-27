@@ -28,7 +28,7 @@ $script:BindingFields = @(
   'python_executable'
 )
 $script:ResultSchema = 'solidworks-to-urdf.windows-lifecycle-result/v1'
-$script:ReceiptSchema = 'solidworks-to-urdf.windows-install-receipt/v1'
+$script:ReceiptSchema = 'solidworks-to-urdf.windows-install-receipt/v2'
 $script:PythonLaunchContract = 'python_module_v1'
 
 function Emit($Document) {
@@ -1539,6 +1539,54 @@ function Get-TaskFilePath($Task) {
   return $path
 }
 
+function Get-TaskDefinitionXml($TaskXml) {
+  $roots = @($TaskXml.SelectNodes('/*[local-name()="Task"]'))
+  if ($roots.Count -ne 1) {
+    Die 'task_definition_invalid' 'the scheduled task XML must have one Task root'
+  }
+  $settingsNodes = @($roots[0].SelectNodes('./*[local-name()="Settings"]'))
+  if ($settingsNodes.Count -ne 1) {
+    Die 'task_definition_invalid' 'the scheduled task XML must have one Settings node'
+  }
+  $enabledNodes = @($settingsNodes[0].SelectNodes('./*[local-name()="Enabled"]'))
+  if ($enabledNodes.Count -gt 1) {
+    Die 'task_definition_invalid' 'the scheduled task XML repeats Settings/Enabled'
+  }
+  $definition = $TaskXml.CloneNode($true)
+  foreach ($enabled in @($definition.SelectNodes(
+      '/*[local-name()="Task"]/*[local-name()="Settings"]/*[local-name()="Enabled"]'))) {
+    [void]$enabled.ParentNode.RemoveChild($enabled)
+  }
+  return [string]$definition.OuterXml
+}
+
+function Get-TaskSemanticSha256([string]$TaskPath, [string]$TaskName, $TaskXml) {
+  $semantic = [ordered]@{
+    task_path = $TaskPath
+    task_name = $TaskName
+    definition_xml = Get-TaskDefinitionXml $TaskXml
+  }
+  return Get-JsonSha256 $semantic
+}
+
+function Get-RequiredTaskSetting([string]$Name, $TaskXml) {
+  $nodes = @($TaskXml.SelectNodes(
+      '/*[local-name()="Task"]/*[local-name()="Settings"]/' +
+      '*[local-name()="' + $Name + '"]'))
+  if ($nodes.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$nodes[0].InnerText)) {
+    Die 'task_identity_mismatch' ('the task XML misses one ' + $Name + ' setting')
+  }
+  return [string]$nodes[0].InnerText
+}
+
+function Convert-TaskBooleanSetting([string]$Name, [string]$Value) {
+  try {
+    return [System.Xml.XmlConvert]::ToBoolean($Value.Trim())
+  } catch {
+    Die 'task_identity_mismatch' ('the task XML has an invalid ' + $Name + ' setting')
+  }
+}
+
 function Get-TaskProjection($Task) {
   if (@($Task.Actions).Count -ne 1) {
     Die 'task_action_invalid' 'the task must carry exactly one action'
@@ -1562,30 +1610,32 @@ function Get-TaskProjection($Task) {
     run_level = [string]$Task.Principal.RunLevel
   }
   $settings = [ordered]@{
-    multiple_instances = [string]$Task.Settings.MultipleInstances
+    multiple_instances = Get-RequiredTaskSetting 'MultipleInstancesPolicy' $xml
+    execution_time_limit = Get-RequiredTaskSetting 'ExecutionTimeLimit' $xml
+    disallow_start_if_on_batteries = Convert-TaskBooleanSetting `
+      'DisallowStartIfOnBatteries' `
+      (Get-RequiredTaskSetting 'DisallowStartIfOnBatteries' $xml)
+    stop_if_going_on_batteries = Convert-TaskBooleanSetting `
+      'StopIfGoingOnBatteries' `
+      (Get-RequiredTaskSetting 'StopIfGoingOnBatteries' $xml)
   }
   $taskFileAcl = Get-AclProjection (Get-TaskFilePath $Task)
-  $semantic = [ordered]@{
-    task_path = [string]$Task.TaskPath
-    task_name = [string]$Task.TaskName
-    principal = $principal
-    action = $action
-    settings = $settings
-    triggers_sha256 = Get-JsonSha256 @($Task.Triggers)
-    security_descriptor_sha256 = Get-JsonSha256 $taskFileAcl
-  }
+  $triggersSha256 = Get-JsonSha256 @($Task.Triggers)
+  $semanticSha256 = Get-TaskSemanticSha256 `
+    ([string]$Task.TaskPath) ([string]$Task.TaskName) $xml
+  $taskAclSha256 = Get-JsonSha256 $taskFileAcl
   return [ordered]@{
     task_path = [string]$Task.TaskPath
     task_name = [string]$Task.TaskName
     state = [string]$Task.State
     xml = $xmlText
     xml_sha256 = Get-TextSha256 $xmlText
-    semantic_sha256 = Get-JsonSha256 $semantic
+    semantic_sha256 = $semanticSha256
     principal = $principal
     action = $action
     settings = $settings
-    triggers_sha256 = $semantic.triggers_sha256
-    security_descriptor_sha256 = $semantic.security_descriptor_sha256
+    triggers_sha256 = $triggersSha256
+    security_descriptor_sha256 = $taskAclSha256
   }
 }
 
@@ -1614,6 +1664,15 @@ function Assert-TaskProjection(
   }
   if ([string]$Projection.settings.multiple_instances -cne 'IgnoreNew') {
     Die 'task_identity_mismatch' 'task must enforce a single instance'
+  }
+  if ([string]$Projection.settings.execution_time_limit -cne 'PT0S') {
+    Die 'task_identity_mismatch' 'task must not have an execution time limit'
+  }
+  if ($Projection.settings.disallow_start_if_on_batteries -isnot [bool] -or
+      $Projection.settings.disallow_start_if_on_batteries -ne $false -or
+      $Projection.settings.stop_if_going_on_batteries -isnot [bool] -or
+      $Projection.settings.stop_if_going_on_batteries -ne $false) {
+    Die 'task_identity_mismatch' 'task must allow battery startup and continue on battery'
   }
   if (-not (Test-Runtime-LauncherAction `
       -Execute ([string]$Projection.action.execute) `
@@ -1708,17 +1767,33 @@ function Read-InstallReceipt([string]$Path) {
       'runtime_python',
       'runtime_python_sha256',
       'base_python',
-      'base_python_sha256')) {
+      'base_python_sha256',
+      'task_xml_sha256',
+      'task_semantic_sha256',
+      'task_acl_sha256')) {
     $value = $document.$field
     if ($value -isnot [string] -or [string]::IsNullOrWhiteSpace($value)) {
       Die 'install_receipt_invalid' ('install-receipt.json misses ' + $field)
     }
   }
   if ([string]$document.install_id -cnotmatch '^win-[0-9a-f]{32}$' -or
-      [string]$document.config_digest -cnotmatch '^[0-9a-f]{64}$') {
+      [string]$document.config_digest -cnotmatch '^[0-9a-f]{64}$' -or
+      [string]$document.task_xml_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+      [string]$document.task_semantic_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+      [string]$document.task_acl_sha256 -cnotmatch '^[0-9a-f]{64}$') {
     Die 'install_receipt_invalid' 'install-receipt.json identity is malformed'
   }
   return $document
+}
+
+function Assert-TaskDefinitionReceipt($Receipt, $Projection) {
+  if ([string]$Receipt.task_semantic_sha256 -cne
+        [string]$Projection.semantic_sha256 -or
+      [string]$Receipt.task_acl_sha256 -cne
+        [string]$Projection.security_descriptor_sha256) {
+    Die 'install_receipt_mismatch' (
+      'install-receipt.json does not describe the current task definition and ACL')
+  }
 }
 
 function Assert-InstallReceipt($Receipt, $Binding, $Release, $Config, $InstallId) {
@@ -2121,12 +2196,10 @@ function Get-InstalledState($Binding, [switch]$SkipDoctor, [switch]$SkipPins) {
       (Normalize-PathIdentity ([string]$receipt.base_python)) -cne
         (Normalize-PathIdentity ([string]$Binding.python_executable)) -or
       [string]$receipt.base_python_sha256 -cne
-        (Sha256 ([string]$Binding.python_executable)) -or
-      [string]$receipt.task_xml_sha256 -cne [string]$projection.xml_sha256 -or
-      [string]$receipt.task_semantic_sha256 -cne [string]$projection.semantic_sha256 -or
-      [string]$receipt.task_acl_sha256 -cne [string]$projection.security_descriptor_sha256) {
+        (Sha256 ([string]$Binding.python_executable))) {
     Die 'install_receipt_mismatch' 'install-receipt.json does not describe the current install'
   }
+  Assert-TaskDefinitionReceipt $receipt $projection
   $serviceSid = Resolve-Sid ([string]$Binding.service_account)
   $stableManagedPaths = @(Get-StableManagedPaths `
     $sourceConfig $Binding $generation $receiptPath)
@@ -2771,6 +2844,15 @@ function Invoke-Start($Binding) {
     Enable-ScheduledTask `
       -TaskName ([string]$Binding.task_name) `
       -TaskPath ([string]$Binding.task_path) | Out-Null
+    $script:LifecyclePhase = 'start-verify-definition'
+    $task = Get-RequiredTask $Binding
+    $projection = Get-TaskProjection $task
+    Assert-TaskProjection `
+      -Projection $projection `
+      -Binding $Binding
+    Assert-TaskDefinitionReceipt $state.receipt $projection
+    $state.task = $task
+    $state.projection = $projection
     $script:LifecyclePhase = 'start-launch'
     $started = $true
     Start-ScheduledTask `
