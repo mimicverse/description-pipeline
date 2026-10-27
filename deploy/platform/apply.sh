@@ -32,6 +32,7 @@ AIRFLOW_SCHEMA="airflow"
 BOOTSTRAP=0
 AIRFLOW_GRANTS=0
 LEGACY_ARCHIVE_RECEIPT=""
+ARCHIVE_USER=""
 LEGACY_ARCHIVE_SHA256=""
 LEGACY_RECEIPT_SHA256=""
 LEGACY_EVIDENCE_SHA256=""
@@ -48,6 +49,7 @@ usage() {
   echo "                [--platform-schema NAME]" >&2
   echo "                [--airflow-schema NAME]" >&2
   echo "                [--legacy-archive-receipt PATH]" >&2
+  echo "                [--archive-user USER]" >&2
   echo "                [--socket DIR | --host HOST] [--port PORT] [--user USER]" >&2
   exit 2
 }
@@ -64,6 +66,7 @@ while [ "$#" -gt 0 ]; do
       LEGACY_ARCHIVE_RECEIPT="${2:?}"
       shift 2
       ;;
+    --archive-user) ARCHIVE_USER="${2:?}"; shift 2 ;;
     --socket) CONNECTION+=(-h "${2:?}"); shift 2 ;;
     --host) CONNECTION+=(-h "${2:?}"); shift 2 ;;
     --port) CONNECTION+=(-p "${2:?}"); shift 2 ;;
@@ -75,6 +78,7 @@ done
 if [ "$BOOTSTRAP" = "1" ] && [ "$AIRFLOW_GRANTS" = "1" ]; then usage; fi
 if [ "$BOOTSTRAP" = "1" ] && [ -n "$LEGACY_ARCHIVE_RECEIPT" ]; then usage; fi
 if [ "$AIRFLOW_GRANTS" = "1" ] && [ -n "$LEGACY_ARCHIVE_RECEIPT" ]; then usage; fi
+if [ -n "$ARCHIVE_USER" ] && [ -z "$LEGACY_ARCHIVE_RECEIPT" ]; then usage; fi
 
 run() {
   local file="$1"
@@ -136,10 +140,15 @@ else
       case "${CONNECTION[index]}" in
         -h) ARCHIVE_ARGS+=(--libpq "h=${CONNECTION[index + 1]}") ;;
         -p) ARCHIVE_ARGS+=(--libpq "p=${CONNECTION[index + 1]}") ;;
-        -U) ARCHIVE_ARGS+=(--libpq "U=${CONNECTION[index + 1]}") ;;
+        -U)
+          if [ -z "$ARCHIVE_USER" ]; then
+            ARCHIVE_ARGS+=(--libpq "U=${CONNECTION[index + 1]}")
+          fi
+          ;;
         *) { echo "unsupported archive connection option" >&2; exit 2; } ;;
       esac
     done
+    [ -z "$ARCHIVE_USER" ] || ARCHIVE_ARGS+=(--libpq "U=$ARCHIVE_USER")
     ARCHIVE_RESULT="$("$ARCHIVE_PYTHON" "$HERE/legacy_cutover.py" "${ARCHIVE_ARGS[@]}")"
     IFS=$'\t' read -r ARCHIVE_STATUS LEGACY_EVIDENCE_SHA256 LEGACY_ARCHIVE_SHA256 \
       LEGACY_ARCHIVE_DATABASE LEGACY_ARCHIVE_DATABASE_OID \

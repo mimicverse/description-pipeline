@@ -1748,6 +1748,31 @@ class LifecycleTests(unittest.TestCase):
             result = replay("both-stage-steps")
             self.assertEqual(result.returncode, 10)
             self.assertEqual(result.stdout.strip(), "replay=fresh")
+            promotion_dir = state / "promotions" / "both-stage-steps"
+            (promotion_dir / "source-platform.json").write_text(
+                '{"source":true}\n', encoding="utf-8"
+            )
+            (promotion_dir / "candidate-platform.json").write_text(
+                '{"candidate":true}\n', encoding="utf-8"
+            )
+            self.assertEqual(replay("both-stage-steps").returncode, 10)
+            (promotion_dir / "windows-promote.path").write_text(
+                "attempted\n", encoding="utf-8"
+            )
+            self.assertEqual(replay("both-stage-steps").returncode, 11)
+            (promotion_dir / "windows-promote.path").unlink()
+            phase_evidence = promotion_dir / "evidence"
+            phase_evidence.mkdir()
+            (phase_evidence / "close-admission.out").write_text(
+                "source close was attempted\n",
+                encoding="utf-8",
+            )
+            attempted = replay("both-stage-steps")
+            self.assertEqual(attempted.returncode, 11)
+            self.assertEqual(attempted.stdout.strip(), "replay=partial")
+            for path in phase_evidence.iterdir():
+                path.unlink()
+            phase_evidence.rmdir()
             stage_receipt = state / "promotions" / "both-stage-steps" / "receipt.json"
             stage_document = json.loads(stage_receipt.read_text(encoding="utf-8"))
             stage_document["steps"].append(
@@ -1816,6 +1841,7 @@ class LifecycleTests(unittest.TestCase):
                 "rollback-drain",
                 "rollback-stop",
                 "rollback-windows",
+                "rollback-database",
                 "rollback-linux",
                 "rollback-config-reference",
                 "rollback-verify",
@@ -3557,7 +3583,13 @@ class InstallOrderingTests(unittest.TestCase):
         (release / "operator" / "scripts").mkdir(parents=True)
         (release / "airflow" / "scripts").mkdir(parents=True)
         (release / "airflow" / "dags").mkdir()
+        (release / "windows").mkdir()
+        for name in ("bootstrap-managed-root.ps1", "instance-lifecycle.ps1"):
+            (release / "windows" / name).write_bytes(
+                (ROOT / "deploy" / "windows" / name).read_bytes()
+            )
         (release / "operator" / "operatorctl.sh").write_bytes(CONTROL.read_bytes())
+        (release / "operator" / "operatorctl.sh").chmod(0o755)
         (release / "operator" / "health.sh").write_bytes(HEALTH.read_bytes())
         (release / "operator" / "health_gate.sh").write_bytes(HEALTH_GATE.read_bytes())
         (release / "operator" / "render_operator.py").write_bytes(RENDER.read_bytes())
@@ -3625,6 +3657,14 @@ class InstallOrderingTests(unittest.TestCase):
             '  exec bash "$(dirname "$0")/services.sh.real" "$@"\n'
             "fi\n"
             'echo "services_$1" >> "$ORDER_LOG"\n'
+            'if [ -n "${RUNTIME_AUTHORITY_LOG:-}" ] && [ "$1" = "stop-executors" ]; then\n'
+            '  [ -z "${EXPECTED_RUNNING_VENV:-}" ] || [ "$AIRFLOW_VENV" = "$EXPECTED_RUNNING_VENV" ] || exit 80\n'
+            '  printf "running:stop-services venv=%s\\n" "$AIRFLOW_VENV" >> "$RUNTIME_AUTHORITY_LOG"\n'
+            "fi\n"
+            'if [ -n "${RUNTIME_AUTHORITY_LOG:-}" ] && [ "$1" = "start" ]; then\n'
+            '  [ -z "${EXPECTED_CANDIDATE_VENV:-}" ] || [ "$AIRFLOW_VENV" = "$EXPECTED_CANDIDATE_VENV" ] || exit 80\n'
+            '  printf "candidate:start venv=%s\\n" "$AIRFLOW_VENV" >> "$RUNTIME_AUTHORITY_LOG"\n'
+            "fi\n"
             'mkdir -p "$SYSTEMCTL_STATE_DIR"\n'
             'execution_units=(\n'
             "  description-solidworks-tunnel\n"
@@ -3660,7 +3700,8 @@ class InstallOrderingTests(unittest.TestCase):
             '    target="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"\n'
             '    mkdir -p "$target"\n'
             '    echo "services_render venv=$AIRFLOW_VENV derived=$OPERATOR_DERIVED_ENV" >> "$ORDER_LOG"\n'
-            '    for unit in description-airflow-dag-processor description-airflow-scheduler '
+            '    for unit in description-postgres description-solidworks-tunnel '
+            'description-airflow-dag-processor description-airflow-scheduler '
             'description-airflow-triggerer description-airflow-api-server; do\n'
             '      printf "[Service]\\nEnvironmentFile=%s\\nExecStart=%s/bin/airflow fixture\\n" '
             '"$OPERATOR_DERIVED_ENV" "$AIRFLOW_VENV" > "$target/$unit.service"\n'
@@ -3756,18 +3797,61 @@ class InstallOrderingTests(unittest.TestCase):
         write_stub(
             tmp / "releases" / "airflow-venv-gen-1" / "bin" / "python",
             "#!/usr/bin/env bash\n"
+            "require_runtime() {\n"
+            '  local expected="$1" marker="$2" label="$3" actual\n'
+            '  actual="$(cd "$(dirname "$0")/.." && pwd)"\n'
+            '  if [ -n "$expected" ] && [ "$actual" != "$expected" ]; then\n'
+            '    echo "unexpected runtime for $label: $actual expected=$expected" >&2\n'
+            "    return 80\n"
+            "  fi\n"
+            '  if [ -n "$marker" ] && [ ! -f "$marker" ]; then\n'
+            '    echo "runtime module missing for $label: $marker" >&2\n'
+            "    return 81\n"
+            "  fi\n"
+            '  if [ -n "${RUNTIME_AUTHORITY_LOG:-}" ]; then\n'
+            '    printf "%s venv=%s\\n" "$label" "$actual" >> "$RUNTIME_AUTHORITY_LOG"\n'
+            "  fi\n"
+            "}\n"
+            'case "${1##*/}:${2:-}" in\n'
+            "  install_record.py:endpoint-identity)\n"
+            '    require_runtime "${EXPECTED_CANDIDATE_VENV:-}" '
+            '"${CANDIDATE_RUNTIME_MODULE:-}" candidate:endpoint-identity || exit $? ;;\n'
+            "  install_record.py:build)\n"
+            '    require_runtime "${EXPECTED_CANDIDATE_VENV:-}" '
+            '"${CANDIDATE_RUNTIME_MODULE:-}" candidate:switch-pointer || exit $? ;;\n'
+            "  install_record.py:verify-active)\n"
+            '    actual_venv="$(cd "$(dirname "$0")/.." && pwd)"\n'
+            '    if [ -n "${EXPECTED_CANDIDATE_VENV:-}" ] '
+            '&& [ "$actual_venv" = "$EXPECTED_CANDIDATE_VENV" ]; then\n'
+            '      require_runtime "$EXPECTED_CANDIDATE_VENV" '
+            '"${CANDIDATE_RUNTIME_MODULE:-}" candidate:verify || exit $?\n'
+            "    else\n"
+            '      require_runtime "${EXPECTED_RUNNING_VENV:-}" "" running:verify-active || exit $?\n'
+            "    fi ;;\n"
+            "  add_connection.py:*)\n"
+            '    require_runtime "${EXPECTED_CANDIDATE_VENV:-}" '
+            '"${CANDIDATE_RUNTIME_MODULE:-}" candidate:config-reference || exit $? ;;\n'
+            "  connection_snapshot.py:*)\n"
+            '    require_runtime "${EXPECTED_RUNNING_VENV:-}" "" running:connection-capture || exit $? ;;\n'
+            "  runtime_dag.py:*)\n"
+            '    require_runtime "${EXPECTED_CANDIDATE_VENV:-}" '
+            '"${CANDIDATE_RUNTIME_MODULE:-}" candidate:start || exit $? ;;\n'
+            "esac\n"
             "case \"$*\" in\n"
-            "  *install_record.py*|*add_connection.py*|*connection_snapshot.py*)\n"
+            "  *install_record.py*|*add_connection.py*|*connection_snapshot.py*|*runtime_dag.py*)\n"
+            '    PYTHONPATH="${FIXTURE_PACKAGE_ROOT:-}" exec python3 "$@" ;;\n'
+            "  *install_record.py*)\n"
             '    exec python3 "$@" ;;\n'
-            "  -c*interface_records.release_domain_identity*)\n"
+            "  *interface_records*release_domain_identity*)\n"
             "    python3 -c 'import json,os; "
             "domain={\"contract\":{\"fixture\":True},\"support\":{\"fixture\":True}}; "
             "print(json.dumps({\"root\":os.environ[\"AIRFLOW_VENV\"],"
             "\"pipeline_id\":\"solidworks-to-urdf\",\"domain\":domain,"
             "\"identity\":{\"pipeline_id\":\"solidworks-to-urdf\","
             "\"version\":\"1.4.0\",\"source_sha256\":\"a\"*64,"
-            "\"contract\":domain[\"contract\"],\"support\":domain[\"support\"]}}))' ;;\n"
+            "\"contract\":domain[\"contract\"],\"support\":domain[\"support\"]}}))' ; exit 0 ;;\n"
             '  "-m description_pipeline.orchestration.lifecycle_state"*)\n'
+            '    require_runtime "${EXPECTED_RUNNING_VENV:-}" "" running:drain || exit $?\n'
             "    python3 -c 'import json,os; from pathlib import Path; "
             'Path(os.environ["LIFECYCLE_ENV_LOG"]).write_text(json.dumps('
             '{"dsn": os.environ.get("PLATFORM_OPERATOR_DSN"), '
@@ -3786,21 +3870,31 @@ class InstallOrderingTests(unittest.TestCase):
             "  *reconcile-effect.py*)\n"
             '    echo "effect_reconcile $*" >> "$ORDER_LOG"\n'
             "    printf '%s\\n' '{\"effect_state\":\"satisfied\"}' ; exit 0 ;;\n"
+            "  -c*)\n"
+            '    PYTHONPATH="${FIXTURE_PACKAGE_ROOT:-}" exec python3 "$@" ;;\n'
             "  *.py|*.py\\ *)\n"
-            '    exec python3 "$@" ;;\n'
+            '    PYTHONPATH="${FIXTURE_PACKAGE_ROOT:-}" exec python3 "$@" ;;\n'
             "esac\n"
             'script="$(cat)"\n'
             'case "$script" in\n'
             "  *airflow-dag-capture*)\n"
+            '    require_runtime "${EXPECTED_RUNNING_VENV:-}" "" running:dag-capture || exit $?\n'
             '    paused="$(cat "$ADMISSION")"\n'
             "    printf '{\"dag_id\":\"solidworks_to_urdf\",\"paused\":%s}\\n' \"$paused\" > \"$2\"\n"
             '    echo "dag_capture paused=$paused" >> "$ORDER_LOG" ;;\n'
             "  *airflow-dag-state-check*)\n"
             '    expected="$2"\n'
+            '    if [ "$expected" = "true" ]; then\n'
+            '      require_runtime "${EXPECTED_RUNNING_VENV:-}" "" running:drain || exit $?\n'
+            "    else\n"
+            '      require_runtime "${EXPECTED_CANDIDATE_VENV:-}" '
+            '"${CANDIDATE_RUNTIME_MODULE:-}" candidate:start || exit $?\n'
+            "    fi\n"
             '    actual="$(cat "$ADMISSION")"\n'
             '    echo "dag_state_check expected=$expected actual=$actual" >> "$ORDER_LOG"\n'
             '    [ "$actual" = "$expected" ] || exit 1 ;;\n'
             "  *platform-close-admission*)\n"
+            '    require_runtime "${EXPECTED_RUNNING_VENV:-}" "" source:close-admission || exit $?\n'
             '    [ "$PLATFORM_SERVICE_DSN" = "$EXPECTED_PLATFORM_SERVICE_DSN" ] || exit 78\n'
             '    [ "$PLATFORM_OPERATOR_DSN" = "$EXPECTED_PLATFORM_DSN" ] || exit 77\n'
             '    [ "$PIPELINE_STORE_ROOT" = "$EXPECTED_PIPELINE_STORE_ROOT" ] || exit 79\n'
@@ -3808,6 +3902,14 @@ class InstallOrderingTests(unittest.TestCase):
             '    echo "platform close_admission" >> "$ORDER_LOG"\n'
             '    echo "admission=closed revision=2" ;;\n'
             "  *platform-open-admission*)\n"
+            '    actual_venv="$(cd "$(dirname "$0")/.." && pwd)"\n'
+            '    if [ -n "${EXPECTED_CANDIDATE_VENV:-}" ] '
+            '&& [ "$actual_venv" = "$EXPECTED_CANDIDATE_VENV" ]; then\n'
+            '      require_runtime "$EXPECTED_CANDIDATE_VENV" '
+            '"${CANDIDATE_RUNTIME_MODULE:-}" candidate:open-admission || exit $?\n'
+            "    else\n"
+            '      require_runtime "${EXPECTED_RUNNING_VENV:-}" "" source:open-admission || exit $?\n'
+            "    fi\n"
             '    [ "$PLATFORM_SERVICE_DSN" = "$EXPECTED_PLATFORM_SERVICE_DSN" ] || exit 78\n'
             '    [ "$PLATFORM_OPERATOR_DSN" = "$EXPECTED_PLATFORM_DSN" ] || exit 77\n'
             '    [ "$PIPELINE_STORE_ROOT" = "$EXPECTED_PIPELINE_STORE_ROOT" ] || exit 79\n'
@@ -3822,20 +3924,48 @@ class InstallOrderingTests(unittest.TestCase):
             '    echo "platform reconcile ${RECONCILE_RUN_ID}:${RECONCILE_STAGE}:${RECONCILE_OUTCOME}"'
             ' >> "$ORDER_LOG"\n'
             '    echo "reconciled=${RECONCILE_RUN_ID}:${RECONCILE_STAGE} outcome=${RECONCILE_OUTCOME}" ;;\n'
+            "  *\"import psycopg2\"*\"pg_postmaster_start_time\"*)\n"
+            '    [ "${FIXTURE_DATABASE_AUTHORITY_RC:-0}" = "0" ] || '
+            'exit "$FIXTURE_DATABASE_AUTHORITY_RC"\n'
+            "    printf 'airflow_meta\\tfixture-postmaster-start\\n' ;;\n"
+            "  *)\n"
+            '    printf "%s\\n" "$script" | PYTHONPATH="${FIXTURE_PACKAGE_ROOT:-}" python3 "$@"\n'
+            "    exit $? ;;\n"
             "esac\n"
             "exit 0\n",
         )
         write_stub(
             tmp / "releases" / "airflow-venv-gen-1" / "bin" / "airflow",
-            '#!/usr/bin/env bash\necho "airflow $*" >> "$ORDER_LOG"\n'
+            "#!/usr/bin/env bash\n"
+            "require_airflow() {\n"
+            '  local expected="$1" marker="$2" label="$3" actual\n'
+            '  actual="$(cd "$(dirname "$0")/.." && pwd)"\n'
+            '  if [ -n "$expected" ] && [ "$actual" != "$expected" ]; then\n'
+            '    echo "unexpected Airflow runtime for $label: $actual expected=$expected" >&2\n'
+            "    return 80\n"
+            "  fi\n"
+            '  if [ -n "$marker" ] && [ ! -f "$marker" ]; then\n'
+            '    echo "runtime module missing for $label: $marker" >&2\n'
+            "    return 81\n"
+            "  fi\n"
+            '  if [ -n "${RUNTIME_AUTHORITY_LOG:-}" ]; then\n'
+            '    printf "%s venv=%s\\n" "$label" "$actual" >> "$RUNTIME_AUTHORITY_LOG"\n'
+            "  fi\n"
+            "}\n"
+            'echo "airflow $*" >> "$ORDER_LOG"\n'
             'case "$*" in\n'
             '  "dags unpause solidworks_to_urdf")\n'
+            '    require_airflow "${EXPECTED_CANDIDATE_VENV:-}" '
+            '"${CANDIDATE_RUNTIME_MODULE:-}" candidate:start || exit $?\n'
             '    [ "${UNPAUSE_RC:-0}" = "0" ] || exit "$UNPAUSE_RC"\n'
             '    echo false > "$ADMISSION" ;;\n'
             '  "dags pause solidworks_to_urdf")\n'
+            '    require_airflow "${EXPECTED_RUNNING_VENV:-}" "" running:drain || exit $?\n'
             '    [ "${PAUSE_RC:-0}" = "0" ] || exit "$PAUSE_RC"\n'
             '    echo true > "$ADMISSION" ;;\n'
             '  "db migrate")\n'
+            '    require_airflow "${EXPECTED_CANDIDATE_VENV:-}" '
+            '"${CANDIDATE_RUNTIME_MODULE:-}" candidate:schema-migration || exit $?\n'
             '    if [ "$(cat "$SYSTEMCTL_STATE_DIR/description-postgres" 2>/dev/null)" != "active" ]; then\n'
             '      echo "psycopg2.OperationalError: connection to server on socket '
             '$POSTGRES_ROOT/socket/.s.PGSQL.$POSTGRES_PORT failed: No such file or directory" >&2\n'
@@ -3919,6 +4049,9 @@ class InstallOrderingTests(unittest.TestCase):
                     "deployment_files": {
                         "deploy/airflow/dags/solidworks_to_urdf.py": hashlib.sha256(
                             dag_content
+                        ).hexdigest(),
+                        "deploy/operator/operatorctl.sh": hashlib.sha256(
+                            (release / "operator" / "operatorctl.sh").read_bytes()
                         ).hexdigest(),
                     },
                 }
@@ -4061,6 +4194,39 @@ class InstallOrderingTests(unittest.TestCase):
             "#!/usr/bin/env bash\n" + client_libraries + 'echo "pg_dump" >> "$ORDER_LOG"\n'
             'out=""\nprev=""\nfor argument in "$@"; do [ "$prev" = "-f" ] && out="$argument"; prev="$argument"; done\n'
             "[ -n \"$out\" ] && printf 'PGDUMP-DOUBLE\\n' > \"$out\"\nexit 0\n",
+        )
+        for command in ("pg_restore", "initdb", "pg_ctl"):
+            write_stub(
+                pgbin / command,
+                f"#!/usr/bin/env bash\n{client_libraries}"
+                f'echo "{command}" >> "$ORDER_LOG"\nexit 0\n',
+            )
+        write_stub(
+            release / "platform" / "legacy_cutover.py",
+            "#!/usr/bin/env python3\n"
+            "import hashlib\n"
+            "import os\n"
+            "import sys\n"
+            "from pathlib import Path\n"
+            "for name in ('OPERATORCTL_MAINTENANCE_LOCK_OWNER', "
+            "'OPERATORCTL_MAINTENANCE_LOCK_FD', 'OPERATORCTL_MAINTENANCE_LOCK_PATH'):\n"
+            "    if not os.environ.get(name):\n"
+            "        raise SystemExit(f'legacy cutover missing inherited lock {name}')\n"
+            "fd = os.environ['OPERATORCTL_MAINTENANCE_LOCK_FD']\n"
+            "if not Path(f'/proc/self/fd/{fd}').exists():\n"
+            "    raise SystemExit('legacy cutover inherited lock descriptor is missing')\n"
+            "status = os.environ.get('FIXTURE_LEGACY_CUTOVER_STATUS', 'no-legacy')\n"
+            "receipt = Path(sys.argv[sys.argv.index('--receipt') + 1])\n"
+            "archive = receipt.with_name(receipt.name + '.archive.tar.gz')\n"
+            "digest = '0' * 64\n"
+            "if status != 'no-legacy':\n"
+            "    receipt.write_bytes(b'{\"schema_version\":\"fixture.legacy/v1\"}\\n')\n"
+            "    archive.write_bytes(b'legacy archive fixture\\n')\n"
+            "    digest = hashlib.sha256(receipt.read_bytes()).hexdigest()\n"
+            "with Path(os.environ['ORDER_LOG']).open('a', encoding='utf-8') as stream:\n"
+            "    stream.write(f'legacy_cutover {status}\\n')\n"
+            "print('\\t'.join([status, 'f' * 64, 'e' * 64, 'airflow_meta', '1', '1', "
+            "'platform', '2', 'd' * 64, 'solidworks', digest]))\n",
         )
         write_stub(bindir / "sleep", '#!/usr/bin/env bash\necho "sleep" >> "$ORDER_LOG"\nexit 0\n')
         write_stub(
@@ -4226,7 +4392,10 @@ class InstallOrderingTests(unittest.TestCase):
 
         order = tmp / "order.log"
         control_env = {
-            "PATH": f"{bindir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+            "PATH": (
+                f"{Path(sys.executable).parent}:{bindir}:"
+                f"{os.environ.get('PATH', '/usr/bin:/bin')}"
+            ),
             "XDG_CONFIG_HOME": str(tmp / "config"),
             "ORDER_LOG": str(order),
             "SYSTEMCTL_STATE_DIR": str(tmp / "unit-state"),
@@ -4248,6 +4417,7 @@ class InstallOrderingTests(unittest.TestCase):
             "FIXTURE_OPERATOR_STATE": str(tmp / "state"),
             "PROJECTION_FILE": str(tmp / "projection.json"),
             "LIFECYCLE_ENV_LOG": str(tmp / "query-environment.json"),
+            "FIXTURE_PACKAGE_ROOT": str(ROOT / "src"),
         }
         return release, control_env, order
 
@@ -4281,6 +4451,49 @@ class InstallOrderingTests(unittest.TestCase):
                 EXPECTED_PIPELINE_STORE_ROOT=values["PIPELINE_STORE_ROOT"],
             )
         return result
+
+    def _bind_source_controller_fixture(
+        self,
+        release: Path,
+        root: Path,
+        control_env: dict[str, str],
+    ) -> Path:
+        source_root = root / "source-release"
+        shutil.copytree(release.parent, source_root)
+        source_control = source_root / "deploy" / "operator" / "operatorctl.sh"
+        shutil.copyfile(
+            Path(__file__).with_name("source_operatorctl_fixture.sh"),
+            source_control,
+        )
+        source_control.chmod(0o755)
+        source_manifest_path = source_root / "release.json"
+        source_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8"))
+        source_manifest["deployment_files"]["deploy/operator/operatorctl.sh"] = hashlib.sha256(
+            source_control.read_bytes()
+        ).hexdigest()
+        source_manifest_path.write_text(json.dumps(source_manifest), encoding="utf-8")
+
+        state = root / "state"
+        source_dag = source_root / "deploy" / "airflow" / "dags" / "solidworks_to_urdf.py"
+        dag_digest = hashlib.sha256(source_dag.read_bytes()).hexdigest()
+        for record_path in (
+            state / "install-record.json",
+            state / "install-records" / "gen-1.json",
+        ):
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            record["dag"]["path"] = str(source_dag)
+            record["dag"]["digest"] = dag_digest
+            record_path.write_text(json.dumps(record), encoding="utf-8")
+
+        config_sha256 = hashlib.sha256((release.parent / "platform.json").read_bytes()).hexdigest()
+        control_env["FIXTURE_SOURCE_STATE_ROOT"] = str(state)
+        control_env["FIXTURE_SOURCE_VENV"] = self._derived_value(
+            state, "gen-1", "AIRFLOW_VENV"
+        )
+        control_env["FIXTURE_SOURCE_DEPLOYMENT_ROOT"] = str(source_root)
+        control_env["FIXTURE_SOURCE_CONFIG_SHA256"] = config_sha256
+        control_env["FIXTURE_SOURCE_TRACE"] = str(root / "source-control-trace.log")
+        return source_root
 
     def test_fresh_install_creates_then_uses_the_managed_unit_before_migration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4334,7 +4547,9 @@ class InstallOrderingTests(unittest.TestCase):
 
     def test_stopped_reinstall_starts_the_managed_unit_before_migration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            release, control_env, order = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            release, control_env, order = self._prepare(
+                Path(tmp), fresh=False, ready_after=1, db_exists=True
+            )
             result = self._install(release, control_env)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             lines = order.read_text(encoding="utf-8").splitlines()
@@ -4681,6 +4896,7 @@ class InstallOrderingTests(unittest.TestCase):
             self.addCleanup(self._stop_runtime_processes, Path(tmp))
             self.assertEqual(self._install(release, control_env).returncode, 0)
             state = Path(tmp) / "state"
+            self._bind_source_controller_fixture(release, Path(tmp), control_env)
             control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(
                 state, "gen-1", "PLATFORM_OPERATOR_DSN"
             )
@@ -4829,13 +5045,53 @@ class InstallOrderingTests(unittest.TestCase):
         for name in ("python", "airflow"):
             (target / name).write_bytes((source / name).read_bytes())
             (target / name).chmod(0o755)
+        candidate_module = (
+            target.parent
+            / "lib"
+            / "python3.12"
+            / "site-packages"
+            / "description_pipeline"
+            / "platform"
+            / "facts.py"
+        )
+        candidate_module.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / "src" / "description_pipeline" / "platform" / "facts.py", candidate_module)
 
     def _maintenance(self, release: Path, env: dict, verb: str, generation: str = ""):
         tree = release.parent
         command = ["bash", str(release / "operator" / "operatorctl.sh"), verb, "--config", str(tree / "platform.json")]
+        if verb == "stage":
+            command += [
+                "--source-config",
+                env.get("FIXTURE_SOURCE_CONFIG", str(tree / "platform.json")),
+            ]
         if generation:
             command += ["--install-id", generation]
-        return run(command, env)
+        run_env = env
+        if verb == "promote" and generation:
+            config = json.loads((tree / "platform.json").read_text(encoding="utf-8"))
+            state_root = Path(config["storage"]["state_root"])
+            candidate_env = state_root / "derived" / generation / "operator.env"
+            if candidate_env.is_file():
+                candidate_venv = Path(self._derived_value(state_root, generation, "AIRFLOW_VENV"))
+                run_env = dict(env)
+                run_env["EXPECTED_CANDIDATE_VENV"] = str(candidate_venv)
+                run_env["EXPECTED_RUNNING_VENV"] = self._derived_value(
+                    state_root, "gen-1", "AIRFLOW_VENV"
+                )
+                run_env["CANDIDATE_RUNTIME_MODULE"] = str(
+                    candidate_venv
+                    / "lib"
+                    / "python3.12"
+                    / "site-packages"
+                    / "description_pipeline"
+                    / "platform"
+                    / "facts.py"
+                )
+                run_env["RUNTIME_AUTHORITY_LOG"] = str(
+                    Path(env["ORDER_LOG"]).with_name("runtime-authority.log")
+                )
+        return run(command, run_env)
 
     def _health_double(
         self,
@@ -4894,6 +5150,7 @@ class InstallOrderingTests(unittest.TestCase):
             installed = self._install(release, control_env)
             self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
             state = Path(tmp) / "state"
+            self._bind_source_controller_fixture(release, Path(tmp), control_env)
             control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(state, "gen-1", "PLATFORM_OPERATOR_DSN")
             self._health_double(release, control_env)
             (Path(tmp) / "handoffs").mkdir(exist_ok=True)
@@ -5329,6 +5586,215 @@ class InstallOrderingTests(unittest.TestCase):
             self.assertNotIn("duplicate", refused.stderr)
             self.assertNotIn("does not declare", refused.stderr)
 
+    def test_candidate_controller_delegates_source_owned_public_verbs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            release, control_env, _order = self._prepare(
+                root, fresh=False, ready_after=1, db_exists=True
+            )
+            self.addCleanup(self._stop_runtime_processes, root)
+            installed = self._install(release, control_env)
+            self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+            self._bind_source_controller_fixture(release, root, control_env)
+            control_env["PYTHONPATH"] = f"{ROOT / 'src'}:/public-delegation-poison"
+            control_env["PLATFORM_SERVICE_DSN"] = "public-target-poison"
+            control_env["PLATFORM_OPERATOR_DSN"] = "public-target-poison"
+            config = release.parent / "platform.json"
+            evidence = root / "legacy-reconcile-evidence.json"
+            evidence.write_text("{}\n", encoding="utf-8")
+            active_env = root / "state" / "derived" / "gen-1" / "operator.env"
+            active_env_original = active_env.read_bytes()
+            derived_lines = active_env.read_text(encoding="utf-8").splitlines()
+            derived_mutation = "\n".join(
+                (
+                    "PLATFORM_OPERATOR_DSN='postgresql://forged@/airflow_meta?"
+                    "host=/forged&port=5433'"
+                    if line.startswith("PLATFORM_OPERATOR_DSN=")
+                    else line
+                )
+                for line in derived_lines
+            )
+            active_env.write_text(derived_mutation + "\n", encoding="utf-8")
+            derived_refused = run(
+                [
+                    "bash",
+                    str(release / "operator" / "operatorctl.sh"),
+                    "status",
+                    "--config",
+                    str(config),
+                ],
+                control_env,
+            )
+            active_env.write_bytes(active_env_original)
+            self.assertNotEqual(
+                derived_refused.returncode,
+                0,
+                derived_refused.stdout + derived_refused.stderr,
+            )
+            self.assertIn(
+                "derived environment differs from its source-owned derivation",
+                derived_refused.stderr,
+            )
+
+            for verb in ("status", "health", "drain", "start"):
+                result = run(
+                    ["bash", str(release / "operator" / "operatorctl.sh"), verb, "--config", str(config)],
+                    control_env,
+                )
+                trace_path = Path(control_env["FIXTURE_SOURCE_TRACE"])
+                trace_detail = trace_path.read_text(encoding="utf-8") if trace_path.is_file() else ""
+                self.assertEqual(
+                    result.returncode,
+                    0,
+                    verb + "\n" + result.stdout + result.stderr + trace_detail,
+                )
+                if verb in {"status", "health"}:
+                    self.assertIn("current generation", result.stdout)
+                elif verb == "drain":
+                    self.assertIn("settled", result.stdout)
+
+            reconciled = run(
+                [
+                    "bash",
+                    str(release / "operator" / "operatorctl.sh"),
+                    "reconcile",
+                    "--config",
+                    str(config),
+                    "--run-id",
+                    "legacy-run",
+                    "--stage",
+                    "capture",
+                    "--outcome",
+                    "completed",
+                    "--evidence",
+                    str(evidence),
+                ],
+                control_env,
+            )
+            self.assertEqual(reconciled.returncode, 0, reconciled.stdout + reconciled.stderr)
+            self.assertIn("delegated argv accepted", reconciled.stdout)
+            reconciled_active = run(
+                [
+                    "bash",
+                    str(release / "operator" / "operatorctl.sh"),
+                    "reconcile",
+                    "--config",
+                    str(config),
+                    "--install-id",
+                    "gen-1",
+                    "--run-id",
+                    "legacy-active-run",
+                    "--stage",
+                    "capture",
+                    "--outcome",
+                    "completed",
+                    "--evidence",
+                    str(evidence),
+                ],
+                control_env,
+            )
+            self.assertEqual(
+                reconciled_active.returncode,
+                0,
+                reconciled_active.stdout + reconciled_active.stderr,
+            )
+            reconciled_staged = run(
+                [
+                    "bash",
+                    str(release / "operator" / "operatorctl.sh"),
+                    "reconcile",
+                    "--config",
+                    str(config),
+                    "--install-id",
+                    "gen-2",
+                    "--run-id",
+                    "future-candidate-run",
+                    "--stage",
+                    "capture",
+                    "--effect-key",
+                    "native-capture",
+                ],
+                control_env,
+            )
+            self.assertEqual(
+                reconciled_staged.returncode,
+                0,
+                reconciled_staged.stdout + reconciled_staged.stderr,
+            )
+            trace = Path(control_env["FIXTURE_SOURCE_TRACE"]).read_text(encoding="utf-8")
+            for action in ("status", "health", "drain", "start", "reconcile"):
+                self.assertIn(f"source_child action={action}", trace)
+            self.assertIn(
+                "--run-id legacy-run --stage capture --outcome completed "
+                f"--evidence {evidence}",
+                trace,
+            )
+            self.assertIn(
+                "--install-id gen-1 --run-id legacy-active-run --stage capture "
+                f"--outcome completed --evidence {evidence}",
+                trace,
+            )
+            self.assertIn(
+                "--install-id gen-2 --run-id future-candidate-run --stage capture "
+                "--effect-key native-capture",
+                trace,
+            )
+            compatibility_config = root / "source-compatible-platform.json"
+            compatibility_document = json.loads(config.read_text(encoding="utf-8"))
+            compatibility_document["source_schema_only"] = {"accepted": True}
+            compatibility_config.write_text(
+                json.dumps(compatibility_document), encoding="utf-8"
+            )
+            source_config_sha = hashlib.sha256(config.read_bytes()).hexdigest()
+            self.assertNotEqual(
+                config.read_bytes(),
+                compatibility_config.read_bytes(),
+                "the public delegation case must exercise distinct source and target bytes",
+            )
+            control_env["FIXTURE_SOURCE_CONFIG_SHA256"] = source_config_sha
+            source_valid = run(
+                [
+                    "bash",
+                    str(release / "operator" / "operatorctl.sh"),
+                    "status",
+                    "--config",
+                    str(compatibility_config),
+                    "--source-config",
+                    str(config),
+                ],
+                control_env,
+            )
+            self.assertEqual(source_valid.returncode, 0, source_valid.stdout + source_valid.stderr)
+            self.assertIn("current generation", source_valid.stdout)
+            trace = Path(control_env["FIXTURE_SOURCE_TRACE"]).read_text(encoding="utf-8")
+            self.assertIn(
+                f"source_child config_sha={source_config_sha} "
+                f"expected_config_sha={source_config_sha}",
+                trace,
+            )
+
+            source_refused = run(
+                [
+                    "bash",
+                    str(release / "operator" / "operatorctl.sh"),
+                    "status",
+                    "--config",
+                    str(compatibility_config),
+                    "--source-config",
+                    str(compatibility_config),
+                ],
+                control_env,
+            )
+            self.assertNotEqual(
+                source_refused.returncode,
+                0,
+                source_refused.stdout + source_refused.stderr,
+            )
+            self.assertIn(
+                "does not bind the selected generation",
+                source_refused.stderr,
+            )
+
     def test_stage_archive_is_read_only_and_promote_reuses_it(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             release, control_env, order = self._prepare(
@@ -5338,9 +5804,13 @@ class InstallOrderingTests(unittest.TestCase):
             installed = self._install(release, control_env)
             self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
             state = Path(tmp) / "state"
+            self._bind_source_controller_fixture(release, Path(tmp), control_env)
             control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(
                 state, "gen-1", "PLATFORM_OPERATOR_DSN"
             )
+            control_env["PYTHONPATH"] = f"{ROOT / 'src'}:/source-poison"
+            control_env["PLATFORM_SERVICE_DSN"] = "target-poison"
+            control_env["PLATFORM_OPERATOR_DSN"] = "target-poison"
             self._health_double(release, control_env)
             (Path(tmp) / "handoffs").mkdir(exist_ok=True)
             (Path(tmp) / "specifications").mkdir(exist_ok=True)
@@ -5353,22 +5823,636 @@ class InstallOrderingTests(unittest.TestCase):
             original = remote_archive.read_bytes()
             self._clone_generation_stubs(state)
             self._linux_health_double(release)
+            control_env["FIXTURE_LEGACY_CUTOVER_STATUS"] = "created-cutover"
             promoted = self._maintenance(release, control_env, "promote", "gen-2")
             detail = promoted.stdout + promoted.stderr
-            for name in ("config-reference.out", "start-services.out", "verify.out"):
+            for name in (
+                "source-drain.out",
+                "source-drain.out.stderr",
+                "source-drain-control-receipt.json",
+                "stop-services.out",
+                "stop-services.out.stderr",
+                "source-stop-control-receipt.json",
+                "schema-migration.out",
+                "config-reference.out",
+                "start-services.out",
+                "verify.out",
+            ):
                 path = state / "promotions" / "gen-2" / "evidence" / name
                 if path.is_file():
                     detail += f"\n== {name} ==\n{path.read_text(encoding='utf-8')}"
+            source_trace = Path(control_env.get("FIXTURE_SOURCE_TRACE", ""))
+            if source_trace.is_file():
+                detail += f"\n== source-control-trace.log ==\n{source_trace.read_text(encoding='utf-8')}"
+            receipt_path = state / "promotions" / "gen-2" / "receipt.json"
+            if receipt_path.is_file():
+                detail += f"\n== receipt.json ==\n{receipt_path.read_text(encoding='utf-8')}"
             self.assertEqual(promoted.returncode, 0, detail)
             self.assertEqual(remote_archive.read_bytes(), original)
             self.assertFalse(stat.S_IMODE(remote_archive.stat().st_mode) & 0o222)
+            schema_output = (
+                state / "promotions" / "gen-2" / "evidence" / "schema-migration.out"
+            ).read_text(encoding="utf-8")
+            self.assertIn("legacy archive: created-cutover", schema_output)
+            receipt = json.loads(
+                (state / "promotions" / "gen-2" / "receipt.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            schema_step = next(
+                row
+                for row in receipt["steps"]
+                if row["verb"] == "promote" and row["step"] == "schema-migration"
+            )
+            schema_evidence = {Path(path).name for path in schema_step["evidence"]}
+            self.assertTrue(
+                any(name.endswith("-legacy-archive-receipt.json") for name in schema_evidence)
+            )
+            self.assertTrue(
+                any(
+                    name.endswith("-legacy-archive-receipt.json.archive.tar.gz")
+                    for name in schema_evidence
+                )
+            )
+            self.assertIn("legacy_cutover created-cutover", order.read_text(encoding="utf-8"))
+            drain_receipt = json.loads(
+                (
+                    state
+                    / "promotions"
+                    / "gen-2"
+                    / "evidence"
+                    / "source-drain-control-receipt.json"
+                ).read_text(encoding="utf-8")
+            )
+            stop_receipt = json.loads(
+                (
+                    state
+                    / "promotions"
+                    / "gen-2"
+                    / "evidence"
+                    / "source-stop-control-receipt.json"
+                ).read_text(encoding="utf-8")
+            )
+            for delegation in (drain_receipt, stop_receipt):
+                self.assertEqual(delegation["schema_version"], "solidworks-to-urdf.source-control-delegation/v1")
+                self.assertEqual(delegation["status"], "completed")
+                self.assertEqual(delegation["child_exit_code"], 0)
+                self.assertFalse(delegation["self_control"])
+                config_path = Path(delegation["config"]["path"])
+                self.assertTrue(config_path.is_file())
+                self.assertEqual(
+                    hashlib.sha256(config_path.read_bytes()).hexdigest(),
+                    delegation["config"]["sha256"],
+                )
+                stdout_path = Path(delegation["stdout"]["path"])
+                stderr_path = Path(delegation["stderr"]["path"])
+                self.assertTrue(stdout_path.is_file())
+                self.assertTrue(stderr_path.is_file())
+                self.assertEqual(
+                    hashlib.sha256(stdout_path.read_bytes()).hexdigest(),
+                    delegation["stdout"]["sha256"],
+                )
+                self.assertEqual(
+                    hashlib.sha256(stderr_path.read_bytes()).hexdigest(),
+                    delegation["stderr"]["sha256"],
+                )
+                lock = delegation["maintenance_lock"]
+                self.assertEqual(lock["owner_id"], json.loads(
+                    (state / "locks" / "maintenance.lock").read_text(encoding="utf-8")
+                )["owner_id"])
+                self.assertGreater(lock["pid"], 0)
+            self.assertEqual(
+                drain_receipt["source_control"]["sha256"],
+                hashlib.sha256(
+                    Path(
+                        control_env["FIXTURE_SOURCE_DEPLOYMENT_ROOT"],
+                        "deploy",
+                        "operator",
+                        "operatorctl.sh",
+                    ).read_bytes()
+                ).hexdigest(),
+            )
+            source_trace = Path(control_env["FIXTURE_SOURCE_TRACE"]).read_text(
+                encoding="utf-8"
+            )
+            source_venv = self._derived_value(state, "gen-1", "AIRFLOW_VENV")
+            self.assertIn(
+                f"control_python={source_venv}/bin/python pythonpath=absent "
+                "service_dsn= operator_dsn=",
+                source_trace,
+            )
+            candidate_venv = Path(self._derived_value(state, "gen-2", "AIRFLOW_VENV"))
+            running_venv = Path(self._derived_value(state, "gen-1", "AIRFLOW_VENV"))
+            candidate_module = (
+                candidate_venv
+                / "lib"
+                / "python3.12"
+                / "site-packages"
+                / "description_pipeline"
+                / "platform"
+                / "facts.py"
+            )
+            running_module = (
+                running_venv
+                / "lib"
+                / "python3.12"
+                / "site-packages"
+                / "description_pipeline"
+                / "platform"
+                / "facts.py"
+            )
+            self.assertTrue(candidate_module.is_file())
+            self.assertFalse(running_module.exists())
+            self.assertEqual(
+                hashlib.sha256(candidate_module.read_bytes()).digest(),
+                hashlib.sha256(
+                    (ROOT / "src" / "description_pipeline" / "platform" / "facts.py").read_bytes()
+                ).digest(),
+            )
+            authority_rows = order.with_name("runtime-authority.log").read_text(
+                encoding="utf-8"
+            ).splitlines()
+            for label in (
+                "source:close-admission",
+                "running:drain",
+                "running:dag-capture",
+                "running:connection-capture",
+                "running:stop-services",
+                "candidate:schema-migration",
+                "candidate:endpoint-identity",
+                "candidate:switch-pointer",
+                "candidate:config-reference",
+                "candidate:start",
+                "candidate:verify",
+                "candidate:open-admission",
+            ):
+                self.assertTrue(
+                    any(row.startswith(label + " ") for row in authority_rows),
+                    f"{label} missing from runtime authority trace: {authority_rows}",
+                )
             scp_lines = order.read_text(encoding="utf-8").splitlines()
+            first_pause = scp_lines.index("airflow dags pause solidworks_to_urdf")
+            migration = scp_lines.index("airflow db migrate")
+            self.assertLess(first_pause, migration)
+            close_index = next(
+                index
+                for index, row in enumerate(authority_rows)
+                if row.startswith("source:close-admission ")
+            )
+            drain_index = next(
+                index
+                for index, row in enumerate(authority_rows)
+                if row.startswith("running:drain ")
+            )
+            schema_index = next(
+                index
+                for index, row in enumerate(authority_rows)
+                if row.startswith("candidate:schema-migration ")
+            )
+            self.assertLess(close_index, drain_index)
+            self.assertLess(drain_index, schema_index)
             archive_scp = [
                 line
                 for line in scp_lines
                 if line.startswith("scp ") and "description-1.4.0-windows-cp312-x86_64.zip" in line
             ]
             self.assertEqual(len(archive_scp), 1, "stage should transfer the archive exactly once")
+
+    def test_promote_refuses_a_source_controller_that_drifted_from_its_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release, control_env, order = self._prepare(
+                Path(tmp), fresh=False, ready_after=1, db_exists=True
+            )
+            self.addCleanup(self._stop_runtime_processes, Path(tmp))
+            installed = self._install(release, control_env)
+            self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+            state = Path(tmp) / "state"
+            self._bind_source_controller_fixture(release, Path(tmp), control_env)
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(
+                state, "gen-1", "PLATFORM_OPERATOR_DSN"
+            )
+            control_env["PYTHONPATH"] = f"{ROOT / 'src'}:/candidate-pythonpath-poison"
+            control_env["PLATFORM_SERVICE_DSN"] = "candidate-dsn-poison"
+            control_env["PLATFORM_OPERATOR_DSN"] = "candidate-dsn-poison"
+            self._health_double(release, control_env)
+            (Path(tmp) / "handoffs").mkdir(exist_ok=True)
+            (Path(tmp) / "specifications").mkdir(exist_ok=True)
+            control_env["FIXTURE_REMOTE_ARCHIVE"] = str(
+                Path(tmp) / "remote" / "description-1.4.0-windows-cp312-x86_64.zip"
+            )
+            staged = self._maintenance(release, control_env, "stage", "gen-2")
+            self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+            self._clone_generation_stubs(state)
+            source_control = (
+                Path(control_env["FIXTURE_SOURCE_DEPLOYMENT_ROOT"])
+                / "deploy"
+                / "operator"
+                / "operatorctl.sh"
+            )
+            source_control.write_text(
+                source_control.read_text(encoding="utf-8") + "\n# drifted\n",
+                encoding="utf-8",
+            )
+            self._linux_health_double(release)
+            active_before = (state / "install-record.json").read_bytes()
+            admission_before = (Path(tmp) / "admission").read_bytes()
+            order_before = order.read_text(encoding="utf-8")
+
+            failed = self._maintenance(release, control_env, "promote", "gen-2")
+            detail = failed.stdout + failed.stderr
+            self.assertNotEqual(failed.returncode, 0, detail)
+            self.assertIn("running generation control identity is invalid", failed.stderr)
+            self.assertEqual((state / "install-record.json").read_bytes(), active_before)
+            self.assertEqual((Path(tmp) / "admission").read_bytes(), admission_before)
+            self.assertFalse(Path(control_env["FIXTURE_SOURCE_TRACE"]).exists())
+            receipt = json.loads(
+                (state / "promotions" / "gen-2" / "receipt.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                [row["step"] for row in receipt["steps"]],
+                ["linux-generation", "windows-generation"],
+            )
+            self.assertEqual(order.read_text(encoding="utf-8"), order_before)
+
+    def test_promote_refuses_candidate_environment_drift_before_any_source_mutation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            release, control_env, _order = self._prepare(
+                root, fresh=False, ready_after=1, db_exists=True
+            )
+            self.addCleanup(self._stop_runtime_processes, root)
+            self.assertEqual(
+                self._install(release, control_env).returncode,
+                0,
+            )
+            state = root / "state"
+            self._bind_source_controller_fixture(release, root, control_env)
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(
+                state, "gen-1", "PLATFORM_OPERATOR_DSN"
+            )
+            self._health_double(release, control_env)
+            (root / "handoffs").mkdir(exist_ok=True)
+            (root / "specifications").mkdir(exist_ok=True)
+            staged = self._maintenance(release, control_env, "stage", "gen-2")
+            self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+            candidate_env = state / "derived" / "gen-2" / "operator.env"
+            lines = candidate_env.read_text(encoding="utf-8").splitlines()
+            candidate_env.write_text(
+                "\n".join(
+                    (
+                        f"PIPELINE_STORE_ROOT={json.dumps(str(root / 'forged-store'))}"
+                        if line.startswith("PIPELINE_STORE_ROOT=")
+                        else line
+                    )
+                    for line in lines
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            active_before = (state / "install-record.json").read_bytes()
+            trace = Path(control_env["FIXTURE_SOURCE_TRACE"])
+
+            refused = self._maintenance(
+                release, control_env, "promote", "gen-2"
+            )
+            self.assertNotEqual(
+                refused.returncode,
+                0,
+                refused.stdout + refused.stderr,
+            )
+            self.assertIn(
+                "derived environment does not match its snapshot and release",
+                refused.stderr,
+            )
+            self.assertEqual((state / "install-record.json").read_bytes(), active_before)
+            self.assertFalse(trace.exists(), "source mutation began before candidate verification")
+            receipt = json.loads(
+                (state / "promotions" / "gen-2" / "receipt.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                [row["step"] for row in receipt["steps"]],
+                ["linux-generation", "windows-generation"],
+            )
+
+    def test_promote_refuses_a_foreign_live_database_before_any_source_mutation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            release, control_env, _order = self._prepare(
+                root, fresh=False, ready_after=1, db_exists=True
+            )
+            self.addCleanup(self._stop_runtime_processes, root)
+            self.assertEqual(
+                self._install(release, control_env).returncode,
+                0,
+            )
+            state = root / "state"
+            self._bind_source_controller_fixture(release, root, control_env)
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(
+                state, "gen-1", "PLATFORM_OPERATOR_DSN"
+            )
+            self._health_double(release, control_env)
+            (root / "handoffs").mkdir(exist_ok=True)
+            (root / "specifications").mkdir(exist_ok=True)
+            self.assertEqual(
+                self._maintenance(release, control_env, "stage", "gen-2").returncode,
+                0,
+            )
+            control_env["FIXTURE_DATABASE_AUTHORITY_RC"] = "1"
+            active_before = (state / "install-record.json").read_bytes()
+            trace = Path(control_env["FIXTURE_SOURCE_TRACE"])
+
+            refused = self._maintenance(
+                release, control_env, "promote", "gen-2"
+            )
+            self.assertNotEqual(
+                refused.returncode,
+                0,
+                refused.stdout + refused.stderr,
+            )
+            self.assertIn(
+                "staged generation does not reach its database authority",
+                refused.stderr,
+            )
+            self.assertEqual((state / "install-record.json").read_bytes(), active_before)
+            self.assertFalse(trace.exists(), "source mutation began before the live database check")
+
+    def test_promote_refuses_candidate_config_drift_before_any_source_mutation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            release, control_env, _order = self._prepare(
+                root, fresh=False, ready_after=1, db_exists=True
+            )
+            self.addCleanup(self._stop_runtime_processes, root)
+            self.assertEqual(
+                self._install(release, control_env).returncode,
+                0,
+            )
+            state = root / "state"
+            self._bind_source_controller_fixture(release, root, control_env)
+            source_config = root / "source-platform.json"
+            shutil.copyfile(release.parent / "platform.json", source_config)
+            control_env["FIXTURE_SOURCE_CONFIG"] = str(source_config)
+            candidate_document = json.loads(
+                (release.parent / "platform.json").read_text(encoding="utf-8")
+            )
+            candidate_document["storage"]["handoff_root"] = str(root / "candidate-handoffs")
+            (release.parent / "platform.json").write_text(
+                json.dumps(candidate_document), encoding="utf-8"
+            )
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(
+                state, "gen-1", "PLATFORM_OPERATOR_DSN"
+            )
+            self._health_double(release, control_env)
+            (root / "handoffs").mkdir(exist_ok=True)
+            (root / "specifications").mkdir(exist_ok=True)
+            self.assertEqual(
+                self._maintenance(release, control_env, "stage", "gen-2").returncode,
+                0,
+            )
+            candidate_document["storage"]["handoff_root"] = str(root / "changed-after-stage")
+            (release.parent / "platform.json").write_text(
+                json.dumps(candidate_document), encoding="utf-8"
+            )
+            active_before = (state / "install-record.json").read_bytes()
+            trace = Path(control_env["FIXTURE_SOURCE_TRACE"])
+            refused = self._maintenance(
+                release, control_env, "promote", "gen-2"
+            )
+            self.assertNotEqual(
+                refused.returncode,
+                0,
+                refused.stdout + refused.stderr,
+            )
+            self.assertIn(
+                "current target configuration differs from the staged candidate configuration",
+                refused.stderr,
+            )
+            self.assertEqual((state / "install-record.json").read_bytes(), active_before)
+            self.assertFalse(trace.exists(), "source mutation began before candidate config binding")
+
+    def test_promote_source_drain_refuses_old_active_or_unknown_work(self) -> None:
+        cases = {
+            "active": {
+                "in_flight": [{"run_id": "old-active-run"}],
+                "unresolved": [],
+                "unknown": [],
+                "settled": False,
+            },
+            "unknown": {
+                "in_flight": [],
+                "unresolved": [],
+                "unknown": [{"run_id": "old-unknown-run"}],
+                "settled": False,
+            },
+        }
+        for label, projection in cases.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+                release, control_env, order = self._prepare(
+                    Path(tmp), fresh=False, ready_after=1, db_exists=True
+                )
+                self.addCleanup(self._stop_runtime_processes, Path(tmp))
+                installed = self._install(release, control_env)
+                self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+                state = Path(tmp) / "state"
+                self._bind_source_controller_fixture(release, Path(tmp), control_env)
+                control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(
+                    state, "gen-1", "PLATFORM_OPERATOR_DSN"
+                )
+                self._health_double(release, control_env)
+                (Path(tmp) / "handoffs").mkdir(exist_ok=True)
+                (Path(tmp) / "specifications").mkdir(exist_ok=True)
+                control_env["FIXTURE_REMOTE_ARCHIVE"] = str(
+                    Path(tmp) / "remote" / "description-1.4.0-windows-cp312-x86_64.zip"
+                )
+                staged = self._maintenance(release, control_env, "stage", "gen-2")
+                self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+                self._clone_generation_stubs(state)
+                self._linux_health_double(release)
+                Path(control_env["PROJECTION_FILE"]).write_text(
+                    json.dumps(projection), encoding="utf-8"
+                )
+                control_env["PROJECTION_RC"] = "1"
+
+                failed = self._maintenance(release, control_env, "promote", "gen-2")
+                detail = failed.stdout + failed.stderr
+                self.assertNotEqual(failed.returncode, 0, detail)
+                self.assertIn(
+                    "source generation still has active, unresolved, or unknown work",
+                    failed.stderr,
+                )
+                authority_rows = order.with_name("runtime-authority.log").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+                self.assertTrue(
+                    any(row.startswith("source:close-admission ") for row in authority_rows)
+                )
+                self.assertTrue(
+                    any(row.startswith("running:drain ") for row in authority_rows)
+                )
+                self.assertFalse(
+                    any(row.startswith("candidate:drain ") for row in authority_rows)
+                )
+                self.assertFalse(
+                    any(row.startswith("candidate:schema-migration ") for row in authority_rows)
+                )
+                receipt = json.loads(
+                    (state / "promotions" / "gen-2" / "receipt.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                promote_steps = {
+                    row["step"]: row["status"]
+                    for row in receipt["steps"]
+                    if row["verb"] == "promote"
+                }
+                self.assertEqual(promote_steps["close-admission"], "completed")
+                self.assertEqual(promote_steps["drain"], "failed")
+                self.assertNotIn("schema-migration", promote_steps)
+                active = json.loads(
+                    (state / "install-record.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(active["install_id"], "gen-1")
+
+    def test_promote_records_unknown_source_child_refusal_before_ddl(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            release, control_env, order = self._prepare(
+                root, fresh=False, ready_after=1, db_exists=True
+            )
+            self.addCleanup(self._stop_runtime_processes, root)
+            installed = self._install(release, control_env)
+            self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+            state = root / "state"
+            self._bind_source_controller_fixture(release, root, control_env)
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(
+                state, "gen-1", "PLATFORM_OPERATOR_DSN"
+            )
+            self._health_double(release, control_env)
+            (root / "handoffs").mkdir(exist_ok=True)
+            (root / "specifications").mkdir(exist_ok=True)
+            control_env["FIXTURE_REMOTE_ARCHIVE"] = str(
+                root / "remote" / "description-1.4.0-windows-cp312-x86_64.zip"
+            )
+            staged = self._maintenance(release, control_env, "stage", "gen-2")
+            self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+            self._clone_generation_stubs(state)
+            self._linux_health_double(release)
+            control_env["FIXTURE_SOURCE_FAIL_BEFORE_CLOSE"] = "1"
+            ddl_before = order.read_text(encoding="utf-8").count("psql_platform_apply")
+            active_before = (state / "install-record.json").read_bytes()
+
+            failed = self._maintenance(release, control_env, "promote", "gen-2")
+            detail = failed.stdout + failed.stderr
+            self.assertNotEqual(failed.returncode, 0, detail)
+            self.assertIn("source drain result is unreadable", failed.stderr)
+            self.assertEqual(
+                order.read_text(encoding="utf-8").count("psql_platform_apply"),
+                ddl_before,
+            )
+            self.assertEqual((state / "install-record.json").read_bytes(), active_before)
+            receipt = json.loads(
+                (state / "promotions" / "gen-2" / "receipt.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            promote_steps = {
+                row["step"]: row["status"]
+                for row in receipt["steps"]
+                if row["verb"] == "promote"
+            }
+            self.assertEqual(promote_steps["close-admission"], "unknown")
+            self.assertNotIn("drain", promote_steps)
+            delegation = json.loads(
+                (
+                    state
+                    / "promotions"
+                    / "gen-2"
+                    / "evidence"
+                    / "source-drain-control-receipt.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(delegation["status"], "unknown")
+            self.assertEqual(delegation["child_exit_code"], 9)
+            self.assertIn(
+                "injected refusal before admission mutation",
+                (
+                    state
+                    / "promotions"
+                    / "gen-2"
+                    / "evidence"
+                    / "source-drain.out.stderr"
+                ).read_text(encoding="utf-8"),
+            )
+
+    def test_promote_preserves_the_real_source_stop_exit_before_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            release, control_env, order = self._prepare(
+                root, fresh=False, ready_after=1, db_exists=True
+            )
+            self.addCleanup(self._stop_runtime_processes, root)
+            installed = self._install(release, control_env)
+            self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+            state = root / "state"
+            self._bind_source_controller_fixture(release, root, control_env)
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(
+                state, "gen-1", "PLATFORM_OPERATOR_DSN"
+            )
+            self._health_double(release, control_env)
+            (root / "handoffs").mkdir(exist_ok=True)
+            (root / "specifications").mkdir(exist_ok=True)
+            control_env["FIXTURE_REMOTE_ARCHIVE"] = str(
+                root / "remote" / "description-1.4.0-windows-cp312-x86_64.zip"
+            )
+            staged = self._maintenance(release, control_env, "stage", "gen-2")
+            self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+            self._clone_generation_stubs(state)
+            self._linux_health_double(release)
+            control_env["FIXTURE_SOURCE_STOP_RC"] = "23"
+            ddl_before = order.read_text(encoding="utf-8").count("psql_platform_apply")
+            active_before = (state / "install-record.json").read_bytes()
+
+            failed = self._maintenance(release, control_env, "promote", "gen-2")
+            detail = failed.stdout + failed.stderr
+            self.assertNotEqual(failed.returncode, 0, detail)
+            self.assertIn("did not stop its writers", failed.stderr)
+            self.assertEqual(
+                order.read_text(encoding="utf-8").count("psql_platform_apply"),
+                ddl_before,
+            )
+            self.assertEqual((state / "install-record.json").read_bytes(), active_before)
+            evidence = state / "promotions" / "gen-2" / "evidence"
+            self.assertFalse((evidence / "backup-manifest.json").exists())
+            delegation = json.loads(
+                (evidence / "source-stop-control-receipt.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(delegation["status"], "failed")
+            self.assertEqual(delegation["child_exit_code"], 23)
+            receipt = json.loads(
+                (state / "promotions" / "gen-2" / "receipt.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            promote_steps = {
+                row["step"]: row["status"]
+                for row in receipt["steps"]
+                if row["verb"] == "promote"
+            }
+            self.assertEqual(promote_steps["drain"], "completed")
+            self.assertEqual(promote_steps["stop-services"], "failed")
+            self.assertNotIn("backup", promote_steps)
 
     def test_promote_refuses_a_failed_generation_render_after_the_pointer_switch(self) -> None:
         """A renderer exit is fatal even when it already left a plausible airflow.cfg on disk."""
@@ -5379,6 +6463,7 @@ class InstallOrderingTests(unittest.TestCase):
             installed = self._install(release, control_env)
             self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
             state = root / "state"
+            self._bind_source_controller_fixture(release, root, control_env)
             control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(
                 state, "gen-1", "PLATFORM_OPERATOR_DSN"
             )
@@ -5389,7 +6474,19 @@ class InstallOrderingTests(unittest.TestCase):
             self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
             self._clone_generation_stubs(state)
             candidate_venv = Path(self._derived_value(state, "gen-2", "AIRFLOW_VENV"))
-            write_stub(candidate_venv / "bin" / "python", '#!/usr/bin/env bash\nexec python3 "$@"\n')
+            candidate_python = candidate_venv / "bin" / "python"
+            preserved_python = candidate_venv / "bin" / "python.fixture"
+            shutil.copyfile(candidate_python, preserved_python)
+            preserved_python.chmod(0o755)
+            write_stub(
+                candidate_python,
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                '  *render_config.py*|*render_operator.py*)\n'
+                '    exec python3 "$@" ;;\n'
+                "esac\n"
+                'exec "$0.fixture" "$@"\n',
+            )
             self._linux_health_double(release)
             write_stub(
                 release / "airflow" / "render_config.py",
@@ -5410,12 +6507,23 @@ class InstallOrderingTests(unittest.TestCase):
             )
             before = order.read_text(encoding="utf-8")
             promoted = self._maintenance(release, control_env, "promote", "gen-2")
-            self.assertNotEqual(promoted.returncode, 0, promoted.stdout + promoted.stderr)
+            evidence = state / "promotions" / "gen-2" / "evidence"
+            config_reference = evidence / "config-reference.out"
+            self.assertNotEqual(
+                promoted.returncode,
+                0,
+                promoted.stdout
+                + promoted.stderr
+                + (
+                    "\nconfig-reference:\n" + config_reference.read_text(encoding="utf-8")
+                    if config_reference.is_file()
+                    else ""
+                ),
+            )
             self.assertIn(
                 "the Airflow DAG/config reference could not bind the switched generation",
                 promoted.stderr,
             )
-            evidence = state / "promotions" / "gen-2" / "evidence"
             self.assertIn(
                 "renderer prepared a plausible config then failed",
                 (evidence / "config-reference.out").read_text(encoding="utf-8"),
@@ -5645,8 +6753,8 @@ class InstallOrderingTests(unittest.TestCase):
                     self.assertEqual(active["install_id"], "gen-1")
                     self.assertEqual((root / "admission").read_text(encoding="utf-8").strip(), "true")
 
-    def test_promote_refuses_a_generation_switch_while_a_dag_reader_is_alive(self) -> None:
-        """The pointer switch has a no-reader barrier; a surviving reader keeps the old record."""
+    def test_promote_refuses_when_a_source_reader_survives_stop_before_ddl(self) -> None:
+        """A surviving source reader blocks DDL and keeps the old record."""
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -5654,6 +6762,7 @@ class InstallOrderingTests(unittest.TestCase):
             installed = self._install(release, control_env)
             self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
             state = root / "state"
+            self._bind_source_controller_fixture(release, root, control_env)
             control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(
                 state, "gen-1", "PLATFORM_OPERATOR_DSN"
             )
@@ -5669,15 +6778,15 @@ class InstallOrderingTests(unittest.TestCase):
             promoted = self._maintenance(release, control_env, "promote", "gen-2")
             self.assertNotEqual(promoted.returncode, 0, promoted.stdout + promoted.stderr)
             self.assertIn(
-                "description-airflow-scheduler is active; refusing a non-barriered generation switch",
+                "source service inventory does not prove stopped writers",
                 promoted.stderr,
             )
             active = json.loads((state / "install-record.json").read_text(encoding="utf-8"))
             self.assertEqual(active["install_id"], "gen-1", "a live reader must block the pointer switch")
             evidence = state / "promotions" / "gen-2" / "evidence"
             self.assertFalse(
-                (evidence / "switch-pointer.out").exists(),
-                "no record write may start after the no-reader barrier refuses",
+                (evidence / "backup-manifest.json").exists(),
+                "no backup or DDL may start after a source reader survives stop",
             )
             self.assertEqual((root / "admission").read_text(encoding="utf-8").strip(), "true")
             appended = order.read_text(encoding="utf-8")[len(before):]
@@ -5722,6 +6831,7 @@ class InstallOrderingTests(unittest.TestCase):
             installed = self._install(release, control_env)
             self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
             state = Path(tmp) / "state"
+            self._bind_source_controller_fixture(release, Path(tmp), control_env)
             control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(state, "gen-1", "PLATFORM_OPERATOR_DSN")
             self._health_double(release, control_env)
             (Path(tmp) / "handoffs").mkdir(exist_ok=True)
@@ -5734,7 +6844,14 @@ class InstallOrderingTests(unittest.TestCase):
             self._linux_health_double(release)
             promoted = self._maintenance(release, control_env, "promote", "gen-2")
             detail = promoted.stdout + promoted.stderr
-            for name in ("config-reference.out", "start-services.out", "verify.out"):
+            for name in (
+                "source-drain.out",
+                "source-drain.out.stderr",
+                "source-drain-control-receipt.json",
+                "config-reference.out",
+                "start-services.out",
+                "verify.out",
+            ):
                 path = state / "promotions" / "gen-2" / "evidence" / name
                 if path.is_file():
                     detail += f"\n== {name} ==\n{path.read_text(encoding='utf-8')}"
@@ -5761,8 +6878,8 @@ class InstallOrderingTests(unittest.TestCase):
                 [row["step"] for row in receipt["steps"]],
                 [
                     "linux-generation", "windows-generation",
-                    "close-admission", "drain", "backup",
-                    "stop-services", "schema-migration", "windows-switch", "endpoint-identity",
+                    "close-admission", "drain", "stop-services",
+                    "backup", "schema-migration", "windows-switch", "endpoint-identity",
                     "switch-pointer", "config-reference", "start-services", "verify", "open-admission",
                 ],
             )
@@ -5804,7 +6921,22 @@ class InstallOrderingTests(unittest.TestCase):
                 ),
                 "rollback",
             )
-            self.assertEqual(rolled.returncode, 0, rolled.stdout + rolled.stderr)
+            detail = rolled.stdout + rolled.stderr
+            for name in (
+                "rollback-active-drain.out",
+                "rollback-active-drain.out.stderr",
+                "rollback-stop.out",
+                "rollback-stop.out.stderr",
+                "rollback-database-restore.out",
+                "rollback-database-source-verify.out",
+                "rollback-config-reference.out",
+                "rollback-start.out",
+                "rollback-health.out",
+            ):
+                path = state / "promotions" / "gen-2" / "evidence" / name
+                if path.is_file():
+                    detail += f"\n== {name} ==\n{path.read_text(encoding='utf-8')}"
+            self.assertEqual(rolled.returncode, 0, detail)
             restored = json.loads((state / "install-record.json").read_text(encoding="utf-8"))
             self.assertEqual(restored["install_id"], "gen-1")
             self.assertEqual(admission.read_text().strip(), "true", "rollback keeps the admission closed")
@@ -5828,11 +6960,8 @@ class InstallOrderingTests(unittest.TestCase):
             self.assertIn(f"venv={restored_venv}", render_lines[-1])
             self.assertIn(f"derived={restored_env}", render_lines[-1])
             rollback_verify = (
-                state / "promotions" / "gen-2" / "evidence" / "rollback-verify.out"
+                state / "promotions" / "gen-2" / "evidence" / "rollback-dag-restore.out"
             ).read_text(encoding="utf-8")
-            self.assertIn("restored_maps=", rollback_verify)
-            self.assertNotIn("restored_maps=0", rollback_verify)
-            self.assertIn("candidate_maps=0", rollback_verify)
             self.assertIn("dag_paused_restored=true", rollback_verify)
             live_maps = []
             for pidfile in (Path(tmp) / "unit-state").glob("description-airflow-*.pid"):
@@ -5846,7 +6975,7 @@ class InstallOrderingTests(unittest.TestCase):
                 [row["step"] for row in final_receipt["steps"] if row["verb"] == "rollback"],
                 [
                     "rollback-close", "rollback-drain", "rollback-stop", "rollback-windows",
-                    "rollback-linux", "rollback-config-reference", "rollback-verify",
+                    "rollback-database", "rollback-linux", "rollback-config-reference", "rollback-verify",
                 ],
             )
             self.assertIn(
@@ -5865,9 +6994,13 @@ class InstallOrderingTests(unittest.TestCase):
             )
             self.assertIn(
                 "connection row restored exactly",
-                (state / "promotions" / "gen-2" / "evidence" / "rollback-config-reference.out").read_text(
-                    encoding="utf-8"
-                ),
+                (
+                    state
+                    / "promotions"
+                    / "gen-2"
+                    / "evidence"
+                    / "rollback-connection-verify.out"
+                ).read_text(encoding="utf-8"),
             )
             # Real restore drill on the sealed archive: open it, then rebuild a broken record
             # from the backup bytes and re-verify the running generation.
@@ -5996,6 +7129,7 @@ class InstallOrderingTests(unittest.TestCase):
             installed = self._install(release, control_env)
             self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
             state = root / "state"
+            self._bind_source_controller_fixture(release, root, control_env)
             control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(
                 state, "gen-1", "PLATFORM_OPERATOR_DSN"
             )
@@ -6077,7 +7211,23 @@ class InstallOrderingTests(unittest.TestCase):
                 ),
                 "rollback",
             )
-            self.assertEqual(rolled.returncode, 0, rolled.stdout + rolled.stderr)
+            rollback_detail = rolled.stdout + rolled.stderr
+            for name in (
+                "rollback-active-drain.out",
+                "rollback-active-drain.out.stderr",
+                "rollback-stop.out",
+                "rollback-stop.out.stderr",
+                "rollback-database-restore.out",
+                "rollback-database-source-verify.out",
+                "rollback-config-reference.out",
+                "rollback-start.out",
+                "rollback-start.out.stderr",
+                "rollback-health.out",
+            ):
+                path = state / "promotions" / "gen-2" / "evidence" / name
+                if path.is_file():
+                    rollback_detail += f"\n== {name} ==\n{path.read_text(encoding='utf-8')}"
+            self.assertEqual(rolled.returncode, 0, rollback_detail)
             restored_record = json.loads(
                 (state / "install-record.json").read_text(encoding="utf-8")
             )
@@ -6087,21 +7237,6 @@ class InstallOrderingTests(unittest.TestCase):
                 "c" * 40,
             )
 
-            previous_health_binding = json.loads(
-                (
-                    state
-                    / "promotions"
-                    / "gen-2"
-                    / "evidence"
-                    / "windows-health-rollback-verify-gen-2-binding.json"
-                ).read_text(encoding="utf-8")
-            )
-            self.assertEqual(previous_health_binding["source_commit"], "c" * 40)
-            self.assertEqual(previous_health_binding["source_sha256"], "a" * 64)
-            self.assertEqual(
-                previous_health_binding["artifact_sha256"],
-                hashlib.sha256(previous_archive).hexdigest(),
-            )
             self.assertEqual(
                 resident_binding_path.read_bytes(),
                 resident_binding_bytes,
@@ -6124,20 +7259,32 @@ class InstallOrderingTests(unittest.TestCase):
                         hashlib.sha256(candidate_archive).hexdigest(),
                     )
 
-            rollback_health = json.loads(
+            self.assertIn(
+                "source_child action=health",
+                Path(control_env["FIXTURE_SOURCE_TRACE"]).read_text(
+                    encoding="utf-8"
+                ),
+            )
+            self.assertIn(
+                "stays closed",
                 (
                     state
                     / "promotions"
                     / "gen-2"
                     / "evidence"
-                    / "rollback-health.json"
-                ).read_text(encoding="utf-8")
+                    / "rollback-start.out"
+                ).read_text(encoding="utf-8"),
             )
-            self.assertEqual(rollback_health["release"]["source_commit"], "c" * 40)
-            rollback_verify = (
-                state / "promotions" / "gen-2" / "evidence" / "rollback-verify.out"
-            ).read_text(encoding="utf-8")
-            self.assertIn("linux_health_gate=PASS", rollback_verify)
+            self.assertIn(
+                "dag_paused_restored=true",
+                (
+                    state
+                    / "promotions"
+                    / "gen-2"
+                    / "evidence"
+                    / "rollback-dag-restore.out"
+                ).read_text(encoding="utf-8"),
+            )
             final_receipt = json.loads(
                 (state / "promotions" / "gen-2" / "receipt.json").read_text(encoding="utf-8")
             )
@@ -6154,6 +7301,7 @@ class InstallOrderingTests(unittest.TestCase):
             self.addCleanup(self._stop_runtime_processes, Path(tmp))
             self.assertEqual(self._install(release, control_env).returncode, 0)
             state = Path(tmp) / "state"
+            self._bind_source_controller_fixture(release, Path(tmp), control_env)
             control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(
                 state, "gen-1", "PLATFORM_OPERATOR_DSN"
             )
@@ -6164,7 +7312,19 @@ class InstallOrderingTests(unittest.TestCase):
             admission = Path(tmp) / "admission"
             admission.write_text("false", encoding="utf-8")
             promoted = self._maintenance(release, control_env, "promote", "gen-2")
-            self.assertEqual(promoted.returncode, 0, promoted.stdout + promoted.stderr)
+            detail = promoted.stdout + promoted.stderr
+            for name in (
+                "source-drain.out",
+                "stop-services.out",
+                "schema-migration.out",
+                "config-reference.out",
+                "start-services.out",
+                "verify.out",
+            ):
+                path = state / "promotions" / "gen-2" / "evidence" / name
+                if path.is_file():
+                    detail += f"\n== {name} ==\n{path.read_text(encoding='utf-8')}"
+            self.assertEqual(promoted.returncode, 0, detail)
             captured = json.loads(
                 (state / "promotions" / "gen-2" / "evidence" / "dag-before-promotion.json").read_text(
                     encoding="utf-8"
@@ -6181,12 +7341,230 @@ class InstallOrderingTests(unittest.TestCase):
                 ),
                 "rollback",
             )
-            self.assertEqual(rolled.returncode, 0, rolled.stdout + rolled.stderr)
+            rollback_detail = rolled.stdout + rolled.stderr
+            for name in (
+                "rollback-active-drain.out",
+                "rollback-active-drain.out.stderr",
+                "rollback-stop.out",
+                "rollback-stop.out.stderr",
+                "rollback-database-restore.out",
+                "rollback-database-source-verify.out",
+                "rollback-config-reference.out",
+                "rollback-start.out",
+                "rollback-start.out.stderr",
+                "rollback-health.out",
+            ):
+                path = state / "promotions" / "gen-2" / "evidence" / name
+                if path.is_file():
+                    rollback_detail += f"\n== {name} ==\n{path.read_text(encoding='utf-8')}"
+            self.assertEqual(rolled.returncode, 0, rollback_detail)
             self.assertEqual(admission.read_text(encoding="utf-8").strip(), "false")
             verify = (
-                state / "promotions" / "gen-2" / "evidence" / "rollback-verify.out"
+                state / "promotions" / "gen-2" / "evidence" / "rollback-dag-restore.out"
             ).read_text(encoding="utf-8")
             self.assertIn("dag_paused_restored=false", verify)
+
+    def test_rollback_before_backup_does_not_restore_a_missing_database_baseline(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            release, control_env, order = self._prepare(
+                root, fresh=False, ready_after=1, db_exists=True
+            )
+            self.addCleanup(self._stop_runtime_processes, root)
+            self.assertEqual(
+                self._install(release, control_env).returncode,
+                0,
+            )
+            state = root / "state"
+            self._bind_source_controller_fixture(release, root, control_env)
+            source_config = root / "rollback-source-platform.json"
+            shutil.copyfile(release.parent / "platform.json", source_config)
+            control_env["FIXTURE_SOURCE_CONFIG"] = str(source_config)
+            candidate_document = json.loads(
+                (release.parent / "platform.json").read_text(encoding="utf-8")
+            )
+            candidate_document["storage"]["handoff_root"] = str(root / "handoffs-next")
+            candidate_document["storage"]["artifact_root"] = str(root / "artifacts-next")
+            (release.parent / "platform.json").write_text(
+                json.dumps(candidate_document), encoding="utf-8"
+            )
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(
+                state, "gen-1", "PLATFORM_OPERATOR_DSN"
+            )
+            self._health_double(release, control_env)
+            (root / "handoffs").mkdir(exist_ok=True)
+            (root / "specifications").mkdir(exist_ok=True)
+            self.assertEqual(
+                self._maintenance(release, control_env, "stage", "gen-2").returncode,
+                0,
+            )
+            self._clone_generation_stubs(state)
+            self._linux_health_double(release)
+            Path(control_env["PROJECTION_FILE"]).write_text(
+                json.dumps(
+                    {
+                        "in_flight": [{"run_id": "still-active"}],
+                        "unresolved": [],
+                        "unknown": [],
+                        "settled": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            control_env["PROJECTION_RC"] = "1"
+            failed_promote = self._maintenance(
+                release, control_env, "promote", "gen-2"
+            )
+            self.assertNotEqual(
+                failed_promote.returncode,
+                0,
+                failed_promote.stdout + failed_promote.stderr,
+            )
+            self.assertFalse(
+                (
+                    state
+                    / "promotions"
+                    / "gen-2"
+                    / "evidence"
+                    / "backup-manifest.json"
+                ).exists()
+            )
+
+            Path(control_env["PROJECTION_FILE"]).write_text(
+                json.dumps(
+                    {
+                        "in_flight": [],
+                        "unresolved": [],
+                        "unknown": [],
+                        "settled": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            control_env["PROJECTION_RC"] = "0"
+            rolled = self._maintenance(release, control_env, "rollback", "gen-2")
+            detail = rolled.stdout + rolled.stderr
+            evidence = state / "promotions" / "gen-2" / "evidence"
+            for name in (
+                "rollback-active-drain.out",
+                "rollback-active-drain.out.stderr",
+                "rollback-stop.out",
+                "rollback-stop.out.stderr",
+                "rollback-database-boundary.out",
+                "rollback-database-noop.out",
+                "rollback-database-source-verify.out",
+                "rollback-config-reference.out",
+                "rollback-start.out",
+                "rollback-health.out",
+            ):
+                path = evidence / name
+                if path.is_file():
+                    detail += f"\n== {name} ==\n{path.read_text(encoding='utf-8')}"
+            self.assertEqual(rolled.returncode, 0, detail)
+            self.assertIn(
+                f"config_sha={hashlib.sha256(source_config.read_bytes()).hexdigest()}",
+                Path(control_env["FIXTURE_SOURCE_TRACE"]).read_text(encoding="utf-8"),
+            )
+            lines = order.read_text(encoding="utf-8").splitlines()
+            self.assertNotIn("pg_restore", lines)
+            self.assertIn(
+                "database_changed=0",
+                (evidence / "rollback-database-boundary.out").read_text(
+                    encoding="utf-8"
+                ),
+            )
+            self.assertIn(
+                "without pg_restore",
+                (evidence / "rollback-database-noop.out").read_text(
+                    encoding="utf-8"
+                ),
+            )
+            receipt = json.loads(
+                (state / "promotions" / "gen-2" / "receipt.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            rollback_steps = {
+                row["step"]: row["status"]
+                for row in receipt["steps"]
+                if row["verb"] == "rollback"
+            }
+            self.assertEqual(rollback_steps["rollback-database"], "completed")
+
+    def test_rollback_after_backup_before_schema_keeps_the_unopened_baseline(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            release, control_env, order = self._prepare(
+                root, fresh=False, ready_after=1, db_exists=True
+            )
+            self.addCleanup(self._stop_runtime_processes, root)
+            self.assertEqual(
+                self._install(release, control_env).returncode,
+                0,
+            )
+            state = root / "state"
+            self._bind_source_controller_fixture(release, root, control_env)
+            control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(
+                state, "gen-1", "PLATFORM_OPERATOR_DSN"
+            )
+            self._health_double(release, control_env)
+            (root / "handoffs").mkdir(exist_ok=True)
+            (root / "specifications").mkdir(exist_ok=True)
+            self.assertEqual(
+                self._maintenance(release, control_env, "stage", "gen-2").returncode,
+                0,
+            )
+            self._clone_generation_stubs(state)
+            candidate_venv = Path(
+                self._derived_value(state, "gen-2", "AIRFLOW_VENV")
+            )
+            (candidate_venv / "bin" / "airflow").unlink()
+            self._linux_health_double(release)
+            failed_promote = self._maintenance(
+                release, control_env, "promote", "gen-2"
+            )
+            self.assertNotEqual(
+                failed_promote.returncode,
+                0,
+                failed_promote.stdout + failed_promote.stderr,
+            )
+            evidence = state / "promotions" / "gen-2" / "evidence"
+            self.assertTrue(
+                (state / "promotions" / "gen-2" / "backup.tar.enc").is_file()
+            )
+            self.assertTrue((evidence / "backup-manifest.json").is_file())
+            self.assertFalse((evidence / "schema-migration.out").exists())
+
+            rolled = self._maintenance(release, control_env, "rollback", "gen-2")
+            detail = rolled.stdout + rolled.stderr
+            for name in (
+                "rollback-active-drain.out",
+                "rollback-active-drain.out.stderr",
+                "rollback-stop.out",
+                "rollback-stop.out.stderr",
+                "rollback-database-boundary.out",
+                "rollback-database-noop.out",
+                "rollback-database-source-verify.out",
+                "rollback-connection-verify.out",
+            ):
+                path = evidence / name
+                if path.is_file():
+                    detail += f"\n== {name} ==\n{path.read_text(encoding='utf-8')}"
+            self.assertEqual(rolled.returncode, 0, detail)
+            self.assertNotIn(
+                "pg_restore",
+                order.read_text(encoding="utf-8").splitlines(),
+            )
+            boundary = (evidence / "rollback-database-boundary.out").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("database_changed=0", boundary)
+            self.assertIn("backup_baseline_available=1", boundary)
+            self.assertFalse((state / "promotions" / "gen-2" / "backup").exists())
 
     def test_rollback_pause_failure_stops_before_drain_projection(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -6229,7 +7607,7 @@ class InstallOrderingTests(unittest.TestCase):
             )
             self.assertEqual(rolled.returncode, 1)
             self.assertIn(
-                "rollback could not pause scheduling or drain settled work",
+                "active rollback close/drain result is unreadable",
                 rolled.stderr,
             )
             self.assertFalse(
@@ -6246,7 +7624,8 @@ class InstallOrderingTests(unittest.TestCase):
                 for row in receipt["steps"]
                 if row["verb"] == "rollback"
             }
-            self.assertEqual(rollback_steps["rollback-drain"], "failed")
+            self.assertEqual(rollback_steps["rollback-close"], "unknown")
+            self.assertNotIn("rollback-drain", rollback_steps)
             self.assertNotIn("rollback-stop", rollback_steps)
             self.assertNotIn("rollback-windows", rollback_steps)
             self.assertNotIn("rollback-linux", rollback_steps)
@@ -6265,10 +7644,13 @@ class InstallOrderingTests(unittest.TestCase):
         """A failed restored-system health check never silently re-enables scheduling."""
 
         with tempfile.TemporaryDirectory() as tmp:
-            release, control_env, order = self._prepare(Path(tmp), fresh=False, ready_after=1, db_exists=True)
+            release, control_env, _order = self._prepare(
+                Path(tmp), fresh=False, ready_after=1, db_exists=True
+            )
             self.addCleanup(self._stop_runtime_processes, Path(tmp))
             self.assertEqual(self._install(release, control_env).returncode, 0)
             state = Path(tmp) / "state"
+            self._bind_source_controller_fixture(release, Path(tmp), control_env)
             control_env["EXPECTED_PLATFORM_DSN"] = self._derived_value(
                 state, "gen-1", "PLATFORM_OPERATOR_DSN"
             )
@@ -6278,10 +7660,7 @@ class InstallOrderingTests(unittest.TestCase):
             self._linux_health_double(release)
             promoted = self._maintenance(release, control_env, "promote", "gen-2")
             self.assertEqual(promoted.returncode, 0, promoted.stdout + promoted.stderr)
-            write_stub(
-                release / "operator" / "health_gate.sh",
-                '#!/usr/bin/env bash\necho "rollback health gate failure" >> "$ORDER_LOG"\nexit 7\n',
-            )
+            control_env["FIXTURE_SOURCE_HEALTH_RC"] = "7"
             candidate_venv = self._derived_value(state, "gen-2", "AIRFLOW_VENV")
             rolled = self._maintenance(
                 release,
@@ -6293,19 +7672,27 @@ class InstallOrderingTests(unittest.TestCase):
                 "rollback",
             )
             self.assertEqual(rolled.returncode, 1)
-            self.assertIn("rollback health gate failure", order.read_text(encoding="utf-8"))
+            self.assertIn(
+                "restored source generation did not verify",
+                rolled.stderr,
+            )
             admission = Path(tmp) / "admission"
             self.assertEqual(admission.read_text(encoding="utf-8").strip(), "true")
             evidence = state / "promotions" / "gen-2" / "evidence"
-            verify = (evidence / "rollback-verify.out").read_text(encoding="utf-8")
-            self.assertIn("restored_maps=", verify)
-            self.assertIn("candidate_maps=0", verify)
-            self.assertNotIn("dag_paused_restored=", verify)
-            self.assertTrue((evidence / "rollback-health.json").is_file())
-            self.assertTrue((evidence / "rollback-identity.json").is_file())
+            self.assertIn(
+                "injected health failure",
+                (evidence / "rollback-health.out.stderr").read_text(
+                    encoding="utf-8"
+                ),
+            )
+            self.assertFalse((evidence / "rollback-dag-restore.out").exists())
             receipt = json.loads((state / "promotions" / "gen-2" / "receipt.json").read_text(encoding="utf-8"))
             steps = {row["step"]: row["status"] for row in receipt["steps"] if row["verb"] == "rollback"}
             self.assertEqual(steps["rollback-verify"], "failed")
+            self.assertIn(
+                "source_child action=health",
+                Path(control_env["FIXTURE_SOURCE_TRACE"]).read_text(encoding="utf-8"),
+            )
 
     def test_cold_stage_promote_uses_database_and_restarts_only_after_switch(self) -> None:
         """The sealed recovery state can stage and promote without restoring old executors.
@@ -7362,6 +8749,10 @@ class InstallOrderingTests(unittest.TestCase):
             self.assertEqual(self._install(release, control_env).returncode, 0)
             state = Path(tmp) / "state"
             tree = release.parent
+            self._bind_source_controller_fixture(release, Path(tmp), control_env)
+            source_config = Path(tmp) / "source-platform.json"
+            shutil.copyfile(tree / "platform.json", source_config)
+            control_env["FIXTURE_SOURCE_CONFIG"] = str(source_config)
             # A legitimate configuration upgrade: the candidate describes new storage roots; the
             # running generation keeps its own snapshot and the maintenance window flows.
             document = json.loads((tree / "platform.json").read_text(encoding="utf-8"))
@@ -7394,6 +8785,57 @@ class InstallOrderingTests(unittest.TestCase):
                 {},
             )
             self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
+            candidate_venv = self._derived_value(state, "gen-2", "AIRFLOW_VENV")
+            ambient_document = json.loads(
+                (tree / "platform.json").read_text(encoding="utf-8")
+            )
+            ambient_document["storage"]["handoff_root"] = str(
+                Path(tmp) / "ambient-does-not-bind-active-generation"
+            )
+            (tree / "platform.json").write_text(
+                json.dumps(ambient_document), encoding="utf-8"
+            )
+            rolled = self._maintenance(
+                release,
+                dict(
+                    control_env,
+                    AIRFLOW_VENV=candidate_venv,
+                    FIXTURE_RUNTIME_PROCESS="1",
+                ),
+                "rollback",
+            )
+            detail = rolled.stdout + rolled.stderr
+            evidence = state / "promotions" / "gen-2" / "evidence"
+            for name in (
+                "rollback-active-drain.out",
+                "rollback-active-drain.out.stderr",
+                "rollback-stop.out",
+                "rollback-stop.out.stderr",
+                "rollback-database-restore.out",
+                "rollback-database-source-verify.out",
+                "rollback-config-reference.out",
+                "rollback-start.out",
+                "rollback-health.out",
+            ):
+                path = evidence / name
+                if path.is_file():
+                    detail += f"\n== {name} ==\n{path.read_text(encoding='utf-8')}"
+            self.assertEqual(rolled.returncode, 0, detail)
+            self.assertEqual(
+                json.loads(
+                    (state / "install-record.json").read_text(encoding="utf-8")
+                )["install_id"],
+                "gen-1",
+            )
+            source_trace = Path(control_env["FIXTURE_SOURCE_TRACE"]).read_text(
+                encoding="utf-8"
+            )
+            source_sha = hashlib.sha256(source_config.read_bytes()).hexdigest()
+            self.assertIn(f"config_sha={source_sha}", source_trace)
+            self.assertEqual(
+                (state / "promotions" / "gen-2" / "candidate-platform.json").read_bytes(),
+                json.dumps(document).encode("utf-8"),
+            )
 
     def test_completed_promote_and_rollback_replays_are_read_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

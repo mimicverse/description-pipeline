@@ -854,6 +854,50 @@ result="$(
             os.close(unlocked)
             os.close(held)
 
+    def test_lock_acquisition_replaces_stale_owner_metadata(self):
+        state_root = self.root / "state"
+        state_root.mkdir()
+        (state_root / "resolved.env").write_text("", encoding="utf-8")
+        lock_dir = state_root / "locks"
+        lock_dir.mkdir()
+        lock_path = lock_dir / "maintenance.lock"
+        lock_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "solidworks-to-urdf.maintenance-lock/v1",
+                    "owner_id": "e50" + "a" * 61,
+                    "acquired_at": "2026-10-22T00:00:00Z",
+                    "pid": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = run(["drain", "--config", str(self.config)])
+
+        self.assertNotEqual(result.returncode, 0)
+        metadata = json.loads(lock_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            set(metadata),
+            {"schema_version", "owner_id", "acquired_at", "pid"},
+        )
+        self.assertEqual(
+            metadata["schema_version"],
+            "solidworks-to-urdf.maintenance-lock/v1",
+        )
+        self.assertRegex(metadata["owner_id"], r"\A[0-9a-f]{64}\Z")
+        self.assertNotEqual(
+            metadata["owner_id"],
+            "e50" + "a" * 61,
+            result.stdout + result.stderr,
+        )
+        self.assertRegex(
+            metadata["acquired_at"],
+            r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z",
+        )
+        self.assertIs(type(metadata["pid"]), int)
+        self.assertGreater(metadata["pid"], 0)
+
     def test_invalid_config_fails_before_any_verb_behavior(self):
         bad = self.root / "bad.json"
         document = platform_document(self.root)

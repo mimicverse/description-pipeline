@@ -24,6 +24,7 @@ ROLLBACK_STEPS = (
     "rollback-drain",
     "rollback-stop",
     "rollback-windows",
+    "rollback-database",
     "rollback-linux",
     "rollback-config-reference",
     "rollback-verify",
@@ -374,6 +375,62 @@ def canonical_code_rollback_receipt(config: Path, install_id: str) -> Path:
     )
 
 
+def code_rollback_source_config(receipt_path: Path, receipt: dict) -> Path:
+    source_record_path = require_file(
+        Path(str(receipt.get("from", ""))),
+        "code rollback source generation",
+    )
+    source_record = load_json(source_record_path)
+    snapshot_binding = source_record.get("snapshot")
+    snapshot_path = (
+        Path(str(snapshot_binding.get("path", "")))
+        if isinstance(snapshot_binding, dict)
+        else None
+    )
+    if snapshot_path is None:
+        raise GateError(
+            "release_recovery_gate_invalid",
+            "rollback source install record has no configuration snapshot",
+        )
+    snapshot = load_json(require_file(snapshot_path, "source configuration snapshot"))
+    if (
+        sha256_file(snapshot_path)
+        != (
+            snapshot_binding.get("digest")
+            if isinstance(snapshot_binding, dict)
+            else None
+        )
+    ):
+        raise GateError(
+            "release_recovery_gate_invalid",
+            "rollback source snapshot bytes differ from the install record digest",
+        )
+    sources = snapshot.get("sources")
+    expected_sha = (
+        sources.get("platform_json_sha256") if isinstance(sources, dict) else None
+    )
+    if not isinstance(expected_sha, str) or not HEX64.fullmatch(expected_sha):
+        raise GateError(
+            "release_recovery_gate_invalid",
+            "rollback source snapshot carries no original configuration digest",
+        )
+    receipt_dir = receipt_path.parent
+    candidates = (
+        receipt_dir / "source-platform.json",
+        receipt_dir / "evidence" / "source-platform.json",
+    )
+    for candidate in candidates:
+        if candidate.is_symlink() or not candidate.is_file():
+            continue
+        if sha256_file(candidate) == expected_sha:
+            return candidate
+    raise GateError(
+        "release_recovery_gate_invalid",
+        "rollback has no preserved source configuration with the bound digest",
+        {"receipt": str(receipt_path), "expected_sha256": expected_sha},
+    )
+
+
 def authority_inputs(
     *,
     config: Path,
@@ -436,6 +493,11 @@ def snapshot(args) -> int:
     config = require_file(Path(args.config), "platform config")
     key = require_file(Path(args.key_file), "recovery key")
     operatorctl = require_file(Path(args.operatorctl), "operatorctl")
+    source_config = (
+        require_file(Path(args.source_config), "source platform config")
+        if getattr(args, "source_config", None)
+        else None
+    )
     identity = expected_identity(Path(args.expected_release))
     out = Path(args.out)
     if out.exists() or out.is_symlink():
@@ -455,6 +517,11 @@ def snapshot(args) -> int:
             str(out),
             "--operatorctl",
             str(operatorctl),
+            *(
+                ("--source-config", str(source_config))
+                if source_config is not None
+                else ()
+            ),
         ],
         timeout=getattr(args, "timeout", DEFAULT_TIMEOUT_SECONDS),
         runner=args.runner,
@@ -481,6 +548,14 @@ def snapshot(args) -> int:
             "archive_sha256": values.get("archive_sha256"),
             "database_snapshot": True,
             "admission": "closed",
+            **(
+                {
+                    "source_config": str(source_config.resolve()),
+                    "source_config_sha256": sha256_file(source_config),
+                }
+                if source_config is not None
+                else {}
+            ),
         },
     )
     print(json.dumps({"status": "succeeded", "manifest": str(manifest)}, sort_keys=True))
@@ -665,6 +740,7 @@ def finalize(args) -> int:
             sha256_file(path),
         )
     rollback = validate_code_rollback(code_rollback_path, args.install_id, identity)
+    source_config = code_rollback_source_config(code_rollback_path, rollback)
     import recovery
 
     manifest_document = load_json(Path(restore_inputs["manifest"]))
@@ -693,6 +769,8 @@ def finalize(args) -> int:
     inputs = {
         "restore_gate_sha256": sha256_file(restore_gate_path),
         "code_rollback_receipt_sha256": sha256_file(code_rollback_path),
+        "source_config": str(source_config.resolve()),
+        "source_config_sha256": sha256_file(source_config),
         "config_sha256": sha256_file(config),
         "release_manifest_sha256": sha256_file(expected_release),
         "recovery_py_sha256": sha256_file(recovery_py),
@@ -741,7 +819,14 @@ def finalize(args) -> int:
     status_value = None
     try:
         start_result = run(
-            [str(operatorctl), "start", "--config", str(config)],
+            [
+                str(operatorctl),
+                "start",
+                "--config",
+                str(config),
+                "--source-config",
+                str(source_config),
+            ],
             timeout=timeout,
             runner=args.runner,
         )
@@ -754,7 +839,14 @@ def finalize(args) -> int:
                 "operatorctl start did not prove that the platform admission opened",
             )
         status_result = run(
-            [str(operatorctl), "status", "--config", str(config)],
+            [
+                str(operatorctl),
+                "status",
+                "--config",
+                str(config),
+                "--source-config",
+                str(source_config),
+            ],
             timeout=timeout,
             runner=args.runner,
         )
@@ -764,7 +856,14 @@ def finalize(args) -> int:
             status_result.stdout, windows_identity["install_id"], windows_identity["config_digest"]
         )
         health_result = run(
-            [str(operatorctl), "health", "--config", str(config)],
+            [
+                str(operatorctl),
+                "health",
+                "--config",
+                str(config),
+                "--source-config",
+                str(source_config),
+            ],
             timeout=timeout,
             runner=args.runner,
         )
@@ -775,7 +874,14 @@ def finalize(args) -> int:
         if start_executed:
             try:
                 completed = args.runner(
-                    [str(operatorctl), "drain", "--config", str(config)],
+                    [
+                        str(operatorctl),
+                        "drain",
+                        "--config",
+                        str(config),
+                        "--source-config",
+                        str(source_config),
+                    ],
                     capture_output=True,
                     text=True,
                     check=False,
@@ -870,6 +976,7 @@ def parser() -> argparse.ArgumentParser:
     snapshot_parser.add_argument("--out", required=True)
     snapshot_parser.add_argument("--operatorctl", required=True)
     snapshot_parser.add_argument("--expected-release", required=True)
+    snapshot_parser.add_argument("--source-config")
     restore_parser = sub.add_parser("restore")
     verify_parser = sub.add_parser("verify")
     for item in (restore_parser, verify_parser):

@@ -37,6 +37,10 @@ flowchart LR
 
 Linux 完成上传与 Freeze 后，Windows 为 Discover 和 Capture 分别物化受控输入、建立并释放自己的原生会话。Discover 返回原生观察，Linux 形成 prepared package；Capture 返回原生证据，Linux 接纳并独立核验传输。SourceSet archive 与 prepared archive 是不同对象，分别记录摘要，并证明同一封存原件血缘。等待 Linux 时不占用 CAD 会话，不引入跨 operation 的可变来源缓存。
 
+代际维护以实际安装代为执行边界：每一代的控制入口、解释器、配置快照和数据库语义共同构成其维护上下文。发行控制器从现有安装记录及发行清单派生并核验上下文，源代自行关闭、排空和对账源状态，候选代自行迁移、启动和验证候选状态；控制器只编排既有锁与证据，不复制另一代业务实现或建立第二份代际状态。源端公共命令通过子进程整件委派，参数由源端契约解释，不按版本号翻译。
+
+源配置原件与派生环境也按代归属。控制器先核验 snapshot 实际 SHA-256 等于安装记录的 `snapshot.digest`，再核验原始 `platform.json` 字节 SHA-256 等于该 snapshot 的 `sources.platform_json_sha256`；两层摘要不得混用。控制器不在候选代码中重编码或重抄源配置推导；`operator.env` 的实际运行值由源代自身现有属主重新派生并核验。继承维护锁以实际 FD、inode 和内核 `FLOCK` 为准，既有 metadata 字段保留，但不以 PID 活性或可由外层污染的环境开关替代锁权与入口身份。
+
 ## 数据权威
 
 | 事实 | 来源及约束 |

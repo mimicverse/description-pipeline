@@ -35,8 +35,8 @@ PROMOTE_STEPS = (
     "windows-generation",
     "close-admission",
     "drain",
-    "backup",
     "stop-services",
+    "backup",
     "schema-migration",
     "windows-switch",
     "endpoint-identity",
@@ -51,6 +51,7 @@ ROLLBACK_STEPS = (
     "rollback-drain",
     "rollback-stop",
     "rollback-windows",
+    "rollback-database",
     "rollback-linux",
     "rollback-config-reference",
     "rollback-verify",
@@ -274,6 +275,66 @@ def recorded_steps_valid(
         return True
     except (OSError, TypeError, ValueError):
         return False
+
+
+def has_unrecorded_phase_artifacts(receipt_file: Path, document: dict, verb: str) -> bool:
+    """Refuse fresh replay when a phase artifact proves that an operation was attempted."""
+
+    receipt_dir = receipt_file.parent
+    stage_owned = {
+        "receipt.json",
+        "source-platform.json",
+        "candidate-platform.json",
+        "candidate-wheel",
+        "linux-generation.out",
+        "windows-stage.out",
+        "windows-stage.path",
+        "windows-stage.path.stderr",
+        "evidence",
+        "evidence-immutable",
+    }
+    for path in receipt_dir.iterdir():
+        if path.name in stage_owned:
+            continue
+        if verb == "promote" and (
+            path.name.startswith("windows-promote.")
+            or path.name.startswith("windows-health-")
+        ):
+            return True
+        if verb == "rollback" and (
+            path.name.startswith("rollback-")
+            or path.name.startswith("windows-status")
+            or path.name.startswith("windows-rollback")
+        ):
+            return True
+    evidence_dir = receipt_dir / "evidence"
+    if evidence_dir.is_dir():
+        if any(evidence_dir.iterdir()) and verb == "promote":
+            return True
+        if verb == "rollback" and any(
+            path.name.startswith("rollback-")
+            or path.name.startswith("windows-status")
+            or path.name.startswith("windows-rollback")
+            for path in evidence_dir.iterdir()
+        ):
+            return True
+    freeze_dir = canonical_evidence_root(receipt_file)
+    if freeze_dir.is_dir():
+        recorded_parents = {
+            Path(path).parent.resolve()
+            for row in document.get("steps", [])
+            if isinstance(row, dict)
+            for path in row.get("evidence", [])
+            if isinstance(path, str)
+        }
+        if any(
+            child.is_dir()
+            and child.name.startswith(verb + "-")
+            and child.resolve() not in recorded_parents
+            for child in freeze_dir.iterdir()
+        ):
+            return True
+    return False
 
 
 def save_receipt(path: Path, document: dict) -> None:
@@ -531,6 +592,9 @@ def main(argv: list[str] | None = None) -> int:
             and all(row.get("status") == "completed" for row in verb_rows)
         )
         if not completed and not fresh:
+            print("replay=partial")
+            return 11
+        if not completed and has_unrecorded_phase_artifacts(path, document, args.verb):
             print("replay=partial")
             return 11
         if not args.active_record.is_file():

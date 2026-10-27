@@ -1747,8 +1747,9 @@ def fake_maintenance_state(
     operatorctl_path: Path,
     timeout: int,
     maintenance_lock: recovery.MaintenanceLock | None = None,
+    source_config: Path | None = None,
 ) -> dict:
-    del database, timeout
+    del database, timeout, source_config
     assert maintenance_lock is not None
     operatorctl_path = Path(operatorctl_path).resolve()
     probe = {

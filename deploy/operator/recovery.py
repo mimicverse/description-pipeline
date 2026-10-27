@@ -7746,6 +7746,7 @@ def quiesce_maintenance(
     operatorctl_path: Path,
     timeout: int,
     maintenance_lock: MaintenanceLock | None = None,
+    source_config: Path | None = None,
 ) -> dict:
     _require_airflow_interpreter(context)
     operatorctl_path = Path(operatorctl_path).resolve()
@@ -7768,6 +7769,8 @@ def quiesce_maintenance(
         "--config",
         context.config_path,
     ]
+    if source_config is not None:
+        drain_argv.extend(("--source-config", source_config))
     inherited = {}
     inherited_fds = ()
     if maintenance_lock is not None:
@@ -7797,6 +7800,8 @@ def quiesce_maintenance(
         context.config_path,
         "--keep-database",
     ]
+    if source_config is not None:
+        stop_argv.extend(("--source-config", source_config))
     _, stop_evidence = _run_maintenance_command(
         stop_argv,
         timeout=timeout,
@@ -7914,6 +7919,7 @@ def backup_command(
     key_file: Path,
     out: Path,
     operatorctl_path: Path | None = None,
+    source_config: Path | None = None,
 ) -> dict:
     require(
         bool(BACKUP_ID.fullmatch(backup_id)),
@@ -7922,9 +7928,16 @@ def backup_command(
     )
     out = Path(out)
     key_file = Path(key_file)
+    source_config = Path(source_config) if source_config is not None else None
     require(out.is_absolute(), "recovery_target_path_unsafe", "--out must be absolute")
     require_no_links(out, "backup output")
     require_real_file(key_file, "external backup key", "recovery_key_unavailable")
+    if source_config is not None:
+        require_real_file(
+            source_config,
+            "source platform configuration",
+            "recovery_maintenance_unavailable",
+        )
     require(
         key_file.stat().st_mode & 0o077 == 0,
         "recovery_key_unavailable",
@@ -7964,6 +7977,7 @@ def backup_command(
                 key_file=key_file,
                 out=out,
                 operatorctl_path=operatorctl_path,
+                source_config=source_config,
             )
         except BaseException as error:
             with contextlib.suppress(Exception):
@@ -8001,6 +8015,7 @@ def _backup_command_claimed(
     key_file: Path,
     out: Path,
     operatorctl_path: Path | None,
+    source_config: Path | None,
 ) -> dict:
     require_current_claim(claim)
     receipt_path = claim.receipt_path
@@ -8043,6 +8058,7 @@ def _backup_command_claimed(
         context,
         database,
         operatorctl_path=operatorctl_path,
+        source_config=source_config,
         timeout=3600,
         maintenance_lock=lifecycle_lock,
     )
@@ -9192,6 +9208,18 @@ def validate_manifest(document: object, *, expected_manifest_sha: str | None) ->
         ]
         if name == "stop":
             expected_argv.append("--keep-database")
+        if "--source-config" in command["argv"]:
+            index = command["argv"].index("--source-config")
+            require(
+                index == len(command["argv"]) - 2
+                and isinstance(command["argv"][index + 1], str)
+                and bool(command["argv"][index + 1]),
+                "recovery_manifest_invalid",
+                f"maintenance {name} source configuration argument is malformed",
+            )
+            expected_argv.extend(
+                ("--source-config", command["argv"][index + 1])
+            )
         require(
             command["argv"] == expected_argv,
             "recovery_manifest_invalid",
@@ -13202,6 +13230,7 @@ def build_parser() -> argparse.ArgumentParser:
     backup_parser.add_argument("--key-file", type=Path, required=True)
     backup_parser.add_argument("--out", type=Path, required=True)
     backup_parser.add_argument("--operatorctl", type=Path)
+    backup_parser.add_argument("--source-config", type=Path)
     restore_parser = subparsers.add_parser("restore")
     restore_parser.add_argument("--manifest", type=Path, required=True)
     restore_parser.add_argument("--key", type=Path, required=True)
@@ -13370,6 +13399,7 @@ def main(argv: list[str] | None = None) -> int:
                 key_file=args.key_file,
                 out=args.out,
                 operatorctl_path=args.operatorctl,
+                source_config=args.source_config,
             )
             completed_backup = result
             print(f"manifest={result['manifest']}")

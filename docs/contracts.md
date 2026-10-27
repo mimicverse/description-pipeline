@@ -356,6 +356,12 @@ metadata closure。同一 command/effect 恢复复用原 intent 与 outbound；�
 <a id="recovery"></a>
 ## 状态与恢复
 
+跨代维护调用必须保持代码、解释器、配置和数据权威来自同一被验证代。源端活动、未解决或未知工作未收口时不得以候选空模型继续；legacy facts 必须经已验证归档及事务切换才能离开旧权威，不得伪造为新 canonical 历史。候选 DDL 完成后只能由候选包解释当前 schema；需要恢复源代时，必须先恢复并验明源数据库基线。确认丢失或 schema 身份不明保持关闭／UNKNOWN，不能从 fresh 分类或缺少日志推断没有副作用。上述行为复用既有安装记录、配置快照、维护锁与 promotion/archive 证据，不新增权威副本。
+
+源端 `operator.env` 只是派生物。控制器不得仅比较可同时被修改的配置摘要，也不得用候选推导替换源代规则。配置绑定有两层：snapshot 实际字节 SHA-256 必须等于安装记录的 `snapshot.digest`，源 `platform.json` 原字节 SHA-256 必须等于该 snapshot 的 `sources.platform_json_sha256`。源端派生环境由其自身现有代码、解释器和对应发布字节重新核验。没有源原件时在变更前拒绝，不能从 resolved 内容编码出伪原件。公共命令及其原始 argv 整体交给源代解释，环境开关不能跳过自委派校验，维护锁权威来自继承 FD、inode 与内核 `FLOCK`。
+
+跨代回滚先依据不可变 promotion 阶段与实际对账确定是否跨过候选数据库变更边界。尚未生成 baseline 且候选 DDL 未发生时，由源上下文核验后恢复；已经变更时必须先有可验证 baseline，恢复并验明源 schema 后才能启动源代。边界不明且无可用 baseline 时保持关闭／UNKNOWN，不执行无依据 restore，也不因缺少某个日志推定无副作用。
+
 `project_stage_status` 与 `project_run_status` 是唯一业务状态投影。它们只消费
 canonical facts 的真实阶段 decision/effect 以及实际 Airflow task/DagRun 关联；
 SQL view、Portal、operator 和 display metadata 均不得另写状态 reducer。正式运行

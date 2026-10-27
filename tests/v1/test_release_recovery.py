@@ -204,7 +204,21 @@ class ReleaseRecoveryTests(unittest.TestCase):
         install_id = "gen-release-rollback"
         source = state_root / "install-records/rollback-source.json"
         source_snapshot = state_root / "snapshots/rollback-source.json"
-        source_snapshot.write_text(json.dumps({"install_id": "rollback-source"}))
+        source_platform = (
+            state_root / "promotions" / install_id / "source-platform.json"
+        )
+        source_platform.parent.mkdir(parents=True, exist_ok=True)
+        source_platform.write_text('{"schema":"source"}\n', encoding="utf-8")
+        source_snapshot.write_text(
+            json.dumps(
+                {
+                    "install_id": "rollback-source",
+                    "sources": {
+                        "platform_json_sha256": digest(source_platform.read_bytes())
+                    },
+                }
+            )
+        )
         source.write_text(
             json.dumps(recovery_tests.install_record_fixture(state_root, "rollback-source", source_snapshot))
         )
@@ -258,9 +272,15 @@ class ReleaseRecoveryTests(unittest.TestCase):
             root = Path(directory)
             expected, config, key, operatorctl, _plan, release = self.make_inputs(root)
             out = root / "snapshot"
+            source_config = root / "source-platform.json"
+            source_config.write_text('{"source":true}\n', encoding="utf-8")
 
             def runner(argv, **_kwargs):
                 self.assertIn("backup", argv)
+                self.assertEqual(
+                    argv[argv.index("--source-config") + 1],
+                    str(source_config),
+                )
                 out.mkdir(parents=True, exist_ok=True)
                 manifest = out / "manifest.json"
                 manifest.write_text(json.dumps({"release": release}), encoding="utf-8")
@@ -282,12 +302,17 @@ class ReleaseRecoveryTests(unittest.TestCase):
                 operatorctl=str(operatorctl),
                 expected_release=str(expected),
                 backup_id="backup-1",
+                source_config=str(source_config),
                 runner=runner,
             )
             self.assertEqual(release_recovery.snapshot(args), 0)
             gate = json.loads((out / release_recovery.RECEIPT).read_text(encoding="utf-8"))
             self.assertEqual(gate["database_snapshot"], True)
             self.assertEqual(gate["release"], release)
+            self.assertEqual(
+                gate["source_config_sha256"],
+                digest(source_config.read_bytes()),
+            )
 
     def test_restore_success_and_idempotence(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -763,6 +788,14 @@ class ReleaseRecoveryTests(unittest.TestCase):
             args.runner = runner
             self.assertEqual(release_recovery.finalize(args), 0)
             self.assertEqual([argv[1] for argv in calls], ["start", "status", "health"])
+            source_config = (
+                Path(args.code_rollback_receipt).parent / "source-platform.json"
+            )
+            for argv in calls:
+                self.assertEqual(
+                    argv[argv.index("--source-config") + 1],
+                    str(source_config.resolve()),
+                )
             status = Path(args.restore_status_dir)
             gate = json.loads((status / release_recovery.FINALIZE_RECEIPT).read_text(encoding="utf-8"))
             restore_gate = json.loads((status / release_recovery.RECEIPT).read_text(encoding="utf-8"))
@@ -779,6 +812,10 @@ class ReleaseRecoveryTests(unittest.TestCase):
             self.assertEqual(
                 gate["inputs"]["restore_gate_sha256"],
                 digest((status / release_recovery.RECEIPT).read_bytes()),
+            )
+            self.assertEqual(
+                gate["inputs"]["source_config_sha256"],
+                digest(source_config.read_bytes()),
             )
             self.assertFalse(restore_gate["runtime_restart"])
             before = len(calls)
@@ -938,6 +975,23 @@ class ReleaseRecoveryTests(unittest.TestCase):
             calls = []
             args.runner = lambda argv, **_kwargs: calls.append(argv) or Result()
             with self.assertRaisesRegex(release_recovery.GateError, "has not completed"):
+                release_recovery.finalize(args)
+            self.assertEqual(calls, [])
+
+    def test_finalize_requires_the_preserved_source_config_before_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = self.completed_finalize_inputs(root)
+            source_config = (
+                Path(args.code_rollback_receipt).parent / "source-platform.json"
+            )
+            source_config.write_text('{"schema":"forged"}\n', encoding="utf-8")
+            calls = []
+            args.runner = lambda argv, **_kwargs: calls.append(argv) or Result()
+            with self.assertRaisesRegex(
+                release_recovery.GateError,
+                "no preserved source configuration",
+            ):
                 release_recovery.finalize(args)
             self.assertEqual(calls, [])
 
