@@ -278,17 +278,28 @@ install_from_config() {
 }
 
 load_env_file() {
-  local file="$1" rc=0 allexport=0
-  [ -f "$file" ] && [ ! -L "$file" ] \
-    || die "environment file is missing or a link: $file"
-  case "$-" in
-    *a*) allexport=1 ;;
-  esac
-  set -a
-  # shellcheck disable=SC1090
-  source "$file" || rc=$?
-  [ "$allexport" = "1" ] || set +a
-  return "$rc"
+  local file="$1" output key value
+  output="$(mktemp)"
+  if ! "$CONTROL_PYTHON" - "$HERE" "$file" > "$output" <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+from render_operator import read_env
+
+values = read_env(Path(sys.argv[2]))
+for key, value in values.items():
+    sys.stdout.buffer.write(key.encode() + b"\0" + value.encode() + b"\0")
+PY
+  then
+    rm -f "$output"
+    return 1
+  fi
+  while IFS= read -r -d '' key && IFS= read -r -d '' value; do
+    printf -v "$key" '%s' "$value"
+    export "$key"
+  done < "$output"
+  rm -f "$output"
 }
 
 resolve_state_root() {
@@ -947,28 +958,18 @@ result = platform_env.derive(
     wheel=wheel_file,
 )
 actual = {}
-optional_empty = {"FEISHU_APP_SECRET_FILE", "FEISHU_TENANT_KEYS"}
-empty_optional_overrides = set()
 for number, line in enumerate(env_file.read_text(encoding="utf-8").splitlines(), 1):
     stripped = line.strip()
     if not stripped or stripped.startswith("#"):
         continue
     key, separator, raw = stripped.partition("=")
-    if (
-        not separator
-        or re.fullmatch(r"[A-Z_][A-Z0-9_]*", key) is None
-    ):
+    if not separator or re.fullmatch(r"[A-Z_][A-Z0-9_]*", key) is None:
         raise SystemExit(f"{env_file}:{number}: invalid environment declaration")
     try:
         value = "" if raw.strip() == "" else render_operator.decode_env_value(raw.strip())
     except ValueError as error:
         raise SystemExit(f"{env_file}:{number}: {error}") from error
-    previous = actual.get(key)
-    if key in actual and previous != value:
-        if value == "" and key in optional_empty:
-            actual[key] = value
-            empty_optional_overrides.add(key)
-            continue
+    if key in actual and actual[key] != value:
         raise SystemExit(f"{env_file}:{number}: conflicting duplicate declaration for {key}")
     actual[key] = value
 expected = {key: value for key, value in result["env"].items() if value != ""}
@@ -977,10 +978,7 @@ if missing:
     raise SystemExit(
         f"the generation environment {env_file} does not define {', '.join(missing)}"
     )
-actual = {key: value for key, value in actual.items() if value != ""}
-for key in empty_optional_overrides:
-    expected.pop(key, None)
-extra = set(actual) - set(expected) - {"SOLIDWORKS_SSH_BIN"}
+extra = set(actual) - set(expected)
 mismatched = [key for key in expected if actual.get(key) != expected[key]]
 if extra or mismatched:
     differing = sorted(
@@ -1051,7 +1049,8 @@ verify_same_database_authority() {
   candidate_identity_file="$(mktemp)"
   if ! CANDIDATE_SERVICE_DSN="$cand_service" CANDIDATE_OPERATOR_DSN="$cand_operator" \
       CANDIDATE_RUNTIME_DSN="$cand_runtime" \
-      "$candidate_python" - > "$candidate_identity_file" <<'GUARD'
+      env -u PYTHONPATH -u PYTHONHOME -u PYTHONNOUSERSITE \
+      "$candidate_python" -I -B - > "$candidate_identity_file" <<'GUARD'
 import os
 
 import psycopg2
@@ -1081,7 +1080,8 @@ GUARD
   running_identity_file="$(mktemp)"
   if ! RUNNING_SERVICE_DSN="$run_service" RUNNING_OPERATOR_DSN="$run_operator" \
       RUNNING_RUNTIME_DSN="$run_runtime" \
-      "$run_python" - > "$running_identity_file" <<'GUARD'
+      env -u PYTHONPATH -u PYTHONHOME -u PYTHONNOUSERSITE \
+      "$run_python" -I -B - > "$running_identity_file" <<'GUARD'
 import os
 
 import psycopg2
@@ -1298,8 +1298,7 @@ PY
   [ -x "$active_venv/bin/python" ] \
     || die "the active generation runtime is missing: $active_venv/bin/python"
   load_generation_control_context "$STATE_ROOT/install-record.json"
-  if [ "$(realpath "$GENERATION_CONTROL")" = "$(realpath "$HERE/operatorctl.sh")" ] \
-      || cmp -s -- "$GENERATION_CONTROL" "$HERE/operatorctl.sh"; then
+  if [ "$(realpath "$GENERATION_CONTROL")" = "$(realpath "$HERE/operatorctl.sh")" ]; then
     return 10
   fi
   if [ -n "$SOURCE_CONFIG_SOURCE_FILE" ]; then
@@ -2505,7 +2504,7 @@ try {{
   exit 1
 }}
 """
-ssh_bin = os.environ.get("SOLIDWORKS_SSH_BIN", "ssh")
+ssh_bin = "ssh"
 evidence_root = Path(os.environ["OPERATOR_STATE"]) / "health-gate"
 evidence_root.mkdir(parents=True, exist_ok=True)
 evidence_stem = f"windows-status-{time.time_ns()}-{os.getpid()}"
@@ -2840,6 +2839,12 @@ promotion_step_state() {
     --verb "$verb" --step "$step"
 }
 
+promotion_step_evidence() {
+  "$CONTROL_PYTHON" "$HERE/promotion.py" evidence \
+    --state-root "$OPERATOR_STATE" --install-id "$1" \
+    --verb "$2" --step "$3" --source "$4"
+}
+
 source_drain_state() {
   local output_file="$1"
   "$CONTROL_PYTHON" - "$output_file" <<'PY'
@@ -2894,6 +2899,14 @@ if [ -n "$SOURCE_CONFIG_SOURCE_FILE" ] \
   usage
 fi
 snapshot_config
+case "$ACTION" in
+  start|drain|stop|reconcile|stage|promote|rollback)
+    resolve_raw_config_state_root "${SOURCE_CONFIG_SOURCE_FILE:-$CONFIG_FILE}"
+    acquire_maintenance_lock "$STATE_ROOT"
+    LOCKED_STATE_ROOT="$STATE_ROOT"
+    assert_config_unchanged
+    ;;
+esac
 DELEGATION_STATUS=0
 delegate_active_public_action "$ACTION" || DELEGATION_STATUS=$?
 if [ "$DELEGATION_STATUS" -ne 10 ]; then
@@ -2909,11 +2922,6 @@ case "$ACTION" in
     acquire_maintenance_lock "$STATE_ROOT"
     LOCKED_STATE_ROOT="$STATE_ROOT"
     assert_config_unchanged
-    ;;
-esac
-case "$ACTION" in
-  stage|promote|rollback)
-    load_running_env
     ;;
 esac
 case "$ACTION" in
@@ -2943,33 +2951,13 @@ case "$ACTION" in
     if [ "$ACTION" != "reconcile" ] || [ -z "$INSTALL_ID" ]; then
       load_active_env
     else
-      # The bootstrap maintenance window: the staged candidate generation runs the canonical
-      # recovery against the same real database.  The running record stays the reference, the
-      # staged generation itself is re-verified below (recorded snapshot, wheel binding to the
-      # release manifest, the runtime the reconcile executes), and the active pointer, units
-      # and admission stay untouched.  The channel is closed-window only: it refuses while
-      # the admission is open.
+      # Candidate reconciliation observes the schema already migrated by promote.
+      # It never creates a second migration or source-baseline path.
       load_running_env
       CANDIDATE_ID="$INSTALL_ID"
       RECEIPT_DIR="$OPERATOR_STATE/promotions/$CANDIDATE_ID"
       [ -f "$RECEIPT_DIR/receipt.json" ] \
         || die "no stage receipt for $CANDIDATE_ID; run stage first"
-      RECONCILE_SCHEMA_COMPLETED=0
-      RECONCILE_SCHEMA_STATE_RC=0
-      RECONCILE_SCHEMA_STATE="$(
-        "$CONTROL_PYTHON" "$HERE/promotion.py" step-state \
-          --state-root "$OPERATOR_STATE" --install-id "$CANDIDATE_ID" \
-          --verb reconcile --step schema-migration
-      )" || RECONCILE_SCHEMA_STATE_RC=$?
-      case "$RECONCILE_SCHEMA_STATE_RC" in
-        0)
-          [ "$RECONCILE_SCHEMA_STATE" = "step=completed" ] \
-            || die "the reconcile schema-migration step is $RECONCILE_SCHEMA_STATE; refusing a duplicate mutation"
-          RECONCILE_SCHEMA_COMPLETED=1
-          ;;
-        10) ;;
-        *) die "the reconcile schema-migration state is unreadable; refusing before DDL" ;;
-      esac
       resolve_release_file
       "$CONTROL_PYTHON" "$HERE/promotion.py" verify-release --state-root "$OPERATOR_STATE" \
         --install-id "$CANDIDATE_ID" --release-file "$RELEASE_FILE" >/dev/null \
@@ -3000,6 +2988,16 @@ case "$ACTION" in
         "$CANDIDATE_RUNTIME_VENV" "$HERE/../.." "$RELEASE_FILE"
       verify_same_database_authority \
         "$CANDIDATE_ENV" "$RUNNING_ENV" "$CANDIDATE_PYTHON"
+      for prerequisite in close-admission drain stop-services backup schema-migration; do
+        RECONCILE_PHASE_STATE="$(
+          promotion_step_state "$CANDIDATE_ID" promote "$prerequisite"
+        )" || die "candidate reconcile requires a verified promote migration window"
+        [ "$RECONCILE_PHASE_STATE" = "step=completed" ] \
+          || die "candidate reconcile requires completed promote/$prerequisite"
+      done
+      promotion_step_evidence "$CANDIDATE_ID" promote schema-migration \
+        "$RECEIPT_DIR/evidence/platform-facts-boundary.json" >/dev/null \
+        || die "candidate reconcile requires the frozen migration fact boundary"
       ENV_FILE="$CANDIDATE_ENV"
       AIRFLOW_VENV="$CANDIDATE_RUNTIME_VENV"
       load_generation_env || die "the verified candidate environment could not be loaded"
@@ -3009,34 +3007,6 @@ case "$ACTION" in
         -m description_pipeline.orchestration.lifecycle_state report \
         --require-admission-closed >/dev/null \
         || die "the staged-candidate reconcile runs only while the admission is closed"
-      # The staged release's platform objects travel to the live authority only here: after
-      # the verified closed gate AND after the complete staged-identity verification above
-      # (snapshot digest, wheel binding, installed package), in the installer's canonical
-      # order (airflow-side boundary grants, then the platform schema/views/roles); they are
-      # additive and idempotent and the staged read model is what the recovery below reads.
-      # The step is recorded on the receipt; promote re-applies the same migrations as its
-      # own verified step.
-      if [ "$RECONCILE_SCHEMA_COMPLETED" != "1" ]; then
-        RECONCILE_DATABASE_UNIT="$(
-          database_unit_for_record "$STATE_ROOT/install-record.json"
-        )" || die "the running generation database unit is unreadable"
-        [ -n "$RECONCILE_DATABASE_UNIT" ] \
-          || die "the running generation database unit is missing"
-        ensure_postgres_ready "$RECONCILE_DATABASE_UNIT"
-        if ! {
-          PLATFORM_PSQL="$PG_BIN/psql" bash "$HERE/../platform/apply.sh" --airflow-grants \
-            --database airflow_meta --socket "$POSTGRES_ROOT/socket" --port "$POSTGRES_PORT" \
-            --user solidworks --airflow-schema "${AIRFLOW_SCHEMA:-airflow}" \
-          && PLATFORM_PSQL="$PG_BIN/psql" bash "$HERE/../platform/apply.sh" \
-            --database airflow_meta --socket "$POSTGRES_ROOT/socket" --port "$POSTGRES_PORT" \
-            --user platform_migrate --airflow-schema "${AIRFLOW_SCHEMA:-airflow}"
-        } > "$RECEIPT_DIR/reconcile-schema-migration.out" 2>&1; then
-          promotion_step "$CANDIDATE_ID" reconcile schema-migration failed "$RECEIPT_DIR/reconcile-schema-migration.out"
-          die "the staged generation's schema objects were not applied (the admission stays closed)"
-        fi
-        promotion_step "$CANDIDATE_ID" reconcile schema-migration completed "$RECEIPT_DIR/reconcile-schema-migration.out"
-      fi
-      load_generation_env
     fi ;;
   stage)
     load_running_env ;;
@@ -3272,15 +3242,6 @@ case "$ACTION" in
         || [ -L "$RECEIPT_DIR/candidate-platform.json" ]; then
       die "stage preserves the existing candidate configuration: $RECEIPT_DIR/candidate-platform.json"
     fi
-    mkdir -p "$RECEIPT_DIR"
-    chmod 700 "$RECEIPT_DIR"
-    cp -- "$SOURCE_CONFIG_SOURCE_FILE" "$RECEIPT_DIR/source-platform.json" \
-      || die "could not preserve the original source configuration"
-    chmod 600 "$RECEIPT_DIR/source-platform.json"
-    assert_config_binds_record "$RECEIPT_DIR/source-platform.json" "$STATE_ROOT/install-record.json"
-    cp -- "$CONFIG_FILE" "$RECEIPT_DIR/candidate-platform.json" \
-      || die "could not preserve the candidate configuration"
-    chmod 600 "$RECEIPT_DIR/candidate-platform.json"
     # Pre-receipt artifacts are deliberately quarantined, never inferred as accepted state.
     # Their generation ID is burned: the same ID is refused and the operator must choose a new one.
     for historical in \
@@ -3292,6 +3253,15 @@ case "$ACTION" in
         die "stage refuses a reused historical generation: $CANDIDATE_ID"
       fi
     done
+    mkdir -p "$RECEIPT_DIR"
+    chmod 700 "$RECEIPT_DIR"
+    cp -- "$SOURCE_CONFIG_SOURCE_FILE" "$RECEIPT_DIR/source-platform.json" \
+      || die "could not preserve the original source configuration"
+    chmod 600 "$RECEIPT_DIR/source-platform.json"
+    assert_config_binds_record "$RECEIPT_DIR/source-platform.json" "$STATE_ROOT/install-record.json"
+    cp -- "$CONFIG_FILE" "$RECEIPT_DIR/candidate-platform.json" \
+      || die "could not preserve the candidate configuration"
+    chmod 600 "$RECEIPT_DIR/candidate-platform.json"
     # The Linux generation is built from the candidate release's own wheel - a cross-release
     # upgrade consumes the release archive, never the running generation's asset - into a new
     # snapshot, derived environment and runtime, with no pointer, unit or admission change.
@@ -4199,9 +4169,11 @@ PY
       10:step=absent) ;;
       *) die "the promotion schema phase is unreadable; rollback cannot infer the database boundary" ;;
     esac
-    if [ "$ROLLBACK_SCHEMA_STATE_RC" = "10" ]; then
+    if [ "$ROLLBACK_DATABASE_CHANGED" = "0" ]; then
       for artifact in \
         "$EVIDENCE_DIR/schema-migration.out" \
+        "$RECEIPT_DIR/evidence/platform-facts-boundary.json" \
+        "$RECEIPT_DIR/evidence/platform-facts-boundary.out" \
         "$EVIDENCE_DIR/windows-promote.path" "$EVIDENCE_DIR/windows-promote.path.stderr" \
         "$EVIDENCE_DIR/health.json" "$EVIDENCE_DIR/endpoint-identity.json" \
         "$EVIDENCE_DIR/switch-pointer.out" "$EVIDENCE_DIR/config-reference.out" \
@@ -4458,10 +4430,12 @@ PY
         2> "$EVIDENCE_DIR/rollback-active-drain.out.stderr" \
         || ROLLBACK_ACTIVE_DRAIN_STATUS=$?
     elif [ "$ROLLBACK_DATABASE_OWNER" = "baseline" ]; then
-      {
-        echo "admission=closed source=phase-evidence"
-        echo '{"in_flight":[],"unresolved":[],"unknown":[],"settled":true}'
-      } > "$EVIDENCE_DIR/rollback-active-drain.out" 2> "$EVIDENCE_DIR/rollback-active-drain.out.stderr"
+      BASELINE_DRAIN_EVIDENCE="$(
+        promotion_step_evidence "$ROLLBACK_ID" promote drain "$EVIDENCE_DIR/source-drain.out"
+      )" || die "the baseline restore has no verified source drain evidence"
+      cp -- "$BASELINE_DRAIN_EVIDENCE" "$EVIDENCE_DIR/rollback-active-drain.out" \
+        || die "the source drain evidence could not be preserved"
+      : > "$EVIDENCE_DIR/rollback-active-drain.out.stderr"
     else
       run_generation_control \
         "$ROLLBACK_ACTIVE_CONTROL" "$ROLLBACK_RUNNING_PYTHON" inherited \
@@ -4480,8 +4454,11 @@ PY
         2> "$EVIDENCE_DIR/rollback-dag-barrier.out.stderr" \
         || ROLLBACK_ACTIVE_DAG_STATUS=$?
     elif [ "$ROLLBACK_DATABASE_OWNER" = "baseline" ]; then
-      echo "DAG pause is proven by the completed close-admission phase" \
-        > "$EVIDENCE_DIR/rollback-dag-barrier.out"
+      BASELINE_DAG_EVIDENCE="$(
+        promotion_step_evidence "$ROLLBACK_ID" promote drain "$EVIDENCE_DIR/source-dag-barrier.out"
+      )" || die "the baseline restore has no verified DAG pause evidence"
+      cp -- "$BASELINE_DAG_EVIDENCE" "$EVIDENCE_DIR/rollback-dag-barrier.out" \
+        || die "the source DAG pause evidence could not be preserved"
       : > "$EVIDENCE_DIR/rollback-dag-barrier.out.stderr"
     else
       airflow_wait_dag_state true > "$EVIDENCE_DIR/rollback-dag-barrier.out" \
@@ -4562,23 +4539,7 @@ PY
 
     ROLLBACK_ACTIVE_STOP_STATUS=0
     ROLLBACK_ACTIVE_STOP_DELEGATION_EVIDENCE="$EVIDENCE_DIR/source-rollback-active-stop-control-receipt.json"
-    if [ "$ROLLBACK_DATABASE_OWNER" = "candidate" ]; then
-      ROLLBACK_ACTIVE_STOP_DELEGATION_EVIDENCE="$EVIDENCE_DIR/rollback-database-owner.out"
-      (
-        ENV_FILE="$CANDIDATE_ENV"
-        AIRFLOW_VENV="$CANDIDATE_RUNTIME_VENV"
-        AIRFLOW_HOME="$CANDIDATE_AIRFLOW_HOME"
-        AIRFLOW_HERE="$HERE/../airflow"
-        load_generation_env || exit $?
-        airflow_lifecycle stop-executors || exit $?
-        operator_units_disable || exit $?
-        state="$(systemctl --user is-active \
-          "${ROLLBACK_ACTIVE_DATABASE_UNITS[0]}.service" 2>/dev/null || true)"
-        [ "$state" = "active" ] || exit 1
-      ) > "$EVIDENCE_DIR/rollback-stop.out" \
-        2> "$EVIDENCE_DIR/rollback-stop.out.stderr" \
-        || ROLLBACK_ACTIVE_STOP_STATUS=$?
-    elif [ "$ROLLBACK_DATABASE_OWNER" = "baseline" ]; then
+    if [ "$ROLLBACK_DATABASE_OWNER" != "source" ]; then
       ROLLBACK_ACTIVE_STOP_DELEGATION_EVIDENCE="$EVIDENCE_DIR/rollback-service-owner-stop.out"
       (
         for ((index=${#ROLLBACK_ACTIVE_SERVICES[@]}-1; index>=0; index--)); do
@@ -4595,7 +4556,7 @@ PY
         || ROLLBACK_ACTIVE_STOP_STATUS=$?
       {
         echo "service_owner=active_pointer"
-        echo "database_owner=candidate"
+        echo "database_owner=$ROLLBACK_DATABASE_OWNER"
         echo "database_unit=${ROLLBACK_ACTIVE_DATABASE_UNITS[0]}"
       } >> "$ROLLBACK_ACTIVE_STOP_DELEGATION_EVIDENCE"
     else
@@ -4658,14 +4619,17 @@ PY
     promotion_step "$ROLLBACK_ID" rollback rollback-stop completed \
       "$EVIDENCE_DIR/rollback-stop.out" "$EVIDENCE_DIR/rollback-stop-readback.out" \
       "$ROLLBACK_ACTIVE_STOP_DELEGATION_EVIDENCE"
-    if [ "$ROLLBACK_SCHEMA_STATE_RC:$ROLLBACK_SCHEMA_STATE" = "0:step=completed" ]; then
-      ROLLBACK_FACT_BOUNDARY="$EVIDENCE_DIR/platform-facts-boundary.json"
+    if [ "$ROLLBACK_DATABASE_OWNER" = "candidate" ]; then
+      ROLLBACK_FACT_BOUNDARY="$(
+        promotion_step_evidence "$ROLLBACK_ID" promote schema-migration \
+          "$EVIDENCE_DIR/platform-facts-boundary.json"
+      )" || die "the candidate platform fact boundary provenance did not verify"
       ROLLBACK_FACT_CURRENT="$EVIDENCE_DIR/rollback-platform-facts.json"
       if [ ! -f "$ROLLBACK_FACT_BOUNDARY" ] \
           || [ -L "$ROLLBACK_FACT_BOUNDARY" ]; then
         promotion_step "$ROLLBACK_ID" rollback rollback-database unknown \
           "$EVIDENCE_DIR/rollback-database-boundary.out"
-        die "the promoted platform fact boundary is missing (the admission stays closed)"
+        die "the candidate platform fact boundary is missing (the admission stays closed)"
       fi
       ROLLBACK_FACT_STATUS=0
       "$CANDIDATE_PYTHON" "$HERE/recovery.py" facts-boundary \
@@ -4918,6 +4882,10 @@ PY
       ENV_FILE="$PREVIOUS_ENV"
       load_generation_env || exit $?
       AIRFLOW_HERE="$SOURCE_DEPLOYMENT_ROOT/deploy/airflow"
+      load_unit_role UNITS all
+      load_unit_role AIRFLOW_UNITS airflow
+      load_unit_role EXECUTOR_UNITS executor
+      load_unit_role OPERATOR_UNITS operator
       PROXY_BIN="$(ensure_proxy_binary \
         "$SOURCE_DEPLOYMENT_ROOT/deploy/operator")" || exit $?
       "$PREVIOUS_PYTHON" "$SOURCE_DEPLOYMENT_ROOT/deploy/operator/render_operator.py" \
@@ -4955,7 +4923,10 @@ PY
     ROLLBACK_START_RECEIPT_STATUS="completed"
     [ "$ROLLBACK_START_STATUS" -eq 0 ] || ROLLBACK_START_RECEIPT_STATUS="failed"
     ROLLBACK_START_RECEIPT_WRITE_STATUS=0
-    write_generation_control_receipt rollback-start "$ROLLBACK_START_RECEIPT_STATUS" "$ROLLBACK_START_STATUS" \
+    write_generation_control_receipt_at \
+      "$SOURCE_CONTROLLER" "$SOURCE_RELEASE_FILE" "$PREVIOUS_RECORD" \
+      "$SOURCE_CONFIG" "$PREVIOUS_ENV" \
+      rollback-start "$ROLLBACK_START_RECEIPT_STATUS" "$ROLLBACK_START_STATUS" \
       "$EVIDENCE_DIR/rollback-start.out" "$EVIDENCE_DIR/rollback-start.out.stderr" \
       start --config "$SOURCE_CONFIG" --keep-admission-closed \
       || ROLLBACK_START_RECEIPT_WRITE_STATUS=$?
@@ -4987,7 +4958,10 @@ PY
     ROLLBACK_HEALTH_RECEIPT_STATUS="completed"
     [ "$ROLLBACK_HEALTH_STATUS" -eq 0 ] || ROLLBACK_HEALTH_RECEIPT_STATUS="failed"
     ROLLBACK_HEALTH_RECEIPT_WRITE_STATUS=0
-    write_generation_control_receipt rollback-health "$ROLLBACK_HEALTH_RECEIPT_STATUS" "$ROLLBACK_HEALTH_STATUS" \
+    write_generation_control_receipt_at \
+      "$SOURCE_CONTROLLER" "$SOURCE_RELEASE_FILE" "$PREVIOUS_RECORD" \
+      "$SOURCE_CONFIG" "$PREVIOUS_ENV" \
+      rollback-health "$ROLLBACK_HEALTH_RECEIPT_STATUS" "$ROLLBACK_HEALTH_STATUS" \
       "$EVIDENCE_DIR/rollback-health.out" "$EVIDENCE_DIR/rollback-health.out.stderr" \
       health --config "$SOURCE_CONFIG" \
       || ROLLBACK_HEALTH_RECEIPT_WRITE_STATUS=$?
@@ -5003,7 +4977,13 @@ PY
     fi
 
     ROLLBACK_DAG_STATUS=0
-    (airflow_restore_dag_state "$DAG_STATE_FILE") \
+    (
+      ENV_FILE="$PREVIOUS_ENV"
+      load_generation_env || exit $?
+      echo "source_airflow_venv=$AIRFLOW_VENV" \
+        > "$EVIDENCE_DIR/rollback-dag-runtime.out"
+      airflow_restore_dag_state "$DAG_STATE_FILE"
+    ) \
       > "$EVIDENCE_DIR/rollback-dag-restore.out" 2>&1 \
       || ROLLBACK_DAG_STATUS=$?
     if [ "$ROLLBACK_DAG_STATUS" -ne 0 ]; then

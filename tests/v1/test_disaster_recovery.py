@@ -44,6 +44,22 @@ import windows_transport  # noqa: E402
 warnings.filterwarnings("ignore", category=ResourceWarning)
 
 
+class BusinessFactBoundaryCliTests(unittest.TestCase):
+    def test_existing_evidence_directory_accepts_a_new_boundary_without_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "platform-facts-boundary.json"
+            boundary = {"tables": {"run_admission": "unchanged"}}
+            arguments = ["facts-boundary", "--dsn", "postgresql://fixture/db", "--out", str(output)]
+            with mock.patch.object(recovery, "capture_business_fact_boundary", return_value=boundary), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(recovery.main(arguments), 0)
+                before = output.read_bytes()
+                self.assertEqual(json.loads(before), boundary)
+                self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
+                self.assertNotEqual(recovery.main(arguments), 0)
+                self.assertEqual(output.read_bytes(), before)
+
+
 class UnitInventoryTests(unittest.TestCase):
     def test_maintenance_units_are_bound_to_the_receipt_schema_role(self) -> None:
         self.assertEqual(recovery.MAINTENANCE_RECEIPT_SCHEMA, "solidworks-to-urdf.recovery-maintenance/v1")

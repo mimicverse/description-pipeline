@@ -129,24 +129,36 @@ def decode_env_value(raw: str) -> str:
     return parts[0]
 
 
-def load_env(path: Path | None) -> dict[str, str]:
+def read_env(path: Path) -> dict[str, str]:
+    """Read environment declarations as data without evaluating shell expressions."""
+
     values: dict[str, str] = {}
-    if path is not None:
-        if not path.is_file():
-            die(f"env file not found: {path}")
-        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            key, separator, raw = stripped.partition("=")
-            if not separator or not re.fullmatch(r"[A-Z][A-Z0-9_]*", key.strip()):
-                die(f"{path}:{number}: expected KEY=VALUE")
-            try:
-                values[key.strip()] = decode_env_value(raw.strip())
-            except ValueError as error:
-                die(f"{path}:{number}: {error}")
-    else:
-        values = {key: value for key, value in os.environ.items() if re.fullmatch(r"[A-Z][A-Z0-9_]*", key)}
+    if not path.is_file() or path.is_symlink():
+        die(f"env file not found or is a link: {path}")
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        key, separator, raw = stripped.partition("=")
+        if not separator or not re.fullmatch(r"[A-Z][A-Z0-9_]*", key.strip()):
+            die(f"{path}:{number}: expected KEY=VALUE")
+        key = key.strip()
+        try:
+            value = decode_env_value(raw.strip())
+        except ValueError as error:
+            die(f"{path}:{number}: {error}")
+        if "\x00" in value:
+            die(f"{path}:{number}: environment values cannot contain NUL")
+        if key in values and values[key] != value:
+            die(f"{path}:{number}: conflicting duplicate declaration for {key}")
+        values[key] = value
+    return values
+
+
+def load_env(path: Path | None) -> dict[str, str]:
+    values = read_env(path) if path is not None else {
+        key: value for key, value in os.environ.items() if re.fullmatch(r"[A-Z][A-Z0-9_]*", key)
+    }
     for required in (
         "OPERATOR_HOST",
         "OPERATOR_STATE",

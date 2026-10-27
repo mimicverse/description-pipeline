@@ -366,6 +366,8 @@ metadata closure。同一 command/effect 恢复复用原 intent 与 outbound；�
 
 派生环境在 shell 加载前必须经非执行解析及所属代的重新派生校验。候选安装包校验复用 `runtime.tool_record()` 的实际文件 inventory，并核对发行 version／source_commit／source_sha256；probe 使用隔离 Python，不能只读取 embedded manifest 声称安装字节一致。
 
+候选对账要求同一 promotion 的 `close-admission`、`drain`、`stop-services`、`backup`、`schema-migration` 均为已验证的 completed，并消费迁移阶段 evidence-map 唯一绑定的冻结事实边界。对账不执行 DDL，也不新增 reconcile/schema-migration。回滚同样从已验证阶段映射读取冻结边界，不把可变工作文件当作恢复基准。
+
 `project_stage_status` 与 `project_run_status` 是唯一业务状态投影。它们只消费
 canonical facts 的真实阶段 decision/effect 以及实际 Airflow task/DagRun 关联；
 SQL view、Portal、operator 和 display metadata 均不得另写状态 reducer。正式运行

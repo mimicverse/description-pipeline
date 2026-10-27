@@ -414,6 +414,12 @@ def main(argv: list[str] | None = None) -> int:
     step_state.add_argument("--install-id", required=True)
     step_state.add_argument("--verb", choices=sorted(VERBS), required=True)
     step_state.add_argument("--step", required=True)
+    evidence = subparsers.add_parser("evidence")
+    evidence.add_argument("--state-root", type=Path, required=True)
+    evidence.add_argument("--install-id", required=True)
+    evidence.add_argument("--verb", choices=sorted(VERBS), required=True)
+    evidence.add_argument("--step", required=True)
+    evidence.add_argument("--source", type=Path, required=True)
     show = subparsers.add_parser("show")
     show.add_argument("--state-root", type=Path, required=True)
     show.add_argument("--install-id", required=True)
@@ -429,6 +435,23 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     path = receipt_path(args.state_root, args.install_id)
+    if args.action == "evidence":
+        document = load_receipt(path)
+        require(recorded_steps_valid(document, path, args.install_id),
+                "the promotion receipt has invalid evidence provenance")
+        rows = [row for row in document["steps"]
+                if row["verb"] == args.verb and row["step"] == args.step]
+        require(len(rows) == 1 and rows[0]["status"] == "completed",
+                "the requested evidence has no completed phase")
+        mapping = next(Path(item) for item in rows[0]["evidence"]
+                       if Path(item).name == "evidence-map.json")
+        sources = [mapping.parent / item["snapshot"]
+                   for group in json.loads(mapping.read_text(encoding="utf-8"))
+                   for item in group
+                   if item["source"] == os.path.realpath(args.source)]
+        require(len(sources) == 1, "the phase evidence source is missing or ambiguous")
+        print(sources[0])
+        return 0
     if args.action == "step-state":
         document = load_receipt(path)
         if not recorded_steps_valid(document, path, args.install_id):
