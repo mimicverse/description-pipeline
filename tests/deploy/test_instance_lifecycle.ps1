@@ -1367,6 +1367,7 @@ function Register-DisabledTask($IgnoredBinding, [string]$Generation) {
     TaskName=$installBinding.task_name
     TaskPath=$installBinding.task_path
     State='Disabled'
+    SemanticSha256=$null
   }
 }
 function Start-ScheduledTask { [CmdletBinding()] param([string]$TaskName, [string]$TaskPath)
