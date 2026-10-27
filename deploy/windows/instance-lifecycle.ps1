@@ -1803,9 +1803,8 @@ function Get-CommandArgumentsForExecutable([string]$CommandLine, [string]$Execut
   return $CommandLine.Substring($offset).Trim()
 }
 
-function Read-PyvenvRuntime([string]$Generation) {
-  $runtimeRoot = Join-Path $Generation 'runtime'
-  $path = Join-Path $runtimeRoot 'pyvenv.cfg'
+function Read-PyvenvRuntime([string]$RuntimeRoot) {
+  $path = Join-Path $RuntimeRoot 'pyvenv.cfg'
   Assert-RegularFile $path 'venv_identity_missing' 'pyvenv.cfg'
   $fields = @{}
   foreach ($line in @((Read-Utf8Text $path).TrimStart([char]0xFEFF) -split '\r?\n')) {
@@ -1829,9 +1828,9 @@ function Read-PyvenvRuntime([string]$Generation) {
   if ([string]$fields['include-system-site-packages'] -cne 'false') {
     throw 'the generation virtual environment includes system site packages'
   }
-  $home = Normalize-PathIdentity ([string]$fields['home'])
+  $venvHome = Normalize-PathIdentity ([string]$fields['home'])
   $base = Normalize-PathIdentity ([string]$fields['executable'])
-  if (-not $base.StartsWith($home + '/') -or
+  if (-not $base.StartsWith($venvHome + '/') -or
       $base -notmatch '(?i)/python\.exe$') {
     throw 'the generation base interpreter differs from pyvenv home'
   }
@@ -1839,7 +1838,7 @@ function Read-PyvenvRuntime([string]$Generation) {
   return [ordered]@{
     path = Normalize-PathIdentity $path
     sha256 = Sha256 $path
-    home = $home
+    home = $venvHome
     version = [string]$fields['version']
     base_interpreter_path = $base
     base_interpreter_sha256 = Sha256 ([string]$fields['executable'])
@@ -1916,9 +1915,9 @@ function Get-ListenerEvidence($Binding, $Projection, $Config) {
       continue
     }
     try {
-      if ((Get-CommandArgumentsForExecutable (
-          [string]$candidate.CommandLine,
-          [string]$action.execute)) -ceq [string]$action.arguments) {
+      if ((Get-CommandArgumentsForExecutable `
+          ([string]$candidate.CommandLine) `
+          ([string]$action.execute)) -ceq [string]$action.arguments) {
         $launchers += $candidate
       }
     } catch { }

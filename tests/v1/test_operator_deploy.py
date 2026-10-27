@@ -272,7 +272,7 @@ def deployment_fixture(root: Path) -> tuple[Path, Path, dict[str, str], dict[str
     (secrets / "postgres.dsn").write_text("fixture\n", encoding="utf-8")
     (secrets / "postgres.dsn").chmod(0o600)
     token = root / "token"
-    token.write_text("token\n", encoding="utf-8")
+    token.write_text("t" * 40 + "\n", encoding="utf-8")
     token.chmod(0o600)
 
     state = root / "state"
@@ -743,6 +743,97 @@ class FirstInstallTests(unittest.TestCase):
         )
         identities = list((self.paths["state"] / "lifecycle").glob("*/windows-endpoint-identity.json"))
         self.assertEqual(len(identities), 1)
+
+    def test_portal_service_delivers_the_complete_production_environment(self) -> None:
+        installed = self._install()
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        unit = self.environment["XDG_CONFIG_HOME"] + "/systemd/user/description-portal.service"
+        probe = self.root / "portal_environment_probe.py"
+        probe.write_text(
+            textwrap.dedent(
+                """\
+                import json
+                import os
+                import sys
+                from pathlib import Path
+                from types import SimpleNamespace
+                from unittest.mock import patch
+
+                from description_pipeline.orchestration import portal
+                from description_pipeline.pipeline.contracts import NativeTargetIdentity
+
+                target = NativeTargetIdentity.create(
+                    install_id="win-" + "1" * 32,
+                    pipeline_id="solidworks-to-urdf",
+                )
+                application = SimpleNamespace(artifacts=object())
+                with (
+                    patch(
+                        "description_pipeline.pipeline.native_target.load_registered_native_target",
+                        return_value=target,
+                    ),
+                    patch(
+                        "description_pipeline.pipeline.application.application_from_environment",
+                        return_value=application,
+                    ),
+                ):
+                    config = portal.load_portal_config(Path(sys.argv[1]))
+                print(json.dumps({
+                    "artifact_root": os.environ["PLATFORM_ARTIFACT_ROOT"],
+                    "config_snapshot": str(config.production_config_snapshot),
+                    "pipeline_work_root": os.environ["PIPELINE_WORK_ROOT"],
+                    "platform_snapshot": os.environ["PLATFORM_CONFIG_SNAPSHOT"],
+                    "application_loaded": config.production_application is application,
+                }, sort_keys=True))
+                """
+            ),
+            encoding="utf-8",
+        )
+        runner = self.root / "portal-service-entry.sh"
+        write_stub(
+            runner,
+            """\
+                #!/usr/bin/env bash
+                set -euo pipefail
+                unit="$1"
+                while IFS= read -r assignment; do
+                  export "${assignment#Environment=}"
+                done < <(sed -n 's/^Environment=//p' "$unit")
+                while IFS= read -r env_file; do
+                  [ -f "$env_file" ] || exit 11
+                  set -a
+                  source "$env_file"
+                  set +a
+                done < <(sed -n 's/^EnvironmentFile=//p' "$unit")
+                config="$(sed -n 's/^ExecStart=.*--config //p' "$unit")"
+                exec "$PROBE_PYTHON" -B "$PROBE_SCRIPT" "$config"
+            """,
+        )
+        result = subprocess.run(
+            ["bash", str(runner), unit],
+            env={
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "PROBE_PYTHON": sys.executable,
+                "PROBE_SCRIPT": str(probe),
+                "PYTHONPATH": str(ROOT / "src"),
+                "PYTHONDONTWRITEBYTECODE": "1",
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        delivered = json.loads(result.stdout)
+        record = json.loads(
+            (self.paths["state"] / "install-record.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(delivered["platform_snapshot"], record["snapshot"]["path"])
+        self.assertEqual(delivered["config_snapshot"], record["snapshot"]["path"])
+        self.assertEqual(delivered["artifact_root"], str(self.paths["artifacts"]))
+        self.assertEqual(delivered["pipeline_work_root"], str(self.paths["workspaces"]))
+        self.assertIs(delivered["application_loaded"], True)
+        self.assertTrue(self.paths["artifacts"].is_dir())
+        self.assertTrue(self.paths["workspaces"].is_dir())
 
     def test_runtime_wheel_is_stable_after_the_source_wheel_is_removed(self) -> None:
         installed = self._install()

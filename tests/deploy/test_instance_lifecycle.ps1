@@ -478,6 +478,151 @@ if ($env:OS -eq 'Windows_NT') {
   } finally {
     Remove-Item Function:\Get-CimInstance -Force
   }
+
+  function New-ListenerEvidenceProcessFixture(
+      [int]$ProcessId,
+      [int]$ParentProcessId,
+      [string]$ExecutablePath,
+      [string]$CommandLine,
+      [datetime]$CreationDate,
+      [int]$SessionId,
+      [string]$OwnerSid) {
+    return [pscustomobject]@{
+      ProcessId = $ProcessId
+      ParentProcessId = $ParentProcessId
+      ExecutablePath = $ExecutablePath
+      CommandLine = $CommandLine
+      CreationDate = $CreationDate
+      SessionId = $SessionId
+      OwnerSid = $OwnerSid
+    }
+  }
+
+  function Get-CimInstance {
+    [CmdletBinding()]
+    param(
+      [Parameter(Position=0)][string]$ClassName,
+      [Parameter(Position=1)][string]$Namespace,
+      [Parameter(Position=2)][string]$Filter
+    )
+    if ($ClassName -ceq 'MSFT_NetTCPConnection') {
+      return @($script:ListenerConnectionSnapshot)
+    }
+    if ($ClassName -ceq 'Win32_Process') {
+      return @($script:ListenerProcessSnapshot)
+    }
+    if ($ClassName -ceq 'Win32_Service') {
+      return @($script:ScheduleServiceSnapshot)
+    }
+    throw ('unexpected CIM class: ' + $ClassName)
+  }
+
+  function Invoke-CimMethod {
+    [CmdletBinding()]
+    param($InputObject, [string]$MethodName)
+    if ($MethodName -cne 'GetOwnerSid') {
+      throw ('unexpected CIM method: ' + $MethodName)
+    }
+    return [pscustomobject]@{
+      ReturnValue = 0
+      Sid = [string]$InputObject.OwnerSid
+    }
+  }
+
+  $listenerEvidenceRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
+    'description-listener-evidence-' + [guid]::NewGuid().ToString('N'))
+  try {
+    $generation = Join-Path $listenerEvidenceRoot 'generation'
+    $runtimeRoot = Join-Path $generation 'runtime'
+    $scriptsRoot = Join-Path $runtimeRoot 'Scripts'
+    $baseRoot = Join-Path $listenerEvidenceRoot 'base'
+    $null = New-Item -ItemType Directory -Path $scriptsRoot -Force
+    $null = New-Item -ItemType Directory -Path $baseRoot -Force
+    $launcherPython = Join-Path $scriptsRoot 'python.exe'
+    $basePython = Join-Path $baseRoot 'python.exe'
+    $configPath = Join-Path $generation 'endpoint.json'
+    $pyvenvPath = Join-Path $runtimeRoot 'pyvenv.cfg'
+    [System.IO.File]::WriteAllText($launcherPython, 'launcher-python')
+    [System.IO.File]::WriteAllText($basePython, 'base-python')
+    [System.IO.File]::WriteAllText($configPath, '{}')
+    $pyvenvText = @"
+home = $baseRoot
+include-system-site-packages = false
+version = 3.12.10
+executable = $basePython
+command = "$basePython" -m venv "$runtimeRoot"
+"@
+    [System.IO.File]::WriteAllText(
+      $pyvenvPath,
+      $pyvenvText,
+      (New-Object System.Text.UTF8Encoding($false)))
+
+    $schedulerPid = 4100
+    $launcherPid = 4200
+    $listenerPid = 4300
+    $serviceSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $schedulerImage = Join-Path ([string]$env:SystemRoot) 'System32\svchost.exe'
+    $actionArguments = Runtime-LauncherArguments $generation
+    $start = [datetime]::UtcNow
+    $schedulerProcess = New-ListenerEvidenceProcessFixture `
+      $schedulerPid 4 $schedulerImage ('"' + $schedulerImage + '"') `
+      $start 0 'S-1-5-18'
+    $launcherProcess = New-ListenerEvidenceProcessFixture `
+      $launcherPid $schedulerPid $launcherPython `
+      ('"' + $launcherPython + '" ' + $actionArguments) `
+      $start.AddSeconds(1) 1 $serviceSid
+    $listenerProcess = New-ListenerEvidenceProcessFixture `
+      $listenerPid $launcherPid $basePython `
+      ('"' + $basePython + '" ' + $actionArguments) `
+      $start.AddSeconds(2) 1 $serviceSid
+    $script:ListenerConnectionSnapshot = @([pscustomobject]@{
+      OwningProcess = $listenerPid
+      LocalPort = 8765
+      State = 2
+    })
+    $script:ListenerProcessSnapshot = @(
+      $schedulerProcess,
+      $launcherProcess,
+      $listenerProcess)
+    $script:ScheduleServiceSnapshot = @([pscustomobject]@{
+      Name = 'Schedule'
+      State = 'Running'
+      ProcessId = $schedulerPid
+    })
+    $projection = [pscustomobject]@{
+      principal = [pscustomobject]@{sid=$serviceSid}
+      action = [pscustomobject]@{
+        execute = $launcherPython
+        arguments = $actionArguments
+      }
+    }
+    $config = [pscustomobject]@{port=8765}
+    $evidence = Get-ListenerEvidence `
+      -Binding $null -Projection $projection -Config $config
+    Check 'listener.production_evidence_complete_chain' (
+      $evidence.relation -ceq 'direct_venv_child' -and
+      $evidence.launcher_pid -eq $launcherPid -and
+      $evidence.listener_pid -eq $listenerPid -and
+      $evidence.listener_parent_pid -eq $launcherPid -and
+      $evidence.scheduler_service_process_id -eq $schedulerPid -and
+      $evidence.venv_config_path -ceq (Normalize-PathIdentity $pyvenvPath) -and
+      $evidence.base_interpreter_path -ceq (Normalize-PathIdentity $basePython))
+
+    $listenerProcess.ParentProcessId = $schedulerPid
+    $wrongBinding = Invoke-Refusal {
+      Get-ListenerEvidence `
+        -Binding $null -Projection $projection -Config $config
+    }
+    Check 'listener.production_evidence_wrong_binding_refused' (
+      $wrongBinding.code -ceq 'windows_listener_identity_mismatch')
+  } finally {
+    Remove-Item Function:\Invoke-CimMethod -Force
+    Remove-Item Function:\Get-CimInstance -Force
+    Remove-Item Function:\New-ListenerEvidenceProcessFixture -Force
+    if (Test-Path -LiteralPath $listenerEvidenceRoot) {
+      Remove-Item -LiteralPath $listenerEvidenceRoot -Recurse -Force
+    }
+  }
 }
 
 $python = Get-TestPython

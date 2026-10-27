@@ -121,6 +121,7 @@ class PlatformEnvTests(unittest.TestCase):
         return platform_env.derive(
             json.dumps(snapshot).encode("utf-8"),
             install_id=install_id,
+            snapshot_path=self.snapshot_path,
             tree_root=tree_root or self.tree,
             release=self.release,
             wheel=wheel,
@@ -160,6 +161,9 @@ class PlatformEnvTests(unittest.TestCase):
         self.assertEqual(env["AIRFLOW_HOME"], str(self.root / "state" / "airflow-home"))
         self.assertEqual(env["POSTGRES_ROOT"], str(self.root / "state" / "airflow-pg"))
         self.assertEqual(env["PIPELINE_WHEEL"], str(self.wheel))
+        self.assertEqual(env["PLATFORM_CONFIG_SNAPSHOT"], str(self.snapshot_path))
+        self.assertEqual(env["PLATFORM_ARTIFACT_ROOT"], str(self.root / "artifacts"))
+        self.assertEqual(env["PIPELINE_WORK_ROOT"], str(self.root / "workspaces"))
         self.assertNotIn("PIPELINE_STORE_ROOT", env)
         self.assertEqual(env["FEISHU_TENANT_KEYS"], "tenant-a,tenant-b")
         self.assertEqual(env["FEISHU_ADMIN_OPEN_IDS"], "ou_admin")
@@ -377,7 +381,13 @@ class PlatformEnvTests(unittest.TestCase):
                 self.assertFalse((state / "derived").exists(), "no derived files may be written")
         before = tree_digest(state)
         with self.assertRaises(SystemExit):
-            platform_env.derive(b"{not json", install_id="gen-1", tree_root=self.tree, release=self.release)
+            platform_env.derive(
+                b"{not json",
+                install_id="gen-1",
+                snapshot_path=self.snapshot_path,
+                tree_root=self.tree,
+                release=self.release,
+            )
         self.assertEqual(tree_digest(state), before, "an unparseable snapshot must not write state")
         self.assertFalse((state / "derived").exists())
 

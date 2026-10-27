@@ -124,6 +124,7 @@ platform_env.atomic_write_once = lambda path, payload: None
 result = platform_env.derive(
     snapshot_file.read_bytes(),
     install_id=install_id,
+    snapshot_path=snapshot_file,
     tree_root=deployment_root,
     release=release,
     wheel=wheel_file,
