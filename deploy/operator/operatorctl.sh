@@ -34,6 +34,7 @@ if ! "$CONTROL_PYTHON" -I -B -c \
 fi
 export CONTROL_PYTHON
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$HERE/environment.sh"
 AIRFLOW_HERE="$HERE/../airflow"
 RELEASE_ROOT="$(cd "$HERE/../.." && pwd -P)"
 die() { echo "operatorctl: $*" >&2; exit 1; }
@@ -277,31 +278,6 @@ install_from_config() {
   ENV_FILE="$DERIVED_ENV"
 }
 
-load_env_file() {
-  local file="$1" output key value
-  output="$(mktemp)"
-  if ! "$CONTROL_PYTHON" - "$HERE" "$file" > "$output" <<'PY'
-import sys
-from pathlib import Path
-
-sys.path.insert(0, sys.argv[1])
-from render_operator import read_env
-
-values = read_env(Path(sys.argv[2]))
-for key, value in values.items():
-    sys.stdout.buffer.write(key.encode() + b"\0" + value.encode() + b"\0")
-PY
-  then
-    rm -f "$output"
-    return 1
-  fi
-  while IFS= read -r -d '' key && IFS= read -r -d '' value; do
-    printf -v "$key" '%s' "$value"
-    export "$key"
-  done < "$output"
-  rm -f "$output"
-}
-
 resolve_state_root() {
   STATE_ROOT="$("$CONTROL_PYTHON" "$HERE/platform_config.py" resolve --config "$CONFIG_FILE" | \
     "$CONTROL_PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["storage"]["state_root"])')" || exit $?
@@ -363,7 +339,7 @@ load_active_env() {
   verify_generation_derived_env \
     "$STATE_ROOT/install-record.json" "$ENV_FILE" "$AIRFLOW_VENV" \
     "$GENERATION_DEPLOYMENT_ROOT" "$GENERATION_RELEASE_FILE"
-  load_env_file "$STATE_ROOT/resolved.env" || return $?
+  load_resolved_env "$STATE_ROOT/resolved.env" || return $?
   load_generation_env || return $?
   VERIFIED_ACTIVE_ID="$(
     AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" \
@@ -397,7 +373,7 @@ load_running_env() {
   verify_generation_derived_env \
     "$STATE_ROOT/install-record.json" "$ENV_FILE" "$AIRFLOW_VENV" \
     "$GENERATION_DEPLOYMENT_ROOT" "$GENERATION_RELEASE_FILE"
-  load_env_file "$STATE_ROOT/resolved.env" || return $?
+  load_resolved_env "$STATE_ROOT/resolved.env" || return $?
   load_generation_env || return $?
   VERIFIED_ACTIVE_ID="$(
     AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" \
@@ -809,6 +785,13 @@ control_member = "deploy/operator/operatorctl.sh"
 control_sha256 = hashlib.sha256(control_path.read_bytes()).hexdigest()
 if files.get(control_member) != control_sha256:
     raise SystemExit("the running controller does not match its release manifest")
+environment_member = "deploy/operator/environment.sh"
+environment_path = control_path.with_name("environment.sh")
+if environment_member in files or environment_path.exists():
+    if environment_path.is_symlink() or not environment_path.is_file():
+        raise SystemExit("the running controller environment helper is missing or a link")
+    if files.get(environment_member) != hashlib.sha256(environment_path.read_bytes()).hexdigest():
+        raise SystemExit("the running environment helper does not match its release manifest")
 dag = record.get("dag")
 if not isinstance(dag, dict):
     raise SystemExit("the running install record has no DAG identity")
@@ -917,12 +900,13 @@ verify_snapshot_derived_env() {
   [ -f "$wheel_file" ] || die "the generation wheel is missing: $wheel_file"
   [ -x "$runtime_venv/bin/python" ] || die "the generation interpreter is missing"
   env -u PYTHONPATH -u PYTHONHOME -u PYTHONNOUSERSITE \
-    "$CONTROL_PYTHON" -B - \
+    "$runtime_venv/bin/python" -I -S -B - \
     "$deployment_root/deploy/operator/platform_env.py" \
     "$deployment_root/deploy/operator/render_operator.py" \
     "$deployment_root" "$snapshot_file" "$install_id" "$env_file" \
     "$release_file" "$wheel_file" <<'PY' \
     || die "the generation derived environment does not match its snapshot and release"
+import hashlib
 import importlib.util
 import json
 import re
@@ -933,6 +917,20 @@ platform_env_path, render_operator_path = map(Path, sys.argv[1:3])
 deployment_root, snapshot_file = map(Path, sys.argv[3:5])
 install_id = sys.argv[5]
 env_file, release_file, wheel_file = map(Path, sys.argv[6:9])
+release_document = json.loads(release_file.read_text(encoding="utf-8"))
+files = release_document.get("deployment_files")
+if not isinstance(files, dict):
+    raise SystemExit("the generation release has no deployment file identities")
+# Bind the actual standalone helper closure before any source-owned code is imported.
+for name in ("platform_env.py", "platform_config.py", "install_record.py", "render_operator.py", "systemd_units.py"):
+    path = platform_env_path.with_name(name)
+    member = path.relative_to(deployment_root).as_posix()
+    if path.is_symlink() or not path.is_file():
+        raise SystemExit(f"the generation helper is missing or a link: {member}")
+    if files.get(member) != hashlib.sha256(path.read_bytes()).hexdigest():
+        raise SystemExit(f"the generation helper does not match its release manifest: {member}")
+# -B prevents writes; redirect cache lookup too so only the verified source bytes execute.
+sys.pycache_prefix = "/dev/null"
 
 def load_module(name, path):
     spec = importlib.util.spec_from_file_location(name, path)
@@ -946,9 +944,7 @@ render_operator = load_module("generation_render_operator", render_operator_path
 install_record = load_module(
     "generation_install_record", platform_env_path.with_name("install_record.py")
 )
-release = install_record.release_identity(
-    json.loads(release_file.read_text(encoding="utf-8"))
-)
+release = install_record.release_identity(release_document)
 platform_env.atomic_write_once = lambda path, payload: None
 result = platform_env.derive(
     snapshot_file.read_bytes(),
@@ -963,13 +959,17 @@ for number, line in enumerate(env_file.read_text(encoding="utf-8").splitlines(),
     if not stripped or stripped.startswith("#"):
         continue
     key, separator, raw = stripped.partition("=")
-    if not separator or re.fullmatch(r"[A-Z_][A-Z0-9_]*", key) is None:
+    if (
+        not separator
+        or re.fullmatch(r"[A-Z_][A-Z0-9_]*", key) is None
+    ):
         raise SystemExit(f"{env_file}:{number}: invalid environment declaration")
     try:
         value = "" if raw.strip() == "" else render_operator.decode_env_value(raw.strip())
     except ValueError as error:
         raise SystemExit(f"{env_file}:{number}: {error}") from error
-    if key in actual and actual[key] != value:
+    previous = actual.get(key)
+    if key in actual and previous != value:
         raise SystemExit(f"{env_file}:{number}: conflicting duplicate declaration for {key}")
     actual[key] = value
 expected = {key: value for key, value in result["env"].items() if value != ""}
@@ -1200,9 +1200,57 @@ if (
 GUARD
 }
 
+verify_generation_resolved_env() {
+  local control="$1" interpreter="$2" generation_env="$3"
+  "$CONTROL_PYTHON" - "$HERE" "$control" "$interpreter" "$generation_env" \
+    "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/description-operator-proxy.service" <<'PY'
+import json
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+import tempfile
+
+sys.path.insert(0, sys.argv[1])
+from render_operator import read_env
+
+control, interpreter, generation_env, proxy_unit = map(Path, sys.argv[2:])
+values = read_env(generation_env)
+state = Path(values["OPERATOR_STATE"])
+actual = read_env(state / "resolved.env")
+commands = [shlex.split(line.partition("=")[2])
+            for line in proxy_unit.read_text(encoding="utf-8").splitlines()
+            if line.startswith("ExecStart=")]
+if len(commands) != 1 or not commands[0] or not Path(commands[0][0]).is_absolute():
+    raise SystemExit("the source proxy unit has no unambiguous executable")
+binary = commands[0][0]
+runtime_env = {key: value for key, value in os.environ.items()
+               if key not in {"PYTHONPATH", "PYTHONHOME", "PYTHONNOUSERSITE"}}
+with tempfile.TemporaryDirectory(prefix="operator-source-environment-") as temporary:
+    rendered_state = Path(temporary) / "state"
+    completed = subprocess.run(
+        [str(interpreter), "-I", "-B", str(control.with_name("render_operator.py")),
+         "--env-file", str(generation_env), "--state", str(rendered_state),
+         "--nginx-bin", binary, "--json"],
+        capture_output=True, text=True, env=runtime_env,
+    )
+    if completed.returncode:
+        raise SystemExit("the source renderer could not resolve its environment: "
+                         + completed.stderr.strip())
+    expected = {key: value.replace(str(rendered_state), str(state))
+                for key, value in json.loads(completed.stdout).items() if value != ""}
+if actual != expected:
+    differing = sorted(key for key in actual.keys() | expected.keys()
+                       if actual.get(key) != expected.get(key))
+    raise SystemExit("the source resolved environment differs from its renderer: "
+                     + ",".join(differing))
+PY
+}
+
 run_generation_control() {
-  local control="$1" interpreter="$2" lock_mode="$3"
-  shift 3
+  local control="$1" interpreter="$2" lock_mode="$3" generation_env="$4"
+  shift 4
   case "$lock_mode" in
     inherited)
       if [ -z "$MAINTENANCE_LOCK_OWNER" ]; then
@@ -1216,6 +1264,9 @@ run_generation_control() {
   if [ ! -x "$interpreter" ]; then
     echo "operatorctl: the generation control interpreter is missing: $interpreter" >&2
     return 2
+  fi
+  if [ "$(realpath "$control")" != "$(realpath "$HERE/operatorctl.sh")" ]; then
+    verify_generation_resolved_env "$control" "$interpreter" "$generation_env" || return $?
   fi
   local -a invocation=(
     env
@@ -1333,7 +1384,7 @@ PY
   done
   [ "$replaced_config" -eq 1 ] || usage
   run_generation_control \
-    "$GENERATION_CONTROL" "$active_venv/bin/python" self "$action" "${delegated_args[@]}"
+    "$GENERATION_CONTROL" "$active_venv/bin/python" self "$active_env" "$action" "${delegated_args[@]}"
 }
 
 write_generation_control_receipt_at() {
@@ -2762,7 +2813,7 @@ load_installed() {
   [ -n "$OPERATOR_STATE_DIR" ] || die "OPERATOR_STATE is not set in $ENV_FILE"
   [ -f "$OPERATOR_STATE_DIR/resolved.env" ] \
     || die "not installed: $OPERATOR_STATE_DIR/resolved.env is missing (run install first)"
-  load_env_file "$OPERATOR_STATE_DIR/resolved.env" || return $?
+  load_resolved_env "$OPERATOR_STATE_DIR/resolved.env" || return $?
   # The verified generation is the final layer: values in its file override both the shared
   # resolved environment and any same-name ambient variable, then are exported to child
   # processes through the one loader above.
@@ -3027,12 +3078,12 @@ case "$ACTION" in
     PROXY_BIN="$(ensure_proxy_binary)" || die "the managed proxy binary is unavailable; nothing was installed"
     "$CONTROL_PYTHON" "$HERE/render_operator.py" --env-file "$ENV_FILE" --nginx-bin "$PROXY_BIN" > "$RENDER_LOG"
     cat "$RENDER_LOG"
-    load_env_file "$(sed -n 's/^OPERATOR_STATE=//p' "$RENDER_LOG" | head -1)/resolved.env"
+    load_resolved_env "$(sed -n 's/^OPERATOR_STATE=//p' "$RENDER_LOG" | head -1)/resolved.env"
     load_generation_env
     TARGET="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
     bash "$HERE/scripts/install_toolchain.sh" > "$TOOLCHAIN_LOG"
     cat "$TOOLCHAIN_LOG"
-    load_env_file "$TOOLCHAIN_LOG"
+    load_env_file "$TOOLCHAIN_LOG" AIRFLOW_PYTHON
     "$CONTROL_PYTHON" "$HERE/render_operator.py" --env-file "$ENV_FILE" --nginx-bin "$PROXY_BIN" \
       --units-dir "$TARGET" >/dev/null
     airflow_render
@@ -3467,7 +3518,7 @@ PY
       die "the pre-maintenance DAG state could not be captured; nothing was switched"
     fi
     SOURCE_DRAIN_STATUS=0
-    run_generation_control "$SOURCE_CONTROLLER" "$RUNNING_PYTHON" inherited drain --config "$SOURCE_CONFIG" \
+    run_generation_control "$SOURCE_CONTROLLER" "$RUNNING_PYTHON" inherited "$ENV_FILE" drain --config "$SOURCE_CONFIG" \
       > "$EVIDENCE_DIR/source-drain.out" 2> "$EVIDENCE_DIR/source-drain.out.stderr" \
       || SOURCE_DRAIN_STATUS=$?
     SOURCE_DAG_STATUS=0
@@ -3550,7 +3601,7 @@ PY
       "$EVIDENCE_DIR/source-drain.out" "$EVIDENCE_DIR/source-dag-barrier.out" \
       "$EVIDENCE_DIR/source-drain-control-receipt.json"
     SOURCE_STOP_STATUS=0
-    run_generation_control "$SOURCE_CONTROLLER" "$RUNNING_PYTHON" inherited stop \
+    run_generation_control "$SOURCE_CONTROLLER" "$RUNNING_PYTHON" inherited "$ENV_FILE" stop \
       --config "$SOURCE_CONFIG" --keep-database \
       > "$EVIDENCE_DIR/stop-services.out" \
       2> "$EVIDENCE_DIR/stop-services.out.stderr" \
@@ -3714,10 +3765,17 @@ PY
       die "the PostgreSQL backup snapshot failed (the admission stays closed)"
     fi
     if ! "$PG_BIN/pg_dump" -h "$POSTGRES_ROOT/socket" -p "$POSTGRES_PORT" -U solidworks -d airflow_meta \
-        --schema-only --no-comments -f "$BACKUP_DIR/source-schema.sql" \
+        --create --schema-only --no-comments -f "$BACKUP_DIR/source-schema.sql" \
         >> "$EVIDENCE_DIR/pg-dump.out" 2>&1; then
       promotion_step "$CANDIDATE_ID" promote backup failed "$EVIDENCE_DIR/pg-dump.out"
       die "the source schema ownership baseline could not be captured"
+    fi
+    if ! "$CONTROL_PYTHON" "$HERE/recovery.py" database-acl capture \
+        --pg-bin "$PG_BIN" --socket-dir "$POSTGRES_ROOT/socket" \
+        --port "$POSTGRES_PORT" --extracted "$BACKUP_DIR" \
+        >> "$EVIDENCE_DIR/pg-dump.out" 2>&1; then
+      promotion_step "$CANDIDATE_ID" promote backup failed "$EVIDENCE_DIR/pg-dump.out"
+      die "the source database ACL baseline could not be captured"
     fi
     # The archive is sealed with the state-root key: controlled, and the only artifact the
     # manifest binds for restore.
@@ -3929,7 +3987,7 @@ PY
       PROXY_BIN="$(ensure_proxy_binary)" || exit $?
       "$CONTROL_PYTHON" "$HERE/render_operator.py" --env-file "$ENV_FILE" \
         --nginx-bin "$PROXY_BIN" --units-dir "$TARGET" || exit $?
-      load_env_file "$STATE_ROOT/resolved.env" || exit $?
+      load_resolved_env "$STATE_ROOT/resolved.env" || exit $?
       load_generation_env || exit $?
       airflow_render || exit $?
       systemctl --user daemon-reload || exit $?
@@ -4216,8 +4274,7 @@ PY
       printf 'database_boundary_unknown=%s\n' "$ROLLBACK_DATABASE_BOUNDARY_UNKNOWN"
       printf 'backup_baseline_available=%s\n' "$ROLLBACK_BACKUP_BASELINE"
     } > "$EVIDENCE_DIR/rollback-database-boundary.out"
-    if [ "$ROLLBACK_DATABASE_BOUNDARY_UNKNOWN" = "1" ] \
-        && [ "$ROLLBACK_BACKUP_BASELINE" != "1" ]; then
+    if [ "$ROLLBACK_DATABASE_BOUNDARY_UNKNOWN" = "1" ]; then
       promotion_step "$ROLLBACK_ID" rollback rollback-database unknown \
         "$EVIDENCE_DIR/rollback-database-boundary.out"
       die "the candidate database boundary is failed or unknown; no source package read or baseline restore was attempted"
@@ -4251,22 +4308,7 @@ PY
       CANDIDATE_AIRFLOW_HOME="$(
         generation_env_declared_value "$CANDIDATE_ENV" AIRFLOW_HOME
       )"
-    elif [ "$ROLLBACK_DATABASE_BOUNDARY_UNKNOWN" = "1" ] \
-        && [ "$ROLLBACK_BACKUP_BASELINE" = "1" ]; then
-      ROLLBACK_DATABASE_OWNER="baseline"
-      for required_phase in close-admission stop-services; do
-        required_phase_rc=0
-        required_phase_state="$(
-          promotion_step_state "$ROLLBACK_ID" promote "$required_phase"
-        )" || required_phase_rc=$?
-        [ "$required_phase_rc" = "0" ] \
-          && [ "$required_phase_state" = "step=completed" ] \
-          || {
-            promotion_step "$ROLLBACK_ID" rollback rollback-database unknown \
-              "$EVIDENCE_DIR/rollback-database-boundary.out"
-            die "the failed database boundary lacks a completed closed/stopped phase; no restore was attempted"
-          }
-      done
+
     fi
 
     PREVIOUS_GENERATION_DIR=""
@@ -4429,16 +4471,9 @@ PY
       ) > "$EVIDENCE_DIR/rollback-active-drain.out" \
         2> "$EVIDENCE_DIR/rollback-active-drain.out.stderr" \
         || ROLLBACK_ACTIVE_DRAIN_STATUS=$?
-    elif [ "$ROLLBACK_DATABASE_OWNER" = "baseline" ]; then
-      BASELINE_DRAIN_EVIDENCE="$(
-        promotion_step_evidence "$ROLLBACK_ID" promote drain "$EVIDENCE_DIR/source-drain.out"
-      )" || die "the baseline restore has no verified source drain evidence"
-      cp -- "$BASELINE_DRAIN_EVIDENCE" "$EVIDENCE_DIR/rollback-active-drain.out" \
-        || die "the source drain evidence could not be preserved"
-      : > "$EVIDENCE_DIR/rollback-active-drain.out.stderr"
     else
       run_generation_control \
-        "$ROLLBACK_ACTIVE_CONTROL" "$ROLLBACK_RUNNING_PYTHON" inherited \
+        "$ROLLBACK_ACTIVE_CONTROL" "$ROLLBACK_RUNNING_PYTHON" inherited "$ROLLBACK_ACTIVE_ENV" \
         drain --config "$ROLLBACK_ACTIVE_CONFIG" \
         > "$EVIDENCE_DIR/rollback-active-drain.out" \
         2> "$EVIDENCE_DIR/rollback-active-drain.out.stderr" \
@@ -4453,13 +4488,6 @@ PY
       ) > "$EVIDENCE_DIR/rollback-dag-barrier.out" \
         2> "$EVIDENCE_DIR/rollback-dag-barrier.out.stderr" \
         || ROLLBACK_ACTIVE_DAG_STATUS=$?
-    elif [ "$ROLLBACK_DATABASE_OWNER" = "baseline" ]; then
-      BASELINE_DAG_EVIDENCE="$(
-        promotion_step_evidence "$ROLLBACK_ID" promote drain "$EVIDENCE_DIR/source-dag-barrier.out"
-      )" || die "the baseline restore has no verified DAG pause evidence"
-      cp -- "$BASELINE_DAG_EVIDENCE" "$EVIDENCE_DIR/rollback-dag-barrier.out" \
-        || die "the source DAG pause evidence could not be preserved"
-      : > "$EVIDENCE_DIR/rollback-dag-barrier.out.stderr"
     else
       airflow_wait_dag_state true > "$EVIDENCE_DIR/rollback-dag-barrier.out" \
         2> "$EVIDENCE_DIR/rollback-dag-barrier.out.stderr" \
@@ -4561,7 +4589,7 @@ PY
       } >> "$ROLLBACK_ACTIVE_STOP_DELEGATION_EVIDENCE"
     else
       run_generation_control \
-        "$ROLLBACK_ACTIVE_CONTROL" "$ROLLBACK_RUNNING_PYTHON" inherited \
+        "$ROLLBACK_ACTIVE_CONTROL" "$ROLLBACK_RUNNING_PYTHON" inherited "$ROLLBACK_ACTIVE_ENV" \
         stop --config "$ROLLBACK_ACTIVE_CONFIG" --keep-database \
         > "$EVIDENCE_DIR/rollback-stop.out" \
         2> "$EVIDENCE_DIR/rollback-stop.out.stderr" \
@@ -4619,6 +4647,7 @@ PY
     promotion_step "$ROLLBACK_ID" rollback rollback-stop completed \
       "$EVIDENCE_DIR/rollback-stop.out" "$EVIDENCE_DIR/rollback-stop-readback.out" \
       "$ROLLBACK_ACTIVE_STOP_DELEGATION_EVIDENCE"
+    ROLLBACK_FACT_EVIDENCE=()
     if [ "$ROLLBACK_DATABASE_OWNER" = "candidate" ]; then
       ROLLBACK_FACT_BOUNDARY="$(
         promotion_step_evidence "$ROLLBACK_ID" promote schema-migration \
@@ -4648,6 +4677,10 @@ PY
           "$EVIDENCE_DIR/rollback-platform-facts.out"
         die "new terminal business facts exist after the promotion boundary; baseline restore was refused"
       fi
+      ROLLBACK_FACT_EVIDENCE=(
+        "$ROLLBACK_FACT_BOUNDARY" "$ROLLBACK_FACT_CURRENT"
+        "$EVIDENCE_DIR/rollback-platform-facts.out"
+      )
     fi
     # The Windows end restores exactly the generation this maintenance bound, then verifies its
     # own health against that generation's release identity.
@@ -4721,17 +4754,25 @@ PY
       fi
       if [ "$ROLLBACK_DB_STATUS" -eq 0 ] \
           && { [ ! -f "$ROLLBACK_BACKUP_DIR/platform.pgc" ] \
-            || [ ! -f "$ROLLBACK_BACKUP_DIR/source-schema.sql" ]; }; then
+            || [ ! -f "$ROLLBACK_BACKUP_DIR/source-schema.sql" ] \
+            || [ ! -f "$ROLLBACK_BACKUP_DIR/database/catalog-baseline.json" ]; }; then
         echo "the restored promotion backup carries no complete PostgreSQL baseline" \
           > "$EVIDENCE_DIR/rollback-database-open.out"
         ROLLBACK_DB_STATUS=1
       fi
       if [ "$ROLLBACK_DB_STATUS" -eq 0 ]; then
         "$PG_BIN/pg_restore" \
-          -h "$POSTGRES_ROOT/socket" -p "$POSTGRES_PORT" -U solidworks -d airflow_meta \
-          --clean --if-exists --exit-on-error --single-transaction \
+          -h "$POSTGRES_ROOT/socket" -p "$POSTGRES_PORT" -U solidworks -d postgres \
+          --create --clean --if-exists --exit-on-error \
           "$ROLLBACK_BACKUP_DIR/platform.pgc" \
           > "$EVIDENCE_DIR/rollback-database-restore.out" 2>&1 \
+          || ROLLBACK_DB_STATUS=$?
+      fi
+      if [ "$ROLLBACK_DB_STATUS" -eq 0 ]; then
+        "$CONTROL_PYTHON" "$HERE/recovery.py" database-acl restore \
+          --pg-bin "$PG_BIN" --socket-dir "$POSTGRES_ROOT/socket" \
+          --port "$POSTGRES_PORT" --extracted "$ROLLBACK_BACKUP_DIR" \
+          >> "$EVIDENCE_DIR/rollback-database-restore.out" 2>&1 \
           || ROLLBACK_DB_STATUS=$?
       fi
       if [ "$ROLLBACK_DB_STATUS" -ne 0 ]; then
@@ -4750,10 +4791,8 @@ PY
     fi
     ROLLBACK_SOURCE_SCHEMA_STATUS=0
     (
-      set -a
-      # shellcheck disable=SC1090
-      . "$PREVIOUS_ENV"
-      set +a
+      ENV_FILE="$PREVIOUS_ENV"
+      load_generation_env || exit $?
       PLATFORM_OPERATOR_DSN="$PLATFORM_OPERATOR_DSN" "$PREVIOUS_PYTHON" \
         -m description_pipeline.orchestration.lifecycle_state report \
         --require-settled --require-admission-closed
@@ -4770,13 +4809,24 @@ PY
         && [ "$ROLLBACK_BACKUP_BASELINE" = "1" ]; then
       ROLLBACK_SCHEMA_IDENTITY_STATUS=0
       "$PG_BIN/pg_dump" -h "$POSTGRES_ROOT/socket" -p "$POSTGRES_PORT" -U solidworks -d airflow_meta \
-        --schema-only --no-comments -f "$EVIDENCE_DIR/rollback-database-schema-after.sql" \
+        --create --schema-only --no-comments -f "$EVIDENCE_DIR/rollback-database-schema-after.sql" \
         > "$EVIDENCE_DIR/rollback-database-schema-verify.out" 2>&1 \
         || ROLLBACK_SCHEMA_IDENTITY_STATUS=$?
       if [ "$ROLLBACK_SCHEMA_IDENTITY_STATUS" -eq 0 ]; then
-        cmp -s -- "$ROLLBACK_BACKUP_DIR/source-schema.sql" \
+        "$CONTROL_PYTHON" - "$HERE/../platform" \
+          "$ROLLBACK_BACKUP_DIR/source-schema.sql" \
           "$EVIDENCE_DIR/rollback-database-schema-after.sql" \
+          >> "$EVIDENCE_DIR/rollback-database-schema-verify.out" 2>&1 <<'PYSQL' \
           || ROLLBACK_SCHEMA_IDENTITY_STATUS=1
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+from legacy_cutover import canonical_schema_sql
+
+before, after = (canonical_schema_sql(Path(path).read_bytes()) for path in sys.argv[2:])
+raise SystemExit(0 if before == after else 1)
+PYSQL
       fi
       if [ "$ROLLBACK_SCHEMA_IDENTITY_STATUS" -ne 0 ]; then
         promotion_step "$ROLLBACK_ID" rollback rollback-database unknown \
@@ -4798,6 +4848,7 @@ PY
       die "the restored database is verified but its private staging could not be removed"
     fi
     ROLLBACK_DATABASE_EVIDENCE=(
+      "${ROLLBACK_FACT_EVIDENCE[@]}"
       "$EVIDENCE_DIR/rollback-database-boundary.out"
       "$EVIDENCE_DIR/rollback-database-source-verify.out"
       "$EVIDENCE_DIR/rollback-database-cleanup.out"
@@ -4853,10 +4904,8 @@ PY
     ROLLBACK_CONNECTION_EVIDENCE="$EVIDENCE_DIR/rollback-connection-verify.out"
     if [ -f "$CONNECTION_PRIVATE_SNAPSHOT" ]; then
       (
-        set -a
-        # shellcheck disable=SC1090
-        . "$PREVIOUS_ENV"
-        set +a
+        ENV_FILE="$PREVIOUS_ENV"
+        load_generation_env || exit $?
         AIRFLOW_HOME="$AIRFLOW_HOME" "$PREVIOUS_PYTHON" \
           "$SOURCE_DEPLOYMENT_ROOT/deploy/operator/connection_snapshot.py" verify \
           --file "$CONNECTION_PRIVATE_SNAPSHOT" --receipt "$RECEIPT_DIR/receipt.json" \
@@ -4915,7 +4964,7 @@ PY
 
     ROLLBACK_START_STATUS=0
     run_generation_control \
-      "$SOURCE_CONTROLLER" "$PREVIOUS_PYTHON" inherited \
+      "$SOURCE_CONTROLLER" "$PREVIOUS_PYTHON" inherited "$PREVIOUS_ENV" \
       start --config "$SOURCE_CONFIG" --keep-admission-closed \
       > "$EVIDENCE_DIR/rollback-start.out" \
       2> "$EVIDENCE_DIR/rollback-start.out.stderr" \
@@ -4947,7 +4996,7 @@ PY
     for attempt in $(seq 1 10); do
       ROLLBACK_HEALTH_STATUS=0
       run_generation_control \
-        "$SOURCE_CONTROLLER" "$PREVIOUS_PYTHON" inherited \
+        "$SOURCE_CONTROLLER" "$PREVIOUS_PYTHON" inherited "$PREVIOUS_ENV" \
         health --config "$SOURCE_CONFIG" \
         >> "$EVIDENCE_DIR/rollback-health.out" \
         2>> "$EVIDENCE_DIR/rollback-health.out.stderr" \
@@ -5009,10 +5058,7 @@ PY
     # Operator arguments cannot manufacture a result or select a second registry.
     [ -f "$ENV_FILE" ] || die "the derived environment is missing; run install"
     (
-      set -a
-      # shellcheck disable=SC1090
-      . "$ENV_FILE"
-      set +a
+      load_generation_env || exit $?
       RESOLVED_CONFIG="$("$CONTROL_PYTHON" "$HERE/platform_config.py" resolve --config "$CONFIG_FILE")"
       PLATFORM_ARTIFACT_ROOT="$(printf '%s' "$RESOLVED_CONFIG" | "$CONTROL_PYTHON" -c \
         'import json,sys; print(json.load(sys.stdin)["storage"]["artifact_root"])')"

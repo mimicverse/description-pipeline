@@ -362,9 +362,11 @@ metadata closure。同一 command/effect 恢复复用原 intent 与 outbound；�
 
 跨代回滚先依据不可变 promotion 阶段与实际对账确定是否跨过候选数据库变更边界。尚未生成 baseline 且候选 DDL 未发生时，由源上下文核验后恢复；已经变更时必须先有可验证 baseline，恢复并验明源 schema 后才能启动源代。边界不明且无可用 baseline 时保持关闭／UNKNOWN，不执行无依据 restore，也不因缺少某个日志推定无副作用。
 
-`schema-migration=completed` 后数据库属主为已验证的候选 package／Python／配置，Linux pointer 尚未切换不改变这一归属；停止服务仍核验实际 unit inventory。DDL／cutover 后、候选启动或对账前，在同一迁移 evidence 冻结 canonical 平台持久业务表的一致快照 fingerprint，排除 admission 控制与 `run_display_metadata`。回滚在写者停止后用同一候选包重读，只有事实边界相同才允许 baseline restore。新增 terminal run、decision、effect 或对账事实、边界缺失或无法证明无写者时均不得覆盖当前数据库；保全事实并记录 failed／UNKNOWN、保持关闭，沿用既有 forward／recovery。另存 archive 本身不授予降级资格。恢复后先由源包验证，再恢复源服务。
+`schema-migration=completed` 后数据库属主为已验证的候选 package／Python／配置，Linux pointer 尚未切换不改变这一归属；停止服务仍核验实际 unit inventory。DDL／cutover 后、候选启动或对账前，在同一迁移 evidence 冻结 canonical 平台持久业务表的一致快照 fingerprint，排除 admission 控制与 `run_display_metadata`。回滚在写者停止后用同一候选包重读，只有事实边界相同才允许 baseline restore，成功比较的冻结边界、当前事实和读取结果一并进入 completed 恢复证据。schema 阶段 failed／UNKNOWN 时即使封存 baseline 可用也不得覆盖当前库。新增 terminal run、decision、effect 或对账事实、边界缺失或无法证明无写者时均不得覆盖当前数据库；保全事实并记录 failed／UNKNOWN、保持关闭，沿用既有 forward／recovery。另存 archive 本身不授予降级资格。恢复后先由源包验证，再恢复源服务。
 
 派生环境在 shell 加载前必须经非执行解析及所属代的重新派生校验。候选安装包校验复用 `runtime.tool_record()` 的实际文件 inventory，并核对发行 version／source_commit／source_sha256；probe 使用隔离 Python，不能只读取 embedded manifest 声称安装字节一致。
+
+跨代 helper 先按该发行已有 `deployment_files` 验证实际导入闭包，再由绑定的 generation Python 隔离执行；新代静态 environment helper 同样绑定，不要求旧包存在新增文件。运行时不得全量导出 resolved/toolchain 中任意声明，health 与维护使用同一个数据 reader 和各自显式字段投影。
 
 候选对账要求同一 promotion 的 `close-admission`、`drain`、`stop-services`、`backup`、`schema-migration` 均为已验证的 completed，并消费迁移阶段 evidence-map 唯一绑定的冻结事实边界。对账不执行 DDL，也不新增 reconcile/schema-migration。回滚同样从已验证阶段映射读取冻结边界，不把可变工作文件当作恢复基准。
 

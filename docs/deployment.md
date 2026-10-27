@@ -432,6 +432,8 @@ Windows 候选配置由正式 `stage` 按当前端点 schema 确定性生成。�
 
 升级意图和每个切换步骤持久登记。失败记录已完成与未确认步骤，`rollback` 使用该记录恢复两端明确的上一发行和配置，再检查身份与状态；不能猜测目录或最新备份。数据库 baseline 只在源准入关闭、写者停止、没有活动／未解决／UNKNOWN 工作，且阶段证据证明 baseline 与待恢复状态对应后才可恢复；baseline 之后已产生 canonical facts 或边界不明时拒绝恢复，不能为 downgrade 丢弃运行、证据或发布记录。涉及存储 schema 的变化须提供备份、迁移验证及明确可恢复方案，准入在完成前保持关闭。
 
+升级维护不迁移 Linux `storage.state_root`；源、目标的其他配置可以按各自绑定原件不同。已完成迁移且停写和事实边界比较成立时，就地回退以已有整库 `-Fc` baseline 为准，通过 `pg_restore --create --clean --if-exists -d postgres` 重建归档指定的 `airflow_meta`，不删除同 cluster 其他数据库。该动作不能放在单事务中，失败保持关闭并保留封包。数据库 ACL 使用 recovery 既有 catalog baseline 与 `apply_database_acl` 恢复并回读；整库 schema 比较包含数据库 owner／ACL，复用既有 `canonical_schema_sql` 仅正规化 pg_dump 顶层随机 restrict token。灾难恢复的空目标和不同 cluster 身份规则仍由 recovery 原入口负责。
+
 `operatorctl rollback` 读取 promotion 的不可变阶段，判断候选数据库变更边界；已跨过时先恢复并核验 promotion baseline，未跨过时保留并核验原数据库。灾难恢复仍通过同版 `recovery.py backup / restore` 执行受控备份和同路径空目标恢复；`backup.py` 的加密归档原语不承担完整恢复判定。备份使用新的输出目录和独立保管的外部密钥，恢复使用显式目标计划；复用既存目录或未取得本次归属的失败请求不得改写旧回执、归档或暂存文件。具体边界遵循[灾难恢复契约](contracts.md#灾难恢复)。
 
 迁移已完成但 Linux pointer 未切时，rollback 仍由 candidate 关闭准入并排空数据库，再按实际 unit inventory 停止写者，不能先让 source 包读取新 schema。`schema-migration` evidence 的 `platform-facts-boundary.json` 在 DDL／cutover 后、候选启动或对账前冻结一致业务事实；restore 前用同一候选包重读并比较，排除 admission 控制与展示 metadata。新增业务事实、边界缺失或读取不明时保全当前库并保持关闭，记录 failed／UNKNOWN，使用既有 forward／recovery，不覆盖 baseline。正常恢复后由 source 包验证源契约再恢复服务。stage/promote 在任何源变更前复用 `runtime.tool_record()` 校验候选实际安装字节与发行三元组；派生环境先验证后加载。

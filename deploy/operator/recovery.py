@@ -1966,7 +1966,9 @@ def _recovery_root(connection) -> dict:
     return root
 
 
-def _discovered_table_fingerprints(connection) -> dict[str, dict]:
+def _discovered_table_fingerprints(
+    connection, *, schemas: tuple[str, ...] = ("platform", "airflow"), excluded: tuple[str, ...] = ()
+) -> dict[str, dict]:
     table_rows = _connection_json(connection, FULL_TABLE_LIST_QUERY)
     require(
         isinstance(table_rows, list),
@@ -1986,6 +1988,8 @@ def _discovered_table_fingerprints(connection) -> dict[str, dict]:
             {"table": table_row},
         )
         name = f"{table_row['schema']}.{table_row['table']}"
+        if table_row["schema"] not in schemas or name in excluded:
+            continue
         tables[name] = _table_fingerprint(
             connection,
             table_row["schema"],
@@ -2024,32 +2028,14 @@ def capture_business_fact_boundary(dsn: str) -> dict:
     connection = _psycopg2().connect(normalized)
     try:
         _begin_exported_snapshot(connection)
-        table_rows = _connection_json(connection, FULL_TABLE_LIST_QUERY)
-        require(
-            isinstance(table_rows, list),
-            "recovery_database_readback_failed",
-            "platform fact table discovery is malformed",
-        )
         excluded = {"admission", "run_display_metadata"}
-        tables = {}
-        for row in table_rows:
-            require(
-                isinstance(row, dict)
-                and set(row) == {"schema", "table"}
-                and isinstance(row["table"], str)
-                and bool(ROLE_NAME.fullmatch(row["table"])),
-                "recovery_catalog_identifier_unsupported",
-                "unsupported platform fact table identifier",
-                {"table": row},
-            )
-            if row["schema"] != "platform" or row["table"] in excluded:
-                continue
-            tables[row["table"]] = _table_fingerprint(
-                connection,
-                "platform",
-                row["table"],
-                allow_discovered=True,
-            )
+        tables = {
+            name.removeprefix("platform."): fingerprint
+            for name, fingerprint in _discovered_table_fingerprints(
+                connection, schemas=("platform",),
+                excluded=tuple(f"platform.{name}" for name in excluded),
+            ).items()
+        }
         require(
             tables,
             "recovery_database_readback_failed",
@@ -10745,6 +10731,64 @@ def apply_database_acl(
     )
 
 
+def database_acl_command(
+    *,
+    operation: str,
+    bin_dir: Path,
+    socket_dir: Path,
+    port: int,
+    extracted: Path,
+) -> None:
+    """Carry the existing database ACL baseline through a promotion backup."""
+
+    require(
+        extracted.is_absolute() and socket_dir.is_absolute(),
+        "recovery_target_path_unsafe",
+        "database ACL paths must be absolute",
+    )
+    baseline_path = extracted / "database" / "catalog-baseline.json"
+    require_no_links(baseline_path, "database ACL baseline")
+    context = command_context(bin_dir, None, [])
+    postgres = {
+        "socket_dir": str(socket_dir),
+        "port": port,
+        "bootstrap_role": BOOTSTRAP_ROLE,
+    }
+    if operation == "restore":
+        baseline = _load_extracted_json(extracted, "database/catalog-baseline.json", "catalog baseline")
+        require(
+            isinstance(baseline, dict)
+            and isinstance(baseline.get("database"), dict)
+            and baseline["database"].get("name") == DATABASE_NAME,
+            "recovery_database_readback_failed",
+            "database ACL baseline is malformed",
+        )
+        apply_database_acl(context=context, postgres=postgres, extracted=extracted)
+    catalog = psql_json(
+        context,
+        socket_dir=socket_dir,
+        port=port,
+        user=BOOTSTRAP_ROLE,
+        database=DATABASE_NAME,
+        query=CATALOG_QUERY,
+    )
+    require(
+        isinstance(catalog, dict)
+        and isinstance(catalog.get("database"), dict)
+        and catalog["database"].get("name") == DATABASE_NAME,
+        "recovery_database_readback_failed",
+        "database ACL readback is malformed",
+    )
+    if operation == "capture":
+        write_json_once(baseline_path, {"database": catalog["database"]})
+    else:
+        require(
+            catalog["database"] == baseline["database"],
+            "recovery_database_readback_failed",
+            "restored database owner, ACL or identity differs from the source baseline",
+        )
+
+
 def _load_extracted_json(extracted: Path, member: str, what: str) -> object:
     _, document = strict_json_file(extracted / member, what)
     return document
@@ -13301,6 +13345,12 @@ def build_parser() -> argparse.ArgumentParser:
     plan_parser.add_argument("--host-id", required=True)
     plan_parser.add_argument("--postgres-config", type=Path, required=True)
     plan_parser.add_argument("--out", type=Path, required=True)
+    acl_parser = subparsers.add_parser("database-acl")
+    acl_parser.add_argument("operation", choices=("capture", "restore"))
+    acl_parser.add_argument("--pg-bin", type=Path, required=True)
+    acl_parser.add_argument("--socket-dir", type=Path, required=True)
+    acl_parser.add_argument("--port", type=int, required=True)
+    acl_parser.add_argument("--extracted", type=Path, required=True)
     facts_parser = subparsers.add_parser("facts-boundary")
     facts_parser.add_argument("--dsn", required=True)
     facts_parser.add_argument("--out", type=Path, required=True)
@@ -13447,6 +13497,16 @@ def main(argv: list[str] | None = None) -> int:
                 os.fsync(stream.fileno())
             print(f"target_plan={args.out}")
             print(f"target_plan_sha256={sha256_file(args.out)}")
+            return 0
+        if args.action == "database-acl":
+            database_acl_command(
+                operation=args.operation,
+                bin_dir=args.pg_bin,
+                socket_dir=args.socket_dir,
+                port=args.port,
+                extracted=args.extracted,
+            )
+            print(f"database_acl={args.operation}")
             return 0
         if args.action == "facts-boundary":
             boundary = capture_business_fact_boundary(args.dsn)

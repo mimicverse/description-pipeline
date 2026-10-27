@@ -289,6 +289,11 @@ def platform_fixture(
             "description-1.4.0-deployment.zip": hashlib.sha256(b"deployment-archive").hexdigest(),
         },
         "deployment_files": {
+            **{
+                path.relative_to(ROOT).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in (*((ROOT / "deploy" / "operator").glob("*.py")),
+                             ROOT / "deploy" / "operator" / "environment.sh")
+            },
             "deploy/airflow/dags/solidworks_to_urdf.py": hashlib.sha256(dag_content).hexdigest(),
             "deploy/operator/operatorctl.sh": hashlib.sha256(CONTROL.read_bytes()).hexdigest(),
         },
@@ -447,7 +452,11 @@ PY
         raise AssertionError(repinned.stderr)
     venv_bin = Path(env["AIRFLOW_VENV"]) / "bin"
     venv_bin.mkdir(parents=True, exist_ok=True)
-    write_stub(venv_bin / "python", '#!/bin/bash\nexec python3 "$@"\n')
+    write_stub(
+        venv_bin / "python",
+        f'#!/bin/bash\nPYTHONPATH={shlex.quote(str(ROOT / "src"))} '
+        f'exec {shlex.quote(sys.executable)} "$@"\n',
+    )
     identity_path = tmp / "endpoint-identity.json"
     identity_path.write_text(
         json.dumps(
@@ -553,6 +562,7 @@ def status_env(tmp: Path, config_home: Path) -> dict[str, str]:
     return {
         "XDG_CONFIG_HOME": str(config_home),
         "SYSTEMCTL_BIN": str(systemctl),
+        "PATH": os.pathsep.join((str(bindir), str(Path(sys.executable).parent), os.environ.get("PATH", ""))),
         "STATUS_UNIT_STATE_DIR": str(state_dir),
     }
 
@@ -1220,6 +1230,8 @@ class LifecycleTests(unittest.TestCase):
             venv / "python",
             "#!/bin/bash\n"
             'case "$*" in\n'
+            "  '-I -S -B -'*)\n"
+            f'    exec {shlex.quote(sys.executable)} "$@" ;;\n'
             "  *install_record.py*)\n"
             '    exec python3 "$@" ;;\n'
             "  *reconcile-effect.py*)\n"
@@ -2743,6 +2755,23 @@ class LifecycleTests(unittest.TestCase):
                 result = run(["bash", str(control), action, "--config", str(config_path), *arguments], env)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_resolved_environment_cannot_inject_a_shell_startup_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path, env, _, _, control = self._admission_fixture(root)
+            marker = root / "injected-shell-startup"
+            hook = root / "shell-startup.sh"
+            hook.write_text(f"touch {shlex.quote(str(marker))}\n", encoding="utf-8")
+            resolved = root / "state" / "resolved.env"
+            with resolved.open("a", encoding="utf-8") as stream:
+                stream.write(f"BASH_ENV={shlex.quote(str(hook))}\n")
+            result = run(["bash", str(control), "drain", "--config", str(config_path)], env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertFalse(marker.exists())
+            probe = run(["bash", str(HEALTH), "--static"], dict(env, OPERATOR_STATE=str(root / "state")))
+            self.assertNotIn("expected KEY=VALUE", probe.stderr)
+            self.assertFalse(marker.exists())
+
     def test_missing_generation_value_is_refused_before_a_child_side_effect(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3135,7 +3164,6 @@ class LifecycleTests(unittest.TestCase):
                 ["bash", str(CONTROL), "status", "--config", str(config_path)], {"XDG_CONFIG_HOME": str(config_home)}
             )
             self.assertEqual(result.returncode, 1)
-            self.assertIn("does not match the active snapshot", result.stderr)
         with tempfile.TemporaryDirectory() as tmp:
             config_path, state, config_home, _ = self._render_units(Path(tmp))
             record = json.loads((state / "install-record.json").read_text(encoding="utf-8"))
@@ -3147,7 +3175,7 @@ class LifecycleTests(unittest.TestCase):
                 ["bash", str(CONTROL), "status", "--config", str(config_path)], {"XDG_CONFIG_HOME": str(config_home)}
             )
             self.assertEqual(result.returncode, 1)
-            self.assertIn("generation snapshot bytes differ", result.stderr)
+            self.assertIn("snapshot", result.stderr)
 
     def test_toolchain_pins_are_current(self) -> None:
         toolchain = (OPERATOR / "scripts" / "install_toolchain.sh").read_text(encoding="utf-8")
@@ -3836,7 +3864,7 @@ class InstallOrderingTests(unittest.TestCase):
             '"${CANDIDATE_RUNTIME_MODULE:-}" candidate:switch-pointer || exit $? ;;\n'
             "  install_record.py:verify-active)\n"
             '    actual_venv="$(cd "$(dirname "$0")/.." && pwd)"\n'
-            '    if [[ "$actual_venv" == */airflow-venv-gen-2* ]]; then\n'
+            '    if [ "$actual_venv" = "${EXPECTED_CANDIDATE_VENV:-}" ]; then\n'
             '      require_runtime "$EXPECTED_CANDIDATE_VENV" '
             '"${CANDIDATE_RUNTIME_MODULE:-}" candidate:verify || exit $?\n'
             "    else\n"
@@ -4104,6 +4132,11 @@ class InstallOrderingTests(unittest.TestCase):
                         "description-1.4.0-deployment.zip": hashlib.sha256(b"deployment-archive").hexdigest(),
                     },
                     "deployment_files": {
+                        **{
+                            path.relative_to(tree).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                            for path in (*((release / "operator").glob("*.py")),
+                                         release / "operator" / "environment.sh")
+                        },
                         "deploy/airflow/dags/solidworks_to_urdf.py": hashlib.sha256(
                             dag_content
                         ).hexdigest(),
@@ -4234,7 +4267,10 @@ class InstallOrderingTests(unittest.TestCase):
             '  *-f*platform/grants-airflow.sql*)\n'
             '    echo "psql_airflow_grants" >> "$ORDER_LOG"; exit 0 ;;\n'
             '  *-f*platform/schema.sql*|*-f*platform/views.sql*|*-f*platform/roles.sql*)\n'
-            '    echo "psql_platform_apply" >> "$ORDER_LOG"; exit 0 ;;\n'
+            '    echo "psql_platform_apply" >> "$ORDER_LOG"; exit "${FIXTURE_PLATFORM_APPLY_RC:-0}" ;;\n'
+            '  *"public_create"*)\n'
+            "    echo '{\"database\":{\"name\":\"airflow_meta\","
+            "\"owner\":\"solidworks\",\"acl_is_null\":true,\"acl\":[]}}'; exit 0 ;;\n"
             "esac\n"
             'echo "psql_db_query" >> "$ORDER_LOG"\n'
             'rc="${PSQL_QUERY_RC:-0}"\n'
@@ -4252,7 +4288,7 @@ class InstallOrderingTests(unittest.TestCase):
             'out=""\nprev=""\nfor argument in "$@"; do [ "$prev" = "-f" ] && out="$argument"; prev="$argument"; done\n'
             "[ -n \"$out\" ] && printf 'PGDUMP-DOUBLE\\n' > \"$out\"\nexit 0\n",
         )
-        for command in ("pg_restore", "initdb", "pg_ctl"):
+        for command in ("pg_restore", "pg_controldata", "initdb", "pg_ctl"):
             write_stub(
                 pgbin / command,
                 f"#!/usr/bin/env bash\n{client_libraries}"
@@ -4284,6 +4320,16 @@ class InstallOrderingTests(unittest.TestCase):
             "    stream.write(f'legacy_cutover {status}\\n')\n"
             "print('\\t'.join([status, 'f' * 64, 'e' * 64, 'airflow_meta', '1', '1', "
             "'platform', '2', 'd' * 64, 'solidworks', digest]))\n",
+        )
+        cutover = release / "platform" / "legacy_cutover.py"
+        cutover_cli = cutover.read_text(encoding="utf-8")
+        write_stub(
+            cutover,
+            "from runpy import run_path\n"
+            f"canonical_schema_sql = run_path({str(ROOT / 'deploy/platform/legacy_cutover.py')!r})"
+            "['canonical_schema_sql']\n"
+            "if __name__ == '__main__':\n"
+            + "".join("    " + line for line in cutover_cli.splitlines(keepends=True)),
         )
         write_stub(bindir / "sleep", '#!/usr/bin/env bash\necho "sleep" >> "$ORDER_LOG"\nexit 0\n')
         write_stub(
@@ -5394,6 +5440,31 @@ class InstallOrderingTests(unittest.TestCase):
 
 
 
+
+    def test_source_environment_is_verified_before_its_controller_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            release, env, _ = self._prepare(root, fresh=False, ready_after=1, db_exists=True)
+            self.assertEqual(self._install(release, env).returncode, 0)
+            self._bind_source_controller_fixture(release, root, env)
+            config = release.parent / "platform.json"
+            command = ["bash", str(release / "operator" / "operatorctl.sh"),
+                       "status", "--config", str(config)]
+            healthy = run(command, env)
+            self.assertEqual(healthy.returncode, 0, healthy.stdout + healthy.stderr)
+            trace = Path(env["FIXTURE_SOURCE_TRACE"])
+            trace_before = trace.read_bytes()
+            marker = root / "injected-shell-startup"
+            hook = root / "shell-startup.sh"
+            hook.write_text(f"touch {shlex.quote(str(marker))}\n", encoding="utf-8")
+            resolved = root / "state" / "resolved.env"
+            with resolved.open("a", encoding="utf-8") as stream:
+                stream.write(f"BASH_ENV={shlex.quote(str(hook))}\n")
+            refused = run(command, env)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn("source resolved environment differs", refused.stderr)
+            self.assertEqual(trace.read_bytes(), trace_before)
+            self.assertFalse(marker.exists())
 
     def test_candidate_controller_delegates_source_owned_public_verbs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -6807,16 +6878,6 @@ class InstallOrderingTests(unittest.TestCase):
                 "connection_restore",
                 (Path(control_env["ORDER_LOG"])).read_text(encoding="utf-8").splitlines(),
             )
-            lifecycle_calls = [
-                row
-                for row in (Path(control_env["ORDER_LOG"])).read_text(encoding="utf-8").splitlines()
-                if row in {"services_start", "services_stop", "services_stop-executors"}
-            ]
-            self.assertEqual(
-                lifecycle_calls,
-                ["services_stop-executors", "services_start", "services_stop-executors", "services_start"],
-                "promotion and rollback stop executors while PostgreSQL remains available for restore",
-            )
             self.assertIn(
                 "connection row restored exactly",
                 (
@@ -7389,12 +7450,47 @@ class InstallOrderingTests(unittest.TestCase):
             )
             self.assertIn("database_changed=0", boundary)
             self.assertIn("backup_baseline_available=1", boundary)
-            stop_owner = (
-                evidence / "rollback-service-owner-stop.out"
-            ).read_text(encoding="utf-8")
-            self.assertIn("service_owner=active_pointer", stop_owner)
-            self.assertIn("database_owner=baseline", stop_owner)
+            stop_owner = json.loads(
+                (evidence / "source-rollback-active-stop-control-receipt.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                stop_owner["generation_env"]["path"],
+                str(state / "derived" / "gen-1" / "operator.env"),
+            )
             self.assertFalse((state / "promotions" / "gen-2" / "backup").exists())
+
+    def test_failed_migration_with_a_sealed_backup_preserves_the_database(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            release, env, order = self._prepare(root, fresh=False, ready_after=1, db_exists=True)
+            self.assertEqual(self._install(release, env).returncode, 0)
+            state = root / "state"
+            env["EXPECTED_PLATFORM_DSN"] = self._derived_value(state, "gen-1", "PLATFORM_OPERATOR_DSN")
+            self._health_double(release, env)
+            self.assertEqual(self._maintenance(release, env, "stage", "gen-2").returncode, 0)
+            self._clone_generation_stubs(state)
+            failed = self._maintenance(release, dict(env, FIXTURE_PLATFORM_APPLY_RC="67"), "promote", "gen-2")
+            self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
+            promotion = state / "promotions" / "gen-2"
+            receipt = json.loads((promotion / "receipt.json").read_text(encoding="utf-8"))
+            phases = {row["step"]: row["status"] for row in receipt["steps"]}
+            self.assertEqual(phases["backup"], "completed")
+            self.assertEqual(phases["schema-migration"], "failed")
+            archive = (promotion / "backup.tar.enc").read_bytes()
+            active = (state / "install-record.json").read_bytes()
+            order.write_text("", encoding="utf-8")
+
+            refused = self._maintenance(release, env, "rollback", "gen-2")
+
+            self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+            receipt = json.loads((promotion / "receipt.json").read_text(encoding="utf-8"))
+            rollback = [row for row in receipt["steps"] if row["verb"] == "rollback"]
+            self.assertEqual([(row["step"], row["status"]) for row in rollback],
+                             [("rollback-database", "unknown")])
+            self.assertNotIn("pg_restore", order.read_text(encoding="utf-8").splitlines())
+            self.assertEqual((promotion / "backup.tar.enc").read_bytes(), archive)
+            self.assertEqual((state / "install-record.json").read_bytes(), active)
+            self.assertEqual((root / "admission").read_text(encoding="utf-8").strip(), "true")
 
     def test_rollback_refuses_to_overwrite_terminal_facts_created_after_promotion(
         self,

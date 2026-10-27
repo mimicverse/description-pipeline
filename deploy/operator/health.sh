@@ -13,6 +13,7 @@ fi
 export CONTROL_PYTHON
 MODE="${1:-full}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$HERE/environment.sh"
 AIRFLOW_HERE="$HERE/../airflow"
 if ! UNIT_MANIFEST="$(bash "$AIRFLOW_HERE/services.sh" units all)"; then
   echo "health: could not read the managed systemd unit manifest" >&2
@@ -38,8 +39,11 @@ if [ ! -f "$OPERATOR_STATE/resolved.env" ]; then
   report FAIL "missing $OPERATOR_STATE/resolved.env (run operatorctl.sh install --config FILE)"
   exit 1
 fi
-# shellcheck disable=SC1090
-source "$OPERATOR_STATE/resolved.env"
+load_env_file "$OPERATOR_STATE/resolved.env" \
+  OPERATOR_STATE OPERATOR_TLS_KEY OPERATOR_TLS_CERT OPERATOR_NGINX_CONF \
+  OPERATOR_HTTPS_PORT OPERATOR_URL PORTAL_CONFIG PORTAL_PORT NGINX_BIN \
+  AIRFLOW_VENV AIRFLOW_HOME AIRFLOW_API_PORT TUNNEL_LOOPBACK_PORT \
+  ENDPOINT_TOKEN_FILE FEISHU_ENV_FILE FEISHU_APP_SECRET_FILE || exit 1
 # Every port comes from the single deploy source (render_operator.py) via resolved.env.
 for key in AIRFLOW_API_PORT TUNNEL_LOOPBACK_PORT PORTAL_PORT OPERATOR_HTTPS_PORT; do
   [ -n "${!key:-}" ] || { report FAIL "resolved.env is missing $key (run install to re-render)"; exit 1; }
