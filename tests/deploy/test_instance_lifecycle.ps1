@@ -235,6 +235,20 @@ if ($StaticOnly) {
 # ---- load the script without running main ----------------------------------
 . $ScriptPath -Verb status -Binding @{}
 $python = Get-TestPython
+$processArguments = @('', 'space value', 'embedded"quote', 'C:\space path\', 'slash\"quote', "line`nbreak")
+$processProbe = @'
+import json, sys
+print(json.dumps(sys.argv[1:]))
+sys.stderr.write("diagnostic " + "x" * 131072)
+sys.exit(7)
+'@
+$capture = Invoke-CapturedProcess $python (@('-I', '-B', '-c', $processProbe) + $processArguments)
+$observedArguments = @($capture.lines[0] | ConvertFrom-Json)
+Check 'process.argv_preserved' (
+  ($observedArguments | ConvertTo-Json -Compress) -ceq
+  ($processArguments | ConvertTo-Json -Compress))
+Check 'process.stderr_and_exit_preserved' (
+  $capture.exit_code -eq 7 -and $capture.text.Contains('diagnostic ' + ('x' * 131072)))
 $root = Join-Path ([System.IO.Path]::GetTempPath()) (
   'lifecycle-contract-' + [guid]::NewGuid().ToString('N'))
 $null = New-Item -ItemType Directory -Path $root -Force

@@ -666,16 +666,33 @@ function Read-ReleaseManifest($Binding) {
 }
 
 function Invoke-CapturedProcess([string]$Executable, [string[]]$Arguments) {
-  $lines = @()
-  $lines = @(
-    & $Executable @Arguments 2>&1 | ForEach-Object {
-      [string]$_
+  $start = New-Object System.Diagnostics.ProcessStartInfo
+  $start.FileName = $Executable
+  $start.UseShellExecute = $false
+  $start.CreateNoWindow = $true
+  $start.RedirectStandardOutput = $true
+  $start.RedirectStandardError = $true
+  $start.Arguments = (@($Arguments | ForEach-Object {
+    # Preserve quotes and backslashes according to the Windows argv rules.
+    $escaped = [regex]::Replace($_, '(\\*)"', '$1$1\"')
+    $escaped = [regex]::Replace($escaped, '(\\+)$', '$1$1')
+    '"' + $escaped + '"'
+  }) -join ' ')
+  $process = New-Object System.Diagnostics.Process
+  $process.StartInfo = $start
+  try {
+    if (-not $process.Start()) { throw 'the process did not start' }
+    $stdout = $process.StandardOutput.ReadToEndAsync()
+    $stderr = $process.StandardError.ReadToEndAsync()
+    $process.WaitForExit()
+    $text = $stdout.GetAwaiter().GetResult() + "`n" + $stderr.GetAwaiter().GetResult()
+    return @{
+      exit_code = [int]$process.ExitCode
+      text = $text
+      lines = @($text -split '\r?\n')
     }
-  )
-  return @{
-    exit_code = [int]$LASTEXITCODE
-    text = ($lines -join "`n")
-    lines = $lines
+  } finally {
+    $process.Dispose()
   }
 }
 
@@ -1306,26 +1323,31 @@ print(json.dumps({
 }
 
 function New-EndpointVirtualEnvironment([string]$BasePython, [string]$Generation) {
-  & $BasePython -m venv (Join-Path $Generation 'runtime')
-  if ($LASTEXITCODE -ne 0) {
-    Die 'venv_failed' 'the bound Python could not create the runtime virtual environment'
+  $capture = Invoke-CapturedProcess $BasePython @('-m', 'venv', (Join-Path $Generation 'runtime'))
+  if ($capture.exit_code -ne 0) {
+    Die 'venv_failed' 'the bound Python could not create the runtime virtual environment' @{
+      output = Protect-DiagnosticText $capture.text
+    }
   }
 }
 
 function Install-EndpointRequirements([string]$Generation) {
   $runtime = Runtime-Python $Generation
   Assert-RegularFile $runtime 'runtime_python_missing' 'the staged runtime Python'
-  & $runtime -I -B -m pip install `
-    --no-index `
-    --require-hashes `
-    --find-links (Join-Path $Generation 'wheels') `
-    -r (Join-Path $Generation 'requirements.lock') | Out-Null
-  if ($LASTEXITCODE -ne 0) {
-    Die 'pip_failed' 'the hash-locked Windows runtime install failed'
+  $capture = Invoke-CapturedProcess $runtime @(
+    '-I', '-B', '-m', 'pip', 'install', '--no-index', '--require-hashes',
+    '--find-links', (Join-Path $Generation 'wheels'),
+    '-r', (Join-Path $Generation 'requirements.lock'))
+  if ($capture.exit_code -ne 0) {
+    Die 'pip_failed' 'the hash-locked Windows runtime install failed' @{
+      output = Protect-DiagnosticText $capture.text
+    }
   }
-  & $runtime -I -B -m pip check | Out-Null
-  if ($LASTEXITCODE -ne 0) {
-    Die 'runtime_dependency_conflict' 'the installed Windows runtime is not dependency-consistent'
+  $capture = Invoke-CapturedProcess $runtime @('-I', '-B', '-m', 'pip', 'check')
+  if ($capture.exit_code -ne 0) {
+    Die 'runtime_dependency_conflict' 'the installed Windows runtime is not dependency-consistent' @{
+      output = Protect-DiagnosticText $capture.text
+    }
   }
 }
 
