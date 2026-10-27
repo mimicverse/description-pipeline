@@ -260,6 +260,16 @@ Check 'acl.projection_owner_uses_resolved_sid' (
   $aclProjectionSource.Contains('owner_sid = Resolve-Sid ([string]$acl.Owner)') -and
   -not $aclProjectionSource.Contains(
     '[System.Security.Principal.SecurityIdentifier]$acl.Owner'))
+$assertAclStart = $source.IndexOf('function Assert-ProtectedAcl')
+$assertAclEnd = $source.IndexOf('function Set-TaskFileAcl', $assertAclStart)
+$assertAclSource = if (
+    $assertAclStart -ge 0 -and
+    $assertAclEnd -gt $assertAclStart) {
+  $source.Substring($assertAclStart, $assertAclEnd - $assertAclStart)
+} else { '' }
+Check 'acl.assert_uses_actual_full_control' (
+  $assertAclSource.Contains('$rights = [long]$row.rights') -and
+  -not $assertAclSource.Contains('Synchronize'))
 Check 'json.single_strict_read_path' (
   -not $source.Contains('$script:JsonPython') -and
   $readJsonSource.Contains('Assert-StrictJsonText $text') -and
@@ -340,6 +350,65 @@ if ($env:OS -eq 'Windows_NT') {
     $script:FixtureAcl = $null
   }
 
+  # Exercise the production ACL functions before install fixtures override them below.
+  $aclRoundtripRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
+    'description-acl-roundtrip-' + [guid]::NewGuid().ToString('N'))
+  $aclServiceSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  try {
+    $null = New-Item -ItemType Directory -Path $aclRoundtripRoot
+    $roundtripFile = Join-Path $aclRoundtripRoot 'roundtrip.txt'
+    [System.IO.File]::WriteAllText($roundtripFile, 'acl-roundtrip')
+    $roundtripRefusal = Invoke-Refusal {
+      Set-ProtectedAcl $aclRoundtripRoot $aclServiceSid
+      Assert-ProtectedAcl $aclRoundtripRoot $aclServiceSid
+      Set-ProtectedAcl $roundtripFile $aclServiceSid
+      Assert-ProtectedAcl $roundtripFile $aclServiceSid
+    }
+    $roundtripPassed = -not $roundtripRefusal.threw
+    Check 'acl.production_roundtrip_directory_and_file' $roundtripPassed $roundtripRefusal.code
+
+    $incompleteFile = Join-Path $aclRoundtripRoot 'incomplete.txt'
+    [System.IO.File]::WriteAllText($incompleteFile, 'incomplete')
+    Set-ProtectedAcl $incompleteFile $aclServiceSid
+    $incompleteAcl = Get-Acl -LiteralPath $incompleteFile -ErrorAction Stop
+    $reducedRule = New-Object System.Security.AccessControl.FileSystemAccessRule -ArgumentList @(
+      (New-Object System.Security.Principal.SecurityIdentifier -ArgumentList $aclServiceSid),
+      [System.Security.AccessControl.FileSystemRights]::ReadAndExecute,
+      [System.Security.AccessControl.InheritanceFlags]::None,
+      [System.Security.AccessControl.PropagationFlags]::None,
+      [System.Security.AccessControl.AccessControlType]::Allow)
+    $incompleteAcl.SetAccessRule($reducedRule)
+    Set-Acl -LiteralPath $incompleteFile -AclObject $incompleteAcl -ErrorAction Stop
+    $incompleteRefusal = Invoke-Refusal {
+      Assert-ProtectedAcl $incompleteFile $aclServiceSid
+    }
+    Check 'acl.incomplete_rights_refused' (
+      $incompleteRefusal.threw -and
+      $incompleteRefusal.code -ceq 'windows_managed_acl_invalid')
+
+    $extraFile = Join-Path $aclRoundtripRoot 'extra.txt'
+    [System.IO.File]::WriteAllText($extraFile, 'extra')
+    Set-ProtectedAcl $extraFile $aclServiceSid
+    $extraAcl = Get-Acl -LiteralPath $extraFile -ErrorAction Stop
+    $extraRule = New-Object System.Security.AccessControl.FileSystemAccessRule -ArgumentList @(
+      (New-Object System.Security.Principal.SecurityIdentifier -ArgumentList 'S-1-1-0'),
+      [System.Security.AccessControl.FileSystemRights]::Read,
+      [System.Security.AccessControl.InheritanceFlags]::None,
+      [System.Security.AccessControl.PropagationFlags]::None,
+      [System.Security.AccessControl.AccessControlType]::Allow)
+    $extraAcl.AddAccessRule($extraRule)
+    Set-Acl -LiteralPath $extraFile -AclObject $extraAcl -ErrorAction Stop
+    $extraRefusal = Invoke-Refusal {
+      Assert-ProtectedAcl $extraFile $aclServiceSid
+    }
+    Check 'acl.extra_principal_refused' (
+      $extraRefusal.threw -and
+      $extraRefusal.code -ceq 'windows_managed_acl_invalid')
+  } finally {
+    if (Test-Path -LiteralPath $aclRoundtripRoot) {
+      Remove-Item -LiteralPath $aclRoundtripRoot -Recurse -Force
+    }
+  }
 }
 
 $python = Get-TestPython

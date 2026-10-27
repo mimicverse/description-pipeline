@@ -1068,7 +1068,7 @@ function Assert-ProtectedAcl([string]$Path, [string]$ServiceSid) {
   }
   $seen = @{}
   foreach ($row in @($projection.rules)) {
-    $rights = ([long]$row.rights) -band (-bnot [long][System.Security.AccessControl.FileSystemRights]::Synchronize)
+    $rights = [long]$row.rights
     $sid = [string]$row.sid
     if ($sid -cnotin $expected -or
         $seen.ContainsKey($sid) -or
