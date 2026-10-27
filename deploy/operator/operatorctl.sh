@@ -68,6 +68,7 @@ operator_units_disable() {
 
 GENERATION_ENV_REQUIRED=(
   AIRFLOW_DB_URL AIRFLOW_HOME AIRFLOW_RUNTIME_DB_URL AIRFLOW_VENV
+  PIPELINE_WORK_ROOT PLATFORM_ARTIFACT_ROOT PLATFORM_CONFIG_SNAPSHOT
   OPERATOR_STATE PIPELINE_WHEEL PLATFORM_CONFIG_DIGEST
   PLATFORM_OPERATOR_DSN PLATFORM_SERVICE_DSN POSTGRES_PORT POSTGRES_ROOT
   SOLIDWORKS_HANDOFF_ROOT SOLIDWORKS_SSH_HOST
@@ -839,6 +840,11 @@ install_from_config() {
   cat "$RENDER_LOG"
   load_resolved_env "$OPERATOR_STATE/resolved.env"
   load_generation_env
+  for root in "$PLATFORM_ARTIFACT_ROOT" "$PIPELINE_WORK_ROOT" "$SOLIDWORKS_HANDOFF_ROOT"; do
+    [ ! -L "$root" ] || die "generation root is a link: $root"
+    mkdir -p "$root"
+    chmod 700 "$root"
+  done
   TARGET="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
   TOOLCHAIN_LOG="$(mktemp)"
   bash "$HERE/scripts/install_toolchain.sh" > "$TOOLCHAIN_LOG"
@@ -883,8 +889,6 @@ install_from_config() {
       importlib.util.find_spec(name) for name in
       ("description_pipeline.orchestration.portal", "description_pipeline.orchestration.feishu_auth")) else 1)' \
     || die "the installed wheel does not provide portal and Feishu auth"
-  mkdir -p "$SOLIDWORKS_HANDOFF_ROOT"
-  chmod 700 "$SOLIDWORKS_HANDOFF_ROOT"
   [ -f "$ENDPOINT_TOKEN_FILE" ] || die "endpoint token file missing: $ENDPOINT_TOKEN_FILE"
   verify_runtime_identity "$AIRFLOW_VENV" "$RELEASE_FILE"
   windows_output="$(windows_action status)"

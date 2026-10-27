@@ -1803,9 +1803,8 @@ function Get-CommandArgumentsForExecutable([string]$CommandLine, [string]$Execut
   return $CommandLine.Substring($offset).Trim()
 }
 
-function Read-PyvenvRuntime([string]$Generation) {
-  $runtimeRoot = Join-Path $Generation 'runtime'
-  $path = Join-Path $runtimeRoot 'pyvenv.cfg'
+function Read-PyvenvRuntime([string]$RuntimeRoot) {
+  $path = Join-Path $RuntimeRoot 'pyvenv.cfg'
   Assert-RegularFile $path 'venv_identity_missing' 'pyvenv.cfg'
   $fields = @{}
   foreach ($line in @((Read-Utf8Text $path).TrimStart([char]0xFEFF) -split '\r?\n')) {
@@ -1916,9 +1915,9 @@ function Get-ListenerEvidence($Binding, $Projection, $Config) {
       continue
     }
     try {
-      if ((Get-CommandArgumentsForExecutable (
-          [string]$candidate.CommandLine,
-          [string]$action.execute)) -ceq [string]$action.arguments) {
+      if ((Get-CommandArgumentsForExecutable `
+          ([string]$candidate.CommandLine) `
+          ([string]$action.execute)) -ceq [string]$action.arguments) {
         $launchers += $candidate
       }
     } catch { }

@@ -154,6 +154,7 @@ def derive(
     snapshot_bytes: bytes,
     *,
     install_id: str,
+    snapshot_path: Path,
     tree_root: Path,
     release: dict,
     wheel: Path | None = None,
@@ -199,6 +200,13 @@ def derive(
     state_root = _absolute(storage.get("state_root"), "resolved.storage.state_root")
     release_root = _absolute(storage.get("release_root"), "resolved.storage.release_root")
     handoff_root = _absolute(storage.get("handoff_root"), "resolved.storage.handoff_root")
+    artifact_root = _absolute(storage.get("artifact_root"), "resolved.storage.artifact_root")
+    workspace_root = _absolute(storage.get("workspace_root"), "resolved.storage.workspace_root")
+    snapshot_file = Path(_absolute(str(snapshot_path), "snapshot path"))
+    require(
+        snapshot_file.is_file() and not snapshot_file.is_symlink(),
+        "snapshot path must name the active regular snapshot",
+    )
     host, https_port = _origin_parts(
         _text(operator.get("origin"), "resolved.operator.origin"),
         "resolved.operator.origin",
@@ -261,6 +269,9 @@ def derive(
         # The runtime freeze reads the platform configuration identity from the same snapshot
         # bytes the install record digests; this is the same source, never a parallel copy.
         "PLATFORM_CONFIG_DIGEST": hashlib.sha256(snapshot_bytes).hexdigest(),
+        "PLATFORM_CONFIG_SNAPSHOT": str(snapshot_file),
+        "PLATFORM_ARTIFACT_ROOT": artifact_root,
+        "PIPELINE_WORK_ROOT": workspace_root,
         "PIPELINE_WHEEL": str(wheel_path),
         "SOLIDWORKS_SSH_HOST": ssh_host,
         "SOLIDWORKS_ENDPOINT_PORT": str(endpoint_port),
@@ -309,6 +320,7 @@ def main(argv: list[str] | None = None) -> int:
     result = derive(
         snapshot,
         install_id=args.install_id,
+        snapshot_path=args.snapshot,
         tree_root=args.tree,
         release=release,
         wheel=args.wheel,
