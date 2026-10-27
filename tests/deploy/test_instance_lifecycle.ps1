@@ -536,21 +536,25 @@ if ($env:OS -eq 'Windows_NT') {
     $runtimeRoot = Join-Path $generation 'runtime'
     $scriptsRoot = Join-Path $runtimeRoot 'Scripts'
     $baseRoot = Join-Path $listenerEvidenceRoot 'base'
+    $alternateBaseRoot = Join-Path $listenerEvidenceRoot 'base-other'
     $null = New-Item -ItemType Directory -Path $scriptsRoot -Force
     $null = New-Item -ItemType Directory -Path $baseRoot -Force
+    $null = New-Item -ItemType Directory -Path $alternateBaseRoot -Force
     $launcherPython = Join-Path $scriptsRoot 'python.exe'
     $basePython = Join-Path $baseRoot 'python.exe'
+    $alternateBasePython = Join-Path $alternateBaseRoot 'python.exe'
     $configPath = Join-Path $generation 'endpoint.json'
     $pyvenvPath = Join-Path $runtimeRoot 'pyvenv.cfg'
     [System.IO.File]::WriteAllText($launcherPython, 'launcher-python')
     [System.IO.File]::WriteAllText($basePython, 'base-python')
+    [System.IO.File]::WriteAllText($alternateBasePython, 'alternate-base-python')
     [System.IO.File]::WriteAllText($configPath, '{}')
     $pyvenvText = @"
-home = $baseRoot
+home = $($baseRoot.ToUpperInvariant())
 include-system-site-packages = false
 version = 3.12.10
-executable = $basePython
-command = "$basePython" -m venv "$runtimeRoot"
+executable = $($basePython.ToLowerInvariant())
+command = "$($basePython.ToLowerInvariant())" -m venv "$runtimeRoot"
 "@
     [System.IO.File]::WriteAllText(
       $pyvenvPath,
@@ -562,17 +566,20 @@ command = "$basePython" -m venv "$runtimeRoot"
     $listenerPid = 4300
     $serviceSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     $schedulerImage = Join-Path ([string]$env:SystemRoot) 'System32\svchost.exe'
+    $schedulerImageObserved = $schedulerImage.Replace('System32', 'system32')
+    $launcherPythonObserved = $launcherPython.ToUpperInvariant()
+    $basePythonObserved = $basePython.ToUpperInvariant()
     $actionArguments = Runtime-LauncherArguments $generation
     $start = [datetime]::UtcNow
     $schedulerProcess = New-ListenerEvidenceProcessFixture `
-      $schedulerPid 4 $schedulerImage ('"' + $schedulerImage + '"') `
+      $schedulerPid 4 $schedulerImageObserved ('"' + $schedulerImageObserved + '"') `
       $start 0 'S-1-5-18'
     $launcherProcess = New-ListenerEvidenceProcessFixture `
-      $launcherPid $schedulerPid $launcherPython `
+      $launcherPid $schedulerPid $launcherPythonObserved `
       ('"' + $launcherPython + '" ' + $actionArguments) `
       $start.AddSeconds(1) 1 $serviceSid
     $listenerProcess = New-ListenerEvidenceProcessFixture `
-      $listenerPid $launcherPid $basePython `
+      $listenerPid $launcherPid $basePythonObserved `
       ('"' + $basePython + '" ' + $actionArguments) `
       $start.AddSeconds(2) 1 $serviceSid
     $script:ListenerConnectionSnapshot = @([pscustomobject]@{
@@ -605,8 +612,10 @@ command = "$basePython" -m venv "$runtimeRoot"
       $evidence.listener_pid -eq $listenerPid -and
       $evidence.listener_parent_pid -eq $launcherPid -and
       $evidence.scheduler_service_process_id -eq $schedulerPid -and
+      $evidence.scheduler_image -ceq (Normalize-PathIdentity $schedulerImageObserved) -and
+      $evidence.launcher_image -ceq (Normalize-PathIdentity $launcherPythonObserved) -and
       $evidence.venv_config_path -ceq (Normalize-PathIdentity $pyvenvPath) -and
-      $evidence.base_interpreter_path -ceq (Normalize-PathIdentity $basePython))
+      $evidence.base_interpreter_path -ceq (Normalize-PathIdentity $basePython.ToLowerInvariant()))
 
     $listenerProcess.ParentProcessId = $schedulerPid
     $wrongBinding = Invoke-Refusal {
@@ -615,6 +624,25 @@ command = "$basePython" -m venv "$runtimeRoot"
     }
     Check 'listener.production_evidence_wrong_binding_refused' (
       $wrongBinding.code -ceq 'windows_listener_identity_mismatch')
+
+    $listenerProcess.ParentProcessId = $launcherPid
+    $foreignPyvenvText = @"
+home = $($baseRoot.ToUpperInvariant())
+include-system-site-packages = false
+version = 3.12.10
+executable = $alternateBasePython
+command = "$alternateBasePython" -m venv "$runtimeRoot"
+"@
+    [System.IO.File]::WriteAllText(
+      $pyvenvPath,
+      $foreignPyvenvText,
+      (New-Object System.Text.UTF8Encoding($false)))
+    $foreignDirectory = Invoke-Refusal {
+      Get-ListenerEvidence `
+        -Binding $null -Projection $projection -Config $config
+    }
+    Check 'listener.production_evidence_foreign_pyvenv_dir_refused' (
+      $foreignDirectory.code -ceq 'windows_listener_identity_mismatch')
   } finally {
     Remove-Item Function:\Invoke-CimMethod -Force
     Remove-Item Function:\Get-CimInstance -Force

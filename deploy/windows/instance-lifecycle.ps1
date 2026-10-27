@@ -1830,7 +1830,9 @@ function Read-PyvenvRuntime([string]$RuntimeRoot) {
   }
   $venvHome = Normalize-PathIdentity ([string]$fields['home'])
   $base = Normalize-PathIdentity ([string]$fields['executable'])
-  if (-not $base.StartsWith($venvHome + '/') -or
+  if (-not $base.StartsWith(
+        $venvHome + '/',
+        [System.StringComparison]::OrdinalIgnoreCase) -or
       $base -notmatch '(?i)/python\.exe$') {
     throw 'the generation base interpreter differs from pyvenv home'
   }
@@ -1910,7 +1912,7 @@ function Get-ListenerEvidence($Binding, $Projection, $Config) {
   $action = $Projection.action
   $launchers = @()
   foreach ($candidate in $processes) {
-    if ((Normalize-PathIdentity ([string]$candidate.ExecutablePath)) -cne
+    if ((Normalize-PathIdentity ([string]$candidate.ExecutablePath)) -ine
         (Normalize-PathIdentity ([string]$action.execute))) {
       continue
     }
@@ -1952,7 +1954,7 @@ function Get-ListenerEvidence($Binding, $Projection, $Config) {
   }
   $schedulerImage = Normalize-PathIdentity (
     Join-Path ([string]$env:SystemRoot) 'System32\svchost.exe')
-  if ($scheduler.image -cne $schedulerImage -or
+  if ($scheduler.image -ine $schedulerImage -or
       $scheduler.user_sid -cne 'S-1-5-18' -or
       $scheduler.session_id -ne 0 -or
       $services.Count -ne 1 -or
@@ -1967,7 +1969,7 @@ function Get-ListenerEvidence($Binding, $Projection, $Config) {
   } catch {
     Die 'windows_listener_identity_mismatch' $_.Exception.Message
   }
-  if ($listener.image -cne [string]$venv.base_interpreter_path -or
+  if ($listener.image -ine [string]$venv.base_interpreter_path -or
       $launcher.user_sid -cne [string]$Projection.principal.sid -or
       $listener.user_sid -cne [string]$Projection.principal.sid -or
       -not (Test-ProcessCreationOrder `
