@@ -130,9 +130,8 @@ class EndpointConfig:
     token: str
     timeout: float = 30.0
     handoff_roots: tuple[Path, ...] = ()
-    #: Linux-side routing: model-repository slug to local checkout, and the attempt store.
+    #: Linux-side routing: model-repository slug to local checkout.
     repositories: dict[str, Path] = dataclass_field(default_factory=dict)
-    store_root: Path | None = None
     #: Linux-side derivation controls: controlled-record roots and interface-name inputs.
     discovery: dict = dataclass_field(default_factory=dict)
     #: Configured publication targets: hardware identity to repository slug and base branch.
@@ -148,7 +147,6 @@ class EndpointConfig:
             raise EndpointProtocolError("Endpoint timeout must be finite and positive")
         object.__setattr__(self, "handoff_roots", _handoff_roots(self.handoff_roots))
         object.__setattr__(self, "repositories", _linux_repositories(self.repositories))
-        object.__setattr__(self, "store_root", _linux_store_root(self.store_root))
         object.__setattr__(self, "discovery", _linux_discovery(self.discovery))
         object.__setattr__(self, "targets", _linux_targets(self.targets))
         if self.config_digest and _SHA256.fullmatch(self.config_digest) is None:
@@ -185,16 +183,6 @@ def _linux_repositories(values) -> dict[str, Path]:
             raise EndpointProtocolError(f"repository path for {slug!r} must be absolute")
         resolved[slug] = candidate
     return resolved
-
-
-def _linux_store_root(value) -> Path | None:
-    """Validate the absolute Linux attempt-store root; absent disables the portable half."""
-    if value in (None, ""):
-        return None
-    candidate = Path(str(value))
-    if not candidate.is_absolute():
-        raise EndpointProtocolError("store_root must be an absolute Linux path")
-    return candidate
 
 
 _TARGET_HARDWARE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}\Z")
@@ -355,7 +343,6 @@ def _endpoint_config_from_snapshot(snapshot: dict, *, config_digest: str, timeou
         timeout=timeout,
         handoff_roots=(resolved["storage"]["handoff_root"],),
         repositories=resolved["derived"]["repositories"],
-        store_root=resolved["derived"]["store_root"],
         discovery=resolved["derived"]["discovery"],
         targets=resolved["targets"],
         config_digest=config_digest,

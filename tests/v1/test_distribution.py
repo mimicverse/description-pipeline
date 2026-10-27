@@ -51,8 +51,8 @@ def complete_release(root: Path, *, identity: dict | None = None) -> dict:
         "requirements/linux-py312.lock": b"demo==1.0\n",
         "requirements/windows-py312.lock": b"demo==1.0\n",
         "deploy/operator/operatorctl.sh": b"operator tool",
-        "deploy/operator/windows_identity.py": (
-            ROOT / "deploy/operator/windows_identity.py"
+        "deploy/operator/install_record.py": (
+            ROOT / "deploy/operator/install_record.py"
         ).read_bytes(),
         "deploy/operator/example.py": b"value = 1\n",
     }

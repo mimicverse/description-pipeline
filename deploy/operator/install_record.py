@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-"""Assemble and persist the Linux-side install record for one generation (IF-16).
+"""Assemble and persist the first-install Linux-side install record (IF-16).
 
-Contract: ``docs/deployment.md`` Linux installation / maintenance, upgrade, and recovery (the install record names
-every managed service and path; the lifecycle reads the same record), frozen-interfaces-v1.1
-IF-16, and the D04 per-end binding: ``ends.linux`` carries this host's snapshot digest while
-``ends.windows`` carries the isolated endpoint's own generation - the two are never compared for
-equality.  The record's release identity is bound to the deployment's ``release.json``: equal
-package digests with a different ``source_commit`` are a mismatch, never a pass.
+The record names the current snapshot, release, services, DAG and the independently installed
+Windows endpoint. ``ends.linux`` carries this host's snapshot digest while ``ends.windows``
+carries the endpoint's own generation; the two digests are not compared for equality. The
+record's release identity is bound to the deployment's ``release.json``.
 
 The Windows end's identity is an explicit input: the endpoint preparation produces
 ``{install_id, config_digest, release{version, source_commit, source_sha256, role: native},
@@ -14,9 +12,7 @@ target_identity{schema_version, install_id, pipeline_id, target_id}}`` and this 
 to write a record without it (fail closed) - no fabricated placeholder generation is ever
 recorded.
 
-Like the other deploy-side modules this one is standalone (stdlib only); the terminal
-``tests/v1/test_install_record.py`` holds the parity guards against
-``description_pipeline.interface_records``.
+This module intentionally has no upgrade, rollback, previous-record or journal operations.
 
 Exit codes: 0 success; 1 error (message on stderr); 2 usage error.
 """
@@ -160,17 +156,16 @@ def _confined_artifact(root: Path, name) -> Path | None:
 
 
 def verify_artifacts(root: Path, artifacts: list[dict]) -> int:
-    """Verify every cited artifact that is present under ``root``; at least one must be."""
+    """Verify the complete release artifact set under ``root``."""
 
     verified = 0
     for row in artifacts:
         candidate = _confined_artifact(root, row["name"])
         if candidate is None:
-            continue
+            die(f"release artifact is missing: {row['name']}")
         actual = hashlib.sha256(candidate.read_bytes()).hexdigest()
         require(actual == row["sha256"], f"artifact {row['name']} does not match release.json ({actual})")
         verified += 1
-    require(verified > 0, f"no release artifact is present under {root}")
     return verified
 
 
@@ -227,6 +222,59 @@ def endpoint_identity(document) -> dict:
     }
 
 
+def endpoint_identity_from_status(status_document, release: dict) -> dict:
+    """Read the installed endpoint identity from its read-only status result."""
+
+    require(
+        isinstance(status_document, dict)
+        and status_document.get("schema_version")
+        == "solidworks-to-urdf.windows-lifecycle-result/v1"
+        and status_document.get("passed") is True
+        and status_document.get("verb") == "status",
+        "endpoint status result is invalid",
+    )
+    task = status_document.get("task")
+    status = status_document.get("status")
+    require(
+        isinstance(task, dict)
+        and task.get("state") == "Disabled"
+        and isinstance(status, dict)
+        and status.get("task_exists") is True
+        and status.get("task_state") == "Disabled"
+        and status.get("error") is None
+        and status.get("consistent") is True
+        and type(status.get("solidworks_processes")) is int
+        and status["solidworks_processes"] == 0
+        and status_document.get("listener") is None
+        and status_document.get("health") is None,
+        "endpoint status does not prove a stopped, consistent endpoint",
+    )
+    identity = status_document.get("identity")
+    require(isinstance(identity, dict), "endpoint status carries no installed identity")
+    install_id = _text(identity.get("install_id"), "endpoint status install_id")
+    config_digest = _hex64(
+        identity.get("config_digest"),
+        "endpoint status config_digest",
+    )
+    endpoint_release = identity.get("release")
+    require(isinstance(endpoint_release, dict), "endpoint status release is missing")
+    require_matching_release(release, {"release": endpoint_release})
+    target_contract, pipeline_id = _native_target_contract()
+    target = target_contract.create(
+        install_id=install_id,
+        pipeline_id=pipeline_id,
+    )
+    return {
+        "install_id": install_id,
+        "config_digest": config_digest,
+        "release": {
+            key: endpoint_release[key]
+            for key in ("version", "source_commit", "source_sha256", "role")
+        },
+        "target_identity": target.to_record(),
+    }
+
+
 def require_matching_release(release: dict, endpoint: dict) -> None:
     """The endpoint generation must carry the same release triple (commit skew never passes)."""
 
@@ -245,18 +293,13 @@ def _canonical_records():
     return interface_records
 
 
-def _verify_generation(config_path: Path | None, state_root: Path) -> dict:
-    """The one running reader: complete record + immutable snapshot identity.
-
-    ``config_path`` adds exactly one term - the current platform.json equals the snapshot's
-    recorded source - which steady-state verbs require and the maintenance window must not
-    (a candidate configuration is the subject of a switch, not drift of the running record).
-    """
+def read_installed_generation(
+    state_root: Path,
+    release_file: Path | None = None,
+) -> tuple[dict, dict]:
+    """Read the complete current record and its immutable snapshot identity."""
 
     state_root = Path(state_root)
-    if config_path is not None:
-        config_path = Path(config_path)
-        require(config_path.is_file(), f"config file not found: {config_path}")
     record_path = state_root / "install-record.json"
     require(record_path.is_file(), f"not installed: install record missing at {record_path} (run install first)")
     interface_records = _canonical_records()
@@ -290,25 +333,32 @@ def _verify_generation(config_path: Path | None, state_root: Path) -> dict:
         storage["state_root"] == str(state_root),
         f"install record belongs to another state root: {storage['state_root']}",
     )
-    if config_path is not None:
-        current = hashlib.sha256(config_path.read_bytes()).hexdigest()
-        require(
-            current == document["sources"]["platform_json_sha256"],
-            "the current platform.json does not match the active snapshot; re-run install or promote",
-        )
+    if release_file is not None:
+        release = release_identity(_load_json(Path(release_file), "release file"))
+        for key in ("version", "source_commit", "source_sha256"):
+            require(
+                record["release"].get(key) == release.get(key),
+                f"install record release differs on {key}",
+            )
+    return record, document
+
+
+def verify_active_generation(
+    config_path: Path,
+    state_root: Path,
+    release_file: Path | None = None,
+) -> dict:
+    """Verify the installed identity and the current configuration source."""
+
+    config_path = Path(config_path)
+    require(config_path.is_file(), f"config file not found: {config_path}")
+    record, document = read_installed_generation(state_root, release_file)
+    current = hashlib.sha256(config_path.read_bytes()).hexdigest()
+    require(
+        current == document["sources"]["platform_json_sha256"],
+        "the current platform.json does not match the active snapshot; re-run install",
+    )
     return record
-
-
-def verify_active_generation(config_path: Path, state_root: Path) -> dict:
-    """Steady-state gate: the running reader plus the current platform.json binding."""
-
-    return _verify_generation(Path(config_path), Path(state_root))
-
-
-def verify_running_generation(state_root: Path) -> dict:
-    """Maintenance-window gate: the same running reader, without the current-config binding."""
-
-    return _verify_generation(None, Path(state_root))
 
 
 def wheel_binding(release: dict, *, wheel: Path | None, tree_root: Path | None = None) -> Path:
@@ -339,6 +389,22 @@ def wheel_binding(release: dict, *, wheel: Path | None, tree_root: Path | None =
     return candidate
 
 
+def stage_release_wheel(
+    release: dict,
+    *,
+    release_root: Path,
+    wheel: Path | None,
+    tree_root: Path | None = None,
+) -> Path:
+    """Copy the verified wheel to the runtime artifact root and return that stable path."""
+
+    require(release_root.is_absolute(), "runtime release root must be absolute")
+    source = wheel_binding(release, wheel=wheel, tree_root=tree_root)
+    stable = release_root / "artifacts" / source.name
+    atomic_write_once(stable, source.read_bytes())
+    return wheel_binding(release, wheel=stable)
+
+
 def build_install_record(
     *,
     install_id: str,
@@ -350,14 +416,8 @@ def build_install_record(
     dag_file: Path,
     deployment_root: Path,
     release_dag_sha256: str,
-    previous: dict | None = None,
-    journal: list | None = None,
 ) -> dict:
-    """Assemble a record that passes the frozen IF-16 validator (parity-tested).
-
-    ``previous`` is the rollback binding of the generation this record replaces and ``journal``
-    carries the switch steps already taken; both are written once, at the pointer switch.
-    """
+    """Assemble the one first-install record that passes the frozen IF-16 validator."""
 
     require(valid_install_id(install_id), "install_id is malformed")
     require(bool(_RFC3339_UTC.match(timestamp)), f"timestamp must be RFC3339 UTC: {timestamp!r}")
@@ -426,26 +486,6 @@ def build_install_record(
         dag_digest == _hex64(release_dag_sha256, "release DAG digest"),
         f"dag file does not match the release deployment member ({dag_digest})",
     )
-    steps = []
-    for index, row in enumerate(journal or []):
-        require(
-            isinstance(row, dict) and set(row) == {"verb", "step", "status", "at", "evidence"},
-            f"journal step {index} is malformed",
-        )
-        require(row["verb"] in {"promote", "rollback"}, f"journal step {index} verb is malformed")
-        require(row["status"] in {"completed", "failed", "unknown"}, f"journal step {index} status is malformed")
-        _text(row["step"], f"journal step {index} name")
-        require(
-            isinstance(row["at"], str) and bool(row["at"]),
-            f"journal step {index} timestamp is malformed",
-        )
-        require(
-            isinstance(row["evidence"], list)
-            and bool(row["evidence"])
-            and all(isinstance(item, str) and item for item in row["evidence"]),
-            f"journal step {index} evidence is malformed",
-        )
-        steps.append({"seq": index + 1, **row})
     return {
         "schema_version": INSTALL_RECORD_SCHEMA,
         "install_id": install_id,
@@ -478,92 +518,21 @@ def build_install_record(
                 "target_identity": target.to_record(),
             },
         },
-        "previous": previous,
-        "journal": steps,
     }
-
-
-def previous_from_record(record: dict, record_path: Path) -> dict:
-    """The rollback binding a new generation records about the one it replaces."""
-
-    return {
-        "release": {key: record["release"][key] for key in ("version", "source_commit", "source_sha256")},
-        "config": {"path": record["snapshot"]["path"], "digest": record["snapshot"]["digest"]},
-        "record": str(Path(record_path)),
-    }
-
-
-def repoint_active(state_root: Path, record_path: Path) -> dict:
-    """Atomically point ``install-record.json`` at an existing generation file (rollback).
-
-    One read is the only source: those exact bytes are validated by the canonical package
-    validator and then committed, so nothing can change between the check and the write.  The
-    active pointer keeps mode 0600 and refuses a conflicting temporary path.
-    """
-
-    state_root, record_path = Path(state_root), Path(record_path)
-    require(record_path.is_file(), f"rollback record not found: {record_path}")
-    try:
-        payload = record_path.read_bytes()
-    except OSError as error:
-        die(f"cannot read record {record_path}: {error}")
-    try:
-        document = json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError) as error:
-        die(f"cannot parse rollback record {record_path}: {error}")
-    try:
-        _canonical_records().validate_install_record(document)
-    except Exception as error:
-        die(f"rollback record invalid: {error}")
-    for entry in document["journal"]:
-        for value in entry["evidence"]:
-            evidence = Path(value)
-            require(
-                evidence.is_absolute()
-                and evidence.is_file()
-                and not evidence.is_symlink()
-                and evidence.resolve() == evidence,
-                f"recovery_history_unavailable: rollback record has unavailable evidence: {evidence}",
-            )
-    active = state_root / "install-record.json"
-    active.parent.mkdir(parents=True, exist_ok=True)
-    temporary = active.with_name(active.name + ".repoint.tmp")
-    require(not temporary.exists(), f"refuse a conflicting temporary path: {temporary}")
-    handle = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(handle, "wb") as stream:
-        stream.write(payload)
-    os.replace(temporary, active)
-    return document
-
-
-def validate_endpoint_health(health_document, release: dict) -> tuple[dict, dict]:
-    """Derive the Windows end's identity from the running endpoint's own IF-09 ``/health``.
-
-    The health payload is validated by the canonical package validator and its release triple
-    must equal the release manifest; a hand-written declaration never becomes an identity.
-    """
-
-    interface_records = _canonical_records()
-    try:
-        health = interface_records.validate_health(health_document)
-    except Exception as error:
-        die(f"endpoint health invalid: {error}")
-    require_matching_release(release, {"release": health["release"]})
-    identity = {
-        "install_id": health["install_id"],
-        "config_digest": health["config_digest"],
-        "release": {key: health["release"][key] for key in ("version", "source_commit", "source_sha256", "role")},
-        "target_identity": dict(health["target_identity"]),
-    }
-    return identity, health
 
 
 def write_install_record(record: dict, state_root: Path, owner) -> tuple[Path, Path]:
-    """Persist one generation (write-once) and update the active record pointer atomically."""
+    """Persist the one first installation without replacing any existing authority."""
 
     payload = owner.canonical(record)
-    generation = atomic_write_once(state_root / "install-records" / f"{record['install_id']}.json", payload)
     active = state_root / "install-record.json"
+    require(not active.exists() and not active.is_symlink(), f"already installed: {active}")
+    generation_path = state_root / "install-records" / f"{record['install_id']}.json"
+    require(
+        not generation_path.exists() and not generation_path.is_symlink(),
+        f"install generation already exists: {generation_path}",
+    )
+    generation = atomic_write_once(generation_path, payload)
     active.parent.mkdir(parents=True, exist_ok=True)
     temporary = active.with_name(f".{active.name}.{os.getpid()}.tmp")
     descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -572,7 +541,10 @@ def write_install_record(record: dict, state_root: Path, owner) -> tuple[Path, P
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, active)
+        try:
+            os.link(temporary, active)
+        except FileExistsError as error:
+            raise SystemExit(f"install_record: already installed: {active}") from error
     finally:
         temporary.unlink(missing_ok=True)
     os.chmod(active, 0o600)
@@ -594,75 +566,54 @@ def main(argv: list[str] | None = None) -> int:
     build.add_argument("--deployment-root", type=Path, required=True)
     build.add_argument("--wheel", type=Path, default=None, help="the installed wheel (contract owner source)")
     build.add_argument("--tree", type=Path, default=None, help="deployment tree for wheel discovery")
-    build.add_argument("--previous-record", type=Path, default=None, help="the generation this record replaces")
-    build.add_argument("--journal", type=Path, default=None, help="the switch steps taken before the pointer switch")
     check = subparsers.add_parser("check")
     check.add_argument("--release-file", type=Path, required=True)
-    check.add_argument("--endpoint-identity", type=Path, required=True)
     check.add_argument("--wheel", type=Path, default=None, help="the wheel that will be installed")
     check.add_argument("--tree", type=Path, default=None, help="deployment tree for wheel discovery")
+    stage = subparsers.add_parser("stage-wheel")
+    stage.add_argument("--release-file", type=Path, required=True)
+    stage.add_argument("--release-root", type=Path, required=True)
+    stage.add_argument("--wheel", type=Path, default=None)
+    stage.add_argument("--tree", type=Path, default=None)
     verify = subparsers.add_parser("verify-active")
     verify.add_argument("--config", type=Path, required=True)
     verify.add_argument("--state-root", type=Path, required=True)
-    running = subparsers.add_parser("verify-running")
-    running.add_argument("--state-root", type=Path, required=True)
-    repoint = subparsers.add_parser("repoint")
-    repoint.add_argument("--state-root", type=Path, required=True)
-    repoint.add_argument("--record", type=Path, required=True, help="the generation file to activate (rollback)")
+    verify.add_argument("--release-file", type=Path)
     identity = subparsers.add_parser("endpoint-identity")
-    identity.add_argument("--health", type=Path, required=True, help="the endpoint's own /health payload")
+    identity.add_argument("--status", type=Path, required=True)
     identity.add_argument("--release-file", type=Path, required=True)
-    identity.add_argument("--record", type=Path, default=None, help="cross-check against this install record")
     identity.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
 
     if args.action == "verify-active":
-        record = verify_active_generation(args.config, args.state_root)
-        print(f"install_id={record['install_id']}")
-        return 0
-    if args.action == "verify-running":
-        record = verify_running_generation(args.state_root)
-        print(f"install_id={record['install_id']}")
-        return 0
-    if args.action == "repoint":
-        record = repoint_active(args.state_root, args.record)
+        record = verify_active_generation(args.config, args.state_root, args.release_file)
         print(f"install_id={record['install_id']}")
         return 0
     if args.action == "endpoint-identity":
         release = release_identity(_load_json(args.release_file, "release file"))
-        health_document = _load_json(args.health, "endpoint health")
-        if args.record is not None:
-            # The record is the authority for its own per-end release (rollback verifies the
-            # restored generation, whose release differs from the current manifest).
-            interface_records = _canonical_records()
-            try:
-                health = interface_records.validate_health(health_document)
-                record = interface_records.validate_install_record(_load_json(args.record, "install record"))
-            except Exception as error:
-                die(f"endpoint health or record invalid: {error}")
-            try:
-                interface_records.require_endpoint_matches_install_record(health, record)
-            except Exception as error:
-                detail = getattr(error, "detail", None)
-                die(f"endpoint does not match the active record: {error} {detail if detail else ''}")
-            endpoint = {
-                "install_id": health["install_id"],
-                "config_digest": health["config_digest"],
-                "release": {
-                    key: health["release"][key] for key in ("version", "source_commit", "source_sha256", "role")
-                },
-                "target_identity": dict(health["target_identity"]),
-            }
-        else:
-            endpoint, health = validate_endpoint_health(health_document, release)
-        args.out.write_text(json.dumps(endpoint, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        endpoint = endpoint_identity_from_status(
+            _load_json(args.status, "endpoint status"),
+            release,
+        )
+        args.out.write_text(
+            json.dumps(endpoint, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
         print(f"install_id={endpoint['install_id']}")
+        return 0
+    if args.action == "stage-wheel":
+        release = release_identity(_load_json(args.release_file, "release file"))
+        stable = stage_release_wheel(
+            release,
+            release_root=args.release_root,
+            wheel=args.wheel,
+            tree_root=args.tree,
+        )
+        print(stable)
         return 0
     if args.action == "check":
         release = release_identity(_load_json(args.release_file, "release file"))
         verified = verify_artifacts(args.release_file.parent, release["artifacts"])
-        endpoint = endpoint_identity(_load_json(args.endpoint_identity, "endpoint identity"))
-        require_matching_release(release, endpoint)
         if args.wheel is not None or args.tree is not None:
             wheel_binding(release, wheel=args.wheel, tree_root=args.tree)
         print("check=ok")
@@ -686,15 +637,6 @@ def main(argv: list[str] | None = None) -> int:
         dag_file=args.dag,
         deployment_root=args.deployment_root,
         release_dag_sha256=release_dag_sha256,
-        previous=(
-            previous_from_record(
-                _load_json(args.previous_record, "previous record"),
-                Path(args.previous_record).resolve(),
-            )
-            if args.previous_record is not None
-            else None
-        ),
-        journal=(_load_json(args.journal, "journal file") if args.journal is not None else None),
     )
     bound_wheel = wheel_binding(release, wheel=args.wheel, tree_root=args.tree)
     contract = load_contract_owner(extract_contract_closure(bound_wheel))

@@ -578,6 +578,9 @@ def capture_native_package(
         worker_version=__version__,
         on_activity=on_activity,
     )
+    verify_snapshot(staging / "evidence")
+    _rehome_evidence(staging, package)
+    _require_plan_against_capture(staging, definition["plan"])
     checked(
         on_event,
         "capture",
@@ -586,8 +589,6 @@ def capture_native_package(
         lambda: verify_snapshot(staging / "evidence"),
         describe=lambda value: _snapshot_details(staging, value),
     )
-    _rehome_evidence(staging, package)
-    _require_plan_against_capture(staging, definition["plan"])
 
     def stable_inputs():
         if package_inventory(package) != original_files:

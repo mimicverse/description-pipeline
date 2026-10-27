@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Exact-path disaster recovery for the description pipeline.
+"""Exact-path same-release disaster recovery for the description pipeline.
 
-This file is intended to be reviewed as ``deploy/operator/recovery.py``.  It owns
-the recovery contract; the legacy ``backup.py`` is reused only for its encrypted
-tar stream, digest helper and private-staging cleanup.  ``backup.py open`` and
-the legacy promotion manifest are not recovery authorities.
+This file owns the current-release encrypted archive helpers, backup inventory,
+restore verification and maintenance-window handling. It has no package upgrade,
+rollback or previous-generation authority.
 
 Backup is a maintenance-window operation.  On success it intentionally leaves
 the platform admission closed, the supported Linux/Airflow writers stopped and
@@ -41,12 +40,9 @@ import fcntl
 import hashlib
 import io
 import json
-import ntpath
 import os
 import re
-import secrets
 import selectors
-import signal
 import shlex
 import shutil
 import socket
@@ -76,7 +72,6 @@ from description_pipeline.pipeline.contracts import RunStatus  # noqa: E402
 from description_pipeline.platform.facts import read_admitted_runs  # noqa: E402
 
 try:
-    import backup
     import install_record
     import platform_config
     import render_operator
@@ -90,21 +85,19 @@ except ImportError as error:  # pragma: no cover - exercised by deployment layou
     ) from error
 
 
-MANIFEST_SCHEMA = "solidworks-to-urdf.recovery-manifest/v7"
-TARGET_SCHEMA = "solidworks-to-urdf.recovery-target/v3"
+MANIFEST_SCHEMA = "solidworks-to-urdf.recovery-manifest/v1"
+TARGET_SCHEMA = "solidworks-to-urdf.recovery-target/v1"
 MARKER_SCHEMA = "solidworks-to-urdf.recovery-marker/v1"
 RECEIPT_SCHEMA = "solidworks-to-urdf.recovery-receipt/v1"
 MAINTENANCE_RECEIPT_SCHEMA = "solidworks-to-urdf.recovery-maintenance/v1"
-SNAPSHOT_WORKER_SCHEMA = "solidworks-to-urdf.recovery-snapshot-worker/v5"
-SELECTION_SCHEMA = "solidworks-to-urdf.recovery-selection/v2"
+SNAPSHOT_WORKER_SCHEMA = "solidworks-to-urdf.recovery-snapshot-worker/v1"
+SELECTION_SCHEMA = "solidworks-to-urdf.recovery-selection/v1"
 SNAPSHOT_READY_SCHEMA = "solidworks-to-urdf.recovery-snapshot-ready/v1"
-WINDOWS_RECOVERY_SCHEMA = "solidworks-to-urdf.windows-recovery/v2"
-WINDOWS_BUNDLE_MEMBER = "windows/recovery.zip"
-WINDOWS_STATE_MEMBER = "windows-state.json"
-WINDOWS_BUNDLE = "recovery.zip"
+WINDOWS_RECOVERY_SCHEMA = "solidworks-to-urdf.windows-recovery/v1"
 POSTGRES_MAJOR = "14"
 DATABASE_NAME = "airflow_meta"
 BOOTSTRAP_ROLE = "solidworks"
+POSTGRES_SEARCH_PATH = "platform,airflow,pg_catalog"
 APPLICATION_ROLES = (
     "platform_migrate",
     "platform_service",
@@ -123,7 +116,6 @@ ARCHIVE_TOP_LEVEL = {
     "release",
     "secrets",
     "reconstruct",
-    "journal-files",
     "inventory",
     "windows",
     "workspace-preserved",
@@ -389,6 +381,192 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def ensure_recovery_key(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(os.urandom(32).hex().encode("ascii"))
+    os.chmod(path, 0o600)
+
+
+def seal_recovery_archive(source: Path, key: Path, output: Path) -> str:
+    require(
+        source.is_dir() and not source.is_symlink(),
+        "recovery_backup_source_invalid",
+        f"backup source is missing or a link: {source}",
+    )
+    ensure_recovery_key(key)
+    output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = output.with_name(f".{output.name}.{os.getpid()}.partial")
+    success = False
+    try:
+        process = subprocess.Popen(
+            [
+                "openssl",
+                "enc",
+                "-aes-256-cbc",
+                "-pbkdf2",
+                "-salt",
+                "-pass",
+                f"file:{key}",
+                "-out",
+                str(temporary),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        stream_error = None
+        try:
+            with tarfile.open(fileobj=process.stdin, mode="w|") as archive:
+                for path in sorted(source.rglob("*")):
+                    archive.add(
+                        path,
+                        arcname=path.relative_to(source).as_posix(),
+                        recursive=False,
+                    )
+        except (BrokenPipeError, OSError, tarfile.TarError) as error:
+            stream_error = error
+        finally:
+            if process.stdin is not None:
+                with contextlib.suppress(BrokenPipeError, OSError):
+                    process.stdin.close()
+        stderr = process.stderr.read() if process.stderr is not None else b""
+        if process.stderr is not None:
+            process.stderr.close()
+        returncode = process.wait()
+        require(
+            returncode == 0,
+            "recovery_archive_write_failed",
+            f"openssl failed: {stderr.decode(errors='replace').strip()}",
+        )
+        require(
+            stream_error is None,
+            "recovery_archive_write_failed",
+            f"tar stream failed: {stream_error}",
+        )
+        os.replace(temporary, output)
+        output.chmod(0o600)
+        success = True
+    finally:
+        if not success:
+            temporary.unlink(missing_ok=True)
+    return sha256_file(output)
+
+
+def extract_recovery_archive(archive: Path, key: Path, destination: Path) -> None:
+    require(
+        archive.is_file() and not archive.is_symlink(),
+        "recovery_archive_hash_mismatch",
+        f"encrypted archive is missing or a link: {archive}",
+    )
+    require(
+        key.is_file() and not key.is_symlink(),
+        "recovery_key_unavailable",
+        f"recovery key is missing or a link: {key}",
+    )
+    require(
+        not destination.exists(),
+        "recovery_target_not_empty",
+        f"refuse to overwrite extraction target: {destination}",
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = Path(
+        tempfile.mkdtemp(
+            prefix=f".{destination.name}.",
+            suffix=".partial",
+            dir=destination.parent,
+        )
+    )
+    success = False
+    try:
+        process = subprocess.Popen(
+            [
+                "openssl",
+                "enc",
+                "-d",
+                "-aes-256-cbc",
+                "-pbkdf2",
+                "-pass",
+                f"file:{key}",
+                "-in",
+                str(archive),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        stream_error = None
+        try:
+            with tarfile.open(fileobj=process.stdout, mode="r|") as tar:
+                tar.extractall(temporary, filter="data")
+        except (OSError, tarfile.TarError) as error:
+            stream_error = error
+        finally:
+            if process.stdout is not None:
+                try:
+                    while process.stdout.read(1024 * 1024):
+                        pass
+                except OSError as error:
+                    if stream_error is None:
+                        stream_error = error
+                finally:
+                    process.stdout.close()
+        stderr = process.stderr.read() if process.stderr is not None else b""
+        if process.stderr is not None:
+            process.stderr.close()
+        returncode = process.wait()
+        require(
+            returncode == 0,
+            "recovery_archive_hash_mismatch",
+            f"openssl failed: {stderr.decode(errors='replace').strip()}",
+        )
+        require(
+            stream_error is None,
+            "recovery_archive_hash_mismatch",
+            f"tar stream failed: {stream_error}",
+        )
+        os.replace(temporary, destination)
+        success = True
+    finally:
+        if not success and temporary.exists():
+            _remove_staging_tree(temporary)
+
+
+def _remove_staging_tree(root: Path) -> None:
+    os.chmod(root, stat.S_IMODE(root.stat().st_mode) | 0o700)
+    for entry in os.scandir(root):
+        if entry.is_symlink():
+            os.unlink(entry.path)
+        elif entry.is_dir(follow_symlinks=False):
+            _remove_staging_tree(Path(entry.path))
+        else:
+            os.unlink(entry.path)
+    os.rmdir(root)
+
+
+def remove_private_staging(parent: Path) -> bool:
+    parent = Path(parent)
+    require(
+        parent.is_absolute()
+        and str(parent) == os.path.realpath(parent)
+        and not parent.is_symlink(),
+        "recovery_target_path_unsafe",
+        f"private staging parent is not canonical: {parent}",
+    )
+    staging = parent / "backup"
+    if not staging.exists() and not staging.is_symlink():
+        return False
+    require(
+        staging.is_dir() and not staging.is_symlink(),
+        "recovery_target_path_unsafe",
+        f"private staging is not a real directory: {staging}",
+    )
+    _remove_staging_tree(staging)
+    return True
 
 
 def canonical_json(document: object) -> bytes:
@@ -798,7 +976,7 @@ def load_backup_context(config_path: Path) -> BackupContext:
         "active derived environment",
         "recovery_release_missing",
     )
-    derived_env = render_operator.load_env(env_path)
+    derived_env = render_operator.read_env(env_path)
     required_env = {
         "AIRFLOW_DB_URL",
         "AIRFLOW_RUNTIME_DB_URL",
@@ -806,7 +984,6 @@ def load_backup_context(config_path: Path) -> BackupContext:
         "PLATFORM_OPERATOR_DSN",
         "POSTGRES_ROOT",
         "POSTGRES_MAJOR",
-        "PIPELINE_STORE_ROOT",
         "AIRFLOW_HOME",
         "AIRFLOW_VENV",
         "PIPELINE_WHEEL",
@@ -822,11 +999,6 @@ def load_backup_context(config_path: Path) -> BackupContext:
         derived_env["POSTGRES_MAJOR"] == POSTGRES_MAJOR,
         "recovery_postgres_version_mismatch",
         "active derived environment does not require PostgreSQL 14",
-    )
-    require(
-        Path(derived_env["PIPELINE_STORE_ROOT"]) == Path(resolved["derived"]["store_root"]),
-        "recovery_manifest_invalid",
-        "derived store root differs from the active snapshot",
     )
     release_root = Path(resolved["storage"]["release_root"])
     archive_root = Path(__file__).resolve().parents[2]
@@ -1257,6 +1429,9 @@ def psql(
     file: Path | None = None,
     password: str | None = None,
 ) -> str:
+    environment = {"PGOPTIONS": f"-c search_path={POSTGRES_SEARCH_PATH}"}
+    if password is not None:
+        environment["PGPASSWORD"] = password
     argv = [
         context.bin_dir / "psql",
         "-X",
@@ -1278,10 +1453,7 @@ def psql(
         argv.extend(["-c", query])
     if file is not None:
         argv.extend(["-f", file])
-    completed = context.run(
-        argv,
-        env={"PGPASSWORD": password} if password is not None else None,
-    )
+    completed = context.run(argv, env=environment)
     return completed.stdout.strip()
 
 
@@ -1334,6 +1506,7 @@ def _db_connect(
         user=BOOTSTRAP_ROLE,
         host=authority["socket_dir"],
         port=authority["port"],
+        options=f"-c search_path={POSTGRES_SEARCH_PATH}",
     )
     connection.autocommit = autocommit
     return connection
@@ -1966,7 +2139,9 @@ def _recovery_root(connection) -> dict:
     return root
 
 
-def _discovered_table_fingerprints(connection) -> dict[str, dict]:
+def _discovered_table_fingerprints(
+    connection, *, schemas: tuple[str, ...] = ("platform", "airflow"), excluded: tuple[str, ...] = ()
+) -> dict[str, dict]:
     table_rows = _connection_json(connection, FULL_TABLE_LIST_QUERY)
     require(
         isinstance(table_rows, list),
@@ -1986,6 +2161,8 @@ def _discovered_table_fingerprints(connection) -> dict[str, dict]:
             {"table": table_row},
         )
         name = f"{table_row['schema']}.{table_row['table']}"
+        if table_row["schema"] not in schemas or name in excluded:
+            continue
         tables[name] = _table_fingerprint(
             connection,
             table_row["schema"],
@@ -2677,274 +2854,6 @@ def inventory_tree(root: Path) -> list[dict]:
     return records
 
 
-DISCOVERY_ALIAS_FILES = {
-    "input/discovery/native-discovery.json": "evidence/discovery.json",
-    "input/discovery/findings.json": "discovery/findings.json",
-    "input/discovery/identity-resolution.json": "discovery/identity-resolution.json",
-}
-LEGACY_DISCOVERY_SIDECARS = frozenset(
-    {
-        "discovery/findings.json",
-        "discovery/identity-resolution.json",
-    }
-)
-NATIVE_STAGES_MEMBER = "reports/native-stages.json"
-
-
-def _legacy_discovery_sidecars(
-    tree: Path,
-    files: list[dict],
-    receipt: dict,
-    artifact_paths: set[str],
-    policy_digest: str,
-) -> set[str]:
-    actual_paths = {row["path"] for row in files if row["type"] == "file"}
-    candidates = {
-        path
-        for path in LEGACY_DISCOVERY_SIDECARS
-        if path in actual_paths and path not in artifact_paths
-    }
-    if not candidates:
-        return set()
-    from description_pipeline.interface_records import RECOVERY_HISTORICAL_POLICY_DIGESTS
-
-    require(
-        policy_digest in RECOVERY_HISTORICAL_POLICY_DIGESTS,
-        "recovery_member_hash_mismatch",
-        "legacy discovery sidecars require an exact historical policy",
-    )
-    require(
-        candidates == LEGACY_DISCOVERY_SIDECARS,
-        "recovery_member_hash_mismatch",
-        "legacy discovery sidecars must be present as an exact pair",
-    )
-    if receipt.get("stage") != "discover":
-        require(
-            False,
-            "recovery_member_hash_mismatch",
-            "legacy discovery sidecars appear outside a discover checkpoint",
-        )
-    if NATIVE_STAGES_MEMBER not in artifact_paths:
-        require(
-            False,
-            "recovery_member_hash_mismatch",
-            "legacy discovery sidecars have no receipt-bound native stage view",
-        )
-    native_stages_sha256 = sha256_file(tree / NATIVE_STAGES_MEMBER)
-    require(
-        receipt.get("native_stages_sha256") == native_stages_sha256,
-        "recovery_member_hash_mismatch",
-        "legacy discovery sidecars are not bound by the receipt native-stage digest",
-    )
-
-    from description_pipeline.io import PipelineError, canonical
-    from description_pipeline.platform.native_recovery import validate_native_discovery_stage
-    from description_pipeline.sources.solidworks.discovery import (
-        FINDING_SCHEMA,
-        validate_historical_discovery_document,
-        validate_historical_identity_resolution,
-    )
-
-    try:
-        native_stages_bytes, native_stages = strict_json_file(
-            tree / NATIVE_STAGES_MEMBER, "native stage view"
-        )
-        require(
-            isinstance(native_stages, dict),
-            "recovery_member_hash_mismatch",
-            "native stage view is not an object",
-        )
-        require(
-            native_stages_bytes == canonical(native_stages),
-            "recovery_member_hash_mismatch",
-            "native stage view is not canonical JSON",
-        )
-        producer_run_id = tree.parent.name
-        require(
-            isinstance(producer_run_id, str)
-            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,249}", producer_run_id) is not None,
-            "recovery_member_hash_mismatch",
-            "discover checkpoint tree has no safe producer run identity",
-        )
-        validate_native_discovery_stage(
-            native_stages,
-            run_id=producer_run_id,
-            handoff_sha256=native_stages.get("handoff_sha256"),
-        )
-    except (PipelineError, RecoveryError) as error:
-        raise RecoveryError(
-            "recovery_member_hash_mismatch",
-            "legacy discovery sidecars carry an invalid native stage view",
-        ) from error
-
-    references = {path: [] for path in DISCOVERY_ALIAS_FILES.values()}
-    try:
-        stages = native_stages["stages"]
-        discovery_qc_details = stages[1]["output_qc"][1]["details"]
-        allowed_positions = [
-            discovery_qc_details["files"],
-            stages[4]["inputs"][0]["files"],
-            stages[5]["inputs"][0]["files"],
-        ]
-    except (IndexError, KeyError, TypeError) as error:
-        raise RecoveryError(
-            "recovery_member_hash_mismatch",
-            "legacy discovery alias stage positions are missing",
-        ) from error
-    require(
-        all(isinstance(files, dict) for files in allowed_positions),
-        "recovery_member_hash_mismatch",
-        "legacy discovery alias stage position is not a file map",
-    )
-    require(
-        isinstance(discovery_qc_details, dict),
-        "recovery_member_hash_mismatch",
-        "legacy discover output details are not an object",
-    )
-    require(
-        all(set(DISCOVERY_ALIAS_FILES) <= set(files) for files in allowed_positions),
-        "recovery_member_hash_mismatch",
-        "legacy discover aliases are not declared at every exact stage position",
-    )
-    allowed_file_maps = {id(files) for files in allowed_positions}
-
-    def walk(value: object) -> None:
-        if isinstance(value, dict):
-            for key, item in value.items():
-                if isinstance(key, str) and key.startswith("input/discovery/"):
-                    require(
-                        id(value) in allowed_file_maps,
-                        "recovery_member_hash_mismatch",
-                        f"discovery alias appears outside a stage file map: {key}",
-                    )
-                    path = DISCOVERY_ALIAS_FILES.get(key)
-                    require(
-                        path is not None,
-                        "recovery_member_hash_mismatch",
-                        f"unknown discovery sidecar alias: {key}",
-                    )
-                    require(
-                        isinstance(item, str) and re.fullmatch(r"[0-9a-f]{64}", item) is not None,
-                        "recovery_member_hash_mismatch",
-                        f"discovery sidecar alias has no SHA-256: {key}",
-                    )
-                    references[path].append(item)
-                walk(item)
-        elif isinstance(value, list):
-            for item in value:
-                walk(item)
-
-    walk(native_stages)
-    for alias, path in DISCOVERY_ALIAS_FILES.items():
-        present = path in actual_paths
-        bound = references[path]
-        if not present and not bound:
-            continue
-        require(
-            present and bound,
-            "recovery_member_hash_mismatch",
-            f"discovery alias and its native-stage references differ: {alias}",
-        )
-        actual_sha256 = sha256_file(tree / path)
-        require(
-            all(value == actual_sha256 for value in bound),
-            "recovery_member_hash_mismatch",
-            f"discovery alias SHA-256 differs: {alias}",
-        )
-
-    handoff_sha256 = native_stages.get("handoff_sha256")
-    require(
-        isinstance(handoff_sha256, str) and re.fullmatch(r"[0-9a-f]{64}", handoff_sha256) is not None,
-        "recovery_member_hash_mismatch",
-        "native stage view has no handoff SHA-256",
-    )
-    if "discovery/identity-resolution.json" in candidates:
-        try:
-            identity_bytes, identity = strict_json_file(
-                tree / "discovery/identity-resolution.json",
-                "legacy identity resolution",
-            )
-        except RecoveryError as error:
-            raise RecoveryError(
-                "recovery_member_hash_mismatch",
-                "legacy identity resolution is unreadable",
-            ) from error
-        require(
-            identity_bytes == canonical(identity),
-            "recovery_member_hash_mismatch",
-            "legacy identity resolution is not canonical JSON",
-        )
-        require(
-            "evidence/discovery.json" in artifact_paths,
-            "recovery_member_hash_mismatch",
-            "legacy findings has no receipt-bound discovery evidence",
-        )
-        try:
-            discovery_bytes, discovery = strict_json_file(
-                tree / "evidence/discovery.json", "discovery evidence"
-            )
-        except RecoveryError as error:
-            raise RecoveryError(
-                "recovery_member_hash_mismatch",
-                "receipt-bound discovery evidence is unreadable",
-            ) from error
-        require(
-            discovery_bytes == canonical(discovery),
-            "recovery_member_hash_mismatch",
-            "receipt-bound discovery evidence is not canonical JSON",
-        )
-        require(
-            discovery_qc_details.get("discovery_sha256")
-            == hashlib.sha256(discovery_bytes).hexdigest(),
-            "recovery_member_hash_mismatch",
-            "legacy discover output carries another discovery digest",
-        )
-        native_inventory = {
-            row["path"].removeprefix("input/cad/"): row["sha256"]
-            for row in files
-            if row["type"] == "file" and row["path"].startswith("input/cad/")
-        }
-        require(
-            all(
-                discovery_qc_details["files"].get(f"input/{name}") == checksum
-                for name, checksum in native_inventory.items()
-            ),
-            "recovery_member_hash_mismatch",
-            "legacy discover output differs from the input/cad inventory",
-        )
-        try:
-            discovery = validate_historical_discovery_document(
-                discovery,
-                run_id=producer_run_id,
-                handoff_sha256=handoff_sha256,
-                native_inventory=native_inventory,
-            )
-        except PipelineError as error:
-            raise RecoveryError(
-                "recovery_member_hash_mismatch",
-                "receipt-bound discovery evidence is invalid",
-            ) from error
-        try:
-            validate_historical_identity_resolution(identity, discovery=discovery)
-        except PipelineError as error:
-            raise RecoveryError(
-                "recovery_member_hash_mismatch",
-                "legacy identity resolution is invalid",
-            ) from error
-        expected = canonical(
-            {
-                "schema_version": FINDING_SCHEMA,
-                "findings": discovery["findings"],
-            }
-        )
-        require(
-            (tree / "discovery/findings.json").read_bytes() == expected,
-            "recovery_member_hash_mismatch",
-            "legacy findings differ from the canonical discovery projection",
-        )
-    return candidates
-
-
 def verify_checkpoint_tree(
     tree: Path,
     files: list[dict],
@@ -2962,12 +2871,12 @@ def verify_checkpoint_tree(
         from description_pipeline.delivery import (
             STAMPED_EXTRA,
             SUBJECT_DIRECTORIES,
-            read_recovery_delivery_manifest,
+            read_delivery_manifest,
         )
         from description_pipeline.io import PipelineError
 
         try:
-            delivery = read_recovery_delivery_manifest(tree)
+            delivery = read_delivery_manifest(tree)
         except (PipelineError, OSError, ValueError) as error:
             raise RecoveryError("recovery_member_hash_mismatch", "checkpoint delivery manifest is invalid") from error
         artifacts = receipt.get("artifacts") or []
@@ -2997,13 +2906,6 @@ def verify_checkpoint_tree(
             )
         sidecars = {name for name in STAMPED_EXTRA if name != "reports" and (tree / name).is_file()}
         expected_files = artifact_paths | {"manifest.json"} | sidecars
-        expected_files |= _legacy_discovery_sidecars(
-            tree,
-            files,
-            receipt,
-            artifact_paths,
-            delivery["policy"]["digest"],
-        )
         require(
             {row["path"] for row in files if row["type"] == "file"} == expected_files,
             "recovery_member_hash_mismatch",
@@ -3665,257 +3567,6 @@ def copy_selected_root(source: Path, destination: Path, selected: list[str]) -> 
     os.chmod(destination, stat.S_IMODE(source.stat().st_mode))
 
 
-def journal_selection(
-    state_root: Path,
-    *,
-    extracted: Path | None = None,
-    expected: list[dict] | None = None,
-    additional_receipts: tuple[Path, ...] = (),
-) -> list[dict]:
-    """Follow typed current/previous journal edges; never enumerate promotions."""
-    entries = {}
-    parsed = set()
-    pending = []
-
-    def physical(path):
-        if extracted is None:
-            return path
-        member = (
-            "config/state/" + path.relative_to(state_root).as_posix()
-            if path.is_relative_to(state_root)
-            else "journal-files/" + hashlib.sha256(str(path).encode()).hexdigest() + "/" + path.name
-        )
-        return extracted / member
-
-    def document(path, label):
-        return strict_json_file(physical(path), label)[1]
-
-    def add(raw, owner, reference, kind, digest=None):
-        path = Path(absolute_text(raw, "journal source"))
-        if not path.is_relative_to(state_root):
-            require(
-                kind in {"release-manifest", "map-source"} and Path(owner).is_relative_to(state_root / "promotions"),
-                "recovery_journal_invalid",
-                "external file has no controlled journal authority",
-            )
-        local = physical(path)
-        require_no_links(local, "journal source")
-        require_real_file(local, "journal source", "recovery_journal_invalid")
-        require(not path.name.endswith(".enc"), "recovery_journal_invalid", "encrypted history is excluded")
-        actual = sha256_file(local)
-        require(digest is None or digest == actual, "recovery_journal_invalid", "journal digest differs")
-        # External evidence stays an explicit exact-file target, never a recursive root.
-        member = (
-            "config/state/" + path.relative_to(state_root).as_posix()
-            if path.is_relative_to(state_root)
-            else "journal-files/" + hashlib.sha256(str(path).encode()).hexdigest() + "/" + path.name
-        )
-        edge = {
-            "owner": str(owner),
-            "reference": reference,
-            "kind": kind,
-            "source_path": str(path),
-            "member": member,
-            "sha256": actual,
-            "bytes": local.stat().st_size,
-            "mode": stat.S_IMODE(local.stat().st_mode),
-        }
-        key = (str(owner), reference, str(path))
-        require(key not in entries or entries[key] == edge, "recovery_journal_invalid", "conflicting journal edge")
-        entries[key] = edge
-        if path not in parsed:
-            pending.append((path, kind))
-        return path
-
-    current_path = state_root / "install-record.json"
-    current = document(current_path, "active install record")
-    for receipt in additional_receipts:
-        add(str(receipt), current_path, "/finalize/receipt", "evidence")
-    records = [(current_path, current)]
-    previous = current.get("previous")
-    if previous is not None:
-        require(isinstance(previous, dict), "recovery_journal_invalid", "previous record is malformed")
-        previous_path = add(previous["record"], current_path, "/previous/record", "record")
-        require(
-            previous_path.parent == state_root / "install-records",
-            "recovery_journal_invalid",
-            "previous record is outside install-records",
-        )
-        previous_document = document(previous_path, "previous install record")
-        records.append((previous_path, previous_document))
-    for path, record in records:
-        try:
-            install_record._canonical_records().validate_install_record(record)
-        except (SystemExit, ValueError, TypeError, KeyError) as error:
-            raise RecoveryError("recovery_journal_invalid", "install record is malformed") from error
-        require(
-            record["paths"].get("state_root") == str(state_root),
-            "recovery_journal_invalid",
-            "install record belongs to another state root",
-        )
-        if path != current_path:
-            require(
-                path.name == record["install_id"] + ".json",
-                "recovery_journal_invalid",
-                "previous record filename differs from its identity",
-            )
-        require(
-            isinstance(record, dict) and isinstance(record.get("journal"), list),
-            "recovery_journal_invalid",
-            "install record has no journal",
-        )
-        snapshot = record.get("snapshot")
-        require(isinstance(snapshot, dict), "recovery_journal_invalid", "install record has no snapshot")
-        require(
-            Path(snapshot["path"]) == state_root / "snapshots" / (record["install_id"] + ".json"),
-            "recovery_journal_invalid",
-            "snapshot filename differs from install identity",
-        )
-        add(snapshot["path"], path, "/snapshot/path", "snapshot", snapshot["digest"])
-        require(
-            document(Path(snapshot["path"]), "journal snapshot").get("install_id") == record["install_id"],
-            "recovery_journal_invalid",
-            "snapshot content belongs to another install",
-        )
-        require(
-            snapshot.get("install_id") == record.get("install_id"),
-            "recovery_journal_invalid",
-            "snapshot install identity differs",
-        )
-        require_real_file(
-            physical(state_root / "derived" / record["install_id"] / "operator.env"),
-            "journal derived environment",
-            "recovery_journal_invalid",
-        )
-        prior = record.get("previous")
-        if prior is not None:
-            prior_record = document(Path(prior["record"]), "previous metadata record")
-            require(
-                prior["config"]
-                == {"path": prior_record["snapshot"]["path"], "digest": prior_record["snapshot"]["digest"]}
-                and Path(prior["record"]) == state_root / "install-records" / (prior_record["install_id"] + ".json")
-                and Path(prior["config"]["path"]) == state_root / "snapshots" / (prior_record["install_id"] + ".json"),
-                "recovery_journal_invalid",
-                "previous configuration differs from its record",
-            )
-            add(prior["config"]["path"], path, "/previous/config/path", "snapshot", prior["config"]["digest"])
-        for index, row in enumerate(record["journal"]):
-            require(
-                isinstance(row, dict) and isinstance(row.get("evidence"), list),
-                "recovery_journal_invalid",
-                "journal evidence is malformed",
-            )
-            receipts = [value for value in row["evidence"] if Path(value).name == "receipt.json"]
-            require(len(receipts) == 1, "recovery_journal_invalid", "journal row must bind one promotion receipt")
-            receipt_doc = document(Path(receipts[0]), "journal receipt")
-            require(
-                receipt_doc.get("schema_version") == "solidworks-to-urdf.promotion/v1"
-                and receipt_doc.get("install_id") == record["install_id"]
-                and receipt_doc.get("to") == snapshot["path"]
-                and receipt_doc.get("to_sha256") == snapshot["digest"],
-                "recovery_journal_invalid",
-                "journal receipt identity differs",
-            )
-            for offset, value in enumerate(row["evidence"]):
-                add(value, path, f"/journal/{index}/evidence/{offset}", "evidence")
-    while pending:
-        path, kind = pending.pop()
-        if path in parsed:
-            continue
-        parsed.add(path)
-        if path.name == "evidence-map.json":
-            groups = document(path, "journal evidence map")
-            require(isinstance(groups, list) and bool(groups), "recovery_journal_invalid", "empty evidence map")
-            sources, snapshots = set(), set()
-            for group_index, group in enumerate(groups):
-                require(isinstance(group, list) and bool(group), "recovery_journal_invalid", "empty evidence group")
-                for index, row in enumerate(group):
-                    require(
-                        isinstance(row, dict) and set(row) == {"source", "snapshot"},
-                        "recovery_journal_invalid",
-                        "invalid evidence map entry",
-                    )
-                    name = row["snapshot"]
-                    require(
-                        isinstance(name, str)
-                        and Path(name).name == name
-                        and name not in {".", "..", path.name}
-                        and name not in snapshots
-                        and row["source"] not in sources,
-                        "recovery_journal_invalid",
-                        "duplicate or unsafe evidence map entry",
-                    )
-                    sources.add(row["source"])
-                    snapshots.add(name)
-                    add(row["source"], path, f"/{group_index}/{index}/source", "map-source")
-                    add(str(path.parent / name), path, f"/{group_index}/{index}/snapshot", "map-snapshot")
-        elif path.name == "receipt.json":
-            receipt = document(path, "journal receipt")
-            if receipt.get("schema_version") != "solidworks-to-urdf.promotion/v1":
-                require(
-                    kind in {"map-source", "map-snapshot"},
-                    "recovery_journal_invalid",
-                    "journal receipt has an unsupported schema",
-                )
-                continue
-            import promotion
-
-            checked_receipt = copy.deepcopy(receipt)
-            if extracted is not None:
-                for step in checked_receipt.get("steps", []):
-                    step["evidence"] = [str(physical(Path(value))) for value in step.get("evidence", [])]
-                    for entry in step.get("evidence_digests", []):
-                        entry["path"] = str(physical(Path(entry["path"])))
-            require(
-                promotion.recorded_steps_valid(checked_receipt, physical(path)),
-                "recovery_journal_invalid",
-                "promotion receipt evidence is incomplete",
-            )
-            for field in ("from", "to"):
-                add(
-                    receipt[field],
-                    path,
-                    "/" + field,
-                    "record" if field == "from" else "snapshot",
-                    receipt[field + "_sha256"],
-                )
-            source_record = document(Path(receipt["from"]), "promotion source record")
-            try:
-                install_record._canonical_records().validate_install_record(source_record)
-            except (SystemExit, ValueError, TypeError, KeyError) as error:
-                raise RecoveryError("recovery_journal_invalid", "promotion source record is malformed") from error
-            require(
-                Path(receipt["from"]).parent == state_root / "install-records"
-                and Path(receipt["from"]).name == source_record["install_id"] + ".json",
-                "recovery_journal_invalid",
-                "promotion source record path differs",
-            )
-            target_snapshot = document(Path(receipt["to"]), "promotion target snapshot")
-            require(
-                Path(receipt["to"]) == state_root / "snapshots" / (receipt["install_id"] + ".json")
-                and target_snapshot.get("install_id") == receipt["install_id"],
-                "recovery_journal_invalid",
-                "promotion target snapshot identity differs",
-            )
-            release = receipt["release_manifest"]
-            add(release["path"], path, "/release_manifest/path", "release-manifest", release["sha256"])
-            for index, step in enumerate(receipt["steps"]):
-                require(
-                    step.get("seq") == index + 1
-                    and isinstance(step.get("evidence"), list)
-                    and isinstance(step.get("evidence_digests"), list)
-                    and step["evidence"] == [entry["path"] for entry in step["evidence_digests"]]
-                    and len(step["evidence"]) == len(set(step["evidence"])),
-                    "recovery_journal_invalid",
-                    "promotion evidence identities differ",
-                )
-                for offset, evidence in enumerate(step["evidence_digests"]):
-                    add(evidence["path"], path, f"/steps/{index}/evidence/{offset}", "evidence", evidence["sha256"])
-    result = sorted(entries.values(), key=lambda row: (row["source_path"], row["owner"], row["reference"]))
-    require(expected is None or result == expected, "recovery_journal_invalid", "journal graph differs from selection")
-    return result
-
-
 def source_inventory(roots: list[dict]) -> list[dict]:
     records = []
     for root in roots:
@@ -3960,7 +3611,6 @@ def source_member_map(
         "install_records": "config/state/install-records",
         "snapshots": "config/state/snapshots",
         "derived": "config/state/derived",
-        "promotions": "config/state/promotions",
         "install_record": "config/state/install-record.json",
         "resolved_env": "config/state/resolved.env",
         "portal": "config/state/portal.json",
@@ -3968,7 +3618,6 @@ def source_member_map(
         "nginx": "config/state/nginx/nginx.conf",
         "airflow_cfg": "config/state/airflow-home/airflow.cfg",
         "maintenance_lock": f"config/state/{MAINTENANCE_LOCK_DIRNAME}/{MAINTENANCE_LOCK_FILENAME}",
-        "store_root": "state/runs",
         "handoff_root": "handoff",
         "artifact_root": "artifacts",
         "release_json": "release/release.json",
@@ -4540,11 +4189,6 @@ def copy_state_configuration(state_root: Path, install_id: str, staging: Path, *
             state_root / source_relative,
             destination / target_relative,
         )
-    promotion_scope = next(row for row in selection["root_scopes"] if row["name"] == "promotions")
-    copy_selected_root(state_root / "promotions", destination / "promotions", promotion_scope["selection"])
-    for scope in selection["root_scopes"]:
-        if scope["name"].startswith("journal_file_"):
-            copy_required_file(Path(scope["path"]), staging / scope["archive"])
     derived = destination / "derived" / install_id / "operator.env"
     require_real_file(
         derived,
@@ -4647,13 +4291,6 @@ def root_contract(
             "required": True,
         },
         {
-            "name": "store_root",
-            "path": resolved["derived"]["store_root"],
-            "archive": "state/runs",
-            "class": "checkpoint",
-            "required": True,
-        },
-        {
             "name": "handoff_root",
             "path": storage["handoff_root"],
             "archive": "handoff",
@@ -4687,11 +4324,6 @@ def root_contract(
     return roots
 
 
-def capture_checkpoint_store(source: Path, staging: Path, *, selection: dict) -> None:
-    scope = next(row for row in selection["root_scopes"] if row["name"] == "store_root")
-    copy_selected_root(source, staging / "state" / "runs", scope["selection"])
-
-
 def capture_artifact_store(source: Path, staging: Path, *, selection: dict) -> None:
     scope = next(row for row in selection["root_scopes"] if row["name"] == "artifact_root")
     copy_selected_root(source, staging / "artifacts", scope["selection"])
@@ -4707,24 +4339,13 @@ def derived_dump_member(staging: Path, name: str) -> dict:
     }
 
 
-def backup_source_checks(context: BackupContext, *, recovery_root: dict, journal: list[dict]) -> list[dict]:
+def backup_source_checks(context: BackupContext, *, recovery_root: dict) -> list[dict]:
     state_root = Path(context.resolved["storage"]["state_root"])
     archive_root = context.archive_root
     checks = [
         {"name": "install_records", "path": str(state_root / "install-records")},
         {"name": "snapshots", "path": str(state_root / "snapshots")},
         {"name": "derived", "path": str(state_root / "derived")},
-        {
-            "name": "promotions",
-            "path": str(state_root / "promotions"),
-            "selection": sorted(
-                {
-                    str(Path(row["source_path"]).relative_to(state_root / "promotions"))
-                    for row in journal
-                    if Path(row["source_path"]).is_relative_to(state_root / "promotions")
-                }
-            ),
-        },
         {"name": "install_record", "path": str(state_root / "install-record.json")},
         {"name": "resolved_env", "path": str(state_root / "resolved.env")},
         {"name": "portal", "path": str(state_root / "portal.json")},
@@ -4737,11 +4358,6 @@ def backup_source_checks(context: BackupContext, *, recovery_root: dict, journal
         {
             "name": "maintenance_lock",
             "path": str(state_root / MAINTENANCE_LOCK_DIRNAME / MAINTENANCE_LOCK_FILENAME),
-        },
-        {
-            "name": "store_root",
-            "path": context.resolved["derived"]["store_root"],
-            "selection": [],
         },
         {
             "name": "handoff_root",
@@ -4777,26 +4393,6 @@ def backup_source_checks(context: BackupContext, *, recovery_root: dict, journal
         context.snapshot["resolved"]["windows"]["token_file"],
     )
     checks.extend({"name": f"secret_{index}", "path": path} for index, path in enumerate(secret_paths))
-    covered = (
-        state_root / "install-records",
-        state_root / "snapshots",
-        state_root / "derived",
-        state_root / "promotions",
-    )
-    existing = {row["path"] for row in checks}
-    extra = {
-        entry["source_path"]: entry
-        for entry in journal
-        if (
-            not Path(entry["source_path"]).is_relative_to(state_root)
-            or (
-                entry["source_path"] not in existing
-                and not any(Path(entry["source_path"]).is_relative_to(root) for root in covered)
-            )
-        )
-    }
-    for index, row in enumerate(extra.values()):
-        checks.append({"name": f"journal_file_{index}", "path": row["source_path"], "archive": row["member"]})
     checks.extend(preserved_workspace_roots(context, recovery_root, include_contract=False))
     return checks
 
@@ -4863,30 +4459,15 @@ def validate_selected_members(manifest: dict) -> None:
             "state scope is incomplete",
         )
     require(
-        {"store_root", "handoff_root", "artifact_root"} <= scopes.keys(),
+        {"handoff_root", "artifact_root"} <= scopes.keys(),
         "recovery_manifest_invalid",
         "required source scope is missing",
-    )
-    require(
-        scopes["promotions"]["path"] == str(state_root / "promotions"),
-        "recovery_manifest_invalid",
-        "promotions root identity differs",
-    )
-    allowed_promotion = {
-        row["member"] for row in selection["journal_entries"] if row["member"].startswith("config/state/promotions/")
-    }
-    require(
-        scopes["promotions"].get("selection")
-        == sorted(member.removeprefix("config/state/promotions/") for member in allowed_promotion),
-        "recovery_manifest_invalid",
-        "promotion scope differs from typed journal",
     )
     members = {row["member"]: row for row in manifest["members"]}
     base_names = {
         "install_records",
         "snapshots",
         "derived",
-        "promotions",
         "install_record",
         "resolved_env",
         "portal",
@@ -4894,7 +4475,6 @@ def validate_selected_members(manifest: dict) -> None:
         "nginx",
         "airflow_cfg",
         "maintenance_lock",
-        "store_root",
         "handoff_root",
         "artifact_root",
         "release_json",
@@ -4903,10 +4483,9 @@ def validate_selected_members(manifest: dict) -> None:
     base_names.update(f"release_artifact_{index}" for index, _ in enumerate(manifest["release"]["artifacts"]))
     base_names.update(f"secret_{index}" for index, _ in enumerate(manifest["secrets"]))
     base_names.update(name for name in roots if name.startswith("specification_root_"))
-    extras = {name for name in scopes if name.startswith("journal_file_")}
     preserved = sorted(name for name in scopes if name.startswith("preserved_workspace_"))
     base_names.update(preserved)
-    require(set(scopes) == base_names | extras, "recovery_manifest_invalid", "source scope set differs")
+    require(set(scopes) == base_names, "recovery_manifest_invalid", "source scope set differs")
     workspace_root = Path(manifest["reconstructibles"]["workspace_root"]["path"])
     retained = set(manifest["selection"]["fact_root"]["retained_locations"])
     command_paths = {
@@ -4921,16 +4500,6 @@ def validate_selected_members(manifest: dict) -> None:
             and (scope["path"] in retained or scope["path"] in command_paths),
             "recovery_manifest_invalid",
             "preserved workspace scope differs from the typed recovery root",
-        )
-    for name in extras:
-        scope = scopes[name]
-        require(
-            any(
-                scope["path"] == edge["source_path"] and scope.get("archive") == edge["member"]
-                for edge in selection["journal_entries"]
-            ),
-            "recovery_manifest_invalid",
-            "extra source scope has no typed journal edge",
         )
     platform_files = [row for row in manifest["files"] if row["name"] == "platform_config"]
     require(
@@ -4956,11 +4525,7 @@ def validate_selected_members(manifest: dict) -> None:
             "recovery_manifest_invalid",
             "secret source scope differs",
         )
-    expected_exact = {
-        (row["source_path"], row["member"], row["mode"])
-        for row in selection["journal_entries"]
-        if not Path(row["source_path"]).is_relative_to(state_root)
-    }
+    expected_exact = set()
     expected_exact.add((platform_files[0]["path"], "config/platform.json", 0o600))
     require(
         len(manifest["files"]) == len(expected_exact)
@@ -4968,29 +4533,6 @@ def validate_selected_members(manifest: dict) -> None:
         "recovery_manifest_invalid",
         "exact file target set differs from typed selection",
     )
-    for edge in selection["journal_entries"]:
-        row = members.get(edge["member"], {})
-        require(
-            row.get("type") == "file"
-            and row.get("bytes") == edge["bytes"]
-            and row.get("sha256") == edge["sha256"]
-            and row.get("mode") == edge["mode"],
-            "recovery_manifest_invalid",
-            "journal member differs from typed edge",
-        )
-        source = Path(edge["source_path"])
-        expected_member = (
-            "config/state/" + source.relative_to(state_root).as_posix()
-            if source.is_relative_to(state_root)
-            else "journal-files/" + hashlib.sha256(str(source).encode()).hexdigest() + "/" + source.name
-        )
-        require(edge["member"] == expected_member, "recovery_manifest_invalid", "journal path mapping differs")
-        if not source.is_relative_to(state_root):
-            require(
-                any(row["path"] == str(source) and row["member"] == expected_member for row in manifest["files"]),
-                "recovery_manifest_invalid",
-                "external journal target is missing",
-            )
     for artifact in manifest["references"]["artifacts"]:
         prefix = "artifacts/" + artifact["tree_relative"]
         for expected in artifact["files"]:
@@ -5005,28 +4547,6 @@ def validate_selected_members(manifest: dict) -> None:
                 "recovery_manifest_invalid",
                 "checkpoint artifact member differs",
             )
-    allowed_promotion_members = {"config/state/promotions", *allowed_promotion}
-    for member in allowed_promotion:
-        allowed_promotion_members.update(
-            parent.as_posix()
-            for parent in Path(member).parents
-            if parent.as_posix().startswith("config/state/promotions")
-        )
-    require(
-        {
-            member
-            for member in members
-            if member == "config/state/promotions" or member.startswith("config/state/promotions/")
-        }
-        == allowed_promotion_members,
-        "recovery_manifest_invalid",
-        "promotion member closure differs",
-    )
-    for member, row in members.items():
-        if row["type"] != "file":
-            continue
-        if member.startswith("config/state/promotions/"):
-            require(member in allowed_promotion, "recovery_manifest_invalid", "unselected promotion file")
 
 
 def verify_selection_archive(manifest: dict, extracted: Path) -> None:
@@ -5036,8 +4556,6 @@ def verify_selection_archive(manifest: dict, extracted: Path) -> None:
         "recovery_manifest_invalid",
         "archived selection differs",
     )
-    state_root = Path(next(row["path"] for row in manifest["roots"] if row["name"] == "state_root"))
-    journal_selection(state_root, extracted=extracted, expected=selection["journal_entries"])
     indexed = checkpoint_index(selection["fact_root"], extracted / "artifacts")
     require(
         indexed
@@ -5059,7 +4577,6 @@ def validate_selection(selection: object) -> dict:
             "fact_root",
             "fact_root_sha256",
             "root_scopes",
-            "journal_entries",
             "source_members",
         },
         "selection",
@@ -5083,11 +4600,7 @@ def validate_selection(selection: object) -> dict:
         "recovery_manifest_invalid",
         "selection fact root differs from its decision references",
     )
-    require(
-        isinstance(selected["root_scopes"], list) and isinstance(selected["journal_entries"], list),
-        "recovery_manifest_invalid",
-        "selection scopes are malformed",
-    )
+    require(isinstance(selected["root_scopes"], list), "recovery_manifest_invalid", "selection scopes are malformed")
     require(
         isinstance(selected["source_members"], dict) and bool(selected["source_members"]),
         "recovery_manifest_invalid",
@@ -5119,33 +4632,12 @@ def validate_selection(selection: object) -> dict:
             )
             for path in scope["selection"]:
                 confined_member(path, "selected path")
-    require({"promotions", "store_root"} <= names, "recovery_manifest_invalid", "missing filtered scopes")
-    store = next(scope for scope in selected["root_scopes"] if scope["name"] == "store_root")
-    require(
-        store.get("selection") == [],
-        "recovery_manifest_invalid",
-        "legacy sealed store must remain empty after the canonical cutover",
-    )
     artifacts = next(scope for scope in selected["root_scopes"] if scope["name"] == "artifact_root")
     require(
         artifacts.get("selection") == checkpoint_artifact_selection(recovery_root),
         "recovery_manifest_invalid",
         "artifact scope differs from the canonical fact root",
     )
-    for row in selected["journal_entries"]:
-        _exact_keys(
-            row, {"owner", "reference", "kind", "source_path", "member", "sha256", "bytes", "mode"}, "journal edge"
-        )
-        absolute_text(row["source_path"], "journal source")
-        confined_member(row["member"], "journal member")
-        require(
-            not row["source_path"].endswith(".enc")
-            and bool(HEX64.fullmatch(row["sha256"]))
-            and type(row["bytes"]) is int
-            and row["bytes"] >= 0,
-            "recovery_manifest_invalid",
-            "invalid journal edge value",
-        )
     return selected
 
 
@@ -5732,19 +5224,17 @@ def _linux_unit_states(*, timeout: int) -> list[dict]:
     return states
 
 
-def _windows_script_path() -> Path:
-    path = Path(__file__).resolve().parent.parent / "windows" / "instance-lifecycle.ps1"
-    require_real_file(path, "Windows instance lifecycle", "recovery_release_missing")
-    return path
+def _windows_quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
 
 
-def _windows_remote_dir(state_root: str, operation: str, identity: str) -> str:
-    suffix = re.sub(r"[^A-Za-z0-9._-]", "_", identity)[:48]
-    return f"{state_root.rstrip('/')}/recovery/{operation}-{suffix}-{os.urandom(8).hex()}"
+def _windows_normalize(value: str) -> str:
+    return value.replace("\\", "/").rstrip("/")
 
 
-def _powershell_quote(value: str) -> str:
-    return "'" + str(value).replace("'", "''") + "'"
+def _windows_lifecycle_paths(state_root: str) -> tuple[str, str]:
+    root = _windows_normalize(state_root)
+    return root + "/instance-lifecycle.ps1", root + "/windows-binding.json"
 
 
 def _run_windows_powershell(
@@ -5752,1776 +5242,291 @@ def _run_windows_powershell(
     ssh_host: str,
     script: str,
     timeout: int,
-    commands: list[dict],
-) -> subprocess.CompletedProcess:
+    commands: list[dict] | None = None,
+) -> tuple[dict, subprocess.CompletedProcess[bytes]]:
     try:
-        process = _transport_powershell(
+        completed = _transport_powershell(
             ssh_host=ssh_host,
             script=script,
             timeout=timeout,
         )
-    except (OSError, subprocess.SubprocessError) as error:
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
         raise RecoveryError(
             "windows_recovery_transport_unknown",
-            "the Windows recovery command could not be executed",
-            {"error": str(error)},
+            f"Windows transport failed: {error}",
         ) from error
     try:
-        stdout = _decode_windows_output(process.stdout, stream="stdout")
-        stderr = _decode_windows_output(process.stderr, stream="stderr")
+        stdout = _decode_windows_output(completed.stdout, stream="stdout")
+        _decode_windows_output(completed.stderr, stream="stderr")
     except TransportDecodeError as error:
         raise RecoveryError(
-            "windows_transport_decode_failed",
-            "Windows transport output could not be decoded",
-            {
-                "stream": error.stream,
-                "bytes": error.payload_bytes,
-                "sha256": error.payload_sha256,
-            },
+            "windows_recovery_transport_unknown",
+            "Windows transport output is not valid text",
+            {"stream": error.stream, "sha256": error.payload_sha256},
         ) from error
-    completed = subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
-    transport = getattr(process, "transport", None)
-    if isinstance(transport, dict):
-        completed.transport = dict(transport)
-    commands.append(_command_evidence(process.args, completed))
-    return completed
-
-
-def _require_windows_process(
-    *,
-    ssh_host: str,
-    script: str,
-    timeout: int,
-    commands: list[dict],
-    code: str,
-) -> subprocess.CompletedProcess:
-    completed = _run_windows_powershell(
-        ssh_host=ssh_host,
-        script=script,
-        timeout=timeout,
-        commands=commands,
-    )
-    require(
-        completed.returncode == 0,
-        code,
-        "the Windows recovery helper did not prove success",
-        {
-            "returncode": completed.returncode,
-            "stdout_sha256": hashlib.sha256(completed.stdout.encode("utf-8")).hexdigest(),
-            "stderr_sha256": hashlib.sha256(completed.stderr.encode("utf-8")).hexdigest(),
-        },
-    )
-    return completed
-
-
-def _run_windows_recovery_json(
-    *,
-    ssh_host: str,
-    script: str,
-    timeout: int,
-    commands: list[dict],
-    expected_verb: str,
-) -> dict:
-    completed = _run_windows_powershell(
-        ssh_host=ssh_host,
-        script=script,
-        timeout=timeout,
-        commands=commands,
-    )
-    lines = [line for line in completed.stdout.strip().splitlines() if line.strip()]
-    try:
-        document = json.loads(lines[-1], object_pairs_hook=_pairs_no_duplicates)
-    except (IndexError, ValueError) as error:
+    document = None
+    for line in reversed(stdout.splitlines()):
+        try:
+            document = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(document, dict):
+            break
+    if not isinstance(document, dict):
         raise RecoveryError(
             "windows_recovery_transport_unknown",
-            "the Windows recovery result is not one JSON document",
-            {
-                "returncode": completed.returncode,
-                "stdout_sha256": hashlib.sha256(completed.stdout.encode("utf-8")).hexdigest(),
-            },
-        ) from error
-    if completed.returncode == 0 and document.get("passed") is True and document.get("verb") == expected_verb:
-        return document
-    code = document.get("code")
-    if (
-        completed.returncode == 1
-        and document.get("passed") is False
-        and document.get("verb") == expected_verb
-        and isinstance(code, str)
-        and code
-    ):
-        raw_detail = document.get("detail")
-        if raw_detail is None:
-            detail = {}
-        elif isinstance(raw_detail, dict):
-            detail = dict(raw_detail)
-        else:
-            detail = {"malformed_original_detail": raw_detail}
-        if "cleanup" in document:
-            detail["windows_inner_cleanup"] = document["cleanup"]
-        raise RecoveryError(
-            code,
-            str(document.get("message") or "Windows recovery refused the operation"),
-            detail,
+            "Windows lifecycle returned no result object",
+            {"returncode": completed.returncode},
         )
-    raise RecoveryError(
+    if commands is not None:
+        commands.append(
+            {
+                "program": "windows-lifecycle",
+                "returncode": completed.returncode,
+                "stdout_sha256": hashlib.sha256(completed.stdout).hexdigest(),
+                "stderr_sha256": hashlib.sha256(completed.stderr).hexdigest(),
+            }
+        )
+    return document, completed
+
+
+def _windows_public_verb(
+    *,
+    ssh_host: str,
+    state_root: str,
+    verb: str,
+    timeout: int,
+    commands: list[dict] | None = None,
+) -> dict:
+    script_path, binding_path = _windows_lifecycle_paths(state_root)
+    script = (
+        f"& {_windows_quote(script_path)} "
+        f"-Verb {verb} -Binding {_windows_quote(binding_path)}"
+    )
+    document, completed = _run_windows_powershell(
+        ssh_host=ssh_host,
+        script=script,
+        timeout=timeout,
+        commands=commands,
+    )
+    if (
+        completed.returncode in (0, 1)
+        and document.get("passed") is False
+        and isinstance(document.get("code"), str)
+    ):
+        raise RecoveryError(
+            "windows_lifecycle_refused",
+            f"Windows {verb} was refused",
+            {
+                "verb": verb,
+                "code": document["code"],
+                "message": document.get("message"),
+            },
+        )
+    require(
+        completed.returncode == 0
+        and document.get("passed") is True
+        and document.get("verb") == verb,
         "windows_recovery_transport_unknown",
-        "the Windows recovery result and exit status disagree",
-        {
-            "returncode": completed.returncode,
-            "passed": document.get("passed"),
-            "code": code,
-            "verb": document.get("verb"),
-            "expected_verb": expected_verb,
-            "detail": document.get("detail"),
-            "cleanup": document.get("cleanup"),
-        },
+        f"Windows {verb} outcome is unknown",
+        {"returncode": completed.returncode, "result": document},
     )
-
-
-def _private_transfer_directory(path: Path, code: str) -> None:
-    require_no_links(path, "Windows transfer evidence")
-    existed = path.exists()
-    path.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if not existed:
-        os.chmod(path, 0o700, follow_symlinks=False)
-    require(stat.S_IMODE(path.stat().st_mode) == 0o700, code, "transfer evidence must be private")
-
-
-def _write_transfer_evidence(path: Path, payload: bytes) -> dict:
-    _private_transfer_directory(path.parent, "windows_recovery_transport_unknown")
-    descriptor, temporary = tempfile.mkstemp(prefix=".transfer-", dir=path.parent)
-    temporary_path = Path(temporary)
-    try:
-        with os.fdopen(descriptor, "wb") as output:
-            os.fchmod(output.fileno(), 0o600)
-            output.write(payload)
-            output.flush()
-            os.fsync(output.fileno())
-        digest = hashlib.sha256(payload).hexdigest()
-        require(sha256_file(temporary_path) == digest, "windows_recovery_transport_unknown", "evidence bytes differ")
-        os.link(temporary_path, path, follow_symlinks=False)
-        return {"path": str(path), "bytes": len(payload), "sha256": digest}
-    finally:
-        temporary_path.unlink(missing_ok=True)
-
-
-def _capture_transfer_process(argv: list[str], *, timeout: int, sensitive_values: tuple[bytes, ...]):
-    """Drain both byte pipes with bounded memory and streaming redaction."""
-    secrets_to_hide = tuple(sorted({value for value in sensitive_values if value}, key=len, reverse=True))
-    longest = max((len(value) for value in secrets_to_hide), default=1)
-    states = {
-        name: {
-            "hash": hashlib.sha256(),
-            "bytes": 0,
-            "pending": bytearray(),
-            "retained": bytearray(),
-            "safe_bytes": 0,
-            "redacted": False,
-        }
-        for name in ("stdout", "stderr")
-    }
-
-    def consume(name, chunk, *, final=False):
-        state = states[name]
-        state["hash"].update(chunk)
-        state["bytes"] += len(chunk)
-        state["pending"].extend(chunk)
-        pending = state["pending"]
-        limit = len(pending) if final else max(0, len(pending) - longest + 1)
-        position = 0
-        while position < limit:
-            secret = next((value for value in secrets_to_hide if pending.startswith(value, position)), None)
-            if (
-                secret is None
-                and final
-                and any(value.startswith(bytes(pending[position:])) for value in secrets_to_hide)
-            ):
-                secret = bytes(pending[position:])
-            if secret is not None:
-                output = b"<redacted>"
-                position += len(secret)
-                state["redacted"] = True
-            elif not secrets_to_hide:
-                output = bytes(pending[position:limit])
-                position = limit
-            else:
-                output = bytes(pending[position : position + 1])
-                position += 1
-            state["safe_bytes"] += len(output)
-            available = 65536 - len(state["retained"])
-            if available > 0:
-                state["retained"].extend(output[:available])
-        del pending[:position]
-
-    process = subprocess.Popen(
-        argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True
-    )
-    selector = selectors.DefaultSelector()
-    interrupted = False
-    drained = True
-    capture_error = None
-    deadline = time.monotonic() + timeout
-    try:
-        for name in states:
-            selector.register(getattr(process, name), selectors.EVENT_READ, name)
-        while selector.get_map():
-            if time.monotonic() >= deadline:
-                if interrupted:
-                    drained = False
-                    break
-                interrupted = True
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(process.pid, signal.SIGKILL)
-                deadline = time.monotonic() + 5
-            for key, _ in selector.select(min(0.1, max(0, deadline - time.monotonic()))):
-                chunk = os.read(key.fileobj.fileno(), 65536)
-                if chunk:
-                    consume(key.data, chunk)
-                else:
-                    consume(key.data, b"", final=True)
-                    selector.unregister(key.fileobj)
-                    key.fileobj.close()
-        for name in states:
-            consume(name, b"", final=True)
-        try:
-            returncode = process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            interrupted = True
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGKILL)
-            returncode = process.wait()
-    except OSError as error:
-        interrupted = True
-        drained = False
-        capture_error = type(error).__name__
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGKILL)
-        returncode = process.wait()
-        for name in states:
-            consume(name, b"", final=True)
-    finally:
-        selector.close()
-        if process.poll() is None:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGKILL)
-            process.wait()
-        for name in states:
-            getattr(process, name).close()
-    result = subprocess.CompletedProcess(
-        argv, returncode, bytes(states["stdout"]["retained"]), bytes(states["stderr"]["retained"])
-    )
-    result.interrupted = interrupted or not drained
-    result.capture_error = capture_error
-    result.stream_observations = {
-        name: {
-            "bytes": state["bytes"],
-            "sha256": state["hash"].hexdigest(),
-            "complete": drained,
-            "truncated": state["safe_bytes"] > 65536,
-            "redacted": state["redacted"],
-            "preview": bytes(state["retained"][:2048]).decode("utf-8", errors="replace"),
-        }
-        for name, state in states.items()
-    }
-    return result
+    return document
 
 
 def _windows_scp(
     *,
     ssh_host: str,
-    sources: list[Path],
-    remote_dir: str,
-    upload: bool,
-    remote_name: str | None = None,
+    source: Path | str,
+    destination: Path | str,
     timeout: int,
-    commands: list[dict],
-    code: str,
-    evidence_dir: Path | None = None,
-    sensitive_values: tuple[bytes, ...] = (),
-    preserved_objects: tuple[dict, ...] = (),
-    expected_download: dict | None = None,
-) -> Path | None:
-    require(
-        isinstance(ssh_host, str)
-        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", ssh_host) is not None
-        and re.match(r"^[A-Za-z]:/", remote_dir) is not None
-        and not any(character in remote_dir for character in ("\x00", "\r", "\n", '"', "\\"))
-        and ":" not in remote_dir[2:]
-        and all(part not in {".", ".."} for part in remote_dir.split("/")),
-        code,
-        "the Windows recovery transfer address is invalid",
-    )
-    phase = "upload" if upload else "download"
-    remote = f"{ssh_host}:{remote_dir.rstrip('/')}/"
-    if upload:
-        argv = [
-            "scp",
-            "-q",
-            "-p",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=yes",
-            *[str(path) for path in sources],
-            remote,
-        ]
-        destination = None
-    else:
-        require(
-            len(sources) == 1
-            and isinstance(remote_name, str)
-            and bool(remote_name)
-            and remote_name not in {".", ".."}
-            and not any(character in remote_name for character in ("/", "\\", "\x00", "\r", "\n", '"', ":")),
-            code,
-            "one named Windows recovery artifact must be selected",
-        )
-        remote_file = f"{ssh_host}:{remote_dir.rstrip('/')}/{remote_name}"
-        destination = Path(sources[0])
-        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        argv = [
-            "scp",
-            "-q",
-            "-p",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=yes",
-            remote_file,
-            str(destination),
-        ]
-    objects = [
-        {"name": path.name, "path": str(path), "bytes": path.stat().st_size, "sha256": sha256_file(path)}
-        for path in sources
-        if upload or path.is_file()
+    recursive: bool = False,
+    commands: list[dict] | None = None,
+) -> None:
+    argv = [
+        "scp",
+        "-q",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
     ]
-
-    def sanitized(raw):
-        result = raw
-        for secret in sensitive_values:
-            if secret:
-                result = result.replace(secret, b"<redacted>")
-        return result
-
-    normalized_argv = [sanitized(str(value).encode("utf-8")).decode("utf-8", errors="replace") for value in argv]
-    for index, value in enumerate(normalized_argv):
-        if value in {str(path) for path in sources}:
-            normalized_argv[index] = f"<{phase}>/{Path(value).name}"
-
-    def preserve(completed, *, interrupted=False, error_type=None):
-        detail = {
-            "phase": phase,
-            "argv": normalized_argv,
-            "returncode": completed.returncode,
-            "interrupted": interrupted,
-            "objects": objects,
-            "preserved_objects": list(preserved_objects),
-            "remote_dir": remote_dir,
-            "remote_name": remote_name,
-        }
-        if error_type is not None:
-            detail["error_type"] = error_type
-        if not upload:
-            present = destination.is_file() and not destination.is_symlink()
-            detail["download"] = {
-                "expected": expected_download,
-                "present": present,
-                "observed": None
-                if not present
-                else {
-                    "path": str(destination),
-                    "bytes": destination.stat().st_size,
-                    "sha256": sha256_file(destination),
-                },
-            }
-            observed = detail["download"]["observed"]
-            matches = bool(
-                present
-                and expected_download
-                and observed["bytes"] == expected_download["bytes"]
-                and observed["sha256"] == expected_download["sha256"]
-            )
-            detail["download"].update(
-                {"matches_expected": matches, "complete": matches, "partial": present and not matches}
-            )
-        for stream in ("stdout", "stderr"):
-            raw = getattr(completed, stream) or b""
-            if isinstance(raw, str):
-                raw = raw.encode("utf-8")
-            observations = getattr(completed, "stream_observations", {})
-            safe = raw if stream in observations else sanitized(raw)
-            row = (
-                dict(observations[stream])
-                if stream in observations
-                else {
-                    "bytes": len(raw),
-                    "sha256": hashlib.sha256(raw).hexdigest(),
-                    "truncated": len(safe) > 65536,
-                    "redacted": safe != raw,
-                    "preview": safe[:2048].decode("utf-8", errors="replace"),
-                }
-            )
-            if evidence_dir is not None:
-                try:
-                    path = evidence_dir / f"{phase}.{stream}"
-                    retained = _write_transfer_evidence(path, safe[:65536])
-                    row.update(
-                        {
-                            "path": str(path),
-                            "retained_bytes": min(len(safe), 65536),
-                            "retained_sha256": retained["sha256"],
-                        }
-                    )
-                except (OSError, RecoveryError) as error:
-                    detail.setdefault("evidence_write_errors", []).append(
-                        {"stream": stream, "error_type": type(error).__name__}
-                    )
-            detail[stream] = row
-        detail["stderr_sha256"] = detail["stderr"]["sha256"]
-        if evidence_dir is not None:
-            try:
-                record = evidence_dir / f"{phase}.json"
-                detail["evidence_record"] = _write_transfer_evidence(record, canonical_json(detail))
-            except (OSError, RecoveryError) as error:
-                detail.setdefault("evidence_write_errors", []).append(
-                    {"stream": "metadata", "error_type": type(error).__name__}
-                )
-        return detail
-
+    if recursive:
+        argv.append("-r")
+    argv.extend([str(source), str(destination)])
     try:
-        completed = _capture_transfer_process(argv, timeout=timeout, sensitive_values=sensitive_values)
-    except (OSError, subprocess.SubprocessError) as error:
-        interrupted = subprocess.CompletedProcess(
-            argv, None, getattr(error, "stdout", None), getattr(error, "stderr", None)
+        completed = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
         )
-        detail = preserve(interrupted, interrupted=True, error_type=type(error).__name__)
-        raise RecoveryError(code, "the Windows recovery transfer could not run", detail) from error
-    commands.append(_command_evidence(normalized_argv, completed))
-    detail = preserve(
-        completed,
-        interrupted=getattr(completed, "interrupted", False),
-        error_type=(getattr(completed, "capture_error", None) or "TimeoutExpired")
-        if getattr(completed, "interrupted", False)
-        else None,
-    )
-    commands[-1]["transfer"] = detail
-    for stream in ("stdout", "stderr"):
-        commands[-1][stream + "_sha256"] = detail[stream]["sha256"]
-    if getattr(completed, "interrupted", False):
-        detail["interrupted"] = True
-        raise RecoveryError(code, "the Windows recovery transfer capture was interrupted", detail)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RecoveryError(
+            "windows_recovery_transport_unknown",
+            f"Windows file transfer failed: {error}",
+        ) from error
+    if commands is not None:
+        commands.append({"program": "scp", "returncode": completed.returncode})
     require(
         completed.returncode == 0,
-        code,
-        "the Windows recovery transfer did not prove success",
-        detail,
-    )
-    require(
-        not detail.get("evidence_write_errors"),
-        code,
-        "the Windows recovery transfer evidence could not be preserved",
-        detail,
-    )
-    if not upload:
-        require(detail["download"]["present"], code, "downloaded Windows recovery object is missing", detail)
-        if expected_download is not None:
-            require(detail["download"]["matches_expected"], code, "downloaded Windows recovery object differs", detail)
-    return destination
-
-
-WINDOWS_REMOTE_OWNERSHIP_MEMBER = ".recovery-owner"
-
-
-def _create_remote_dir(
-    *,
-    ssh_host: str,
-    remote_dir: str,
-    ownership_token: str,
-    timeout: int,
-    commands: list[dict],
-) -> None:
-    require(
-        bool(HEX64.fullmatch(ownership_token)),
         "windows_recovery_transport_unknown",
-        "the Windows recovery ownership token is malformed",
-    )
-    quoted = _powershell_quote(remote_dir.replace("/", "\\"))
-    quoted_token = _powershell_quote(ownership_token)
-    _require_windows_process(
-        ssh_host=ssh_host,
-        script=(
-            "$ErrorActionPreference='Stop';"
-            f"$dir={quoted};"
-            f"$token={quoted_token};"
-            "$full=[System.IO.Path]::GetFullPath($dir);"
-            "if (Test-Path -LiteralPath $full) { throw 'the recovery directory already exists' };"
-            "$current=$full;"
-            "while ($current) {"
-            "  if (Test-Path -LiteralPath $current) {"
-            "    $item=Get-Item -LiteralPath $current -Force -ErrorAction Stop;"
-            "    if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {"
-            "      throw ('the recovery directory crosses a reparse point: ' + $current)"
-            "    }"
-            "  };"
-            "  $parent=[System.IO.Path]::GetDirectoryName($current);"
-            "  if (-not $parent -or $parent -eq $current) { break };"
-            "  $current=$parent"
-            "};"
-            "$created=$false;"
-            "try {"
-            "  New-Item -ItemType Directory -Path $full -ErrorAction Stop | Out-Null;"
-            "  $created=$true;"
-            f"  $marker=Join-Path $full {_powershell_quote(WINDOWS_REMOTE_OWNERSHIP_MEMBER)};"
-            "  [System.IO.File]::WriteAllText($marker,$token,(New-Object System.Text.UTF8Encoding($false)));"
-            "$sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User;"
-            "$security=New-Object System.Security.AccessControl.DirectorySecurity;"
-            "$security.SetAccessRuleProtection($true,$false);"
-            "$rule=New-Object System.Security.AccessControl.FileSystemAccessRule("
-            "$sid,[System.Security.AccessControl.FileSystemRights]::FullControl,"
-            "([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor "
-            "[System.Security.AccessControl.InheritanceFlags]::ObjectInherit),"
-            "[System.Security.AccessControl.PropagationFlags]::None,"
-            "[System.Security.AccessControl.AccessControlType]::Allow);"
-            "$security.AddAccessRule($rule);"
-            "  Set-Acl -LiteralPath $full -AclObject $security -ErrorAction Stop;"
-            "  $acl=Get-Acl -LiteralPath $full -ErrorAction Stop;"
-            "  if (-not $acl.AreAccessRulesProtected) { throw 'recovery directory ACL is not protected' };"
-            "  $leaf=Get-Item -LiteralPath $full -Force -ErrorAction Stop;"
-            "  if ($leaf.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {"
-            "    throw 'the recovery directory became a reparse point'"
-            "  }"
-            "} catch {"
-            "  if ($created -and (Test-Path -LiteralPath $full)) {"
-            f"    $marker=Join-Path $full {_powershell_quote(WINDOWS_REMOTE_OWNERSHIP_MEMBER)};"
-            "    if (Test-Path -LiteralPath $marker -PathType Leaf) {"
-            "      $observed=[System.IO.File]::ReadAllText("
-            "        $marker,(New-Object System.Text.UTF8Encoding($false)));"
-            "      if ($observed -ceq $token) {"
-            "        Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction SilentlyContinue"
-            "      }"
-            "    }"
-            "  };"
-            "  throw"
-            "}"
-        ),
-        timeout=timeout,
-        commands=commands,
-        code="windows_recovery_transport_unknown",
+        "Windows file transfer failed",
+        {"stderr": completed.stderr.strip()[-2000:]},
     )
 
 
-def _remove_remote_dir(
-    *,
-    ssh_host: str,
-    remote_dir: str,
-    ownership_token: str,
-    timeout: int,
-    commands: list[dict],
-) -> None:
-    require(
-        bool(HEX64.fullmatch(ownership_token)),
-        "windows_recovery_transport_unknown",
-        "the Windows recovery ownership token is malformed",
-    )
-    quoted = _powershell_quote(remote_dir.replace("/", "\\"))
-    quoted_token = _powershell_quote(ownership_token)
-    _require_windows_process(
-        ssh_host=ssh_host,
-        script=(
-            "$ErrorActionPreference='Stop';"
-            f"$dir={quoted};"
-            f"$token={quoted_token};"
-            "$full=[System.IO.Path]::GetFullPath($dir);"
-            "$current=$full;"
-            "while ($current) {"
-            "  if (Test-Path -LiteralPath $current) {"
-            "    $item=Get-Item -LiteralPath $current -Force -ErrorAction Stop;"
-            "    if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {"
-            "      throw ('the recovery directory crosses a reparse point: ' + $current)"
-            "    }"
-            "  };"
-            "  $parent=[System.IO.Path]::GetDirectoryName($current);"
-            "  if (-not $parent -or $parent -eq $current) { break };"
-            "  $current=$parent"
-            "};"
-            "if (-not (Test-Path -LiteralPath $full)) { exit 0 };"
-            "$leaf=Get-Item -LiteralPath $full -Force -ErrorAction Stop;"
-            "if (-not $leaf.PSIsContainer -or "
-            "($leaf.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {"
-            "  throw 'the recovery directory is not a regular directory'"
-            "};"
-            f"$marker=Join-Path $full {_powershell_quote(WINDOWS_REMOTE_OWNERSHIP_MEMBER)};"
-            "if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) {"
-            "  throw 'the recovery directory ownership marker is missing'"
-            "};"
-            "$owned=[System.IO.File]::ReadAllText("
-            "  $marker,(New-Object System.Text.UTF8Encoding($false)));"
-            "if ($owned -cne $token) {"
-            "  throw 'the recovery directory ownership marker differs'"
-            "};"
-            "Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction Stop"
-        ),
-        timeout=timeout,
-        commands=commands,
-        code="windows_recovery_transport_unknown",
-    )
-
-
-def _attempt_remote_dir_cleanup(
-    *,
-    ssh_host: str,
-    remote_dir: str,
-    ownership_token: str,
-    timeout: int,
-    commands: list[dict],
-) -> dict:
-    try:
-        _remove_remote_dir(
-            ssh_host=ssh_host,
-            remote_dir=remote_dir,
-            ownership_token=ownership_token,
-            timeout=timeout,
-            commands=commands,
-        )
-    except RecoveryError as error:
-        return {
-            "attempted": True,
-            "passed": False,
-            "remote_dir": remote_dir,
-            "ownership_marker": f"{remote_dir.rstrip('/')}/{WINDOWS_REMOTE_OWNERSHIP_MEMBER}",
-            "code": error.code,
-            "message": error.message,
-            "detail": error.detail,
-        }
-    return {
-        "attempted": True,
-        "passed": True,
-        "remote_dir": remote_dir,
+def _read_windows_binding(path: Path) -> dict:
+    _, document = strict_json_file(path, "Windows binding")
+    fields = {
+        "endpoint_config",
+        "release_file",
+        "task_name",
+        "task_path",
+        "service_account",
+        "python_executable",
     }
-
-
-def _read_windows_state(bundle: Path) -> dict:
-    require_real_file(bundle, "Windows recovery bundle", "windows_recovery_bundle_invalid")
-    try:
-        with zipfile.ZipFile(bundle) as archive:
-            names = archive.namelist()
-            require(
-                WINDOWS_STATE_MEMBER in names,
-                "windows_recovery_bundle_invalid",
-                "the Windows recovery bundle carries no state document",
-            )
-            payload = archive.read(WINDOWS_STATE_MEMBER)
-    except (OSError, zipfile.BadZipFile, KeyError) as error:
-        raise RecoveryError(
-            "windows_recovery_bundle_invalid",
-            "the Windows recovery bundle is unreadable",
-            {"error": str(error)},
-        ) from error
-    try:
-        document = json.loads(payload, object_pairs_hook=_pairs_no_duplicates)
-    except ValueError as error:
-        raise RecoveryError(
-            "windows_recovery_bundle_invalid",
-            "the Windows recovery state is not JSON",
-        ) from error
-    return _validate_windows_recovery_state(document)
-
-
-def verify_windows_recovery_bundle_members(bundle: Path, state: dict) -> None:
-    expected_members = {row["member"]: row for row in state["members"]}
-    roles_by_member = {row["member"]: row["role"] for row in state["files"]}
-    member_names = [row["member"] for row in state["members"]]
-    file_members = [row["member"] for row in state["files"]]
     require(
-        len(member_names) == len(set(member_names))
-        and len(file_members) == len(set(file_members))
-        and len(file_members) == len(member_names)
-        and set(expected_members) == {row["member"] for row in state["files"]},
-        "windows_recovery_bundle_invalid",
-        "Windows recovery members and file roles differ",
-    )
-    for row in state["files"]:
-        member = expected_members.get(row["member"])
-        require(
-            member is not None and row["bytes"] == member["bytes"] and row["sha256"] == member["sha256"],
-            "windows_recovery_bundle_invalid",
-            "Windows recovery file bytes and digest differ from members",
-            {"member": row["member"]},
-        )
-    try:
-        with zipfile.ZipFile(bundle) as archive:
-            names = archive.namelist()
-            require(
-                len(names) == len(set(names)) and set(names) == set(expected_members) | {WINDOWS_STATE_MEMBER},
-                "windows_recovery_bundle_invalid",
-                "Windows recovery bundle has missing, extra or duplicate members",
-            )
-            for name in names:
-                info = archive.getinfo(name)
-                require(
-                    not info.is_dir()
-                    and not name.startswith("/")
-                    and "\\" not in name
-                    and "/" not in name
-                    and name not in {".", ".."},
-                    "windows_recovery_bundle_invalid",
-                    "Windows recovery bundle carries an unsafe member",
-                    {"member": name},
-                )
-            for name, row in expected_members.items():
-                payload = archive.read(name)
-                require(
-                    len(payload) == row["bytes"] and hashlib.sha256(payload).hexdigest() == row["sha256"],
-                    "windows_recovery_bundle_invalid",
-                    "Windows recovery member differs from its state",
-                    {"member": name},
-                )
-                if roles_by_member[name] == "install_id":
-                    try:
-                        install_id = payload.decode("ascii").rstrip("\r\n")
-                    except UnicodeDecodeError as error:
-                        raise RecoveryError(
-                            "windows_recovery_bundle_invalid",
-                            "the Windows install identity is not ASCII",
-                        ) from error
-                    require(
-                        install_id == state["identity"]["install_id"],
-                        "windows_recovery_state_invalid",
-                        "the Windows install identity file and state differ",
-                    )
-    except (OSError, zipfile.BadZipFile, KeyError) as error:
-        raise RecoveryError(
-            "windows_recovery_bundle_invalid",
-            "the Windows recovery bundle is unreadable",
-            {"error": str(error)},
-        ) from error
-
-
-def _windows_acl_projection_sha256(projection: dict) -> str:
-    document = {
-        "owner_sid": projection["owner_sid"],
-        "group_sid": projection["group_sid"],
-        "protected": projection["protected"],
-        "sddl": projection["sddl"],
-        "rules": [
-            {
-                "sid": rule["sid"],
-                "access_type": rule["access_type"],
-                "rights": rule["rights"],
-                "inherited": rule["inherited"],
-                "inheritance": rule["inheritance"],
-                "propagation": rule["propagation"],
-            }
-            for rule in projection["rules"]
-        ],
-    }
-    payload = json.dumps(
-        document,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
-
-
-def _validate_windows_acl_projection(value: object, label: str) -> None:
-    projection = _exact_keys(
-        value,
-        {"owner_sid", "group_sid", "protected", "sddl", "rules", "projection_sha256"},
-        label,
-    )
-    require(
-        isinstance(projection["owner_sid"], str)
-        and projection["owner_sid"].startswith("S-1-")
-        and isinstance(projection["group_sid"], str)
-        and projection["group_sid"].startswith("S-1-")
-        and type(projection["protected"]) is bool
-        and isinstance(projection["sddl"], str)
-        and bool(projection["sddl"])
-        and isinstance(projection["rules"], list)
-        and isinstance(projection["projection_sha256"], str)
-        and bool(HEX64.fullmatch(projection["projection_sha256"])),
+        isinstance(document, dict) and set(document) == fields,
         "windows_recovery_state_invalid",
-        f"{label} is malformed",
+        "Windows binding fields differ from the six-field contract",
     )
-    for index, rule in enumerate(projection["rules"]):
-        exact = _exact_keys(
-            rule,
-            {"sid", "access_type", "rights", "inherited", "inheritance", "propagation"},
-            f"{label}.rules[{index}]",
-        )
-        require(
-            isinstance(exact["sid"], str)
-            and exact["sid"].startswith("S-1-")
-            and exact["access_type"] in {"Allow", "Deny"}
-            and type(exact["rights"]) is int
-            and type(exact["inherited"]) is bool
-            and type(exact["inheritance"]) is int
-            and type(exact["propagation"]) is int,
-            "windows_recovery_state_invalid",
-            f"{label}.rules[{index}] is malformed",
-        )
-    rule_order = [
-        (
-            rule["sid"].casefold(),
-            rule["rights"],
-            rule["access_type"],
-            rule["inheritance"],
-            rule["propagation"],
-            rule["inherited"],
-        )
-        for rule in projection["rules"]
+    require(
+        all(isinstance(value, str) and value for value in document.values()),
+        "windows_recovery_state_invalid",
+        "Windows binding values must be non-empty strings",
+    )
+    return document
+
+
+def _windows_file_row(path: Path, source_path: str, root: Path) -> dict:
+    return {
+        "source_path": source_path,
+        "member": path.relative_to(root).as_posix(),
+        "bytes": path.stat().st_size,
+        "sha256": sha256_file(path),
+    }
+
+
+def _windows_deployment_archive(manifest: dict, extracted: Path) -> Path:
+    rows = manifest["release"].get("artifacts")
+    matches = [
+        row
+        for row in rows
+        if isinstance(row, dict)
+        and isinstance(row.get("name"), str)
+        and re.fullmatch(r"description-.*-deployment\.zip", row["name"])
     ]
     require(
-        rule_order == sorted(rule_order),
-        "windows_recovery_state_invalid",
-        f"{label}.rules is not in canonical order",
+        len(matches) == 1,
+        "windows_recovery_bundle_invalid",
+        "Windows recovery requires exactly one deployment archive",
     )
+    row = matches[0]
+    archive = extracted / row["member"]
+    require_real_file(archive, "deployment archive", "windows_recovery_bundle_invalid")
     require(
-        projection["projection_sha256"] == _windows_acl_projection_sha256(projection),
-        "windows_recovery_state_invalid",
-        f"{label} digest differs from its contents",
+        sha256_file(archive) == row["sha256"],
+        "windows_recovery_bundle_invalid",
+        "deployment archive differs from the recovery manifest",
     )
+    return archive
 
 
-def _validate_windows_acl_policy(
-    projection: dict,
-    *,
-    label: str,
-    operator_sid: str,
-    directory: bool,
-    non_inheriting: bool = False,
-    protected: bool = True,
-) -> None:
-    """Require the exact administrator-owned runtime permission matrix."""
-
-    system_sid = "S-1-5-18"
-    administrators_sid = "S-1-5-32-544"
-    require(
-        operator_sid not in {system_sid, administrators_sid},
-        "windows_managed_acl_policy_invalid",
-        f"{label} service principal aliases a boundary principal",
-    )
-
-    inheritance = 0 if non_inheriting or not directory else 3
-    expected = {
-        system_sid: 2032127,
-        administrators_sid: 2032127,
-        operator_sid: 2032127,
-    }
-    rules = projection["rules"]
-    require(
-        projection["owner_sid"] == administrators_sid
-        and projection["protected"] is protected
-        and len(rules) == len(expected),
-        "windows_managed_acl_policy_invalid",
-        f"{label} does not carry the administrator-owned protected boundary",
-    )
-    seen = set()
-    for index, rule in enumerate(rules):
-        sid = rule["sid"]
+def _windows_script_from_deployment(archive: Path, destination: Path, *, name: str) -> None:
+    member = f"deploy/windows/{name}"
+    with zipfile.ZipFile(archive) as bundle:
+        matches = [info for info in bundle.infolist() if info.filename == member]
         require(
-            sid in expected
-            and sid not in seen
-            and rule["access_type"] == "Allow"
-            and rule["rights"] == expected[sid]
-            and rule["inherited"] is (not protected)
-            and rule["inheritance"] == inheritance
-            and rule["propagation"] == 0,
-            "windows_managed_acl_policy_invalid",
-            f"{label}.rules[{index}] is outside the minimum permission matrix",
+            len(matches) == 1 and not matches[0].is_dir(),
+            "windows_recovery_bundle_invalid",
+            f"deployment archive must carry exactly one {member}",
         )
-        seen.add(sid)
+        payload = bundle.read(matches[0])
     require(
-        seen == set(expected),
-        "windows_managed_acl_policy_invalid",
-        f"{label} misses a required SID",
+        payload and b"\x00" not in payload,
+        "windows_recovery_bundle_invalid",
+        f"deployment archive carries an invalid {member}",
     )
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    destination.write_bytes(payload)
+    destination.chmod(0o600)
 
 
-def _validate_windows_runtime_leaf_acl_policy(projection: dict, parent: dict, *, label: str, operator_sid: str) -> None:
-    """Accept only protected or inherited leaves under the protected state root."""
-
-    _validate_windows_acl_policy(parent, label=f"{label}.parent", operator_sid=operator_sid, directory=True)
-    _validate_windows_acl_policy(
-        projection,
-        label=label,
-        operator_sid=operator_sid,
-        directory=False,
-        protected=projection["protected"],
-    )
-
-
-def _canonical_windows_pin(value: object, *, directory: bool) -> str | None:
-    """Compare local absolute Windows pins without changing their recorded bytes.
-
-    Path case is preserved because a Windows directory can be case-sensitive.
-    The observed recovery defect was only separator spelling, so accepting
-    additional case or Unicode equivalences would weaken object identity.
-    """
-    if not isinstance(value, str) or not value or any(ord(char) < 32 for char in value):
-        return None
-    path = value.replace("\\", "/")
-    trimmed = path.rstrip("/")
-    if not directory and trimmed != path:
-        return None
-    path = trimmed
-    if not re.match(r"^[A-Za-z]:/", path):
-        return None
-    parts = path[3:].split("/")
-    if any(
-        not part or part in {".", ".."} or part.endswith((" ", "."))
-        or any(char in '<>:"|?*' for char in part)
-        or re.fullmatch(
-            r"con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³]|conin\$|conout\$",
-            part.split(".", 1)[0].rstrip(" ").casefold(),
-        )
-        for part in parts
-    ):
-        return None
-    return path
-
-
-def _validate_windows_recovery_state(document: object) -> dict:
-    state = _exact_keys(
-        document,
-        {
-            "schema_version",
-            "ssh_host",
-            "task",
-            "identity",
-            "files",
-            "acl",
-            "cad",
-            "members",
-        },
-        "windows state",
-    )
-    require(
-        state["schema_version"] == WINDOWS_RECOVERY_SCHEMA,
-        "recovery_schema_unsupported",
-        "Windows recovery state schema is not supported",
-    )
-    require(
-        isinstance(state["ssh_host"], str) and bool(state["ssh_host"]),
-        "windows_recovery_state_invalid",
-        "Windows recovery state carries no SSH authority",
-    )
-    task = _exact_keys(
-        state["task"],
-        {
-            "task_path",
-            "task_name",
-            "state",
-            "xml_sha256",
-            "semantic_sha256",
-            "principal",
-            "action",
-            "settings",
-            "triggers_sha256",
-            "security_descriptor_sha256",
-        },
-        "windows state task",
-    )
-    require(
-        isinstance(task["task_path"], str)
-        and task["task_path"].startswith("\\")
-        and isinstance(task["task_name"], str)
-        and bool(task["task_name"]),
-        "windows_recovery_state_invalid",
-        "Windows task path or name is malformed",
-    )
-    require(
-        task["state"] == "Disabled",
-        "windows_task_not_disabled",
-        "the captured Windows task is not disabled",
-    )
-    for key in ("xml_sha256", "semantic_sha256", "triggers_sha256", "security_descriptor_sha256"):
-        require(
-            isinstance(task[key], str) and bool(HEX64.fullmatch(task[key])),
-            "windows_recovery_state_invalid",
-            f"Windows task {key} is malformed",
-        )
-    principal = _exact_keys(
-        task["principal"],
-        {"user", "sid", "logon_type", "run_level", "group_id", "administrator"},
-        "windows state task principal",
-    )
-    require(
-        isinstance(principal["sid"], str) and principal["sid"].startswith("S-1-"),
-        "windows_recovery_state_invalid",
-        "Windows task principal has no SID",
-    )
-    require(
-        principal["logon_type"] in {"Interactive", "InteractiveToken"},
-        "windows_logon_type_unsupported",
-        "Windows task principal is not interactive",
-    )
-    require(
-        principal["run_level"] in {"Highest", "HighestAvailable"},
-        "windows_run_level_not_elevated",
-        "Windows task principal does not request the elevated administrator token",
-    )
-    require(
-        type(principal["administrator"]) is bool,
-        "windows_recovery_state_invalid",
-        "Windows task principal privilege qualification is missing",
-    )
-    action = _exact_keys(
-        task["action"],
-        {"execute", "arguments", "working_directory"},
-        "windows state task action",
-    )
-    for key, value in action.items():
-        require(
-            isinstance(value, str) and bool(value),
-            "windows_recovery_state_invalid",
-            f"Windows task action {key} is empty",
-        )
-    require(
-        isinstance(task["settings"], dict) and task["settings"].get("multiple_instances") == "IgnoreNew",
-        "windows_recovery_state_invalid",
-        "Windows task does not enforce singleton instances",
-    )
-    raw_identity = state["identity"]
-    identity = _exact_keys(
-        raw_identity,
-        {
-            "operator_sid",
-            "operator_administrator",
-            "runtime_sid",
-            "runtime_administrator",
-            "runtime_privilege_qualification",
-            "endpoint_root",
-            "config_path",
-            "config_sha256",
-            "config_digest",
-            "package_root",
-            "output_root",
-            "state_root",
-            "port",
-            "token_path",
-            "token_sha256",
-            "install_id_path",
-            "install_id",
-            "release_identity_sha256",
-            "domain_environment",
-        },
-        "windows state identity",
-    )
-    require(
-        identity["operator_administrator"] is True,
-        "windows_operator_not_administrator",
-        "the Windows deployment operator is not proven administrative",
-    )
-    require(
-        identity["runtime_sid"] == principal["sid"]
-        and identity["operator_sid"] == principal["sid"]
-        and identity["runtime_administrator"] is True
-        and identity["runtime_administrator"] is principal["administrator"]
-        and identity["runtime_privilege_qualification"]
-        == ("user-approved-administrator-runtime" if principal["administrator"] else "non-administrative-runtime"),
-        "windows_recovery_state_invalid",
-        "Windows runtime identity privilege qualification differs from the task principal",
-    )
-    for key in ("config_sha256", "config_digest", "token_sha256", "release_identity_sha256"):
-        require(
-            isinstance(identity[key], str) and bool(HEX64.fullmatch(identity[key])),
-            "windows_recovery_state_invalid",
-            f"Windows identity {key} is malformed",
-        )
-    require(
-        isinstance(identity["install_id"], str) and bool(re.fullmatch(r"win-[0-9a-f]{32}", identity["install_id"])),
-        "windows_recovery_state_invalid",
-        "Windows install identity is malformed",
-    )
-    normalized = {
-        key: str(identity[key]).replace("\\", "/").rstrip("/")
-        for key in (
-            "endpoint_root",
-            "config_path",
-            "package_root",
-            "output_root",
-            "state_root",
-            "token_path",
-            "install_id_path",
-        )
-    }
-    normalized_action = {key: str(value).replace("\\", "/") for key, value in action.items()}
-    managed_runtime_action = (
-        normalized_action["execute"]
-        == normalized["endpoint_root"] + "/runtime/Scripts/python.exe"
-    )
-    require(
-        managed_runtime_action
-        and normalized["config_path"].casefold()
-        in normalized_action["arguments"].casefold()
-        and normalized_action["working_directory"] == normalized["state_root"]
-        and normalized["config_path"] == normalized["endpoint_root"] + "/endpoint.json"
-        and normalized["install_id_path"].startswith(normalized["state_root"] + "/")
-        and normalized["package_root"] != normalized["state_root"]
-        and normalized["output_root"] != normalized["state_root"]
-        and normalized["package_root"] != normalized["output_root"]
-        and not normalized["package_root"].startswith(normalized["state_root"] + "/")
-        and not normalized["state_root"].startswith(normalized["package_root"] + "/")
-        and not normalized["output_root"].startswith(normalized["state_root"] + "/")
-        and not normalized["state_root"].startswith(normalized["output_root"] + "/"),
-        "windows_recovery_state_invalid",
-        "Windows task action or managed roots differ from the endpoint identity",
-    )
-    for key in (
-        "endpoint_root",
-        "config_path",
-        "package_root",
-        "output_root",
-        "state_root",
-        "token_path",
-        "install_id_path",
-    ):
-        require(
-            isinstance(identity[key], str)
-            and bool(re.fullmatch(r"[A-Za-z]:/[^/].*", identity[key]))
-            and ".." not in identity[key].split("/"),
-            "windows_recovery_state_invalid",
-            f"Windows identity {key} is not a safe absolute forward-slash path",
-        )
-    require(
-        isinstance(identity["operator_sid"], str) and bool(re.fullmatch(r"S-1-[0-9-]+", identity["operator_sid"])),
-        "windows_recovery_state_invalid",
-        "Windows operator SID is malformed",
-    )
-    nt_paths = {key: value.replace("/", "\\") for key, value in normalized.items()}
-    common_parent = ntpath.commonpath(
-        [
-            nt_paths[key]
-            for key in (
-                "package_root",
-                "output_root",
-                "state_root",
-                "endpoint_root",
-                "config_path",
-                "token_path",
-                "install_id_path",
-            )
-        ]
-    ).replace("\\", "/")
-    common_parts = [part.casefold() for part in common_parent.split("/")[1:] if part]
-    require(
-        bool(common_parts)
-        and common_parts[0]
-        not in {
-            "windows",
-            "program files",
-            "program files (x86)",
-            "programdata",
-            "users",
-        },
-        "windows_recovery_state_invalid",
-        "Windows managed common parent is a shared or system root",
-    )
-    lifecycle_root = normalized["state_root"] + "/lifecycle"
-    secret_root = ntpath.dirname(nt_paths["token_path"]).replace("\\", "/")
-    require(
-        normalized["endpoint_root"].startswith(lifecycle_root + "/")
-        and normalized["config_path"] == normalized["endpoint_root"] + "/endpoint.json"
-        and normalized["install_id_path"] == normalized["state_root"] + "/install-id"
-        and secret_root
-        not in {
-            normalized["package_root"],
-            normalized["output_root"],
-            normalized["state_root"],
-            lifecycle_root,
-            normalized["endpoint_root"],
-            common_parent,
-        },
-        "windows_recovery_state_invalid",
-        "Windows lifecycle, generation, install identity, or secret root is unsafe",
-    )
-    require(
-        type(identity["port"]) is int and 0 < identity["port"] < 65536,
-        "windows_recovery_state_invalid",
-        "Windows endpoint port is malformed",
-    )
-    environment = identity["domain_environment"]
-    require(
-        isinstance(environment, dict),
-        "windows_recovery_state_invalid",
-        "Windows account environment pins are not canonical",
-    )
-    environment_endpoint = _canonical_windows_pin(
-        environment.get("DESCRIPTION_ENDPOINT_ROOT"),
-        directory=True,
-    )
-    expected_endpoint = _canonical_windows_pin(
-        identity["endpoint_root"],
-        directory=True,
-    )
-    environment_ownership = _canonical_windows_pin(
-        environment.get("DESCRIPTION_CAD_OWNERSHIP_FILE"),
-        directory=False,
-    )
-    expected_ownership = _canonical_windows_pin(
-        normalized["state_root"] + "/cad-ownership.json",
-        directory=False,
-    )
-    require(
-        environment.get("scope") == "user"
-        and environment_endpoint is not None
-        and environment_endpoint == expected_endpoint
-        and environment_ownership is not None
-        and environment_ownership == expected_ownership,
-        "windows_recovery_state_invalid",
-        "Windows account environment pins are not canonical",
-    )
-    acl = _exact_keys(
-        state["acl"],
-        {
-            "common_parent",
-            "managed_root_marker",
-            "lifecycle_root",
-            "endpoint_secrets_root",
-            "task_file",
-            "endpoint_config",
-            "endpoint_token",
-            "install_id",
-            "cad_ownership",
-            "cad_lease",
-            "roots",
-        },
-        "windows state acl",
-    )
-    roots_acl = _exact_keys(
-        acl["roots"],
-        {"package_root", "output_root", "state_root", "endpoint_root"},
-        "windows state acl.roots",
-    )
-    for name, value in acl.items():
-        if name == "roots":
-            for root_name, projection in roots_acl.items():
-                _validate_windows_acl_projection(
-                    projection,
-                    f"windows state acl.roots.{root_name}",
-                )
-            continue
-        if value is None:
-            require(
-                name in {"cad_ownership", "cad_lease"},
-                "windows_recovery_state_invalid",
-                "only absent CAD ownership files may have a null ACL",
-            )
-            continue
-        _validate_windows_acl_projection(
-            value,
-            f"windows state acl.{name}",
-        )
-    policies = (
-        ("common_parent", acl["common_parent"], True, False),
-        ("managed_root_marker", acl["managed_root_marker"], False, False),
-        ("lifecycle_root", acl["lifecycle_root"], True, False),
-        ("endpoint_secrets_root", acl["endpoint_secrets_root"], True, False),
-        ("task_file", acl["task_file"], False, False),
-        ("endpoint_config", acl["endpoint_config"], False, False),
-        ("endpoint_token", acl["endpoint_token"], False, False),
-        ("install_id", acl["install_id"], False, False),
-        ("package_root", roots_acl["package_root"], True, False),
-        ("output_root", roots_acl["output_root"], True, False),
-        ("state_root", roots_acl["state_root"], True, False),
-        ("endpoint_root", acl["roots"]["endpoint_root"], True, False),
-    )
-    for name, projection, directory, non_inheriting in policies:
-        _validate_windows_acl_policy(
-            projection,
-            label=f"windows state acl.{name}",
-            operator_sid=identity["operator_sid"],
-            directory=directory,
-            non_inheriting=non_inheriting,
-        )
-    for name in ("cad_ownership", "cad_lease"):
-        if acl[name] is not None:
-            _validate_windows_runtime_leaf_acl_policy(
-                acl[name],
-                roots_acl["state_root"],
-                label=f"windows state acl.{name}",
-                operator_sid=identity["operator_sid"],
-            )
-    cad = _exact_keys(
-        state["cad"],
-        {
-            "ownership_path",
-            "ownership_sha256",
-            "ledger_present",
-            "lease_path",
-            "lease_held",
-            "external_detected",
-            "problems",
-        },
-        "windows state cad",
-    )
-    require(
-        isinstance(cad["ownership_path"], str)
-        and bool(re.fullmatch(r"[A-Za-z]:/[^/].*", cad["ownership_path"]))
-        and ".." not in cad["ownership_path"].split("/")
-        and isinstance(cad["lease_path"], str)
-        and bool(re.fullmatch(r"[A-Za-z]:/[^/].*", cad["lease_path"]))
-        and ".." not in cad["lease_path"].split("/")
-        and type(cad["ledger_present"]) is bool
-        and (
-            cad["ownership_sha256"] is None
-            if not cad["ledger_present"]
-            else isinstance(cad["ownership_sha256"], str) and bool(HEX64.fullmatch(cad["ownership_sha256"]))
-        ),
-        "windows_recovery_state_invalid",
-        "Windows CAD ownership identity is malformed",
-    )
-    require(
-        str(cad["ownership_path"]).replace("\\", "/") == normalized["state_root"] + "/cad-ownership.json"
-        and str(cad["lease_path"]).replace("\\", "/") == normalized["state_root"] + "/cad-ownership.json.lease",
-        "windows_recovery_state_invalid",
-        "Windows CAD ownership paths differ from the endpoint state root",
-    )
-    require(
-        cad["lease_held"] is False and cad["external_detected"] is False and cad["problems"] == [],
-        "windows_cad_ownership_unknown",
-        "Windows CAD ownership is not proven free",
-    )
-    files = state["files"]
-    require(isinstance(files, list) and bool(files), "windows_recovery_state_invalid", "Windows files are empty")
-    roles = set()
-    for index, entry in enumerate(files):
-        row = _exact_keys(
-            entry,
-            {"role", "path", "member", "bytes", "sha256"},
-            f"windows state files[{index}]",
-        )
-        require(
-            isinstance(row["role"], str)
-            and row["role"] not in roles
-            and isinstance(row["path"], str)
-            and bool(re.fullmatch(r"[A-Za-z]:/[^/].*", row["path"]))
-            and ".." not in row["path"].split("/")
-            and isinstance(row["member"], str)
-            and bool(row["member"])
-            and "/" not in row["member"]
-            and "\\" not in row["member"]
-            and type(row["bytes"]) is int
-            and row["bytes"] >= 0
-            and isinstance(row["sha256"], str)
-            and bool(HEX64.fullmatch(row["sha256"])),
-            "windows_recovery_state_invalid",
-            f"Windows file row {index} is malformed",
-        )
-        roles.add(row["role"])
-    require(
-        {"task_xml", "managed_root_marker", "endpoint_config", "endpoint_token", "install_id"} <= roles,
-        "windows_recovery_state_invalid",
-        "Windows recovery does not cover its required files",
-    )
-    require(
-        roles
-        <= {
-            "task_xml",
-            "managed_root_marker",
-            "endpoint_config",
-            "endpoint_token",
-            "install_id",
-            "cad_ownership",
-        },
-        "windows_recovery_state_invalid",
-        "Windows recovery contains an unsupported file role",
-    )
-    expected_role_members = {
-        "task_xml": "task.xml",
-        "managed_root_marker": "managed-root.json",
-        "endpoint_config": "endpoint.json",
-        "endpoint_token": "token",
-        "install_id": "install-id",
-        "cad_ownership": "cad-ownership.json",
-    }
-    require(
-        all(expected_role_members.get(row["role"]) == row["member"] for row in files),
-        "windows_recovery_state_invalid",
-        "Windows recovery file roles and members differ",
-    )
-    task_xml_file = next(row for row in files if row["role"] == "task_xml")
-    require(
-        task_xml_file["sha256"] == task["xml_sha256"] and task_xml_file["member"] == "task.xml",
-        "windows_recovery_state_invalid",
-        "Windows task XML file and task projection differ",
-    )
-    files_by_role = {row["role"]: row for row in files}
-    require(
-        files_by_role["managed_root_marker"]["path"] == common_parent + "/.description-managed-root.json",
-        "windows_recovery_state_invalid",
-        "Windows managed-root marker is outside the computed common parent",
-    )
-    require(
-        files_by_role["endpoint_config"]["path"] == identity["config_path"]
-        and files_by_role["endpoint_config"]["sha256"] == identity["config_sha256"]
-        and files_by_role["endpoint_token"]["path"] == identity["token_path"]
-        and files_by_role["endpoint_token"]["sha256"] == identity["token_sha256"]
-        and files_by_role["install_id"]["path"] == identity["install_id_path"],
-        "windows_recovery_state_invalid",
-        "Windows recovery file roles differ from the endpoint identity",
-    )
-    if cad["ledger_present"]:
-        require(
-            files_by_role.get("cad_ownership", {}).get("path") == cad["ownership_path"]
-            and files_by_role.get("cad_ownership", {}).get("sha256") == cad["ownership_sha256"]
-            and acl["cad_ownership"] is not None,
-            "windows_recovery_state_invalid",
-            "Windows CAD ownership file and ledger identity differ",
-        )
-    else:
-        require(
-            "cad_ownership" not in files_by_role and acl["cad_ownership"] is None,
-            "windows_recovery_state_invalid",
-            "an absent Windows CAD ledger must not carry a recovery file",
-        )
-    members = state["members"]
-    require(isinstance(members, list) and bool(members), "windows_recovery_state_invalid", "Windows members are empty")
-    for index, row in enumerate(members):
-        exact = _exact_keys(row, {"member", "bytes", "sha256"}, f"windows state members[{index}]")
-        require(
-            isinstance(exact["member"], str)
-            and exact["member"]
-            and "/" not in exact["member"]
-            and "\\" not in exact["member"]
-            and type(exact["bytes"]) is int
-            and exact["bytes"] >= 0
-            and isinstance(exact["sha256"], str)
-            and bool(HEX64.fullmatch(exact["sha256"])),
-            "windows_recovery_state_invalid",
-            f"Windows member {index} is malformed",
-        )
-    return state
-
-
-def _windows_target_from_state(state: dict) -> dict:
-    principal = state["task"]["principal"]
-    identity = state["identity"]
-    return {
-        "ssh_host": state["ssh_host"],
-        "task_path": state["task"]["task_path"],
-        "task_name": state["task"]["task_name"],
-        "principal_sid": principal["sid"],
-        "task_xml_sha256": state["task"]["xml_sha256"],
-        "task_semantic_sha256": state["task"]["semantic_sha256"],
-        "task_acl_sha256": state["acl"]["task_file"]["projection_sha256"],
-        "endpoint_root": identity["endpoint_root"],
-        "config_path": identity["config_path"],
-        "config_sha256": identity["config_sha256"],
-        "config_digest": identity["config_digest"],
-        "token_path": identity["token_path"],
-        "token_sha256": identity["token_sha256"],
-        "install_id_path": identity["install_id_path"],
-        "install_id": identity["install_id"],
-        "release_identity_sha256": identity["release_identity_sha256"],
-        "package_root": identity["package_root"],
-        "output_root": identity["output_root"],
-        "state_root": identity["state_root"],
-        "port": identity["port"],
-        "cad_ownership_path": state["cad"]["ownership_path"],
-        "cad_ownership_sha256": state["cad"]["ownership_sha256"],
-    }
-
-
-def _validate_remote_cleanup(value: object) -> dict:
-    require(isinstance(value, dict), "recovery_manifest_invalid", "windows.remote_cleanup must be an object")
-    required = {"attempted", "passed", "remote_dir"}
-    allowed = required | {"ownership_marker", "code", "message", "detail"}
-    require(
-        required <= set(value) and set(value) <= allowed,
-        "recovery_manifest_invalid",
-        "windows.remote_cleanup carries an unknown shape",
-    )
-    attempted = value["attempted"]
-    passed = value["passed"]
-    remote_dir = value["remote_dir"]
-    require(
-        isinstance(attempted, bool)
-        and ((attempted and isinstance(passed, bool)) or (not attempted and passed is None))
-        and isinstance(remote_dir, str)
-        and bool(re.fullmatch(r"[A-Za-z]:/[^/].*", remote_dir))
-        and ".." not in remote_dir.split("/"),
-        "recovery_manifest_invalid",
-        "windows.remote_cleanup identity is malformed",
-    )
-    if passed is False:
-        require(
-            isinstance(value.get("ownership_marker"), str)
-            and value["ownership_marker"].startswith(remote_dir.rstrip("/") + "/")
-            and isinstance(value.get("code"), str)
-            and bool(value["code"])
-            and isinstance(value.get("message"), str)
-            and bool(value["message"])
-            and isinstance(value.get("detail"), dict),
-            "recovery_manifest_invalid",
-            "failed windows.remote_cleanup lacks residual evidence",
-        )
-    return value
-
-
-def _validate_windows_inner_cleanup(value: object, *, required: bool) -> dict | None:
-    if value is None and not required:
-        return None
-    require(isinstance(value, dict), "recovery_manifest_invalid", "Windows temp cleanup must be an object")
-    allowed = {"attempted", "passed", "path", "error"}
-    require(
-        {"attempted", "passed", "path"} <= set(value) <= allowed,
-        "recovery_manifest_invalid",
-        "Windows temp cleanup carries an unknown shape",
-    )
-    attempted = value["attempted"]
-    passed = value["passed"]
-    path = value["path"]
-    require(
-        isinstance(attempted, bool)
-        and (
-            (attempted and isinstance(passed, bool) and isinstance(path, str) and bool(path))
-            or (not attempted and passed is None and path == "")
-        ),
-        "recovery_manifest_invalid",
-        "Windows temp cleanup identity is malformed",
-    )
-    if passed is False:
-        require(
-            isinstance(value.get("error"), str) and bool(value["error"]),
-            "recovery_manifest_invalid",
-            "failed Windows temp cleanup lacks its residual path error",
-        )
-    return value
-
-
-def _windows_snapshot_binding(context: BackupContext) -> dict:
-    windows = context.resolved["windows"]
-    instance = windows["instance"]
-    return {
-        "schema_version": WINDOWS_RECOVERY_SCHEMA,
-        "ssh_host": windows["ssh_host"],
-        "task_name": instance["task_name"],
-        "state_root": instance["state_root"],
-        "package_root": instance["package_root"],
-        "output_root": instance["output_root"],
-        "port": windows["endpoint_port"],
-    }
-
-
-def _windows_restore_binding(
+def _windows_acl_document(
     *,
     ssh_host: str,
-    target: dict,
-    remote_bundle: str,
-    bundle_sha256: str,
-) -> dict:
-    return {
-        "schema_version": WINDOWS_RECOVERY_SCHEMA,
-        "ssh_host": ssh_host,
-        "task_path": target["task_path"],
-        "task_name": target["task_name"],
-        "principal_sid": target["principal_sid"],
-        "state_root": target["state_root"],
-        "package_root": target["package_root"],
-        "output_root": target["output_root"],
-        "port": target["port"],
-        "recovery_bundle": remote_bundle,
-        "recovery_bundle_sha256": bundle_sha256,
-        "expected": target,
-    }
-
-
-def _transfer_windows_recovery(
-    *,
-    ssh_host: str,
-    remote_dir: str,
-    script: Path,
-    binding_document: dict,
-    operation: str,
-    commands: list[dict],
+    paths: list[str],
     timeout: int,
-    upload_bundle: Path | None = None,
-    download_bundle: Path | None = None,
-    evidence_dir: Path | None = None,
+    commands: list[dict],
 ) -> dict:
-    def reject_credentials(value):
-        if isinstance(value, list):
-            for item in value:
-                reject_credentials(item)
-        elif isinstance(value, dict):
-            for key, item in value.items():
-                name = key.lower().replace("-", "_")
-                sensitive = any(term in name for term in ("password", "secret", "token", "private_key", "dsn"))
-                require(
-                    not sensitive or name.endswith(("_path", "_sha256", "_digest")),
-                    "windows_recovery_binding_invalid",
-                    "recovery binding cannot contain credential values",
-                )
-                reject_credentials(item)
+    encoded = base64.b64encode(
+        json.dumps(paths, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii")
+    script = rf"""
+$ErrorActionPreference = 'Stop'
+$paths = ConvertFrom-Json ([Text.Encoding]::UTF8.GetString(
+  [Convert]::FromBase64String('{encoded}')))
+try {{
+  $rows = @()
+  foreach ($path in @($paths)) {{
+    $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+    $acl = Get-Acl -LiteralPath $path -ErrorAction Stop
+    $rows += [ordered]@{{
+      path = ([IO.Path]::GetFullPath($path)).Replace('\','/')
+      type = $(if ($item.PSIsContainer) {{ 'directory' }} else {{ 'file' }})
+      owner_sid = $acl.Owner
+      group_sid = $acl.Group
+      sddl = $acl.GetSecurityDescriptorSddlForm(
+        [System.Security.AccessControl.AccessControlSections]::All)
+    }}
+  }}
+  @{{
+    passed = $true
+    entries = @($rows)
+  }} | ConvertTo-Json -Depth 8 -Compress
+}} catch {{
+  @{{
+    passed = $false
+    code = 'windows_acl_observation_unknown'
+    message = $_.Exception.Message
+  }} | ConvertTo-Json -Compress
+  exit 2
+}}
+"""
+    document, completed = _run_windows_powershell(
+        ssh_host=ssh_host,
+        script=script,
+        timeout=timeout,
+        commands=commands,
+    )
+    require(
+        completed.returncode == 0
+        and document.get("passed") is True
+        and isinstance(document.get("entries"), list)
+        and len(document["entries"]) == len(paths),
+        "windows_recovery_transport_unknown",
+        "Windows ACL projection is unavailable",
+    )
+    return document
 
-    reject_credentials(binding_document)
-    binding_document = {
-        **binding_document,
-        "script_sha256": sha256_file(script),
-    }
-    with tempfile.TemporaryDirectory(prefix="windows-recovery-binding-") as temporary:
-        binding = Path(temporary) / "windows-binding.json"
-        atomic_write(binding, canonical_json(binding_document))
-        uploads = [script, binding]
-        if upload_bundle is not None:
-            uploads.append(upload_bundle)
 
-        def known_secrets(value):
-            if not isinstance(value, dict):
-                return []
-            result = []
-            for key, item in value.items():
-                if key.lower() in {"password", "token", "secret", "private_key", "dsn"} and isinstance(item, str):
-                    result.append(item.encode("utf-8"))
-                elif isinstance(item, dict):
-                    result.extend(known_secrets(item))
-            return result
-
-        sensitive_values = tuple(known_secrets(binding_document))
-        if os.environ.get("SSH_AUTH_SOCK"):
-            sensitive_values += (os.environ["SSH_AUTH_SOCK"].encode("utf-8"),)
-        preserved_objects = []
-        if evidence_dir is not None:
-            _private_transfer_directory(evidence_dir, "windows_recovery_transport_unknown")
-            # The helper and binding contain code, paths and identity hashes, not credential values.
-            # Keep these inputs outside disposable staging; never copy the credential-bearing bundle.
-            for source in (script, binding):
-                target = evidence_dir / source.name
-                raw = source.read_bytes()
-                retained = raw
-                for secret in sensitive_values:
-                    retained = retained.replace(secret, b"<redacted>")
-                _write_transfer_evidence(target, retained)
-                preserved_objects.append(
-                    {
-                        "name": source.name,
-                        "path": str(target),
-                        "bytes": len(retained),
-                        "sha256": sha256_file(target),
-                        "source_bytes": len(raw),
-                        "source_sha256": hashlib.sha256(raw).hexdigest(),
-                        "redacted": retained != raw,
-                    }
-                )
-        ownership_token = secrets.token_hex(32)
-        remote_dir_owned = False
-        document: dict | None = None
-        action_error: BaseException | None = None
-        try:
-            _create_remote_dir(
-                ssh_host=ssh_host,
-                remote_dir=remote_dir,
-                ownership_token=ownership_token,
-                timeout=timeout,
-                commands=commands,
-            )
-            remote_dir_owned = True
-            _windows_scp(
-                ssh_host=ssh_host,
-                sources=uploads,
-                remote_dir=remote_dir,
-                upload=True,
-                timeout=timeout,
-                commands=commands,
-                code="windows_recovery_transport_unknown",
-                evidence_dir=evidence_dir,
-                sensitive_values=sensitive_values,
-                preserved_objects=tuple(preserved_objects),
-            )
-            remote_script = f"{remote_dir}/instance-lifecycle.ps1"
-            remote_binding = f"{remote_dir}/windows-binding.json"
-            invocation = (
-                "$ErrorActionPreference='Stop';"
-                f"& {_powershell_quote(remote_script.replace('/', '\\'))} "
-                f"-Verb {_powershell_quote(operation)} "
-                f"-Binding {_powershell_quote(remote_binding.replace('/', '\\'))}"
-            )
-            if operation == "recovery-snapshot":
-                invocation += f" -RecoveryDir {_powershell_quote(remote_dir.replace('/', '\\'))}"
-            if operation in {"recovery-restore", "recovery-verify"}:
-                remote_bundle = f"{remote_dir}/{WINDOWS_BUNDLE}"
-                invocation += f" -RecoveryBundle {_powershell_quote(remote_bundle.replace('/', '\\'))}"
-            document = _run_windows_recovery_json(
-                ssh_host=ssh_host,
-                script=invocation,
-                timeout=timeout,
-                commands=commands,
-                expected_verb=operation,
-            )
-            if download_bundle is not None:
-                require(
-                    operation == "recovery-snapshot",
-                    "windows_recovery_state_invalid",
-                    "only snapshot may download a Windows recovery bundle",
-                )
-                require(
-                    type(document.get("bundle_bytes")) is int
-                    and document["bundle_bytes"] >= 0
-                    and isinstance(document.get("bundle_sha256"), str)
-                    and bool(HEX64.fullmatch(document["bundle_sha256"])),
-                    "windows_recovery_bundle_invalid",
-                    "remote bundle identity is incomplete",
-                )
-                _windows_scp(
-                    ssh_host=ssh_host,
-                    sources=[download_bundle],
-                    remote_dir=remote_dir,
-                    upload=False,
-                    remote_name=WINDOWS_BUNDLE,
-                    timeout=timeout,
-                    commands=commands,
-                    code="windows_recovery_transport_unknown",
-                    evidence_dir=evidence_dir,
-                    sensitive_values=sensitive_values,
-                    preserved_objects=tuple(preserved_objects),
-                    expected_download={
-                        "name": WINDOWS_BUNDLE,
-                        "path": f"{remote_dir}/{WINDOWS_BUNDLE}",
-                        "bytes": document["bundle_bytes"],
-                        "sha256": document["bundle_sha256"],
-                    },
-                )
-                expected = document.get("bundle_sha256")
-                require(
-                    isinstance(expected, str)
-                    and bool(HEX64.fullmatch(expected))
-                    and download_bundle.stat().st_size == document["bundle_bytes"]
-                    and sha256_file(download_bundle) == expected,
-                    "windows_recovery_bundle_invalid",
-                    "downloaded Windows recovery bundle differs from the remote receipt",
-                )
-        except BaseException as error:
-            action_error = error
-        cleanup = (
-            _attempt_remote_dir_cleanup(
-                ssh_host=ssh_host,
-                remote_dir=remote_dir,
-                ownership_token=ownership_token,
-                timeout=timeout,
-                commands=commands,
-            )
-            if remote_dir_owned
-            else {"attempted": False, "passed": None, "remote_dir": remote_dir}
-        )
-        if action_error is not None:
-            if isinstance(action_error, RecoveryError):
-                detail = dict(action_error.detail or {})
-                detail["remote_cleanup"] = cleanup
-                action_error.detail = detail
-            else:
-                action_error.add_note("remote_cleanup=" + canonical_json(cleanup).decode("utf-8").strip())
-            raise action_error
-        if document is None:
-            raise RecoveryError(
-                "windows_recovery_transport_unknown",
-                "the Windows recovery action returned no receipt",
-                {"remote_cleanup": cleanup},
-            )
-        document["remote_cleanup"] = cleanup
-        return document
+def _windows_task_state(
+    *,
+    ssh_host: str,
+    state_root: str,
+    timeout: int,
+) -> tuple[str, dict]:
+    document = _windows_public_verb(
+        ssh_host=ssh_host,
+        state_root=state_root,
+        verb="status",
+        timeout=timeout,
+    )
+    task = document.get("task")
+    state = task.get("state") if isinstance(task, dict) else "missing"
+    return str(state), document
 
 
 def capture_windows_recovery(
@@ -7530,63 +5535,557 @@ def capture_windows_recovery(
     backup_id: str,
     staging: Path,
     commands: list[dict],
-    timeout: int = 3600,
 ) -> dict:
-    """Capture the exact existing Windows endpoint while its task is disabled."""
-
     windows = context.resolved["windows"]
+    instance = windows["instance"]
     ssh_host = windows["ssh_host"]
-    remote_dir = _windows_remote_dir(windows["instance"]["state_root"], "snapshot", backup_id)
-    bundle = staging / WINDOWS_BUNDLE_MEMBER
-    bundle.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    script = _windows_script_path()
-    result = _transfer_windows_recovery(
+    state_root = _windows_normalize(instance["state_root"])
+    stage = staging / "windows"
+    stage.mkdir(parents=True, mode=0o700)
+    script_path, binding_remote = _windows_lifecycle_paths(state_root)
+    binding_local = stage / "windows-binding.json"
+    _windows_scp(
         ssh_host=ssh_host,
-        remote_dir=remote_dir,
-        script=script,
-        binding_document=_windows_snapshot_binding(context),
-        operation="recovery-snapshot",
+        source=f"{ssh_host}:{binding_remote}",
+        destination=binding_local,
+        timeout=3600,
         commands=commands,
+    )
+    binding = _read_windows_binding(binding_local)
+    status = _windows_public_verb(
+        ssh_host=ssh_host,
+        state_root=state_root,
+        verb="status",
+        timeout=180,
+        commands=commands,
+    )
+    task = status.get("task")
+    require(
+        isinstance(task, dict) and task.get("state") in {"Disabled", "Ready"},
+        "windows_recovery_maintenance_changed",
+        "Windows task is not stopped before backup",
+    )
+    require(
+        isinstance(status.get("identity"), dict),
+        "windows_recovery_state_invalid",
+        "Windows status carries no installed identity",
+    )
+    endpoint_config_remote = _windows_normalize(binding["endpoint_config"])
+    endpoint_config_local = stage / "endpoint.json"
+    _windows_scp(
+        ssh_host=ssh_host,
+        source=f"{ssh_host}:{endpoint_config_remote}",
+        destination=endpoint_config_local,
+        timeout=180,
+        commands=commands,
+    )
+    _, endpoint_document = strict_json_file(endpoint_config_local, "Windows endpoint configuration")
+    require(
+        isinstance(endpoint_document, dict),
+        "windows_recovery_state_invalid",
+        "Windows endpoint configuration is not an object",
+    )
+    token_remote = _windows_normalize(str(endpoint_document.get("token_file") or ""))
+    output_root = _windows_normalize(str(endpoint_document.get("output_root") or ""))
+    package_root = _windows_normalize(str(endpoint_document.get("package_root") or ""))
+    require(
+        token_remote and output_root and package_root,
+        "windows_recovery_state_invalid",
+        "Windows endpoint configuration lacks required paths",
+    )
+    token_local = stage / "endpoint.token"
+    _windows_scp(
+        ssh_host=ssh_host,
+        source=f"{ssh_host}:{token_remote}",
+        destination=token_local,
+        timeout=180,
+        commands=commands,
+    )
+    release_remote = _windows_normalize(binding["release_file"])
+    release_local = stage / "release.json"
+    _windows_scp(
+        ssh_host=ssh_host,
+        source=f"{ssh_host}:{release_remote}",
+        destination=release_local,
+        timeout=180,
+        commands=commands,
+    )
+    _, release_document = strict_json_file(release_local, "Windows release manifest")
+    artifacts = release_document.get("artifacts") if isinstance(release_document, dict) else None
+    require(isinstance(artifacts, dict), "windows_recovery_state_invalid", "Windows release has no artifacts")
+    archive_names = sorted(
+        name
+        for name in artifacts
+        if name.endswith(".zip") and "-windows-" in name
+    )
+    require(
+        len(archive_names) == 1,
+        "windows_recovery_state_invalid",
+        "Windows release must name one native archive",
+    )
+    lifecycle_local = stage / "instance-lifecycle.ps1"
+    bootstrap_local = stage / "bootstrap-managed-root.ps1"
+    for remote, local, label in (
+        (script_path, lifecycle_local, "Windows lifecycle"),
+        (state_root + "/bootstrap-managed-root.ps1", bootstrap_local, "Windows bootstrap helper"),
+        (state_root + "/install-id", stage / "install-id", "Windows install id"),
+        (state_root + "/install-receipt.json", stage / "install-receipt.json", "Windows install receipt"),
+    ):
+        _windows_scp(
+            ssh_host=ssh_host,
+            source=f"{ssh_host}:{remote}",
+            destination=local,
+            timeout=180,
+            commands=commands,
+        )
+        require(local.is_file() and not local.is_symlink(), "windows_recovery_state_invalid", f"{label} is unavailable")
+
+    native_remote = state_root + "/native-operations"
+    native_local = stage / "native-operations"
+    native_exists = _windows_path_exists(
+        ssh_host=ssh_host,
+        path=native_remote,
+        timeout=60,
+        commands=commands,
+    )
+    if native_exists:
+        _windows_scp(
+            ssh_host=ssh_host,
+            source=f"{ssh_host}:{native_remote}",
+            destination=native_local,
+            timeout=3600,
+            recursive=True,
+            commands=commands,
+        )
+    output_local = stage / Path(output_root).name
+    _windows_scp(
+        ssh_host=ssh_host,
+        source=f"{ssh_host}:{output_root}",
+        destination=output_local,
+        timeout=3600,
+        recursive=True,
+        commands=commands,
+    )
+    acl = _windows_acl_document(
+        ssh_host=ssh_host,
+        paths=[
+            state_root,
+            package_root,
+            output_root,
+            endpoint_config_remote,
+            token_remote,
+            state_root + "/install-id",
+            state_root + "/install-receipt.json",
+            binding_remote,
+        ],
+        timeout=180,
+        commands=commands,
+    )
+    acl_path = stage / "acl.json"
+    atomic_write(acl_path, canonical_json(acl))
+    document = {
+        "schema_version": WINDOWS_RECOVERY_SCHEMA,
+        "ssh_host": ssh_host,
+        "state_root": state_root,
+        "output_root": output_root,
+        "package_root": package_root,
+        "binding": _windows_file_row(binding_local, binding_remote, staging),
+        "endpoint_config": _windows_file_row(endpoint_config_local, endpoint_config_remote, staging),
+        "token": _windows_file_row(token_local, token_remote, staging),
+        "release": {
+            **_windows_file_row(release_local, release_remote, staging),
+            "archive_name": archive_names[0],
+            "archive_sha256": artifacts[archive_names[0]],
+        },
+        "install_id": _windows_file_row(stage / "install-id", state_root + "/install-id", staging),
+        "install_receipt": _windows_file_row(
+            stage / "install-receipt.json",
+            state_root + "/install-receipt.json",
+            staging,
+        ),
+        "lifecycle": _windows_file_row(lifecycle_local, script_path, staging),
+        "bootstrap": _windows_file_row(
+            bootstrap_local,
+            state_root + "/bootstrap-managed-root.ps1",
+            staging,
+        ),
+        "acl": _windows_file_row(acl_path, "windows/acl.json", staging),
+        "native_operations": {
+            "source_path": native_remote,
+            "member": native_local.relative_to(staging).as_posix(),
+            "exists": native_exists,
+        },
+        "output": {
+            "source_path": output_root,
+            "member": output_local.relative_to(staging).as_posix(),
+            "exists": True,
+        },
+        "status": status,
+        "archive_name": archive_names[0],
+        "archive_sha256": artifacts[archive_names[0]],
+    }
+    atomic_write(stage / "state.json", canonical_json(document))
+    return document
+
+
+def _windows_path_exists(
+    *,
+    ssh_host: str,
+    path: str,
+    timeout: int,
+    commands: list[dict] | None = None,
+) -> bool:
+    script = f"""
+$ErrorActionPreference = 'Stop'
+try {{
+  $exists = [bool](Test-Path -LiteralPath {_windows_quote(path)} -ErrorAction Stop)
+  @{{passed=$true;exists=$exists}} | ConvertTo-Json -Compress
+}} catch {{
+  @{{
+    passed=$false
+    code='windows_path_observation_unknown'
+    message=$_.Exception.Message
+  }} | ConvertTo-Json -Compress
+  exit 2
+}}
+"""
+    document, completed = _run_windows_powershell(
+        ssh_host=ssh_host,
+        script=script,
         timeout=timeout,
-        download_bundle=bundle,
-        evidence_dir=staging.parent / "windows-transfer-evidence",
-    )
-    state = _read_windows_state(bundle)
-    verify_windows_recovery_bundle_members(bundle, state)
-    require(
-        state["ssh_host"] == ssh_host
-        and state["task"]["task_name"] == windows["instance"]["task_name"]
-        and state["identity"]["state_root"] == windows["instance"]["state_root"]
-        and state["identity"]["package_root"] == windows["instance"]["package_root"]
-        and state["identity"]["output_root"] == windows["instance"]["output_root"]
-        and state["identity"]["port"] == windows["endpoint_port"],
-        "windows_recovery_state_invalid",
-        "Windows recovery state differs from the active platform binding",
+        commands=commands,
     )
     require(
-        result.get("task_state") == "Disabled"
-        and result.get("endpoint") == "stopped"
-        and result.get("cad_ownership") == "free",
-        "windows_recovery_state_invalid",
-        "Windows snapshot did not prove a disabled, stopped, CAD-free endpoint",
+        completed.returncode == 0
+        and document.get("passed") is True
+        and type(document.get("exists")) is bool,
+        "windows_recovery_transport_unknown",
+        "Windows path outcome is unknown",
     )
-    cleanup = _validate_remote_cleanup(result.get("remote_cleanup"))
-    windows_cleanup = _validate_windows_inner_cleanup(
-        result.get("cleanup"),
-        required=False,
+    return document["exists"]
+
+
+def _windows_create_parents(
+    *,
+    ssh_host: str,
+    paths: list[str],
+    timeout: int,
+    commands: list[dict],
+) -> None:
+    encoded = base64.b64encode(
+        json.dumps(paths, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii")
+    script = rf"""
+$paths = ConvertFrom-Json ([Text.Encoding]::UTF8.GetString(
+  [Convert]::FromBase64String('{encoded}')))
+foreach ($path in @($paths)) {{
+  $parent = Split-Path -Parent $path
+  if ($parent) {{
+    $null = New-Item -ItemType Directory -Path $parent -Force
+  }}
+}}
+@{{passed=$true;created=$true}} | ConvertTo-Json -Compress
+"""
+    document, _ = _run_windows_powershell(
+        ssh_host=ssh_host,
+        script=script,
+        timeout=timeout,
+        commands=commands,
+    )
+    require(
+        document.get("passed") is True,
+        "windows_recovery_transport_unknown",
+        "Windows target directories could not be prepared",
+    )
+
+
+def _windows_restore_target_empty(
+    *,
+    ssh_host: str,
+    binding: dict,
+    paths: list[str],
+    roots: list[str] | None = None,
+    timeout: int,
+    commands: list[dict],
+) -> None:
+    payload = {
+        "task_name": binding["task_name"],
+        "task_path": binding["task_path"],
+        "files": paths,
+        "roots": roots or [],
+    }
+    encoded = base64.b64encode(
+        json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii")
+    script = rf"""
+$ErrorActionPreference = 'Stop'
+$request = ConvertFrom-Json ([Text.Encoding]::UTF8.GetString(
+  [Convert]::FromBase64String('{encoded}')))
+function Deny-Target([string]$Code, [string]$Path) {{
+  @{{passed=$false;code=$Code;path=$Path}} | ConvertTo-Json -Compress
+  exit 1
+}}
+try {{
+  $tasks = @(Get-ScheduledTask -ErrorAction Stop)
+  $matching = @($tasks | Where-Object {{
+    [string]::Equals(
+      [string]$_.TaskName,
+      [string]$request.task_name,
+      [System.StringComparison]::OrdinalIgnoreCase) -and
+    [string]::Equals(
+      [string]$_.TaskPath,
+      [string]$request.task_path,
+      [System.StringComparison]::OrdinalIgnoreCase)
+  }})
+  if ($matching.Count -ne 0) {{
+    Deny-Target 'windows_target_task_exists' ([string]$request.task_path)
+  }}
+  foreach ($path in @($request.files)) {{
+    $item = $null
+    try {{
+      $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+    }} catch [System.Management.Automation.ItemNotFoundException] {{
+      continue
+    }}
+    if ($null -ne $item) {{
+      Deny-Target 'windows_target_not_empty' ([string]$path)
+    }}
+  }}
+  foreach ($root in @($request.roots)) {{
+    $item = $null
+    try {{
+      $item = Get-Item -LiteralPath $root -Force -ErrorAction Stop
+    }} catch [System.Management.Automation.ItemNotFoundException] {{
+      continue
+    }}
+    if ($null -eq $item) {{
+      throw 'target root observation returned no object'
+    }}
+    if (-not $item.PSIsContainer -or
+        ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {{
+      Deny-Target 'windows_target_not_empty' ([string]$root)
+    }}
+    if (@(Get-ChildItem -LiteralPath $root -Force -ErrorAction Stop).Count -ne 0) {{
+      Deny-Target 'windows_target_not_empty' ([string]$root)
+    }}
+  }}
+  @{{passed=$true}} | ConvertTo-Json -Compress
+}} catch {{
+  @{{
+    passed=$false
+    code='windows_target_observation_unknown'
+    message=$_.Exception.Message
+  }} | ConvertTo-Json -Compress
+  exit 2
+}}
+"""
+    document, completed = _run_windows_powershell(
+        ssh_host=ssh_host,
+        script=script,
+        timeout=timeout,
+        commands=commands,
+    )
+    if (
+        completed.returncode in (0, 1)
+        and document.get("passed") is False
+        and document.get("code")
+        in {"windows_target_task_exists", "windows_target_not_empty"}
+    ):
+        raise RecoveryError(
+            "windows_target_not_empty",
+            "Windows disaster recovery requires an empty target",
+            document,
+        )
+    require(
+        completed.returncode == 0 and document.get("passed") is True,
+        "windows_recovery_transport_unknown",
+        "Windows target-emptiness outcome is unknown",
+        document,
+    )
+
+
+def _validate_windows_recovery_state(document: object) -> dict:
+    fields = {
+        "schema_version",
+        "ssh_host",
+        "state_root",
+        "output_root",
+        "package_root",
+        "binding",
+        "endpoint_config",
+        "token",
+        "release",
+        "install_id",
+        "install_receipt",
+        "lifecycle",
+        "bootstrap",
+        "acl",
+        "native_operations",
+        "output",
+        "status",
+        "archive_name",
+        "archive_sha256",
+    }
+    require(
+        isinstance(document, dict) and set(document) == fields,
+        "windows_recovery_state_invalid",
+        "Windows recovery state fields differ",
+    )
+    require(
+        document["schema_version"] == WINDOWS_RECOVERY_SCHEMA,
+        "windows_recovery_state_invalid",
+        "Windows recovery schema is unsupported",
+    )
+    for name in ("ssh_host", "state_root", "output_root", "package_root", "archive_name"):
+        require(
+            isinstance(document[name], str) and bool(document[name]),
+            "windows_recovery_state_invalid",
+            f"Windows recovery {name} is invalid",
+        )
+    require(
+        isinstance(document["archive_sha256"], str)
+        and bool(HEX64.fullmatch(document["archive_sha256"])),
+        "windows_recovery_state_invalid",
+        "Windows archive digest is invalid",
+    )
+    for name in (
+        "binding",
+        "endpoint_config",
+        "token",
+        "release",
+        "install_id",
+        "install_receipt",
+        "lifecycle",
+        "bootstrap",
+        "acl",
+    ):
+        row = document[name]
+        require(
+            isinstance(row, dict)
+            and {"source_path", "member", "bytes", "sha256"} <= set(row)
+            and isinstance(row["source_path"], str)
+            and isinstance(row["member"], str)
+            and type(row["bytes"]) is int
+            and row["bytes"] >= 0
+            and isinstance(row["sha256"], str)
+            and bool(HEX64.fullmatch(row["sha256"])),
+            "windows_recovery_state_invalid",
+            f"Windows recovery {name} descriptor is invalid",
+        )
+        confined_member(row["member"], "Windows recovery member")
+    for name in ("native_operations", "output"):
+        row = document[name]
+        require(
+            isinstance(row, dict)
+            and set(row) == {"source_path", "member", "exists"}
+            and isinstance(row["source_path"], str)
+            and isinstance(row["member"], str)
+            and type(row["exists"]) is bool,
+            "windows_recovery_state_invalid",
+            f"Windows recovery {name} descriptor is invalid",
+        )
+        confined_member(row["member"], "Windows recovery member")
+    status = document["status"]
+    require(
+        isinstance(status, dict)
+        and status.get("passed") is True
+        and status.get("verb") == "status"
+        and isinstance(status.get("task"), dict)
+        and isinstance(status.get("identity"), dict),
+        "windows_recovery_state_invalid",
+        "Windows recovery status identity is invalid",
+    )
+    return document
+
+
+def _windows_target_from_state(state: dict) -> dict:
+    identity = state["status"]["identity"]
+    release = identity.get("release")
+    require(
+        isinstance(release, dict),
+        "windows_recovery_state_invalid",
+        "Windows status identity has no release",
     )
     return {
-        "schema_version": WINDOWS_RECOVERY_SCHEMA,
-        "bundle": {
-            "member": WINDOWS_BUNDLE_MEMBER,
-            "bytes": bundle.stat().st_size,
-            "sha256": sha256_file(bundle),
+        "ssh_host": state["ssh_host"],
+        "state_root": state["state_root"],
+        "output_root": state["output_root"],
+        "package_root": state["package_root"],
+        "install_id": identity["install_id"],
+        "config_digest": identity["config_digest"],
+        "release": {
+            key: release[key]
+            for key in ("version", "source_commit", "source_sha256")
         },
-        "state_sha256": _digest_document(state),
-        "state": state,
-        "remote_cleanup": cleanup,
-        "windows_cleanup": windows_cleanup,
     }
+
+
+def _require_windows_disabled_status(document: dict, expected: dict) -> dict:
+    expected_task = expected.get("task")
+    expected_identity = expected.get("identity")
+    task = document.get("task")
+    status = document.get("status")
+    require(
+        document.get("passed") is True
+        and document.get("verb") == "status"
+        and isinstance(expected_task, dict)
+        and isinstance(expected_identity, dict)
+        and isinstance(task, dict)
+        and isinstance(status, dict),
+        "windows_recovery_state_invalid",
+        "Windows live status is malformed",
+    )
+    require(
+        task.get("state") == "Disabled"
+        and task.get("task_name") == expected_task.get("task_name")
+        and task.get("task_path") == expected_task.get("task_path")
+        and task.get("semantic_sha256") == expected_task.get("semantic_sha256")
+        and task.get("security_descriptor_sha256")
+        == expected_task.get("security_descriptor_sha256"),
+        "windows_recovery_state_invalid",
+        "Windows task, semantic identity, or ACL differs from the archive",
+    )
+    require(
+        document.get("identity") == expected_identity,
+        "windows_recovery_identity_mismatch",
+        "Windows live identity differs from the archive",
+    )
+    require(
+        status.get("task_exists") is True
+        and status.get("task_state") == "Disabled"
+        and status.get("error") is None
+        and status.get("consistent") is True
+        and type(status.get("solidworks_processes")) is int
+        and status["solidworks_processes"] == 0
+        and document.get("listener") is None
+        and document.get("health") is None,
+        "windows_recovery_state_invalid",
+        "Windows live status is not a verified Disabled endpoint",
+    )
+    return document
+
+
+def _verify_windows_state_members(state: dict, extracted: Path) -> None:
+    for name in (
+        "binding",
+        "endpoint_config",
+        "token",
+        "release",
+        "install_id",
+        "install_receipt",
+        "lifecycle",
+        "bootstrap",
+        "acl",
+    ):
+        row = state[name]
+        path = extracted / row["member"]
+        require_real_file(path, f"Windows recovery {name}", "windows_recovery_bundle_invalid")
+        require(
+            path.stat().st_size == row["bytes"]
+            and sha256_file(path) == row["sha256"],
+            "windows_recovery_bundle_invalid",
+            f"Windows recovery {name} differs from its manifest",
+        )
 
 
 def restore_windows_recovery(
@@ -7597,146 +6096,191 @@ def restore_windows_recovery(
     status_dir: Path,
     verify_only: bool,
     commands: list[dict],
-    timeout: int = 3600,
 ) -> dict:
-    """Restore/verify Windows objects without starting the endpoint."""
-
-    windows = manifest["windows"]
-    target = plan["windows"]
-    bundle = extracted / windows["bundle"]["member"]
-    require_real_file(bundle, "Windows recovery bundle", "windows_recovery_bundle_invalid")
+    state = _validate_windows_recovery_state(manifest["windows"])
+    _verify_windows_state_members(state, extracted)
+    if verify_only:
+        status = _windows_public_verb(
+            ssh_host=plan["windows"]["ssh_host"],
+            state_root=plan["windows"]["state_root"],
+            verb="status",
+            timeout=180,
+            commands=commands,
+        )
+        _require_windows_disabled_status(status, state["status"])
+        result = {"verified_only": True, "status": status}
+        write_json_once(status_dir / "windows-recovery.json", result)
+        return result
+    binding_path = extracted / state["binding"]["member"]
+    binding = _read_windows_binding(binding_path)
+    state_root = state["state_root"]
+    ssh_host = state["ssh_host"]
+    endpoint_config_path = _windows_normalize(binding["endpoint_config"])
+    token_path = _windows_normalize(
+        json.loads((extracted / state["endpoint_config"]["member"]).read_text(encoding="utf-8"))[
+            "token_file"
+        ]
+    )
+    release_file_path = _windows_normalize(binding["release_file"])
+    release_parent = str(Path(release_file_path.replace("/", os.sep)).parent).replace(os.sep, "/")
+    install_id_path = state_root + "/install-id"
+    lifecycle_path = state_root + "/instance-lifecycle.ps1"
+    bootstrap_path = state_root + "/bootstrap-managed-root.ps1"
+    fixed_binding = state_root + "/windows-binding.json"
+    archive_path = release_parent + "/" + state["archive_name"]
+    generation_path = state_root + "/lifecycle/generation"
+    local_archive = extracted / "release" / "artifacts" / state["archive_name"]
+    require_real_file(local_archive, "Windows release archive", "windows_recovery_bundle_invalid")
     require(
-        bundle.stat().st_size == windows["bundle"]["bytes"] and sha256_file(bundle) == windows["bundle"]["sha256"],
+        sha256_file(local_archive) == state["archive_sha256"],
         "windows_recovery_bundle_invalid",
-        "Windows recovery bundle differs from its manifest member",
+        "Windows release archive differs from the recovery state",
     )
-    state = _read_windows_state(bundle)
+    local_deployment = _windows_deployment_archive(manifest, extracted)
+    release_scripts = status_dir / "windows-release-scripts"
+    release_scripts.mkdir(mode=0o700)
+    local_lifecycle = release_scripts / "instance-lifecycle.ps1"
+    local_bootstrap = release_scripts / "bootstrap-managed-root.ps1"
+    _windows_script_from_deployment(
+        local_deployment,
+        local_lifecycle,
+        name="instance-lifecycle.ps1",
+    )
+    _windows_script_from_deployment(
+        local_deployment,
+        local_bootstrap,
+        name="bootstrap-managed-root.ps1",
+    )
     require(
-        _digest_document(state) == windows["state_sha256"] and state == windows["state"],
+        sha256_file(local_lifecycle) == state["lifecycle"]["sha256"]
+        and sha256_file(local_bootstrap) == state["bootstrap"]["sha256"],
         "windows_recovery_bundle_invalid",
-        "Windows recovery bundle state differs from the manifest",
+        "Windows release scripts differ from the installed control scripts",
     )
-    require(
-        _windows_target_from_state(state) == target,
-        "windows_target_plan_invalid",
-        "Windows target plan differs from the archived Windows state",
-    )
-    operation = "recovery-verify" if verify_only else "recovery-restore"
-    remote_dir = _windows_remote_dir(target["state_root"], operation, windows["state_sha256"])
-    remote_bundle = f"{remote_dir}/{WINDOWS_BUNDLE}"
-    binding = _windows_restore_binding(
-        ssh_host=target["ssh_host"],
-        target=target,
-        remote_bundle=remote_bundle,
-        bundle_sha256=windows["bundle"]["sha256"],
-    )
-    result = _transfer_windows_recovery(
-        ssh_host=target["ssh_host"],
-        remote_dir=remote_dir,
-        script=_windows_script_path(),
-        binding_document=binding,
-        operation=operation,
+    _windows_restore_target_empty(
+        ssh_host=ssh_host,
+        binding=binding,
+        roots=[state_root, release_parent],
+        paths=[
+            state_root + "/install-id",
+            state_root + "/install-receipt.json",
+            lifecycle_path,
+            bootstrap_path,
+            fixed_binding,
+            generation_path,
+            endpoint_config_path,
+            token_path,
+            release_file_path,
+            archive_path,
+            state["output_root"],
+            state["package_root"],
+            state_root + "/native-operations",
+        ],
+        timeout=180,
         commands=commands,
-        timeout=timeout,
-        upload_bundle=bundle,
-        evidence_dir=status_dir / "windows-transfer-evidence",
     )
-    _validate_remote_cleanup(result.get("remote_cleanup"))
-    _validate_windows_inner_cleanup(result.get("cleanup"), required=True)
-    observed_state = _validate_windows_recovery_state(result.get("state"))
-    observed_sha256 = _digest_document(observed_state)
+
+    _windows_create_parents(
+        ssh_host=ssh_host,
+        paths=[
+            state_root,
+            endpoint_config_path,
+            token_path,
+            release_file_path,
+            archive_path,
+            fixed_binding,
+            lifecycle_path,
+            bootstrap_path,
+        ],
+        timeout=180,
+        commands=commands,
+    )
+    for source, remote in (
+        (local_lifecycle, lifecycle_path),
+        (local_bootstrap, bootstrap_path),
+    ):
+        _windows_scp(
+            ssh_host=ssh_host,
+            source=source,
+            destination=f"{ssh_host}:{remote}",
+            timeout=3600,
+            commands=commands,
+        )
+    for member, remote in (
+        (state["binding"]["member"], fixed_binding),
+        (state["endpoint_config"]["member"], endpoint_config_path),
+        (state["token"]["member"], token_path),
+        (state["install_id"]["member"], install_id_path),
+        (state["install_receipt"]["member"], state_root + "/install-receipt.json"),
+        (state["release"]["member"], release_file_path),
+    ):
+        _windows_scp(
+            ssh_host=ssh_host,
+            source=extracted / member,
+            destination=f"{ssh_host}:{remote}",
+            timeout=3600,
+            commands=commands,
+        )
+    _windows_scp(
+        ssh_host=ssh_host,
+        source=local_archive,
+        destination=f"{ssh_host}:{archive_path}",
+        timeout=3600,
+        commands=commands,
+    )
+    if state["native_operations"]["exists"]:
+        local_native = extracted / state["native_operations"]["member"]
+        require_real_dir(local_native, "Windows native-operation data", "windows_recovery_bundle_invalid")
+        _windows_scp(
+            ssh_host=ssh_host,
+            source=local_native,
+            destination=f"{ssh_host}:{state_root}/",
+            timeout=3600,
+            recursive=True,
+            commands=commands,
+        )
+    local_output = extracted / state["output"]["member"]
+    require_real_dir(local_output, "Windows output data", "windows_recovery_bundle_invalid")
+    output_parent = _windows_normalize(str(Path(state["output_root"].replace("/", os.sep)).parent).replace(os.sep, "/"))
+    _windows_scp(
+        ssh_host=ssh_host,
+        source=local_output,
+        destination=f"{ssh_host}:{output_parent}/",
+        timeout=3600,
+        recursive=True,
+        commands=commands,
+    )
+    installed = _windows_public_verb(
+        ssh_host=ssh_host,
+        state_root=state_root,
+        verb="install",
+        timeout=3600,
+        commands=commands,
+    )
+    identity = installed.get("identity")
+    expected = state["status"]["identity"]
     require(
-        result.get("task_state") == "Disabled"
-        and result.get("endpoint") == "stopped"
-        and result.get("cad_ownership") == "free"
-        and observed_state == state
-        and observed_sha256 == windows["state_sha256"],
-        "windows_recovery_verification_failed",
-        "Windows recovery did not end disabled, stopped, CAD-free and state-identical",
+        isinstance(identity, dict)
+        and identity.get("install_id") == expected.get("install_id")
+        and identity.get("config_digest") == expected.get("config_digest")
+        and identity.get("release") == expected.get("release"),
+        "windows_recovery_identity_mismatch",
+        "reinstalled Windows endpoint differs from the archived identity",
     )
-    result["state_sha256"] = observed_sha256
+    status = _windows_public_verb(
+        ssh_host=ssh_host,
+        state_root=state_root,
+        verb="status",
+        timeout=180,
+        commands=commands,
+    )
+    _require_windows_disabled_status(status, state["status"])
+    result = {
+        "status": status,
+        "installation": installed,
+    }
     write_json_once(status_dir / "windows-recovery.json", result)
     return result
-
-
-def _windows_task_state(
-    *,
-    ssh_host: str,
-    task_name: str,
-    timeout: int,
-) -> tuple[str, dict]:
-    escaped = task_name.replace("'", "''")
-    script = (
-        f"$ErrorActionPreference='Stop';$task=Get-ScheduledTask -TaskName '{escaped}';[Console]::Out.Write($task.State)"
-    )
-    commands: list[dict] = []
-    completed = _run_windows_powershell(
-        ssh_host=ssh_host,
-        script=script,
-        timeout=min(timeout, 60),
-        commands=commands,
-    )
-    evidence = commands[-1]
-    state = completed.stdout.strip()
-    require(
-        state in {"Disabled", "Ready", "Queued", "Running"},
-        "recovery_maintenance_unavailable",
-        "the Windows maintenance task state is unreadable",
-        {"task": task_name, "state": state or "unknown"},
-    )
-    return state, evidence
-
-
-def _disable_windows_task(
-    *,
-    ssh_host: str,
-    task_name: str,
-    timeout: int,
-) -> tuple[str, list[dict]]:
-    evidence = []
-    initial_state, initial_evidence = _windows_task_state(
-        ssh_host=ssh_host,
-        task_name=task_name,
-        timeout=timeout,
-    )
-    evidence.append(initial_evidence)
-    if initial_state != "Disabled":
-        escaped = task_name.replace("'", "''")
-        script = (
-            "$ErrorActionPreference='Stop';"
-            f"$task=Get-ScheduledTask -TaskName '{escaped}';"
-            "if ($task.State -eq 'Running') {"
-            f"Stop-ScheduledTask -TaskName '{escaped}' -ErrorAction Stop;"
-            "};"
-            f"Disable-ScheduledTask -TaskName '{escaped}' -ErrorAction Stop | Out-Null;"
-            "[Console]::Out.Write('Disabled')"
-        )
-        disable_commands: list[dict] = []
-        completed = _run_windows_powershell(
-            ssh_host=ssh_host,
-            script=script,
-            timeout=min(timeout, 60),
-            commands=disable_commands,
-        )
-        require(
-            completed.returncode == 0 and completed.stdout.strip() == "Disabled",
-            "recovery_maintenance_not_exclusive",
-            "the Windows native writer task could not be disabled",
-        )
-        evidence.append(disable_commands[-1])
-    final_state, final_evidence = _windows_task_state(
-        ssh_host=ssh_host,
-        task_name=task_name,
-        timeout=timeout,
-    )
-    evidence.append(final_evidence)
-    require(
-        final_state == "Disabled",
-        "recovery_maintenance_not_exclusive",
-        "the Windows native writer task is not disabled",
-        {"task": task_name, "state": final_state},
-    )
-    return final_state, evidence
 
 
 def quiesce_maintenance(
@@ -7744,8 +6288,8 @@ def quiesce_maintenance(
     database: dict,
     *,
     operatorctl_path: Path,
+    maintenance_lock: MaintenanceLock,
     timeout: int,
-    maintenance_lock: MaintenanceLock | None = None,
 ) -> dict:
     _require_airflow_interpreter(context)
     operatorctl_path = Path(operatorctl_path).resolve()
@@ -7761,6 +6305,12 @@ def quiesce_maintenance(
         "bash is unavailable for operatorctl",
     )
     opened_at = utc_now()
+    lock_env = {
+        "OPERATORCTL_MAINTENANCE_LOCK_OWNER": maintenance_lock.owner_id,
+        "OPERATORCTL_MAINTENANCE_LOCK_FD": str(maintenance_lock.descriptor),
+        "OPERATORCTL_MAINTENANCE_LOCK_PATH": str(maintenance_lock.path),
+    }
+    lock_fds = (maintenance_lock.descriptor,)
     drain_argv = [
         bash,
         operatorctl_path,
@@ -7768,25 +6318,11 @@ def quiesce_maintenance(
         "--config",
         context.config_path,
     ]
-    inherited = {}
-    inherited_fds = ()
-    if maintenance_lock is not None:
-        require(
-            maintenance_lock.descriptor >= 0,
-            "recovery_maintenance_unavailable",
-            "the maintenance lock descriptor is closed",
-        )
-        inherited = {
-            "OPERATORCTL_MAINTENANCE_LOCK_OWNER": maintenance_lock.owner_id,
-            "OPERATORCTL_MAINTENANCE_LOCK_FD": str(maintenance_lock.descriptor),
-            "OPERATORCTL_MAINTENANCE_LOCK_PATH": str(maintenance_lock.path),
-        }
-        inherited_fds = (maintenance_lock.descriptor,)
     _, drain_evidence = _run_maintenance_command(
         drain_argv,
         timeout=timeout,
-        env=inherited,
-        pass_fds=inherited_fds,
+        env=lock_env,
+        pass_fds=lock_fds,
     )
     _wait_database_quiescence(database, timeout=timeout)
     stop_argv = [
@@ -7800,18 +6336,24 @@ def quiesce_maintenance(
     _, stop_evidence = _run_maintenance_command(
         stop_argv,
         timeout=timeout,
-        env=inherited,
-        pass_fds=inherited_fds,
+        env=lock_env,
+        pass_fds=lock_fds,
     )
     linux_states = _linux_unit_states(timeout=timeout)
     windows = context.resolved["windows"]
     instance = windows["instance"]
     ssh_host = windows["ssh_host"]
     task_name = instance["task_name"]
-    windows_state, windows_evidence = _disable_windows_task(
+    windows_state, windows_evidence = _windows_task_state(
         ssh_host=ssh_host,
-        task_name=task_name,
+        state_root=_windows_normalize(instance["state_root"]),
         timeout=timeout,
+    )
+    require(
+        windows_state == "Disabled",
+        "recovery_maintenance_not_exclusive",
+        "the Windows endpoint task is not disabled",
+        {"task": task_name, "state": windows_state},
     )
     database_before = _wait_database_quiescence(database, timeout=timeout)
     return {
@@ -7843,7 +6385,7 @@ def finalize_maintenance_receipt(
     task_name = windows["instance"]["task_name"]
     windows_state, windows_evidence = _windows_task_state(
         ssh_host=windows["ssh_host"],
-        task_name=task_name,
+        state_root=_windows_normalize(windows["instance"]["state_root"]),
         timeout=timeout,
     )
     require(
@@ -7951,11 +6493,14 @@ def backup_command(
             {"root": str(root)},
         )
 
-    lifecycle_lock = acquire_maintenance_lock(Path(context.resolved["storage"]["state_root"]))
+    lifecycle_lock: dict[str, MaintenanceLock] = {}
     claim = None
     try:
         claim = claim_backup_output(out, backup_id)
         try:
+            lifecycle_lock["lock"] = acquire_maintenance_lock(
+                Path(context.resolved["storage"]["state_root"])
+            )
             return _backup_command_claimed(
                 context=context,
                 lifecycle_lock=lifecycle_lock,
@@ -7989,13 +6534,15 @@ def backup_command(
                 error.backup_failure = failure
             raise
     finally:
-        lifecycle_lock.close()
+        lock = lifecycle_lock.get("lock")
+        if lock is not None:
+            lock.close()
 
 
 def _backup_command_claimed(
     *,
     context: BackupContext,
-    lifecycle_lock: MaintenanceLock,
+    lifecycle_lock: dict[str, MaintenanceLock],
     claim: BackupOutputClaim,
     backup_id: str,
     key_file: Path,
@@ -8043,8 +6590,8 @@ def _backup_command_claimed(
         context,
         database,
         operatorctl_path=operatorctl_path,
+        maintenance_lock=lifecycle_lock["lock"],
         timeout=3600,
-        maintenance_lock=lifecycle_lock,
     )
     write_json_once(
         maintenance_stopped_path,
@@ -8062,7 +6609,7 @@ def _backup_command_claimed(
     staging = out / "backup"
     require_current_claim(claim)
     try:
-        backup.remove_private_staging(out)
+        remove_private_staging(out)
     except SystemExit as error:
         raise RecoveryError(
             "recovery_target_path_unsafe",
@@ -8106,7 +6653,7 @@ def _backup_command_claimed(
         },
     )
     worker_env = os.environ.copy()
-    deploy_dir = str(Path(backup.__file__).resolve().parent)
+    deploy_dir = str(Path(__file__).resolve().parent)
     python_path = worker_env.get("PYTHONPATH", "")
     worker_env["PYTHONPATH"] = f"{deploy_dir}:{python_path}" if python_path else deploy_dir
     worker_log = (control / "worker.stdout.log").open("wb")
@@ -8144,8 +6691,7 @@ def _backup_command_claimed(
             "recovery_snapshot_worker_failed",
             "snapshot recovery root differs from its decision references",
         )
-        journal = journal_selection(Path(context.resolved["storage"]["state_root"]))
-        source_checks = backup_source_checks(context, recovery_root=recovery_root, journal=journal)
+        source_checks = backup_source_checks(context, recovery_root=recovery_root)
         selection = {
             "schema_version": SELECTION_SCHEMA,
             "snapshot_id": snapshot_ready["snapshot_id"],
@@ -8154,7 +6700,6 @@ def _backup_command_claimed(
             "fact_root": recovery_root,
             "fact_root_sha256": snapshot_ready["recovery_root_sha256"],
             "root_scopes": source_checks,
-            "journal_entries": journal,
         }
         inventory_before = source_inventory(selection["root_scopes"])
         selection["source_members"] = source_member_map(context.release_document, inventory_before)[0]
@@ -8212,11 +6757,6 @@ def _backup_command_claimed(
         copy_required_file(
             context.archive_root / "release.json",
             staging / "config" / "release.json",
-        )
-        capture_checkpoint_store(
-            Path(context.resolved["derived"]["store_root"]),
-            staging,
-            selection=selection,
         )
         copy_required_tree(
             Path(context.resolved["storage"]["handoff_root"]),
@@ -8424,8 +6964,8 @@ def _backup_command_claimed(
         **capture_result["consistency"],
         "maintenance_lock": {
             "kind": "exclusive-filesystem-lock",
-            "path": str(lifecycle_lock.path),
-            "owner_id": lifecycle_lock.owner_id,
+            "path": str(lifecycle_lock["lock"].path),
+            "owner_id": lifecycle_lock["lock"].owner_id,
             "held": True,
         },
         "source_inventory_before_sha256": hashlib.sha256(canonical_json(inventory_before)).hexdigest(),
@@ -8440,7 +6980,7 @@ def _backup_command_claimed(
     }
     archive_path = out / "recovery.tar.enc"
     require_current_claim(claim)
-    archive_sha = backup.seal(staging, key_file, archive_path)
+    archive_sha = seal_recovery_archive(staging, key_file, archive_path)
     try:
         verify_manifest_source_binding(
             staging,
@@ -8515,18 +7055,6 @@ def _backup_command_claimed(
                 "mode": 0o600,
                 "required": True,
             }
-        ]
-        + [
-            {
-                "name": scope["name"],
-                "path": scope["path"],
-                "member": scope["archive"],
-                "mode": next(row["mode"] for row in journal if row["source_path"] == scope["path"]),
-                "required": True,
-            }
-            for scope in selection["root_scopes"]
-            if scope["name"].startswith("journal_file_")
-            and not Path(scope["path"]).is_relative_to(Path(context.resolved["storage"]["state_root"]))
         ],
         "roots": roots,
         "members": inventory_rows,
@@ -8580,7 +7108,7 @@ def _backup_command_claimed(
     cleanup_error = None
     try:
         require_current_claim(claim)
-        staging_removed = backup.remove_private_staging(out)
+        staging_removed = remove_private_staging(out)
     except (SystemExit, OSError, RecoveryError) as error:
         cleanup_error = str(error)
     final_receipt = {
@@ -9233,25 +7761,19 @@ def validate_manifest(document: object, *, expected_manifest_sha: str | None) ->
             {"task_name", "state", "evidence"},
             f"maintenance.receipt.services.{phase}",
         )
+        evidence = windows_state["evidence"]
         require(
             isinstance(windows_state["task_name"], str)
             and bool(windows_state["task_name"])
             and windows_state["state"] == "Disabled"
-            and isinstance(windows_state["evidence"], list)
-            and bool(windows_state["evidence"])
-            and all(
-                isinstance(command, dict)
-                and set(command) == {"argv", "returncode", "stdout_sha256", "stderr_sha256"}
-                and isinstance(command["argv"], list)
-                and bool(command["argv"])
-                and all(isinstance(value, str) and bool(value) for value in command["argv"])
-                and command["returncode"] == 0
-                and isinstance(command["stdout_sha256"], str)
-                and bool(HEX64.fullmatch(command["stdout_sha256"]))
-                and isinstance(command["stderr_sha256"], str)
-                and bool(HEX64.fullmatch(command["stderr_sha256"]))
-                for command in windows_state["evidence"]
-            ),
+            and isinstance(evidence, dict)
+            and evidence.get("schema_version")
+            == "solidworks-to-urdf.windows-lifecycle-result/v1"
+            and evidence.get("passed") is True
+            and evidence.get("verb") == "status"
+            and isinstance(evidence.get("task"), dict)
+            and evidence["task"].get("state") == "Disabled"
+            and evidence["task"].get("task_name") == windows_state["task_name"],
             "recovery_manifest_invalid",
             f"maintenance receipt {phase} Windows state is malformed",
         )
@@ -9282,44 +7804,11 @@ def validate_manifest(document: object, *, expected_manifest_sha: str | None) ->
         "recovery_manifest_invalid",
         "maintenance receipt belongs to another database authority",
     )
-    windows = _exact_keys(
-        doc["windows"],
-        {
-            "schema_version",
-            "bundle",
-            "state_sha256",
-            "state",
-            "remote_cleanup",
-            "windows_cleanup",
-        },
-        "windows",
-    )
-    bundle = _exact_keys(
-        windows["bundle"],
-        {"member", "bytes", "sha256"},
-        "windows.bundle",
-    )
+    windows_state = _validate_windows_recovery_state(doc["windows"])
+    windows_task = windows_state["status"]["task"]
     require(
-        windows["schema_version"] == WINDOWS_RECOVERY_SCHEMA
-        and bundle["member"] == WINDOWS_BUNDLE_MEMBER
-        and isinstance(windows["state_sha256"], str)
-        and bool(HEX64.fullmatch(windows["state_sha256"])),
-        "recovery_manifest_invalid",
-        "Windows recovery block is malformed",
-    )
-    _validate_remote_cleanup(windows["remote_cleanup"])
-    _validate_windows_inner_cleanup(windows["windows_cleanup"], required=False)
-    require_bound_file(
-        bundle["member"],
-        expected_bytes=bundle["bytes"],
-        expected_sha=bundle["sha256"],
-        where="windows.bundle",
-    )
-    windows_state = _validate_windows_recovery_state(windows["state"])
-    require(
-        _digest_document(windows_state) == windows["state_sha256"]
-        and windows_state["task"]["task_name"] == services["windows_before"]["task_name"]
-        and windows_state["task"]["task_name"] == services["windows_after"]["task_name"],
+        windows_task.get("task_name") == services["windows_before"]["task_name"]
+        and windows_task.get("task_name") == services["windows_after"]["task_name"],
         "recovery_manifest_invalid",
         "Windows recovery state differs from the maintenance receipt",
     )
@@ -9331,6 +7820,7 @@ def validate_manifest(document: object, *, expected_manifest_sha: str | None) ->
                 "admission",
                 "settled",
                 "unsettled_count",
+                "unsettled",
                 "active_application_sessions",
                 "wal_lsn",
             },
@@ -9345,6 +7835,7 @@ def validate_manifest(document: object, *, expected_manifest_sha: str | None) ->
             admission["state"] == "closed"
             and value["settled"] is True
             and value["unsettled_count"] == 0
+            and value["unsettled"] == []
             and value["active_application_sessions"] == []
             and isinstance(value["wal_lsn"], str)
             and bool(value["wal_lsn"]),
@@ -9740,21 +8231,9 @@ def prepare_extraction(
         dir=status_dir,
     )
     destination = Path(temporary.name) / "archive"
-    legacy = {
-        "schema": backup.MANIFEST_SCHEMA,
-        "files": {row["member"]: row["sha256"] for row in manifest["members"] if row["type"] == "file"},
-        "encrypted": {
-            "path": str(archive),
-            "sha256": manifest["archive"]["sha256"],
-            "cipher": "aes-256-cbc",
-            "key": str(key),
-        },
-    }
-    legacy_path = Path(temporary.name) / "legacy-manifest.json"
-    atomic_write(legacy_path, canonical_json(legacy))
     try:
-        backup.open_archive(archive, key, legacy_path, destination)
-    except SystemExit as error:
+        extract_recovery_archive(archive, key, destination)
+    except RecoveryError as error:
         temporary.cleanup()
         raise RecoveryError(
             "recovery_member_hash_mismatch",
@@ -9848,39 +8327,19 @@ def validate_target_plan(
         plan["windows"],
         {
             "ssh_host",
-            "task_path",
-            "task_name",
-            "principal_sid",
-            "task_xml_sha256",
-            "task_semantic_sha256",
-            "task_acl_sha256",
-            "endpoint_root",
-            "config_path",
-            "config_sha256",
-            "config_digest",
-            "token_path",
-            "token_sha256",
-            "install_id_path",
-            "install_id",
-            "release_identity_sha256",
-            "package_root",
-            "output_root",
             "state_root",
-            "port",
-            "cad_ownership_path",
-            "cad_ownership_sha256",
+            "output_root",
+            "package_root",
+            "install_id",
+            "config_digest",
+            "release",
         },
         "target.windows",
     )
     for key in (
-        "endpoint_root",
-        "config_path",
-        "token_path",
-        "install_id_path",
         "package_root",
         "output_root",
         "state_root",
-        "cad_ownership_path",
     ):
         require(
             isinstance(windows[key], str)
@@ -9890,7 +8349,7 @@ def validate_target_plan(
             f"target.windows.{key} must be an absolute forward-slash Windows path",
         )
     require(
-        windows == _windows_target_from_state(manifest["windows"]["state"]),
+        windows == _windows_target_from_state(manifest["windows"]),
         "recovery_target_plan_invalid",
         "target.windows does not exactly equal the archived Windows state",
     )
@@ -9909,7 +8368,7 @@ def build_target_plan(manifest: dict, manifest_sha: str, *, host_id: str, postgr
         "host_id": host_id,
         "postgres": copy.deepcopy(postgres),
         "roots": {row["name"]: row["path"] for row in manifest["roots"] if "reconstructible_runtime" not in row},
-        "windows": _windows_target_from_state(manifest["windows"]["state"]),
+        "windows": _windows_target_from_state(manifest["windows"]),
     }
     validate_target_plan(plan, manifest, manifest_sha)
     return plan
@@ -10374,8 +8833,8 @@ def verify_maintenance_archive_consistency(manifest: dict, extracted: Path) -> N
         and bool(task_name)
         and receipt["services"]["windows_before"]["task_name"] == task_name
         and receipt["services"]["windows_after"]["task_name"] == task_name
-        and manifest["windows"]["state"]["task"]["task_name"] == task_name
-        and manifest["windows"]["state"]["ssh_host"] == platform["windows"].get("ssh_host"),
+        and manifest["windows"]["status"]["task"]["task_name"] == task_name
+        and manifest["windows"]["ssh_host"] == platform["windows"].get("ssh_host"),
         "recovery_manifest_invalid",
         "maintenance receipt does not bind the archived Windows task authority",
     )
@@ -10392,21 +8851,8 @@ def verify_maintenance_archive_consistency(manifest: dict, extracted: Path) -> N
 
 
 def verify_windows_recovery_archive(manifest: dict, extracted: Path) -> None:
-    windows = manifest["windows"]
-    bundle = extracted / windows["bundle"]["member"]
-    require_real_file(bundle, "archived Windows recovery bundle", "windows_recovery_bundle_invalid")
-    require(
-        bundle.stat().st_size == windows["bundle"]["bytes"] and sha256_file(bundle) == windows["bundle"]["sha256"],
-        "windows_recovery_bundle_invalid",
-        "archived Windows recovery bundle differs from the manifest",
-    )
-    state = _read_windows_state(bundle)
-    require(
-        state == windows["state"] and _digest_document(state) == windows["state_sha256"],
-        "windows_recovery_bundle_invalid",
-        "embedded Windows recovery state differs from the manifest",
-    )
-    verify_windows_recovery_bundle_members(bundle, state)
+    state = _validate_windows_recovery_state(manifest["windows"])
+    _verify_windows_state_members(state, extracted)
 
 
 def verify_archive_consistency(manifest: dict, extracted: Path) -> None:
@@ -10978,7 +9424,7 @@ def copy_extracted_directory(
     finally:
         if path_exists(partial):
             with contextlib.suppress(OSError, SystemExit):
-                backup._remove_staging_tree(partial)  # same private-tree cleanup primitive
+                _remove_staging_tree(partial)
 
 
 def restore_directories(
@@ -11951,7 +10397,7 @@ def restore_workspaces(manifest: dict, extracted: Path, *, verify_only: bool) ->
             _workspace_verify(target, row)
         except (OSError, subprocess.SubprocessError, RecoveryError) as error:
             if path_exists(partial):
-                backup._remove_staging_tree(partial)
+                _remove_staging_tree(partial)
             raise RecoveryError(
                 "recovery_workspace_failed",
                 f"workspace reconstruction failed: {row['repository_slug']}",
@@ -12473,6 +10919,9 @@ def _recovered_runtime_environment() -> dict[str, str]:
     """Return only the caller environment needed to probe a recovered runtime."""
 
     environment = os.environ.copy()
+    for name in tuple(environment):
+        if name == "AIRFLOW_CONFIG" or name.startswith("AIRFLOW__"):
+            environment.pop(name)
     for name in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV"):
         environment.pop(name, None)
     environment["PYTHONNOUSERSITE"] = "1"
@@ -12674,22 +11123,27 @@ def verify_release_runtime(
         "recovered Python environment fails pip check",
         {"stderr": pip_check.stderr[-2000:]},
     )
-    for entry in ("airflow", "description"):
-        version_args = ["version"] if entry == "airflow" else ["--version"]
-        entry_probe = subprocess.run(
-            [str(venv / "bin" / entry), *version_args],
-            capture_output=True,
-            text=True,
-            timeout=120,
-            check=False,
-            env=runtime_environment,
-        )
-        require(
-            entry_probe.returncode == 0 and bool(entry_probe.stdout.strip()),
-            "recovery_release_missing",
-            f"recovered {entry} entry point does not execute",
-            {"stderr": entry_probe.stderr[-2000:]},
-        )
+    with tempfile.TemporaryDirectory(
+        prefix=".release-runtime-probe-",
+        dir=release_root,
+    ) as probe_home:
+        probe_environment = runtime_environment | {"AIRFLOW_HOME": probe_home}
+        for entry in ("airflow", "description"):
+            version_args = ["version"] if entry == "airflow" else ["--version"]
+            entry_probe = subprocess.run(
+                [str(venv / "bin" / entry), *version_args],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+                env=probe_environment,
+            )
+            require(
+                entry_probe.returncode == 0 and bool(entry_probe.stdout.strip()),
+                "recovery_release_missing",
+                f"recovered {entry} entry point does not execute",
+                {"stderr": entry_probe.stderr[-2000:]},
+            )
     require(
         release_contract["version"] == release["version"]
         and release_contract["source_sha256"] == release["source_sha256"],
@@ -12812,10 +11266,10 @@ def rehydrate_release_runtime(
             "PIP_FIND_LINKS": str(linux_dir / "wheels"),
         }
     )
-    install = deployment_dir / "deploy" / "airflow" / "install.sh"
-    require_real_file(install, "release Airflow installer", "recovery_release_missing")
+    installer = deployment_dir / "deploy" / "airflow" / "install_runtime.sh"
+    require_real_file(installer, "release Airflow runtime installer", "recovery_release_missing")
     completed = subprocess.run(
-        ["bash", str(install), "--stage"],
+        ["bash", str(installer)],
         capture_output=True,
         text=True,
         env=env,
@@ -13320,7 +11774,7 @@ def record_backup_failure(
             isinstance(payload["detail"], dict) and payload["detail"].get("download", {}).get("present") is True
         )
         if _claim_is_current(claim) and not partial_download:
-            staging_removed = backup.remove_private_staging(out)
+            staging_removed = remove_private_staging(out)
         if partial_download:
             payload["staging_retained_reason"] = "partial_windows_download"
     except (SystemExit, OSError, RecoveryError):

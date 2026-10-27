@@ -129,24 +129,33 @@ def decode_env_value(raw: str) -> str:
     return parts[0]
 
 
-def load_env(path: Path | None) -> dict[str, str]:
+def read_env(path: Path) -> dict[str, str]:
+    """Read environment declarations as data without evaluating shell expressions."""
+
     values: dict[str, str] = {}
-    if path is not None:
-        if not path.is_file():
-            die(f"env file not found: {path}")
-        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            key, separator, raw = stripped.partition("=")
-            if not separator or not re.fullmatch(r"[A-Z][A-Z0-9_]*", key.strip()):
-                die(f"{path}:{number}: expected KEY=VALUE")
-            try:
-                values[key.strip()] = decode_env_value(raw.strip())
-            except ValueError as error:
-                die(f"{path}:{number}: {error}")
-    else:
-        values = {key: value for key, value in os.environ.items() if re.fullmatch(r"[A-Z][A-Z0-9_]*", key)}
+    if not path.is_file() or path.is_symlink():
+        die(f"env file not found or is a link: {path}")
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        key, separator, raw = stripped.partition("=")
+        if not separator or not re.fullmatch(r"[A-Z][A-Z0-9_]*", key.strip()):
+            die(f"{path}:{number}: expected KEY=VALUE")
+        key = key.strip()
+        try:
+            value = decode_env_value(raw.strip())
+        except ValueError as error:
+            die(f"{path}:{number}: {error}")
+        if "\x00" in value:
+            die(f"{path}:{number}: environment values cannot contain NUL")
+        if key in values and values[key] != value:
+            die(f"{path}:{number}: conflicting duplicate declaration for {key}")
+        values[key] = value
+    return values
+
+
+def validate_env(values: dict[str, str]) -> dict[str, str]:
     for required in (
         "OPERATOR_HOST",
         "OPERATOR_STATE",
@@ -279,7 +288,6 @@ def ensure_portal_config(state: Path, resolved: dict[str, str]) -> Path:
         ("@OPERATOR_UPLOAD_ROOT@", resolved["SOLIDWORKS_HANDOFF_ROOT"]),
     ):
         rendered = rendered.replace(token, value)
-    rendered = rendered.replace('"@PIPELINE_STORE_ROOT@"', json.dumps(resolved["PIPELINE_STORE_ROOT"]))
     rendered = rendered.replace("@MODEL_REPOSITORIES_JSON@", resolved["MODEL_REPOSITORIES_JSON"])
     rendered = rendered.replace("@MODEL_TARGETS_JSON@", resolved["MODEL_TARGETS_JSON"])
     rendered = rendered.replace("@DISCOVERY_SETTINGS_JSON@", resolved["DISCOVERY_SETTINGS_JSON"])
@@ -313,7 +321,10 @@ def main() -> int:
     parser.add_argument("--json", action="store_true", help="print the resolved environment as JSON")
     args = parser.parse_args()
 
-    values = load_env(args.env_file)
+    values = read_env(args.env_file) if args.env_file is not None else {
+        key: value for key, value in os.environ.items() if re.fullmatch(r"[A-Z][A-Z0-9_]*", key)
+    }
+    values = validate_env(values)
     if args.state:
         values["OPERATOR_STATE"] = args.state
     installed_state = private_dir(require_no_space(values["OPERATOR_STATE"], "OPERATOR_STATE"), "OPERATOR_STATE")
@@ -366,18 +377,6 @@ def main() -> int:
     for label, other in runtime_paths:
         if handoff_root == other or other in handoff_root.parents or handoff_root in other.parents:
             die(f"SOLIDWORKS_HANDOFF_ROOT must not overlap {label}: {handoff_root}")
-    store_root = private_dir(
-        require_no_space(values.get("PIPELINE_STORE_ROOT") or str(installed_state / "runs"), "PIPELINE_STORE_ROOT"),
-        "PIPELINE_STORE_ROOT",
-    )
-    if store_root in BROAD_ROOTS or store_root == installed_state:
-        die("PIPELINE_STORE_ROOT must be a dedicated run directory")
-    for parent in (store_root, *store_root.parents):
-        if parent.is_symlink():
-            die("PIPELINE_STORE_ROOT cannot traverse a symlink")
-    for label, other in [("SOLIDWORKS_HANDOFF_ROOT", handoff_root), *runtime_paths[1:]]:
-        if store_root.is_relative_to(other) or other.is_relative_to(store_root):
-            die(f"PIPELINE_STORE_ROOT must not overlap {label}")
     repositories = {}
     repositories_file = values.get("MODEL_REPOSITORIES_FILE", "")
     if repositories_file:
@@ -398,7 +397,7 @@ def main() -> int:
             directory = private_dir(checkout, "model checkout")
             if directory in BROAD_ROOTS or any(parent.is_symlink() for parent in directory.parents):
                 die("Model checkout must be a dedicated real directory")
-            for label, other in [("capture store", store_root), ("handoff intake", handoff_root), *runtime_paths]:
+            for label, other in [("handoff intake", handoff_root), *runtime_paths]:
                 if directory.is_relative_to(other) or other.is_relative_to(directory):
                     die(f"Model checkout must not overlap {label}")
     targets = {}
@@ -487,7 +486,6 @@ def main() -> int:
         SOLIDWORKS_ENDPOINT_PORT=str(endpoint_port),
         OPERATOR_URL=f"https://{host}:{https_port}/",
         SOLIDWORKS_HANDOFF_ROOT=str(handoff_root),
-        PIPELINE_STORE_ROOT=str(store_root),
         MODEL_REPOSITORIES_JSON=json.dumps(repositories, sort_keys=True),
         MODEL_TARGETS_JSON=json.dumps(targets, sort_keys=True),
         DISCOVERY_SETTINGS_JSON=json.dumps(discovery, sort_keys=True),

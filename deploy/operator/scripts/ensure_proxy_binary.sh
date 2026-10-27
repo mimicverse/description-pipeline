@@ -9,7 +9,7 @@
 # path that was never installed is ever rendered.
 #
 # This mode may install or download, so it is called only from the controlled change entries
-# (install, promote, rollback) that re-render and re-bind the deployment; read-only verbs
+# (install) that re-renders and binds the deployment; read-only verbs
 # validate the bound value with ``check_proxy_binary.sh`` instead.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

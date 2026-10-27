@@ -514,7 +514,6 @@ class CaptureInputs:
     plan: Mapping[str, Any]
     object_names: tuple[str, ...]
     request_evidence: Mapping[str, Any]
-    historical_native_tool: Mapping[str, Any]
     current_native_tool: Mapping[str, Any]
     native_tool_requirement: ArtifactRef
 
@@ -863,7 +862,6 @@ class CaptureInputs:
             plan=plan,
             object_names=tuple(sorted(active)),
             request_evidence=dict(request_evidence),
-            historical_native_tool=dict(native_tool),
             current_native_tool=dict(current_native_tool),
             native_tool_requirement=requirement,
         )
@@ -1061,7 +1059,6 @@ def _seal_native_capture_artifact(
 ) -> dict[str, Any]:
     """Seal the native artifact and atomically install the completed Capture tree."""
 
-    from ..native_transfer import expected_native_check_details
     from ..orchestration.stage_transfer import CAPTURE_ARCHIVE, CAPTURE_MANIFEST, seal_capture
 
     write_json(staging / "reports/native-tool.json", native_tool)
@@ -1076,21 +1073,6 @@ def _seal_native_capture_artifact(
             "reason": "owned_native_sessions_released",
         },
     )
-    discovery = read_data(staging / "evidence/discovery.json")
-    native_files = discovery.get("native_files") if isinstance(discovery, dict) else None
-    if not isinstance(native_files, dict) or not native_files:
-        raise PipelineError("Native discovery has no file inventory")
-    expected_details = expected_native_check_details(
-        staging,
-        handoff_sha256=handoff_sha256,
-        main_assembly=main_assembly,
-        main_assembly_sha256=file_digest(staging / "input/cad" / main_assembly),
-        native_files=native_files,
-    )
-    for event in receipt["events"]:
-        check = event.get("check") if isinstance(event, dict) else None
-        if isinstance(check, dict) and check.get("id") in expected_details:
-            check["details"] = expected_details[check["id"]]
     _stamp_capture(staging, receipt)
     native_stages = read_data(staging / "reports/stages.json")
     native_stages["events"] = list(receipt["events"])

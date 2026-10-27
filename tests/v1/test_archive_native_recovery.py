@@ -46,7 +46,7 @@ class ArchiveNativeRecoveryTests(unittest.TestCase):
         self.snapshot_path.write_text("{}")
         self.resolved = {
             "storage": {"state_root": str(self.state), "release_root": str(self.runtime)},
-            "derived": {"store_root": str(self.state / "store")},
+            "derived": {},
         }
         self.snapshot = {
             "schema_version": recovery.platform_config.SNAPSHOT_SCHEMA,
@@ -70,7 +70,6 @@ class ArchiveNativeRecoveryTests(unittest.TestCase):
             "AIRFLOW_HOME": str(self.state / "airflow-home"),
             "AIRFLOW_VENV": str(self.venv),
             "PIPELINE_WHEEL": str(self.wheel),
-            "PIPELINE_STORE_ROOT": str(self.state / "store"),
             **dict.fromkeys(
                 ("AIRFLOW_DB_URL", "AIRFLOW_RUNTIME_DB_URL", "PLATFORM_SERVICE_DSN", "PLATFORM_OPERATOR_DSN"), "fixture"
             ),
@@ -93,7 +92,7 @@ class ArchiveNativeRecoveryTests(unittest.TestCase):
             ),
             mock.patch.object(recovery.platform_config, "validate_platform", return_value=self.resolved),
             mock.patch.object(recovery.install_record, "verify_active_generation", return_value=self.record),
-            mock.patch.object(recovery.render_operator, "load_env", return_value=self.env),
+            mock.patch.object(recovery.render_operator, "read_env", return_value=self.env),
             mock.patch.object(recovery, "workspace_reconstructible_plan", return_value={}),
             mock.patch.object(
                 recovery.subprocess, "check_output", side_effect=AssertionError("Git must not be queried")

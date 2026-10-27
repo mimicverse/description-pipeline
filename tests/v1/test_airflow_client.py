@@ -106,25 +106,22 @@ class ClientTests(unittest.TestCase):
                         str(caught.exception),
                     )
 
-    def test_linux_routing_map_and_store_root_are_validated(self) -> None:
+    def test_linux_routing_map_is_validated(self) -> None:
         config = EndpointConfig(
             base_url="http://127.0.0.1",
             token=TOKEN,
             repositories={
                 "mimicverse/description": "/home/andy/Work/description"
             },
-            store_root="/home/andy/operator/runs",
         )
         self.assertEqual(
             config.repositories,
             {"mimicverse/description": Path("/home/andy/Work/description")},
         )
-        self.assertEqual(config.store_root, Path("/home/andy/operator/runs"))
         for kwargs in (
             {"repositories": {"noslug": "/srv/repo"}},
             {"repositories": {"owner/repo": "relative/repo"}},
             {"repositories": ["owner/repo"]},
-            {"store_root": "relative/store"},
         ):
             with (
                 self.subTest(kwargs=kwargs),

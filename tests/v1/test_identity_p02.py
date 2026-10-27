@@ -75,7 +75,6 @@ class PortalConfigTargetsTests(unittest.TestCase):
                     "airflow": {"url": "http://127.0.0.1:8791"},
                     "endpoint": {"url": "http://127.0.0.1:18765", "token_file": str(token)},
                     "pipeline": {
-                        "store_root": str(root / "runs"),
                         "repositories": repositories,
                         "targets": targets,
                         "discovery": {},
@@ -114,6 +113,21 @@ class PortalConfigTargetsTests(unittest.TestCase):
             with self.assertRaises(portal.AirflowApiError) as caught:
                 portal.load_portal_config(config)
             self.assertIn("unconfigured repository", str(caught.exception))
+
+    def test_loader_rejects_removed_store_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self._write_config(
+                root,
+                targets={"m3.0": {"repository_slug": "mimicverse/description", "base": "main"}},
+                repositories={"mimicverse/description": str(root / "models")},
+            )
+            document = json.loads(config.read_text(encoding="utf-8"))
+            document["pipeline"]["store_root"] = str(root / "removed-store")
+            config.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertRaises(portal.AirflowApiError) as caught:
+                portal.load_portal_config(config)
+            self.assertIn("unknown keys", str(caught.exception))
 
 
 class IdentitySynthesisTests(unittest.TestCase):

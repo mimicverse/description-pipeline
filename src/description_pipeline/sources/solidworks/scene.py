@@ -352,18 +352,36 @@ def _kinematic_root(cfg: dict[str, Any], link_names: Sequence[str]) -> str | Non
 def material_unverified(payload: Any) -> bool:
     """Whether a raw reading explicitly records that its material is unverified.
 
-    Real captures write ``reference.material_assignment``: a complete assignment is
-    a per-entity material reading, while a missing assignment carries an
-    ``unverified_reason`` such as ``cad_material_provenance_missing``. SolidWorks
-    default density can produce a plausible-looking CAD mass, so such a reading is
-    not verified mass: ``build_scene`` preserves the value and records a
-    non-blocking warning. Fixtures and historical readings without this block
-    return False.
+    Every non-effective part mass reading carries
+    ``reference.material_assignment``: a complete assignment is a per-entity
+    material reading, while an explicitly missing assignment carries
+    ``cad_material_provenance_missing``. Effective instance readings carry their
+    own measurement basis and make no part-material claim, so they are the only
+    records exempt from this block. Any other missing or malformed evidence fails
+    before scene generation.
     """
 
-    reference = payload.get("reference") if isinstance(payload, dict) else None
-    assignment = reference.get("material_assignment") if isinstance(reference, dict) else None
-    return isinstance(assignment, dict) and bool(assignment.get("unverified_reason"))
+    if not isinstance(payload, dict):
+        raise ConfigError("CAD mass reading must be an object")
+    if payload.get("mode") == "effective_instance":
+        return False
+    reference = payload.get("reference")
+    if not isinstance(reference, dict):
+        raise ConfigError("CAD part mass reading has no reference block")
+    assignment = reference.get("material_assignment")
+    if not isinstance(assignment, dict):
+        raise ConfigError("CAD part mass reading has no material assignment")
+    if "unverified_reason" in assignment:
+        if assignment["unverified_reason"] != "cad_material_provenance_missing":
+            raise ConfigError(
+                "CAD part material assignment has an unsupported unverified reason",
+                {"unverified_reason": assignment["unverified_reason"]},
+            )
+        return True
+    bodies = assignment.get("bodies")
+    if not isinstance(bodies, list) or not bodies:
+        raise ConfigError("CAD part material assignment has no body coverage")
+    return False
 
 
 def unverified_mass_components(included: Iterable[str], masses: dict[str, Any]) -> list[str]:

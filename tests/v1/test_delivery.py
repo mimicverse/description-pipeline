@@ -11,7 +11,6 @@ from description_pipeline.delivery import (
     SUBJECT_DIRECTORIES,
     SUBJECT_FILES,
     read_delivery_manifest,
-    read_recovery_delivery_manifest,
     read_source_record,
     subject_digest,
     subject_inventory,
@@ -104,36 +103,6 @@ class DeliveryTests(unittest.TestCase):
         )
         with self.assertRaises(ir.InterfaceRecordError):
             read_delivery_manifest(self.root)
-
-    def test_recovery_manifest_reader_uses_the_exact_historical_policy_allowlist(self):
-        historical = next(iter(ir.RECOVERY_HISTORICAL_POLICY_DIGESTS))
-        manifest_path = self.root / "manifest.json"
-        manifest = json.loads(manifest_path.read_text())
-        manifest["contract"]["digest"] = CONTRACT_SHA256
-        manifest["policy"]["digest"] = historical
-        manifest_path.write_text(json.dumps(manifest))
-
-        with self.assertRaisesRegex(ir.InterfaceRecordError, "delivery_manifest_policy_mismatch"):
-            read_delivery_manifest(self.root)
-        recovered = read_recovery_delivery_manifest(self.root)
-        self.assertEqual(recovered["policy"]["digest"], historical)
-
-        manifest["policy"]["digest"] = OTHER_HEX
-        manifest_path.write_text(json.dumps(manifest))
-        with self.assertRaisesRegex(ir.InterfaceRecordError, "delivery_manifest_policy_mismatch"):
-            read_recovery_delivery_manifest(self.root)
-
-        manifest["policy"]["digest"] = historical
-        manifest_path.write_text(json.dumps(manifest))
-        (self.root / "model/subject.txt").write_text("changed")
-        with self.assertRaisesRegex(PipelineError, "files differ"):
-            read_recovery_delivery_manifest(self.root)
-        (self.root / "model/subject.txt").write_text("model")
-
-        manifest["contract"]["digest"] = OTHER_HEX
-        manifest_path.write_text(json.dumps(manifest))
-        with self.assertRaisesRegex(ir.InterfaceRecordError, "delivery_manifest_invalid"):
-            read_recovery_delivery_manifest(self.root)
 
     def test_manifest_reader_rebinds_every_subject_record(self):
         manifest_path = self.root / "manifest.json"

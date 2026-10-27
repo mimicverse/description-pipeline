@@ -199,11 +199,6 @@ def derive(
     state_root = _absolute(storage.get("state_root"), "resolved.storage.state_root")
     release_root = _absolute(storage.get("release_root"), "resolved.storage.release_root")
     handoff_root = _absolute(storage.get("handoff_root"), "resolved.storage.handoff_root")
-    store_root = _absolute(derived.get("store_root"), "resolved.derived.store_root")
-    require(
-        store_root.startswith(state_root.rstrip("/") + "/"),
-        "resolved.derived.store_root must live under the state root",
-    )
     host, https_port = _origin_parts(
         _text(operator.get("origin"), "resolved.operator.origin"),
         "resolved.operator.origin",
@@ -227,9 +222,8 @@ def derive(
     require(isinstance(repositories, dict) and bool(repositories), "resolved.derived.repositories is empty")
     require(isinstance(discovery, dict), "resolved.derived.discovery is missing")
 
-    # Derived artifacts bind to their immutable installation generation: a candidate preparation
-    # writes only inside <state_root>/derived/<install_id>/ and never edits an older generation's
-    # referenced bytes; active reference switching belongs to promote/rollback alone.
+    # Derived artifacts bind to the immutable first-install generation under
+    # <state_root>/derived/<install_id>/.
     derived_dir = Path(state_root) / "derived" / install_id
     repositories_file = derived_dir / "repositories.json"
     targets_file = derived_dir / "targets.json"
@@ -268,7 +262,6 @@ def derive(
         # bytes the install record digests; this is the same source, never a parallel copy.
         "PLATFORM_CONFIG_DIGEST": hashlib.sha256(snapshot_bytes).hexdigest(),
         "PIPELINE_WHEEL": str(wheel_path),
-        "PIPELINE_STORE_ROOT": store_root,
         "SOLIDWORKS_SSH_HOST": ssh_host,
         "SOLIDWORKS_ENDPOINT_PORT": str(endpoint_port),
         "TUNNEL_LOOPBACK_PORT": str(tunnel_port),

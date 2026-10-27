@@ -113,64 +113,6 @@ GENERATOR_VERSION = "1"
 NATIVE_READER_GENERATOR = "solidworks-native-reader"
 _DATE_ID = re.compile(r"[0-9]{8}\Z")
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}\Z")
-_HISTORICAL_DISCOVERY_KEYS = frozenset(
-    {
-        "contract",
-        "derivation",
-        "findings",
-        "frozen_names",
-        "generator",
-        "generator_version",
-        "handoff_sha256",
-        "identity",
-        "namespace",
-        "native_files",
-        "raw",
-        "records",
-        "run_id",
-        "schema_version",
-    }
-)
-_HISTORICAL_DERIVATION_KEYS = frozenset(
-    {"configuration", "frozen_names", "main_assembly", "record_roots"}
-)
-_HISTORICAL_IDENTITY_KEYS = frozenset(
-    {
-        "change_summary",
-        "control",
-        "delivery_configuration",
-        "hardware_id",
-        "main_assembly",
-        "owner",
-        "parent_revision",
-        "revision",
-        "robot_name",
-        "robot_name_technical",
-    }
-)
-_HISTORICAL_RAW_KEYS = frozenset(
-    {
-        "components",
-        "contract",
-        "datums",
-        "document_state",
-        "exporter",
-        "files",
-        "generator",
-        "identity",
-        "masses",
-        "mates",
-        "namespace",
-        "notes",
-        "properties",
-        "reference_axes",
-        "saved_configuration",
-        "schema_version",
-        "selection",
-        "solidworks",
-        "source_selection",
-    }
-)
 _FINDING_KEYS = frozenset({"schema_version", "code", "object", "message", "detail", "blocking"})
 _IDENTITY_RESOLUTION_KEYS = frozenset(
     {
@@ -330,11 +272,7 @@ def _saved_configuration_observed(record: dict, name: str) -> bool:
         return False
     selection = record.get("source_selection")
     files = record.get("files")
-    if (
-        not isinstance(selection, dict)
-        or not isinstance(files, dict)
-        or selection.get("files") != files
-    ):
+    if not isinstance(selection, dict) or not isinstance(files, dict) or selection.get("files") != files:
         return False
     readings = (state.get("before"), state.get("after"))
     if not all(isinstance(reading, dict) for reading in readings):
@@ -451,285 +389,6 @@ def _require_text_map(value: object, what: str) -> dict[str, str]:
             raise PipelineError(f"{what} must map non-empty text to non-empty text")
         result[key] = item
     return result
-
-
-def _validate_historical_identity(
-    document: object, *, technical: bool, allow_empty_control: bool = False
-) -> dict:
-    keys = _HISTORICAL_IDENTITY_KEYS if technical else _HISTORICAL_IDENTITY_KEYS - {
-        "robot_name_technical"
-    }
-    identity = _require_exact_keys(document, keys, "historical discovery identity")
-    for field in ("hardware_id", "revision", "parent_revision"):
-        value = identity[field]
-        if value is not None and (
-            not isinstance(value, str) or _IDENTITY_ID.fullmatch(value) is None
-        ):
-            raise PipelineError(f"historical discovery identity.{field} is not a stable identifier")
-    _require_optional_text(identity["owner"], "historical discovery identity.owner")
-    _require_optional_text(
-        identity["change_summary"],
-        "historical discovery identity.change_summary",
-        multiline=True,
-    )
-    _require_optional_text(
-        identity["delivery_configuration"],
-        "historical discovery identity.delivery_configuration",
-    )
-    for field in ("robot_name", "robot_name_technical") if technical else ("robot_name",):
-        value = identity[field]
-        if value is not None and (
-            not isinstance(value, str) or _SNAKE.fullmatch(value) is None
-        ):
-            raise PipelineError(f"historical discovery identity.{field} is not snake_case")
-    main_assembly = identity["main_assembly"]
-    if not _text(main_assembly):
-        raise PipelineError("historical discovery identity.main_assembly must be non-empty text")
-    control = identity["control"]
-    if control is not None:
-        control = _require_exact_keys(control, frozenset({"system", "reference"}), "identity.control")
-        empty_control = control["system"] is None and control["reference"] is None
-        if allow_empty_control and empty_control:
-            return identity
-        if control["system"] not in CONTROL_SYSTEMS:
-            raise PipelineError("historical discovery identity.control.system is not allowed")
-        reference = _require_optional_text(control["reference"], "historical discovery identity.control.reference")
-        if reference is None:
-            raise PipelineError("historical discovery identity.control.reference must be non-empty")
-        if control["system"] == "git" and _GIT_COMMIT.search(reference) is None:
-            raise PipelineError("historical discovery identity.control.reference is not a full Git commit")
-    return identity
-
-
-def _validate_historical_findings(value: object) -> list[dict]:
-    if not isinstance(value, list):
-        raise PipelineError("historical discovery findings must be a list")
-    findings: list[dict] = []
-    for index, item in enumerate(value):
-        finding = _require_exact_keys(item, _FINDING_KEYS, f"historical discovery findings[{index}]")
-        if finding["schema_version"] != FINDING_SCHEMA:
-            raise PipelineError("historical discovery finding carries another schema")
-        for field in ("code", "object", "message"):
-            if _require_optional_text(
-                finding[field], f"historical discovery findings[{index}].{field}"
-            ) is None:
-                raise PipelineError(f"historical discovery findings[{index}].{field} must be non-empty text")
-        if type(finding["blocking"]) is not bool:
-            raise PipelineError("historical discovery finding.blocking must be boolean")
-        if finding["detail"] is not None and not isinstance(finding["detail"], dict):
-            raise PipelineError("historical discovery finding.detail must be an object or null")
-        findings.append(finding)
-    return findings
-
-
-def _validate_historical_records(value: object) -> list[dict]:
-    if value != []:
-        raise PipelineError("historical discovery records must be the exact empty list")
-    return []
-
-
-def _historical_raw_identity_value(raw: Mapping[str, object], field: str) -> object:
-    """Resolve one administrative value exactly as the historical writer did."""
-
-    identity = raw.get("identity")
-    if not isinstance(identity, Mapping):
-        raise PipelineError("historical discovery raw identity must be an object")
-    if field == "control":
-        control = identity.get("control")
-        if isinstance(control, Mapping):
-            system = control.get("system")
-            reference = control.get("reference")
-        else:
-            system = _scalar(dict(raw), NAMESPACE, "control.system")
-            reference = _scalar(dict(raw), NAMESPACE, "control.reference")
-        if not _text(system) or not _text(reference):
-            return None
-        return {"system": str(system).strip(), "reference": str(reference).strip()}
-    value = _identity_value(dict(raw), NAMESPACE, field)
-    return str(value).strip() if _text(value) else None
-
-
-def validate_historical_discovery_document(
-    document: object,
-    *,
-    run_id: str,
-    handoff_sha256: str,
-    native_inventory: Mapping[str, str],
-) -> dict:
-    """Validate one exact historical prepared-discovery document during recovery."""
-
-    from .selection import selection_bindings, validate_file_index
-
-    discovery = _require_exact_keys(document, _HISTORICAL_DISCOVERY_KEYS, "historical discovery")
-    if discovery["schema_version"] != DISCOVERY_SCHEMA:
-        raise PipelineError("historical discovery carries another schema")
-    if discovery["contract"] != CONTRACT:
-        raise PipelineError("historical discovery carries another contract")
-    if discovery["namespace"] != NAMESPACE:
-        raise PipelineError("historical discovery carries another namespace")
-    if discovery["generator"] != GENERATOR:
-        raise PipelineError("historical discovery carries another generator")
-    if discovery["generator_version"] != GENERATOR_VERSION:
-        raise PipelineError("historical discovery carries another generator version")
-    if discovery["run_id"] != run_id:
-        raise PipelineError("historical discovery carries another run identity")
-    if discovery["handoff_sha256"] != handoff_sha256:
-        raise PipelineError("historical discovery carries another handoff identity")
-    native_files = validate_file_index(discovery["native_files"])
-    if dict(native_files) != discovery["native_files"]:
-        raise PipelineError("historical discovery native inventory is not canonical")
-    if native_files != validate_file_index(native_inventory):
-        raise PipelineError("historical discovery native inventory differs from input/cad")
-    if digest(native_files) != handoff_sha256:
-        raise PipelineError("historical discovery native inventory does not match its handoff")
-
-    derivation = _require_exact_keys(
-        discovery["derivation"], _HISTORICAL_DERIVATION_KEYS, "historical discovery derivation"
-    )
-    _require_optional_text(derivation["configuration"], "historical discovery derivation.configuration")
-    record_roots = derivation["record_roots"]
-    if (
-        not isinstance(record_roots, list)
-        or any(not _authored_text(item) for item in record_roots)
-        or len(record_roots) != len(set(record_roots))
-    ):
-        raise PipelineError("historical discovery derivation.record_roots must be unique non-empty text")
-    _require_text_map(
-        derivation["frozen_names"], "historical discovery derivation.frozen_names"
-    )
-    _require_text_map(discovery["frozen_names"], "historical discovery frozen_names")
-    identity = _validate_historical_identity(discovery["identity"], technical=True)
-    main_assembly = identity["main_assembly"]
-    if derivation["main_assembly"] != main_assembly:
-        raise PipelineError("historical discovery derivation names another main assembly")
-    if main_assembly not in native_files:
-        raise PipelineError("historical discovery main assembly is outside native inventory")
-
-    findings = _validate_historical_findings(discovery["findings"])
-    records = _validate_historical_records(discovery["records"])
-    raw = _require_exact_keys(discovery["raw"], _HISTORICAL_RAW_KEYS, "historical discovery raw record")
-    _validate_native_record(raw)
-    if (
-        raw["schema_version"] != DISCOVERY_SCHEMA
-        or raw["contract"] != CONTRACT
-        or raw["namespace"] != NAMESPACE
-        or raw["generator"] != NATIVE_READER_GENERATOR
-    ):
-        raise PipelineError("historical discovery raw record carries another identity")
-    if validate_file_index(raw["files"]) != native_files:
-        raise PipelineError("historical discovery raw file inventory differs from native inventory")
-    _validate_historical_identity(raw["identity"], technical=False, allow_empty_control=True)
-    for field in (
-        "hardware_id",
-        "revision",
-        "parent_revision",
-        "owner",
-        "change_summary",
-        "delivery_configuration",
-        "main_assembly",
-        "robot_name",
-    ):
-        raw_value = _historical_raw_identity_value(raw, field)
-        if raw_value is not None and raw_value != identity[field]:
-            raise PipelineError(f"historical discovery raw identity.{field} differs from its CAD value")
-    raw_control = _historical_raw_identity_value(raw, "control")
-    if raw_control is not None and identity["control"] != raw_control:
-        raise PipelineError("historical discovery raw identity.control differs from its CAD value")
-    selection = _require_exact_keys(
-        raw["selection"], frozenset({"main_assembly", "mode"}), "historical discovery raw selection"
-    )
-    if selection != {"main_assembly": main_assembly, "mode": "explicit"}:
-        raise PipelineError("historical discovery raw selection differs from its main assembly")
-    if not isinstance(raw["source_selection"], dict):
-        raise PipelineError("historical discovery raw source selection must be an object")
-    source_selection = selection_bindings(raw["source_selection"])
-    if source_selection["files"] != native_files:
-        raise PipelineError("historical discovery source selection differs from native inventory")
-    if source_selection["handoff_sha256"] != handoff_sha256:
-        raise PipelineError("historical discovery source selection differs from its handoff")
-    if source_selection["main_assembly"] != main_assembly:
-        raise PipelineError("historical discovery source selection differs from its main assembly")
-    for field in ("components", "datums", "masses", "mates", "reference_axes"):
-        if not isinstance(raw[field], list):
-            raise PipelineError(f"historical discovery raw.{field} must be a list")
-    if raw["notes"] is not None and not isinstance(raw["notes"], list):
-        raise PipelineError("historical discovery raw.notes must be a list or null")
-    for field in ("document_state", "exporter", "properties", "solidworks"):
-        if not isinstance(raw[field], dict):
-            raise PipelineError(f"historical discovery raw.{field} must be an object")
-    if not _text(raw["saved_configuration"]):
-        raise PipelineError("historical discovery raw.saved_configuration must be non-empty text")
-    result = dict(discovery)
-    result["identity"] = identity
-    result["native_files"] = native_files
-    result["findings"] = findings
-    result["records"] = records
-    return result
-
-
-def validate_historical_identity_resolution(document: object, *, discovery: Mapping[str, object]) -> dict:
-    """Validate the exact historical identity-resolution sidecar and its sources."""
-
-    resolution = _require_exact_keys(
-        document, _IDENTITY_RESOLUTION_KEYS, "historical identity resolution"
-    )
-    if resolution["schema_version"] != IDENTITY_SCHEMA:
-        raise PipelineError("historical identity resolution carries another schema")
-    if resolution["run_id"] != discovery.get("run_id"):
-        raise PipelineError("historical identity resolution carries another run identity")
-    if resolution["handoff_sha256"] != discovery.get("handoff_sha256"):
-        raise PipelineError("historical identity resolution carries another handoff identity")
-    identity = discovery.get("identity")
-    raw = discovery.get("raw")
-    if not isinstance(identity, Mapping) or not isinstance(raw, Mapping):
-        raise PipelineError("historical identity resolution has no discovery identity")
-    raw_identity = raw.get("identity")
-    if not isinstance(raw_identity, Mapping):
-        raise PipelineError("historical identity resolution has no raw discovery identity")
-    for field in ("hardware_id", "revision", "parent_revision"):
-        if resolution[field] != identity.get(field):
-            raise PipelineError(f"historical identity resolution.{field} differs from discovery")
-    sources = _require_exact_keys(
-        resolution["sources"], _IDENTITY_RESOLUTION_SOURCES, "historical identity resolution sources"
-    )
-    for field, origin in sources.items():
-        if not isinstance(origin, str) or origin not in _IDENTITY_SOURCE_ORIGINS[field]:
-            raise PipelineError(f"historical identity resolution source {field} has an invalid origin")
-        derived = identity.get(field)
-        raw_value = _historical_raw_identity_value(raw, field)
-        if origin == "absent":
-            if derived is not None:
-                raise PipelineError(f"historical identity resolution source {field} contradicts its value")
-            if field == "control":
-                if raw_value is not None and raw_value != {"system": None, "reference": None}:
-                    raise PipelineError("historical identity resolution control has a CAD value")
-            elif raw_value is not None:
-                raise PipelineError(f"historical identity resolution source {field} contradicts its CAD value")
-        elif origin == "cad":
-            if derived is None or raw_value != derived:
-                raise PipelineError(f"historical identity resolution source {field} has no matching CAD value")
-        elif origin == "platform_configuration":
-            if field != "hardware_id" or derived is None or raw_value is not None:
-                raise PipelineError("historical identity resolution hardware source contradicts its value")
-        elif origin == "submission":
-            if field != "change_summary" or derived is None or raw_value is not None:
-                raise PipelineError("historical identity resolution summary source contradicts its value")
-        else:
-            raise PipelineError(f"historical identity resolution source {field} has an invalid origin")
-    raw_delivery = raw_identity.get("delivery_configuration")
-    delivery = identity.get("delivery_configuration")
-    saved_configuration = raw.get("saved_configuration")
-    if raw_delivery is not None:
-        if delivery != raw_delivery:
-            raise PipelineError("historical identity resolution delivery configuration differs from CAD")
-    elif delivery is not None and delivery != saved_configuration:
-        raise PipelineError("historical identity resolution delivery configuration differs from saved state")
-    raw_robot_name = raw_identity.get("robot_name")
-    if raw_robot_name is not None and identity.get("robot_name") != raw_robot_name:
-        raise PipelineError("historical identity resolution robot name differs from CAD")
-    if raw_identity.get("main_assembly") != identity.get("main_assembly"):
-        raise PipelineError("historical identity resolution main assembly differs from CAD")
-    return resolution
 
 
 def _cross(left: Sequence[float], right: Sequence[float]) -> list[float]:
@@ -1440,8 +1099,10 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
         rows += [_rotation_row(direction) for direction in basis]
         # The documented concentric rotation lock removes the spin only.
         # Axial translation remains free until another native mate constrains it.
-        if (mate.get("lock_rotation") is True
-                and mate.get("lock_rotation_api") == "IConcentricMateFeatureData.LockRotation"):
+        if (
+            mate.get("lock_rotation") is True
+            and mate.get("lock_rotation_api") == "IConcentricMateFeatureData.LockRotation"
+        ):
             rows.append(_rotation_row(axis))
         # Rows may be reconstructed from a circular edge, but shaft evidence is
         # only ever an actual cylindrical face: a circle normal can be flipped
@@ -2341,8 +2002,7 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                                 "drive_status",
                             ],
                             "note": (
-                                "delivery-surface summary; this discovery finding remains "
-                                "the authoritative evidence"
+                                "delivery-surface summary; this discovery finding remains the authoritative evidence"
                             ),
                         },
                         "warning_does_not_authorize": True,
@@ -2441,10 +2101,14 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                 continue
             native_limit_values.add((lower, upper, unit))
         if native_limit_invalid:
-            findings.append(_finding(
-                "discovery.joint_limits_invalid", obj,
-                "native position-limit evidence is readable but invalid", {"errors": native_limit_invalid},
-            ))
+            findings.append(
+                _finding(
+                    "discovery.joint_limits_invalid",
+                    obj,
+                    "native position-limit evidence is readable but invalid",
+                    {"errors": native_limit_invalid},
+                )
+            )
             continue
         declared_limit = None
         declared_bounds = None
@@ -2466,10 +2130,7 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                     )
                 )
                 continue
-            if (
-                not (math.isfinite(declared_lower) and math.isfinite(declared_upper))
-                or declared_lower > declared_upper
-            ):
+            if not (math.isfinite(declared_lower) and math.isfinite(declared_upper)) or declared_lower > declared_upper:
                 findings.append(
                     _finding(
                         "discovery.joint_limits_invalid",
@@ -2535,23 +2196,28 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                 not all(type(native[key]) in (int, float) and math.isfinite(limits[key]) for key in ("lower", "upper"))
                 or limits["lower"] > limits["upper"]
             ):
-                findings.append(_finding(
-                    "discovery.joint_limits_invalid", obj, "native mate limits must be finite and ordered", limits,
-                ))
+                findings.append(
+                    _finding(
+                        "discovery.joint_limits_invalid",
+                        obj,
+                        "native mate limits must be finite and ordered",
+                        limits,
+                    )
+                )
                 continue
             limit_source = "native"
             if declared_bounds is not None:
                 declared_lower, declared_upper = declared_bounds
                 if declared_bounds not in {(0.0, 0.0), (limits["lower"], limits["upper"])}:
-                        findings.append(
-                            _finding(
-                                "discovery.joint_limits_conflict",
-                                obj,
-                                "native mate limits and the controlled record disagree",
-                                {"native": limits, "record": {"lower": declared_lower, "upper": declared_upper}},
-                            )
+                    findings.append(
+                        _finding(
+                            "discovery.joint_limits_conflict",
+                            obj,
+                            "native mate limits and the controlled record disagree",
+                            {"native": limits, "record": {"lower": declared_lower, "upper": declared_upper}},
                         )
-                        continue
+                    )
+                    continue
                 limit_evidence = declared_limit
         elif joint_type == "continuous":
             if declared_bounds is not None:
@@ -2585,11 +2251,15 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
             )
             limits = {"lower": -ROTATION_WINDOW_RAD, "upper": ROTATION_WINDOW_RAD}
             limit_source = "default_policy"
-            findings.append(_finding(
-                "discovery.joint_default_policy", obj,
-                "engineering uses the versioned non-native default rotation window; the range is unqualified",
-                default_policy, blocking=False,
-            ))
+            findings.append(
+                _finding(
+                    "discovery.joint_default_policy",
+                    obj,
+                    "engineering uses the versioned non-native default rotation window; the range is unqualified",
+                    default_policy,
+                    blocking=False,
+                )
+            )
         elif native_limit_errors:
             findings.append(
                 _finding(
@@ -2601,15 +2271,16 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
             )
             continue
         else:
-            findings.append(_finding(
-                "discovery.joint_limits_missing", obj,
-                "the active CAD constraints provide no native position range",
-            ))
+            findings.append(
+                _finding(
+                    "discovery.joint_limits_missing",
+                    obj,
+                    "the active CAD constraints provide no native position range",
+                )
+            )
             continue
         if joint_type != "continuous" and limits is None:
-            findings.append(
-                _finding("discovery.joint_limits_missing", obj, "no native position range for this joint")
-            )
+            findings.append(_finding("discovery.joint_limits_missing", obj, "no native position range for this joint"))
             continue
         drive = None
         drive_source = "absent"
@@ -2683,9 +2354,7 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                 "limits": limits,
                 "limit_evidence": limit_evidence,
                 "limit_source": limit_source,
-                "native_observation_errors": (
-                    list(native_limit_errors) if limit_source == "declared_author" else []
-                ),
+                "native_observation_errors": (list(native_limit_errors) if limit_source == "declared_author" else []),
                 **({"default_policy": default_policy} if default_policy is not None else {}),
                 "drive": drive,
                 "drive_source": drive_source,
@@ -3115,9 +2784,7 @@ def _apply_cad_names(
             )
             continue
         try:
-            datum_target = (
-                format_joint_name(native) if joint.get("type") != "fixed" else joint_names[native]
-            )
+            datum_target = format_joint_name(native) if joint.get("type") != "fixed" else joint_names[native]
         except ValueError:
             datum_target = None
         if datum_target != joint_names[native]:
@@ -3147,12 +2814,8 @@ def _apply_cad_names(
         source_name = str(body["name"])
         body["source_name"] = source_name
         body["name"] = body_names[source_name]
-    clusters.members = {
-        body_names.get(name, name): members for name, members in clusters.members.items()
-    }
-    clusters.of = {
-        component: body_names.get(owner, owner) for component, owner in clusters.of.items()
-    }
+    clusters.members = {body_names.get(name, name): members for name, members in clusters.members.items()}
+    clusters.of = {component: body_names.get(owner, owner) for component, owner in clusters.of.items()}
     for joint in joints:
         if "name" not in joint:
             continue
@@ -3413,6 +3076,8 @@ def _exporter_constraint_checks(
                             {**detail, "native": limits, "declared": declared},
                         )
                     )
+
+
 def _exporter_axis(
     record: dict, declared: dict, body: dict, parent_body: dict | None, findings: list[dict]
 ) -> tuple[dict, dict | None]:
@@ -3681,9 +3346,7 @@ def _exporter_joint_facts(
         else []
     )
     assembly_owner = root_name if len(ownerless_root) == 1 else None
-    preview_allowed = purpose == PURPOSE_INSPECTION_PREVIEW and native_limit_inventory_complete(
-        record.get("mates")
-    )
+    preview_allowed = purpose == PURPOSE_INSPECTION_PREVIEW and native_limit_inventory_complete(record.get("mates"))
 
     joints = []
     for link in declaration["links"]:
@@ -3756,10 +3419,7 @@ def _exporter_joint_facts(
                     or mate.get("limits") is not None
                     or mate.get("is_advanced_mate") is True
                 )
-                if (
-                    mate_kind not in {"distance", "angle", "limitdistance", "limitangle"}
-                    and not carries_limit_evidence
-                ):
+                if mate_kind not in {"distance", "angle", "limitdistance", "limitangle"} and not carries_limit_evidence:
                     continue
                 if mate.get("suppressed") is True:
                     continue
@@ -3783,15 +3443,12 @@ def _exporter_joint_facts(
                     continue
                 if scope == "claimed_unreadable":
                     entities = mate.get("entities")
-                    wrong_owner = (
-                        isinstance(entities, list)
-                        and any(
-                            isinstance(entity, dict)
-                            and isinstance(entity.get("component"), str)
-                            and entity["component"]
-                            and owner_for(entity["component"]) is None
-                            for entity in entities
-                        )
+                    wrong_owner = isinstance(entities, list) and any(
+                        isinstance(entity, dict)
+                        and isinstance(entity.get("component"), str)
+                        and entity["component"]
+                        and owner_for(entity["component"]) is None
+                        for entity in entities
                     )
                     target = native_invalid_errors if wrong_owner else native_read_errors
                     target.append(
@@ -3880,17 +3537,24 @@ def _exporter_joint_facts(
                 if native_values or (
                     isinstance(limits, dict) and any(limits.get(key) is not None for key in ("lower", "upper"))
                 ):
-                    findings.append(_finding(
-                        "discovery.joint_limits_unexpected", obj,
-                        "a continuous joint cannot carry position limits",
-                        {"declared": limits, "native": sorted(native_values)},
-                    ))
+                    findings.append(
+                        _finding(
+                            "discovery.joint_limits_unexpected",
+                            obj,
+                            "a continuous joint cannot carry position limits",
+                            {"declared": limits, "native": sorted(native_values)},
+                        )
+                    )
                     continue
                 if native_read_errors:
-                    findings.append(_finding(
-                        "discovery.joint_limits_unreadable", obj,
-                        "native position-limit evidence is incomplete or unreadable", {"errors": native_read_errors},
-                    ))
+                    findings.append(
+                        _finding(
+                            "discovery.joint_limits_unreadable",
+                            obj,
+                            "native position-limit evidence is incomplete or unreadable",
+                            {"errors": native_read_errors},
+                        )
+                    )
                     continue
                 limits = {key: (limits or {}).get(key) for key in ("effort", "velocity")}
                 limit_source = "declared_author"
@@ -3906,11 +3570,7 @@ def _exporter_joint_facts(
                     )
                     continue
                 native_lower, native_upper = next(iter(native_values))
-                declared_values = (
-                    (float(limits.get("lower")), float(limits.get("upper")))
-                    if bounds_usable
-                    else None
-                )
+                declared_values = (float(limits.get("lower")), float(limits.get("upper"))) if bounds_usable else None
                 if declared_values not in {None, (0.0, 0.0), (native_lower, native_upper)}:
                     findings.append(
                         _finding(
@@ -4395,9 +4055,7 @@ def _interface_frames(
     for candidate in sorted(candidates, key=lambda item: (item["identity"], item["name"])):
         base_name = candidate["base_name"]
         collided = counts[base_name] > 1 or base_name in body_names
-        frame_name = (
-            disambiguated_frame_name(base_name, candidate["identity"]) if collided else base_name
-        )
+        frame_name = disambiguated_frame_name(base_name, candidate["identity"]) if collided else base_name
         if frame_name in used or frame_name in body_names:
             findings.append(
                 _finding(
@@ -4952,8 +4610,7 @@ def _identity(
         deferred(
             "discovery.revision_missing",
             "revision",
-            "structural revision is not recorded in the CAD records; it stays missing and the review "
-            "shows the gap",
+            "structural revision is not recorded in the CAD records; it stays missing and the review shows the gap",
         )
     if revision is not None and _IDENTITY_ID.fullmatch(revision) is None:
         findings.append(
@@ -4974,8 +4631,7 @@ def _identity(
         deferred(
             "discovery.owner_missing",
             "owner",
-            "revision owner is not recorded in the CAD records; it stays missing and the review shows "
-            "the gap",
+            "revision owner is not recorded in the CAD records; it stays missing and the review shows the gap",
         )
     if owner is not None and not _authored_text(owner):
         findings.append(
@@ -5030,8 +4686,7 @@ def _identity(
         deferred(
             "discovery.control_missing",
             "control",
-            "CAD control system/reference are not recorded; they stay missing and the review shows "
-            "the gap",
+            "CAD control system/reference are not recorded; they stay missing and the review shows the gap",
         )
         control = None
     elif system not in CONTROL_SYSTEMS:
@@ -5219,11 +4874,7 @@ def _evidence_summary(resolved: dict, embedded: dict) -> dict[str, Any]:
         "anchor": embedded.get("anchor"),
         "key": str(embedded.get("key") or ""),
         "reference": str(embedded.get("reference") or ""),
-        "declared_values": {
-            key: value[key]
-            for key in ("lower", "upper", "effort", "velocity")
-            if key in value
-        },
+        "declared_values": {key: value[key] for key in ("lower", "upper", "effort", "velocity") if key in value},
     }
 
 
@@ -5258,9 +4909,7 @@ def _check_derivation_paths(frozen_source: Path, output: Path) -> None:
 
 
 def _check_authored_files(native_files: Mapping[str, str]) -> None:
-    authored = sorted(
-        name for name in native_files if name == SOURCE_FILE or name.startswith("discovery/")
-    )
+    authored = sorted(name for name in native_files if name == SOURCE_FILE or name.startswith("discovery/"))
     if authored:
         raise PipelineError(f"frozen_source already contains authored package files: {authored[:5]}")
 
@@ -5319,9 +4968,7 @@ def read_native_record(frozen_source: Path, settings: DiscoverySettings, *, back
     return record
 
 
-def sealed_embedded_virtual_document(
-    component: dict, name: str, native_files: Mapping[str, str]
-) -> bool:
+def sealed_embedded_virtual_document(component: dict, name: str, native_files: Mapping[str, str]) -> bool:
     """Whether the sealed record proves an embedded virtual session document."""
 
     provenance = component.get("source_provenance")
@@ -5365,10 +5012,7 @@ def sealed_embedded_virtual_document(
         return False
     for key in ("native_document_path", "materialization_path"):
         value = provenance.get(key)
-        if (
-            not isinstance(value, str)
-            or value.replace("\\", "/").casefold() != session_path.casefold()
-        ):
+        if not isinstance(value, str) or value.replace("\\", "/").casefold() != session_path.casefold():
             return False
     document = component.get("document")
     return (
@@ -5397,12 +5041,9 @@ def _capture_plan_selector(
     name = native_component_identity(component)
     provenance = component.get("source_provenance")
     if isinstance(provenance, dict) and (
-        provenance.get("state") == "cached_materialization"
-        or provenance.get("kind") == "native_import_materialization"
+        provenance.get("state") == "cached_materialization" or provenance.get("kind") == "native_import_materialization"
     ):
-        error = PipelineError(
-            f"Cached 3D Interconnect import is not an accepted capture input: {name}"
-        )
+        error = PipelineError(f"Cached 3D Interconnect import is not an accepted capture input: {name}")
         error.details = {
             "object": name,
             "reason": "cached_materialization",
@@ -5519,11 +5160,7 @@ def derive_native_package(
             raise PipelineError("the requested configuration does not match the recorded delivery configuration")
     source_selection = record.get("source_selection") if isinstance(record.get("source_selection"), dict) else {}
     upload_digest = source_selection.get("upload_sha256")
-    upload_handoff_digest = (
-        upload_digest
-        if _SHA256_HEX.fullmatch(str(upload_digest or ""))
-        else None
-    )
+    upload_handoff_digest = upload_digest if _SHA256_HEX.fullmatch(str(upload_digest or "")) else None
     findings: list[dict] = []
     components = record.get("components")
     if not isinstance(components, list):
@@ -5810,14 +5447,18 @@ def _derive_carriers(
 
     for mate in record.get("mates") or []:
         if (
-            isinstance(mate, dict) and mate.get("suppressed") is False
+            isinstance(mate, dict)
+            and mate.get("suppressed") is False
             and mate.get("native_limit") is not None
             and str(mate.get("type") or "").lower() not in {"limitangle", "limitdistance"}
         ):
-            findings.append(_finding(
-                "discovery.joint_limits_invalid", f"mate:{mate.get('name', '')}",
-                "a non-limit mate carries native position-limit evidence",
-            ))
+            findings.append(
+                _finding(
+                    "discovery.joint_limits_invalid",
+                    f"mate:{mate.get('name', '')}",
+                    "a non-limit mate carries native position-limit evidence",
+                )
+            )
 
     if exporter_declaration_present(record):
         declaration = _exporter_declaration(record, identity, findings)
@@ -5848,12 +5489,8 @@ def _derive_carriers(
                         "the naming rule did not reserve base_link for the declared root",
                     )
                 )
-            derived_names = {
-                str(body.get("source_name") or body["name"]): body["name"] for body in bodies
-            } | {
-                    str(joint.get("source_name") or joint["name"]): joint["name"]
-                    for joint in joints
-                    if "name" in joint
+            derived_names = {str(body.get("source_name") or body["name"]): body["name"] for body in bodies} | {
+                str(joint.get("source_name") or joint["name"]): joint["name"] for joint in joints if "name" in joint
             }
             frames = _interface_frames(record, clusters, bodies, root, findings)
         return bodies, joints, frames, derived_names
@@ -5896,12 +5533,8 @@ def _derive_carriers(
         root=str(root["name"]) if root is not None else None,
     )
     _apply_mate_direction(record, bodies, joints, findings)
-    derived_names = {
-        str(body.get("source_name") or body["name"]): body["name"] for body in bodies
-    } | {
-        str(joint.get("source_name") or joint["name"]): joint["name"]
-        for joint in joints
-        if "name" in joint
+    derived_names = {str(body.get("source_name") or body["name"]): body["name"] for body in bodies} | {
+        str(joint.get("source_name") or joint["name"]): joint["name"] for joint in joints if "name" in joint
     }
     seen_names: dict[str, str] = {}
     for body in bodies:
@@ -6049,9 +5682,7 @@ def source_definition(
                         continue
                     value = _controlled_number(raw_limits[field])
                     if value is None:
-                        raise PipelineError(
-                            f"joint {joint['name']!r} exporter declaration has an invalid {field}"
-                        )
+                        raise PipelineError(f"joint {joint['name']!r} exporter declaration has an invalid {field}")
                     declared_values[field] = value
             common_evidence = {
                 "kind": "native_declaration",
@@ -6064,17 +5695,13 @@ def source_definition(
             if joint.get("limit_source") == "declared_author" and joint["type"] != "continuous":
                 entry["limit_evidence"] = {
                     **common_evidence,
-                    "declared_values": {
-                        field: declared_values[field] for field in ("lower", "upper")
-                    },
+                    "declared_values": {field: declared_values[field] for field in ("lower", "upper")},
                     "native_observation_errors": [],
                 }
             if all(field in declared_values for field in ("effort", "velocity")):
                 entry["drive_evidence"] = {
                     **common_evidence,
-                    "declared_values": {
-                        field: declared_values[field] for field in ("effort", "velocity")
-                    },
+                    "declared_values": {field: declared_values[field] for field in ("effort", "velocity")},
                 }
                 entry["drive_source"] = "controlled"
         elif joint["type"] == "continuous":
@@ -6103,13 +5730,9 @@ def source_definition(
                 None,
             )
             if embedded is None:
-                raise PipelineError(
-                    f"joint {joint['name']!r} limit evidence is not in the embedded record index"
-                )
+                raise PipelineError(f"joint {joint['name']!r} limit evidence is not in the embedded record index")
             entry["limit_evidence"] = _evidence_summary(limit_evidence, embedded)
-            entry["limit_evidence"]["native_observation_errors"] = list(
-                joint.get("native_observation_errors") or []
-            )
+            entry["limit_evidence"]["native_observation_errors"] = list(joint.get("native_observation_errors") or [])
         drive_evidence = joint.get("drive")
         if isinstance(drive_evidence, dict):
             embedded = next(
@@ -6122,9 +5745,7 @@ def source_definition(
                 None,
             )
             if embedded is None:
-                raise PipelineError(
-                    f"joint {joint['name']!r} drive evidence is not in the embedded record index"
-                )
+                raise PipelineError(f"joint {joint['name']!r} drive evidence is not in the embedded record index")
             entry["drive_evidence"] = _evidence_summary(drive_evidence, embedded)
             entry["drive_source"] = "controlled"
         if joint.get("limit_source") is not None:
@@ -6142,11 +5763,7 @@ def source_definition(
             derived_robot_name = None
     source: dict[str, Any] = {
         "provider": "solidworks",
-        "robot_name": (
-            identity.get("robot_name")
-            or derived_robot_name
-            or "robot"
-        ),
+        "robot_name": (identity.get("robot_name") or derived_robot_name or "robot"),
         "robot_name_source": "cad" if identity.get("robot_name") else "cad_filename_derived",
         "assembly": str(confined(package.resolve(), cad_prefix + str(view["main_assembly"]))),
         "configuration": view["delivery_configuration"],
@@ -6159,11 +5776,7 @@ def source_definition(
                 "id": body["name"],
                 "name": body["name"],
                 "source_name": body.get("source_name", body["name"]),
-                **(
-                    {"name_rule": dict(body["name_rule"])}
-                    if isinstance(body.get("name_rule"), dict)
-                    else {}
-                ),
+                **({"name_rule": dict(body["name_rule"])} if isinstance(body.get("name_rule"), dict) else {}),
                 "components": body["components"],
                 "frame": {"coordinate_system": body["datum"]},
             }
@@ -6221,9 +5834,7 @@ def _source_record(
         "main_assembly": str(assembly),
         "configuration": str(configuration),
         "hardware_id": str(hardware),
-        "records": [
-            {"reference": reference, "file_sha256": references[reference]} for reference in sorted(references)
-        ],
+        "records": [{"reference": reference, "file_sha256": references[reference]} for reference in sorted(references)],
     }
     return validate_source_record(
         {

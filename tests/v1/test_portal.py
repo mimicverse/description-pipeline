@@ -4326,8 +4326,6 @@ class PortalTests(unittest.TestCase):
                             "target_identity": target.to_record(),
                         },
                     },
-                    "previous": None,
-                    "journal": [],
                 },
             )
             artifacts = root / "artifacts"

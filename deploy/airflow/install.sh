@@ -10,79 +10,20 @@
 #
 # Rerunning is safe: the existing Fernet key and [api_auth] jwt_secret in
 # $AIRFLOW_HOME/airflow.cfg are preserved (see render_config.py).
-#
-#   install.sh --stage:  build and verify the generation's runtime only (venv, hash-locked
-#                        dependencies, doctor); no configuration switch and no migration -
-#                        the stage half of the promote protocol.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-die() { echo "install.sh: $*" >&2; exit 1; }
-
-if [ "$#" -gt 1 ] || { [ "$#" -eq 1 ] && [ "$1" != "--stage" ]; }; then
-  echo "usage: $0 [--stage]" >&2
+if [ "$#" -ne 0 ]; then
+  echo "usage: $0" >&2
   exit 2
 fi
-MODE="${1:-}"
 
 : "${AIRFLOW_VENV:?set AIRFLOW_VENV to the private venv path}"
-: "${AIRFLOW_HOME:?set AIRFLOW_HOME to the Airflow home directory}"
-: "${PIPELINE_WHEEL:?set PIPELINE_WHEEL to the built mimicverse_description wheel}"
-if [ "$MODE" != "--stage" ]; then
-  # Normal installation renders the managed config and migrates the live database; refuse
-  # missing connection/port inputs here, before creating the venv or running pip.
-  : "${AIRFLOW_DB_URL:?set AIRFLOW_DB_URL to the dedicated PostgreSQL DSN}"
-  : "${AIRFLOW_RUNTIME_DB_URL:?set AIRFLOW_RUNTIME_DB_URL to the least-privilege runtime DSN}"
-  : "${AIRFLOW_API_PORT:?set AIRFLOW_API_PORT to the Airflow api-server loopback port}"
-fi
+: "${AIRFLOW_DB_URL:?set AIRFLOW_DB_URL to the dedicated PostgreSQL DSN}"
+: "${AIRFLOW_RUNTIME_DB_URL:?set AIRFLOW_RUNTIME_DB_URL to the least-privilege runtime DSN}"
+: "${AIRFLOW_API_PORT:?set AIRFLOW_API_PORT to the Airflow api-server loopback port}"
 
-for pair in "AIRFLOW_VENV:$AIRFLOW_VENV" "AIRFLOW_HOME:$AIRFLOW_HOME" "PIPELINE_WHEEL:$PIPELINE_WHEEL"; do
-  name="${pair%%:*}" value="${pair#*:}"
-  case "$value" in
-    /*) ;;
-    *) die "$name must be an absolute path (got: $value)" ;;
-  esac
-  case "$value" in
-    /|/usr|/etc|/opt|/var|"${HOME:-/nonexistent}")
-      die "$name refuses a shared/root path: $value" ;;
-  esac
-done
-[ "$AIRFLOW_VENV" != "$AIRFLOW_HOME" ] || die "AIRFLOW_VENV and AIRFLOW_HOME must be distinct"
-[ -f "$PIPELINE_WHEEL" ] || die "PIPELINE_WHEEL does not exist: $PIPELINE_WHEEL"
-case "$(basename "$PIPELINE_WHEEL")" in
-  mimicverse_description-*.whl) ;;
-  *) die "PIPELINE_WHEEL must be the built mimicverse_description-*.whl wheel" ;;
-esac
-
-PYTHON="${AIRFLOW_PYTHON:-python3.12}"
-command -v "$PYTHON" >/dev/null 2>&1 || die "AIRFLOW_PYTHON=$PYTHON not found"
-[ "$("$PYTHON" -c 'import sys; print("%d.%d" % sys.version_info[:2])')" = "3.12" ] \
-  || die "AIRFLOW_PYTHON must be Python 3.12 (the pinned lock targets CPython 3.12)"
-if [ ! -x "$AIRFLOW_VENV/bin/python" ]; then
-  "$PYTHON" -m venv "$AIRFLOW_VENV" \
-    || die "'$PYTHON -m venv' failed; pass AIRFLOW_PYTHON=<a Python 3.12 with working venv/ensurepip>"
-fi
-
-# The lock is a fully resolved, hash-pinned, wheel-only stack: no floating versions,
-# no build dependencies, no pip upgrade in the private venv.
-"$AIRFLOW_VENV/bin/python" -m pip install --require-hashes --only-binary=:all: \
-  -r "$HERE/requirements.lock"
-"$AIRFLOW_VENV/bin/python" -m pip install --no-deps --force-reinstall "$PIPELINE_WHEEL"
-# Fail closed if the lock does not cover the wheel's declared runtime dependencies.
-"$AIRFLOW_VENV/bin/python" -m pip check
-# pip check excludes optional dependencies. Exercise the Linux verifier before
-# installing configuration or migrating the service database.
-"$AIRFLOW_VENV/bin/description" doctor
-INSTALLED_AIRFLOW_VERSION="$("$AIRFLOW_VENV/bin/airflow" version 2>/dev/null)"
-[ "$INSTALLED_AIRFLOW_VERSION" = "3.3.2" ] \
-  || die "expected Airflow 3.3.2, found: ${INSTALLED_AIRFLOW_VERSION:-unknown}"
-"$AIRFLOW_VENV/bin/airflow" triggerer --help >/dev/null \
-  || die "the pinned Airflow runtime has no triggerer command"
-
-if [ "$MODE" = "--stage" ]; then
-  echo "Airflow runtime staged (no configuration switch, no migration): $INSTALLED_AIRFLOW_VERSION"
-  exit 0
-fi
+bash "$HERE/install_runtime.sh"
 
 # Atomic 0600 config; preserves previously generated Fernet/JWT secrets on rerun.
 AIRFLOW_DB_URL="$AIRFLOW_DB_URL" AIRFLOW_API_PORT="$AIRFLOW_API_PORT" "$AIRFLOW_VENV/bin/python" "$HERE/render_config.py" \
@@ -103,4 +44,4 @@ AIRFLOW_DB_URL="$AIRFLOW_RUNTIME_DB_URL" AIRFLOW_API_PORT="$AIRFLOW_API_PORT" "$
   --home "$AIRFLOW_HOME" --venv "$AIRFLOW_VENV" \
   --template "$HERE/airflow.cfg.template" --dags-folder "$HERE/dags"
 # Installation preserves admission state. Only operatorctl start opens the DAG.
-echo "Airflow installed: $INSTALLED_AIRFLOW_VERSION, home=$AIRFLOW_HOME"
+echo "Airflow installed: home=$AIRFLOW_HOME"

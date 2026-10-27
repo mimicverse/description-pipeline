@@ -124,40 +124,18 @@ def write_delivery_manifest(root: Path, *, contract: dict, policy: dict) -> dict
     return manifest
 
 
-def _read_delivery_manifest(
-    root: Path,
-    *,
-    recovery: bool = False,
-) -> dict:
-    from .interface_records import validate_delivery_manifest, validate_recovery_delivery_manifest
+def read_delivery_manifest(root: Path) -> dict:
+    """Validate the current manifest and rebind every subject path, size and digest."""
+    from .interface_records import validate_delivery_manifest
 
     root = Path(root)
-    validator = validate_recovery_delivery_manifest if recovery else validate_delivery_manifest
-    manifest = validator(read_data(confined(root, MANIFEST)))
+    manifest = validate_delivery_manifest(read_data(confined(root, MANIFEST)))
     records = subject_records(root)
     if manifest["subject"]["files"] != records:
         raise PipelineError("Delivery subject files differ from manifest.json")
     if manifest["subject"]["digest"] != subject_digest(root):
         raise PipelineError("Delivery subject digest differs from manifest.json")
     return manifest
-
-
-def read_delivery_manifest(root: Path) -> dict:
-    """Read and validate ``manifest.json``, re-binding every subject record.
-
-    The stored ``{path, bytes, sha256}`` records must equal the current subject
-    record-for-record (missing, extra, replaced or re-sized entries are refused,
-    including byte-length changes that keep the digest), and the subject digest
-    must recompute over those records.
-    """
-
-    return _read_delivery_manifest(Path(root))
-
-
-def read_recovery_delivery_manifest(root: Path) -> dict:
-    """Read a sealed archive manifest under the exact recovery policy allowlist."""
-
-    return _read_delivery_manifest(Path(root), recovery=True)
 
 
 def read_source_record(root: Path) -> dict:
