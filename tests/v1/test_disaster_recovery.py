@@ -879,6 +879,7 @@ maintenance = {
     },
     "settled": True,
     "unsettled_count": 0,
+    "unsettled": [],
     "active_application_sessions": [],
     "wal_lsn": "0/100",
 }
@@ -1053,6 +1054,7 @@ def fake_maintenance_state(
         },
         "settled": True,
         "unsettled_count": 0,
+        "unsettled": [],
         "active_application_sessions": [],
         "wal_lsn": "0/100",
     }
@@ -3026,6 +3028,10 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 linux_after=row["services"]["linux_after"][:1],
             ),
             lambda row: row.update(backup_id="another-backup"),
+            lambda row: row["database"]["before"].update(
+                unsettled=[{"object_kind": "run", "object_id": "fixture", "state": "running"}],
+            ),
+            lambda row: row["database"]["before"].pop("unsettled"),
         )
         for rewrite in rewrites:
             with self.subTest(rewrite=rewrite):
@@ -3923,6 +3929,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
             },
             "settled": True,
             "unsettled_count": 0,
+            "unsettled": [],
             "active_application_sessions": [],
             "wal_lsn": "0/100",
         }

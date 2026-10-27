@@ -7819,6 +7819,7 @@ def validate_manifest(document: object, *, expected_manifest_sha: str | None) ->
                 "admission",
                 "settled",
                 "unsettled_count",
+                "unsettled",
                 "active_application_sessions",
                 "wal_lsn",
             },
@@ -7833,6 +7834,7 @@ def validate_manifest(document: object, *, expected_manifest_sha: str | None) ->
             admission["state"] == "closed"
             and value["settled"] is True
             and value["unsettled_count"] == 0
+            and value["unsettled"] == []
             and value["active_application_sessions"] == []
             and isinstance(value["wal_lsn"], str)
             and bool(value["wal_lsn"]),
