@@ -369,6 +369,8 @@ effect ledger，最后进入当前 claim/fence、cancellation/effect 与 candida
 
 备份前关闭准入、排空并确认无未决副作用，在同一维护锁内停止写者，取得平台与 Airflow schema 的同一数据库快照，再按该快照引用复制冻结原件、交付/诊断、安装记录、配置与密钥并核验清单。备份加密、访问受控，按部署恢复目标保留；同版恢复能力须经过实际演练。备份成功或中途失败后均明确报告服务停止与准入状态，由受控生命周期入口恢复运行。恢复在关闭准入状态下核验清单和引用，查询两端作业与远端发布结果后重建投影，先证明完整再开启服务。
 
+首次安装与灾备恢复共用一份内部运行时安装脚本，只重建虚拟环境、安装锁定依赖和发行 wheel，并验证运行时。恢复复用归档中的配置与数据库事实，不执行首次安装的配置渲染、数据库迁移、pool 或登录表初始化，也不将临时解包目录写入运行配置。
+
 恢复 runtime 必须用自身的 Python 3.12 虚拟环境完成 package identity、
 `description`／`airflow` entry probe 与 `pip check`。probe 从 caller 仅去除
 `PYTHONPATH`、`PYTHONHOME`、`VIRTUAL_ENV`，设置 `PYTHONNOUSERSITE=1`，并保留

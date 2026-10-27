@@ -1190,6 +1190,9 @@ def runtime_installer(venv: Path, source_sha: str = "b" * 64) -> str:
     lines = [
         "#!/bin/sh",
         "set -eu",
+        ': "${AIRFLOW_HOME:?}"',
+        ': "${PIPELINE_WHEEL:?}"',
+        '[ -f "$PIPELINE_WHEEL" ]',
         ': "${AIRFLOW_PYTHON:=python3.12}"',
         '"$AIRFLOW_PYTHON" -m venv "$AIRFLOW_VENV"',
         f'mkdir -p "{package}"',
@@ -1333,15 +1336,18 @@ def make_context(root: Path, fake_bin: Path) -> recovery.BackupContext:
     deployment_name = "description-1.0.0-test-deployment.zip"
     deployment_path = release_root / deployment_name
     recovery_script = Path(recovery.__file__).read_bytes()
-    installer = runtime_installer(release_root / ("airflow-venv-" + install_id))
+    runtime_installer_script = runtime_installer(release_root / ("airflow-venv-" + install_id))
+    installer = "#!/bin/sh\nset -eu\nexec bash \"$(dirname \"$0\")/install_runtime.sh\"\n"
     linux_lock = b"linux-lock\n"
     windows_lock = b"windows-lock\n"
     with zipfile.ZipFile(deployment_path, "w") as archive:
         archive.writestr("deploy/operator/recovery.py", recovery_script)
         archive.writestr("deploy/airflow/install.sh", installer)
+        archive.writestr("deploy/airflow/install_runtime.sh", runtime_installer_script)
         archive.writestr("requirements/linux-py312.lock", linux_lock)
         archive.writestr("requirements/windows-py312.lock", windows_lock)
     write(release_root / "deploy/airflow/install.sh", installer, mode=0o755)
+    write(release_root / "deploy/airflow/install_runtime.sh", runtime_installer_script, mode=0o755)
     write(release_root / "deploy/operator/recovery.py", recovery_script, mode=0o755)
     write(release_root / "requirements/linux-py312.lock", linux_lock)
     write(release_root / "requirements/windows-py312.lock", windows_lock)
@@ -1371,6 +1377,7 @@ def make_context(root: Path, fake_bin: Path) -> recovery.BackupContext:
         "deployment_files": {
             "deploy/operator/recovery.py": hashlib.sha256(recovery_script).hexdigest(),
             "deploy/airflow/install.sh": hashlib.sha256(installer.encode()).hexdigest(),
+            "deploy/airflow/install_runtime.sh": hashlib.sha256(runtime_installer_script.encode()).hexdigest(),
             "requirements/linux-py312.lock": hashlib.sha256(linux_lock).hexdigest(),
             "requirements/windows-py312.lock": hashlib.sha256(windows_lock).hexdigest(),
         },
@@ -2752,12 +2759,22 @@ class RecoveryControlFlowTests(unittest.TestCase):
             archive.writestr("requirements.lock", lock_bytes)
         deployment_zip = release_files / "artifacts" / "description-1.0.0-test-deployment.zip"
         recovery_script = Path(recovery.__file__).read_bytes()
-        installer = runtime_installer(release_root / "airflow-venv")
+        runtime_installer_script = runtime_installer(release_root / "airflow-venv")
+        full_install_marker = self.root / "full-install-called"
+        installer = (
+            "#!/bin/sh\n"
+            "set -eu\n"
+            f"touch {str(full_install_marker)!r}\n"
+            "exit 99\n"
+        )
+        airflow_cfg = self.root / "airflow-home" / "airflow.cfg"
+        write(airflow_cfg, "restored-config\n")
         linux_lock = b"linux-lock\n"
         windows_lock = b"windows-lock\n"
         with zipfile.ZipFile(deployment_zip, "w") as archive:
             archive.writestr("deploy/operator/recovery.py", recovery_script)
             archive.writestr("deploy/airflow/install.sh", installer)
+            archive.writestr("deploy/airflow/install_runtime.sh", runtime_installer_script)
             archive.writestr("requirements/linux-py312.lock", linux_lock)
             archive.writestr("requirements/windows-py312.lock", windows_lock)
         write(
@@ -2777,6 +2794,9 @@ class RecoveryControlFlowTests(unittest.TestCase):
                     "deployment_files": {
                         "deploy/operator/recovery.py": hashlib.sha256(recovery_script).hexdigest(),
                         "deploy/airflow/install.sh": hashlib.sha256(installer.encode()).hexdigest(),
+                        "deploy/airflow/install_runtime.sh": hashlib.sha256(
+                            runtime_installer_script.encode()
+                        ).hexdigest(),
                         "requirements/linux-py312.lock": hashlib.sha256(linux_lock).hexdigest(),
                         "requirements/windows-py312.lock": hashlib.sha256(windows_lock).hexdigest(),
                     },
@@ -2821,6 +2841,8 @@ class RecoveryControlFlowTests(unittest.TestCase):
         )
         self.assertEqual(result["identity"]["version"], "1.0.0")
         self.assertTrue((release_root / "airflow-venv" / "bin" / "python").is_file())
+        self.assertFalse(full_install_marker.exists())
+        self.assertEqual(airflow_cfg.read_text(encoding="utf-8"), "restored-config\n")
         verified = recovery.rehydrate_release_runtime(
             manifest=manifest,
             plan={"roots": {"release_root": str(release_root)}},

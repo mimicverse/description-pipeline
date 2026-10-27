@@ -11258,10 +11258,10 @@ def rehydrate_release_runtime(
             "PIP_FIND_LINKS": str(linux_dir / "wheels"),
         }
     )
-    install = deployment_dir / "deploy" / "airflow" / "install.sh"
-    require_real_file(install, "release Airflow installer", "recovery_release_missing")
+    installer = deployment_dir / "deploy" / "airflow" / "install_runtime.sh"
+    require_real_file(installer, "release Airflow runtime installer", "recovery_release_missing")
     completed = subprocess.run(
-        ["bash", str(install)],
+        ["bash", str(installer)],
         capture_output=True,
         text=True,
         env=env,

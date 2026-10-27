@@ -373,12 +373,17 @@ class LockAndScriptsTest(unittest.TestCase):
             self.assertIn(required, joined)
         self.assertNotIn("mimicverse-description==", joined)
         installer = (DEPLOY / "install.sh").read_text(encoding="utf-8")
-        self.assertIn("--require-hashes --only-binary=:all:", installer)
-        self.assertIn("-m pip check", installer)
-        self.assertIn('INSTALLED_AIRFLOW_VERSION="$("$AIRFLOW_VENV/bin/airflow" version', installer)
-        self.assertIn('[ "$INSTALLED_AIRFLOW_VERSION" = "3.3.2" ]', installer)
-        self.assertIn('"$AIRFLOW_VENV/bin/airflow" triggerer --help', installer)
-        self.assertNotIn("pip install --upgrade", installer)
+        runtime_installer = (DEPLOY / "install_runtime.sh").read_text(encoding="utf-8")
+        self.assertIn('bash "$HERE/install_runtime.sh"', installer)
+        self.assertIn("--require-hashes --only-binary=:all:", runtime_installer)
+        self.assertIn("-m pip check", runtime_installer)
+        self.assertIn(
+            'INSTALLED_AIRFLOW_VERSION="$("$AIRFLOW_VENV/bin/airflow" version',
+            runtime_installer,
+        )
+        self.assertIn('[ "$INSTALLED_AIRFLOW_VERSION" = "3.3.2" ]', runtime_installer)
+        self.assertIn('"$AIRFLOW_VENV/bin/airflow" triggerer --help', runtime_installer)
+        self.assertNotIn("pip install --upgrade", runtime_installer)
         self.assertNotIn("sed -e", installer)
 
     def test_postgres_installer_is_socket_only(self) -> None:
