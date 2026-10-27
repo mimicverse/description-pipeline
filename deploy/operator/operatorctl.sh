@@ -45,6 +45,9 @@ load_unit_role OPERATOR_UNITS operator
 [ "${#DATABASE_UNITS[@]}" -eq 1 ] || die "the managed database role must name exactly one unit"
 OPERATOR_UNIT_FILES=()
 for unit in "${OPERATOR_UNITS[@]}"; do OPERATOR_UNIT_FILES+=("$unit.service"); done
+EXECUTOR_UNIT_FILES=()
+for unit in "${EXECUTOR_UNITS[@]}"; do EXECUTOR_UNIT_FILES+=("$unit.service"); done
+DATABASE_UNIT_FILE="${DATABASE_UNITS[0]}.service"
 operator_units_enable() {
   systemctl --user enable --now "${OPERATOR_UNIT_FILES[@]}"
 }
@@ -52,12 +55,15 @@ operator_units_active() {
   systemctl --user is-active --quiet "${OPERATOR_UNIT_FILES[@]}"
 }
 operator_units_disable() {
-  local index
+  local index rc=0
   local -a reversed=()
   for ((index=${#OPERATOR_UNIT_FILES[@]}-1; index>=0; index--)); do
     reversed+=("${OPERATOR_UNIT_FILES[$index]}")
   done
-  systemctl --user disable --now "${reversed[@]}"
+  for unit in "${reversed[@]}"; do
+    systemctl --user disable --now "$unit" || rc=$?
+  done
+  return "$rc"
 }
 
 GENERATION_ENV_REQUIRED=(
@@ -340,7 +346,7 @@ PY
 }
 
 clean_or_absent() {
-  local path="$1" label="$2"
+  local path="$1" label="$2" first
   if [ -L "$path" ]; then
     die "$label is a link: $path"
   fi
@@ -348,19 +354,115 @@ clean_or_absent() {
     return 0
   fi
   [ -d "$path" ] || die "$label is not a directory: $path"
-  [ -z "$(find "$path" -mindepth 1 -maxdepth 1 -print -quit)" ] \
-    || die "$label contains unknown residual state: $path"
+  first="$(find "$path" -mindepth 1 -maxdepth 1 -print -quit)" \
+    || die "$label could not be inspected: $path"
+  [ -z "$first" ] || die "$label contains unknown residual state: $path"
+}
+
+install_state_inventory() {
+  local mode="$1"
+  "$CONTROL_PYTHON" - "$STATE_ROOT" "$mode" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+mode = sys.argv[2]
+if mode not in {"prelock", "postlock"}:
+    raise SystemExit("operatorctl: invalid install-state inventory mode")
+if root.is_symlink() or not root.is_dir():
+    raise SystemExit(f"operatorctl: install state root is missing, linked, or not a directory: {root}")
+entries = {entry.name: entry for entry in os.scandir(root)}
+unexpected = sorted(set(entries) - {"locks"})
+if unexpected:
+    raise SystemExit(f"operatorctl: state root contains unknown residual state: {unexpected}")
+if "locks" not in entries:
+    if mode == "postlock":
+        raise SystemExit("operatorctl: the maintenance lock directory is missing")
+    raise SystemExit(0)
+locks = Path(entries["locks"].path)
+if locks.is_symlink() or not locks.is_dir():
+    raise SystemExit(f"operatorctl: lifecycle lock directory is linked or invalid: {locks}")
+if mode == "prelock":
+    raise SystemExit(0)
+lock_entries = {entry.name: entry for entry in os.scandir(locks)}
+if set(lock_entries) != {"maintenance.lock"}:
+    raise SystemExit(
+        f"operatorctl: lifecycle lock directory contains unknown residual state: {sorted(lock_entries)}"
+    )
+lock = Path(lock_entries["maintenance.lock"].path)
+try:
+    metadata = lock.lstat()
+except OSError as error:
+    raise SystemExit(f"operatorctl: lifecycle lock cannot be inspected: {error}")
+if (
+    not stat.S_ISREG(metadata.st_mode)
+    or stat.S_IMODE(metadata.st_mode) != 0o600
+    or stat.S_IMODE(locks.stat().st_mode) != 0o700
+):
+    raise SystemExit(f"operatorctl: lifecycle lock permissions are invalid: {lock}")
+PY
+}
+
+prepare_install_state_root() {
+  [ ! -L "$STATE_ROOT" ] || die "install state root is a link: $STATE_ROOT"
+  if [ ! -e "$STATE_ROOT" ]; then
+    mkdir -m 700 -- "$STATE_ROOT" \
+      || [ -d "$STATE_ROOT" ] \
+      || die "could not create the install state root: $STATE_ROOT"
+  fi
+  [ -d "$STATE_ROOT" ] || die "install state root is not a directory: $STATE_ROOT"
+  install_state_inventory prelock
+}
+
+check_first_install_business_roots() {
+  local -a roots=()
+  local output
+  output="$(
+    "$CONTROL_PYTHON" - "$RESOLVED_CONFIG" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+document = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+for name in ("handoff_root", "artifact_root", "workspace_root"):
+    print(document["storage"][name])
+PY
+  )" || die "the first-install business roots are unreadable"
+  mapfile -t roots <<< "$output"
+  [ "${#roots[@]}" -eq 3 ] || die "the first-install business roots are incomplete"
+  clean_or_absent "${roots[0]}" "handoff root"
+  clean_or_absent "${roots[1]}" "artifact root"
+  clean_or_absent "${roots[2]}" "workspace root"
 }
 
 first_install_preflight() {
   local target="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user" unit
-  clean_or_absent "$STATE_ROOT" "state root"
+  install_state_inventory postlock
   clean_or_absent "$RELEASE_TARGET_ROOT" "runtime release root"
+  check_first_install_business_roots
   for unit in "${UNITS[@]}"; do
     if [ -e "$target/$unit.service" ] || [ -L "$target/$unit.service" ]; then
       die "managed unit already exists before first install: $target/$unit.service"
     fi
   done
+}
+
+require_units_stopped() {
+  local label="$1" unit state rc=0
+  shift
+  for unit in "$@"; do
+    state="$(systemctl --user is-active "$unit" 2>/dev/null || true)"
+    case "$state" in
+      inactive|failed) ;;
+      *)
+        echo "operatorctl: $label unit $unit is still ${state:-unknown} after stop" >&2
+        rc=1
+        ;;
+    esac
+  done
+  return "$rc"
 }
 
 ensure_proxy_binary() {
@@ -691,7 +793,7 @@ drift_check() {
 }
 
 install_from_config() {
-  local install_output snapshot_digest snapshot_path derived_env proxy_bin
+  local install_output snapshot_digest snapshot_path derived_env proxy_bin stable_wheel
   local windows_output windows_identity services_csv
   first_install_preflight
   resolve_release_file
@@ -705,28 +807,27 @@ install_from_config() {
   if [ -z "$INSTALL_ID" ]; then
     INSTALL_ID="$("$CONTROL_PYTHON" -c 'import uuid; print(uuid.uuid4().hex)')"
   fi
-  install_output="$(mktemp)"
   if [ -n "$WHEEL_FILE" ]; then
-    "$CONTROL_PYTHON" "$HERE/platform_config.py" render --config "$CONFIG_FILE" \
-      --install-id "$INSTALL_ID" --wheel "$WHEEL_FILE" > "$install_output" || exit $?
+    stable_wheel="$("$CONTROL_PYTHON" "$HERE/install_record.py" stage-wheel \
+      --release-file "$RELEASE_FILE" --release-root "$RELEASE_TARGET_ROOT" \
+      --wheel "$WHEEL_FILE")" || exit $?
   else
-    "$CONTROL_PYTHON" "$HERE/platform_config.py" render --config "$CONFIG_FILE" \
-      --install-id "$INSTALL_ID" --tree "$RELEASE_ROOT" > "$install_output" || exit $?
+    stable_wheel="$("$CONTROL_PYTHON" "$HERE/install_record.py" stage-wheel \
+      --release-file "$RELEASE_FILE" --release-root "$RELEASE_TARGET_ROOT" \
+      --tree "$RELEASE_ROOT")" || exit $?
   fi
+  [ -f "$stable_wheel" ] || die "the stable runtime wheel was not installed"
+  install_output="$(mktemp)"
+  "$CONTROL_PYTHON" "$HERE/platform_config.py" render --config "$CONFIG_FILE" \
+    --install-id "$INSTALL_ID" --wheel "$stable_wheel" > "$install_output" || exit $?
   snapshot_digest="$(sed -n 's/^config_digest=//p' "$install_output")"
   snapshot_path="$(sed -n 's/^snapshot=//p' "$install_output")"
   rm -f "$install_output"
   [ -n "$snapshot_digest" ] && [ -f "$snapshot_path" ] \
     || die "the configuration snapshot was not written"
-  if [ -n "$WHEEL_FILE" ]; then
-    derived_env="$("$CONTROL_PYTHON" "$HERE/platform_env.py" emit --snapshot "$snapshot_path" \
-      --install-id "$INSTALL_ID" --tree "$RELEASE_ROOT" --release-file "$RELEASE_FILE" \
-      --wheel "$WHEEL_FILE" | sed -n 's/^env=//p')" || exit $?
-  else
-    derived_env="$("$CONTROL_PYTHON" "$HERE/platform_env.py" emit --snapshot "$snapshot_path" \
-      --install-id "$INSTALL_ID" --tree "$RELEASE_ROOT" --release-file "$RELEASE_FILE" \
-      | sed -n 's/^env=//p')" || exit $?
-  fi
+  derived_env="$("$CONTROL_PYTHON" "$HERE/platform_env.py" emit --snapshot "$snapshot_path" \
+    --install-id "$INSTALL_ID" --tree "$RELEASE_ROOT" --release-file "$RELEASE_FILE" \
+    --wheel "$stable_wheel" | sed -n 's/^env=//p')" || exit $?
   [ -f "$derived_env" ] || die "the derived environment was not written"
   ENV_FILE="$derived_env"
   OPERATOR_STATE="$(generation_env_declared_value "$ENV_FILE" OPERATOR_STATE)"
@@ -796,7 +897,7 @@ install_from_config() {
     --snapshot "$snapshot_path" --release-file "$RELEASE_FILE" \
     --endpoint-identity "$windows_identity" --services "$services_csv" \
     --dag "$AIRFLOW_HERE/dags/solidworks_to_urdf.py" \
-    --deployment-root "$RELEASE_ROOT" --tree "$RELEASE_ROOT"
+    --deployment-root "$RELEASE_ROOT" --wheel "$stable_wheel"
   AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" \
     "$AIRFLOW_HERE/scripts/add_connection.py" \
     --state-root "$STATE_ROOT" --snapshot "$snapshot_path" \
@@ -813,6 +914,8 @@ case "$ACTION" in
   install)
     snapshot_config
     resolve_config
+    prepare_install_state_root
+    acquire_lifecycle_lock
     install_from_config
     ;;
   start)
@@ -866,6 +969,7 @@ case "$ACTION" in
     esac
     ;;
   stop)
+    STOP_RC=0
     snapshot_config
     resolve_config
     acquire_lifecycle_lock
@@ -878,17 +982,31 @@ case "$ACTION" in
     echo "$projection"
     windows_action stop "$STATE_ROOT/install-record.json" >/dev/null \
       || die "the Windows endpoint did not prove stop; Linux remains active"
-    operator_units_disable || true
-    airflow_set_dag_paused true || ADMISSION_RC=$?
+    operator_units_disable || STOP_RC=1
+    airflow_set_dag_paused true || STOP_RC=1
     if [ -n "$KEEP_DATABASE" ]; then
-      airflow_lifecycle stop-executors
-      [ "$(systemctl --user is-active "${DATABASE_UNITS[0]}.service" 2>/dev/null || true)" = "active" ] \
-        || die "PostgreSQL is not active for --keep-database"
-      echo "stop complete: writers stopped; PostgreSQL remains active"
+      airflow_lifecycle stop-executors || STOP_RC=1
+      database_state="$(systemctl --user is-active "$DATABASE_UNIT_FILE" 2>/dev/null || true)"
+      [ "$database_state" = "active" ] || {
+        echo "operatorctl: PostgreSQL is not active for --keep-database: ${database_state:-unknown}" >&2
+        STOP_RC=1
+      }
     else
-      airflow_lifecycle stop
+      airflow_lifecycle stop || STOP_RC=1
     fi
-    exit "${ADMISSION_RC:-0}"
+    require_units_stopped operator "${OPERATOR_UNIT_FILES[@]}" || STOP_RC=1
+    require_units_stopped executor "${EXECUTOR_UNIT_FILES[@]}" || STOP_RC=1
+    if [ -z "$KEEP_DATABASE" ]; then
+      require_units_stopped database "$DATABASE_UNIT_FILE" || STOP_RC=1
+    fi
+    [ "$STOP_RC" -ne 0 ] || {
+      if [ -n "$KEEP_DATABASE" ]; then
+        echo "stop complete: writers stopped; PostgreSQL remains active"
+      else
+        echo "stop complete: all managed units stopped"
+      fi
+    }
+    exit "$STOP_RC"
     ;;
   status)
     snapshot_config

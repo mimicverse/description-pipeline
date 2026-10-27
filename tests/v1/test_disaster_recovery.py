@@ -3700,6 +3700,80 @@ class RecoveryControlFlowTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "windows_target_not_empty")
         self.assertEqual(raised.exception.detail["path"], "C:/description/state")
 
+    def test_windows_target_observation_failure_is_unknown(self) -> None:
+        document = {
+            "passed": False,
+            "code": "windows_target_observation_unknown",
+            "message": "access denied",
+        }
+        completed = subprocess.CompletedProcess(
+            ["ssh", "windows-fixture"],
+            2,
+            json.dumps(document) + "\n",
+            "",
+        )
+        with (
+            mock.patch.object(recovery, "_run_windows_powershell", return_value=(document, completed)),
+            self.assertRaises(recovery.RecoveryError) as raised,
+        ):
+            recovery._windows_restore_target_empty(
+                ssh_host="windows-fixture",
+                binding={
+                    "task_name": "description-e2e-endpoint",
+                    "task_path": "\\URDF\\",
+                },
+                paths=["C:/description/state/install-id"],
+                roots=["C:/description/state"],
+                timeout=5,
+                commands=[],
+            )
+        self.assertEqual(raised.exception.code, "windows_recovery_transport_unknown")
+
+    def test_windows_path_probe_failure_is_unknown(self) -> None:
+        document = {
+            "passed": False,
+            "code": "windows_path_observation_unknown",
+            "message": "access denied",
+        }
+        completed = subprocess.CompletedProcess(
+            ["ssh", "windows-fixture"],
+            2,
+            json.dumps(document) + "\n",
+            "",
+        )
+        with (
+            mock.patch.object(recovery, "_run_windows_powershell", return_value=(document, completed)),
+            self.assertRaises(recovery.RecoveryError) as raised,
+        ):
+            recovery._windows_path_exists(
+                ssh_host="windows-fixture",
+                path="C:/description/state/native-operations",
+                timeout=5,
+                commands=[],
+            )
+        self.assertEqual(raised.exception.code, "windows_recovery_transport_unknown")
+
+    def test_windows_acl_projection_rejects_incomplete_or_failed_observation(self) -> None:
+        for entries, returncode in (([], 0), ([{"path": "C:/description/state"}], 2)):
+            with self.subTest(entries=entries, returncode=returncode):
+                document = {"passed": True, "entries": entries}
+                completed = subprocess.CompletedProcess(
+                    ["ssh", "windows-fixture"], returncode, json.dumps(document) + "\n", ""
+                )
+                with (
+                    mock.patch.object(
+                        recovery, "_run_windows_powershell", return_value=(document, completed)
+                    ),
+                    self.assertRaises(recovery.RecoveryError) as raised,
+                ):
+                    recovery._windows_acl_document(
+                        ssh_host="windows-fixture",
+                        paths=["C:/description/state"],
+                        timeout=5,
+                        commands=[],
+                    )
+                self.assertEqual(raised.exception.code, "windows_recovery_transport_unknown")
+
     def test_windows_lifecycle_refusal_preserves_the_lifecycle_code(self) -> None:
         completed = subprocess.CompletedProcess(
             ["ssh", "windows-fixture"],

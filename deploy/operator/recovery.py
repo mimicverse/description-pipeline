@@ -1505,6 +1505,7 @@ def _db_connect(
         user=BOOTSTRAP_ROLE,
         host=authority["socket_dir"],
         port=authority["port"],
+        options="-c search_path=platform,airflow,pg_catalog",
     )
     connection.autocommit = autocommit
     return connection
@@ -5463,13 +5464,14 @@ def _windows_acl_document(
         json.dumps(paths, separators=(",", ":")).encode("utf-8")
     ).decode("ascii")
     script = rf"""
+$ErrorActionPreference = 'Stop'
 $paths = ConvertFrom-Json ([Text.Encoding]::UTF8.GetString(
   [Convert]::FromBase64String('{encoded}')))
-$rows = @()
-foreach ($path in @($paths)) {{
-  if (Test-Path -LiteralPath $path) {{
-    $item = Get-Item -LiteralPath $path -Force
-    $acl = Get-Acl -LiteralPath $path
+try {{
+  $rows = @()
+  foreach ($path in @($paths)) {{
+    $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+    $acl = Get-Acl -LiteralPath $path -ErrorAction Stop
     $rows += [ordered]@{{
       path = ([IO.Path]::GetFullPath($path)).Replace('\','/')
       type = $(if ($item.PSIsContainer) {{ 'directory' }} else {{ 'file' }})
@@ -5479,20 +5481,30 @@ foreach ($path in @($paths)) {{
         [System.Security.AccessControl.AccessControlSections]::All)
     }}
   }}
+  @{{
+    passed = $true
+    entries = @($rows)
+  }} | ConvertTo-Json -Depth 8 -Compress
+}} catch {{
+  @{{
+    passed = $false
+    code = 'windows_acl_observation_unknown'
+    message = $_.Exception.Message
+  }} | ConvertTo-Json -Compress
+  exit 2
 }}
-@{{
-  passed = $true
-  entries = @($rows)
-}} | ConvertTo-Json -Depth 8 -Compress
 """
-    document, _ = _run_windows_powershell(
+    document, completed = _run_windows_powershell(
         ssh_host=ssh_host,
         script=script,
         timeout=timeout,
         commands=commands,
     )
     require(
-        document.get("passed") is True and isinstance(document.get("entries"), list),
+        completed.returncode == 0
+        and document.get("passed") is True
+        and isinstance(document.get("entries"), list)
+        and len(document["entries"]) == len(paths),
         "windows_recovery_transport_unknown",
         "Windows ACL projection is unavailable",
     )
@@ -5722,19 +5734,32 @@ def _windows_path_exists(
     timeout: int,
     commands: list[dict] | None = None,
 ) -> bool:
-    document, _ = _run_windows_powershell(
+    script = f"""
+$ErrorActionPreference = 'Stop'
+try {{
+  $exists = [bool](Test-Path -LiteralPath {_windows_quote(path)} -ErrorAction Stop)
+  @{{passed=$true;exists=$exists}} | ConvertTo-Json -Compress
+}} catch {{
+  @{{
+    passed=$false
+    code='windows_path_observation_unknown'
+    message=$_.Exception.Message
+  }} | ConvertTo-Json -Compress
+  exit 2
+}}
+"""
+    document, completed = _run_windows_powershell(
         ssh_host=ssh_host,
-        script=(
-            f"if (Test-Path -LiteralPath {_windows_quote(path)}) "
-            "{ '{\"exists\":true}' } else { '{\"exists\":false}' }"
-        ),
+        script=script,
         timeout=timeout,
         commands=commands,
     )
     require(
-        type(document.get("exists")) is bool,
+        completed.returncode == 0
+        and document.get("passed") is True
+        and type(document.get("exists")) is bool,
         "windows_recovery_transport_unknown",
-        "Windows path probe returned no boolean",
+        "Windows path outcome is unknown",
     )
     return document["exists"]
 
@@ -5778,36 +5803,80 @@ def _windows_restore_target_empty(
     ssh_host: str,
     binding: dict,
     paths: list[str],
+    roots: list[str] | None = None,
     timeout: int,
     commands: list[dict],
 ) -> None:
     payload = {
         "task_name": binding["task_name"],
         "task_path": binding["task_path"],
-        "paths": paths,
+        "files": paths,
+        "roots": roots or [],
     }
     encoded = base64.b64encode(
         json.dumps(payload, separators=(",", ":")).encode("utf-8")
     ).decode("ascii")
     script = rf"""
+$ErrorActionPreference = 'Stop'
 $request = ConvertFrom-Json ([Text.Encoding]::UTF8.GetString(
   [Convert]::FromBase64String('{encoded}')))
-$tasks = @(Get-ScheduledTask `
-  -TaskName ([string]$request.task_name) `
-  -TaskPath ([string]$request.task_path) `
-  -ErrorAction SilentlyContinue)
-if ($tasks.Count -ne 0) {{
-  @{{passed=$false;code='windows_target_task_exists'}} | ConvertTo-Json -Compress
+function Deny-Target([string]$Code, [string]$Path) {{
+  @{{passed=$false;code=$Code;path=$Path}} | ConvertTo-Json -Compress
   exit 1
 }}
-foreach ($path in @($request.paths)) {{
-  if (Test-Path -LiteralPath $path) {{
-    @{{passed=$false;code='windows_target_not_empty';path=$path}} |
-      ConvertTo-Json -Compress
-    exit 1
+try {{
+  $tasks = @(Get-ScheduledTask -ErrorAction Stop)
+  $matching = @($tasks | Where-Object {{
+    [string]::Equals(
+      [string]$_.TaskName,
+      [string]$request.task_name,
+      [System.StringComparison]::OrdinalIgnoreCase) -and
+    [string]::Equals(
+      [string]$_.TaskPath,
+      [string]$request.task_path,
+      [System.StringComparison]::OrdinalIgnoreCase)
+  }})
+  if ($matching.Count -ne 0) {{
+    Deny-Target 'windows_target_task_exists' ([string]$request.task_path)
   }}
+  foreach ($path in @($request.files)) {{
+    $item = $null
+    try {{
+      $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+    }} catch [System.Management.Automation.ItemNotFoundException] {{
+      continue
+    }}
+    if ($null -ne $item) {{
+      Deny-Target 'windows_target_not_empty' ([string]$path)
+    }}
+  }}
+  foreach ($root in @($request.roots)) {{
+    $item = $null
+    try {{
+      $item = Get-Item -LiteralPath $root -Force -ErrorAction Stop
+    }} catch [System.Management.Automation.ItemNotFoundException] {{
+      continue
+    }}
+    if ($null -eq $item) {{
+      throw 'target root observation returned no object'
+    }}
+    if (-not $item.PSIsContainer -or
+        ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {{
+      Deny-Target 'windows_target_not_empty' ([string]$root)
+    }}
+    if (@(Get-ChildItem -LiteralPath $root -Force -ErrorAction Stop).Count -ne 0) {{
+      Deny-Target 'windows_target_not_empty' ([string]$root)
+    }}
+  }}
+  @{{passed=$true}} | ConvertTo-Json -Compress
+}} catch {{
+  @{{
+    passed=$false
+    code='windows_target_observation_unknown'
+    message=$_.Exception.Message
+  }} | ConvertTo-Json -Compress
+  exit 2
 }}
-@{{passed=$true}} | ConvertTo-Json -Compress
 """
     document, completed = _run_windows_powershell(
         ssh_host=ssh_host,
@@ -5815,10 +5884,21 @@ foreach ($path in @($request.paths)) {{
         timeout=timeout,
         commands=commands,
     )
+    if (
+        completed.returncode in (0, 1)
+        and document.get("passed") is False
+        and document.get("code")
+        in {"windows_target_task_exists", "windows_target_not_empty"}
+    ):
+        raise RecoveryError(
+            "windows_target_not_empty",
+            "Windows disaster recovery requires an empty target",
+            document,
+        )
     require(
         completed.returncode == 0 and document.get("passed") is True,
-        "windows_target_not_empty",
-        "Windows disaster recovery requires an empty target",
+        "windows_recovery_transport_unknown",
+        "Windows target-emptiness outcome is unknown",
         document,
     )
 
@@ -6079,6 +6159,7 @@ def restore_windows_recovery(
     _windows_restore_target_empty(
         ssh_host=ssh_host,
         binding=binding,
+        roots=[state_root, release_parent],
         paths=[
             state_root + "/install-id",
             state_root + "/install-receipt.json",

@@ -553,6 +553,10 @@ if [ "${1:-}" = "--user" ]; then action="${2:-}"; else action="${1:-}"; fi
 case "$action" in
   is-active)
     unit="${!#}"
+    if [ -n "${SYSTEMCTL_UNKNOWN_UNIT:-}" ] && [ "$unit" = "$SYSTEMCTL_UNKNOWN_UNIT" ]; then
+      echo unknown
+      exit 4
+    fi
     if [ -f "$SYSTEMCTL_STATE_DIR/$unit" ]; then
       echo active
     else
@@ -564,6 +568,11 @@ case "$action" in
       case "$unit" in description-*.service) : > "$SYSTEMCTL_STATE_DIR/$unit" ;; esac
     done ;;
   stop|disable)
+    for unit in "$@"; do
+      if [ -n "${SYSTEMCTL_DISABLE_FAIL_UNIT:-}" ] && [ "$unit" = "$SYSTEMCTL_DISABLE_FAIL_UNIT" ]; then
+        exit 9
+      fi
+    done
     for unit in "$@"; do
       case "$unit" in description-*.service) rm -f "$SYSTEMCTL_STATE_DIR/$unit" ;; esac
     done ;;
@@ -618,15 +627,33 @@ document = {
     "passed": True,
     "verb": verb,
     "identity": identity,
-    "health": {
+    "task_state": "Running" if verb in {"install", "start", "status", "health"} else "Disabled",
+}
+if verb == "status":
+    document.update({
+        "task": {
+            "task_name": "description-e2e-endpoint",
+            "task_path": "\\\\URDF\\\\",
+            "state": "Disabled",
+        },
+        "listener": None,
+        "health": None,
+        "status": {
+            "consistent": True,
+            "task_exists": True,
+            "task_state": "Disabled",
+            "error": None,
+            "solidworks_processes": 0,
+        },
+    })
+else:
+    document["health"] = {
         "install_id": identity["install_id"],
         "config_digest": identity["config_digest"],
         "release": identity["release"],
         "target_identity": identity["target_identity"],
         "endpoint": {"port": 9765},
-    },
-    "task_state": "Running" if verb in {"install", "start", "status", "health"} else "Disabled",
-}
+    }
 print(json.dumps(document))
 """,
     )
@@ -652,6 +679,11 @@ print(json.dumps(document))
         "release_file": release_file,
         "state": state,
         "runtime_releases": runtime_releases,
+        "handoffs": handoffs,
+        "artifacts": artifacts,
+        "workspaces": workspaces,
+        "specifications": specifications,
+        "source_wheel": wheel,
         "order": order,
         "admission": admission,
         "unit_state": unit_state,
@@ -712,6 +744,25 @@ class FirstInstallTests(unittest.TestCase):
         identities = list((self.paths["state"] / "lifecycle").glob("*/windows-endpoint-identity.json"))
         self.assertEqual(len(identities), 1)
 
+    def test_runtime_wheel_is_stable_after_the_source_wheel_is_removed(self) -> None:
+        installed = self._install()
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        operator_env = self.paths["state"] / "derived" / "gen-1" / "operator.env"
+        values = dict(
+            line.split("=", 1)
+            for line in operator_env.read_text(encoding="utf-8").splitlines()
+            if "=" in line
+        )
+        stable = Path(values["PIPELINE_WHEEL"])
+        expected = self.paths["runtime_releases"] / "artifacts" / self.paths["source_wheel"].name
+        self.assertEqual(stable, expected)
+        self.assertEqual(stable.read_bytes(), self.paths["source_wheel"].read_bytes())
+        self.paths["source_wheel"].unlink()
+        for unit in ALL_UNITS:
+            (self.paths["unit_state"] / f"{unit}.service").write_text("active\n", encoding="utf-8")
+        status = run(self._command("status"), self.environment)
+        self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+
     def test_install_refuses_unknown_state_before_writing(self) -> None:
         self.paths["state"].mkdir()
         (self.paths["state"] / "unknown").write_text("residue", encoding="utf-8")
@@ -720,6 +771,78 @@ class FirstInstallTests(unittest.TestCase):
         self.assertIn("unknown residual state", installed.stderr)
         self.assertFalse((self.paths["state"] / "snapshots").exists())
         self.assertFalse((self.paths["state"] / "lifecycle").exists())
+
+    def test_install_refuses_unknown_business_residue(self) -> None:
+        for key, label in (
+            ("handoffs", "handoff root"),
+            ("artifacts", "artifact root"),
+            ("workspaces", "workspace root"),
+        ):
+            with self.subTest(root=label):
+                self.paths[key].mkdir()
+                sentinel = self.paths[key] / "unknown"
+                sentinel.write_text("residue", encoding="utf-8")
+                installed = self._install()
+                self.assertNotEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+                self.assertIn(f"{label} contains unknown residual state", installed.stderr)
+                self.assertFalse((self.paths["state"] / "install-record.json").exists())
+                sentinel.unlink()
+                self.paths[key].rmdir()
+
+    def test_install_refuses_an_unreadable_business_root(self) -> None:
+        self.paths["artifacts"].mkdir()
+        self.paths["artifacts"].chmod(0)
+        try:
+            installed = self._install()
+        finally:
+            self.paths["artifacts"].chmod(0o700)
+        self.assertNotEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        self.assertIn("artifact root could not be inspected", installed.stderr)
+        self.assertFalse((self.paths["state"] / "install-record.json").exists())
+
+    def test_install_treats_nonempty_specification_roots_as_declared_inputs(self) -> None:
+        self.paths["specifications"].mkdir()
+        record = self.paths["specifications"] / "records.json"
+        record.write_text('{"declared":true}\n', encoding="utf-8")
+        installed = self._install()
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        self.assertEqual(record.read_text(encoding="utf-8"), '{"declared":true}\n')
+
+    def test_install_uses_the_shared_lifecycle_lock(self) -> None:
+        lock_dir = self.paths["state"] / "locks"
+        lock_dir.mkdir(parents=True)
+        lock_file = lock_dir / "maintenance.lock"
+        holder = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import fcntl, sys, time\n"
+                    "handle = open(sys.argv[1], 'a+', encoding='utf-8')\n"
+                    "fcntl.flock(handle, fcntl.LOCK_EX)\n"
+                    "print('ready', flush=True)\n"
+                    "time.sleep(30)\n"
+                ),
+                str(lock_file),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            self.assertIsNotNone(holder.stdout)
+            self.assertEqual(holder.stdout.readline().strip(), "ready")
+            installed = self._install()
+            self.assertNotEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+            self.assertIn("another supported lifecycle operation owns the lock", installed.stderr)
+            self.assertFalse((self.paths["state"] / "snapshots").exists())
+        finally:
+            holder.terminate()
+            holder.wait(timeout=5)
+            if holder.stdout is not None:
+                holder.stdout.close()
+            if holder.stderr is not None:
+                holder.stderr.close()
 
     def test_failed_windows_identity_stops_the_partial_database(self) -> None:
         Path(self.environment["FIXTURE_WINDOWS_IDENTITY"]).unlink()
@@ -752,6 +875,36 @@ class FirstInstallTests(unittest.TestCase):
         self.assertIn("airflow_services stop-executors", order)
         self.assertNotIn("promote", order)
         self.assertNotIn("rollback", order)
+
+    def test_stop_fails_when_an_operator_unit_remains_active(self) -> None:
+        installed = self._install()
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        started = run(self._command("start"), self.environment)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        drained = run(self._command("drain"), self.environment)
+        self.assertEqual(drained.returncode, 0, drained.stdout + drained.stderr)
+        self.environment["SYSTEMCTL_DISABLE_FAIL_UNIT"] = "description-portal.service"
+        stopped = run(self._command("stop", "--keep-database"), self.environment)
+        self.assertNotEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertIn("description-portal.service is still active after stop", stopped.stderr)
+        self.assertTrue(
+            (self.paths["unit_state"] / "description-portal.service").exists()
+        )
+        self.assertFalse(
+            (self.paths["unit_state"] / "description-operator-proxy.service").exists()
+        )
+
+    def test_stop_fails_closed_for_an_unknown_unit_state(self) -> None:
+        installed = self._install()
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        started = run(self._command("start"), self.environment)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        drained = run(self._command("drain"), self.environment)
+        self.assertEqual(drained.returncode, 0, drained.stdout + drained.stderr)
+        self.environment["SYSTEMCTL_UNKNOWN_UNIT"] = "description-operator-proxy.service"
+        stopped = run(self._command("stop", "--keep-database"), self.environment)
+        self.assertNotEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertIn("description-operator-proxy.service is still unknown after stop", stopped.stderr)
 
     def test_start_keep_admission_closed_skips_health_and_open(self) -> None:
         installed = self._install()

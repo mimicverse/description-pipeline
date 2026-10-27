@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib.util
 import json
@@ -45,6 +46,33 @@ def native_target(install_id: str = "win-" + "7" * 32) -> dict:
         install_id=install_id,
         pipeline_id=PIPELINE_ID,
     ).to_record()
+
+
+def disabled_status(release: dict, install_id: str) -> dict:
+    return {
+        "schema_version": "solidworks-to-urdf.windows-lifecycle-result/v1",
+        "passed": True,
+        "verb": "status",
+        "task": {
+            "task_name": "description-e2e-endpoint",
+            "task_path": "\\URDF\\",
+            "state": "Disabled",
+        },
+        "identity": {
+            "install_id": install_id,
+            "config_digest": "d" * 64,
+            "release": {**release, "role": "native"},
+        },
+        "listener": None,
+        "health": None,
+        "status": {
+            "consistent": True,
+            "task_exists": True,
+            "task_state": "Disabled",
+            "error": None,
+            "solidworks_processes": 0,
+        },
+    }
 
 
 def platform_document(root: Path) -> dict:
@@ -294,16 +322,7 @@ class InstallRecordTests(unittest.TestCase):
             "source_sha256": SOURCE_SHA,
             "artifacts": [],
         }
-        status = {
-            "schema_version": "solidworks-to-urdf.windows-lifecycle-result/v1",
-            "passed": True,
-            "verb": "status",
-            "identity": {
-                "install_id": install_id,
-                "config_digest": "d" * 64,
-                "release": {**release, "role": "native"},
-            },
-        }
+        status = disabled_status(release, install_id)
         endpoint = install_record.endpoint_identity_from_status(status, release)
         self.assertEqual(endpoint["install_id"], install_id)
         self.assertEqual(endpoint["config_digest"], "d" * 64)
@@ -314,6 +333,55 @@ class InstallRecordTests(unittest.TestCase):
                 pipeline_id=PIPELINE_ID,
             ).to_record(),
         )
+
+    def test_installed_status_identity_requires_a_stopped_consistent_endpoint(self) -> None:
+        install_id = "win-" + "9" * 32
+        release = {
+            "version": "1.0.0",
+            "source_commit": COMMIT,
+            "source_sha256": SOURCE_SHA,
+            "artifacts": [],
+        }
+        valid = disabled_status(release, install_id)
+        mutations = {
+            "running task": lambda value: value["task"].update(state="Running"),
+            "task absent": lambda value: value["status"].update(task_exists=False),
+            "task state differs": lambda value: value["status"].update(task_state="Running"),
+            "status error": lambda value: value["status"].update(error={"code": "failed"}),
+            "status inconsistent": lambda value: value["status"].update(consistent=False),
+            "solidworks running": lambda value: value["status"].update(solidworks_processes=1),
+            "listener present": lambda value: value.update(listener={"listener_pid": 42}),
+            "health present": lambda value: value.update(health={"ready": False}),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                status = copy.deepcopy(valid)
+                mutate(status)
+                with self.assertRaises(SystemExit):
+                    install_record.endpoint_identity_from_status(status, release)
+
+    def test_release_wheel_is_staged_under_the_runtime_artifact_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            deployment, release_document, _ = self._fixture(root)
+            release = install_record.release_identity(release_document)
+            runtime = root / "runtime"
+            stable = install_record.stage_release_wheel(
+                release,
+                release_root=runtime,
+                wheel=None,
+                tree_root=deployment,
+            )
+            self.assertEqual(stable, runtime / "artifacts" / WHEEL_NAME)
+            self.assertEqual(stable.read_bytes(), (deployment / WHEEL_NAME).read_bytes())
+            self.assertEqual(
+                install_record.stage_release_wheel(
+                    release,
+                    release_root=runtime,
+                    wheel=stable,
+                ),
+                stable,
+            )
 
     def test_release_artifact_check_is_complete(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -233,6 +233,22 @@ def endpoint_identity_from_status(status_document, release: dict) -> dict:
         and status_document.get("verb") == "status",
         "endpoint status result is invalid",
     )
+    task = status_document.get("task")
+    status = status_document.get("status")
+    require(
+        isinstance(task, dict)
+        and task.get("state") == "Disabled"
+        and isinstance(status, dict)
+        and status.get("task_exists") is True
+        and status.get("task_state") == "Disabled"
+        and status.get("error") is None
+        and status.get("consistent") is True
+        and type(status.get("solidworks_processes")) is int
+        and status["solidworks_processes"] == 0
+        and status_document.get("listener") is None
+        and status_document.get("health") is None,
+        "endpoint status does not prove a stopped, consistent endpoint",
+    )
     identity = status_document.get("identity")
     require(isinstance(identity, dict), "endpoint status carries no installed identity")
     install_id = _text(identity.get("install_id"), "endpoint status install_id")
@@ -371,6 +387,22 @@ def wheel_binding(release: dict, *, wheel: Path | None, tree_root: Path | None =
         f"the consumed wheel {candidate.name} does not match release.json ({actual})",
     )
     return candidate
+
+
+def stage_release_wheel(
+    release: dict,
+    *,
+    release_root: Path,
+    wheel: Path | None,
+    tree_root: Path | None = None,
+) -> Path:
+    """Copy the verified wheel to the runtime artifact root and return that stable path."""
+
+    require(release_root.is_absolute(), "runtime release root must be absolute")
+    source = wheel_binding(release, wheel=wheel, tree_root=tree_root)
+    stable = release_root / "artifacts" / source.name
+    atomic_write_once(stable, source.read_bytes())
+    return wheel_binding(release, wheel=stable)
 
 
 def build_install_record(
@@ -538,6 +570,11 @@ def main(argv: list[str] | None = None) -> int:
     check.add_argument("--release-file", type=Path, required=True)
     check.add_argument("--wheel", type=Path, default=None, help="the wheel that will be installed")
     check.add_argument("--tree", type=Path, default=None, help="deployment tree for wheel discovery")
+    stage = subparsers.add_parser("stage-wheel")
+    stage.add_argument("--release-file", type=Path, required=True)
+    stage.add_argument("--release-root", type=Path, required=True)
+    stage.add_argument("--wheel", type=Path, default=None)
+    stage.add_argument("--tree", type=Path, default=None)
     verify = subparsers.add_parser("verify-active")
     verify.add_argument("--config", type=Path, required=True)
     verify.add_argument("--state-root", type=Path, required=True)
@@ -563,6 +600,16 @@ def main(argv: list[str] | None = None) -> int:
             encoding="utf-8",
         )
         print(f"install_id={endpoint['install_id']}")
+        return 0
+    if args.action == "stage-wheel":
+        release = release_identity(_load_json(args.release_file, "release file"))
+        stable = stage_release_wheel(
+            release,
+            release_root=args.release_root,
+            wheel=args.wheel,
+            tree_root=args.tree,
+        )
+        print(stable)
         return 0
     if args.action == "check":
         release = release_identity(_load_json(args.release_file, "release file"))
