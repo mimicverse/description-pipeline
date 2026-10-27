@@ -421,6 +421,29 @@ def _casefold_inventory(value, label: str) -> dict[str, tuple[str, str]]:
     return rows
 
 
+def _source_relative_inventory(native_files, main_assembly: str) -> dict[str, str]:
+    """Map native package paths into the capture's assembly-relative namespace."""
+
+    native = _casefold_inventory(native_files, "Native discovery file inventory")
+    _require(isinstance(main_assembly, str) and main_assembly, "Main assembly identity is missing")
+    artifact_path_parts(main_assembly)
+    main_key = main_assembly.casefold()
+    _require(main_key in native, "Native discovery lacks the selected main assembly")
+    root = ntpath.dirname(main_assembly.replace("/", "\\"))
+    rows: dict[str, str] = {}
+    for _key, (name, checksum) in sorted(native.items()):
+        artifact_path_parts(name)
+        normalized = name.replace("/", "\\")
+        relative = ntpath.relpath(normalized, root) if root else normalized
+        relative_name = relative.replace("\\", "/").casefold()
+        _require(
+            relative_name not in rows,
+            f"Native discovery source paths collide case-insensitively: {relative_name}",
+        )
+        rows[relative_name] = checksum
+    return rows
+
+
 def _validate_input(root: Path, report, main_assembly: str) -> tuple[dict[str, str], str, str]:
     _require(isinstance(report, dict), "Input report must be an object")
     _require(report.get("passed") is True, "Input report did not pass")
@@ -512,11 +535,7 @@ def _validate_evidence(
     )
     source_hashes = capture.get("source_hashes")
     _require(isinstance(source_hashes, dict) and source_hashes, "Evidence lacks native source hashes")
-    native_by_basename = {_document_basename(name).casefold(): checksum for name, checksum in native_files.items()}
-    _require(
-        len(native_by_basename) == len(native_files),
-        "Native discovery repeats a basename case-insensitively",
-    )
+    native_source_inputs = _source_relative_inventory(native_files, main_assembly)
     source_inputs = {}
     for name, row in source_hashes.items():
         _require(
@@ -531,7 +550,7 @@ def _validate_evidence(
         _require(key not in source_inputs, "Evidence repeats a source identity case-insensitively")
         source_inputs[key] = row["sha256"]
     _require(
-        source_inputs == native_by_basename,
+        source_inputs == native_source_inputs,
         "Evidence source hashes differ from the native discovery inventory",
     )
     _require(
@@ -634,12 +653,59 @@ def _stage_checks(view: dict) -> dict[str, dict]:
     return checks
 
 
+def _prepared_input_inventory(
+    root: Path, native_files: dict[str, str], archived: dict[str, str], package_files
+) -> dict[str, str]:
+    """Reconstruct producer-relative inputs from the existing archived-input layout."""
+
+    root = Path(root)
+    archived_rows = _casefold_inventory(archived, "Archived input files")
+    package_rows = _casefold_inventory(package_files, "Frozen package files")
+    _require(
+        set(package_rows) == set(archived_rows),
+        "Frozen package file inventory differs from the archived input",
+    )
+    for key, (_name, checksum) in package_rows.items():
+        _require(
+            archived_rows[key][1] == checksum,
+            f"Frozen package file differs from its archived bytes: {archived_rows[key][0]}",
+        )
+    native_rows = {}
+    for _key, (name, checksum) in sorted(_casefold_inventory(native_files, "Native discovery file inventory").items()):
+        artifact_path_parts(name)
+        native_rows[name.casefold()] = checksum
+    archived_cad = {
+        key.removeprefix("cad/"): value[1]
+        for key, value in archived_rows.items()
+        if key.startswith("cad/")
+    }
+    _require(
+        archived_cad == native_rows,
+        "Archived CAD inventory differs from the native discovery inventory",
+    )
+    prepared = {}
+    prepared_rows = set()
+    for name, checksum in archived.items():
+        relative = name.removeprefix("cad/") if name.startswith("cad/") else name
+        artifact_path_parts(relative)
+        folded = relative.casefold()
+        _require(folded not in prepared_rows, f"Prepared input paths collide case-insensitively: {relative}")
+        prepared_rows.add(folded)
+        prepared[f"input/{relative}"] = checksum
+    plan_name = "input/capture-plan.json"
+    _require(
+        plan_name.removeprefix("input/").casefold() not in prepared_rows,
+        "Capture-plan archive path is ambiguous",
+    )
+    prepared[plan_name] = file_digest(confined(root, "evidence/capture-plan.json"))
+    return prepared
+
+
 def expected_native_check_details(
     root: Path,
     *,
     handoff_sha256: str,
     main_assembly: str,
-    main_assembly_sha256: str,
     native_files: dict[str, str],
 ) -> dict[str, dict]:
     """Recompute every stage detail that is derivable from the final capture tree."""
@@ -652,21 +718,7 @@ def expected_native_check_details(
     }
     handoff_record = read_data(confined(root, "input/handoff.json"))
     package_files = handoff_record.get("package_files")
-    package_casefold = _casefold_inventory(package_files, "Frozen package files")
-    input_casefold = _casefold_inventory(input_inventory, "Archived input files")
-    for name, (_original, checksum) in package_casefold.items():
-        _require(
-            name in input_casefold and input_casefold[name][1] == checksum,
-            f"Frozen package file is absent from archived input or changed: {name}",
-        )
-    derived_inputs = {
-        "discovery/native-discovery.json",
-        "discovery/findings.json",
-    } & set(input_casefold)
-    _require(
-        set(input_casefold) == set(package_casefold) | derived_inputs,
-        "Archived input contains an unbound non-package file",
-    )
+    prepared_inputs = _prepared_input_inventory(root, native_files, input_inventory, package_files)
     expected_input = {f"input/{name}": checksum for name, checksum in input_inventory.items()}
     discovery_record = read_data(confined(root, "evidence/discovery.json"))
     derivation = discovery_record.get("derivation") if isinstance(discovery_record, dict) else None
@@ -676,15 +728,13 @@ def expected_native_check_details(
         "Native discovery derivation carries invalid controlled-record roots",
     )
     evidence_root = Path(root) / "evidence"
-    evidence_inventory = inventory(evidence_root)
-    generated_top_level = {
-        "capture-plan.json",
-        "capture.json",
-        "discovery.json",
-        "native-runtime.json",
-    }
+    evidence_manifest = verify_snapshot(evidence_root)
     expected_evidence = {
-        f"evidence/{name}": checksum for name, checksum in evidence_inventory.items() if name not in generated_top_level
+        "evidence/manifest.json": file_digest(evidence_root / "manifest.json"),
+        **{
+            f"evidence/{name}": checksum
+            for name, checksum in evidence_manifest["files"].items()
+        },
     }
     return {
         "discovery.inputs": {
@@ -706,7 +756,7 @@ def expected_native_check_details(
             "manifest_sha256": file_digest(evidence_root / "manifest.json"),
         },
         "capture.input_stability": {
-            "files": {"input/" + _document_basename(name): checksum for name, checksum in input_inventory.items()},
+            "files": prepared_inputs,
         },
     }
 
@@ -717,7 +767,6 @@ def _validate_stage_details(
     *,
     handoff_sha256: str,
     main_assembly: str,
-    main_assembly_sha256: str,
     native_files: dict[str, str],
 ) -> None:
     checks = _stage_checks(view)
@@ -725,7 +774,6 @@ def _validate_stage_details(
         root,
         handoff_sha256=handoff_sha256,
         main_assembly=main_assembly,
-        main_assembly_sha256=main_assembly_sha256,
         native_files=native_files,
     )
     required_identifiers = {
@@ -1024,7 +1072,6 @@ def _validate_capture(
         view,
         handoff_sha256=handoff_sha256,
         main_assembly=main_assembly,
-        main_assembly_sha256=main_assembly_sha256,
         native_files=native_files,
     )
     return {

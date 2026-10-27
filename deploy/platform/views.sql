@@ -36,13 +36,15 @@ scheduling_projection AS (
         bound.run_id,
         bound.task_state AS state,
         CASE
-            WHEN bound.task_state IN (
-                'queued', 'running', 'scheduled', 'deferred',
-                'up_for_retry', 'up_for_reschedule', 'restarting'
-            ) THEN 'in_flight'
-            WHEN bound.task_state IN (
-                'success', 'failed', 'skipped', 'upstream_failed', 'removed'
-            ) THEN 'terminal'
+            WHEN bound.task_state::text = ANY (ARRAY[
+                'queued'::text, 'running'::text, 'scheduled'::text,
+                'deferred'::text, 'up_for_retry'::text,
+                'up_for_reschedule'::text, 'restarting'::text
+            ]) THEN 'in_flight'
+            WHEN bound.task_state::text = ANY (ARRAY[
+                'success'::text, 'failed'::text, 'skipped'::text,
+                'upstream_failed'::text, 'removed'::text
+            ]) THEN 'terminal'
             ELSE 'unknown'
         END AS bucket,
         bound.updated_at
@@ -54,8 +56,12 @@ dag_run_projection AS (
         command.run_id,
         dag.state,
         CASE
-            WHEN dag.state IN ('success', 'failed') THEN 'terminal'
-            WHEN dag.state IN ('queued', 'running') THEN 'in_flight'
+            WHEN dag.state::text = ANY (ARRAY[
+                'success'::text, 'failed'::text
+            ]) THEN 'terminal'
+            WHEN dag.state::text = ANY (ARRAY[
+                'queued'::text, 'running'::text
+            ]) THEN 'in_flight'
             ELSE 'unknown'
         END AS bucket,
         COALESCE(dag.end_date, dag.start_date) AS updated_at

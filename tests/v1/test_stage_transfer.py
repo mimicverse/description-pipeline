@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import ntpath
 import shutil
 import subprocess
 import tempfile
@@ -145,17 +146,12 @@ def _capture_events(
         for name, checksum in inventory(root / "input").items()
         if name not in {"handoff.json", "request.json"}
     }
-    evidence_inventory = {
-        name: checksum
-        for name, checksum in inventory(root / "evidence").items()
-        if name
-        not in {
-            "capture-plan.json",
-            "capture.json",
-            "discovery.json",
-            "native-runtime.json",
-        }
+    evidence_manifest = read_data(root / "evidence/manifest.json")
+    prepared_inputs = {
+        f"input/{name.removeprefix('cad/')}": checksum
+        for name, checksum in input_inventory.items()
     }
+    prepared_inputs["input/capture-plan.json"] = file_digest(root / "evidence/capture-plan.json")
     return [
         event(
             0,
@@ -186,8 +182,11 @@ def _capture_events(
                 "capture.integrity",
                 {
                     "files": {
-                        f"evidence/{name}": checksum
-                        for name, checksum in evidence_inventory.items()
+                        "evidence/manifest.json": file_digest(root / "evidence/manifest.json"),
+                        **{
+                            f"evidence/{name}": checksum
+                            for name, checksum in evidence_manifest["files"].items()
+                        },
                     },
                     "manifest_sha256": file_digest(root / "evidence/manifest.json"),
                 },
@@ -201,10 +200,7 @@ def _capture_events(
                 "output",
                 "capture.input_stability",
                 {
-                    "files": {
-                        f"input/{Path(name).name}": checksum
-                        for name, checksum in input_inventory.items()
-                    }
+                    "files": prepared_inputs,
                 },
             ),
         ),
@@ -216,19 +212,29 @@ def capture_root(
     base: Path,
     *,
     run_id: str = RUN_ID,
-    handoff: str = HANDOFF,
-    upload: str = HANDOFF,
+    handoff: str | None = None,
+    upload: str | None = None,
     upload_files: dict[str, str] | None = None,
     main: str = MAIN_ASSEMBLY,
+    extra_native_files: dict[str, bytes] | None = None,
 ) -> Path:
     root = Path(base) / "capture"
     (root / "input" / "cad").mkdir(parents=True)
-    (root / "input" / "cad" / main).write_bytes(MAIN_BYTES)
-    native_files = {main: file_digest(root / "input" / "cad" / main)}
+    native_contents = {main: MAIN_BYTES, **(extra_native_files or {})}
+    if main not in native_contents:
+        raise AssertionError("native fixture lacks its main assembly")
+    native_files = {}
+    for relative, payload in sorted(native_contents.items()):
+        target = root / "input" / "cad" / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(payload)
+        native_files[relative] = file_digest(target)
+    handoff = digest(native_files) if handoff is None else handoff
     upload_files = dict(upload_files or native_files)
+    upload = digest(upload_files) if upload is None else upload
     if digest(upload_files) != upload:
         raise AssertionError("upload fixture digest differs from its inventory")
-    package_files = {"cad/" + main: native_files[main]}
+    package_files = {f"cad/{name}": checksum for name, checksum in native_files.items()}
     cad_revision = {
         "change_summary": "fixture",
         "control": None,
@@ -325,19 +331,31 @@ def capture_root(
     (evidence / "raw").mkdir(parents=True)
     (evidence / "evidence").mkdir()
     write_json(evidence / "raw/scene_raw.json", {"components": [], "mates": []})
+    main_root = ntpath.dirname(main.replace("/", "\\"))
+    source_inputs = {}
+    for name, checksum in native_files.items():
+        normalized = name.replace("/", "\\")
+        relative = ntpath.relpath(normalized, main_root) if main_root else normalized
+        source_inputs[relative.replace("\\", "/").casefold()] = checksum
     dependency_closure = {
         "configuration": "Default",
-        "copy_files": {"source/" + main: native_files[main]},
+        "copy_files": {
+            "source/" + name: checksum for name, checksum in native_files.items()
+        },
         "mapping": [
             {
-                "copy": "source/" + main,
-                "copy_sha256": native_files[main],
-                "instance": "top_level",
-                "source": str(root / "input/cad" / main),
-                "source_sha256": native_files[main],
+                "copy": "source/" + name,
+                "copy_sha256": checksum,
+                "instance": "top_level" if name == main else name,
+                "source": str(root / "input/cad" / name),
+                "source_sha256": checksum,
             }
+            for name, checksum in native_files.items()
         ],
-        "original_files": {str(root / "input/cad" / main): native_files[main]},
+        "original_files": {
+            str(root / "input/cad" / name): checksum
+            for name, checksum in native_files.items()
+        },
         "top_level": str(root / "input/cad" / main),
     }
     write_json(evidence / "raw/dependency_closure.json", dependency_closure)
@@ -361,7 +379,7 @@ def capture_root(
         "toolchain": tool,
         "worker_version": tool["version"],
     }
-    dependency_inputs = [(main.casefold(), native_files[main])]
+    dependency_inputs = sorted(source_inputs.items())
     identity = {
         "provider": "solidworks",
         "assembly": str(root / "input" / "cad" / main),
@@ -377,9 +395,12 @@ def capture_root(
         "capture": {
             "collected_document": str(root / "input/cad" / main),
             "originals_unchanged": {
-                "files_checked": 1,
+                "files_checked": len(native_files),
             },
-            "source_hashes": {main.casefold(): {"sha256": native_files[main]}},
+            "source_hashes": {
+                name: {"sha256": checksum}
+                for name, checksum in sorted(source_inputs.items())
+            },
         },
     }
     write_json(evidence / "evidence/collection.json", collection)
@@ -396,6 +417,13 @@ def capture_root(
         },
     )
     write_json(evidence / "native-runtime.json", environment)
+    write_json(
+        evidence / "capture-plan.json",
+        {
+            "schema_version": "solidworks-to-urdf.capture-plan/v1",
+            "objects": [],
+        },
+    )
     (evidence / "geometry").mkdir()
     (evidence / "geometry/base.stl").write_bytes(b"STL-BYTES")
     write_manifest(
@@ -534,6 +562,97 @@ class StageTransferTests(unittest.TestCase):
         self.assertEqual(manifest["execution"], execution())
         self.assertNotIn("native_stage_scope", manifest)
         self.assertEqual(manifest["main_assembly_sha256"], manifest["files"]["input/cad/" + MAIN_ASSEMBLY])
+
+    def test_nested_duplicate_basenames_keep_complete_source_and_input_paths(self) -> None:
+        root = capture_root(
+            self.base / "nested-duplicate-basenames",
+            main="cad/robot.SLDASM",
+            extra_native_files={
+                "cad/left/part.SLDPRT": b"LEFT-PART",
+                "cad/right/part.SLDPRT": b"RIGHT-PART",
+            },
+        )
+        native_files = read_data(root / "evidence/discovery.json")["native_files"]
+        handoff = digest(native_files)
+        source_hashes = read_data(root / "evidence/evidence/collection.json")["capture"]["source_hashes"]
+        self.assertEqual(
+            set(source_hashes),
+            {"robot.sldasm", "left/part.sldprt", "right/part.sldprt"},
+        )
+
+        producer_events = read_data(root / "reports/native-stages.json")["events"]
+        producer_checks = {
+            event["check"]["id"]: event["check"]["details"]
+            for event in producer_events
+            if isinstance(event.get("check"), dict)
+        }
+        self.assertEqual(
+            set(producer_checks["capture.input_stability"]["files"]),
+            {
+                "input/cad/left/part.SLDPRT",
+                "input/cad/right/part.SLDPRT",
+                "input/cad/robot.SLDASM",
+                "input/capture-plan.json",
+                "input/discovery/findings.json",
+                "input/discovery/native-discovery.json",
+                "input/source.json",
+            },
+        )
+        self.assertEqual(
+            set(producer_checks["capture.integrity"]["files"]),
+            {
+                "evidence/capture-plan.json",
+                "evidence/capture.json",
+                "evidence/discovery.json",
+                "evidence/evidence/collection.json",
+                "evidence/evidence/environment.json",
+                "evidence/geometry/base.stl",
+                "evidence/manifest.json",
+                "evidence/native-runtime.json",
+                "evidence/raw/dependency_closure.json",
+                "evidence/raw/material_provenance.json",
+                "evidence/raw/scene_raw.json",
+            },
+        )
+
+        archive = self.base / "nested-duplicate-basenames.zip"
+        seal(
+            root,
+            archive,
+            handoff_sha256=handoff,
+            upload_sha256=handoff,
+            main_assembly="cad/robot.SLDASM",
+        )
+        destination = self.base / "nested-duplicate-basenames-out"
+        admit(
+            archive,
+            destination,
+            expected_handoff_sha256=handoff,
+            expected_upload_sha256=handoff,
+            expected_main_assembly="cad/robot.SLDASM",
+        )
+        admitted_events = read_data(destination / "reports/native-stages.json")["events"]
+        self.assertEqual(admitted_events, producer_events)
+
+    def test_input_stability_rejects_a_missing_or_ambiguous_capture_plan(self) -> None:
+        missing = capture_root(self.base / "missing-capture-plan")
+        (missing / "evidence/capture-plan.json").unlink()
+        manifest_path = missing / "evidence/manifest.json"
+        manifest = read_data(manifest_path)
+        manifest["files"].pop("capture-plan.json")
+        write_json(manifest_path, manifest)
+        with self.assertRaisesRegex(PipelineError, "capture-plan.json"):
+            seal(missing, self.base / "missing-capture-plan.zip")
+
+        ambiguous = capture_root(self.base / "ambiguous-capture-plan")
+        plan = ambiguous / "input/capture-plan.json"
+        plan.write_bytes((ambiguous / "evidence/capture-plan.json").read_bytes())
+        handoff_path = ambiguous / "input/handoff.json"
+        handoff = read_data(handoff_path)
+        handoff["package_files"]["capture-plan.json"] = file_digest(plan)
+        write_json(handoff_path, handoff)
+        with self.assertRaisesRegex(PipelineError, "Capture-plan archive path is ambiguous"):
+            seal(ambiguous, self.base / "ambiguous-capture-plan.zip")
 
     def test_transfer_requires_exact_upstream_and_execution_bindings(self) -> None:
         seal(self.root, self.archive)
@@ -1114,6 +1233,13 @@ class StageTransferTests(unittest.TestCase):
                 },
             )
             write_json(capture / "evidence/native-runtime.json", collection["environment"])
+            write_json(
+                capture / "evidence/capture-plan.json",
+                {
+                    "schema_version": "solidworks-to-urdf.capture-plan/v1",
+                    "objects": [],
+                },
+            )
             native_files = {
                 name: file_digest(work / "cad" / name) for name in ("robot.SLDASM", "base.SLDPRT", "arm.SLDPRT")
             }
@@ -1154,6 +1280,9 @@ class StageTransferTests(unittest.TestCase):
             manifest["files"]["discovery.json"] = file_digest(capture / "evidence" / "discovery.json")
             manifest["files"]["native-runtime.json"] = file_digest(
                 capture / "evidence/native-runtime.json"
+            )
+            manifest["files"]["capture-plan.json"] = file_digest(
+                capture / "evidence/capture-plan.json"
             )
             manifest["files"] = dict(sorted(manifest["files"].items()))
             write_json(capture / "evidence" / "manifest.json", manifest)
@@ -1208,7 +1337,11 @@ class StageTransferTests(unittest.TestCase):
                     },
                 },
             )
-            package_files["source.json"] = file_digest(capture / "input/source.json")
+            package_files = {
+                name: checksum
+                for name, checksum in inventory(capture / "input").items()
+                if name not in {"handoff.json", "request.json"}
+            }
             handoff_record = read_data(capture / "input/handoff.json")
             handoff_record["package_files"] = dict(sorted(package_files.items()))
             write_json(capture / "input/handoff.json", handoff_record)
@@ -1592,7 +1725,7 @@ class StageTransferTests(unittest.TestCase):
             root / "reports/native-stages.json",
             stage_view(run_id=RUN_ID, handoff=HANDOFF, events=events),
         )
-        with self.assertRaisesRegex(PipelineError, "unbound non-package file"):
+        with self.assertRaisesRegex(PipelineError, "Frozen package file inventory differs"):
             seal(root, self.base / "unknown-discovery-input.zip")
 
     def test_receipt_rows_cannot_diverge_from_raw_events(self) -> None:

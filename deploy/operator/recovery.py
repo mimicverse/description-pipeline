@@ -97,6 +97,7 @@ WINDOWS_RECOVERY_SCHEMA = "solidworks-to-urdf.windows-recovery/v1"
 POSTGRES_MAJOR = "14"
 DATABASE_NAME = "airflow_meta"
 BOOTSTRAP_ROLE = "solidworks"
+POSTGRES_SEARCH_PATH = "platform,airflow,pg_catalog"
 APPLICATION_ROLES = (
     "platform_migrate",
     "platform_service",
@@ -1428,6 +1429,9 @@ def psql(
     file: Path | None = None,
     password: str | None = None,
 ) -> str:
+    environment = {"PGOPTIONS": f"-c search_path={POSTGRES_SEARCH_PATH}"}
+    if password is not None:
+        environment["PGPASSWORD"] = password
     argv = [
         context.bin_dir / "psql",
         "-X",
@@ -1449,10 +1453,7 @@ def psql(
         argv.extend(["-c", query])
     if file is not None:
         argv.extend(["-f", file])
-    completed = context.run(
-        argv,
-        env={"PGPASSWORD": password} if password is not None else None,
-    )
+    completed = context.run(argv, env=environment)
     return completed.stdout.strip()
 
 
@@ -1505,7 +1506,7 @@ def _db_connect(
         user=BOOTSTRAP_ROLE,
         host=authority["socket_dir"],
         port=authority["port"],
-        options="-c search_path=platform,airflow,pg_catalog",
+        options=f"-c search_path={POSTGRES_SEARCH_PATH}",
     )
     connection.autocommit = autocommit
     return connection
