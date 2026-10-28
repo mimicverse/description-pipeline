@@ -76,6 +76,10 @@ class _CompletingHandler:
         artifacts = {item.kind: item for item in command.input_artifacts}
         if command.stage == "discover":
             source_files = dict(command.request["source_files"])
+            prepared_files = {
+                f"input/{name}": checksum
+                for name, checksum in source_files.items()
+            }
             write_json(
                 output / "result.json",
                 {
@@ -89,13 +93,17 @@ class _CompletingHandler:
                         "upload_sha256": command.request["source_inventory_sha256"],
                         "main_assembly": command.request["main_assembly"],
                     },
-                    "prepared_sha256": digest({"prepared": command.command_id}),
+                    "prepared_sha256": digest(prepared_files),
+                    "prepared_files": prepared_files,
+                    "findings": [],
                     "native_observation_sha256": digest({"observation": command.command_id}),
                     "passed": True,
                     "native_tool": dict(self.native_tool),
                     "source_set_artifact": artifacts["freeze_originals"].to_record(),
                     "ruleset_artifact": artifacts["freeze_ruleset"].to_record(),
                     "configuration_artifact": artifacts["platform_config"].to_record(),
+                    "discovery_file": "input/discovery/native-discovery.json",
+                    "findings_file": "input/discovery/findings.json",
                 },
             )
         elif command.stage == "verify":
@@ -121,17 +129,31 @@ class _CompletingHandler:
                 "actual_verifier": verifier,
                 "actual_verifier_sha256": verifier_sha256,
                 "capture_artifact": capture.to_record(),
+                "checks": [{"id": "fixture", "state": "passed", "passed": True}],
+                "closure_sha256": digest(
+                    {
+                        "capture_artifact": capture.to_record(),
+                        "generate_artifact": generate.to_record(),
+                    }
+                ),
                 "config_snapshot_sha256": command.config_snapshot_sha256,
                 "contract_sha256": command.contract_sha256,
                 "decision": "PASS",
+                "diagnostics": [],
+                "evaluation_subject_sha256": digest({"evaluation": command.command_id}),
                 "generate_artifact": generate.to_record(),
+                "generate_receipt_sha256": digest({"generate": command.command_id}),
                 "passed": True,
+                "pipeline_id": "solidworks-to-urdf",
                 "policy_sha256": command.policy_sha256,
                 "purpose": command.request["purpose"],
+                "qualifications": [],
                 "request": request,
                 "request_sha256": digest(request),
+                "required_checks": ["fixture"],
                 "schema_version": VERIFICATION_CERTIFICATE_SCHEMA,
                 "subject_sha256": generate.set_sha256,
+                "subject_status": "bound",
             }
             certificate["verification_key"] = digest(certificate)
             write_json(output / "verification-certificate.json", certificate)

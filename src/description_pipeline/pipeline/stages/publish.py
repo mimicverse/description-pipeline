@@ -2216,7 +2216,6 @@ class PublishHandler:
             pr_body = sealed.body
             publisher_tool, actual_executor = _executor_identity(command, claim)
             git_effect_id = git_settlement.effect_id
-            git_reused = True
         elif git_settlement is None or git_settlement.state is EffectState.PREPARED:
             inputs = self._prepare(
                 command,
@@ -2269,7 +2268,7 @@ class PublishHandler:
                 if candidate is not None:
                     candidate.cleanup()
                 return git_result
-            git_effect_id, git_observation, git_reused = git_result
+            git_effect_id, git_observation, _ = git_result
         elif git_settlement.state is EffectState.CONFLICT:
             raise StageFailure("publish_git_effect_conflict", "The Git effect is conflicted")
         elif git_settlement.state is EffectState.DEFINITELY_FAILED:
@@ -2287,11 +2286,10 @@ class PublishHandler:
             )
             if isinstance(pr_result, StageDeferral):
                 return pr_result
-            pr_effect_id, pr_observation, pr_reused = pr_result
-            if not (git_reused and pr_reused):
-                if repository.observe(request.branch_ref) != candidate_facts.commit:
-                    raise StageFailure("publish_remote_drift", "Published branch changed before stage completion")
-                repository.fetch_expected(request.base_ref, request.expected_base_oid)
+            pr_effect_id, pr_observation, _ = pr_result
+            if repository.observe(request.branch_ref) != candidate_facts.commit:
+                raise StageFailure("publish_remote_drift", "Published branch changed before stage completion")
+            repository.fetch_expected(request.base_ref, request.expected_base_oid)
             receipt = {
                 "schema_version": PUBLISH_RECEIPT_SCHEMA,
                 "command_id": command.command_id,

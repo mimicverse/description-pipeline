@@ -41,6 +41,7 @@ from description_pipeline.orchestration.portal import (
     DEFAULT_DAG_ID,
     PortalApp,
     PortalConfig,
+    _findings,
     load_portal_config,
 )
 
@@ -2505,6 +2506,24 @@ class PortalTests(unittest.TestCase):
         staging = self.upload_root / ".staging"
         self.assertTrue(not staging.exists() or not any(staging.iterdir()))
 
+    def test_upload_rechecks_the_live_principal_before_admission(self) -> None:
+        self.client.login()
+        admissions_before = len(self.production_application.admission_requests)
+        self.airflow.profiles[AIRFLOW_TOKEN]["principal"] = VIEWER_PRINCIPAL
+        status, _, body = self.client.request_raw(
+            "POST",
+            "/api/runs",
+            _upload_body(files=[("model.SLDASM", b"<assembly/>")]),
+            "multipart/form-data; boundary=portal-boundary",
+        )
+        self.assertEqual(status, 401, body)
+        self.assertIn("identity changed", json.loads(body)["error"])
+        self.assertEqual(
+            len(self.production_application.admission_requests),
+            admissions_before,
+        )
+        self.assertEqual(self.airflow.trigger_payloads, [])
+
     def test_a_closed_admission_gate_refuses_before_uploading_or_triggering(self) -> None:
         self.client.login()
         self.platform.state = "closed"
@@ -3293,6 +3312,38 @@ class PortalTests(unittest.TestCase):
             ["freeze", "discover", "capture", "generate", "verify", "publish"],
         )
         self.assertEqual(payload["job"]["status"], "passed")
+
+    def test_findings_preserve_state_only_failed_quality_checks(self) -> None:
+        findings = _findings(
+            {
+                "result": {
+                    "quality": {
+                        "checks": [
+                            {
+                                "id": "fixture.state_failed",
+                                "state": "failed",
+                                "details": {"reason": "recorded failure"},
+                            },
+                            {
+                                "id": "fixture.boolean_failed",
+                                "state": "passed",
+                                "passed": False,
+                                "details": {"reason": "contradictory failure"},
+                            },
+                            {
+                                "id": "fixture.passed",
+                                "state": "passed",
+                                "passed": True,
+                            },
+                        ]
+                    }
+                }
+            }
+        )
+        self.assertEqual(
+            [finding["id"] for finding in findings],
+            ["fixture.state_failed", "fixture.boolean_failed"],
+        )
 
     def test_coverage_external_scope_ignores_job_confirmation_claims(self) -> None:
         self.client.login()

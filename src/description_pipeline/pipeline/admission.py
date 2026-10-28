@@ -700,14 +700,18 @@ class VerifiedDiscoverResult:
             "request_digest",
             "selection",
             "prepared_sha256",
+            "prepared_files",
+            "findings",
             "native_observation_sha256",
             "passed",
             "source_set_artifact",
             "ruleset_artifact",
             "configuration_artifact",
             "native_tool",
+            "discovery_file",
+            "findings_file",
         }
-        if not isinstance(record, Mapping) or not required <= set(record):
+        if not isinstance(record, Mapping) or set(record) != required:
             raise ProtocolError("admission.discover_result_invalid", {"where": "record"})
         if (
             record["schema_version"] != DISCOVER_RESULT_SCHEMA
@@ -834,20 +838,29 @@ class VerifiedVerifyResult:
             "actual_verifier",
             "actual_verifier_sha256",
             "capture_artifact",
+            "checks",
+            "closure_sha256",
             "config_snapshot_sha256",
             "contract_sha256",
             "decision",
+            "diagnostics",
+            "evaluation_subject_sha256",
             "generate_artifact",
+            "generate_receipt_sha256",
             "passed",
+            "pipeline_id",
             "policy_sha256",
             "purpose",
+            "qualifications",
             "request",
             "request_sha256",
+            "required_checks",
             "schema_version",
             "subject_sha256",
+            "subject_status",
             "verification_key",
         }
-        if not isinstance(certificate, Mapping) or not required <= set(certificate):
+        if not isinstance(certificate, Mapping) or set(certificate) != required:
             raise ProtocolError("admission.verify_result_invalid", {"where": "certificate"})
         proof = {key: certificate[key] for key in certificate if key != "verification_key"}
         if (

@@ -1229,8 +1229,8 @@ def verify_transfer(
 
     ``carried`` names the Linux-side originals the freeze stage registered from their own
     bytes (``input/request.json``), mapped to the frozen binding of this attempt.  A carried
-    original is never a native member, is verified against its frozen bytes on every
-    revalidation, and never exempts anything else: unknown extras still refuse.
+    original may also be listed by the native manifest; either classification must bind the
+    same delivered bytes.  It never exempts anything else: unknown extras still refuse.
     """
 
     bundle = Path(bundle)
@@ -1284,7 +1284,6 @@ def verify_transfer(
         receipt_manifest = receipt_native_tool = receipt_stages = None
     derived = set(regenerated)
     carried_bindings = dict(carried or {})
-    skip = derived | set(carried_bindings)
     manifest = receipt_manifest if receipt_manifest is not None else read_data(confined(bundle, CAPTURE_MANIFEST))
     _require(isinstance(manifest, dict), "Transfer manifest must be an object")
     manifest_schema = manifest.get("schema_version")
@@ -1344,6 +1343,8 @@ def verify_transfer(
         "Transfer manifest omits required capture reports: "
         f"{sorted(set(_REQUIRED_REPORTS) - set(files))}",
     )
+    carried_not_native = set(carried_bindings) - set(files)
+    skip = derived | carried_not_native
     ignored = {CAPTURE_MANIFEST}
     if transfer_manifest is not None:
         ignored.update(_LIVE_REPORTS)
@@ -1352,7 +1353,7 @@ def verify_transfer(
         actual_members = {
             name for name in actual_members if _allowed_payload(name)
         }
-    actual = actual_members - ignored - derived
+    actual = actual_members - ignored - skip
     expected_members = set(files) - derived
     _require(
         actual == expected_members,
@@ -1446,8 +1447,12 @@ def verify_transfer(
     )
     for name, checksum in carried_bindings.items():
         _require(_allowed_payload(name), f"Carried original lies outside the capture payload: {name!r}")
-        _require(name not in files, f"Carried original duplicates a native member: {name!r}")
         _require(_is_sha256(checksum), f"Carried original binding is not a sha256: {name}")
+        if name in files:
+            _require(
+                files[name] == checksum,
+                f"Carried original differs from the native manifest binding: {name}",
+            )
         _require(
             file_digest(confined(bundle, name)) == checksum,
             f"Delivered carried original differs from its frozen bytes: {name}",

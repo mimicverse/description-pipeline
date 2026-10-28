@@ -980,12 +980,16 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
                 "main_assembly": self.admission_harness.spec.main_assembly,
             },
             "prepared_sha256": digest({"prepared": 1}),
+            "prepared_files": {"input/robot.SLDASM": files["cad/robot.SLDASM"]},
+            "findings": [],
             "native_observation_sha256": digest({"observation": 1}),
             "source_set_artifact": self.admission_harness.originals_ref.to_record(),
             "ruleset_artifact": self.admission_harness.ruleset_ref.to_record(),
             "configuration_artifact": self.admission_harness.configuration_ref.to_record(),
             "native_tool": self.admission_harness.native_tool,
             "passed": True,
+            "discovery_file": "input/discovery/native-discovery.json",
+            "findings_file": "input/discovery/findings.json",
         }
 
     def test_admission_binds_run_freeze_dispatch_conf_and_effect_atomically(self) -> None:
@@ -1675,19 +1679,33 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
             },
             "actual_verifier_sha256": self.admission_harness.spec.executors.verify,
             "capture_artifact": capture.result.output_artifact.to_record(),
+            "checks": [{"id": "fixture", "state": "passed", "passed": True}],
+            "closure_sha256": digest(
+                {
+                    "capture_artifact": capture.result.output_artifact.to_record(),
+                    "generate_artifact": generate.result.output_artifact.to_record(),
+                }
+            ),
             "config_snapshot_sha256": (
                 self.admission_harness.spec.platform_config_sha256
             ),
             "contract_sha256": self.admission_harness.spec.contract_sha256,
             "decision": "PASS",
+            "diagnostics": [],
+            "evaluation_subject_sha256": digest({"evaluation": "fixture"}),
             "generate_artifact": generate.result.output_artifact.to_record(),
+            "generate_receipt_sha256": "f" * 64,
             "passed": True,
+            "pipeline_id": "solidworks-to-urdf",
             "policy_sha256": self.admission_harness.spec.policy_sha256,
             "purpose": self.admission_harness.spec.purpose,
+            "qualifications": [],
             "request": verify_request,
             "request_sha256": digest(verify_request),
+            "required_checks": ["fixture"],
             "schema_version": VERIFICATION_CERTIFICATE_SCHEMA,
             "subject_sha256": generate.result.output_artifact.set_sha256,
+            "subject_status": "bound",
         }
         certificate["verification_key"] = digest(certificate)
         certificate_bytes = canonical(certificate)

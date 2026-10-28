@@ -121,6 +121,24 @@ class RunQueryTests(unittest.TestCase):
             "publish",
         ])
 
+    def test_stage_summary_uses_the_canonical_unresolved_state(self):
+        projection = {
+            "stages": [
+                {
+                    "stage": "freeze",
+                    "state": "unresolved",
+                    "decision": {
+                        "outcome": "completed",
+                        "command_id": "freeze-command",
+                        "reason_code": None,
+                    },
+                    "command": {"command_id": "freeze-command"},
+                }
+            ]
+        }
+        summary = render_stage_summary(projection)
+        self.assertEqual(summary[0]["state"], "unresolved")
+
 
 if __name__ == "__main__":
     unittest.main()

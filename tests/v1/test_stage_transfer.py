@@ -23,6 +23,7 @@ from description_pipeline.delivery import PIPELINE_ID
 from description_pipeline.io import PipelineError, canonical, digest, file_digest, inventory, read_data, write_json
 from description_pipeline.orchestration import stage_transfer as transfer
 from description_pipeline.pipeline.contracts import ArtifactRef
+from description_pipeline.request_evidence import build_request_evidence
 from description_pipeline.runtime import RUNTIME_VERSIONS, required_packages
 from description_pipeline.schemas import SOURCE_RECORD_SCHEMA
 from description_pipeline import native_transfer
@@ -1571,6 +1572,41 @@ class StageTransferTests(unittest.TestCase):
         (destination / "reports/native-tool.json").write_bytes(b'{"forged":true}\n')
         with self.assertRaisesRegex(PipelineError, "disk receipt differs"):
             _verify_transfer(destination, native_receipts=receipts)
+
+    def test_carried_request_is_consistent_with_or_without_a_native_member(self) -> None:
+        request = build_request_evidence(
+            purpose="engineering",
+            request_id="portal-20261016T000000-abcdef01",
+            target_hardware="fixture",
+            change_summary="carried request consistency",
+            main_assembly=MAIN_ASSEMBLY,
+            handoff_digest=HANDOFF,
+            platform_config_digest="e" * 64,
+        )
+        for label, native_member in (("native-member", True), ("carried-only", False)):
+            with self.subTest(case=label):
+                root = capture_root(self.base / label)
+                if native_member:
+                    write_json(root / "input/request.json", request)
+                archive = self.base / f"{label}.zip"
+                seal(root, archive)
+                destination = self.base / f"{label}-admitted"
+                admit(archive, destination)
+                if not native_member:
+                    write_json(destination / "input/request.json", request)
+                receipts = {
+                    "native_tool_bytes": (destination / "reports/native-tool.json").read_bytes(),
+                    "native_stages_bytes": (destination / "reports/native-stages.json").read_bytes(),
+                    "transfer_manifest_bytes": (destination / transfer.CAPTURE_MANIFEST).read_bytes(),
+                    "structural_team_md_bytes": (
+                        destination / "reports/structural-team.md"
+                    ).read_bytes(),
+                    "structural_team_json_bytes": (
+                        destination / "reports/structural-team.json"
+                    ).read_bytes(),
+                }
+                evidence = native_transfer.validate_native_receipts(destination, receipts)
+                self.assertEqual(evidence["main_assembly"], MAIN_ASSEMBLY)
 
     def test_immutable_receipts_always_verify_the_complete_total_bytes(self) -> None:
         seal(self.root, self.archive)

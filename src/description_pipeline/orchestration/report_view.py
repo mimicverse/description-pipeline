@@ -1178,14 +1178,23 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
             first_failed = stage
         stages_out.append(stage_out)
     states = {stage["state"] for stage in stages_out}
+    verification_completed = (
+        any(stage["id"] == "verify" and stage["state"] == "completed" for stage in stages_out)
+        and quality.get("passed") is True
+    )
     if "failed" in states:
         overall_state, headline = "failed", f"{first_failed['name']} stage failed; downstream stages did not run"
     elif job.get("status") == "failed":
         overall_state, headline = "failed", "Job failed; see the raw diagnostic"
     elif "running" in states:
         overall_state, headline = "running", "Run is in progress; not all stages have completed"
-    elif stages_out and states == {"completed"}:
+    elif stages_out and states == {"completed"} and verification_completed:
         overall_state, headline = "passed", "All six stages completed and independent verification passed"
+    elif stages_out and states == {"completed"}:
+        overall_state, headline = (
+            "failed",
+            "All six stages completed, but independent verification did not pass",
+        )
     else:
         overall_state, headline = "not_run", "No stage records yet"
     warning_items = [item for stage in stages_out for item in stage.get("warnings") or []]
@@ -1216,11 +1225,9 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
         },
         "stages": stages_out,
     }
-    verified = (
-        any(stage["id"] == "verify" and stage["state"] == "completed" for stage in stages_out)
-        and quality.get("passed") is True
+    report["overall"]["engineering_state"] = (
+        "external_review" if verification_completed else "not_ready"
     )
-    report["overall"]["engineering_state"] = "external_review" if verified else "not_ready"
     report["external_review"] = {
         "tracking": "external",
         "scopes": [

@@ -1263,6 +1263,32 @@ else:
         self.assertEqual(first.checks_sha256, second.checks_sha256)
         self.assertEqual(before, after)
 
+    def test_completed_effect_replay_rechecks_the_live_base(self) -> None:
+        self._run()
+        seed = self.fixture.root / "seed"
+        (seed / "README.md").write_text("moved after effects completed\n", encoding="utf-8")
+        git(seed, "add", "README.md")
+        git(seed, "commit", "-m", "move base after publication")
+        git(seed, "push", "origin", "main")
+        second_workspace = StageWorkspace(
+            root=self.fixture.root / "replay-workspace",
+            inputs=self.fixture.workspace.inputs,
+        )
+        second_claim = replace(
+            self.fixture.claim,
+            claim_id="publish-claim-replay",
+            fence=2,
+            owner_sha256=digest({"process": "publish-replay"}),
+        )
+        with (
+            patch.object(PublishHandler, "_prepare", side_effect=AssertionError("must not rebuild publication")),
+            patch.object(PublicationRepository, "push", side_effect=AssertionError("must not resend")),
+            patch.object(self.fixture.pr, "create", side_effect=AssertionError("must not recreate PR")),
+            patch.object(self.fixture.pr, "update", side_effect=AssertionError("must not update PR")),
+            self.assertRaisesRegex(PipelineError, "publish.base_moved"),
+        ):
+            self._run(workspace=second_workspace, claim=second_claim)
+
     def test_pull_request_reconciliation_reuses_original_outbound_without_writes(self) -> None:
         first, effect_id, intent, outbound = self._pr_recovery_inputs()
         original = self.fixture.pr.rows[0]

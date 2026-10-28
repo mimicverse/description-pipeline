@@ -1118,7 +1118,9 @@ def _findings(job: dict | None) -> list[dict]:
     quality = result.get("quality")
     if isinstance(quality, dict):
         for check in quality.get("checks") or []:
-            if isinstance(check, dict) and check.get("passed") is False:
+            if isinstance(check, dict) and (
+                check.get("state") == "failed" or check.get("passed") is False
+            ):
                 findings.append(
                     {
                         "id": str(check.get("id") or ""),
@@ -1738,11 +1740,6 @@ class PortalApp:
     def _start_run(self, environ: dict, start_response: Callable) -> Iterable[bytes]:
         """One uploaded SolidWorks folder starts one run; manual platform paths are gone."""
         session = self._session(environ, csrf=True)
-        principal = session.principal or ""
-        if not principal:
-            # The submitter identity is the strict profile principal only - never a
-            # username fallback and never client text.
-            raise PortalError(HTTPStatus.UNAUTHORIZED, "Feishu session expired; sign in again")
         content_type = str(environ.get("CONTENT_TYPE") or "")
         if not content_type.lower().startswith("multipart/form-data"):
             raise PortalError(
@@ -1761,24 +1758,10 @@ class PortalApp:
                 HTTPStatus.SERVICE_UNAVAILABLE,
                 "The production admission and dispatch composition is unavailable",
             )
-        # A cached portal session can outlive the Airflow token behind it; prove the live
-        # profile before reading a single byte of a possibly multi-gigabyte body.
-        try:
-            self.config.airflow.profile(session.token)
-        except AirflowAuthError:
-            return _json_response(
-                start_response,
-                HTTPStatus.UNAUTHORIZED,
-                {"error": "Feishu session expired; sign in again and retry"},
-                self.config,
-            )
-        except AirflowApiError:
-            return _json_response(
-                start_response,
-                HTTPStatus.BAD_GATEWAY,
-                {"error": "Airflow is temporarily unavailable; retry later"},
-                self.config,
-            )
+        # The submitter identity is the strict live profile principal only - never a
+        # cached session value, username fallback, or client text. Recheck it before
+        # reading a single byte of a possibly multi-gigabyte upload body.
+        principal, _ = self._viewer_identity(session)
         submission_key = str(environ.get("HTTP_IDEMPOTENCY_KEY") or "").strip()
         if submission_key and (
             _RUN_ID.fullmatch(submission_key) is None

@@ -726,7 +726,7 @@ def render_stage_summary(projection: Mapping[str, Any]) -> list[dict[str, Any]]:
     return [
         {
             "stage": row["stage"],
-            "state": row["decision"]["outcome"] if row.get("decision") else "waiting",
+            "state": row.get("state") or "waiting",
             "command_id": row["decision"]["command_id"]
             if row.get("decision")
             else (row.get("command") or {}).get("command_id"),

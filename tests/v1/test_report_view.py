@@ -258,6 +258,14 @@ class ReportViewTests(unittest.TestCase):
         self.assertEqual(file_rows[0]["label"], freeze["inputs"][0]["label"])
         self.assertTrue(any(row["boundary"] == "output" for row in file_rows))
 
+    def test_completed_stages_do_not_claim_pass_without_quality_pass(self) -> None:
+        job = passed_job()
+        job["result"]["quality"]["passed"] = False
+        report = build_report(job)
+        self.assertEqual(report["overall"]["state"], "failed")
+        self.assertEqual(report["overall"]["engineering_state"], "not_ready")
+        self.assertIn("independent verification did not pass", report["overall"]["headline"])
+
     def test_failed_discovery_meaning_is_safe_and_downstream_is_blocked(self) -> None:
         job = passed_job()
         job["status"] = "failed"
