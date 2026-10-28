@@ -16,7 +16,9 @@ from typing import Any
 
 import numpy as np
 
+from ...geometry.native_transform import rigid_matrix_from_row_major
 from .jsonio import read_json
+from .native_limits import NativeLimitInvalidError, finite_number
 from ...io import PipelineError
 from ...schemas import EFFECTIVE_INSTANCES_SCHEMA as EFFECTIVE_SCHEMA
 
@@ -71,9 +73,7 @@ def _rpy_matrix(rpy: Sequence[float] | np.ndarray) -> np.ndarray:
 
 
 def _transform(matrix: Sequence[float]) -> tuple[np.ndarray, np.ndarray]:
-    values = np.array([float(value) for value in matrix], dtype=float)
-    if values.size != 16:
-        raise ValueError("a component transform must have 16 row-major values")
+    values = np.array(rigid_matrix_from_row_major(matrix), dtype=float)
     grid = values.reshape(4, 4)
     return grid[:3, :3], grid[:3, 3]
 
@@ -96,7 +96,10 @@ CLOSURE_MASS_RTOL = 1e-6
 def _finite_positive(value: Any, what: str) -> float:
     """A finite, positive number, or a ``ValueError`` naming the field."""
 
-    number = float(value)
+    try:
+        number = finite_number(value)
+    except NativeLimitInvalidError as error:
+        raise ValueError(f"{what} is not a finite number") from error
     if not math.isfinite(number) or number <= 0.0:
         raise ValueError(f"{what} is not finite and positive")
     return number
@@ -105,7 +108,10 @@ def _finite_positive(value: Any, what: str) -> float:
 def _finite_non_negative(value: Any, what: str) -> float:
     """A finite, non-negative number, or a ``ValueError`` naming the field."""
 
-    number = float(value)
+    try:
+        number = finite_number(value)
+    except NativeLimitInvalidError as error:
+        raise ValueError(f"{what} is not a finite number") from error
     if not math.isfinite(number) or number < 0.0:
         raise ValueError(f"{what} is not finite and non-negative")
     return number
@@ -114,7 +120,10 @@ def _finite_non_negative(value: Any, what: str) -> float:
 def _finite_vector(value: Any, what: str) -> np.ndarray:
     """A finite 3-vector, or a ``ValueError`` naming the field."""
 
-    array = np.asarray([float(item) for item in value], dtype=float)
+    try:
+        array = np.asarray([finite_number(item) for item in value], dtype=float)
+    except (NativeLimitInvalidError, TypeError) as error:
+        raise ValueError(f"{what} is not a finite 3-vector") from error
     if array.shape != (3,):
         raise ValueError(f"{what} is not a 3-vector")
     if not np.isfinite(array).all():

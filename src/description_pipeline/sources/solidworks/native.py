@@ -23,7 +23,10 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from ...geometry.native_scope import NATIVE_SOURCE_SCOPE_RULE
-from ...geometry.native_transform import transform_from_solidworks as _shared_transform
+from ...geometry.native_transform import (
+    rigid_matrix_from_row_major,
+    transform_from_solidworks as _shared_transform,
+)
 from ...schemas import NATIVE_CAPTURE_FACTS_KEYS, NATIVE_DISCOVERY_SCHEMA
 from .errors import CadError, EnvironmentError_
 from .protocol import (
@@ -2248,28 +2251,10 @@ def _frame_matrix(values):
     """
 
     try:
-        numbers = [float(value) for value in values or ()]
+        numbers = rigid_matrix_from_row_major(values)
     except (TypeError, ValueError):
         return None
-    if len(numbers) != 16 or not all(math.isfinite(value) for value in numbers):
-        return None
     rows = [numbers[0:4], numbers[4:8], numbers[8:12], numbers[12:16]]
-    if any(abs(rows[3][i] - (1.0 if i == 3 else 0.0)) > 1e-9 for i in range(4)):
-        return None
-    rotation = [[rows[i][j] for j in range(3)] for i in range(3)]
-    if any(
-        abs(sum(rotation[k][i] * rotation[k][j] for k in range(3)) - (1.0 if i == j else 0.0)) > 1e-9
-        for i in range(3)
-        for j in range(3)
-    ):
-        return None
-    determinant = (
-        rotation[0][0] * (rotation[1][1] * rotation[2][2] - rotation[1][2] * rotation[2][1])
-        - rotation[0][1] * (rotation[1][0] * rotation[2][2] - rotation[1][2] * rotation[2][0])
-        + rotation[0][2] * (rotation[1][0] * rotation[2][1] - rotation[1][1] * rotation[2][0])
-    )
-    if abs(determinant - 1.0) > 1e-9:
-        return None
     return rows
 
 
@@ -7727,10 +7712,14 @@ class SolidWorksBackend(CadBackend):
                 components_total += len(root_children)
                 for raw in root_children:
                     component = _component(raw)
-                    name = str(_property(component, "Name2") or "")
-                    if not name:
-                        components_done += 1
-                        continue
+                    raw_name = _property(component, "Name2")
+                    if not _is_text_name(raw_name):
+                        raise CadError(
+                            "cad_component_identity_unreadable",
+                            "a component has no readable Name2",
+                            {"raw_name": _raw_scalar(raw_name)},
+                        )
+                    name = str(raw_name)
                     # The scoped instance identity must be byte-identical to the
                     # selection walk's stitching rule so the
                     # closure carrier's occurrence strings compare exactly.

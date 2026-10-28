@@ -463,6 +463,73 @@ class DiscoveryTests(unittest.TestCase):
             self.assertEqual(error.detail["field"], "raw.components[0].transform[3]")
             json.dumps(error.to_dict(), allow_nan=False)
 
+    def test_prepare_and_verify_refuse_a_nonrigid_component_transform(self):
+        def mutate(payload):
+            raw = payload.get("raw", payload)
+            raw["components"][0]["transform"][0] = 2.0
+
+        result, _source, _output = self._prepare(mutate=mutate)
+        self.assertIn("discovery.component_transform_missing", self._codes(result))
+
+        baseline, _source, output = self._prepare()
+        self.assertTrue(baseline.passed, baseline.findings)
+        report = self._verify_mutated_record(output, mutate)
+        self.assertFalse(report["passed"])
+
+    def test_prepare_and_verify_refuse_a_nonrigid_datum(self):
+        def mutate(payload):
+            raw = payload.get("raw", payload)
+            datum = next(item for item in raw["datums"] if item["name"] == "CS_base_link")
+            datum["array"][0] = 2.0
+
+        result, _source, _output = self._prepare(mutate=mutate)
+        self.assertFalse(result.passed)
+
+        baseline, _source, output = self._prepare()
+        self.assertTrue(baseline.passed, baseline.findings)
+        report = self._verify_mutated_record(output, mutate)
+        self.assertFalse(report["passed"])
+        self.assertIn("discovery.joint_rebuild", {item["code"] for item in report["errors"]})
+
+    def test_prepare_and_verify_refuse_lightweight_occurrences(self):
+        def mutate(payload):
+            raw = payload.get("raw", payload)
+            raw["components"][0].update(
+                suppression_state=1,
+                suppressed=False,
+                lightweight=True,
+            )
+
+        result, _source, _output = self._prepare(mutate=mutate)
+        self.assertIn("discovery.suppression_lightweight", self._codes(result))
+
+        baseline, _source, output = self._prepare()
+        self.assertTrue(baseline.passed, baseline.findings)
+        report = self._verify_mutated_record(output, mutate)
+        self.assertFalse(report["passed"])
+        self.assertIn(
+            "discovery.suppression_lightweight",
+            {item["code"] for item in report["errors"]},
+        )
+
+    def test_prepare_and_verify_refuse_nonpositive_cylinder_radii(self):
+        def mutate(payload):
+            raw = payload.get("raw", payload)
+            for mate in raw["mates"]:
+                for entity in mate["entities"]:
+                    cylinder = entity.get("cylinder")
+                    if isinstance(cylinder, dict):
+                        cylinder["radius"] = -0.006
+
+        result, _source, _output = self._prepare(mutate=mutate)
+        self.assertIn("discovery.mate_entities_unsupported", self._codes(result))
+
+        baseline, _source, output = self._prepare()
+        self.assertTrue(baseline.passed, baseline.findings)
+        report = self._verify_mutated_record(output, mutate)
+        self.assertFalse(report["passed"])
+        self.assertIn("discovery.graph", {item["code"] for item in report["errors"]})
+
     def test_large_finite_axis_normalizes_without_squared_norm_overflow(self):
         axis = _unit([1e308, 1e308, 0.0])
         self.assertAlmostEqual(axis[0], 2**-0.5)
@@ -1420,6 +1487,54 @@ class DiscoveryTests(unittest.TestCase):
                 )
                 self.assertIn(code, [finding["code"] for finding in findings if finding["blocking"]])
 
+    def test_present_nontext_identity_is_invalid_instead_of_missing(self):
+        complete = {
+            "identity": {
+                "hardware_id": "wire_test",
+                "revision": "r1",
+                "owner": "owner",
+                "change_summary": "summary",
+                "control": {"system": "handoff", "reference": "ref"},
+                "robot_name": "wire_test",
+            },
+            "properties": {"document": {}},
+        }
+        for field, value in (
+            ("hardware_id", 1),
+            ("revision", []),
+            ("owner", True),
+            ("change_summary", {}),
+            ("robot_name", 123),
+            ("control", "handoff:ref"),
+        ):
+            with self.subTest(field=field, value=value):
+                record_value = copy.deepcopy(complete)
+                record_value["identity"][field] = value
+                with self.assertRaises(CadError) as caught:
+                    _identity(
+                        record_value,
+                        DiscoverySettings(),
+                        [],
+                        configuration="Default",
+                        assembly="robot.SLDASM",
+                        native_files={"robot.SLDASM": "0" * 64},
+                    )
+                self.assertEqual(caught.exception.code, "cad_identity_invalid")
+
+        property_record = copy.deepcopy(complete)
+        property_record["identity"].pop("robot_name")
+        property_record["properties"]["document"]["dp.robot_name"] = False
+        with self.assertRaises(CadError) as caught:
+            _identity(
+                property_record,
+                DiscoverySettings(),
+                [],
+                configuration="Default",
+                assembly="robot.SLDASM",
+                native_files={"robot.SLDASM": "0" * 64},
+            )
+        self.assertEqual(caught.exception.code, "cad_identity_invalid")
+
     def test_unknown_mate_type_blocks_instead_of_going_rigid(self):
         result, _source, output = self._prepare(
             mutate=lambda payload: payload["mates"].append(
@@ -1469,6 +1584,31 @@ class DiscoveryTests(unittest.TestCase):
         joint = rebuild_joint_facts(payload, output, purpose="engineering")[0]
         self.assertNotIn("effort", joint["limits"])
         self.assertNotIn("velocity", joint["limits"])
+
+    def test_present_nontext_record_references_block_instead_of_becoming_absent(self):
+        cases = (
+            ("dp.joint.limits_record", True, "discovery.joint_limits_invalid"),
+            ("dp.joint.drive_record", False, "discovery.joint_drive_invalid"),
+        )
+        baseline, _source, output = self._prepare()
+        self.assertTrue(baseline.passed, baseline.findings)
+        for key, value, code in cases:
+            with self.subTest(key=key, value=value):
+                def mutate(payload: dict, key=key, value=value) -> None:
+                    raw = payload.get("raw", payload)
+                    raw["mates"][0]["limits"] = None
+                    raw["properties"]["mates"]["shoulder_pitch_joint__coaxial"][key] = value
+
+                result, _source, _output = self._prepare(mutate=mutate)
+                self.assertIn(code, self._codes(result))
+                if key == "dp.joint.limits_record":
+                    self.assertNotIn(
+                        "discovery.joint_default_policy",
+                        {item["code"] for item in result.findings},
+                    )
+                report = self._verify_mutated_record(output, mutate)
+                self.assertFalse(report["passed"])
+                self.assertIn(code, {item["code"] for item in report["errors"]})
 
     def test_mate_author_limits_precede_engineering_default(self):
         def mutate(payload):
@@ -2309,6 +2449,19 @@ class DiscoveryTests(unittest.TestCase):
         result, _source, _output = self._prepare(mutate=mutate)
         self.assertIn("discovery.body_datum_owner_mismatch", self._codes(result))
 
+    def test_present_nontext_body_datum_blocks_instead_of_falling_back(self):
+        def mutate(payload):
+            raw = payload.get("raw", payload)
+            raw["properties"]["components"] = {"arm-1": {"dp.body_datum": True}}
+
+        result, _source, _output = self._prepare(mutate=mutate)
+        self.assertIn("discovery.body_datum_invalid", self._codes(result))
+        baseline, _source, baseline_output = self._prepare()
+        self.assertTrue(baseline.passed, baseline.findings)
+        report = self._verify_mutated_record(baseline_output, mutate)
+        self.assertFalse(report["passed"])
+        self.assertIn("discovery.body_rebuild", {item["code"] for item in report["errors"]})
+
     def test_duplicate_occurrence_cannot_overwrite_a_native_identity(self):
         result, _source, _output = self._prepare(
             mutate=lambda payload: payload["components"].append(copy.deepcopy(payload["components"][0]))
@@ -2322,6 +2475,26 @@ class DiscoveryTests(unittest.TestCase):
 
         result, _source, _output = self._prepare(mutate=mutate)
         self.assertIn("discovery.datum_identity_duplicate", self._codes(result))
+
+    def test_oracle_requires_exactly_one_explicit_body_datum_match(self):
+        result, _source, output = self._prepare()
+        self.assertTrue(result.passed, result.findings)
+        payload = json.loads((output / "discovery/native-discovery.json").read_text(encoding="utf-8"))
+        arm_datum = copy.deepcopy(
+            next(
+                datum
+                for datum in payload["raw"]["datums"]
+                if datum["name"] == "CS_arm_link" and datum["owner"] == "arm-1"
+            )
+        )
+        payload["raw"]["datums"].append(arm_datum)
+        payload["raw"]["properties"]["components"] = {
+            "arm-1": {"dp.body_datum": "CS_arm_link"},
+        }
+        with self.assertRaises(_Failure) as caught:
+            rebuild_rigid_bodies(payload)
+        self.assertEqual(caught.exception.code, "discovery.body_rebuild")
+        self.assertEqual(caught.exception.detail["matches"], 2)
 
     def test_interface_suffix_is_corrected_by_the_shared_naming_rule(self):
         def mutate(payload):
@@ -3164,6 +3337,66 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(source_record["metadata"]["change_summary"], "提交说明\n第二行")
         report = verify_discovery(self._deliver(output))
         self.assertTrue(report["passed"], report["errors"])
+
+    def test_verifier_recomputes_owner_and_control_source_metadata(self):
+        result, _source, output = self._prepare()
+        self.assertTrue(result.passed, result.findings)
+        for field, value in (
+            ("owner", "forged_owner"),
+            (
+                "control",
+                {
+                    "system": "git",
+                    "reference": "0" * 40,
+                },
+            ),
+        ):
+            with self.subTest(field=field):
+                delivery = self._deliver(output)
+
+                def forge(source_record: dict, field=field, value=value) -> None:
+                    source_record["metadata"][field] = value
+
+                self._tamper_delivered(delivery, "input/source.json", forge)
+                report = verify_discovery(delivery)
+                self.assertFalse(report["passed"])
+                self.assertIn("discovery.identity", [item["code"] for item in report["errors"]])
+
+    def test_verifier_checks_revision_even_when_other_metadata_is_missing(self):
+        raw = record()
+        raw["identity"].pop("owner")
+        result, output = self._derive_pure(raw)
+        self.assertTrue(result.passed, result.findings)
+        delivery = self._deliver(output)
+
+        def forge(source_record: dict) -> None:
+            source_record["metadata"]["revision"] = "forged_revision"
+
+        self._tamper_delivered(delivery, "input/source.json", forge)
+        report = verify_discovery(delivery)
+        self.assertFalse(report["passed"])
+        self.assertIn("discovery.revision", [item["code"] for item in report["errors"]])
+
+    def test_verifier_recomputes_an_absent_change_summary_and_its_origin(self):
+        raw = record()
+        raw["identity"].pop("change_summary")
+        result, output = self._derive_pure(raw)
+        self.assertTrue(result.passed, result.findings)
+        for field, value, detail in (
+            ("change_summary", "forged summary", "change_summary"),
+            ("change_summary_source", "cad", "change_summary_source"),
+        ):
+            with self.subTest(field=field):
+                delivery = self._deliver(output)
+
+                def forge(source_record: dict, field=field, value=value) -> None:
+                    source_record["metadata"][field] = value
+
+                self._tamper_delivered(delivery, "input/source.json", forge)
+                report = verify_discovery(delivery)
+                self.assertFalse(report["passed"])
+                failure = next(item for item in report["errors"] if item["code"] == "discovery.identity")
+                self.assertEqual(failure["detail"]["field"], detail)
 
     def test_verifier_refuses_a_configured_target_over_authored_cad_identity(self):
         result, _source, output = self._prepare()

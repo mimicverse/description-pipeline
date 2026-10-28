@@ -19,7 +19,10 @@ from description_pipeline.geometry.native_tessellation import (
     summarize_native_topology,
     write_native_triangle_stream,
 )
-from description_pipeline.geometry.native_transform import transform_from_solidworks
+from description_pipeline.geometry.native_transform import (
+    rigid_matrix_from_row_major,
+    transform_from_solidworks,
+)
 from description_pipeline.io import PipelineError
 
 
@@ -214,6 +217,20 @@ class NativeTrianglesContractTest(unittest.TestCase):
                 changed = [invalid, *raw[1:]]
                 with self.assertRaises(ValueError):
                     transform_from_solidworks(changed)
+
+    def test_row_major_rigid_matrix_refuses_non_rigid_and_coerced_values(self):
+        identity = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+        self.assertEqual(rigid_matrix_from_row_major(identity), tuple(identity))
+        cases = {
+            "boolean": [True, *identity[1:]],
+            "numeric-string": ["1.0", *identity[1:]],
+            "scaled": [2.0, *identity[1:]],
+            "reflected": [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            "skewed-final-row": [*identity[:12], 0.0, 0.0, 0.1, 1.0],
+        }
+        for label, value in cases.items():
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                rigid_matrix_from_row_major(value)
 
 
 if __name__ == "__main__":

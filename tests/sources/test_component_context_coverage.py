@@ -70,6 +70,23 @@ class ComponentContextCoverageTests(unittest.TestCase):
         self.assertIsNotNone(error)
         self.assertIn("other/x", error)
 
+    def test_numeric_helpers_refuse_boolean_and_numeric_strings(self):
+        for value in (True, False, "1", "0"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                oracle._finite_positive(value, "positive")
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                oracle._finite_non_negative(value, "non-negative")
+        for value in ([True, False, True], ["1", "2", "3"]):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                oracle._finite_vector(value, "vector")
+
+    def test_component_context_refuses_boolean_mass(self):
+        payload, scene = self._fixture()
+        payload["component_context"]["instances"][0]["context_mass_kg"] = True
+        _details, error = oracle._component_context_findings(payload, 0.1, scene)
+        self.assertIsNotNone(error)
+        self.assertIn("component mass context mass", error)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -37,6 +37,7 @@ import re
 from pathlib import Path, PurePosixPath
 
 from ..delivery import read_delivery_manifest, read_source_record
+from ..geometry.native_transform import rigid_matrix_from_row_major
 from ..interface_records import validate_request_record
 from ..io import PipelineError, confined, digest, parse_data
 from ..schemas import NATIVE_DISCOVERY_SCHEMA, exporter_declaration_present
@@ -1008,13 +1009,12 @@ def _frames(record: dict) -> dict[str, list[list[float]] | None]:
         suppressed = item.get("suppressed")
         if not isinstance(name, str) or not isinstance(suppressed, bool) or suppressed:
             continue
-        values = [_number(value) for value in item.get("transform") or ()]
-        numbers = [value for value in values if value is not None]
-        frames[name] = (
-            [numbers[0:4], numbers[4:8], numbers[8:12], numbers[12:16]]
-            if len(values) == 16 and len(numbers) == 16
-            else None
-        )
+        try:
+            numbers = list(rigid_matrix_from_row_major(item.get("transform")))
+        except (TypeError, ValueError):
+            frames[name] = None
+        else:
+            frames[name] = [numbers[0:4], numbers[4:8], numbers[8:12], numbers[12:16]]
     return frames
 
 
@@ -1992,11 +1992,25 @@ def rebuild_rigid_bodies(record: dict) -> list[dict]:
     bodies: list[dict] = []
     for group, full in by_material.items():
         members = sorted(str(value) for value in full)
-        declared = {
-            str(value).strip()
-            for member in members
-            if isinstance((value := (properties.get(member) or {}).get("dp.body_datum")), str) and value.strip()
-        }
+        declared: set[str] = set()
+        for member in members:
+            member_properties = properties.get(member) or {}
+            _require(
+                isinstance(member_properties, dict),
+                "discovery.body_rebuild",
+                "component properties for a body datum must be an object",
+                {"component": member, "value_type": type(member_properties).__name__},
+            )
+            if "dp.body_datum" not in member_properties:
+                continue
+            value = member_properties["dp.body_datum"]
+            _require(
+                isinstance(value, str) and bool(value.strip()),
+                "discovery.body_rebuild",
+                "a declared body datum must be non-empty text",
+                {"component": member, "value": value, "value_type": type(value).__name__},
+            )
+            declared.add(value.strip())
         _require(
             len(declared) <= 1,
             "discovery.body_rebuild",
@@ -2023,20 +2037,22 @@ def rebuild_rigid_bodies(record: dict) -> list[dict]:
         )
         if explicit is not None:
             scope = {*members, *({""} if proven and explicit == "CS_base_link" else set())}
-            chosen = next(
-                (
-                    datum
-                    for datum in datums
-                    if str(datum.get("name") or "") == explicit and str(datum.get("owner") or "") in scope
-                ),
-                None,
-            )
+            matches = [
+                datum
+                for datum in datums
+                if str(datum.get("name") or "") == explicit and str(datum.get("owner") or "") in scope
+            ]
             _require(
-                chosen is not None,
+                len(matches) == 1,
                 "discovery.body_rebuild",
                 "the declared body datum does not bind exactly one coordinate system owned by this body",
-                {"components": members, "datum": explicit},
+                {
+                    "components": members,
+                    "datum": explicit,
+                    "matches": len(matches),
+                },
             )
+            chosen = matches[0]
         elif len(owned) == 1:
             chosen = owned[0]
         elif owned:
@@ -2556,8 +2572,19 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
         )
         author_limits = None
         author_evidence = None
+        limits_record_key = f"{namespace}.joint.limits_record"
         author_reference = properties.get(f"{namespace}.joint.limits_record")
-        if isinstance(author_reference, str) and author_reference.strip():
+        if limits_record_key in properties:
+            _require(
+                isinstance(author_reference, str) and bool(author_reference.strip()),
+                "discovery.joint_limits_invalid",
+                "controlled limits record reference must be non-empty text",
+                {
+                    "pair": [left, right],
+                    "value": author_reference,
+                    "value_type": type(author_reference).__name__,
+                },
+            )
             entry = _find_record_entry(payload, author_reference)
             value = _record_value(package, entry["entry"], entry["key"])
             _require(
@@ -2675,10 +2702,21 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
                 "the joint has no native position range",
                 {"pair": [left, right]},
             )
-        drive_reference = properties.get(f"{namespace}.joint.drive_record")
+        drive_record_key = f"{namespace}.joint.drive_record"
+        drive_reference = properties.get(drive_record_key)
         drive = None
         drive_evidence = None
-        if isinstance(drive_reference, str) and drive_reference.strip():
+        if drive_record_key in properties:
+            _require(
+                isinstance(drive_reference, str) and bool(drive_reference.strip()),
+                "discovery.joint_drive_invalid",
+                "controlled drive record reference must be non-empty text",
+                {
+                    "pair": [left, right],
+                    "value": drive_reference,
+                    "value_type": type(drive_reference).__name__,
+                },
+            )
             entry = _find_record_entry(payload, drive_reference)
             value = _record_value(package, entry["entry"], entry["key"])
             _require(
@@ -2857,13 +2895,9 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
 
 def _frame(values) -> list[list[float]] | None:
     try:
-        raw = list(values or ())
-    except TypeError:
+        numbers = list(rigid_matrix_from_row_major(values))
+    except (TypeError, ValueError):
         return None
-    values_as_numbers = [_number(value) for value in raw]
-    if len(values_as_numbers) != 16 or any(value is None for value in values_as_numbers):
-        return None
-    numbers = [value for value in values_as_numbers if value is not None]
     return [numbers[0:4], numbers[4:8], numbers[8:12], numbers[12:16]]
 
 
@@ -3452,6 +3486,13 @@ def verify_discovery(package: Path) -> dict:
 
         request = state["request"]
 
+        for key in ("owner", "control"):
+            _require(
+                metadata.get(key) == authored[key],
+                "discovery.identity",
+                "sealed source metadata differs from native evidence",
+                {"field": key},
+            )
         for key in ("revision", "parent_revision", "owner", "control"):
             _require(
                 claimed.get(key) == authored[key],
@@ -3547,6 +3588,19 @@ def verify_discovery(package: Path) -> dict:
             "generated metadata differs from native evidence",
             {"field": "change_summary"},
         )
+        _require(
+            metadata.get("change_summary") == summary,
+            "discovery.identity",
+            "sealed source metadata differs from native evidence",
+            {"field": "change_summary"},
+        )
+        if summary is None:
+            _require(
+                metadata.get("change_summary_source") == "generated",
+                "discovery.identity",
+                "sealed source metadata has a false change-summary origin",
+                {"field": "change_summary_source"},
+            )
 
         # The delivery configuration is qualified by native state, not by the
         # name it carries.  The requirement is derived from the sealed selection
@@ -3626,14 +3680,18 @@ def verify_discovery(package: Path) -> dict:
         source = read_source_record(package)
         metadata = source.get("metadata") or {}
         authored = state.get("authored_identity")
-        if isinstance(authored, dict) and not authored.get("missing"):
-            declared = metadata.get("revision")
-            _require(
-                declared in (None, authored.get("revision")),
-                "discovery.revision",
-                "revision metadata differs from native author metadata",
-                {"field": "revision"},
-            )
+        _require(
+            isinstance(authored, dict),
+            "discovery.revision",
+            "native authored identity is unavailable for revision verification",
+        )
+        declared = metadata.get("revision")
+        _require(
+            declared == authored.get("revision"),
+            "discovery.revision",
+            "revision metadata differs from native author metadata",
+            {"field": "revision", "declared": declared, "native": authored.get("revision")},
+        )
         return {
             "revision": metadata.get("revision"),
             "label_source": (source.get("selection") or {}).get("hardware_source"),
@@ -4688,7 +4746,7 @@ def verify_discovery(package: Path) -> dict:
             if identifier == "discovery.revision":
                 authored = state.get("authored_identity") or {}
                 declared = (read_source_record(package).get("metadata") or {}).get("revision")
-                if not declared:
+                if not declared and authored.get("revision") is None:
                     # The CAD revision label is optional raw metadata; its absence is a
                     # readiness warning, never a passed check.
                     diagnostics.append(

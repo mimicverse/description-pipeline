@@ -142,13 +142,19 @@ def native_limit_inventory_complete(mates) -> bool:
     return True
 
 
-def _finite(value) -> float:
+def finite_number(value) -> float:
+    """One strict finite JSON number from native evidence."""
+
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise NativeLimitInvalidError("native limit number is not numeric")
+        raise NativeLimitInvalidError("native number is not numeric")
     number = float(value)
     if not math.isfinite(number):
-        raise NativeLimitInvalidError("native limit number is not finite")
+        raise NativeLimitInvalidError("native number is not finite")
     return number
+
+
+def _finite(value) -> float:
+    return finite_number(value)
 
 
 def _value_record(record, key: str, expected_api: str, unit: str) -> float:

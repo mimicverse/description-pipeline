@@ -1750,6 +1750,8 @@ class NativeDeclarationsTests(unittest.TestCase):
             # fixture's source record coherent with the raw reading.
             source["metadata"]["change_summary"] = raw["identity"]["change_summary"]
             source["metadata"]["change_summary_source"] = "cad"
+            source["metadata"]["owner"] = raw["identity"]["owner"]
+            source["metadata"]["control"] = copy.deepcopy(raw["identity"]["control"])
             support.write_target_delivery(
                 package,
                 capture={},
@@ -1785,20 +1787,21 @@ class NativeDeclarationsTests(unittest.TestCase):
             authored = copy.deepcopy(raw["identity"])
             source["metadata"]["revision"] = None
             reseal()
-            unsealed = verify_discovery(package)
-            self.assertTrue(unsealed["passed"], unsealed["errors"])
-            self.assertNotIn("discovery.revision", {item["id"] for item in unsealed["checks"]})
-            self.assertEqual(
-                [item["code"] for item in unsealed["diagnostics"]],
-                ["discovery.revision_absent"],
+            mismatched = verify_discovery(package)
+            self.assertIn(
+                "discovery.revision",
+                {item["code"] for item in mismatched["errors"]},
             )
-            self.assertTrue(all(item["blocking"] is False for item in unsealed["diagnostics"]))
 
             raw["identity"] = dict.fromkeys(authored)
             payload["identity"] = copy.deepcopy(raw["identity"])
             robot["hardware_id"] = None
             robot["source"]["robot_name"] = "robot"
             payload["identity"]["robot_name_technical"] = "robot"
+            source["metadata"]["owner"] = None
+            source["metadata"]["control"] = None
+            source["metadata"]["change_summary"] = None
+            source["metadata"]["change_summary_source"] = "generated"
             reseal()
             unsealed = verify_discovery(package)
             self.assertTrue(unsealed["passed"], unsealed["errors"])
@@ -1838,6 +1841,10 @@ class NativeDeclarationsTests(unittest.TestCase):
             payload["identity"] = copy.deepcopy(authored)
             robot["hardware_id"] = "fixture"
             robot["source"]["robot_name"] = "fixture"
+            source["metadata"]["owner"] = authored["owner"]
+            source["metadata"]["control"] = copy.deepcopy(authored["control"])
+            source["metadata"]["change_summary"] = authored["change_summary"]
+            source["metadata"]["change_summary_source"] = "cad"
             source["metadata"]["revision"] = "r9"
             reseal()
             self.assertIn("discovery.revision", {item["code"] for item in verify_discovery(package)["errors"]})

@@ -65,6 +65,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from collections.abc import Mapping, Sequence
 
+from ...geometry.native_transform import rigid_matrix_from_row_major
 from ...io import PipelineError, artifact_path_parts, confined, digest, inventory, parse_data, read_data
 from ...interface_records import PURPOSE_ENGINEERING, PURPOSE_INSPECTION_PREVIEW
 from ...request_evidence import read_request_evidence
@@ -315,10 +316,84 @@ def _scalar(record: dict, namespace: str, key: str, *, section: str = "document"
 
 
 def _identity_value(record: dict, namespace: str, key: str) -> Any:
-    value = (record.get("identity") or {}).get(key)
-    if value is None or value == "":
-        value = _scalar(record, namespace, key)
-    return value
+    """One optional identity value, preserving absent and malformed distinctly."""
+
+    identity = record.get("identity")
+    if identity is None:
+        identity = {}
+    elif not isinstance(identity, dict):
+        raise CadError(
+            "cad_identity_invalid",
+            "raw identity evidence is not an object",
+            {"value_type": type(identity).__name__},
+        )
+    properties = record.get("properties")
+    if properties is None:
+        properties = {}
+    elif not isinstance(properties, dict):
+        raise CadError(
+            "cad_property_unreadable",
+            "raw property evidence is not an object",
+            {"value_type": type(properties).__name__},
+        )
+    bucket = properties.get("document")
+    if bucket is None:
+        bucket = {}
+    elif not isinstance(bucket, dict):
+        raise CadError(
+            "cad_property_unreadable",
+            "raw document properties are not an object",
+            {"value_type": type(bucket).__name__},
+        )
+
+    candidates: list[str] = []
+
+    def add(value) -> None:
+        if value is None:
+            return
+        if not isinstance(value, str) or not value.strip():
+            raise CadError(
+                "cad_identity_invalid",
+                "a supplied identity value must be non-empty text",
+                {"field": key, "value": repr(value)[:300], "value_type": type(value).__name__},
+            )
+        normalized = value
+        if key == "change_summary":
+            normalized = normalized.replace("\r\n", "\n").replace("\r", "\n")
+        candidates.append(normalized.strip())
+
+    if key.startswith("control."):
+        control_key = key.split(".", 1)[1]
+        control = identity.get("control")
+        if control is not None and not isinstance(control, dict):
+            raise CadError(
+                "cad_identity_invalid",
+                "raw control identity is not an object",
+                {"field": key, "value_type": type(control).__name__},
+            )
+        if isinstance(control, dict):
+            unknown = set(control) - {"system", "reference"}
+            if unknown:
+                raise CadError(
+                    "cad_identity_invalid",
+                    "raw control identity carries unknown fields",
+                    {"field": key, "unknown": sorted(str(value) for value in unknown)},
+                )
+            if control_key in control:
+                add(control[control_key])
+    elif key in identity:
+        add(identity[key])
+
+    property_key = f"{namespace}.{key}"
+    if property_key in bucket:
+        add(bucket[property_key])
+    if len(set(candidates)) > 1:
+        raise CadError(
+            "cad_identity_conflict",
+            "native identity readings disagree",
+            {"field": key, "values": candidates},
+        )
+    return candidates[0] if candidates else None
 
 
 def _unit(vector) -> list[float] | None:
@@ -439,11 +514,8 @@ def _component_frames(record: dict, findings: list[dict]) -> dict[str, list[list
         name = str(item.get("name2") or "")
         if not name or item.get("suppressed"):
             continue
-        try:
-            values = [float(value) for value in item.get("transform") or ()]
-        except (TypeError, ValueError):
-            values = []
-        if len(values) != 16 or not all(math.isfinite(value) for value in values):
+        values = _rigid_matrix(item.get("transform"))
+        if values is None:
             frames[name] = None
             findings.append(
                 _finding(
@@ -452,8 +524,8 @@ def _component_frames(record: dict, findings: list[dict]) -> dict[str, list[list
                     "component has no finite recorded 4x4 assembly transform",
                 )
             )
-        else:
-            frames[name] = [values[0:4], values[4:8], values[8:12], values[12:16]]
+            continue
+        frames[name] = [values[0:4], values[4:8], values[8:12], values[12:16]]
     return frames
 
 
@@ -560,6 +632,13 @@ def _finite_vector(value: Any, length: int) -> list[float] | None:
             return None
         numbers.append(number)
     return numbers
+
+
+def _rigid_matrix(value: Any) -> list[float] | None:
+    try:
+        return list(rigid_matrix_from_row_major(value))
+    except (TypeError, ValueError):
+        return None
 
 
 def _controlled_number(value: Any) -> float | None:
@@ -960,11 +1039,12 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
             point = _point([float(value) for value in (cylinder.get("point") or cylinder.get("center")) or ()], frame)
         except (TypeError, ValueError):
             point = None
-        if direction is None or point is None or len(point) != 3:
+        radius = _controlled_number(cylinder.get("radius"))
+        if direction is None or point is None or len(point) != 3 or radius is None or radius <= 0:
             fail(
                 "discovery.mate_entities_unsupported",
                 "recorded cylinder is not usable",
-                {"feature": entity.get("feature")},
+                {"feature": entity.get("feature"), "radius": cylinder.get("radius")},
             )
             return None
         return point, direction
@@ -1005,11 +1085,12 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
             centre = _point([float(value) for value in circle.get("center") or ()], frame)
         except (TypeError, ValueError):
             centre = None
-        if normal is None or centre is None or len(centre) != 3:
+        radius = _controlled_number(circle.get("radius"))
+        if normal is None or centre is None or len(centre) != 3 or radius is None or radius <= 0:
             fail(
                 "discovery.mate_entities_unsupported",
                 "recorded circular edge is not usable",
-                {"feature": entity.get("feature")},
+                {"feature": entity.get("feature"), "radius": circle.get("radius")},
             )
             return None
         return centre, normal
@@ -2140,7 +2221,17 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
         declared_limit = None
         declared_bounds = None
         declared_ref = properties.get(f"{NAMESPACE}.joint.limits_record")
-        if _text(declared_ref):
+        if f"{NAMESPACE}.joint.limits_record" in properties:
+            if not _text(declared_ref):
+                findings.append(
+                    _finding(
+                        "discovery.joint_limits_invalid",
+                        obj,
+                        "controlled limits record reference must be non-empty text",
+                        {"value": declared_ref, "value_type": type(declared_ref).__name__},
+                    )
+                )
+                continue
             declared_limit = _resolve_record(settings, str(declared_ref), findings, obj)
             if declared_limit is None:
                 continue
@@ -2312,7 +2403,17 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
         drive = None
         drive_source = "absent"
         drive_ref = properties.get(f"{NAMESPACE}.joint.drive_record")
-        if _text(drive_ref):
+        if f"{NAMESPACE}.joint.drive_record" in properties:
+            if not _text(drive_ref):
+                findings.append(
+                    _finding(
+                        "discovery.joint_drive_invalid",
+                        obj,
+                        "controlled drive record reference must be non-empty text",
+                        {"value": drive_ref, "value_type": type(drive_ref).__name__},
+                    )
+                )
+                continue
             drive = _resolve_record(settings, str(drive_ref), findings, obj)
             if drive is None:
                 continue
@@ -2657,7 +2758,7 @@ def _exporter_memberships(record: dict, declaration: dict, findings: list[dict])
                     datum_selector,
                 )
             )
-        if datum is None or _finite_vector(datum.get("array"), 16) is None:
+        if datum is None or _rigid_matrix(datum.get("array")) is None:
             findings.append(
                 _finding(
                     "discovery.exporter_frame_missing",
@@ -2879,8 +2980,8 @@ def _apply_mate_direction(record: dict, bodies: list[dict], joints: list[dict], 
             if len(ownerless) == 1:
                 parent_datum = ownerless[0]
         child_datum = _body_datum(record, child) if child else None
-        parent_array = _finite_vector(parent_datum.get("array"), 16) if parent_datum else None
-        child_array = _finite_vector(child_datum.get("array"), 16) if child_datum else None
+        parent_array = _rigid_matrix(parent_datum.get("array")) if parent_datum else None
+        child_array = _rigid_matrix(child_datum.get("array")) if child_datum else None
         local = _axis_in_child(joint, child_datum) if child_datum else None
         if parent_array is None or child_array is None or local is None:
             findings.append(
@@ -3165,7 +3266,7 @@ def _exporter_axis(
         component = next(
             (item for item in record.get("components") or [] if item.get("name2") == selector["component"]), None
         )
-        transform = _finite_vector(component.get("transform"), 16) if component else None
+        transform = _rigid_matrix(component.get("transform")) if component else None
         if transform is None:
             findings.append(
                 _finding(
@@ -3184,7 +3285,7 @@ def _exporter_axis(
         )
         return axis, selector
     datum = _body_datum(record, body)
-    transform = _finite_vector(datum.get("array"), 16) if datum else None
+    transform = _rigid_matrix(datum.get("array")) if datum else None
     local = _unit_vector(declared.get("axis"))
     if local is None or transform is None:
         findings.append(
@@ -3207,7 +3308,7 @@ def _exporter_axis(
             )
         )
     parent_datum = _body_datum(record, parent_body) if parent_body is not None else None
-    parent_transform = _finite_vector(parent_datum.get("array"), 16) if parent_datum else None
+    parent_transform = _rigid_matrix(parent_datum.get("array")) if parent_datum else None
     if parent_transform is None:
         findings.append(
             _finding(
@@ -3294,8 +3395,8 @@ def _exporter_origin(declared: dict, child: dict, parent: dict, record: dict, fi
         return
     xyz, rpy = _finite_vector(origin.get("xyz"), 3), _finite_vector(origin.get("rpy"), 3)
     parent_datum, child_datum = _body_datum(record, parent), _body_datum(record, child)
-    left = _finite_vector(parent_datum.get("array"), 16) if parent_datum else None
-    right = _finite_vector(child_datum.get("array"), 16) if child_datum else None
+    left = _rigid_matrix(parent_datum.get("array")) if parent_datum else None
+    right = _rigid_matrix(child_datum.get("array")) if child_datum else None
     if xyz is None or rpy is None or left is None or right is None:
         findings.append(
             _finding(
@@ -3824,11 +3925,39 @@ def _body_records(
         anchor = material[0]
         item = components.get(anchor, {})
         identity = str(item.get("instance_id") or f"{item.get('document') or ''}#{anchor}")
-        declared = {
-            str(value).strip()
-            for member in members
-            if _text(value := (properties.get(member) or {}).get(f"{NAMESPACE}.body_datum"))
-        }
+        declared: set[str] = set()
+        invalid_datum = False
+        for member in members:
+            member_properties = properties.get(member) or {}
+            key = f"{NAMESPACE}.body_datum"
+            if not isinstance(member_properties, dict):
+                findings.append(
+                    _finding(
+                        "discovery.body_datum_invalid",
+                        f"body:{root}",
+                        "component properties for a body datum must be an object",
+                        {"component": member, "value_type": type(member_properties).__name__},
+                    )
+                )
+                invalid_datum = True
+                break
+            if key not in member_properties:
+                continue
+            value = member_properties[key]
+            if not _text(value):
+                findings.append(
+                    _finding(
+                        "discovery.body_datum_invalid",
+                        f"body:{root}",
+                        "a declared body datum must be non-empty text",
+                        {"component": member, "value": value, "value_type": type(value).__name__},
+                    )
+                )
+                invalid_datum = True
+                break
+            declared.add(str(value).strip())
+        if invalid_datum:
+            continue
         if len(declared) > 1:
             findings.append(
                 _finding(
@@ -4584,6 +4713,21 @@ def _identity(
     """
 
     namespace = NAMESPACE
+    authored = {
+        key: _identity_value(record, namespace, key)
+        for key in (
+            "hardware_id",
+            "revision",
+            "parent_revision",
+            "owner",
+            "change_summary",
+            "delivery_configuration",
+            "main_assembly",
+            "robot_name",
+            "control.system",
+            "control.reference",
+        )
+    }
     sources: dict[str, str] = {}
     derived: list[str] = []
 
@@ -4599,7 +4743,7 @@ def _identity(
     sub_hardware = submitted(submission.hardware_id) if submission is not None else None
     sub_summary = submitted(submission.change_summary) if submission is not None else None
 
-    hardware = _identity_value(record, namespace, "hardware_id")
+    hardware = authored["hardware_id"]
     hardware = str(hardware).strip() if _text(hardware) else None
     if hardware is None:
         if sub_hardware is not None:
@@ -4637,7 +4781,7 @@ def _identity(
                 {"value": hardware},
             )
         )
-    revision = _identity_value(record, namespace, "revision")
+    revision = authored["revision"]
     revision = str(revision).strip() if _text(revision) else None
     if revision is not None:
         sources["revision"] = "cad"
@@ -4659,7 +4803,7 @@ def _identity(
                 {"value": revision},
             )
         )
-    owner = _identity_value(record, namespace, "owner")
+    owner = authored["owner"]
     owner = str(owner).strip() if _text(owner) else None
     if owner is not None:
         sources["owner"] = "cad"
@@ -4680,7 +4824,7 @@ def _identity(
                 {"value": owner},
             )
         )
-    summary = _identity_value(record, namespace, "change_summary")
+    summary = authored["change_summary"]
     summary = str(summary).strip() if _text(summary) else None
     if summary is not None:
         sources["change_summary"] = "cad"
@@ -4710,12 +4854,10 @@ def _identity(
                 {"value": summary},
             )
         )
-    control = (record.get("identity") or {}).get("control")
-    if not isinstance(control, dict):
-        control = {
-            "system": _scalar(record, namespace, "control.system"),
-            "reference": _scalar(record, namespace, "control.reference"),
-        }
+    control = {
+        "system": authored["control.system"],
+        "reference": authored["control.reference"],
+    }
     system = str(control["system"]).strip() if _text(control.get("system")) else None
     reference = str(control["reference"]).strip() if _text(control.get("reference")) else None
     if system is None or reference is None:
@@ -4754,7 +4896,7 @@ def _identity(
         sources["control"] = "cad"
     delivery = (
         configuration
-        or _identity_value(record, namespace, "delivery_configuration")
+        or authored["delivery_configuration"]
         or record.get("saved_configuration")
     )
     if not _text(delivery):
@@ -4773,7 +4915,7 @@ def _identity(
             )
         )
         delivery = None
-    main = assembly or _identity_value(record, namespace, "main_assembly")
+    main = assembly or authored["main_assembly"]
     main = str(main).replace("\\", "/") if _text(main) else None
     if main is None or main not in native_files:
         findings.append(
@@ -4784,7 +4926,7 @@ def _identity(
                 {"assembly": main},
             )
         )
-    authored_name = _identity_value(record, namespace, "robot_name")
+    authored_name = authored["robot_name"]
     if _text(authored_name):
         robot_name = str(authored_name).strip()
         if _SNAKE.fullmatch(robot_name) is None:
@@ -4813,7 +4955,7 @@ def _identity(
                 blocking=False,
             )
         )
-    parent = _identity_value(record, namespace, "parent_revision")
+    parent = authored["parent_revision"]
     if _text(parent):
         parent_value = str(parent).strip()
         sources["parent_revision"] = "cad"
@@ -5277,6 +5419,16 @@ def derive_native_package(
                         "suppressed": suppressed,
                         "lightweight": lightweight,
                     },
+                )
+            )
+            continue
+        if state in {1, 4}:
+            findings.append(
+                _finding(
+                    "discovery.suppression_lightweight",
+                    f"component:{name}",
+                    "a lightweight component cannot be independently measured; the native capture must fully load it",
+                    {"component": name, "suppression_state": state},
                 )
             )
     known_occurrences = {

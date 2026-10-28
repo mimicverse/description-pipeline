@@ -6690,10 +6690,12 @@ class MateEntityReferenceTests(unittest.TestCase):
         scaled = (2.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
         reflected = (1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
         skewed_tail = (1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 2.0)
+        boolean = (True, *identity[1:])
         self.assertIsNotNone(native_module._frame_matrix(identity))
         self.assertIsNone(native_module._frame_matrix(scaled))
         self.assertIsNone(native_module._frame_matrix(reflected))
         self.assertIsNone(native_module._frame_matrix(skewed_tail))
+        self.assertIsNone(native_module._frame_matrix(boolean))
         self.assertIsNone(native_module._frame_matrix(identity[:12]))
 
     def test_malformed_entity_params_fail_closed(self) -> None:
@@ -6922,6 +6924,17 @@ class ComponentSuppressionStateTests(unittest.TestCase):
 
             self.assertEqual(triple("arm-1"), (2, False, False))
             self.assertEqual(triple("arm-2"), (1, False, True))
+
+    def test_discover_native_refuses_an_empty_component_name(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            valid = _Component("base-1", _write(root, "base.SLDPRT"))
+            unnamed = _Component("", _write(root, "orphan.SLDPRT"))
+            assembly = _write(root, "robot.SLDASM")
+            with self.assertRaises(CadError) as caught:
+                _read(root, _App({assembly: _Doc(assembly, doc_type=2, children=[valid, unnamed])}))
+            self.assertEqual(caught.exception.code, "cad_component_identity_unreadable")
+            self.assertEqual(caught.exception.detail["raw_name"], "")
 
     def test_unreadable_child_transform_blocks_descent_without_fabrication(self):
         """An unreadable occurrence transform must not become an empty parent frame.
