@@ -11,7 +11,10 @@ import tempfile
 from pathlib import Path
 
 from ..delivery import read_source_record
-from ..geometry.native_scope import native_source_scope_is_valid
+from ..geometry.native_scope import (
+    SESSION_SOURCE_IDENTITY_FIELDS,
+    native_source_scope_is_valid,
+)
 from ..geometry.native_tessellation import (
     build_native_tessellation,
     materialize_native_stl,
@@ -19,12 +22,13 @@ from ..geometry.native_tessellation import (
     parse_native_tessellation,
 )
 from ..geometry.native_transform import transform_from_solidworks
-from ..io import PipelineError, confined, file_digest, read_data
+from ..io import PipelineError, confined, digest, file_digest, read_data
 from ..schemas import EFFECTIVE_INSTANCES_SCHEMA, LINK_GROUP_MASS_SCHEMA
 from ..sources.solidworks.capture_projection import load_native_capture_observation
 from ..sources.solidworks.inertia_convention import POSITIVE, detect_family
 from ..sources.solidworks.session_artifacts import (
     embedded_virtual_component_under_root,
+    session_materialization_under_root,
     session_root_pid,
 )
 
@@ -1024,6 +1028,7 @@ def source_scopes(root) -> dict:
     if not isinstance(geometry_raw, dict):
         raise PipelineError("Geometry component inventory is malformed")
     geometry_names = set(geometry_raw)
+    capture_session_pid = None
     scope_names = set(record)
     scene_names = set(scene_by_name)
     discovery_exported_names = {
@@ -1114,6 +1119,14 @@ def source_scopes(root) -> dict:
             )
         discovery_row = discovery_by_name[name]
         scene_row = scene_by_name[name]
+        source_state = (discovery_row.get("source_provenance") or {}).get("state")
+        expected_kind = {
+            None: "file_sha256", "resolved": "file_sha256",
+            "embedded_virtual_component": "virtual_path_sha256",
+            "cached_materialization": "session_source_sha256",
+        }.get(source_state)
+        if scope["source_document_identity_kind"] != expected_kind:
+            raise PipelineError(f"Source identity kind differs from discovery: {name}")
         configuration = discovery_row.get("configuration")
         if (
             not isinstance(configuration, str)
@@ -1262,7 +1275,7 @@ def source_scopes(root) -> dict:
                 raise PipelineError(
                     f"Archived source bytes differ from the source scope: {name}"
                 )
-        else:
+        elif scope["source_document_identity_kind"] == "virtual_path_sha256":
             provenance = discovery_row.get("source_provenance")
             if not isinstance(provenance, dict):
                 raise PipelineError(
@@ -1344,6 +1357,150 @@ def source_scopes(root) -> dict:
                 raise PipelineError(
                     f"Virtual source owner/path/root differs: {name}"
                 )
+        else:
+            provenance = discovery_row.get("source_provenance")
+            session_source = scope.get("session_source")
+            if (
+                not isinstance(provenance, dict)
+                or not isinstance(session_source, dict)
+                or set(session_source) != (
+                    SESSION_SOURCE_IDENTITY_FIELDS
+                    | {
+                        "session_document_path",
+                        "session_temp_root",
+                        "native_api_pid",
+                        "author_imported_path",
+                        "author_imported_error",
+                        "author_imported_relative",
+                        "author_imported_exists",
+                    }
+                )
+            ):
+                raise PipelineError(
+                    f"Cached source provenance is missing: {name}"
+                )
+            identity = {
+                key: session_source[key]
+                for key in SESSION_SOURCE_IDENTITY_FIELDS
+            }
+            owner = session_source["owner"]
+            owner_key = ntpath.normpath(str(owner)).replace(
+                "\\", "/"
+            ).casefold()
+            owner_file_sha = source_files_case.get(owner_key)
+            session_path = _canonical_evidence_path(
+                session_source["session_document_path"]
+            )
+            if capture_session_pid is None:
+                runtime_record = runtime(delivery_root)
+                solidworks = (
+                    runtime_record.get("solidworks")
+                    if isinstance(runtime_record, dict)
+                    else None
+                )
+                sessions = (
+                    solidworks.get("sessions")
+                    if isinstance(solidworks, dict)
+                    else None
+                )
+                copy_session = (
+                    sessions.get("copy")
+                    if isinstance(sessions, dict)
+                    else None
+                )
+                capture_session_pid = (
+                    copy_session.get("pid")
+                    if isinstance(copy_session, dict)
+                    else None
+                )
+            discovery_path = _canonical_evidence_path(
+                provenance.get("session_document_path")
+            )
+            discovery_root = _canonical_evidence_path(
+                provenance.get("session_temp_root")
+            )
+            if (
+                digest(identity) != scope["source_document_identity_sha256"]
+                or session_source["occurrence"] != name
+                or session_source["configuration"] != scope["referenced_configuration"]
+                or session_source["is_virtual"] is not False
+                or session_source["used_api"]
+                != "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual"
+                or owner_file_sha != session_source["owner_sha256"]
+                or provenance.get("state") != "cached_materialization"
+                or provenance.get("kind") != "native_import_materialization"
+                or provenance.get("is_virtual") is not False
+                or provenance.get("used_api") != session_source["used_api"]
+                or provenance.get("owner") != session_source["owner"]
+                or provenance.get("owner_sha256") != session_source["owner_sha256"]
+                or provenance.get("configuration") != session_source["configuration"]
+                or provenance.get("defining_anchor")
+                != session_source["defining_anchor"]
+                or session_path != _canonical_evidence_path(scope["source_document_path"])
+                or session_root_pid(session_source["session_temp_root"])
+                != session_source["native_api_pid"]
+                or capture_session_pid != session_source["native_api_pid"]
+                or not isinstance(discovery_path, str)
+                or not isinstance(discovery_root, str)
+                or not session_materialization_under_root(
+                    discovery_path,
+                    discovery_root,
+                )
+                or session_root_pid(discovery_root)
+                != provenance.get("native_api_pid")
+            ):
+                raise PipelineError(
+                    f"Cached source owner/path/root differs: {name}"
+                )
+            capture_policy = (runtime_record.get("prepared_capture") or {}).get("policy") or {}
+            for author_evidence, author_root in (
+                (session_source, capture_policy.get("source_root")),
+                (provenance, provenance.get("source_root")),
+            ):
+                author_path = author_evidence.get("author_imported_path")
+                author_error = author_evidence.get("author_imported_error")
+                author_relative = author_evidence.get("author_imported_relative")
+                author_exists = author_evidence.get("author_imported_exists")
+                if (
+                    not {
+                        "author_imported_path", "author_imported_error",
+                        "author_imported_exists", "author_imported_relative",
+                    } <= author_evidence.keys()
+                    or (author_error is not None and (not isinstance(author_error, str) or not author_error.strip()))
+                    or (author_path is not None and (
+                        not isinstance(author_path, str) or not author_path.strip() or not ntpath.isabs(author_path)
+                    ))
+                    or (author_relative is not None and (
+                        not isinstance(author_relative, str) or not author_relative.strip()
+                    ))
+                ):
+                    raise PipelineError(f"Cached source author metadata is incomplete or malformed: {name}")
+                if author_path is None:
+                    if author_exists is not None or author_relative is not None:
+                        raise PipelineError(f"Cached source has contradictory author metadata: {name}")
+                    continue
+                if author_error is not None:
+                    raise PipelineError(f"Cached source author path contradicts its read error: {name}")
+                if author_relative is None:
+                    if author_exists is not False:
+                        raise PipelineError(
+                            f"Cached source retains an existing external author path or unknown availability: {name}"
+                        )
+                    continue
+                relative_key = ntpath.normpath(author_relative).replace("\\", "/").casefold()
+                if (
+                    author_exists is not True
+                    or not isinstance(author_root, str)
+                    or not ntpath.isabs(author_root)
+                    or relative_key in {"..", "."}
+                    or relative_key.startswith("../")
+                    or ntpath.isabs(author_relative)
+                    or _canonical_evidence_path(author_path)
+                    != _canonical_evidence_path(ntpath.join(author_root, author_relative))
+                    or relative_key not in discovery_files_case
+                    or source_files_case.get(relative_key) != discovery_files_case[relative_key]
+                ):
+                    raise PipelineError(f"Cached source author path is missing or differs: {name}")
     return record
 
 

@@ -710,6 +710,10 @@ Windows native worker owner 分别记录和验证，任一相同或不同都不�
 
 状态、健康及漂移查询不得安装、下载或修复持久工具链文件。已绑定的工具缺失或不可执行时如实报告，不通过自动安装掩盖漂移。
 
+选择闭包的 `imports` 对 `cached_materialization` 绑定单一 `session_source_sha256`：以本项目唯一 canonical UTF-8 编码计算冻结 owner 及 SHA、完整 occurrence、defining anchor、configuration、原生 API 和精确 `is_virtual=false` 的摘要。Capture plan 不包含旧缓存文档路径，只传实例和摘要；新受控会话须由相同冻结 owner 重现全部对应对象。每个会话分别记录和核验当次临时路径、`swxPID` 根与真实 owned PID，不能要求两次会话的临时路径或 PID 相同。几何从当次原生实体采集，临时缓存文件不归档为上传来源。作者导入路径、存在状态和读取错误保真：包内精确来源核验冻结字节；现存包外文件、包内哈希冲突及错绑定拒绝；无法取得原始导入来源且必要保存状态仍可读取时 warning 后继续。`source.native_cached_materialization` 贯通来源 scope、模型、URDF、独立 Verify、报告、预览和 PR，明确原始来源完整性未建立；不得按 basename 绑定，不建立第二来源或配置状态。
+
+作者来源读取状态逐会话独立核验：明确空路径、非空读取错误及确认不存在的历史路径分别保留，不能互相转换，也不要求跨会话的错误文字一致。非空路径的存在性未知、路径与读取错误同时出现、空路径却附带存在性或相对路径，以及字段缺失或状态矛盾均拒绝。读取错误只降低原始来源完整性资格，不改变已证明的冻结 owner、实例、配置和当次原生几何绑定。
+
 选择闭包的 `virtual_components` 单独记录内嵌虚拟组件：`state=embedded_virtual_component`、`binding=owner_embedded_geometry`、`kind=native_embedded_virtual_component`。每项保留 `IComponent2.GetPathName/GetImportedPath/IsVirtual` 的直接读取依据，要求 `is_virtual=true`，并绑定可达上传图中的 `owner` 及其 SHA-256、精确 `instance`、可空的 `owner_anchor`、引用 `configuration`、`session_document_path`、`session_temp_root` 和正整数 `native_api_pid`。原生端从实际 SolidWorks API 读取进程 ID，并核对它与会话根 `swxNNNN` 的进程编号一致；文档须位于该受控会话的 `VC~~` 内，路径形状本身不是归属证明。不得携带非空作者导入路径或读取错误，不得与 `imports` 中的 `IC~~` 缓存共享实例身份。后续会话可以产生不同临时路径，但须重新读取原生对象，并以相同所属装配字节、实例与配置对应封存记录；原生采集和独立验证双向核对当前对象与封存清单，拒绝遗漏、额外对象和冲突绑定。临时文档不进入上传文件图，Linux 只验证封存证据，不访问 Windows 临时目录。
 
 Discover 由 Windows 执行一次精确 native observation，再由 Linux 依据已绑定 ruleset

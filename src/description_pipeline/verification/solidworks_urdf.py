@@ -39,10 +39,13 @@ from ..sources.solidworks.native_limits import (
     PREVIEW_WINDOW_RAD,
 )
 from ..sources.solidworks.evidence import (
+    CACHED_MATERIALIZATION_WARNING_CODE,
+    CACHED_MATERIALIZATION_WARNING_MESSAGE,
     METADATA_WARNING_CODE,
     METADATA_WARNING_MESSAGE,
     RUNTIME_EVIDENCE,
     metadata_value_warnings,
+    cached_materialization_warnings,
     INPLACE_WARNING_CODE,
     INPLACE_WARNING_MESSAGE,
     inplace_observation_warnings,
@@ -2253,6 +2256,7 @@ def _verify_model(
             raw_scene=raw,
             native_appearance=native_appearance,
             metadata_warnings=metadata_warnings,
+            source_scopes=evidence.source_scopes(root),
             observation_warnings=inplace_observation_warnings(
                 read_data(root / "input/discovery/native-discovery.json")["raw"]
             ),
@@ -2517,6 +2521,7 @@ def _value_warning_gate(
     native_appearance=False,
     metadata_warnings=None,
     observation_warnings=None,
+    source_scopes=None,
 ):
     """Re-derive every non-native value warning from source facts and the model."""
 
@@ -2525,6 +2530,7 @@ def _value_warning_gate(
     mesh_namespace = asset_namespace(Path(str(source.get("assembly") or "robot")).name)
     warnings = (model.get("provenance") or {}).get("value_warnings")
     _require(isinstance(warnings, list), "Non-native value provenance warnings are missing")
+    cached_source_warnings = cached_materialization_warnings(source_scopes)
     saved_state_selection = source.get("saved_state_selection")
     if saved_state_selection is None:
         saved_state_warning = None
@@ -2684,6 +2690,9 @@ def _value_warning_gate(
         for object_row in saved_state_warning["objects"]:
             add(saved_state_warning["code"], object_row)
     for warning in observation_warnings or []:
+        for object_row in warning["objects"]:
+            add(warning["code"], object_row)
+    for warning in cached_source_warnings:
         for object_row in warning["objects"]:
             add(warning["code"], object_row)
 
@@ -3316,6 +3325,7 @@ def _value_warning_gate(
         "units.si_conversion": "Delivered values use SI units after conversion from native CAD units.",
         METADATA_WARNING_CODE: METADATA_WARNING_MESSAGE,
         INPLACE_WARNING_CODE: INPLACE_WARNING_MESSAGE,
+        CACHED_MATERIALIZATION_WARNING_CODE: CACHED_MATERIALIZATION_WARNING_MESSAGE,
         **(
             {SAVED_STATE_WARNING_CODE: saved_state_warning["message"]}
             if saved_state_warning is not None

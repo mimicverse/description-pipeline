@@ -21,6 +21,12 @@ _VC_MARKER = "vc~~"
 _SESSION_ROOT = re.compile(r"swx[0-9]+\Z", re.IGNORECASE)
 _SESSION_ROOT_PID = re.compile(r"swx([0-9]+)\Z", re.IGNORECASE)
 SESSION_DOCUMENT_API = "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual"
+SESSION_SOURCE_IDENTITY_FIELDS = frozenset(
+    {
+        "kind", "state", "owner", "owner_sha256", "occurrence", "defining_anchor",
+        "configuration", "is_virtual", "used_api",
+    }
+)
 
 
 def _path_parts(value: object) -> tuple[str, object, str, list[str]] | None:

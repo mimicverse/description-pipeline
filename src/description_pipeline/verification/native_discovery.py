@@ -78,6 +78,7 @@ from ..sources.solidworks.session_artifacts import (
     session_materialization_under_root,
     session_root_pid,
 )
+from ..sources.solidworks.native_selection import sealed_session_source
 from .capture_evidence import is_container
 
 VERIFICATION_SCHEMA = "solidworks-to-urdf.native-discovery-verification/v1"
@@ -554,6 +555,7 @@ def _cached_materialization_reason(
     )
     temp_root = provenance.get("session_temp_root")
     native_api_pid = provenance.get("native_api_pid")
+    session_path = provenance.get("session_document_path")
     author = provenance.get("author_imported_path")
     virtual = provenance.get("is_virtual")
     if not (isinstance(owner, str) and owner.strip()):
@@ -574,6 +576,15 @@ def _cached_materialization_reason(
             return "the recorded materialization is not a session temp materialization"
         return "the session materialization is outside its recorded owned session temp root"
     if (
+        not isinstance(session_path, str)
+        or not session_materialization_under_root(session_path, temp_root)
+        or (
+            provenance.get("materialization_path") is not None
+            and provenance.get("materialization_path") != session_path
+        )
+    ):
+        return "the current cached materialization path is not bound to its owned session root"
+    if (
         type(native_api_pid) is not int
         or native_api_pid <= 0
         or session_root_pid(temp_root) != native_api_pid
@@ -581,6 +592,28 @@ def _cached_materialization_reason(
         return "the cached materialization root does not match its native API session"
     if author is not None and not isinstance(author, str):
         return "the cached materialization author metadata is unreadable"
+    author_exists = provenance.get("author_imported_exists")
+    author_error = provenance.get("author_imported_error")
+    relative = provenance.get("author_imported_relative")
+    if (
+        not {
+            "author_imported_path", "author_imported_error", "author_imported_exists", "author_imported_relative"
+        } <= provenance.keys()
+        or (author_error is not None and (not isinstance(author_error, str) or not author_error.strip()))
+        or (author is None and (author_exists is not None or relative is not None))
+        or (author is not None and (not author.strip() or not ntpath.isabs(author)))
+    ):
+        return "the cached materialization author metadata is incomplete or contradictory"
+    if author is not None and provenance.get("author_imported_error") is not None:
+        return "the cached materialization author path and read failure contradict each other"
+    if author is not None and provenance.get("author_imported_in_source_root") is True and author_exists is not True:
+        return "the cached materialization in-package author source availability is unproven"
+    if (
+        author is not None
+        and provenance.get("author_imported_in_source_root") is not True
+        and (author_exists is not False or relative is not None)
+    ):
+        return "the cached materialization retains an external author path"
     if virtual is not False:
         return "the cached materialization requires an explicit False IsVirtual reading"
     files = carrier.get("files")
@@ -605,7 +638,16 @@ def _cached_materialization_reason(
         if slot.get("owner_sha256") != owner_sha:
             continue
         slot_configuration = slot.get("configuration")
-        if slot_configuration is not None and component.get("configuration") != slot_configuration:
+        if (
+            not isinstance(slot_configuration, str)
+            or not slot_configuration
+            or component.get("configuration") != slot_configuration
+            or slot.get("used_api") != SESSION_DOCUMENT_API
+        ):
+            continue
+        try:
+            sealed_session_source(component, slot, native_files=native)
+        except (ValueError, PipelineError):
             continue
         if not session_materialization_under_root(
             slot.get("materialization"), slot.get("session_temp_root")
@@ -615,6 +657,27 @@ def _cached_materialization_reason(
             type(slot.get("native_api_pid")) is not int
             or slot["native_api_pid"] <= 0
             or session_root_pid(slot.get("session_temp_root")) != slot["native_api_pid"]
+        ):
+            continue
+        slot_author = slot.get("author_imported_path")
+        slot_error = slot.get("author_imported_error")
+        slot_exists = slot.get("author_imported_exists")
+        slot_relative = slot.get("author_imported_relative")
+        if (
+            not {
+                "author_imported_path", "author_imported_error", "author_imported_exists", "author_imported_relative"
+            } <= slot.keys()
+            or (slot_error is not None and (not isinstance(slot_error, str) or not slot_error.strip()))
+            or (slot_author is None and (slot_exists is not None or slot_relative is not None))
+            or (slot_author is not None and (
+                not isinstance(slot_author, str) or not slot_author.strip()
+                or not ntpath.isabs(slot_author) or slot_error is not None
+                or (slot.get("author_metadata_in_stage") is True and slot_exists is not True)
+                or (
+                    slot.get("author_metadata_in_stage") is not True
+                    and (slot_exists is not False or slot_relative is not None)
+                )
+            ))
         ):
             continue
         if provenance.get("author_imported_in_source_root") is True:
@@ -647,10 +710,9 @@ def _cached_materialization_reason(
             if not (isinstance(sealed, str) and sealed and sealed == recorded):
                 continue
         else:
-            slot_author = slot.get("author_imported_path")
-            if (slot_author is None) != (author is None):
-                continue
-            if slot_author is not None and ntpath.normcase(slot_author) != ntpath.normcase(author):
+            # An absent external author path is deliberately not turned into a
+            # binding or compared by its session-specific spelling.
+            if author is not None and author_exists is not False:
                 continue
         slot_state = slot.get("suppression_state")
         if isinstance(slot_state, int) and slot_state != component.get("suppression_state"):

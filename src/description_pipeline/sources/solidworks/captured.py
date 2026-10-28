@@ -43,6 +43,7 @@ def derive_engineering_input(
     """Construct Generate input using only a verified SolidWorks snapshot."""
     from .evidence import (
         RUNTIME_EVIDENCE,
+        cached_materialization_warnings,
         metadata_value_warnings,
         inplace_observation_warnings,
     )
@@ -241,6 +242,7 @@ def derive_engineering_input(
         runtime_sha256=runtime_sha256,
         expected_configuration=str(config.get("configuration") or ""),
     )
+    cached_warnings = cached_materialization_warnings(observation.get("source_scopes"))
     provenance = scene.setdefault("provenance", {})
     # Native producer paths remain in raw evidence. The model retains only a
     # location-independent member reference so moving an identical artifact
@@ -264,5 +266,6 @@ def derive_engineering_input(
         *inplace_observation_warnings(payload.get("raw") or {}),
         *metadata_warnings,
         *([saved_state_warning] if saved_state_warning is not None else []),
+        *cached_warnings,
     ]
     return scene

@@ -1168,6 +1168,8 @@ class FixtureCadBackend(CadBackend):
         groups: Sequence[dict],
         on_activity=None,
         require_material: bool = True,
+        expected_session_sources: Mapping[str, str] | None = None,
+        native_files: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
         """Return the seven raw fact families consumed after CAD release."""
 

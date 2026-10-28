@@ -15,6 +15,7 @@ from .discovery import (
     native_component_identity,
     sealed_embedded_virtual_document,
 )
+from .native_selection import sealed_session_source, session_source_identity_sha256
 from .selection import selection_bindings
 
 _PLAN_KEYS = frozenset(
@@ -35,7 +36,7 @@ _PLAN_KEYS = frozenset(
     }
 )
 _PLAN_IDENTITY_KEYS = frozenset({"hardware_id", "revision"})
-_PLAN_OBJECT_KEYS = frozenset({"name", "document", "state"})
+_PLAN_OBJECT_KEYS = frozenset({"name", "document", "state", "session_source_sha256"})
 _PLAN_GROUP_KEYS = frozenset({"name", "components"})
 _PLAN_AXIS_KEYS = frozenset({"name", "axis_reference"})
 _PLAN_REFERENCE_AXIS_KEYS = frozenset(
@@ -162,6 +163,13 @@ def validate_capture_plan_shape(plan: object) -> dict:
                 "The sealed capture plan does not bind the native suppression state"
             )
         document = item.get("document")
+        session_source_sha256 = item.get("session_source_sha256")
+        if session_source_sha256 is not None and (
+            not _is_digest(session_source_sha256) or document is not None
+        ):
+            raise PipelineError(
+                "The sealed capture plan carries an invalid cached session selector"
+            )
         if document is not None:
             if not isinstance(document, str) or not document:
                 raise PipelineError(
@@ -263,33 +271,6 @@ def _require_selector_state(item: dict, component: object) -> None:
         raise PipelineError(
             "The sealed capture plan does not bind the native suppression state"
         )
-
-
-def _require_supported_source_kind(component: object, name: str) -> None:
-    """Reject the source class this capture runtime does not implement."""
-
-    provenance = (
-        component.get("source_provenance")
-        if isinstance(component, dict)
-        and isinstance(component.get("source_provenance"), dict)
-        else {}
-    )
-    if (
-        provenance.get("kind") == "native_import_materialization"
-        or provenance.get("state") == "cached_materialization"
-    ):
-        error = PipelineError(
-            f"Cached 3D Interconnect import is not an accepted capture input: {name}"
-        )
-        error.details = {
-            "object": name,
-            "reason": "cached_materialization",
-            "state": provenance.get("state"),
-            "kind": provenance.get("kind"),
-            "used_api": provenance.get("used_api"),
-            "is_virtual": provenance.get("is_virtual"),
-        }
-        raise error
 
 
 def consume_sealed_definition(package: Path) -> tuple[dict, dict]:
@@ -421,6 +402,7 @@ def consume_sealed_definition(package: Path) -> tuple[dict, dict]:
             "name",
             "document",
             "state",
+            "session_source_sha256",
         }:
             raise PipelineError(
                 "The sealed capture plan carries an unknown native selector field"
@@ -435,9 +417,55 @@ def consume_sealed_definition(package: Path) -> tuple[dict, dict]:
                 "The sealed capture plan names instances outside the sealed record"
             )
         component = raw_components.get(name)
-        _require_supported_source_kind(component, name)
+        provenance = (
+            component.get("source_provenance")
+            if isinstance(component, dict)
+            and isinstance(component.get("source_provenance"), dict)
+            else {}
+        )
+        closure = (record.get("source_selection") or {}).get("closure")
+        cached = (
+            isinstance(component, dict)
+            and provenance.get("state") == "cached_materialization"
+            and provenance.get("kind") == "native_import_materialization"
+        )
         document = item.get("document")
-        if document is None:
+        if document is None and cached:
+            imports = (
+                closure.get("imports")
+                if isinstance(closure, dict)
+                else None
+            )
+            matches = [
+                row
+                for row in (imports or [])
+                if isinstance(row, dict)
+                and row.get("state") == "cached_materialization"
+                and (row.get("occurrence") or row.get("instance")) == name
+            ]
+            if len(matches) != 1:
+                raise PipelineError(
+                    "The sealed closure carries no unique cached session occurrence"
+                )
+            if matches[0].get("author_imported_error") != provenance.get("author_imported_error"):
+                raise PipelineError(
+                    "The sealed closure does not preserve cached author metadata"
+                )
+            try:
+                identity = sealed_session_source(
+                    component,
+                    matches[0],
+                    native_files=expected_files,
+                )
+            except ValueError as error:
+                raise PipelineError(
+                    "The sealed closure does not bind the cached session occurrence"
+                ) from error
+            if item.get("session_source_sha256") != session_source_identity_sha256(identity):
+                raise PipelineError(
+                    "The sealed capture plan cached selector differs from its identity"
+                )
+        elif document is None:
             virtual = isinstance(
                 component, dict
             ) and sealed_embedded_virtual_document(
@@ -449,12 +477,10 @@ def consume_sealed_definition(package: Path) -> tuple[dict, dict]:
                 raise PipelineError(
                     "The sealed capture plan omits a native selector document without complete session proof"
                 )
-            provenance = (
-                component.get("source_provenance")
-                if isinstance(component.get("source_provenance"), dict)
-                else {}
-            )
-            closure = (record.get("source_selection") or {}).get("closure")
+            if item.get("session_source_sha256") is not None:
+                raise PipelineError(
+                    "The sealed capture plan binds a session identity to a non-cached selector"
+                )
             virtuals = (
                 closure.get("virtual_components")
                 if isinstance(closure, dict)

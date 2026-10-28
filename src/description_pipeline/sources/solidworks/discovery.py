@@ -97,6 +97,10 @@ from .native_limits import (
     rotation_window_policy,
     validate_native_limit,
 )
+from .native_selection import (
+    session_source_identity,
+    session_source_identity_sha256,
+)
 from .direction import canonicalize_axis
 from .naming import robot_name as format_robot_name
 from .revision import package_inventory
@@ -5952,8 +5956,8 @@ def _capture_plan_selector(
     Fully sealed embedded-virtual occurrences keep their absolute session path
     in the raw diagnostic record only.  Their occurrence name and suppression
     state are the portable selector.  A cached 3D Interconnect materialization
-    is retained in Discovery evidence for diagnosis but is not a capture input.
-    A delivered document must remain a portable staged path, so any other
+    is a documentless selector bound to its stable session identity.  A
+    delivered document must remain a portable staged path, so any other
     non-portable value is refused instead of being silently removed.
     """
 
@@ -5964,16 +5968,25 @@ def _capture_plan_selector(
     if isinstance(provenance, dict) and (
         provenance.get("state") == "cached_materialization" or provenance.get("kind") == "native_import_materialization"
     ):
-        error = PipelineError(f"Cached 3D Interconnect import is not an accepted capture input: {name}")
-        error.details = {
-            "object": name,
-            "reason": "cached_materialization",
-            "state": provenance.get("state"),
-            "kind": provenance.get("kind"),
-            "used_api": provenance.get("used_api"),
-            "is_virtual": provenance.get("is_virtual"),
+        try:
+            identity = session_source_identity(
+                component,
+                native_files=native_files,
+            )
+        except ValueError as error:
+            raise PipelineError(
+                f"Cached 3D Interconnect import has no stable capture identity: {name}"
+            ) from error
+        state = component.get("suppression_state")
+        if type(state) is not int or state not in {0, 1, 2, 3, 4}:
+            raise PipelineError(
+                "A cached materialization selector carries no truthful suppression state"
+            )
+        return {
+            "name": name,
+            "state": state,
+            "session_source_sha256": session_source_identity_sha256(identity),
         }
-        raise error
     selector = {"name": name}
     document = component.get("document")
     session_document = sealed_embedded_virtual_document(component, name, native_files)

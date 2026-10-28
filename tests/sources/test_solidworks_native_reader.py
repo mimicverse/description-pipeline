@@ -16,6 +16,7 @@ stays owned by the native owner.
 from __future__ import annotations
 
 import copy
+import hashlib
 import os
 import sys
 import threading
@@ -30,6 +31,7 @@ from unittest.mock import Mock, patch
 
 import description_pipeline.sources.solidworks.native as native_module
 from description_pipeline.sources.solidworks.discovery import _project_native_record
+from description_pipeline.io import digest
 from description_pipeline.sources.solidworks.errors import BridgeError, CadError
 from description_pipeline.sources.solidworks.isolation import CadSession
 from description_pipeline.sources.solidworks.jsonio import read_json, write_json
@@ -1829,6 +1831,168 @@ class CaptureSceneTests(unittest.TestCase):
             backend._source_provenance = {}
             with self.assertRaises(CadError):
                 backend.source_scopes([virtual.Name2])
+
+    def test_capture_replays_cached_materialization_in_the_current_owned_session(self) -> None:
+        with TemporaryDirectory() as tmp, TemporaryDirectory() as native_tmp, _com_stubs():
+            root = Path(tmp)
+            materialization = (
+                Path(native_tmp)
+                / "swx21040"
+                / "IC~~"
+                / "imported_part.step.SLDPRT"
+            )
+            materialization.parent.mkdir(parents=True)
+            materialization.write_bytes(b"current session cache bytes")
+            assembly = _write(root, "robot.SLDASM")
+            component = _Component("imported_part.step-1", materialization)
+            component.GetImportedPath = lambda: None
+            component.IsVirtual = False
+            main = _Doc(assembly, doc_type=2, children=[component])
+            backend = _CaptureBackend(
+                session_factory=lambda: _Session(_App({assembly: main}))
+            )
+            backend.prepare_prepared_capture(str(root), str(assembly), "Default")
+            owner_sha = hashlib.sha256(assembly.read_bytes()).hexdigest()
+            identity = {
+                "kind": "native_import_materialization",
+                "state": "cached_materialization",
+                "owner": "robot.SLDASM",
+                "owner_sha256": owner_sha,
+                "occurrence": "imported_part.step-1",
+                "defining_anchor": None,
+                "configuration": "Default",
+                "is_virtual": False,
+                "used_api": (
+                    "IComponent2.GetPathName/"
+                    "IComponent2.GetImportedPath/"
+                    "IComponent2.IsVirtual"
+                ),
+            }
+            facts = backend.collect_prepared_scene(
+                str(assembly),
+                [],
+                groups=[
+                    {
+                        "name": "imported_link",
+                        "components": ["imported_part.step-1"],
+                    }
+                ],
+                expected_session_sources={
+                    "imported_part.step-1": digest(identity)
+                },
+                native_files={"robot.SLDASM": owner_sha},
+            )
+            self.assertEqual(
+                facts["source_scopes"]["imported_part.step-1"][
+                    "source_document_identity_kind"
+                ],
+                "session_source_sha256",
+            )
+
+    def test_capture_nested_cache_inherits_the_frozen_owner_and_anchor(self) -> None:
+        with TemporaryDirectory() as tmp, TemporaryDirectory() as native_tmp, _com_stubs():
+            root = Path(tmp)
+            parent_path = (
+                Path(native_tmp)
+                / "swx21040"
+                / "IC~~"
+                / "parent.step.SLDASM"
+            )
+            child_path = (
+                Path(native_tmp)
+                / "swx21040"
+                / "IC~~"
+                / "child.step.SLDPRT"
+            )
+            parent_path.parent.mkdir(parents=True)
+            parent_path.write_bytes(b"parent cache bytes")
+            child_path.write_bytes(b"child cache bytes")
+            assembly = _write(root, "robot.SLDASM")
+            child = _Component(
+                "parent-1/child-1",
+                child_path,
+                doc=_Doc(child_path, doc_type=1),
+            )
+            child.GetImportedPath = lambda: None
+            child.IsVirtual = False
+            parent = _Component(
+                "parent-1",
+                parent_path,
+                children=[child],
+                doc=_Doc(parent_path, doc_type=2, children=[child]),
+            )
+            parent.GetImportedPath = lambda: None
+            parent.IsVirtual = False
+            main = _Doc(assembly, doc_type=2, children=[parent])
+            backend = _CaptureBackend(
+                session_factory=lambda: _Session(_App({assembly: main}))
+            )
+            backend.prepare_prepared_capture(str(root), str(assembly), "Default")
+            owner_sha = hashlib.sha256(assembly.read_bytes()).hexdigest()
+
+            def expected(name, anchor):
+                return digest(
+                    {
+                        "kind": "native_import_materialization",
+                        "state": "cached_materialization",
+                        "owner": "robot.SLDASM",
+                        "owner_sha256": owner_sha,
+                        "occurrence": name,
+                        "defining_anchor": anchor,
+                        "configuration": "Default",
+                        "is_virtual": False,
+                        "used_api": (
+                            "IComponent2.GetPathName/"
+                            "IComponent2.GetImportedPath/"
+                            "IComponent2.IsVirtual"
+                        ),
+                    }
+                )
+
+            facts = backend.collect_prepared_scene(
+                str(assembly),
+                [],
+                groups=[
+                    {
+                        "name": "child_link",
+                        "components": ["parent-1/child-1"],
+                    }
+                ],
+                expected_session_sources={
+                    "parent-1": expected("parent-1", None),
+                    "parent-1/child-1": expected("parent-1/child-1", "parent-1"),
+                },
+                native_files={"robot.SLDASM": owner_sha},
+            )
+            child_scope = facts["source_scopes"]["parent-1/child-1"]
+            self.assertEqual(child_scope["session_source"]["owner"], "robot.SLDASM")
+            self.assertEqual(
+                child_scope["session_source"]["defining_anchor"],
+                "parent-1",
+            )
+            self.assertEqual(
+                backend._source_provenance["parent-1/child-1"]["owner"],
+                "robot.SLDASM",
+            )
+            with self.assertRaises(CadError):
+                backend.collect_prepared_scene(
+                    str(assembly),
+                    [],
+                    groups=[
+                        {
+                            "name": "child_link",
+                            "components": ["parent-1/child-1"],
+                        }
+                    ],
+                    expected_session_sources={
+                        "parent-1": expected("parent-1", None),
+                        "parent-1/child-1": expected(
+                            "parent-1/child-1",
+                            "other-parent",
+                        ),
+                    },
+                    native_files={"robot.SLDASM": owner_sha},
+                )
 
     def test_capture_source_scopes_fail_closed_for_missing_frozen_file(self) -> None:
         with TemporaryDirectory() as tmp, _com_stubs():

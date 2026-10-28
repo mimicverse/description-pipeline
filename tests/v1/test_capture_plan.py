@@ -517,7 +517,7 @@ class CapturePlanTests(unittest.TestCase):
         with self.assertRaisesRegex(PipelineError, "without complete session proof"):
             steps._consume_sealed_definition(self.root)
 
-    def test_plan_entry_refuses_an_api_proven_cached_import(self) -> None:
+    def test_plan_entry_binds_an_api_proven_cached_import(self) -> None:
         session_path = "C:\\Users\\operator\\AppData\\Local\\Temp\\swx7\\IC~~\\arm.step.SLDPRT"
         session_root = "C:\\Users\\operator\\AppData\\Local\\Temp\\swx7"
         selection_root = "C:\\selection\\m3-flat"
@@ -553,18 +553,33 @@ class CapturePlanTests(unittest.TestCase):
                 "used_api": "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual",
                 "error": None,
                 "author_imported_error": None,
+                "configuration": "Default",
             },
         )
+        identity = {
+            "kind": "native_import_materialization",
+            "state": "cached_materialization",
+            "owner": MAIN,
+            "owner_sha256": "a" * 64,
+            "occurrence": "arm-1",
+            "defining_anchor": None,
+            "configuration": "Default",
+            "is_virtual": False,
+            "used_api": "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual",
+        }
+        session_source_sha256 = digest(identity)
         entry = {
             "document": selection_path,
             "owner": MAIN,
             "owner_sha256": "a" * 64,
+            "occurrence": "arm-1",
             "bound_source": "cad/arm.SLDPRT",
             "defining_materialization": None,
             "instance": "arm-1",
             "name": "arm-1",
             "author_imported_path": selection_root + "\\cad\\arm.SLDPRT",
             "author_metadata_in_stage": True,
+            "kind": "native_import_materialization",
             "is_virtual": False,
             "materialization": selection_path,
             "session_temp_root": selection_root + "\\swx8",
@@ -574,6 +589,9 @@ class CapturePlanTests(unittest.TestCase):
             "state": "cached_materialization",
             "binding": "author_metadata_only",
             "owner_anchor": None,
+            "defining_anchor": None,
+            "used_api": identity["used_api"],
+            "session_source_sha256": session_source_sha256,
         }
         files = dict(discovery_document["raw"]["files"])
         from description_pipeline.sources.solidworks.selection import seal_closure_selection
@@ -614,30 +632,41 @@ class CapturePlanTests(unittest.TestCase):
         ).hexdigest()
         self._rewrite_plan(
             lambda plan: (
-                plan.update(discovery_sha256=discovery_sha),
-                plan["objects"][1].pop("document"),
+                plan.update(
+                    discovery_sha256=discovery_sha,
+                    objects=[
+                        plan["objects"][0],
+                        {
+                            "name": "arm-1",
+                            "state": 2,
+                            "session_source_sha256": session_source_sha256,
+                        },
+                    ],
+                )
             )
         )
         from description_pipeline.sources.solidworks.discovery import _capture_plan_selector
 
-        for boundary, action in (
-            ("producer", lambda: _capture_plan_selector(component, files)),
-            ("consumer", lambda: steps._consume_sealed_definition(self.root)),
-        ):
-            with self.subTest(boundary=boundary):
-                with self.assertRaisesRegex(PipelineError, "arm-1") as caught:
-                    action()
-                self.assertEqual(
-                    caught.exception.details,
-                    {
-                        "object": "arm-1",
-                        "reason": "cached_materialization",
-                        "state": "cached_materialization",
-                        "kind": "native_import_materialization",
-                        "used_api": "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual",
-                        "is_virtual": False,
-                    },
-                )
+        self.assertEqual(
+            _capture_plan_selector(component, files),
+            {
+                "name": "arm-1",
+                "state": 2,
+                "session_source_sha256": session_source_sha256,
+            },
+        )
+        _source, consumed = steps._consume_sealed_definition(self.root)
+        self.assertEqual(
+            consumed["objects"][1]["session_source_sha256"],
+            session_source_sha256,
+        )
+        self._rewrite_plan(
+            lambda plan: plan["objects"][1].update(
+                session_source_sha256="0" * 64
+            )
+        )
+        with self.assertRaisesRegex(PipelineError, "cached selector differs"):
+            steps._consume_sealed_definition(self.root)
 
     def test_plan_entry_keeps_a_saved_resident_document_with_import_origin(self) -> None:
         discovery_document = json.loads(

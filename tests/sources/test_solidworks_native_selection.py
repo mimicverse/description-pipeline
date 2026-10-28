@@ -600,6 +600,116 @@ class ClosureAdmissionTests(unittest.TestCase):
         self.assertTrue(warning["needs_absence_test"])
         self.assertEqual(warning["owner_sha256"], self.files["robot.SLDASM"])
 
+    def test_cached_session_identity_is_stable_across_owned_processes(self) -> None:
+        from description_pipeline.sources.solidworks.native_selection import (
+            current_session_source_matches,
+            session_source_identity,
+            session_source_identity_sha256,
+        )
+
+        component = {
+            "instance_id": "imported-1",
+            "name2": "imported-1",
+            "configuration": "Default",
+            "source_provenance": {
+                "state": "cached_materialization",
+                "kind": "native_import_materialization",
+                "owner": "robot.SLDASM",
+                "owner_sha256": self.files["robot.SLDASM"],
+                "occurrence": "imported-1",
+                "defining_anchor": None,
+                "configuration": "Default",
+                "is_virtual": False,
+                "used_api": "IComponent2.GetPathName/IComponent2.GetImportedPath/IComponent2.IsVirtual",
+            },
+        }
+        identity = session_source_identity(component, native_files=self.files)
+        expected = session_source_identity_sha256(identity)
+        capture = {
+            **component["source_provenance"],
+            "materialization_path": "/tmp/swx2/IC~~/imported.step.SLDPRT",
+            "session_document_path": "/tmp/swx2/IC~~/imported.step.SLDPRT",
+            "session_temp_root": "/tmp/swx2",
+            "native_api_pid": 2,
+            "author_imported_path": None,
+            "author_imported_error": None,
+            "author_imported_exists": None,
+            "author_imported_relative": None,
+        }
+        self.assertTrue(
+            current_session_source_matches(
+                capture,
+                expected,
+                2,
+                self.files,
+            )
+        )
+        self.assertFalse(
+            current_session_source_matches(
+                {**capture, "configuration": "Other"},
+                expected,
+                2,
+                self.files,
+            )
+        )
+        self.assertFalse(
+            current_session_source_matches(
+                {**capture, "session_document_path": "/tmp/swx3/IC~~/imported.step.SLDPRT"},
+                expected,
+                2,
+                self.files,
+            )
+        )
+        missing_external = {
+            **capture,
+            "author_imported_path": r"D:\old\imported.step",
+            "author_imported_error": None,
+            "author_imported_exists": False,
+            "author_imported_in_source_root": False,
+        }
+        self.assertTrue(
+            current_session_source_matches(
+                missing_external,
+                expected,
+                2,
+                self.files,
+            )
+        )
+        self.assertFalse(
+            current_session_source_matches(
+                {**missing_external, "author_imported_exists": True},
+                expected,
+                2,
+                self.files,
+            )
+        )
+        self.assertFalse(current_session_source_matches(
+            {**missing_external, "author_imported_exists": None}, expected, 2, self.files
+        ))
+        self.assertTrue(current_session_source_matches(
+            {**capture, "author_imported_error": "RuntimeError: author read failed"}, expected, 2, self.files
+        ))
+        self.assertFalse(current_session_source_matches(
+            {**capture, "author_imported_exists": False}, expected, 2, self.files
+        ))
+        self.assertFalse(current_session_source_matches(
+            {key: value for key, value in capture.items() if key != "author_imported_error"}, expected, 2, self.files
+        ))
+        imported = self.stage / "author.step"
+        imported.write_bytes(b"frozen imported bytes")
+        files = {**self.files, "author.step": hashlib.sha256(imported.read_bytes()).hexdigest()}
+        bound_author = {
+            **capture, "author_imported_path": str(imported), "author_imported_relative": "author.step",
+            "source_root": str(self.stage), "author_imported_exists": True, "author_imported_error": None,
+            "author_imported_in_source_root": True,
+        }
+        self.assertTrue(current_session_source_matches(bound_author, expected, 2, files))
+        self.assertFalse(current_session_source_matches(
+            {**bound_author, "author_imported_path": str(self.stage / "other.step")}, expected, 2, files
+        ))
+        imported.write_bytes(b"changed imported bytes")
+        self.assertFalse(current_session_source_matches(bound_author, expected, 2, files))
+
     def test_in_stage_author_metadata_is_flagged_but_not_a_binding(self) -> None:
         extra = write_stage(self.stage, {"imported_part.step": b"np-bytes"})
         files = {**self.files, **extra}

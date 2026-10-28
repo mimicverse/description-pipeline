@@ -36,7 +36,11 @@ from ..sources.solidworks.discovery import (
     GENERATOR_VERSION as DISCOVERY_GENERATOR_VERSION,
     NAMESPACE as DISCOVERY_NAMESPACE,
 )
-from ..sources.solidworks.evidence import METADATA_WARNING_CODE
+from ..sources.solidworks.evidence import (
+    CACHED_MATERIALIZATION_WARNING_CODE,
+    CACHED_MATERIALIZATION_WARNING_MESSAGE,
+    METADATA_WARNING_CODE,
+)
 from ..sources.solidworks.saved_state import SAVED_STATE_WARNING_CODE
 from ..stages import stage_view
 
@@ -284,6 +288,7 @@ _DIAGNOSTIC_CODE_LABELS = {
     "v14.membership_unread": "Link membership not read (diagnostic)",
     METADATA_WARNING_CODE: "Platform metadata provenance (not direct CAD readings)",
     SAVED_STATE_WARNING_CODE: "Saved-state export has native diagnostics (not source-qualified)",
+    CACHED_MATERIALIZATION_WARNING_CODE: CACHED_MATERIALIZATION_WARNING_MESSAGE,
 }
 
 #: Readable descriptions for the contract's declared input/output records.
