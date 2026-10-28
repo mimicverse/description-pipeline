@@ -888,9 +888,25 @@ def _build_joints(
                         entry["provenance"][f"axis.{key}"] = axis_provenance[key]
         limits = joint.get("limits")
         if limits:
-            entry["limits"] = {str(key): float(value) for key, value in limits.items()}
+            entry["limits"] = {
+                str(key): float(value) for key, value in limits.items()
+                if value is not None or key not in {"effort", "velocity"}
+            }
+        elif joint_type == "continuous":
+            entry["limits"] = {}
         elif movable:
-            raise ConfigError("movable joints need explicit limits; none are invented", {"joint": joint_id})
+            raise ConfigError("bounded joints need explicit position limits", {"joint": joint_id})
+        if movable:
+            missing_drive = [field for field in ("effort", "velocity") if field not in entry["limits"]]
+            for field in missing_drive:
+                entry["limits"][field] = 0.0
+            if missing_drive:
+                entry["provenance"]["drive_defaults"] = {
+                    "rule_id": "drive.missing_zero",
+                    "rule_version": "v1",
+                    "fields": missing_drive,
+                    "drive_qualified": False,
+                }
         dynamics = joint.get("dynamics")
         if dynamics:
             entry["dynamics"] = {str(key): float(value) for key, value in dynamics.items()}
@@ -918,6 +934,7 @@ def _value_warnings(
     declared_author_limits = []
     controlled_drive = []
     unqualified_drive = []
+    default_drive = []
     visuals = []
     mesh_paths = []
     native_appearances = []
@@ -941,6 +958,18 @@ def _value_warnings(
     for index, joint in enumerate(joints):
         source_joint = source_joints[index] if index < len(source_joints) else {}
         source_name = str(source_joint.get("source_name") or source_joint.get("name") or joint["name"])
+        defaults = joint.get("provenance", {}).get("drive_defaults") or {}
+        for field in defaults.get("fields", []):
+            default_drive.append(
+                {
+                    "object_type": "joint", "object": joint["name"], "field": field,
+                    "actual": joint["limits"][field], "original": None,
+                    "source": "platform default for missing drive value",
+                    "rule_id": "drive.missing_zero", "rule_version": "v1",
+                    "reason": "user-authorized zero placeholder; drive capability is unqualified",
+                    "drive_qualified": False,
+                }
+            )
         if source_name != joint["name"]:
             rule = source_joint.get("name_rule") if isinstance(source_joint.get("name_rule"), dict) else {}
             mappings.append(
@@ -1315,6 +1344,16 @@ def _value_warnings(
                     "they are not native CAD readings."
                 ),
                 "objects": declared_author_limits,
+            }
+        )
+    if default_drive:
+        warnings.append(
+            {
+                "code": "drive.default_zero",
+                "message": (
+                    "Missing effort or velocity uses a platform zero placeholder; drive capability is unqualified."
+                ),
+                "objects": default_drive,
             }
         )
     if controlled_drive:

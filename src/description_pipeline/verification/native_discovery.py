@@ -1391,6 +1391,62 @@ def _verification_mate_reference(block, component, owner, frames):
     return projected
 
 
+def _check_inplace_observations(mate: dict) -> None:
+    """Check the raw in-place contract independently of Source projection."""
+
+    def expect(condition):
+        _require(
+            condition, "discovery.inplace_record", "in-place native evidence is malformed", {"mate": mate.get("name")}
+        )
+
+    def read_value(observation, kind):
+        expect(isinstance(observation, dict) and set(observation) == {"value", "error"})
+        error, value = observation["error"], observation["value"]
+        if error is not None:
+            expect(isinstance(error, dict) and value is None)
+            expect(all(isinstance(error.get(key), str) and bool(error[key]) for key in ("code", "message")))
+        expect(value is None or type(value) is kind)
+        return value
+
+    def check_component(observation):
+        value = read_value(observation, dict)
+        if value is not None:
+            expect(set(value) == {"name2", "path", "configuration"})
+            for key in ("name2", "path", "configuration"):
+                read_value(value[key], str)
+
+    expect(
+        (mate.get("type"), mate.get("native_feature_type"), mate.get("native_interface"))
+        == ("inplace", "MateInPlace", "IMateInPlace")
+    )
+    expect(type(mate.get("suppressed")) is bool and type(mate.get("error_code")) is int)
+    expect(mate.get("entities") == [] and not ({"alignment", "type_index"} & set(mate)))
+    for key in ("limits", "native_limit", "is_advanced_mate", "is_advanced_mate_error", "is_advanced_mate_api"):
+        expect(key in mate and mate[key] is None)
+    raw = mate.get("inplace")
+    expect(isinstance(raw, dict) and set(raw) == {"component", "entities"})
+    check_component(raw["component"])
+    count = mate.get("entity_count")
+    expect(type(count) is int and count > 0 and isinstance(raw["entities"], list) and len(raw["entities"]) == count)
+    for index, endpoint in enumerate(raw["entities"]):
+        expect(isinstance(endpoint, dict) and set(endpoint) == {"index", "component_name", "entity_type", "entity"})
+        expect(type(endpoint["index"]) is int and endpoint["index"] == index)
+        read_value(endpoint["component_name"], str)
+        read_value(endpoint["entity_type"], int)
+        geometry = read_value(endpoint["entity"], dict)
+        if geometry is not None:
+            expect({"interface_iid", "component"}.issubset(geometry))
+            expect(not (set(geometry) - {"interface_iid", "component", "plane_params", "transform_raw"}))
+            read_value(geometry["interface_iid"], str)
+            check_component(geometry["component"])
+            for key in ("plane_params", "transform_raw"):
+                if key in geometry:
+                    values = read_value(geometry[key], list)
+                    expect(
+                        values is None or all(type(value) in (int, float) and math.isfinite(value) for value in values)
+                    )
+
+
 def project_native_verification_record(record: dict) -> dict:
     """Materialize a verifier-only view from preserved local native facts."""
 
@@ -1544,6 +1600,9 @@ def project_native_verification_record(record: dict) -> dict:
                     "expected": owner_configuration,
                 },
             )
+        if mate.get("type") == "inplace" or "inplace" in mate:
+            _check_inplace_observations(mate)
+            continue
         entities = mate.get("entities")
         if not isinstance(entities, list):
             raise _Failure(
@@ -3434,23 +3493,23 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
                 "drive record must contain an object",
                 {"pair": [left, right]},
             )
-            effort = _number(value.get("effort"))
-            velocity_limit = _number(value.get("velocity"))
-            if effort is None or velocity_limit is None:
+            readings = {
+                field: _number(value[field]) for field in ("effort", "velocity") if value.get(field) is not None
+            }
+            if any(reading is None for reading in readings.values()):
                 raise _Failure(
                     "discovery.joint_rebuild",
-                    "drive record lacks finite effort/velocity",
+                    "present drive record values must be finite numbers",
                     {"pair": [left, right]},
                 ) from None
             _require(
-                math.isfinite(effort) and math.isfinite(velocity_limit) and effort >= 0.0 and velocity_limit >= 0.0,
+                all(math.isfinite(reading) and reading >= 0.0 for reading in readings.values()),
                 "discovery.joint_rebuild",
                 "drive record effort/velocity must be finite and nonnegative",
                 {"pair": [left, right]},
             )
             limits = dict(limits or {})
-            limits["effort"] = effort
-            limits["velocity"] = velocity_limit
+            limits.update(readings)
             drive = {
                 "file": entry["entry"].get("package_file"),
                 "sha256": entry["entry"].get("sha256"),
@@ -3467,7 +3526,7 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
                 "declared_values": {
                     key: value[key]
                     for key in ("effort", "velocity")
-                    if key in value
+                    if value.get(key) is not None
                 },
             }
         facts.append(

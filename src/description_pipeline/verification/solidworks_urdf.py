@@ -43,6 +43,9 @@ from ..sources.solidworks.evidence import (
     METADATA_WARNING_MESSAGE,
     RUNTIME_EVIDENCE,
     metadata_value_warnings,
+    INPLACE_WARNING_CODE,
+    INPLACE_WARNING_MESSAGE,
+    inplace_observation_warnings,
 )
 from ..sources.solidworks.saved_state import (
     SAVED_STATE_WARNING_CODE,
@@ -319,7 +322,7 @@ def _input(root, diagnostics=None):
                     },
                     "native_observation_errors": [],
                 }
-            if all(
+            if any(
                 type(raw_limits.get(field)) in (int, float) and math.isfinite(raw_limits[field])
                 for field in ("effort", "velocity")
             ):
@@ -328,6 +331,7 @@ def _input(root, diagnostics=None):
                     "declared_values": {
                         field: float(raw_limits[field])
                         for field in ("effort", "velocity")
+                        if raw_limits.get(field) is not None
                     },
                 }
                 joint["drive_source"] = "controlled"
@@ -888,6 +892,17 @@ def _link_physics(node, canonical):
     return {"mass_kg": mass, "principal_inertia_kg_m2": eigenvalues.tolist()}
 
 
+def _delivered_joint_limits(authored):
+    """Recompute authorized missing-drive placeholders from independent inputs."""
+
+    limits = dict(authored.get("limits") or {})
+    if authored.get("type") != "fixed":
+        for field in ("effort", "velocity"):
+            if limits.get(field) is None:
+                limits[field] = 0.0
+    return limits
+
+
 def _joint(node, authored, canonical, datums, body_datums, diagnostics, *, preview=False):
     _require(node.get("type") == authored["type"] == canonical["type"], "Joint type changed")
     for key in ("parent", "child"):
@@ -910,7 +925,19 @@ def _joint(node, authored, canonical, datums, body_datums, diagnostics, *, previ
         "Signed joint axis changed",
     )
     limits = {key: float(value) for key, value in _one(node, "limit").attrib.items()}
-    _require(limits == authored["limits"] == canonical["limits"], "Joint limits differ from author inputs")
+    expected_limits = _delivered_joint_limits(authored)
+    missing_drive = [field for field in ("effort", "velocity") if (authored.get("limits") or {}).get(field) is None]
+    _require(
+        limits == expected_limits == canonical["limits"], "Joint limits differ from native values and default rules"
+    )
+    expected_defaults = (
+        {"rule_id": "drive.missing_zero", "rule_version": "v1", "fields": missing_drive, "drive_qualified": False}
+        if missing_drive else None
+    )
+    _require(
+        (canonical.get("provenance") or {}).get("drive_defaults") == expected_defaults,
+        "Missing drive defaults have absent or inconsistent provenance",
+    )
     _require(all(math.isfinite(value) for value in limits.values()), "Invalid joint limits")
     _require(
         all(limits.get(key, 0.0) >= 0 for key in ("effort", "velocity")),
@@ -1023,7 +1050,7 @@ def _joint(node, authored, canonical, datums, body_datums, diagnostics, *, previ
         require_record_binding(
             "drive_evidence",
             "drive_evidence",
-            ("effort", "velocity"),
+            tuple(field for field in ("effort", "velocity") if (authored.get("limits") or {}).get(field) is not None),
             selected=True,
         )
     unqualified = [key for key in ("effort", "velocity") if key in limits and limits[key] == 0]
@@ -1035,7 +1062,7 @@ def _joint(node, authored, canonical, datums, body_datums, diagnostics, *, previ
                 "code": "urdf.motion_unqualified",
                 "blocking": False,
                 "message": (
-                    "authored motion/drive values are zero or degenerate; consumers import the zero-range "
+                    "delivered motion/drive values are zero or degenerate; consumers import the zero-range "
                     "joint as unlimited while effort/velocity are dropped, so motion is unqualified and not "
                     "robot-ready"
                 ),
@@ -1277,7 +1304,7 @@ def _motion(authored, joints, components, body_datums, bodies, record, native_ax
 
     name, child = authored["name"], authored["child"]
     point, direction = _signed_axis_line(authored, record, components, body_datums)
-    limits = authored["limits"]
+    limits = authored.get("limits") or {}
     samples = (_joint_sample(authored, 1.0), _joint_sample(authored, -1.0))
     parents = {joint["child"]: joint for joint in joints}
     moving = [joint for joint in joints if joint["type"] != "fixed"]
@@ -1342,8 +1369,8 @@ def _motion(authored, joints, components, body_datums, bodies, record, native_ax
                 "stored_direction": axis_dir,
                 "limits": dict(joint_limits),
                 "drive": {
-                    "effort": joint_limits.get("effort"),
-                    "velocity": joint_limits.get("velocity"),
+                    "effort": _delivered_joint_limits(joint)["effort"],
+                    "velocity": _delivered_joint_limits(joint)["velocity"],
                 },
                 "origin_parent_child": np.eye(4).ravel().tolist(),
             }
@@ -2226,6 +2253,9 @@ def _verify_model(
             raw_scene=raw,
             native_appearance=native_appearance,
             metadata_warnings=metadata_warnings,
+            observation_warnings=inplace_observation_warnings(
+                read_data(root / "input/discovery/native-discovery.json")["raw"]
+            ),
         ),
     )
     gates.add("physics.independent", lambda: _physics(root, source, model, verify_physics))
@@ -2486,6 +2516,7 @@ def _value_warning_gate(
     raw_scene=None,
     native_appearance=False,
     metadata_warnings=None,
+    observation_warnings=None,
 ):
     """Re-derive every non-native value warning from source facts and the model."""
 
@@ -2652,6 +2683,9 @@ def _value_warning_gate(
     if saved_state_warning is not None:
         for object_row in saved_state_warning["objects"]:
             add(saved_state_warning["code"], object_row)
+    for warning in observation_warnings or []:
+        for object_row in warning["objects"]:
+            add(warning["code"], object_row)
 
     for body in bodies:
         source_name = str(body.get("source_name") or body["name"])
@@ -2840,6 +2874,22 @@ def _value_warning_gate(
         model_provenance = (
             model_joint.get("provenance") if isinstance((model_joint or {}).get("provenance"), dict) else {}
         )
+        source_limits = joint.get("limits") or {}
+        if joint.get("type") != "fixed":
+            for field in ("effort", "velocity"):
+                if source_limits.get(field) is None:
+                    _require(model_limits.get(field) == 0.0, "Missing drive placeholder is not zero")
+                    add(
+                        "drive.default_zero",
+                        {
+                            "object_type": "joint", "object": joint["name"], "field": field,
+                            "actual": 0.0, "original": None,
+                            "source": "platform default for missing drive value",
+                            "rule_id": "drive.missing_zero", "rule_version": "v1",
+                            "reason": "user-authorized zero placeholder; drive capability is unqualified",
+                            "drive_qualified": False,
+                        },
+                    )
 
         def observe_evidence(
             evidence,
@@ -2921,9 +2971,10 @@ def _value_warning_gate(
                 model_provenance.get("drive_evidence") == drive_evidence,
                 "Model drive evidence is missing, foreign, or differs from the controlled record",
             )
-            observe_evidence(drive_evidence, ("effort", "velocity"), selected=True)
+            drive_fields = tuple(field for field in ("effort", "velocity") if source_limits.get(field) is not None)
+            observe_evidence(drive_evidence, drive_fields, selected=True)
             declared = drive_evidence.get("declared_values") or {}
-            for field in ("effort", "velocity"):
+            for field in drive_fields:
                 row = {
                     "object_type": "joint",
                     "object": joint["name"],
@@ -3251,6 +3302,9 @@ def _value_warning_gate(
             "Joint drive values come from a controlled author record; "
             "they are preserved but are not native CAD readings."
         ),
+        "drive.default_zero": (
+            "Missing effort or velocity uses a platform zero placeholder; drive capability is unqualified."
+        ),
         "drive.unqualified": (
             "Controlled drive values of zero are retained for delivery but do not "
             "qualify effort or velocity sizing."
@@ -3261,6 +3315,7 @@ def _value_warning_gate(
         ),
         "units.si_conversion": "Delivered values use SI units after conversion from native CAD units.",
         METADATA_WARNING_CODE: METADATA_WARNING_MESSAGE,
+        INPLACE_WARNING_CODE: INPLACE_WARNING_MESSAGE,
         **(
             {SAVED_STATE_WARNING_CODE: saved_state_warning["message"]}
             if saved_state_warning is not None

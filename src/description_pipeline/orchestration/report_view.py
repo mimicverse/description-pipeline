@@ -241,6 +241,10 @@ _DISCOVERY_CODE_LABELS = {
     "limits.declared_author": "Controlled author limits are preserved but are not native CAD readings",
     "drive.declared_author": "Controlled author drive values are preserved but are not native CAD readings",
     "drive.unqualified": "Zero effort or velocity is retained but drive sizing remains unqualified",
+    "drive.default_zero": "Missing drive value uses a zero placeholder; drive capability remains unqualified",
+    "source.inplace_observations": (
+        "In-place observations retain native nulls and read errors without proving constraints"
+    ),
     "discovery.joint_default_policy": (
         "Engineering default rotation window; no usable native or authored range was read"
     ),

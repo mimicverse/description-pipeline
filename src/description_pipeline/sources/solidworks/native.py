@@ -60,6 +60,7 @@ IMASSPROPERTYOVERRIDEOPTIONS_IID = "{82E1635E-B650-4C8B-84C8-D5FFBF660E49}"
 ICUSTOMPROPERTYMANAGER_IID = "{F1938D94-0D1F-4E88-9874-164B1E6568F1}"
 IFEATURE_IID = "{83A33D38-27C5-11CE-BFD4-00400513BB57}"
 IMATE2_IID = "{B09D234A-7581-408E-B3B3-FC0A514AAFA8}"
+IMATEINPLACE_IID = "{1C4BC27B-4B76-4390-AE66-4A21A96C0C9C}"
 IMATEENTITY2_IID = "{CE7FE69D-BCFA-441F-A37D-E740546458A4}"
 IBODY2_IID = "{3A075BFD-9962-4431-8321-7AF4903C55AD}"
 IFACE2_IID = "{4A8BA4D8-DA25-4B75-8E2D-4922B74D81ED}"
@@ -92,8 +93,6 @@ RETURN_VIEWS = {
     "GetNextSubFeature": IFEATURE_IID,
     "GetFirstSubFeature": IFEATURE_IID,
     "GetFeature": IFEATURE_IID,
-    "GetSpecificFeature2": IMATE2_IID,
-    "MateEntity": IMATEENTITY2_IID,
     "GetSurface": ISURFACE_IID,
     "GetCurve": ICURVE_IID,
     "GetTotalTransform": IMATHTRANSFORM_IID,
@@ -389,6 +388,8 @@ def _indexed_property(obj, name, *args):
         raise CadError("cad_member_missing", name) from error
     if raw is None:
         return None
+    if isinstance(raw, (str, bool, int, float)):
+        return raw
     result = _win32().Dispatch(raw)
     bound = _return_view(name, result)
     return bound if bound is not None else result
@@ -2487,8 +2488,100 @@ def _urdf_exporter_pid_bindings(xml_text, extension, source_root, *, native_api_
     return bindings
 
 
+def _inplace_read(operation):
+    """Preserve one native value, null return or precise read failure."""
+
+    try:
+        return {"value": _json_raw_value(operation()), "error": None}
+    except Exception as error:  # noqa: BLE001 - partial native evidence is retained
+        failure = _native_error_record(error)
+        if type(getattr(error, "hresult", None)) is int:
+            failure["hresult"] = error.hresult
+        return {"value": None, "error": failure}
+
+
+def _inplace_component(component):
+    if component is None:
+        return None
+    component = _component(component)
+    return {
+        "name2": _inplace_read(lambda: _property(component, "Name2")),
+        "path": _inplace_read(lambda: _method(component, "GetPathName")),
+        "configuration": _inplace_read(lambda: _property(component, "ReferencedConfiguration")),
+    }
+
+
+def _inplace_entity(target, entity_type):
+    if target is None:
+        return None
+    record = {
+        "interface_iid": _inplace_read(lambda: str(target._oleobj_.GetTypeInfo().GetTypeAttr().iid)),
+        "component": _inplace_read(
+            lambda: _inplace_component(_method(_interface(target, IENTITY_IID), "GetComponent"))
+        ),
+    }
+    if type(entity_type) is int and entity_type == 2:
+        record["plane_params"] = _inplace_read(
+            lambda: _property(_method(_interface(target, IFACE2_IID), "GetSurface"), "PlaneParams")
+        )
+    elif type(entity_type) is int and entity_type == 4:
+        record["transform_raw"] = _inplace_read(lambda: _property(_property(target, "Transform"), "ArrayData"))
+    return record
+
+
+def _inplace_mate_record(feature, specific, entity_count, *, scope, configuration):
+    """Read IMateInPlace without inventing IMate2 fields or solver constraints."""
+
+    name = str(_property(feature, "Name") or "")
+    suppressed = _method(feature, "IsSuppressed")
+    error_code = _method(feature, "GetErrorCode")
+    if type(suppressed) is not bool or type(error_code) is not int:
+        raise CadError(
+            "cad_mate_unreadable",
+            "in-place mate suppression or solve state is unreadable",
+            {"mate": name, "suppressed": _json_raw_value(suppressed), "error_code": _json_raw_value(error_code)},
+        )
+    entities = []
+    for index in range(entity_count):
+        entity_type = _inplace_read(lambda i=index: _indexed_property(specific, "MateEntityType", i))
+        entities.append(
+            {
+                "index": index,
+                "component_name": _inplace_read(lambda i=index: _indexed_property(specific, "MateComponentName", i)),
+                "entity_type": entity_type,
+                "entity": _inplace_read(
+                    lambda i=index, kind=entity_type["value"]: _inplace_entity(
+                        _indexed_property(specific, "MateEntity", i), kind
+                    )
+                ),
+            }
+        )
+    return {
+        "name": name,
+        "type": "inplace",
+        "native_feature_type": "MateInPlace",
+        "native_interface": "IMateInPlace",
+        "scope": scope,
+        "configuration": configuration,
+        "suppressed": suppressed,
+        "error_code": error_code,
+        "entity_count": entity_count,
+        # In-place endpoints are not IMateEntity2 and contribute no ordinary mate rows.
+        "entities": [],
+        "limits": None,
+        "native_limit": None,
+        "is_advanced_mate": None,
+        "is_advanced_mate_error": None,
+        "is_advanced_mate_api": None,
+        "inplace": {
+            "component": _inplace_read(lambda: _inplace_component(_property(specific, "Component"))),
+            "entities": entities,
+        },
+    }
+
+
 def _mate_specific(feature, strict=False):
-    """Return ``(IMate2, entity_count)`` for a mate feature.
+    """Return the actual mate interface and its native entity count.
 
     ``GetSpecificFeature2`` and ``GetMateEntityCount`` are parameterless vendor
     *methods* (SW2026 typelib: ``IMate2.GetMateEntityCount()``).  A recognised
@@ -2514,7 +2607,13 @@ def _mate_specific(feature, strict=False):
             )
         return None
     try:
-        specific = _method(feature, "GetSpecificFeature2")
+        specific = _specific_feature_object(feature)
+        if specific is None:
+            raise ValueError("GetSpecificFeature2 returned null")
+        specific = _interface(
+            specific,
+            IMATEINPLACE_IID if type_name == "MateInPlace" else IMATE2_IID,
+        )
         raw_count = _method(specific, "GetMateEntityCount")
     except Exception as error:  # noqa: BLE001
         raise CadError(
@@ -2550,7 +2649,7 @@ def _mate_features(doc):
                 ) from error
             found = _mate_specific(feature, strict=inside_group)
             if found is not None:
-                features.append((feature, found[0], found[1]))
+                features.append((feature, found[0], found[1], type_name))
             try:
                 sub = _dynamic(_method(feature, "GetFirstSubFeature"))
             except Exception as error:  # noqa: BLE001
@@ -7522,7 +7621,7 @@ class SolidWorksBackend(CadBackend):
                     components_done += 1
                 mate_list = list(_mate_features(assembly))
                 mates_total += len(mate_list)
-                for feature, specific, entity_count in mate_list:
+                for feature, specific, entity_count, feature_type in mate_list:
                     name = str(_property(feature, "Name") or "")
                     activity.emit(
                         "read_mates",
@@ -7530,6 +7629,18 @@ class SolidWorksBackend(CadBackend):
                         completed=mates_done,
                         total=mates_total,
                     )
+                    if feature_type == "MateInPlace":
+                        mates.append(
+                            _inplace_mate_record(
+                                feature,
+                                specific,
+                                entity_count,
+                                scope=prefix or "",
+                                configuration=referenced_configuration,
+                            )
+                        )
+                        mates_done += 1
+                        continue
                     try:
                         type_index = _property(specific, "Type")
                         if type(type_index) is not int:
@@ -7564,7 +7675,7 @@ class SolidWorksBackend(CadBackend):
                         if suppressed:
                             continue
                         try:
-                            entity = _dynamic(_method(specific, "MateEntity", entity_index))
+                            entity = _interface(_method(specific, "MateEntity", entity_index), IMATEENTITY2_IID)
                             reference = _component(_property(entity, "ReferenceComponent"))
                             reference_full = str(_method(reference, "GetPathName") or "")
                             reference_name = str(_property(reference, "Name2") or "")

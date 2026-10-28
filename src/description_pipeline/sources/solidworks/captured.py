@@ -44,6 +44,7 @@ def derive_engineering_input(
     from .evidence import (
         RUNTIME_EVIDENCE,
         metadata_value_warnings,
+        inplace_observation_warnings,
     )
     from .capture_geometry import materialize_native_geometry
     from .capture_projection import (
@@ -260,6 +261,7 @@ def derive_engineering_input(
         raise PipelineError("Saved-state source warning was emitted twice")
     provenance["value_warnings"] = [
         *existing,
+        *inplace_observation_warnings(payload.get("raw") or {}),
         *metadata_warnings,
         *([saved_state_warning] if saved_state_warning is not None else []),
     ]

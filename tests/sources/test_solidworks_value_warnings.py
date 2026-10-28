@@ -615,7 +615,7 @@ class ValueWarningTests(unittest.TestCase):
                 "parent": "base_link",
                 "child": "base_link",
                 "axis": [0.0, 0.0, -1.0],
-                "limits": {"lower": -0.3, "upper": 0.7, "unit": "rad"},
+                "limits": {"lower": -0.3, "upper": 0.7, "unit": "rad", "effort": 1.0, "velocity": 2.0},
                 "drive": {"effort": 1.0, "velocity": 2.0},
                 "axis_provenance": provenance,
             }
@@ -686,8 +686,8 @@ class ValueWarningTests(unittest.TestCase):
                         "model_frame": "child",
                         "q_sign": 1,
                         "range_transform": "not_applied",
-                        "limits_before": {"lower": -0.3, "upper": 0.7, "unit": "rad"},
-                        "limits_after": {"lower": -0.3, "upper": 0.7, "unit": "rad"},
+                        "limits_before": {"lower": -0.3, "upper": 0.7, "unit": "rad", "effort": 1.0, "velocity": 2.0},
+                        "limits_after": {"lower": -0.3, "upper": 0.7, "unit": "rad", "effort": 1.0, "velocity": 2.0},
                         "drive_before": {"effort": 1.0, "velocity": 2.0},
                         "drive_after": {"effort": 1.0, "velocity": 2.0},
                         "limits_status": "present",
@@ -876,7 +876,8 @@ class ValueWarningTests(unittest.TestCase):
     def test_unclassified_joint_has_a_direct_warning_fixture(self):
         source = copy.deepcopy(self.source)
         model = copy.deepcopy(self.model)
-        source["joints"] = [{"name": "waist_joint", "source_name": "waist_joint", "type": "revolute"}]
+        source["joints"] = [{"name": "waist_joint", "source_name": "waist_joint", "type": "revolute",
+                             "limits": {"effort": 1.0, "velocity": 2.0}}]
         model["joints"] = [{"name": "waist_joint"}]
         warnings = model["provenance"]["value_warnings"]
         next(item for item in warnings if item["code"] == "geometry.derived_from_native")["objects"].append(
@@ -972,6 +973,7 @@ class ValueWarningTests(unittest.TestCase):
                 "name": "left_shoulder_pitch_joint",
                 "source_name": "left_shoulder_pitch_joint",
                 "type": "revolute",
+                "limits": {"effort": 1.0, "velocity": 2.0},
                 "axis_provenance": {
                     "status": "local_class_aligned",
                     "motion": "pitch",

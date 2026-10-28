@@ -298,6 +298,14 @@ class ExporterWireTests(unittest.TestCase):
 
 
 class ExporterDiscoveryTests(unittest.TestCase):
+    def test_missing_drive_field_is_retained_as_missing_and_does_not_replace_present_value(self):
+        raw = raw_record()
+        xml = wire_xml({"lower": -1.0, "upper": 1.0, "effort": 7.5, "velocity": None})
+        raw["exporter"].update(raw_xml=xml, raw_xml_sha256=hashlib.sha256(xml.encode()).hexdigest())
+        _bodies, joints, findings = self.derive(raw)
+        self.assertFalse(any(row["blocking"] for row in findings), findings)
+        self.assertEqual(joints[0]["limits"], {"lower": -1.0, "upper": 1.0, "effort": 7.5, "velocity": None})
+
     def derive(self, record, *, purpose=PURPOSE_ENGINEERING):
         declaration = decode_exporter_v14(record["exporter"]["raw_xml"], 1.4)
         findings = []
@@ -598,7 +606,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
         for changes, code in (
             ({"upper": float("nan")}, "discovery.joint_limits_invalid"),
             ({"lower": 2, "upper": 1}, "discovery.joint_limits_invalid"),
-            ({"effort": None}, "discovery.joint_drive_invalid"),
+            ({"effort": False}, "discovery.joint_drive_invalid"),
             ({"velocity": float("inf")}, "discovery.joint_drive_invalid"),
             ({"effort": -1}, "discovery.joint_drive_invalid"),
             ({"velocity": -1}, "discovery.joint_drive_invalid"),

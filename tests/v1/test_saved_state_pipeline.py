@@ -1,6 +1,7 @@
 """End-to-end saved-state warning projection through Generate and Verify."""
 
 import copy
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -74,12 +75,60 @@ class SavedStatePipelineTests(unittest.TestCase):
         self.assertIn("WARNING source.saved_state_incomplete", urdf)
         self.assertIn("hidden_or_auto_suppressed_objects_unknown", urdf)
 
+    def test_missing_drive_defaults_reach_actual_urdf_and_independent_verify(self) -> None:
+        from tests.v1.test_pipeline_verify import PipelineVerifyHandlerTests
+
+        native = fixture.capture_record()
+        native["properties"]["mates"]["shoulder_pitch_joint__coaxial"].pop("dp.joint.drive_record")
+        handler_fixture = PipelineVerifyHandlerTests(methodName="runTest")
+        self.addCleanup(handler_fixture.doCleanups)
+        with patch.object(fixture, "capture_record", return_value=native):
+            handler_fixture.setUp()
+        report = handler_fixture._bundle_report(handler_fixture.generate_ref)
+        self.assertTrue(report["passed"], [item for item in report["checks"] if not item["passed"]])
+        defaults = next(item for item in report["diagnostics"] if item["code"] == "drive.default_zero")
+        fields = defaults["detail"]["objects"]
+        self.assertEqual({item["field"] for item in fields}, {"effort", "velocity"})
+        self.assertTrue(all(item["actual"] == 0 and item["drive_qualified"] is False for item in fields))
+        self.assertEqual(handler_fixture._run_verify()[1].outcome, "completed")
+        urdf = next(handler_fixture.generate_root.rglob("*.urdf")).read_text()
+        self.assertIn("WARNING drive.default_zero", urdf)
+        self.assertIn('effort="0"', urdf)
+        self.assertIn('velocity="0"', urdf)
+
     def test_scope_changes_cannot_be_hidden_by_a_warning(self) -> None:
         record = fixture.incomplete_saved_state_record()
         _require_saved_state_open({"raw": record})
         record["components"].pop()
         with self.assertRaisesRegex(Exception, "occurrence scope differs"):
             _require_saved_state_open({"raw": record})
+
+    def test_partial_controlled_drive_preserves_provided_value_and_defaults_only_missing_field(self) -> None:
+        from tests.v1.test_pipeline_verify import PipelineVerifyHandlerTests
+
+        original_setup = fixture.HermeticNativeFixture.setUp
+
+        def partial_drive(instance):
+            original_setup(instance)
+            path = instance.records / "joints/arm.json"
+            record = json.loads(path.read_text())
+            record["drive"] = {"effort": 7.5, "velocity": None}
+            path.write_text(json.dumps(record))
+
+        scenario = PipelineVerifyHandlerTests(methodName="runTest")
+        self.addCleanup(scenario.doCleanups)
+        with patch.object(fixture.HermeticNativeFixture, "setUp", partial_drive):
+            scenario.setUp()
+        report = scenario._bundle_report(scenario.generate_ref)
+        self.assertTrue(report["passed"], [item for item in report["checks"] if not item["passed"]])
+        defaults = next(item for item in report["diagnostics"] if item["code"] == "drive.default_zero")
+        self.assertEqual([item["field"] for item in defaults["objects"]], ["velocity"])
+        authored = next(item for item in report["diagnostics"] if item["code"] == "drive.declared_author")
+        self.assertEqual([(item["field"], item["actual"]) for item in authored["objects"]], [("effort", 7.5)])
+        self.assertEqual(scenario._run_verify()[1].outcome, "completed")
+        urdf = next(scenario.generate_root.rglob("*.urdf")).read_text()
+        self.assertIn('effort="7.5"', urdf)
+        self.assertIn('velocity="0"', urdf)
 
     def test_readable_occurrence_cannot_be_reclassified_as_missing(self) -> None:
         record = fixture.incomplete_saved_state_record()

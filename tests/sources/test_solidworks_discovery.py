@@ -4046,6 +4046,8 @@ class FakeMateFeature:
         return None
 
     def __getattr__(self, name):
+        if name == "_oleobj_":
+            raise AttributeError(name)
         if name == "GetTypeName2":
             return lambda: self.type_name
         if name == "Name":
