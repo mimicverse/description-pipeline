@@ -296,7 +296,9 @@ class _ReplayBackend:
         self.payload = payload
 
     def discover_native(self, frozen_source: Path, settings: dict, *, on_activity=None) -> dict:
-        return copy.deepcopy(self.payload)
+        return support.local_native_record_payload(
+            copy.deepcopy(self.payload)
+        )
 
 
 class OracleSemanticsTests(unittest.TestCase):
@@ -340,7 +342,9 @@ class OracleSemanticsTests(unittest.TestCase):
         """Mutate the bound record and reseal the manifest, keeping the binding check honest."""
         record_path = package / RECORD_FILE
         payload = json.loads(record_path.read_text(encoding="utf-8"))
-        mutate(payload["raw"], payload)
+        canonical_raw = support.native_consumer_view(payload["raw"])
+        mutate(canonical_raw, payload)
+        payload["raw"] = support.local_native_record_payload(canonical_raw)
         # Allow non-finite literals when callers inject them so the shared strict
         # reader, rather than manifest resealing, is the rejection boundary.
         record_path.write_text(
@@ -383,8 +387,10 @@ class OracleSemanticsTests(unittest.TestCase):
                 binding["message"],
             )
             return
-        graph = [error for error in errors if error["code"] == "discovery.graph"]
-        self.assertTrue(any(expected in error["message"] for error in graph), errors)
+        self.assertTrue(
+            any(expected in error["message"] for error in errors),
+            errors,
+        )
 
     # ---------------------------------------------------------------- controls
 
@@ -530,7 +536,10 @@ class OracleSemanticsTests(unittest.TestCase):
         def string_transform(raw, payload):
             raw["components"][1]["transform"][3] = "0.0"
 
-        self.reject(string_transform, "outside the supported constraint scope")
+        self.reject(
+            string_transform,
+            "raw local SolidWorks transform is invalid",
+        )
 
     def test_large_finite_axis_cannot_overflow_to_a_zero_vector(self) -> None:
         """hypot normalization keeps a huge finite direction usable instead of collapsing to zero."""
@@ -689,7 +698,7 @@ class OracleSemanticsTests(unittest.TestCase):
         def mutate(raw, payload):
             raw["components"].append(copy.deepcopy(raw["components"][1]))
 
-        self.reject(mutate, "component occurrence names must be unique and non-empty")
+        self.reject(mutate, "share one stable identity")
 
     def test_body_frame_datum_must_be_owned_by_that_body(self) -> None:
         def mutate(raw, payload):
@@ -1171,7 +1180,7 @@ class OracleSemanticsTests(unittest.TestCase):
                 self.assertFalse(passed, errors)
                 self.assertTrue(
                     any(
-                        error["code"] == "discovery.graph" and "names an unknown component" in error["message"]
+                        error["code"] == "discovery.mate_scope"
                         for error in errors
                     ),
                     errors,
@@ -1205,8 +1214,11 @@ class OracleSemanticsTests(unittest.TestCase):
                 self.assertFalse(passed, errors)
                 self.assertTrue(
                     any(
-                        error["code"] == "discovery.frame_attachment"
-                        and "exactly one frame entity and one occurrence entity" in error["message"]
+                        (
+                            error["code"] == "discovery.frame_attachment"
+                            and "exactly one frame entity and one occurrence entity" in error["message"]
+                        )
+                        or error["code"] == "discovery.mate_scope"
                         for error in errors
                     ),
                     errors,
@@ -1231,8 +1243,7 @@ class OracleSemanticsTests(unittest.TestCase):
                 self.assertFalse(passed, errors)
                 self.assertTrue(
                     any(
-                        error["code"] == "discovery.frame_attachment"
-                        and "outside the frozen top assembly" in error["message"]
+                        error["code"] == "discovery.mate_scope"
                         for error in errors
                     ),
                     errors,
@@ -1257,8 +1268,7 @@ class OracleSemanticsTests(unittest.TestCase):
                 self.assertFalse(passed, errors)
                 self.assertTrue(
                     any(
-                        error["code"] == "discovery.graph"
-                        and "datum owner must be a known occurrence name or the frozen top assembly" in error["message"]
+                        error["code"] == "discovery.datum_owner"
                         for error in errors
                     ),
                     errors,

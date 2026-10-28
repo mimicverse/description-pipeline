@@ -22,6 +22,7 @@ from description_pipeline.verification.native_discovery import (
 )
 
 from . import test_solidworks_discovery_oracle as oracle_fixtures
+from . import support
 
 
 class RebuildCarrierTests(unittest.TestCase):
@@ -183,9 +184,19 @@ class RebuildCarrierTests(unittest.TestCase):
         )
         for label, record in cases:
             with self.subTest(case=label), self.assertRaises(_Failure):
-                rebuild_interface_frames(record)
+                rebuild_interface_frames(
+                    support.local_native_record_payload(
+                        record,
+                        default_mate_scope=True,
+                    )
+                )
         self.assertEqual(
-            rebuild_interface_frames(with_datum("TCP_ToolPoint", "arm-1"))[0]["name"],
+            rebuild_interface_frames(
+                support.local_native_record_payload(
+                    with_datum("TCP_ToolPoint", "arm-1"),
+                    default_mate_scope=True,
+                )
+            )[0]["name"],
             "tool_point_tcp",
         )
 
@@ -200,7 +211,10 @@ class RebuildCarrierTests(unittest.TestCase):
                 datum["name"], datum["owner"] = name, "arm-1"
                 record["datums"].append(datum)
             frames = rebuild_interface_frames(
-                record,
+                support.local_native_record_payload(
+                    record,
+                    default_mate_scope=True,
+                ),
                 bodies=[
                     {
                         "name": "base_link",

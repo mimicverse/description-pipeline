@@ -24,11 +24,28 @@ from description_pipeline.interface_records import PURPOSE_ENGINEERING, PURPOSE_
 from description_pipeline.io import PipelineError, digest
 from description_pipeline.verification import solidworks_urdf
 from description_pipeline.verification import native_declarations as native_declarations_module
-from description_pipeline.verification.native_declarations import verify_declarations
+from description_pipeline.verification.native_declarations import (
+    verify_declarations as _verify_declarations,
+)
 from description_pipeline.verification.native_discovery import _Failure, rebuild_interface_frames, verify_discovery
 
 from .selection_support import sealed_selection
 from . import support
+
+
+def verify_declarations(raw, source=None, *, purpose=None):
+    """Fixture adapter: encode scenario values as the Windows local raw shape."""
+
+    if all(
+        "transform_raw" not in item
+        for item in raw.get("components") or []
+        if isinstance(item, dict)
+    ):
+        raw = support.local_native_record_payload(
+            raw,
+            default_mate_scope=True,
+        )
+    return _verify_declarations(raw, source, purpose=purpose)
 
 
 NS = 'xmlns="http://schemas.datacontract.org/2004/07/SW2URDF"'
@@ -539,6 +556,10 @@ class DeclarationConsumerTests(unittest.TestCase):
             mutate_raw(raw)
         raw["files"] = native_files
         raw["source_selection"] = sealed_selection(native_files, "robot.SLDASM", edges={"robot.SLDASM": []})
+        raw = support.local_native_record_payload(
+            raw,
+            default_mate_scope=True,
+        )
         robot = {"hardware_id": "fixture", "source": source_claims(), "checks": {}}
         robot["source"]["robot_name"] = "fixture"
         payload = support.frozen_discovery_payload(
@@ -655,7 +676,7 @@ class DeclarationConsumerTests(unittest.TestCase):
             (
                 "foreign owner",
                 lambda raw: raw["datums"].append(self._interface("TCP_orphan", "ghost-1")),
-                "not owned by any rebuilt body",
+                "no known occurrence owner",
             ),
             (
                 "duplicate native interface identity",
@@ -745,6 +766,10 @@ class DeclarationConsumerTests(unittest.TestCase):
     def test_interface_expansion_refuses_a_missing_referenced_configuration(self) -> None:
         raw = {"components": [{"name2": "a-1"}], "datums": [self._interface("TCP_x", "a-1")]}
         bodies = [{"id": "a", "name": "a", "components": ["a-1"], "frame": {"coordinate_system": "CS_a"}}]
+        raw = support.local_native_record_payload(
+            raw,
+            default_mate_scope=True,
+        )
         with self.assertRaises(_Failure) as raised:
             rebuild_interface_frames(raw, bodies=bodies, base=None)
         self.assertIn("no recorded referenced configuration", str(raised.exception))
@@ -1327,7 +1352,15 @@ class NativeDeclarationsTests(unittest.TestCase):
                 candidate["mates"] = [mate]
                 report = verify_declarations(candidate, purpose=PURPOSE_ENGINEERING)
                 self.assertFalse(report["passed"])
-                self.assertIn("v14.native_limits_invalid", {item["code"] for item in report["errors"]})
+                expected = (
+                    "discovery.mate_scope"
+                    if label == "unknown_binding"
+                    else "v14.native_limits_invalid"
+                )
+                self.assertIn(
+                    expected,
+                    {item["code"] for item in report["errors"]},
+                )
                 self.assertNotIn("v14.default_policy", {item["code"] for item in report["diagnostics"]})
 
         conflict = copy.deepcopy(raw)
@@ -1497,7 +1530,7 @@ class NativeDeclarationsTests(unittest.TestCase):
         candidate["exporter"]["pid_bindings"][2]["document"] = None
         native = next(item for item in candidate["components"] if item["name2"] == row["name2"])
         native.update(document=None, virtual=True)
-        self.assertIn("v14.pid_document_unread", self.errors(candidate))
+        self.assertIn("discovery.reference_cycle", self.errors(candidate))
         raw = fixture()
         raw["exporter"]["pid_bindings"][0]["name2"] = "foreign"
         self.assertIn("v14.pid_unread", self.errors(raw))
@@ -1665,7 +1698,7 @@ class NativeDeclarationsTests(unittest.TestCase):
         self.assertIn("v14.evidence_invalid", self.errors(raw))
         raw = fixture()
         raw["datums"][1]["owner"] = "foreign"
-        self.assertIn("v14.datum_unread", self.errors(raw))
+        self.assertIn("discovery.datum_owner", self.errors(raw))
         claims = source_claims()
         claims["joints"][0]["limits"]["effort"] = 10
         self.assertIn("v14.claims", self.errors(fixture(), claims))
@@ -1721,6 +1754,10 @@ class NativeDeclarationsTests(unittest.TestCase):
             raw = fixture()
             raw["files"] = native_files
             raw["source_selection"] = sealed_selection(native_files, "robot.SLDASM", edges={"robot.SLDASM": []})
+            raw = support.local_native_record_payload(
+                raw,
+                default_mate_scope=True,
+            )
             robot = {
                 "hardware_id": "fixture",
                 "source": source_claims(),

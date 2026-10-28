@@ -567,6 +567,14 @@ Windows 传输消费同一固定策略。工程传输包含闭合文件清单、
 验证完整性后原子接纳。Discover result 绑定工程清单、主装配、实际配置、native
 observation、selection、ruleset 与 prepared bytes；Capture result 绑定该 result、
 同版 native requirement、prepared inventory 与原生运行环境。Linux 对这些绑定逐层复核。
+
+Discover 原始记录保留组件的 `transform_raw`（SolidWorks 原生 16 值局部变换）与
+`parent_occurrence`、基准的 `array_raw` 与 owner，以及配合端点的原始名称、文档、owner
+scope 和 `EntityParams`。Windows 只验证读取形状与可读性，不组合世界坐标或局部化配合
+几何。Linux Discover 从这些原值生成临时消费视图，独立 Verify 另行复算；两者都不把
+派生结果写回封存 raw。父链、owner、引用冲突或缺失字段必须拒绝，不能当作根节点或
+空帧补齐；原生明确记录的空读数与字段缺失、null 分别处理。
+
 Discover 与 Capture 可以各自传输并 materialize 自己的封存输入 closure。前者使用
 SourceSet archive，后者使用由同一 SourceSet 原件血缘派生的 prepared archive；
 SourceSet 与 prepared 分别保存不同摘要。每个 operation 必须绑定原请求、上游

@@ -419,6 +419,385 @@ def solidworks_transform(matrix: Sequence[float]) -> list[float]:
     ]
 
 
+def _matrix_product(left: Sequence[float], right: Sequence[float]) -> list[float]:
+    left_rows = [list(left[index : index + 4]) for index in range(0, 16, 4)]
+    right_rows = [list(right[index : index + 4]) for index in range(0, 16, 4)]
+    return [
+        sum(left_rows[row][index] * right_rows[index][column] for index in range(4))
+        for row in range(4)
+        for column in range(4)
+    ]
+
+
+def _matrix_inverse(frame: Sequence[float]) -> list[float]:
+    rows = [list(frame[index : index + 4]) for index in range(0, 16, 4)]
+    rotation = [[rows[row][column] for column in range(3)] for row in range(3)]
+    translation = [rows[row][3] for row in range(3)]
+    inverse_rotation = [
+        [rotation[column][row] for column in range(3)]
+        for row in range(3)
+    ]
+    inverse_translation = [
+        -sum(
+            inverse_rotation[row][column] * translation[column]
+            for column in range(3)
+        )
+        for row in range(3)
+    ]
+    return [
+        inverse_rotation[0][0],
+        inverse_rotation[0][1],
+        inverse_rotation[0][2],
+        inverse_translation[0],
+        inverse_rotation[1][0],
+        inverse_rotation[1][1],
+        inverse_rotation[1][2],
+        inverse_translation[1],
+        inverse_rotation[2][0],
+        inverse_rotation[2][1],
+        inverse_rotation[2][2],
+        inverse_translation[2],
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    ]
+
+
+def _entity_params_from_geometry(entity: dict, local_to_owner: Sequence[float]) -> list[float] | None:
+    reference = entity.get("mate_entity_reference")
+    if not isinstance(reference, dict):
+        return None
+    if isinstance(reference.get("params"), list):
+        return list(reference["params"])
+    geometry = reference.get("geometry")
+    if not isinstance(geometry, dict):
+        return None
+    kind = geometry.get("kind")
+    point = geometry.get("point")
+    if not isinstance(point, list) or len(point) != 3:
+        return None
+    owner_point = [
+        sum(local_to_owner[row * 4 + column] * float(point[column]) for column in range(3))
+        + local_to_owner[row * 4 + 3]
+        for row in range(3)
+    ]
+    if kind == "point":
+        return owner_point
+    direction = geometry.get("direction") or geometry.get("normal")
+    if not isinstance(direction, list) or len(direction) != 3:
+        return None
+    owner_direction = [
+        sum(
+            local_to_owner[row * 4 + column] * float(direction[column])
+            for column in range(3)
+        )
+        for row in range(3)
+    ]
+    radius = float(geometry.get("radius") or 0.0)
+    radius2 = float(geometry.get("radius2") or 0.0)
+    return [*owner_point, *owner_direction, radius, radius2]
+
+
+def _entity_reference_from_primary(
+    entity: dict,
+    local_to_owner: Sequence[float],
+) -> tuple[int, list[float]] | None:
+    if isinstance(entity.get("cylinder"), dict):
+        geometry = {
+            "kind": "cylinder",
+            "point": entity["cylinder"].get("point"),
+            "direction": entity["cylinder"].get("direction"),
+            "radius": entity["cylinder"].get("radius"),
+        }
+        reference_type = 4
+    elif isinstance(entity.get("plane"), dict):
+        geometry = {
+            "kind": "plane",
+            "point": entity["plane"].get("point"),
+            "normal": entity["plane"].get("normal"),
+        }
+        reference_type = 3
+    elif isinstance(entity.get("point"), list):
+        geometry = {
+            "kind": "point",
+            "point": entity["point"],
+        }
+        reference_type = 0
+    elif isinstance(entity.get("line"), dict):
+        geometry = {
+            "kind": "line",
+            "point": entity["line"].get("point"),
+            "direction": entity["line"].get("direction"),
+        }
+        reference_type = 1
+    else:
+        return None
+    params = _entity_params_from_geometry(
+        {"mate_entity_reference": {"geometry": geometry}},
+        local_to_owner,
+    )
+    return (reference_type, params) if params is not None else None
+
+
+def _reference_type_from_geometry(reference: dict) -> int | None:
+    geometry = reference.get("geometry")
+    if not isinstance(geometry, dict):
+        return None
+    return {
+        "point": 0,
+        "line": 1,
+        "plane": 3,
+        "cylinder": 4,
+        "cone": 7,
+    }.get(geometry.get("kind"))
+
+
+def local_native_record_payload(
+    payload: dict,
+    *,
+    default_mate_scope: bool = False,
+    fill_missing_parents: bool = False,
+) -> dict:
+    """Encode fixture scenario values as the local facts the Windows reader emits."""
+
+    result = copy.deepcopy(payload)
+    components = [
+        item
+        for item in result.get("components") or []
+        if isinstance(item, dict) and isinstance(item.get("name2"), str)
+    ]
+    if fill_missing_parents:
+        known = {str(item["name2"]) for item in components}
+        synthetic = []
+        for name in sorted(known):
+            parts = name.split("/")
+            for index in range(1, len(parts)):
+                parent = "/".join(parts[:index])
+                if parent in known:
+                    continue
+                known.add(parent)
+                synthetic.append(
+                    {
+                        "name2": parent,
+                        "document": "",
+                        "configuration": "Default",
+                        "fixed": False,
+                        "suppressed": True,
+                        "lightweight": False,
+                        "suppression_state": 0,
+                        "transform": [],
+                    }
+                )
+        components.extend(synthetic)
+        result["components"] = components
+    by_name = {str(item["name2"]): item for item in components}
+    world = {
+        name: copy.deepcopy(
+            item["transform"]
+            if "transform" in item
+            else _identity()
+        )
+        for name, item in by_name.items()
+    }
+    for component in components:
+        name = str(component["name2"])
+        parent = name.rsplit("/", 1)[0] if "/" in name else ""
+        if parent and parent not in by_name:
+            parent = ""
+        values = world[name]
+        valid = (
+            isinstance(values, list)
+            and len(values) == 16
+            and all(
+                type(value) in (int, float)
+                for value in values
+            )
+        )
+        parent_values = (
+            world.get(parent, _identity())
+            if parent
+            else _identity()
+        )
+        valid_parent = (
+            isinstance(parent_values, list)
+            and len(parent_values) == 16
+            and all(
+                type(value) in (int, float)
+                for value in parent_values
+            )
+        )
+        if valid and values and valid_parent:
+            local = _matrix_product(
+                _matrix_inverse(parent_values),
+                values,
+            )
+            transform_raw = solidworks_transform(local)
+        else:
+            transform_raw = copy.deepcopy(values)
+        component["parent_occurrence"] = parent
+        component["transform_raw"] = transform_raw
+        component.pop("transform", None)
+
+    for datum in result.get("datums") or []:
+        if not isinstance(datum, dict):
+            continue
+        owner = str(datum.get("owner") or "")
+        owner_world = world.get(owner, _identity()) if owner else _identity()
+        array = copy.deepcopy(
+            datum["array"]
+            if "array" in datum
+            else _identity()
+        )
+        if (
+            isinstance(array, list)
+            and len(array) == 16
+            and all(type(value) in (int, float) for value in array)
+            and isinstance(owner_world, list)
+            and len(owner_world) == 16
+            and all(type(value) in (int, float) for value in owner_world)
+        ):
+            datum["array_raw"] = solidworks_transform(
+                _matrix_product(_matrix_inverse(owner_world), array)
+            )
+        else:
+            datum["array_raw"] = array
+        datum.pop("array", None)
+
+    for mate in result.get("mates") or []:
+        if not isinstance(mate, dict):
+            continue
+        if default_mate_scope:
+            mate.setdefault("scope", "")
+        scope = str(mate.get("scope") or "")
+        owner_world = world.get(scope, _identity()) if scope else _identity()
+        for entity in mate.get("entities") or []:
+            if not isinstance(entity, dict):
+                continue
+            full = str(entity.get("component") or "")
+            explicit_component = entity.get("component")
+            assembly_frame = (
+                entity.get("assembly_frame") is True
+                and (
+                    explicit_component == ""
+                    or (
+                        bool(scope)
+                        and explicit_component == scope
+                    )
+                )
+            )
+            if full and full in by_name:
+                reference_document = str(by_name[full].get("document") or "")
+                component_world = world.get(full, _identity())
+            else:
+                reference_document = (
+                    str(by_name.get(scope, {}).get("document") or "")
+                    if scope
+                    else str((result.get("identity") or {}).get("main_assembly") or "")
+                )
+                component_world = _identity()
+            reference_name = (
+                full[len(scope) + 1 :]
+                if scope and full.startswith(scope + "/")
+                else (
+                    full
+                    or (
+                        "assembly_root"
+                        if assembly_frame and explicit_component == ""
+                        else ""
+                    )
+                )
+            )
+            reference = (
+                copy.deepcopy(entity.get("mate_entity_reference"))
+                if isinstance(entity.get("mate_entity_reference"), dict)
+                else {
+                    "source": "mate-entity-params",
+                    "reference_type": None,
+                    "reference_type2": None,
+                    "reference_type2_error": None,
+                    "space": "mate-assembly",
+                    "params": None,
+                    "error": None,
+                }
+            )
+            valid_frames = all(
+                isinstance(frame, list)
+                and len(frame) == 16
+                and all(type(value) in (int, float) for value in frame)
+                for frame in (owner_world, component_world)
+            )
+            local_to_owner = (
+                _matrix_product(
+                    _matrix_inverse(owner_world),
+                    component_world,
+                )
+                if valid_frames
+                else None
+            )
+            primary = (
+                _entity_reference_from_primary(
+                    entity,
+                    local_to_owner,
+                )
+                if local_to_owner is not None
+                else None
+            )
+            if primary is not None:
+                reference["reference_type"], reference["params"] = primary
+                reference["error"] = None
+            else:
+                if isinstance(entity.get("circle"), dict):
+                    reference["reference_type"] = None
+                    reference["params"] = None
+                    reference["error"] = "EntityParams is unavailable"
+                else:
+                    params = (
+                        _entity_params_from_geometry(entity, local_to_owner)
+                        if local_to_owner is not None
+                        else None
+                    )
+                    if params is not None:
+                        reference["params"] = params
+                        if type(reference.get("reference_type")) is not int:
+                            reference["reference_type"] = (
+                                _reference_type_from_geometry(reference)
+                            )
+                    elif (
+                        reference.get("params") is None
+                        and reference.get("error") is None
+                    ):
+                        if mate.get("type") in {
+                            "lock",
+                            "limitangle",
+                            "limitdistance",
+                        }:
+                            reference["reference_type"] = 0
+                            reference["params"] = [0.0, 0.0, 0.0]
+                        else:
+                            reference["error"] = "EntityParams is unavailable"
+            reference.pop("geometry", None)
+            reference.pop("reference_type_name", None)
+            reference["source"] = "mate-entity-params"
+            reference["space"] = "mate-assembly"
+            entity["reference_name"] = reference_name
+            entity["reference_document"] = reference_document
+            entity["assembly_frame"] = bool(assembly_frame)
+            entity["mate_entity_reference"] = reference
+            entity.pop("component", None)
+    return result
+
+
+def native_consumer_view(raw: dict) -> dict:
+    """Fixture-only normalized view for mutating scenario fields before re-encoding."""
+
+    from description_pipeline.verification.native_discovery import (
+        project_native_verification_record,
+    )
+
+    return copy.deepcopy(dict(project_native_verification_record(raw)))
+
+
 def placement(xyz: Sequence[float] = (0.0, 0.0, 0.0), rpy: Sequence[float] = (0.0, 0.0, 0.0)) -> list[float]:
     """Row-major 4x4 for a URDF-style xyz/rpy placement."""
 
@@ -2078,7 +2457,7 @@ def native_record(
             "robot.SLDASM",
             edges={"robot.SLDASM": parts, **{name: [] for name in parts}},
         )
-    return payload
+    return local_native_record_payload(payload)
 
 
 def seal_scene_inputs(

@@ -376,6 +376,39 @@ def _complete_membership(raw, components, members, leaves):
 
 def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str | None = None) -> dict:
     """Audit raw native declaration evidence and, optionally, generated source claims."""
+
+    from .native_discovery import _Failure, project_native_verification_record
+
+    try:
+        raw = project_native_verification_record(raw)
+    except _Failure as error:
+        failure = {
+            "code": error.code,
+            "message": error.message,
+            "detail": error.detail,
+        }
+        return {
+            "schema_version": SCHEMA,
+            "passed": False,
+            "checks": [
+                {
+                    "id": "declarations.binding",
+                    "passed": False,
+                    "details": failure,
+                }
+            ],
+            "errors": [failure],
+            "diagnostics": [],
+            "members": {},
+            "joints": 0,
+            "completion": {},
+            "carrier": {
+                "root": None,
+                "expansion": {},
+                "bodies": [],
+                "joints": [],
+            },
+        }
     checks, errors, diagnostics, state = [], [], [], {}
     state["directions"] = {}
     state["carried_axes"] = {}

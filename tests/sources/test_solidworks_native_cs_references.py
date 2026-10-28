@@ -40,7 +40,8 @@ class CoordinateSystemReferenceTests(unittest.TestCase):
             self.assertEqual(record["saved_configuration"], "Default")
             self.assertIsNone(record["identity"]["delivery_configuration"])
             self.assertEqual(
-                datum["array"], [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+                datum["array_raw"],
+                list(SW_IDENTITY),
             )
             refs = datum["references"]
             self.assertEqual(refs["state"], "unread")
