@@ -54,13 +54,15 @@ from description_pipeline.pipeline.effects import EffectState
 from description_pipeline.platform.facts import FactStoreError, RunNotAdmittedError
 from description_pipeline.schemas import (
     AIRFLOW_DISPATCH_CONF_SCHEMA,
+    NATIVE_DISCOVERY_SCHEMA,
+    NATIVE_DISCOVERY_FINDING_SCHEMA,
     VERIFICATION_CERTIFICATE_SCHEMA,
     VERIFY_REQUEST_SCHEMA,
 )
 from description_pipeline.sources.solidworks import discovery
 from description_pipeline.stages import CONTRACT, stage_view
 
-from .protocol_support import protocol_events
+from .protocol_support import discovery_finding, native_discovery_record, protocol_events
 
 AIRFLOW_TOKEN = "airflow-session-token"
 FEISHU_NAME = "崔工"
@@ -2030,10 +2032,17 @@ class PortalTests(unittest.TestCase):
             error="cad capture failed",
             result=None,
             discovery={
+                "schema_version": NATIVE_DISCOVERY_SCHEMA,
+                "run_id": native_run_id(dag_run_id),
+                "identity": {
+                    "hardware_id": "m3.0",
+                    "main_assembly": "robot.SLDASM",
+                    "revision": "r1",
+                },
                 "passed": False,
                 "findings": [
                     {
-                        "schema_version": "native-discovery/finding/v1",
+                        "schema_version": NATIVE_DISCOVERY_FINDING_SCHEMA,
                         "code": "discovery.axis_unresolved",
                         "object": "mate:elbow-1",
                         "message": "elbow axis cannot be resolved",
@@ -3715,6 +3724,197 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(status, 502, body)
         status, _, _ = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/input/handoff.json")
         self.assertEqual(status, 200)
+
+    def _seed_registered_warning_run(self) -> tuple[str, dict]:
+        self.client.login()
+        self._seed_airflow_run(DAG_RUN_ID, state="failed")
+        events = protocol_events(
+            failed_stage="verify",
+        )
+        handoff_warning = {
+            "code": "input.name",
+            "message": "normalized by the recorded input contract",
+        }
+        for event in events:
+            check = event.get("check")
+            if isinstance(check, dict) and check.get("id") == "input.valid":
+                check["details"]["warnings"] = [{"code": "stale.input", "blocking": False}]
+        self._seed_job(
+            DAG_RUN_ID,
+            status="failed",
+            result=None,
+            events=events,
+            discovery={
+                "passed": False,
+                "hardware_id": "stale_hardware",
+                "revision": "stale_revision",
+                "findings": [discovery_finding(code="stale.finding", blocking=True)],
+                "discovery_sha256": "e" * 64,
+            },
+        )
+        run_id = native_run_id(DAG_RUN_ID)
+        finding = discovery_finding(message="Readable saved state retained")
+        discovery_record = native_discovery_record(run_id, [finding], hardware_id=TEST_TARGET)
+        self._register_attempt(
+            run_id,
+            {
+                "urdf/robot.urdf": b"<robot name='fixture'/>",
+                "reports/diagnostic.json": (
+                    b'{"passed":false,"checks":[]}\n'
+                ),
+                "input/handoff.json": json.dumps(
+                    {"warnings": [handoff_warning]}
+                ).encode(),
+                "input/discovery/native-discovery.json": json.dumps(
+                    discovery_record
+                ).encode(),
+            },
+            verified=False,
+        )
+
+        return run_id, discovery_record
+
+    def test_registered_warnings_reach_run_report_and_preview_from_one_record(self) -> None:
+        _run_id, discovery_record = self._seed_registered_warning_run()
+        status, _, body = self.client.request(
+            "GET",
+            f"/api/runs/{DAG_RUN_ID}",
+        )
+        self.assertEqual(status, 200, body)
+        run = json.loads(body)
+        self.assertEqual(run["discovery"]["hardware_id"], TEST_TARGET)
+        self.assertEqual(run["discovery"]["revision"], "r1")
+        expected_digest = hashlib.sha256(json.dumps(discovery_record).encode()).hexdigest()
+        self.assertEqual(run["discovery"]["discovery_sha256"], expected_digest)
+        self.assertEqual(run["coverage"]["structure"]["hardware_id"], TEST_TARGET)
+        self.assertEqual(run["coverage"]["structure"]["revision"], "r1")
+        self.assertEqual(run["coverage"]["structure"]["discovery_sha256"], expected_digest)
+        self.assertNotIn("stale.finding", json.dumps(run))
+        self.assertEqual(run["findings"][0]["id"], "native.observation")
+        self.assertIs(run["findings"][0]["blocking"], False)
+        warning_codes = {
+            item["code"] for item in run["report"]["warnings"]["items"]
+        }
+        self.assertEqual(
+            warning_codes,
+            {"input.name", "native.observation"},
+        )
+
+        status, _, body = self.client.request(
+            "GET",
+            f"/api/runs/{DAG_RUN_ID}/preview",
+        )
+        self.assertEqual(status, 200, body)
+        preview = json.loads(body)
+        self.assertEqual(preview["warnings_total"], 2)
+        self.assertEqual(
+            {item["code"] for item in preview["warnings"]},
+            {"input.name", "native.observation"},
+        )
+
+    def test_registered_discovery_defects_refuse_run_and_preview(self) -> None:
+        self.client.login()
+        self._seed_airflow_run(DAG_RUN_ID, state="failed")
+        self._seed_job(
+            DAG_RUN_ID,
+            status="failed",
+            result=None,
+            events=protocol_events(
+                failed_stage="verify",
+            ),
+        )
+        run_id = native_run_id(DAG_RUN_ID)
+        valid = native_discovery_record(run_id, [discovery_finding()], hardware_id=TEST_TARGET)
+        valid["identity"]["control"] = {"system": "git", "reference": "main"}
+        valid["records"] = [{
+            "reference": "fixture", "file": "fixture.json", "key": "fixture",
+            "package_file": "input/records/fixture.json", "sha256": "a" * 64,
+            "source_sha256": "b" * 64, "anchor": "assembly",
+        }]
+        valid["budget"] = {
+            "reference": "fixture", "key": "fixture", "package_file": "input/budget.json", "sha256": "c" * 64,
+        }
+        self._register_attempt(
+            run_id,
+            {
+                "urdf/robot.urdf": b"<robot name='fixture'/>",
+                "reports/diagnostic.json": (
+                    b'{"passed":false,"checks":[]}\n'
+                ),
+                "input/discovery/native-discovery.json": json.dumps(
+                    valid
+                ).encode(),
+            },
+            verified=False,
+        )
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
+        self.assertEqual(status, 200, body)
+        cases = {}
+        for path in (
+            (),
+            ("identity",),
+            ("identity", "control"),
+            ("derivation",),
+            ("records", 0),
+            ("budget",),
+            ("findings", 0),
+        ):
+            section = valid
+            for key in path:
+                section = section[key]
+            for key in (*section, "extra"):
+                if not path and key == "budget":
+                    continue  # The producer's budget index is optional.
+                changed = json.loads(json.dumps(valid))
+                target = changed
+                for part in path:
+                    target = target[part]
+                if key == "extra":
+                    target[key] = "unexpected"
+                else:
+                    target.pop(key)
+                cases[f"{path}: {key}"] = changed
+        for field, value in (
+            ("code", 123),
+            ("schema_version", "wrong"),
+            ("blocking", "false"),
+            ("object", 123),
+            ("message", None),
+        ):
+            changed = json.loads(json.dumps(valid))
+            changed["findings"][0][field] = value
+            cases[f"finding {field}"] = changed
+        for field, value in (("contract", "wrong"), ("namespace", "wrong"), ("raw", []), ("native_files", [])):
+            changed = json.loads(json.dumps(valid))
+            changed[field] = value
+            cases[field] = changed
+
+        for label, record in cases.items():
+            with self.subTest(label=label):
+                self._rebind_attempt_member(
+                    run_id,
+                    "input/discovery/native-discovery.json",
+                    json.dumps(record).encode(),
+                )
+                status, _, body = self.client.request(
+                    "GET",
+                    f"/api/runs/{DAG_RUN_ID}",
+                )
+                self.assertEqual(status, 502, body)
+                status, _, body = self.client.request(
+                    "GET",
+                    f"/api/runs/{DAG_RUN_ID}/preview",
+                )
+                self.assertEqual(status, 502, body)
+
+    def test_malformed_registered_handoff_warnings_refuse_run_and_preview(self) -> None:
+        run_id, _record = self._seed_registered_warning_run()
+        for warning in ({"code": 123}, {"code": "input.name", "blocking": True}):
+            self._rebind_attempt_member(run_id, "input/handoff.json", json.dumps({"warnings": [warning]}).encode())
+            for suffix in ("", "/preview"):
+                with self.subTest(warning=warning, suffix=suffix):
+                    status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}{suffix}")
+                    self.assertEqual(status, 502, body)
 
     def test_undeclared_optional_warning_source_is_not_an_error(self) -> None:
         """A warning source the registration does not carry stays absent: no error, and

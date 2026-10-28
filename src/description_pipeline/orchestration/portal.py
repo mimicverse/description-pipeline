@@ -100,7 +100,9 @@ from .run_ownership import (
 from .report_view import (
     build_report,
     merge_warnings,
+    registered_discovery_record,
     registered_discovery_findings,
+    registered_handoff_warnings,
 )
 from .uploads import (
     MAX_FILE_BYTES,
@@ -251,7 +253,9 @@ def _registered_source_rows(report: dict, field: str, *, code_required: bool = F
         return []
     rows = report[field]
     if not isinstance(rows, list) or any(
-        not isinstance(row, dict) or (code_required and not row.get("code")) for row in rows
+        not isinstance(row, dict)
+        or (code_required and (not isinstance(row.get("code"), str) or not row["code"]))
+        for row in rows
     ):
         raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered diagnostic content has an invalid structure")
     return rows
@@ -262,26 +266,24 @@ def _delivery_warnings(members: dict) -> list[dict]:
 
     warnings: list[dict] = []
     handoff = members.get("input/handoff.json")
-    if handoff is not None:
-        for item in _registered_source_rows(_parse_registered_json(handoff), "warnings", code_required=True):
-            warning = dict(item)
-            # Handoff's warnings list is non-blocking by contract.
-            warning.setdefault("blocking", False)
-            if warning["blocking"] is not False:
-                raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered input warning has an invalid blocking state")
-            warning.setdefault("source", "input")
-            warnings.append(warning)
     discovery = members.get("input/discovery/native-discovery.json")
-    if discovery is not None:
-        findings = _registered_source_rows(_parse_registered_json(discovery), "findings", code_required=True)
-        for item in findings:
-            if type(item.get("blocking")) is not bool:
-                raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered discovery finding has an invalid blocking state")
-            if item["blocking"]:
-                continue
-            warning = dict(item)
-            warning.setdefault("source", "discovery")
-            warnings.append(warning)
+    try:
+        if handoff is not None:
+            for warning in registered_handoff_warnings(
+                _parse_registered_json(handoff).get("warnings")
+            ):
+                warning.setdefault("source", "input")
+                warnings.append(warning)
+        if discovery is not None:
+            record = registered_discovery_record(_parse_registered_json(discovery))
+            for item in record["findings"]:
+                if item["blocking"]:
+                    continue
+                warning = dict(item)
+                warning.setdefault("source", "discovery")
+                warnings.append(warning)
+    except PipelineError as error:
+        raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
     return warnings
 
 
@@ -2175,8 +2177,13 @@ class PortalApp:
         # mutable conf echo never decides the display, and an unfinished
         # registration reads as "not recorded".
         display_job = self._registered_stage_job(job, projection)
-        stage_view_payload = stage_view(display_job)
-        report = build_report(job or {}, view=stage_view_payload)
+        # Registered stage rows own the terminal partition. The run's coarse
+        # failure must not turn the final downstream blocked row into a failure.
+        stage_view_payload = stage_view({**(display_job or {}), "status": None})
+        try:
+            report = build_report(display_job or {}, view=stage_view_payload)
+        except PipelineError as error:
+            raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
         purpose = projection.get("purpose") if projection is not None else None
         request = projection.get("request") if projection is not None else None
         request = request if isinstance(request, dict) else {}
@@ -2247,20 +2254,20 @@ class PortalApp:
                 "failure_diagnostics": job.get("failure_diagnostics"),
             },
             "discovery": None
-            if not isinstance(job, dict) or not isinstance(job.get("discovery"), dict)
+            if not isinstance(display_job, dict) or not isinstance(display_job.get("discovery"), dict)
             else {
-                "passed": job["discovery"].get("passed"),
-                "hardware_id": job["discovery"].get("hardware_id"),
-                "revision": job["discovery"].get("revision"),
-                "discovery_sha256": job["discovery"].get("discovery_sha256"),
+                "passed": display_job["discovery"].get("passed"),
+                "hardware_id": display_job["discovery"].get("hardware_id"),
+                "revision": display_job["discovery"].get("revision"),
+                "discovery_sha256": display_job["discovery"].get("discovery_sha256"),
             },
             "stage_view": stage_view_payload,
             "report": report,
             "verification_reports": self._verification_report_links(dag_run_id, projection),
-            "findings": _findings(job),
-            "activity": activity_view(job),
-            "automatic": _automatic_summary(job),
-            "coverage": _coverage_report(job, report),
+            "findings": _findings(display_job),
+            "activity": activity_view(display_job),
+            "automatic": _automatic_summary(display_job),
+            "coverage": _coverage_report(display_job, report),
             "pr": pr,
             "endpoint_error": endpoint_error,
             # Display rename / reversible tombstone; an unreadable ledger fails closed above.
@@ -3036,6 +3043,51 @@ class PortalApp:
             )
         return artifact
 
+    def _registered_discovery_projection(
+        self,
+        projection: dict,
+    ) -> dict | None:
+        """Read the registered Capture input's native discovery record for display."""
+
+        by_stage = projection.get("by_stage")
+        capture = by_stage.get("capture") if isinstance(by_stage, dict) else None
+        if not isinstance(capture, dict):
+            return None
+        member = capture.get("input/discovery/native-discovery.json")
+        if not isinstance(member, dict):
+            return None
+        try:
+            self._registered_stage_artifact(capture, stage="capture")
+            discover = by_stage.get("discover")
+            if not isinstance(discover, dict) or not discover:
+                raise PipelineError("Registered discovery record has no Discover artifact")
+            source = self._registered_stage_artifact(discover, stage="discover")
+            data = self._registered_member_bytes(
+                "input/discovery/native-discovery.json",
+                member,
+            )
+            record = registered_discovery_record(
+                _parse_registered_json(data)
+            )
+            findings = registered_discovery_findings({"discovery": record})
+            if record["run_id"] != source.producer_run_id:
+                raise PipelineError(
+                    "Registered discovery record belongs to another producer run"
+                )
+        except PipelineError as error:
+            raise PortalError(
+                HTTPStatus.BAD_GATEWAY,
+                str(error),
+            ) from error
+        identity = record["identity"]
+        return {
+            "findings": findings,
+            "passed": not any(item["blocking"] for item in findings),
+            "hardware_id": identity.get("hardware_id"),
+            "revision": identity.get("revision"),
+            "discovery_sha256": hashlib.sha256(data).hexdigest(),
+        }
+
     def _registered_stage_job(self, job: dict | None, projection: dict | None) -> dict | None:
         """A display snapshot whose stage states come from registered rows.
 
@@ -3237,9 +3289,24 @@ class PortalApp:
             )
         display = dict(job)
         display["events"] = events
-        # Registered stage rows own the terminal partition. The mutable job's
-        # coarse failure flag must not convert a final blocked row to failed.
-        display.pop("status", None)
+        capture_members = by_stage.get("capture")
+        if isinstance(capture_members, dict) and "input/handoff.json" in capture_members:
+            handoff = _parse_registered_json(self._registered_member_bytes(
+                "input/handoff.json", capture_members["input/handoff.json"]
+            ))
+            try:
+                warnings = registered_handoff_warnings(handoff.get("warnings"))
+            except PipelineError as error:
+                raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
+            for event in events:
+                check = event.get("check")
+                if event["stage"] == "capture" and isinstance(check, dict) and check.get("id") == "input.valid":
+                    check["details"] = {**check["details"], "warnings": warnings}
+        discovery = self._registered_discovery_projection(projection)
+        if discovery is not None:
+            display["discovery"] = discovery
+            display["hardware_id"] = discovery["hardware_id"]
+            display["revision"] = discovery["revision"]
         return display
 
     @staticmethod

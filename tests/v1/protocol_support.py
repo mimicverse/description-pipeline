@@ -3,6 +3,68 @@
 from datetime import UTC, datetime
 
 from description_pipeline.stages import CONTRACT, STAGE_IDS
+from description_pipeline.schemas import NATIVE_DISCOVERY_SCHEMA, NATIVE_DISCOVERY_FINDING_SCHEMA
+from description_pipeline.io import digest
+
+
+def discovery_finding(**fields):
+    return {
+        "schema_version": NATIVE_DISCOVERY_FINDING_SCHEMA,
+        "code": "native.observation",
+        "object": "assembly",
+        "message": "Recorded native observation",
+        "detail": None,
+        "blocking": False,
+        **fields,
+    }
+
+
+def native_discovery_record(
+    run_id,
+    findings=(),
+    *,
+    hardware_id="m3.0",
+    revision="r1",
+    main_assembly="robot.SLDASM",
+    native_files=None,
+):
+    """A complete synthetic envelope for transport/display tests only."""
+    native_files = (
+        {"robot.SLDASM": "a" * 64}
+        if native_files is None
+        else dict(native_files)
+    )
+    return {
+        "schema_version": NATIVE_DISCOVERY_SCHEMA,
+        "contract": "native-discovery/v1",
+        "namespace": "dp",
+        "run_id": run_id,
+        "generator": "native-discovery",
+        "generator_version": "1",
+        "handoff_sha256": digest(native_files),
+        "native_files": native_files,
+        "derivation": {
+            "record_roots": [],
+            "main_assembly": main_assembly,
+            "configuration": "Default",
+        },
+        "identity": {
+            "hardware_id": hardware_id,
+            "revision": revision,
+            "parent_revision": None,
+            "owner": "fixture",
+            "change_summary": "Transport fixture",
+            "control": None,
+            "delivery_configuration": "Default",
+            "main_assembly": main_assembly,
+            "robot_name": "fixture_robot",
+            "robot_name_technical": False,
+        },
+        "records": [],
+        "derived_interface_names": {},
+        "raw": {},
+        "findings": list(findings),
+    }
 
 
 def protocol_events(*, stages=STAGE_IDS, subject=None, failed_stage=None):

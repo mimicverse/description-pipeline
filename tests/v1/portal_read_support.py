@@ -30,7 +30,7 @@ from description_pipeline.schemas import (
 )
 from description_pipeline.stages import CONTRACT, CONTRACT_SHA256, STAGE_IDS, stage_view
 
-from .protocol_support import protocol_events
+from .protocol_support import native_discovery_record, protocol_events
 from .source_record_support import source_record
 
 
@@ -98,18 +98,13 @@ def build_sealed_delivery(
     )
     write_json(
         root / "input" / "discovery" / "native-discovery.json",
-        {
-            "discovery": "fixture",
-            "handoff_sha256": digest(native_inventory),
-            "native_files": native_inventory,
-            "identity": {
-                "main_assembly": "cad/robot.SLDASM",
-                "delivery_configuration": "Default",
-                "hardware_id": hardware_id,
-                "revision": revision,
-            },
-            "records": [],
-        },
+        native_discovery_record(
+            run_id,
+            hardware_id=hardware_id,
+            revision=revision,
+            main_assembly="cad/robot.SLDASM",
+            native_files=native_inventory,
+        ),
     )
     write_json(root / "input" / "capture-plan.json", {"plan": "fixture"})
     write_json(
