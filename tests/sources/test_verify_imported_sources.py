@@ -243,6 +243,94 @@ def cached_carrier(owner_sha, slot=None):
 
 
 class ImportedSourceTests(unittest.TestCase):
+    @staticmethod
+    def _excluded_fixture():
+        owner = "robot.SLDASM"
+        contents = {owner: b"frozen native owner"}
+        sha = hashlib.sha256(contents[owner]).hexdigest()
+        name = "unavailable-import-1"
+        path = r"D:\author-only\unavailable.step.SLDASM"
+        component = {
+            "name2": name, "instance_id": name, "parent_occurrence": "",
+            "document": path, "configuration": "Default", "defining_anchor": None,
+            "suppressed": True, "suppression_state": 0, "lightweight": False,
+            "native_reference": {
+                "defining": owner, "native_owner": owner, "defining_anchor": None,
+                "resolved_path": path, "is_virtual": False,
+            },
+            "solver_observation": {"context": {"document": owner, "scope": "", "configuration": "Default"}},
+            "source_provenance": {
+                "state": "unread", "owner": owner, "owner_sha256": sha,
+                "occurrence": name, "defining_anchor": None, "native_document_path": path,
+                "is_virtual": False, "used_api": IMPORT_API, "error": "Native reference is unavailable",
+            },
+        }
+        slot = {
+            "document": owner, "instance": name, "name": name, "owner_anchor": None,
+            "resolved_path": path, "suppression_state": 0, "justification": "authored_suppression_clean_open",
+        }
+        return contents, [component], [slot]
+
+    def test_sealed_suppressed_unread_reference_is_reported_as_excluded(self):
+        contents, components, slots = self._excluded_fixture()
+        files = {name: hashlib.sha256(data).hexdigest() for name, data in contents.items()}
+        selection = sealed_selection(files, "robot.SLDASM", suppressed=slots)
+        with tempfile.TemporaryDirectory() as directory:
+            package = self._package(directory, contents, components, extra_raw={"source_selection": selection})
+            check = self._check(verify_discovery(package))
+        self.assertTrue(check["passed"], check["details"])
+        self.assertEqual(check["details"]["excluded_suppressed_occurrences"], [components[0]["name2"]])
+        self.assertEqual(check["details"]["cached_materializations"], 0)
+
+    def test_suppression_does_not_bypass_source_binding_or_required_facts(self):
+        def active_child(rows, slots, extra):
+            rows.append({
+                "name2": rows[0]["name2"] + "/required-child", "document": "robot.SLDASM",
+                "suppressed": False, "suppression_state": 2, "lightweight": False,
+            })
+
+        def required_mate(rows, slots, extra):
+            extra["mates"] = support.native_hinge_mates(
+                rows[0]["name2"], rows[0]["name2"],
+                left_point=[0, 0, 0], right_point=[0, 0, 0], radius=0.01,
+            )
+
+        cases = {
+            "missing_slot": lambda rows, slots, extra: slots.clear(),
+            "duplicate_slot": lambda rows, slots, extra: slots.append(dict(slots[0])),
+            "wrong_owner_bytes": lambda rows, slots, extra: rows[0]["source_provenance"].update(owner_sha256="0" * 64),
+            "wrong_owner": lambda rows, slots, extra: rows[0]["native_reference"].update(native_owner="other.SLDASM"),
+            "wrong_anchor": lambda rows, slots, extra: rows[0].update(defining_anchor="other-1"),
+            "wrong_path": lambda rows, slots, extra: rows[0].update(document=r"D:\other.SLDASM"),
+            "wrong_context": lambda rows, slots, extra: rows[0]["solver_observation"]["context"].update(
+                document="other.SLDASM"
+            ),
+            "wrong_configuration": lambda rows, slots, extra: rows[0]["solver_observation"]["context"].update(
+                configuration="Other"
+            ),
+            "boolean_state": lambda rows, slots, extra: rows[0].update(suppression_state=False),
+            "active": lambda rows, slots, extra: rows[0].update(suppressed=False, suppression_state=2),
+            "unknown_state": lambda rows, slots, extra: rows[0].update(suppression_state=7),
+            "active_child": active_child,
+            "required_mate": required_mate,
+        }
+        for label, mutate in cases.items():
+            with self.subTest(case=label):
+                contents, rows, slots = self._excluded_fixture()
+                extra = {}
+                mutate(rows, slots, extra)
+                files = {name: hashlib.sha256(data).hexdigest() for name, data in contents.items()}
+                extra["source_selection"] = sealed_selection(files, "robot.SLDASM", suppressed=slots)
+                with tempfile.TemporaryDirectory() as directory:
+                    package = self._package(directory, contents, rows, extra_raw=extra)
+                    report = verify_discovery(package)
+                    check = self._check(report)
+                self.assertFalse(check["passed"], label)
+                if label == "required_mate":
+                    self.assertIn("discovery.mate_scope", {error["code"] for error in report["errors"]})
+                else:
+                    self.assertEqual(check["details"]["code"], "discovery.imported_source_unbound", label)
+
     def _package(self, directory, contents, components, *, raw_files=None, extra_raw=None):
         package = Path(directory) / "delivery"
         contents = dict(contents)

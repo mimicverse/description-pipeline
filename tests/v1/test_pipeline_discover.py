@@ -1280,6 +1280,26 @@ class DiscoverDomainTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.reason_code, "discover.derivation_invalid")
 
+    def test_derivation_failure_preserves_object_diagnostics(self) -> None:
+        from description_pipeline.io import PipelineError
+
+        failure = PipelineError("Native mate binding is inconsistent")
+        failure.details = {
+            "code": "cad_mate_scope_ambiguous",
+            "detail": {"mate": "seat", "component": "arm-1/bearing-1"},
+        }
+        claim, effects = self.harness.effect_port(self.command)
+        with (
+            patch("description_pipeline.pipeline.discover.derive_native_package", side_effect=failure),
+            self.assertRaises(StageFailure) as raised,
+        ):
+            DiscoverHandler(self.harness.port()).execute(
+                self.command, claim, self.harness.workspace(), effects=effects,
+            )
+        self.assertEqual(raised.exception.reason_code, "discover.derivation_invalid")
+        self.assertEqual(raised.exception.detail, failure.details)
+        self.assertEqual(len(raised.exception.evidence_artifacts), 1)
+
     def test_no_capture_or_downstream_stage_is_invoked(self) -> None:
         with patch(
             "description_pipeline.pipeline.capture._capture_native_transaction",

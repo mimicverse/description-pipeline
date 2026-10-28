@@ -523,14 +523,14 @@ def _entity_reference_from_primary(
             "kind": "point",
             "point": entity["point"],
         }
-        reference_type = 0
+        reference_type = 1
     elif isinstance(entity.get("line"), dict):
         geometry = {
             "kind": "line",
             "point": entity["line"].get("point"),
             "direction": entity["line"].get("direction"),
         }
-        reference_type = 1
+        reference_type = 2
     else:
         return None
     params = _entity_params_from_geometry(
@@ -545,11 +545,11 @@ def _reference_type_from_geometry(reference: dict) -> int | None:
     if not isinstance(geometry, dict):
         return None
     return {
-        "point": 0,
-        "line": 1,
+        "point": 1,
+        "line": 2,
         "plane": 3,
         "cylinder": 4,
-        "cone": 7,
+        "cone": 5,
     }.get(geometry.get("kind"))
 
 

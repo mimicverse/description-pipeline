@@ -32,6 +32,15 @@ def _carrier_names(bodies, joints, root: str) -> tuple[dict[str, str], dict[str,
 
 
 class NamingTests(unittest.TestCase):
+    def test_native_axis_and_datum_carriers_share_the_same_role_semantics(self):
+        for prefix in ("", "c_", "CS_", "a_", "AXIS_"):
+            with self.subTest(prefix=prefix):
+                self.assertEqual(
+                    role_link_name(prefix + "r_elbow", [("right_", "wrist_pitch")]),
+                    "right_forearm_link",
+                )
+                self.assertIsNone(role_link_name(prefix + "r_elbow", [None]))
+
     def test_functional_pitch_names_require_topology_and_parallel_cad_axes(self):
         joints = [
             {"name": "waist", "type": "revolute", "parent": "base", "child": "pelvis",

@@ -54,6 +54,7 @@ from ..schemas import (
     NATIVE_DISCOVERY_RECORD_KEYS,
     NATIVE_DISCOVERY_SCHEMA,
     exporter_declaration_present,
+    saved_native_reference_present,
 )
 from ..sources.solidworks.direction import canonicalize_axis
 from ..sources.solidworks.naming import robot_name as format_robot_name
@@ -871,6 +872,109 @@ def _owned_relative_match(value: object, root: object, relative: str) -> bool:
     return computed.replace("\\", "/").casefold() == relative.replace("\\", "/").casefold()
 
 
+def _suppressed_exclusion_reason(component: dict, raw: dict, native: dict) -> str | None:
+    """Prove an unread occurrence is excluded, without granting source provenance."""
+    name = component.get("name2")
+    provenance = component.get("source_provenance")
+    reference = component.get("native_reference")
+    selection = raw.get("source_selection")
+    closure = selection.get("closure") if isinstance(selection, dict) else None
+    slots = closure.get("suppressed") if isinstance(closure, dict) else None
+    if (
+        not isinstance(name, str) or not name
+        or component.get("instance_id") != name
+        or component.get("suppressed") is not True
+        or type(component.get("suppression_state")) is not int
+        or component["suppression_state"] != 0
+        or component.get("lightweight") is not False
+        or not isinstance(provenance, dict) or provenance.get("state") != "unread"
+        or not isinstance(reference, dict) or not isinstance(slots, list)
+    ):
+        return "the unread occurrence has no exact native suppression evidence"
+    matches = [slot for slot in slots if isinstance(slot, dict) and slot.get("instance") == name]
+    if len(matches) != 1:
+        return "the unread occurrence has no unique sealed suppression exclusion"
+    slot = matches[0]
+    status = closure.get("open_status") or {}
+    justification = (
+        "suppression_with_incomplete_saved_state"
+        if status.get("errors") or status.get("warnings") else "authored_suppression_clean_open"
+    )
+    if slot.get("justification") != justification or slot.get("name", name) != name:
+        return "the suppression exclusion contradicts the sealed saved-state observation"
+    owner, anchor = provenance.get("owner"), provenance.get("defining_anchor")
+    owner_sha = provenance.get("owner_sha256")
+    files = selection.get("files")
+    documents = closure.get("documents")
+    owner_record = documents.get(owner) if isinstance(documents, dict) and isinstance(owner, str) else None
+    if (
+        not isinstance(owner, str) or not isinstance(owner_sha, str) or not _HEX.fullmatch(owner_sha)
+        or not isinstance(files, dict) or files.get(owner) != owner_sha
+        or native.get(owner) != owner_sha or (raw.get("files") or {}).get(owner) != owner_sha
+        or not isinstance(owner_record, dict) or owner_record.get("staged_sha256") != owner_sha
+        or slot.get("document") != owner or slot.get("owner_anchor") != anchor
+        or type(slot.get("suppression_state")) is not int or slot["suppression_state"] != 0
+        or provenance.get("occurrence") != name or provenance.get("used_api") != SESSION_DOCUMENT_API
+        or component.get("defining_anchor") != anchor or reference.get("defining_anchor") != anchor
+        or reference.get("native_owner") != owner
+        or provenance.get("is_virtual") is not False or reference.get("is_virtual") is not False
+    ):
+        return "the suppression exclusion is not bound to the frozen defining owner"
+    path = reference.get("resolved_path")
+    if (
+        not isinstance(path, str) or not ntpath.isabs(path)
+        or any(
+            _verification_document_key(value) != _verification_document_key(path)
+            for value in (slot.get("resolved_path"), component.get("document"), provenance.get("native_document_path"))
+        )
+    ):
+        return "the suppression exclusion names another native reference"
+    components = raw.get("components") or []
+    if anchor is None:
+        defining = owner
+    else:
+        parents = [row for row in components if isinstance(row, dict) and row.get("name2") == anchor]
+        if not isinstance(anchor, str) or len(parents) != 1 or anchor != component.get("parent_occurrence"):
+            return "the suppression exclusion has no unique defining context"
+        defining = parents[0].get("document")
+    observation = component.get("solver_observation")
+    context = observation.get("context") if isinstance(observation, dict) else None
+    parent = component.get("parent_occurrence")
+    parents = [row for row in components if isinstance(row, dict) and row.get("name2") == parent]
+    if parent:
+        if len(parents) != 1 or parents[0].get("document") != defining:
+            return "the excluded occurrence is not bound to its immediate parent"
+        configuration = parents[0].get("configuration")
+    else:
+        if defining != selection.get("main_assembly"):
+            return "the excluded top-level occurrence names another defining assembly"
+        configuration = raw.get("saved_configuration")
+    if (
+        reference.get("defining") != defining or not isinstance(context, dict)
+        or context.get("document") != defining or context.get("scope") != component.get("parent_occurrence")
+        or not isinstance(context.get("configuration"), str) or not context["configuration"]
+        or context["configuration"] != configuration
+    ):
+        return "the suppression exclusion differs from the native definition context"
+    for row in components:
+        if not isinstance(row, dict):
+            continue
+        child = row.get("name2")
+        if isinstance(child, str) and child.startswith(name + "/") and (
+            row.get("suppressed") is not True or type(row.get("suppression_state")) is not int
+            or row["suppression_state"] != 0 or row.get("lightweight") is not False
+        ):
+            return "an excluded unread occurrence has an active or unread descendant"
+    for mate in raw.get("mates") or []:
+        if not isinstance(mate, dict) or mate.get("suppressed") is True:
+            continue
+        for entity in mate.get("entities") or []:
+            target = entity.get("reference_name") if isinstance(entity, dict) else None
+            if isinstance(target, str) and (target == name or target.startswith(name + "/")):
+                return "an active or unread mate requires the excluded occurrence"
+    return None
+
+
 def _require_suppression_states(record: dict) -> None:
     """Every component must carry the documented raw suppression state.
 
@@ -1141,19 +1245,29 @@ _PROJECTED_IDENTITY = (
     (0.0, 0.0, 1.0, 0.0),
     (0.0, 0.0, 0.0, 1.0),
 )
+# IMateEntity2.ReferenceType uses swMateEntityTypes_e, not the similar
+# swMateEntity2ReferenceType_e enumeration.
 _ENTITY_TYPE_NAMES = {
-    0: "Point",
-    1: "Line",
+    0: "Unsupported",
+    1: "Point",
+    2: "Line",
     3: "Plane",
     4: "Cylinder",
-    7: "Cone",
+    5: "Cone",
+    6: "Sphere",
+    7: "Circle",
 }
 _ENTITY_MINIMUMS = {
-    0: 3,
-    1: 6,
+    1: 3,
+    2: 6,
     3: 6,
     4: 7,
-    7: 8,
+    5: 8,
+}
+_ENTITY_UNSUPPORTED = {
+    0: "swMateUnsupported carries no mate entity geometry",
+    6: "swMateSphere local geometry and rank layout are not verified",
+    7: "swMateCircle local geometry and rank layout are not verified",
 }
 
 
@@ -1282,8 +1396,9 @@ def _verification_component_document_is_bound(
     component: dict,
     name: str,
     reference_document: str,
-    native_files: object,
+    record: dict,
 ) -> bool:
+    native_files = record.get("files")
     document = component.get("document")
     if (
         not isinstance(document, str)
@@ -1292,6 +1407,51 @@ def _verification_component_document_is_bound(
         != _verification_document_key(reference_document)
     ):
         return False
+    provenance = component.get("source_provenance")
+    if provenance is not None and not isinstance(provenance, dict):
+        return False
+    provenance = provenance or {}
+    if provenance.get("state") == "cached_materialization" or provenance.get("kind") == "native_import_materialization":
+        reference = component.get("native_reference")
+        if (
+            not isinstance(native_files, dict) or not isinstance(reference, dict)
+            or not isinstance(record.get("session"), dict)
+        ):
+            return False
+        anchor = provenance.get("defining_anchor")
+        defining = provenance.get("owner") if anchor is None else next(
+            (row.get("document") for row in record.get("components", []) if row.get("name2") == anchor), None
+        )
+        pid = (record.get("session") or {}).get("native_api_pid")
+        if (
+            provenance.get("document") is not None
+            or provenance.get("configuration") != component.get("configuration")
+            or provenance.get("occurrence") != name
+            or reference.get("is_virtual") is not False
+            or _verification_document_key(reference.get("native_owner"))
+            != _verification_document_key(provenance.get("owner"))
+            or reference.get("defining_anchor") != anchor
+            or not defining
+            or _verification_document_key(reference.get("defining")) != _verification_document_key(defining)
+            or (anchor is not None and anchor != component.get("parent_occurrence"))
+            or type(pid) is not int or pid <= 0
+            or type(provenance.get("native_api_pid")) is not int
+            or provenance.get("native_api_pid") != pid
+            or session_root_pid(provenance.get("session_temp_root")) != pid
+            or not session_materialization_under_root(document, provenance.get("session_temp_root"))
+            or any(
+                _verification_document_key(provenance.get(key)) != _verification_document_key(document)
+                for key in ("native_document_path", "materialization_path", "session_document_path")
+            )
+        ):
+            return False
+        carrier = record.get("source_selection")
+        if not isinstance(carrier, dict) or not isinstance(carrier.get("closure"), dict):
+            return False
+        slots = carrier["closure"].get("imports")
+        if not isinstance(slots, list) or any(not isinstance(slot, dict) for slot in slots):
+            return False
+        return _cached_materialization_reason(component, provenance, slots, set(), carrier, native_files) is None
     try:
         artifact_path_parts(document.replace("\\", "/"))
     except PipelineError:
@@ -1336,23 +1496,31 @@ def _verification_entity_geometry(reference_type, params):
             "ReferenceType must be an exact native integer",
             {"value_type": type(reference_type).__name__},
         )
+    type_name = _ENTITY_TYPE_NAMES.get(reference_type)
+    if type_name is None:
+        return None, f"ReferenceType {reference_type} is outside swMateEntityTypes_e"
+    unsupported = _ENTITY_UNSUPPORTED.get(reference_type)
+    if unsupported is not None:
+        return {
+            "kind": "unsupported",
+            "type": type_name,
+            "reason": unsupported,
+        }, None
     minimum = _ENTITY_MINIMUMS.get(reference_type)
-    if minimum is None:
-        return None, None
     if len(params) < minimum:
         return None, (
             f"EntityParams has {len(params)} values; the documented layout for "
-            f"{_ENTITY_TYPE_NAMES[reference_type]} needs at least {minimum}"
+            f"{type_name} needs at least {minimum}"
         )
     point = list(params[0:3])
-    if reference_type == 0:
+    if reference_type == 1:
         return {"kind": "point", "point": point}, None
     vector = list(params[3:6])
     norm = math.hypot(*vector)
     if norm <= 0:
         return None, "EntityParams vector is zero-length"
     unit = [value / norm for value in vector]
-    if reference_type == 1:
+    if reference_type == 2:
         return {"kind": "line", "point": point, "direction": unit}, None
     if reference_type == 3:
         return {"kind": "plane", "point": point, "normal": unit}, None
@@ -1618,7 +1786,6 @@ def project_native_verification_record(record: dict) -> dict:
         name: str(component.get("document") or "")
         for name, component in by_component.items()
     }
-    native_files = projected.get("files")
     mates = projected.get("mates")
     if not isinstance(mates, list):
         raise _Failure(
@@ -1725,7 +1892,7 @@ def project_native_verification_record(record: dict) -> dict:
                             by_component[scope],
                             scope,
                             reference_document,
-                            native_files,
+                            record,
                         )
                     )
                 else:
@@ -1763,7 +1930,7 @@ def project_native_verification_record(record: dict) -> dict:
                         by_component[component],
                         component,
                         reference_document,
-                        native_files,
+                        record,
                     )
                 ):
                     raise _Failure(
@@ -2239,9 +2406,16 @@ def _rows_for(mate: dict, frames) -> dict | None:
         # exactly like the same relation written as an ordinary in-scope pair.
         entities = [{**entity, "assembly_frame": False} if entity is nested else entity for entity in entities]
     first, second = entities[0], entities[1]
-    for entity in (first, second):
-        if _rejected_entity(entity, frames):
-            return None
+    geometry_relevant = kind not in {"lock", "limitangle", "limitdistance"}
+    if not geometry_relevant and any(
+        _kind(entity) is not None
+        for entity in (first, second)
+    ):
+        geometry_relevant = True
+    if geometry_relevant:
+        for entity in (first, second):
+            if _rejected_entity(entity, frames):
+                return None
     # The independent rebuild refuses an incomplete or unusable limits reading
     # itself: only an intact observation (explicit null or a mapping) may ever
     # be treated as absence, and no purpose changes that.
@@ -4097,7 +4271,7 @@ def verify_discovery(package: Path) -> dict:
     def imported_sources():
         """Every recorded imported occurrence must bind to a frozen native source.
 
-        Two classes are accepted.  A resolved native imported document whose
+        A resolved native imported document whose
         GetImportedPath names the captured document inside the frozen root binds
         directly.  A cached native materialization (a session temp document whose author
         path is metadata) is accepted only through the mandatory sealed selection
@@ -4106,7 +4280,10 @@ def verify_discovery(package: Path) -> dict:
         native suppression/virtual readings must all match one recorded cached
         materialization, and every recorded cached materialization must be proven by a
         current occurrence.  Nothing is guessed from raw paths, names or suffixes, and a
-        present external file is never downgraded; everything else yields a precise
+        present external file is never downgraded. An unread, natively suppressed
+        occurrence may be reported as excluded only through its exact sealed
+        exclusion and frozen owner, without active descendants or mate dependencies.
+        Exclusion does not grant source provenance. Everything else yields a precise
         discovery.imported_source_unbound failure.
         """
 
@@ -4159,6 +4336,7 @@ def verify_discovery(package: Path) -> dict:
             ]
         cached_used: set[int] = set()
         virtual_used: set[int] = set()
+        excluded: list[str] = []
         unbound: list[dict] = []
         observed = 0
         current_instances: set[str] = set()
@@ -4212,6 +4390,13 @@ def verify_discovery(package: Path) -> dict:
             }
             if not isinstance(provenance, dict):
                 unbound.append({**entry, "state": None, "reason": "imported provenance is not an object"})
+                continue
+            if component.get("suppressed") is True and provenance.get("state") == "unread":
+                reason = _suppressed_exclusion_reason(component, raw, native)
+                if reason is None:
+                    excluded.append(component_name)
+                else:
+                    unbound.append({**entry, "state": "unread", "reason": reason, "error": provenance.get("error")})
                 continue
             if document_has_session_marker and provenance.get("state") not in {
                 "cached_materialization",
@@ -4358,6 +4543,7 @@ def verify_discovery(package: Path) -> dict:
             "imported_occurrences": observed,
             "cached_materializations": len(cached_used),
             "embedded_virtual_components": len(virtual_used),
+            "excluded_suppressed_occurrences": sorted(excluded),
         }
 
     def identity():
@@ -5568,6 +5754,22 @@ def verify_discovery(package: Path) -> dict:
             "diagnostics": report["diagnostics"],
         }
 
+    def saved_native_references():
+        from .saved_native_references import rebuild_saved_native_references
+
+        carrier = rebuild_saved_native_references(
+            state["payload"]["raw"], purpose=str(state["request"]["purpose"]),
+            payload=state["payload"], package=package,
+        )
+        expected_names = {row["source_name"]: row["name"] for row in (*carrier["bodies"], *carrier["joints"])}
+        _require(
+            state["payload"].get("derived_interface_names") == expected_names,
+            "discovery.names", "Saved native interface names differ from the independent reconstruction",
+        )
+        diagnostics.extend(carrier["diagnostics"])
+        return {"bodies": len(carrier["bodies"]), "joints": len(carrier["joints"]),
+                "frames": len(carrier["frames"]), "mechanical_qualified": False, "hardware_qualified": False}
+
     bound = check("discovery.binding", binding)
 
     def suppression():
@@ -5602,7 +5804,10 @@ def verify_discovery(package: Path) -> dict:
     # below; every other present state keeps the declarations suite, which fails closed on
     # unreadable declarations.
     declaration_capture = exporter_declaration_present(raw_block)
-    if bound["passed"] and declaration_capture:
+    native_inspection = saved_native_reference_present(
+        raw_block, str((state.get("request") or {}).get("purpose") or ""),
+    )
+    if bound["passed"] and (declaration_capture or native_inspection):
         # Explicit native declarations do not require incomplete mate inference to
         # rediscover memberships or impose unrelated CS_/dp.* naming conventions.
         # Capture/file binding remains mandatory. A declaration carries no
@@ -5616,7 +5821,8 @@ def verify_discovery(package: Path) -> dict:
             ("discovery.identity", identity),
             ("discovery.revision", revision),
             ("discovery.budgets", budgets),
-            ("discovery.declarations", declarations),
+            ("discovery.saved_native_references", saved_native_references)
+            if native_inspection else ("discovery.declarations", declarations),
         )
     if bound["passed"]:
         payload = state["payload"]
@@ -5667,7 +5873,7 @@ def verify_discovery(package: Path) -> dict:
             (
                 item["details"].get("bodies")
                 for item in checks
-                if item["id"] in {"discovery.bodies", "discovery.declarations"}
+                if item["id"] in {"discovery.bodies", "discovery.declarations", "discovery.saved_native_references"}
             ),
             None,
         )
@@ -5675,7 +5881,7 @@ def verify_discovery(package: Path) -> dict:
             (
                 item["details"].get("joints")
                 for item in checks
-                if item["id"] in {"discovery.joints", "discovery.declarations"}
+                if item["id"] in {"discovery.joints", "discovery.declarations", "discovery.saved_native_references"}
             ),
             None,
         )

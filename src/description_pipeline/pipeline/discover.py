@@ -713,6 +713,7 @@ class DiscoverHandler:
                     "discover.derivation_invalid",
                     str(error),
                     evidence_artifacts=(effect_artifact,),
+                    detail=getattr(error, "details", None),
                 ) from error
             shutil.copytree(observation.root, output / "native-observation")
             checks = {

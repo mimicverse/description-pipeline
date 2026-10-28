@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from ...io import PipelineError, confined, digest, inventory, read_data
+from ...request_evidence import read_request_evidence
 
 
 def _raw_scene_record(scene) -> dict:
@@ -46,6 +47,7 @@ def derive_engineering_input(
         cached_materialization_warnings,
         metadata_value_warnings,
         inplace_observation_warnings,
+        saved_native_reference_warnings,
     )
     from .capture_geometry import materialize_native_geometry
     from .capture_projection import (
@@ -264,6 +266,10 @@ def derive_engineering_input(
     provenance["value_warnings"] = [
         *existing,
         *inplace_observation_warnings(payload.get("raw") or {}),
+        *saved_native_reference_warnings(
+            payload.get("raw") or {},
+            purpose=str(read_request_evidence(delivery / "input/request.json")[0]["purpose"]),
+        ),
         *metadata_warnings,
         *([saved_state_warning] if saved_state_warning is not None else []),
         *cached_warnings,

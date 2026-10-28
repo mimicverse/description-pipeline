@@ -31,7 +31,9 @@ from ..geometry.native_scope import (
 )
 from ..io import PipelineError, confined, digest, file_digest, inventory, read_data
 from ..runtime import python_version_is_supported
-from ..schemas import EFFECTIVE_INSTANCES_SCHEMA, TOOL_SCHEMA, exporter_declaration_present
+from ..schemas import (
+    EFFECTIVE_INSTANCES_SCHEMA, TOOL_SCHEMA, exporter_declaration_present, saved_native_reference_present,
+)
 from ..sources.solidworks.naming import fixed_joint_name
 from ..sources.solidworks.native_limits import (
     ENGINEERING_DEFAULT_POLICY_ID,
@@ -49,6 +51,9 @@ from ..sources.solidworks.evidence import (
     INPLACE_WARNING_CODE,
     INPLACE_WARNING_MESSAGE,
     inplace_observation_warnings,
+    SAVED_NATIVE_WARNING_CODE,
+    SAVED_NATIVE_WARNING_MESSAGE,
+    saved_native_reference_warnings,
 )
 from ..sources.solidworks.saved_state import (
     SAVED_STATE_WARNING_CODE,
@@ -291,7 +296,20 @@ def _input(root, diagnostics=None):
     raw = discovery_record["raw"]
     from .native_discovery import rebuild_interface_frames, rebuild_joint_facts, rebuild_rigid_bodies
 
-    if exporter_declaration_present(raw):
+    if saved_native_reference_present(raw, _request_purpose(root)):
+        from .saved_native_references import rebuild_saved_native_references
+
+        saved = rebuild_saved_native_references(
+            raw, purpose=_request_purpose(root), payload=discovery_record, package=Path(root),
+        )
+        bodies, joints, frames = saved["bodies"], saved["joints"], saved["frames"]
+        native_names = {body["name"]: body["source_name"] for body in bodies}
+        native_bodies = [{**body, "name": body["source_name"]} for body in bodies]
+        native_joints = [{**joint, "name": joint["source_name"], "parent": native_names[joint["parent"]],
+                          "child": native_names[joint["child"]]} for joint in joints]
+        carrier_snapshot = _carrier_snapshot(native_names[saved["root"]], native_bodies, native_joints, raw)
+        diagnostics.extend(saved["diagnostics"])
+    elif exporter_declaration_present(raw):
         # The declaration domain carries its own independent decode: the consumer
         # expectations come from the sealed declaration, and the failure cause is never
         # swallowed into zero objects.
@@ -2221,6 +2239,7 @@ def _verify_model(
     from .solidworks_physics import verify_physics
     source = definition["source"]
     carrier = source.get("carrier")
+    discovery_raw = evidence.discovery(root)["raw"]
     native_geometry_rows = evidence.geometry(root)
     source_manifest = verify_snapshot(root / "evidence")
     native_appearance = source_manifest.get("evidence_class") != "fixture"
@@ -2257,9 +2276,12 @@ def _verify_model(
             native_appearance=native_appearance,
             metadata_warnings=metadata_warnings,
             source_scopes=evidence.source_scopes(root),
-            observation_warnings=inplace_observation_warnings(
-                read_data(root / "input/discovery/native-discovery.json")["raw"]
-            ),
+            observation_warnings=[
+                *inplace_observation_warnings(discovery_raw),
+                *saved_native_reference_warnings(
+                    discovery_raw, purpose=_request_purpose(root),
+                ),
+            ],
         ),
     )
     gates.add("physics.independent", lambda: _physics(root, source, model, verify_physics))
@@ -3326,6 +3348,7 @@ def _value_warning_gate(
         METADATA_WARNING_CODE: METADATA_WARNING_MESSAGE,
         INPLACE_WARNING_CODE: INPLACE_WARNING_MESSAGE,
         CACHED_MATERIALIZATION_WARNING_CODE: CACHED_MATERIALIZATION_WARNING_MESSAGE,
+        SAVED_NATIVE_WARNING_CODE: SAVED_NATIVE_WARNING_MESSAGE,
         **(
             {SAVED_STATE_WARNING_CODE: saved_state_warning["message"]}
             if saved_state_warning is not None
