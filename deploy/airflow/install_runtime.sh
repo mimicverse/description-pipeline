@@ -30,6 +30,9 @@ for pair in "AIRFLOW_VENV:$AIRFLOW_VENV" "AIRFLOW_HOME:$AIRFLOW_HOME" "PIPELINE_
 done
 [ "$AIRFLOW_VENV" != "$AIRFLOW_HOME" ] || die "AIRFLOW_VENV and AIRFLOW_HOME must be distinct"
 [ -f "$PIPELINE_WHEEL" ] || die "PIPELINE_WHEEL does not exist: $PIPELINE_WHEEL"
+: "${PIP_FIND_LINKS:?set PIP_FIND_LINKS to the verified release wheelhouse}"
+case "$PIP_FIND_LINKS" in /*) ;; *) die "PIP_FIND_LINKS must be an absolute directory" ;; esac
+[ -d "$PIP_FIND_LINKS" ] && [ ! -L "$PIP_FIND_LINKS" ] || die "PIP_FIND_LINKS must be an ordinary directory"
 case "$(basename "$PIPELINE_WHEEL")" in
   mimicverse_description-*.whl) ;;
   *) die "PIPELINE_WHEEL must be the built mimicverse_description-*.whl wheel" ;;
@@ -46,9 +49,9 @@ fi
 
 # The lock is a fully resolved, hash-pinned, wheel-only stack: no floating versions,
 # no build dependencies, no pip upgrade in the private venv.
-"$AIRFLOW_VENV/bin/python" -m pip install --require-hashes --only-binary=:all: \
+"$AIRFLOW_VENV/bin/python" -m pip install --no-index --find-links "$PIP_FIND_LINKS" --require-hashes --only-binary=:all: \
   -r "$HERE/requirements.lock"
-"$AIRFLOW_VENV/bin/python" -m pip install --no-deps --force-reinstall "$PIPELINE_WHEEL"
+"$AIRFLOW_VENV/bin/python" -m pip install --no-index --no-deps --force-reinstall "$PIPELINE_WHEEL"
 "$AIRFLOW_VENV/bin/python" -m pip check
 "$AIRFLOW_VENV/bin/description" doctor
 

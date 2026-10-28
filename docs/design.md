@@ -37,7 +37,7 @@ flowchart LR
 
 Linux 完成上传与 Freeze 后，Windows 为 Discover 和 Capture 分别物化受控输入、建立并释放自己的原生会话。Discover 返回原生观察，Linux 形成 prepared package；Capture 返回原生证据，Linux 接纳并独立核验传输。SourceSet archive 与 prepared archive 是不同对象，分别记录摘要，并证明同一封存原件血缘。等待 Linux 时不占用 CAD 会话，不引入跨 operation 的可变来源缓存。
 
-部署只维护当前发行的首次安装和运行。双端从固定 main 的离线资产安装同一发行，CPython 3.12 及依赖由角色档案锁定。已存在的安装或身份不明残留不能自动覆盖；安装失败保全诊断、停止本次启动的写者并保持准入关闭，不切换或恢复历史发行。
+部署只维护当前发行的首次安装和运行。主机先满足支持矩阵中的 CPython、系统服务与原生软件条件；双端产品及 Python 依赖从固定 main 的离线角色资产安装同一发行。Linux 首次安装和同版恢复均消费经发行摘要验证的 wheelhouse，pip 禁止访问索引。已存在的安装或身份不明残留不能自动覆盖；安装失败保全诊断、停止本次启动的写者并保持准入关闭，不切换或恢复历史发行。
 
 Linux 控制入口负责安装、启动、排空、停止、状态、健康和当前业务 effect 对账；Windows 入口负责当前执行端的安装和生命周期。删除 stage/promote/rollback、跨代控制器委派与历史包适配。业务 UNKNOWN 对账、受控重试和资源释放仍由 StageApplication、FactStore 与资源所有权规则决定，部署工具不复制业务恢复逻辑。同版业务数据的备份与灾难恢复保持独立，不依赖历史发行切换记录。
 

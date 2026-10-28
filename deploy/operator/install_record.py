@@ -21,10 +21,12 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import re
 import sys
+import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -588,6 +590,33 @@ def stage_release_wheel(
     return wheel_binding(release, wheel=stable)
 
 
+def extract_linux_wheelhouse(release_file: Path, destination: Path) -> None:
+    """Materialize only wheels from the manifest-bound Linux role archive."""
+
+    release = release_identity(_load_json(release_file, "release file"))
+    name = f"description-{release['version']}-linux-cp312-x86_64.zip"
+    artifacts = {row["name"]: row["sha256"] for row in release["artifacts"]}
+    require(name in artifacts, "release.json has no Linux role archive")
+    source = _confined_artifact(release_file.parent, name)
+    require(source is not None, "the Linux role archive is missing")
+    payload = source.read_bytes()
+    require(hashlib.sha256(payload).hexdigest() == artifacts[name], "Linux role archive differs from release.json")
+    require(destination.is_dir() and not _is_link(destination) and not any(destination.iterdir()),
+            "wheelhouse destination must be an empty ordinary directory")
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        names = archive.namelist()
+        require(len(names) == len(set(names)), "Linux role archive repeats a member")
+        wheels = []
+        for member in names:
+            confined_relative(member, "Linux role member")
+            parts = member.split("/")
+            if len(parts) == 2 and parts[0] == "wheels" and parts[1].endswith(".whl"):
+                wheels.append(member)
+        require(bool(wheels), "Linux role archive contains no wheels")
+        for member in wheels:
+            atomic_write_once(destination / member.split("/")[1], archive.read(member))
+
+
 def build_install_record(
     *,
     install_id: str,
@@ -758,6 +787,9 @@ def main(argv: list[str] | None = None) -> int:
     stage.add_argument("--release-root", type=Path, required=True)
     stage.add_argument("--wheel", type=Path, default=None)
     stage.add_argument("--tree", type=Path, default=None)
+    wheelhouse = subparsers.add_parser("extract-linux-wheelhouse")
+    wheelhouse.add_argument("--release-file", type=Path, required=True)
+    wheelhouse.add_argument("--destination", type=Path, required=True)
     verify = subparsers.add_parser("verify-active")
     verify.add_argument("--config", type=Path, required=True)
     verify.add_argument("--state-root", type=Path, required=True)
@@ -773,6 +805,9 @@ def main(argv: list[str] | None = None) -> int:
     windows_result.add_argument("--install-record", type=Path)
     args = parser.parse_args(argv)
 
+    if args.action == "extract-linux-wheelhouse":
+        extract_linux_wheelhouse(args.release_file, args.destination)
+        return 0
     if args.action == "verify-windows-result":
         document = load_windows_result(args.result)
         if document is None:

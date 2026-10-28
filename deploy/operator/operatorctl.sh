@@ -79,9 +79,11 @@ CONFIG_FILE=""
 RESOLVED_CONFIG=""
 RENDER_LOG=""
 TOOLCHAIN_LOG=""
+INSTALL_WHEELHOUSE=""
 INSTALL_DATABASE_STARTED=""
 INSTALL_COMMITTED=""
 cleanup_operatorctl() {
+  [ -z "$INSTALL_WHEELHOUSE" ] || rm -rf -- "$INSTALL_WHEELHOUSE" 2>/dev/null || true
   [ -z "$RENDER_LOG" ] || rm -f -- "$RENDER_LOG" 2>/dev/null || true
   [ -z "$TOOLCHAIN_LOG" ] || rm -f -- "$TOOLCHAIN_LOG" 2>/dev/null || true
   [ -z "$RESOLVED_CONFIG" ] || rm -f -- "$RESOLVED_CONFIG" 2>/dev/null || true
@@ -758,6 +760,9 @@ install_from_config() {
     "$CONTROL_PYTHON" "$HERE/install_record.py" check --release-file "$RELEASE_FILE" \
       --tree "$RELEASE_ROOT" >/dev/null || exit $?
   fi
+  INSTALL_WHEELHOUSE="$(mktemp -d)"
+  "$CONTROL_PYTHON" "$HERE/install_record.py" extract-linux-wheelhouse \
+    --release-file "$RELEASE_FILE" --destination "$INSTALL_WHEELHOUSE" || exit $?
   if [ -z "$INSTALL_ID" ]; then
     INSTALL_ID="$("$CONTROL_PYTHON" -c 'import uuid; print(uuid.uuid4().hex)')"
   fi
@@ -827,6 +832,7 @@ install_from_config() {
     || die "platform bootstrap failed"
   AIRFLOW_VENV="$AIRFLOW_VENV" AIRFLOW_HOME="$AIRFLOW_HOME" \
     AIRFLOW_PYTHON="${AIRFLOW_PYTHON:-}" \
+    PIP_NO_INDEX=1 PIP_FIND_LINKS="$INSTALL_WHEELHOUSE" \
     PIPELINE_WHEEL="${PIPELINE_WHEEL:?PIPELINE_WHEEL is required}" \
     AIRFLOW_DB_URL="$AIRFLOW_DB_URL" AIRFLOW_RUNTIME_DB_URL="$AIRFLOW_RUNTIME_DB_URL" \
     AIRFLOW_API_PORT="$AIRFLOW_API_PORT" bash "$AIRFLOW_HERE/install.sh"

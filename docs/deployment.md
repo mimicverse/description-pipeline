@@ -28,6 +28,8 @@ Linux 承担平台编排、工程模型与 URDF 生成、独立验证、报告�
 
 发行物的 `release.json` 是支持矩阵与依赖身份的权威：两端源码发行身份一致，角色依赖分别锁定。Linux 消费者验证无渲染，不要求桌面、GPU 或图形驱动。Windows 服务不能运行在 Session 0，不能复用工程师的交互 CAD 会话。
 
+Linux 安装先校验同一发行的角色 ZIP，再将其中 wheels 提取到本次命令独占的临时目录；Airflow 与产品依赖安装使用 `--no-index` 和锁定摘要，成功或失败均清理该临时目录。CPython、PostgreSQL、代理、Git 与 SolidWorks 属于上表的主机准备条件，不包含在 Python wheelhouse 中。
+
 Windows 安装与生命周期脚本须在 Windows PowerShell 5.1 Desktop 上通过语法、API 及实际入口验证，保留严格 JSON 和重复键拒绝语义；Linux 上的 `pwsh` 测试不能代替该兼容性证明。新发行进入部署窗口前，先在目标主机用 `powershell.exe` 完成不操作 CAD、不修改活动服务的兼容性预验。
 
 ## 配置权威

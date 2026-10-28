@@ -402,7 +402,8 @@ def deployment_fixture(root: Path) -> tuple[Path, Path, dict[str, str], dict[str
     linux = release / "description-1.0.0-linux-cp312-x86_64.zip"
     windows_zip = release / "description-1.0.0-windows-cp312-x86_64.zip"
     deployment_zip = release / "description-1.0.0-deployment.zip"
-    linux.write_bytes(b"linux")
+    with zipfile.ZipFile(linux, "w") as archive:
+        archive.writestr(f"wheels/{wheel.name}", wheel.read_bytes())
     windows_zip.write_bytes(b"windows")
     deployment_zip.write_bytes(b"deployment")
     dag = airflow / "dags" / "solidworks_to_urdf.py"
