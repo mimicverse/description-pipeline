@@ -2,7 +2,7 @@
 
 部署由一台 Linux 平台主机和一个串行 Windows 原生执行端组成。用户仅访问一个 HTTPS 操作台；Airflow、数据库、内部 API 和原生端点不直接向用户开放。
 
-Linux 承担平台编排、工程模型与 URDF 生成、独立验证、报告和发布。Windows 运行原生 CAD 读取，并在释放 CAD 后完成当前 Capture 的原值投影、惯量规范化、raw/STL 序列化与证据封包；这部分不再占用 CAD 会话，但仍使用 Windows 主机，不能宣称全部可移植计算已迁到 Linux。Windows 只安装原生运行依赖和已资格化的 SolidWorks，运行在专用登录用户的交互式桌面中；不配置模型仓库、发布目标、Git 凭据、报告或 MuJoCo。
+Linux 承担平台编排、工程模型与 URDF 生成、独立验证、报告和发布。Windows 运行原生 CAD 读取，释放 CAD 后完成原值序列化与证据封包。Linux Capture 核验传输与绑定，Generate 一次执行语义投影、惯量规范化和 STL 生成，Verify 从 raw 独立复算。Windows 只安装原生运行依赖和已资格化的 SolidWorks，运行在专用登录用户的交互式桌面中；不配置模型仓库、发布目标、Git 凭据、报告或 MuJoCo。
 
 ## 开发与发行链路
 
@@ -266,7 +266,8 @@ fact/decision、不取消外部操作。401/403、`native_operation_identity_mis
     origin claim、native worker owner 与 install target 分别核验。
 11. 使用固定候选的真实生产方法验证 `native-triangles/v1`：从 occurrence/body/face
     的原生返回读取 raw 三角形、实际 placement、物性与基准值，证明 CAD 释放先于
-    离线投影、STL 序列化和封包。质量、质心及两种参考点的惯量须从同一实际原生
+    封包，语义投影、惯量规范化和 STL 物化只在 Linux Generate 执行一次；Windows
+    不执行这些计算职责，Capture 接纳不重复投影。质量、质心及两种参考点的惯量须从同一实际原生
     物性对象读取；测试不得用 support fixture 预填缺失原值来替代生产读取。
 12. 注入原生读取失败、原始矩阵和惯量缺失或篡改、非法数量、截断/尾随字节、非有限
     三角形、错误 occurrence/configuration/source scope、face span 遗漏或重叠、

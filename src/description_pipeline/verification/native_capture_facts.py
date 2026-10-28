@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import copy
 import math
 from pathlib import Path
 
 from ..geometry.native_scope import native_source_scope_is_valid
 from ..geometry.native_transform import transform_from_solidworks
 from ..io import PipelineError
-from ..schemas import NATIVE_CAPTURE_FACTS_KEYS
+from ..schemas import NATIVE_CAPTURE_OBSERVATION_KEYS
 from ..sources.solidworks.inertia_convention import POSITIVE, detect_family
 from . import capture_evidence as evidence
 
@@ -149,6 +150,7 @@ def _raw_link_detector_record(raw: object) -> dict:
                     "inertia_values_about_origin_api": read.get(
                         "inertia_values_about_origin_api"
                     ),
+                    "read_errors": copy.deepcopy(read.get("read_errors")),
                 }
             )
         links[str(name)] = {"reads": reads}
@@ -173,6 +175,14 @@ def _verify_raw_scene(root: Path, raw_facts: dict) -> None:
         name = row["name"]
         if name in occurrences:
             raise PipelineError(f"native scene repeats occurrence {name}")
+        if type(row.get("is_fixed")) is not bool:
+            raise PipelineError(
+                f"native scene occurrence {name} has no native fixed state"
+            )
+        if row.get("is_fixed_error") is not None:
+            raise PipelineError(
+                f"native scene occurrence {name} carries a contradictory fixed error"
+            )
         transform = transform_from_solidworks(row.get("transform_raw"))
         occurrences[name] = (row, transform)
     projected_components = projected.get("components")
@@ -192,6 +202,14 @@ def _verify_raw_scene(root: Path, raw_facts: dict) -> None:
             raise PipelineError("native leaf component has no identity")
         name = row["name"]
         raw_leaf_names.add(name)
+        if type(row.get("is_fixed")) is not bool:
+            raise PipelineError(
+                f"native leaf {name} has no native fixed state"
+            )
+        if row.get("is_fixed_error") is not None:
+            raise PipelineError(
+                f"native leaf {name} carries a contradictory fixed error"
+            )
         occurrence = occurrences.get(name)
         if occurrence is None:
             raise PipelineError(f"native leaf {name} has no occurrence transform")
@@ -222,10 +240,17 @@ def _verify_raw_scene(root: Path, raw_facts: dict) -> None:
     for key, datum in raw_datums.items():
         if not isinstance(datum, dict):
             raise PipelineError(f"{key}: raw coordinate system is malformed")
+        read_errors = datum.get("read_errors")
+        if type(read_errors) is not dict:
+            raise PipelineError(f"{key}: raw coordinate system has no error map")
+        if read_errors:
+            raise PipelineError(f"{key}: raw coordinate system carries a read error")
         local = transform_from_solidworks(datum.get("array_data"))
         owner = datum.get("owner")
+        if type(owner) is not str:
+            raise PipelineError(f"{key}: raw coordinate-system owner is not a string")
         if owner:
-            occurrence = occurrences.get(str(owner))
+            occurrence = occurrences.get(owner)
             if occurrence is None:
                 raise PipelineError(f"{key}: raw coordinate-system owner is not an occurrence")
             local = _compose_matrix(occurrence[1], local)
@@ -420,10 +445,42 @@ def _verify_raw_links(root: Path, raw_facts: dict, *, positive_products: bool) -
             )
             raw_origin = raw_read.get("inertia_values_about_origin_api")
             projected_origin = projected_read.get("inertia_values_about_origin_api")
+            raw_read_errors = raw_read.get("read_errors")
+            if not isinstance(raw_read_errors, dict):
+                raise PipelineError(
+                    f"link-group {name} read {index} has no error map"
+                )
+            recorded_origin_error = raw_read_errors.get(
+                "inertia_values_about_origin_api"
+            )
             if raw_origin is None:
+                if recorded_origin_error is not None:
+                    raise PipelineError(
+                        f"link-group {name} read {index} origin error has no matching origin value"
+                    )
                 if projected_origin is not None:
                     raise PipelineError(f"link-group {name} read {index} invents an origin tensor")
+            elif isinstance(raw_origin, dict):
+                if (
+                    not isinstance(raw_origin.get("code"), str)
+                    or not raw_origin["code"].strip()
+                ):
+                    raise PipelineError(
+                        f"link-group {name} read {index} origin error is malformed"
+                    )
+                if recorded_origin_error != raw_origin:
+                    raise PipelineError(
+                        f"link-group {name} read {index} origin error differs from its read-error entry"
+                    )
+                if projected_origin != raw_origin:
+                    raise PipelineError(
+                        f"link-group {name} read {index} origin error differs from raw facts"
+                    )
             else:
+                if recorded_origin_error is not None:
+                    raise PipelineError(
+                        f"link-group {name} read {index} origin error conflicts with a recorded tensor"
+                    )
                 if not isinstance(raw_origin, list) or len(raw_origin) != 9:
                     raise PipelineError(f"link-group {name} read {index} origin tensor is malformed")
                 expected_origin = [float(value) for value in raw_origin]
@@ -461,21 +518,16 @@ def verify_native_capture_facts(bundle_root: Path) -> dict:
 
     root = Path(bundle_root)
     raw_facts = evidence.native_capture_facts(root)
-    if not isinstance(raw_facts, dict) or set(raw_facts) != NATIVE_CAPTURE_FACTS_KEYS:
+    if (
+        not isinstance(raw_facts, dict)
+        or set(raw_facts) != NATIVE_CAPTURE_OBSERVATION_KEYS
+    ):
         raise PipelineError("native_capture_facts has an unknown field set")
-    convention = evidence.inertia_convention(root)
-    if not isinstance(convention, dict):
-        raise PipelineError("inertia convention evidence is not an object")
     try:
         raw_family = detect_family(_raw_link_detector_record(raw_facts.get("link_group_mass_raw")))["family"]
     except Exception as error:
         raise PipelineError(f"raw native link-group inertia convention is unverified: {error}") from error
-    if convention.get("detected") != raw_family:
-        raise PipelineError("sealed inertia convention differs from raw link-group facts")
     applied = raw_family == POSITIVE
-    transform = convention.get("capture_transform")
-    if not isinstance(transform, dict) or transform.get("applied") is not applied:
-        raise PipelineError("sealed inertia convention transform differs from raw facts")
     _verify_raw_scene(root, raw_facts)
     _verify_raw_masses(root, raw_facts, positive_products=applied)
     _verify_raw_effective(root, raw_facts, positive_products=applied)

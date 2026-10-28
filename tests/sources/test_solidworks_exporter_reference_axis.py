@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from description_pipeline.sources.solidworks import native as N
+from description_pipeline.sources.solidworks import capture_projection
 from description_pipeline.sources.solidworks.errors import CadError
 from tests.sources.test_solidworks_native_reader import (
     _App,
@@ -172,7 +173,7 @@ class ReferenceAxisReadTests(unittest.TestCase):
                 self.assertNotIn("raw_endpoints_m", raw)
                 self.assertNotIn("axis_point_m", raw)
                 self.assertNotIn("axis_direction", raw)
-                record = N.project_axis_references([{"joint": "hinge", **raw}])[0]
+                record = capture_projection.project_axis_references([{"joint": "hinge", **raw}])[0]
                 self.assertEqual(record["raw_endpoints_m"], [1.0, 2.0, 3.0, 1.0, 5.0, 7.0])
                 self.assertEqual(record["axis_point_m"], [1.0, 2.0, 3.0])
                 self.assertEqual(record["axis_direction"], [0.0, 0.6, 0.8])
@@ -194,7 +195,7 @@ class ReferenceAxisReadTests(unittest.TestCase):
         ):
             with self.subTest(feature=feature), self.assertRaises(CadError) as caught:
                 raw = N._capture_reference_axis_raw(_doc(feature), "a_joint")
-                N.project_axis_references([{"joint": "hinge", **raw}])
+                capture_projection.project_axis_references([{"joint": "hinge", **raw}])
             self.assertEqual(caught.exception.code, "cad_axis_reference_unreadable")
 
     def test_capture_keeps_the_assembly_selector_raw_until_projection(self):
@@ -206,7 +207,7 @@ class ReferenceAxisReadTests(unittest.TestCase):
         captured.assert_called_once_with("saved-assembly", phase="axis_reference")
         self.assertEqual(raw["coordinate_frame"], "assembly")
         self.assertNotIn("axis_point_m", raw)
-        projected = N.project_axis_references([{"joint": "hinge", **raw}])[0]
+        projected = capture_projection.project_axis_references([{"joint": "hinge", **raw}])[0]
         self.assertEqual(projected["coordinate_frame"], "assembly")
 
     def test_capture_retains_selector_errors_and_projection_refuses_them(self):
@@ -223,7 +224,7 @@ class ReferenceAxisReadTests(unittest.TestCase):
                     CadError,
                     msg="raw selector failures must not be replaced by a fallback axis",
                 ):
-                    N.project_axis_references([{"joint": "hinge", **raw}])
+                    capture_projection.project_axis_references([{"joint": "hinge", **raw}])
 
 
 def session_materialization(directory: Path, name: str) -> Path:

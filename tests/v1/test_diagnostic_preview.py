@@ -157,10 +157,19 @@ class DiagnosticPreviewTests(unittest.TestCase):
         )
         (tree / "input").mkdir()
         write_json(tree / "input/handoff.json", {"passed": True, "warnings": INPUT_WARNINGS["warnings"]})
+        (tree / "input/discovery").mkdir()
         (tree / "evidence").mkdir()
-        write_json(tree / "evidence/discovery.json", DISCOVERY_FINDINGS)
+        write_json(
+            tree / "input/discovery/native-discovery.json",
+            DISCOVERY_FINDINGS,
+        )
         members = []
-        for path in ("urdf/robot.urdf", "reports/quality.json", "input/handoff.json", "evidence/discovery.json"):
+        for path in (
+            "urdf/robot.urdf",
+            "reports/quality.json",
+            "input/handoff.json",
+            "input/discovery/native-discovery.json",
+        ):
             data = (tree / path).read_bytes()
             members.append({"path": path, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()})
         platform.stage(
@@ -480,9 +489,16 @@ class DiagnosticPreviewTests(unittest.TestCase):
         handoff = json.loads((tree / "input/handoff.json").read_text(encoding="utf-8"))
         handoff["warnings"] = INPUT_WARNINGS["warnings"]
         write_json(tree / "input/handoff.json", handoff)
-        discovery = json.loads((tree / "evidence/discovery.json").read_text(encoding="utf-8"))
+        discovery = json.loads(
+            (
+                tree / "input/discovery/native-discovery.json"
+            ).read_text(encoding="utf-8")
+        )
         discovery["findings"] = DISCOVERY_FINDINGS["findings"]
-        write_json(tree / "evidence/discovery.json", discovery)
+        write_json(
+            tree / "input/discovery/native-discovery.json",
+            discovery,
+        )
         write_delivery_manifest(tree, contract=manifest["contract"], policy=manifest["policy"])
         manifest = read_delivery_manifest(tree)
         report = (tree / "reports/quality.json").read_bytes()

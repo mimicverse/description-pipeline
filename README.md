@@ -14,7 +14,7 @@
 
 ## 系统边界
 
-Linux 负责上传冻结、受控规格、结构推导、模型生成、独立验证、报告、预览和发布。Windows 只在自有只读会话中一次读取 CAD 原生几何、轴线、配合、物性及对象归属，随后释放 CAD。Capture 的坐标与物性投影、惯量规范化、raw/STL 序列化和封包仍由 Windows 离线完成；Linux 执行 Generate 与独立 Verify，不修改 CAD。
+Linux 负责上传冻结、受控规格、结构推导、模型生成、独立验证、报告、预览和发布。Windows 只在自有只读会话中一次读取 CAD 原生几何、轴线、配合、物性及对象归属，随后释放 CAD。Windows 只完成原值序列化和封包；Linux Capture 核验传输与绑定，Generate 一次完成坐标与物性投影、惯量规范化和 STL 生成，Verify 从原始事实独立复算。整个流程不修改 CAD。
 
 外观读取在同一个只读会话中保留 document/face 的无参 active-configuration 属性（仅当 active 与 referenced configuration 相同）、各 owner 自己的 configuration/display-state wrapper、同一 exact state 的 `GetRenderMaterialsCount2` 总数与 NULL 原值，以及同 owner/context 的持久引用和对象观察索引。Generate 与 Verify 分别从这些 raw 事实重建绑定；原生总数确证为 0 不等于把 NULL 改写成空数组，无法绑定或无法证明无关的实体不会被静默忽略。
 

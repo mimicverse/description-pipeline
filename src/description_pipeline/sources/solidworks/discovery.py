@@ -88,6 +88,7 @@ from .direction import canonicalize_axis
 from .naming import robot_name as format_robot_name
 from .revision import package_inventory
 from ...schemas import (
+    CAPTURE_EVIDENCE_REQUESTS,
     NATIVE_DISCOVERY_FINDING_SCHEMA,
     NATIVE_DISCOVERY_SCHEMA,
     NATIVE_IDENTITY_RESOLUTION_SCHEMA,
@@ -5292,6 +5293,171 @@ def native_component_identity(component: dict) -> str:
     return values[0]
 
 
+def _validate_component_states(record: dict, findings: list[dict]) -> None:
+    """Validate the raw component state/flags once for derivation and rebuilds."""
+
+    components = record.get("components")
+    if not isinstance(components, list):
+        findings.append(
+            _finding(
+                "discovery.suppression_state_invalid",
+                "assembly",
+                "the native record carries no component list to classify",
+                {"components": type(components).__name__},
+            )
+        )
+        return
+    for item in components:
+        if not isinstance(item, dict):
+            findings.append(
+                _finding(
+                    "discovery.suppression_state_invalid",
+                    "assembly",
+                    "a raw component entry is not an object",
+                    {"entry": repr(item)[:200]},
+                )
+            )
+            continue
+        name = str(item.get("name2") or "?")
+        state = item.get("suppression_state")
+        if type(state) is not int or state not in {0, 1, 2, 3, 4}:
+            findings.append(
+                _finding(
+                    "discovery.suppression_state_invalid",
+                    f"component:{name}",
+                    "every component must carry the documented raw suppression state "
+                    "(integer 0..4); state 5 and missing, boolean or undocumented values are refused",
+                    {"suppression_state": state},
+                )
+            )
+            continue
+        suppressed = item.get("suppressed")
+        lightweight = item.get("lightweight")
+        fixed = item.get("fixed")
+        if type(fixed) is not bool:
+            findings.append(
+                _finding(
+                    "discovery.component_fixed_invalid",
+                    f"component:{name}",
+                    "component does not carry the exact native boolean IComponent2.IsFixed reading",
+                    {"fixed": fixed, "error": item.get("fixed_error")},
+                )
+            )
+        if type(suppressed) is not bool or type(lightweight) is not bool:
+            findings.append(
+                _finding(
+                    "discovery.suppression_state_invalid",
+                    f"component:{name}",
+                    "every component must carry boolean suppressed and lightweight flags",
+                    {
+                        "suppressed": suppressed,
+                        "lightweight": lightweight,
+                    },
+                )
+            )
+            continue
+        if suppressed != (state == 0) or lightweight != (state in {1, 4}):
+            findings.append(
+                _finding(
+                    "discovery.suppression_state_incoherent",
+                    f"component:{name}",
+                    "the emitted suppression flags must agree with the raw suppression state",
+                    {
+                        "suppression_state": state,
+                        "suppressed": suppressed,
+                        "lightweight": lightweight,
+                    },
+                )
+            )
+            continue
+        if state in {1, 4}:
+            findings.append(
+                _finding(
+                    "discovery.suppression_lightweight",
+                    f"component:{name}",
+                    "a lightweight component cannot be independently measured; the native capture must fully load it",
+                    {"component": name, "suppression_state": state},
+                )
+            )
+
+
+def _validate_source_definition_record(payload: object) -> dict:
+    """Strictly validate the raw evidence consumed by one source rebuild."""
+
+    if not isinstance(payload, dict) or payload.get("schema_version") != DISCOVERY_SCHEMA:
+        raise PipelineError("native discovery record has an unexpected schema")
+    for field in ("identity", "derivation"):
+        value = payload.get(field)
+        if value is not None and not isinstance(value, dict):
+            raise PipelineError(
+                f"native discovery {field} must be an object"
+            )
+    records = payload.get("records")
+    if records is not None and (
+        not isinstance(records, list)
+        or any(not isinstance(item, dict) for item in records)
+    ):
+        raise PipelineError(
+            "native discovery records must be an object list"
+        )
+    raw = payload.get("raw")
+    if not isinstance(raw, dict):
+        raise PipelineError("native discovery raw record must be an object")
+    _validate_native_record(raw)
+    _validate_property_objects(raw)
+    identity = raw.get("identity")
+    if identity is not None and not isinstance(identity, dict):
+        raise CadError(
+            "cad_identity_invalid",
+            "raw identity evidence is not an object",
+            {"value_type": type(identity).__name__},
+        )
+    control = identity.get("control") if isinstance(identity, dict) else None
+    if control is not None and not isinstance(control, dict):
+        raise CadError(
+            "cad_identity_invalid",
+            "raw control identity is not an object",
+            {"value_type": type(control).__name__},
+        )
+    if isinstance(control, dict) and set(control) - {"system", "reference"}:
+        raise CadError(
+            "cad_identity_invalid",
+            "raw control identity carries unknown fields",
+            {
+                "unknown": sorted(
+                    str(value)
+                    for value in set(control) - {"system", "reference"}
+                )
+            },
+        )
+    for key in (
+        "hardware_id",
+        "revision",
+        "parent_revision",
+        "owner",
+        "change_summary",
+        "delivery_configuration",
+        "main_assembly",
+        "robot_name",
+        "control.system",
+        "control.reference",
+    ):
+        value = _identity_value(raw, NAMESPACE, key)
+        if value is not None and (
+            not isinstance(value, str) or not value.strip()
+        ):
+            raise CadError(
+                "cad_identity_invalid",
+                "a supplied identity value must be non-empty text",
+                {
+                    "field": key,
+                    "value": repr(value)[:300],
+                    "value_type": type(value).__name__,
+                },
+            )
+    return raw
+
+
 def derive_native_package(
     frozen_source: Path,
     output: Path,
@@ -5373,85 +5539,7 @@ def derive_native_package(
             findings.append(saved_state_warning)
     except ValueError as error:
         raise PipelineError(f"Saved-state source evidence is incoherent: {error}") from error
-    components = record.get("components")
-    if not isinstance(components, list):
-        findings.append(
-            _finding(
-                "discovery.suppression_state_invalid",
-                "assembly",
-                "the native record carries no component list to classify",
-                {"components": type(components).__name__},
-            )
-        )
-    for item in components if isinstance(components, list) else []:
-        if not isinstance(item, dict):
-            findings.append(
-                _finding(
-                    "discovery.suppression_state_invalid",
-                    "assembly",
-                    "a raw component entry is not an object",
-                    {"entry": repr(item)[:200]},
-                )
-            )
-            continue
-        name = str(item.get("name2") or "?")
-        state = item.get("suppression_state")
-        if type(state) is not int or state not in {0, 1, 2, 3, 4}:
-            findings.append(
-                _finding(
-                    "discovery.suppression_state_invalid",
-                    f"component:{name}",
-                    "every component must carry the documented raw suppression state "
-                    "(integer 0..4); state 5 and missing, boolean or undocumented values are refused",
-                    {"suppression_state": state},
-                )
-            )
-            continue
-        suppressed = item.get("suppressed")
-        lightweight = item.get("lightweight")
-        fixed = item.get("fixed")
-        if type(fixed) is not bool:
-            findings.append(
-                _finding(
-                    "discovery.component_fixed_invalid",
-                    f"component:{name}",
-                    "component does not carry the exact native boolean IComponent2.IsFixed reading",
-                    {"fixed": fixed, "error": item.get("fixed_error")},
-                )
-            )
-        if type(suppressed) is not bool or type(lightweight) is not bool:
-            findings.append(
-                _finding(
-                    "discovery.suppression_state_invalid",
-                    f"component:{name}",
-                    "every component must carry boolean suppressed and lightweight flags",
-                    {"suppressed": suppressed, "lightweight": lightweight},
-                )
-            )
-            continue
-        if suppressed != (state == 0) or lightweight != (state in {1, 4}):
-            findings.append(
-                _finding(
-                    "discovery.suppression_state_incoherent",
-                    f"component:{name}",
-                    "the emitted suppression flags must agree with the raw suppression state",
-                    {
-                        "suppression_state": state,
-                        "suppressed": suppressed,
-                        "lightweight": lightweight,
-                    },
-                )
-            )
-            continue
-        if state in {1, 4}:
-            findings.append(
-                _finding(
-                    "discovery.suppression_lightweight",
-                    f"component:{name}",
-                    "a lightweight component cannot be independently measured; the native capture must fully load it",
-                    {"component": name, "suppression_state": state},
-                )
-            )
+    _validate_component_states(record, findings)
     known_occurrences = {
         str(item.get("name2"))
         for item in record.get("components") or []
@@ -5641,11 +5729,7 @@ def derive_native_package(
                     if isinstance(item, dict) and item.get("coordinate_system")
                 }
             ),
-            "evidence_requests": [
-                "evidence/capture.json",
-                "evidence/geometry/",
-                "evidence/native-runtime.json",
-            ],
+            "evidence_requests": list(CAPTURE_EVIDENCE_REQUESTS),
         },
     )
     source_record = _source_record(identity, identity_sources, upload_handoff_digest, records)
@@ -5807,7 +5891,7 @@ def source_definition(
 
     package = Path(package)
     payload = read_data(package / discovery_name)
-    raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
+    raw = _validate_source_definition_record(payload)
     identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else {}
     derivation = payload.get("derivation") if isinstance(payload.get("derivation"), dict) else {}
     records = [item for item in payload.get("records") or [] if isinstance(item, dict)]
@@ -5832,6 +5916,7 @@ def source_definition(
             "main_assembly": identity.get("main_assembly") or derivation.get("main_assembly"),
             "delivery_configuration": identity.get("delivery_configuration") or derivation.get("configuration"),
         }
+        _validate_component_states(raw, findings)
         checks, _budget_entry = _budgets(raw, settings, findings)
         bodies, joints, frames, _names = _derive_carriers(raw, view, settings, findings)
     blocking = [item for item in findings if item.get("blocking")]

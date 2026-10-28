@@ -343,8 +343,9 @@ def _unassigned_world(item: dict, raw_scene: dict) -> tuple[float, np.ndarray, n
 def _link_direct_record(evidence_root: Path, *, configuration: str) -> dict:
     """The sealed direct link group readout record (one supported schema)."""
 
-    collection = evidence.collection(evidence_root)
-    expected_assembly = (collection.get("capture") or {}).get("collected_document")
+    expected_assembly = evidence.dependency_closure(
+        evidence_root
+    ).get("top_level")
     _require(
         isinstance(expected_assembly, str) and bool(expected_assembly),
         "The capture collection carries no collected document identity",
@@ -391,6 +392,44 @@ def _link_direct_record(evidence_root: Path, *, configuration: str) -> dict:
             f"{name}: link group entry carries no reproducibility block",
         )
     return payload
+
+
+def _require_link_repeatability(
+    name: str,
+    reads: list[dict],
+    tensors: list[np.ndarray],
+    recorded_repeat: object,
+) -> None:
+    first, second = reads
+    mass_delta = abs(float(first["mass_kg"]) - float(second["mass_kg"]))
+    com_delta_norm = float(
+        np.linalg.norm(np.subtract(first["com_m"], second["com_m"]))
+    )
+    tensor_delta = float(np.max(np.abs(tensors[0] - tensors[1])))
+    repeat_scale = max(float(np.max(np.abs(tensors[0]))), 1e-20)
+    _require(
+        mass_delta <= LINK_REPEAT_MASS_ATOL_KG
+        and com_delta_norm <= LINK_REPEAT_COM_ATOL_M
+        and tensor_delta <= LINK_REPEAT_TENSOR_RTOL * repeat_scale,
+        name
+        + ": the recorded link group reads do not repeat within the evidence bound",
+    )
+    _require(
+        isinstance(recorded_repeat, dict),
+        name + ": the link group record carries no reproducibility block",
+    )
+    for key, measured in (
+        ("mass_delta_kg", mass_delta),
+        ("com_delta_norm_m", com_delta_norm),
+        ("tensor_delta_max_abs", tensor_delta),
+    ):
+        value = recorded_repeat.get(key)
+        _require(
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and abs(float(value) - measured) <= 1e-12 + 1e-9 * abs(measured),
+            name + ": recorded reproducibility " + key + " differs from the recomputed pair",
+        )
 
 
 def _direct_link_sum(record: dict, source: dict) -> tuple[float, np.ndarray, np.ndarray]:
@@ -576,13 +615,34 @@ def _capture_identity(root):
     identity = verify_snapshot(evidence_dir).get("identity")
     _require(isinstance(identity, dict), "Capture collection identity is missing")
     _require(
-        identity == evidence.collection(root).get("identity"),
-        "Collection and archived source identities differ",
-    )
-    _require(
         isinstance(identity.get("assembly"), str) and bool(identity["assembly"]),
         "Capture identity carries no main assembly",
     )
+    source = evidence.source(root)
+    main = str((source.get("selection") or {}).get("main_assembly") or "")
+    _require(bool(main), "Source record carries no main assembly")
+    normalized_main = main.replace("/", "\\").casefold()
+    _require(
+        identity["assembly"].replace("/", "\\").casefold().endswith(
+            "\\" + normalized_main
+        ),
+        "Capture identity assembly differs from the source record",
+    )
+    observation = evidence.native_capture_facts(root)
+    component = observation.get("component_mass_raw")
+    raw_assembly = (
+        component.get("assembly")
+        if isinstance(component, dict)
+        else None
+    )
+    _require(
+        isinstance(raw_assembly, str)
+        and raw_assembly.replace("/", "\\").casefold().endswith(
+            "\\" + normalized_main
+        ),
+        "Raw component context names another main assembly",
+    )
+    identity = {**identity, "assembly": raw_assembly}
     return identity
 
 
@@ -1111,34 +1171,13 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
                         {"read": len(tensors), "active": sorted(key for key, value in overrides.items() if value)}
                     )
                 tensors.append(tensor)
-            first, second = reads
-            mass_delta = abs(float(first["mass_kg"]) - float(second["mass_kg"]))
-            com_delta_norm = float(np.linalg.norm(np.subtract(first["com_m"], second["com_m"])))
-            tensor_delta = float(np.max(np.abs(tensors[0] - tensors[1])))
-            repeat_scale = max(float(np.max(np.abs(tensors[0]))), 1e-20)
-            _require(
-                mass_delta <= LINK_REPEAT_MASS_ATOL_KG
-                and com_delta_norm <= LINK_REPEAT_COM_ATOL_M
-                and tensor_delta <= LINK_REPEAT_TENSOR_RTOL * repeat_scale,
-                name + ": the recorded link group reads do not repeat within the evidence bound",
+            first = reads[0]
+            _require_link_repeatability(
+                name,
+                reads,
+                tensors,
+                entry.get("reproducibility"),
             )
-            recorded_repeat = entry.get("reproducibility")
-            _require(
-                isinstance(recorded_repeat, dict),
-                name + ": the link group record carries no reproducibility block",
-            )
-            for key, measured in (
-                ("mass_delta_kg", mass_delta),
-                ("com_delta_norm_m", com_delta_norm),
-                ("tensor_delta_max_abs", tensor_delta),
-            ):
-                value = recorded_repeat.get(key)
-                _require(
-                    isinstance(value, (int, float))
-                    and not isinstance(value, bool)
-                    and abs(float(value) - measured) <= 1e-12 + 1e-9 * abs(measured),
-                    name + ": recorded reproducibility " + key + " differs from the recomputed pair",
-                )
             rotation, origin = oracle._transform(datums[body["frame"]["coordinate_system"]])
             expected_mass = float(first["mass_kg"])
             expected_com = rotation.T @ (np.array(first["com_m"], dtype=float) - origin)
@@ -1201,7 +1240,14 @@ def verify_physics(evidence_root: Path, source: dict, model: dict) -> list[dict]
         context = payload["component_context"]
         _require(isinstance(context, dict), "Component mass context is not an object")
         _require(context["status"] == "recorded" and not context["errors"], "Incomplete component-context evidence")
-        entries = oracle.load_effective_instances(root)
+        record = evidence.effective_instances(root)
+        entries = {
+            (str(item["component"]), str(item["code"])): item
+            for item in record.get("warnings") or []
+            if isinstance(item, dict)
+            and isinstance(item.get("component"), str)
+            and isinstance(item.get("code"), str)
+        }
         entry_names = sorted({name for name, _code in entries})
         overridden = {
             str(row["name"]): row for row in context["instances"] if any((row.get("overrides") or {}).values())

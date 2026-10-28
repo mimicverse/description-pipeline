@@ -296,13 +296,14 @@ def _input(root, diagnostics=None):
         )
         carrier = declarations["carrier"]
         bodies, joints = carrier["bodies"], carrier["joints"]
+        discovery_name = "input/discovery/native-discovery.json"
         declaration_evidence = {
             "kind": "native_declaration",
-            "file": "evidence/discovery.json",
-            "sha256": file_digest(root / "evidence/discovery.json"),
+            "file": discovery_name,
+            "sha256": file_digest(root / discovery_name),
             "anchor": raw["exporter"]["raw_xml_sha256"],
             "key": "raw.exporter.raw_xml",
-            "reference": "evidence/discovery.json#raw.exporter.raw_xml",
+            "reference": f"{discovery_name}#raw.exporter.raw_xml",
         }
         for joint in joints:
             raw_limits = joint.get("declared_limits")
@@ -372,8 +373,15 @@ def _input(root, diagnostics=None):
         "Handoff and source record disagree on the configuration",
     )
     raw_identity = (discovery_record.get("raw") or {}).get("identity") or {}
+    generated_identity = (
+        discovery_record.get("identity")
+        if isinstance(discovery_record.get("identity"), dict)
+        else {}
+    )
     robot_name = (
         raw_identity.get("robot_name")
+        or generated_identity.get("robot_name")
+        or generated_identity.get("robot_name_technical")
         or discovery_record.get("robot_name")
         or discovery_record.get("robot_name_technical")
     )
@@ -579,14 +587,10 @@ def _native(root, manifest):
         manifest["kind"] == "solidworks" and manifest["evidence_class"] == "cad",
         "A release requires native SolidWorks evidence",
     )
-    collection = evidence.collection(root)
-    _require(collection.get("identity") == manifest["identity"], "Collection and archived source identities differ")
     environment = evidence.runtime(root)
     _require(isinstance(environment, dict), "Capture environment is unavailable")
-    _require(environment == collection.get("environment"), "Environment evidence differs")
     revision = str(environment["solidworks"]["revision"])
     _require(revision.split(".")[0] == "34", "Native inertia API qualification currently covers SolidWorks 34 only")
-    _require((collection.get("limits") or {}).get("native_cad") is True, "Native capture was not recorded")
     return {
         "solidworks_revision": revision,
         "configuration": manifest["identity"]["configuration"],
@@ -760,9 +764,12 @@ def _handoff_native_hashes(root: Path) -> set[str]:
     """
 
     payload = evidence.discovery(root)
-    native = payload.get("files") if isinstance(payload, dict) else None
-    _require(isinstance(native, list) and bool(native), "The archived native file inventory is missing")
-    frozen = {str(row["path"]): str(row["sha256"]) for row in native}
+    native = payload.get("native_files") if isinstance(payload, dict) else None
+    _require(
+        isinstance(native, dict) and bool(native),
+        "The archived native file inventory is missing",
+    )
+    frozen = {str(path): str(checksum) for path, checksum in native.items()}
     for relative, checksum in sorted(frozen.items()):
         path = confined(root / "input/cad", relative)
         _require(path.is_file(), f"A frozen native file is missing from the archived input: {relative}")
@@ -771,7 +778,7 @@ def _handoff_native_hashes(root: Path) -> set[str]:
             f"A frozen native file differs from its recorded bytes: {relative}",
         )
     _require(
-        digest(native) == payload.get("native_inventory_sha256"),
+        digest(native) == payload.get("handoff_sha256"),
         "The native inventory digest does not match the discovery record",
     )
     raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
@@ -1548,12 +1555,12 @@ def _geometry(root, body, node, model_link, geometry, components, body_pose, urd
             type(row.get("triangles")) is int and row["triangles"] > 0,
             "Geometry receipt carries no triangle count",
         )
-        original = confined(root / "evidence", row["path"])
+        source_bytes = row.get("source_bytes")
         _require(
-            file_digest(original) == row["sha"],
+            isinstance(source_bytes, bytes)
+            and hashlib.sha256(source_bytes).hexdigest() == row["sha"],
             "Source mesh identity differs",
         )
-        source_bytes = original.read_bytes()
         stats = stl.read_bytes(source_bytes)
         _require(
             stats.binary and stats.triangles == row["triangles"],
@@ -1933,7 +1940,7 @@ def evaluate_bundle(
         from .native_mesh_observations import verify_native_mesh_observations
 
         def _verify_native_tessellation():
-            native_details = verify_native_mesh_observations(root)
+            native_details = verify_native_mesh_observations(root, model)
             projected = native_gate_warning_diagnostics(native_details)
             diagnostics.extend(projected)
             return native_details
@@ -2186,19 +2193,12 @@ def _verify_model(
     require_native_receipts=False,
 ):
     from .solidworks_physics import verify_physics
-    from ..sources.solidworks.appearance import bind_capture_appearance
-
     source = definition["source"]
     carrier = source.get("carrier")
     native_geometry_rows = evidence.geometry(root)
     source_manifest = verify_snapshot(root / "evidence")
     native_appearance = source_manifest.get("evidence_class") != "fixture"
     if "raw/native_capture_facts.json" in (source_manifest.get("files") or {}):
-        raw, native_geometry_rows = bind_capture_appearance(
-            raw,
-            native_geometry_rows,
-            evidence.native_capture_facts(root),
-        )
         from .native_appearance import verify_native_appearance
 
         gates.add(
@@ -3009,8 +3009,18 @@ def _value_warning_gate(
                 and native_row.get("sha") == shape.get("sha256"),
                 "Visual mesh identity differs from the raw geometry evidence",
             )
-        current_sha256 = file_digest(confined(root / "evidence", str(shape.get("filename") or "")))
-        _require(shape.get("sha256") == current_sha256, "Visual digest differs from capture evidence")
+            current_sha256 = str(native_row["sha"])
+        else:
+            current_sha256 = file_digest(
+                confined(
+                    root / "evidence",
+                    str(shape.get("filename") or ""),
+                )
+            )
+            _require(
+                shape.get("sha256") == current_sha256,
+                "Visual digest differs from capture evidence",
+            )
         if shape.get("rgba") is not None:
             _require(
                 provenance.get("material_source") == "native_appearance",

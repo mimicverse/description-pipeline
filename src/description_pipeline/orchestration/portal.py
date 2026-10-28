@@ -277,7 +277,7 @@ def _delivery_warnings(members: dict) -> list[dict]:
                     "detail": item.get("detail"),
                 }
             )
-    discovery = members.get("evidence/discovery.json")
+    discovery = members.get("input/discovery/native-discovery.json")
     if discovery is not None:
         findings = _registered_source_rows(_parse_registered_json(discovery), "findings", code_required=True)
         for item in findings:
@@ -3675,7 +3675,11 @@ class PortalApp:
                     {
                         path: self._registered_member_bytes(path, member)
                         for path, member in members.items()
-                        if path in {"input/handoff.json", "evidence/discovery.json"}
+                        if path
+                        in {
+                            "input/handoff.json",
+                            "input/discovery/native-discovery.json",
+                        }
                     }
                 ),
             )

@@ -20,7 +20,7 @@ diff -r /path/to/release-a /path/to/release-b
 
 每次构建交付同一完整集合：wheel、源码、部署档案、Linux 离线运行档案与最小 Windows 离线运行档案。校验入口要求清单和全部资产存在，核对部署成员、角色工具与依赖锁来自同一源码发行；缺项或重新封存后来源不一致均拒绝。
 
-运行档案只包含对应角色的全部精确依赖及 hash-locked 安装文件。Linux 支持生成、独立验证和平台；Windows 支持原生读取、释放 CAD 后的 Capture 离线计算与封包，以及必要传输/资源管理。两端安装同一源码发行身份，原生资格记录精确 Windows、SolidWorks 版本/build 与 API 环境。原生对象归属与 Part namespace 解析以[原生外观契约](docs/contracts.md#原生外观读数与交付)为准，不另建发行侧解释。
+运行档案只包含对应角色的全部精确依赖及 hash-locked 安装文件。Linux 支持生成、独立验证和平台；Windows 支持原生读取、原值序列化与封包，以及必要传输/资源管理；语义投影、惯量规范化和 STL 生成由 Linux Generate 执行。两端安装同一源码发行身份，原生资格记录精确 Windows、SolidWorks 版本/build 与 API 环境。原生对象归属与 Part namespace 解析以[原生外观契约](docs/contracts.md#原生外观读数与交付)为准，不另建发行侧解释。
 
 ## 必需验收
 

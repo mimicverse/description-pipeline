@@ -196,14 +196,23 @@ class EmissionReceipt:
     mesh_files: tuple[dict[str, str], ...]
 
 
-def emit(model: EngineeringModel, *, evidence_root: Path, destination: Path) -> EmissionReceipt:
+def emit(
+    model: EngineeringModel,
+    *,
+    mesh_source_root: Path,
+    destination: Path,
+) -> EmissionReceipt:
     """Write the model and target projection without introducing new semantics."""
 
     from ..backends.urdf import generate_urdf
 
     destination = Path(destination)
     write_json(destination / "model/robot.json", model.to_dict())
-    urdf = generate_urdf(model, Path(evidence_root), destination)
+    urdf = generate_urdf(
+        model,
+        Path(mesh_source_root),
+        destination,
+    )
     meshes = tuple(
         {"path": "meshes/" + path, "sha256": checksum}
         for path, checksum in sorted(inventory(destination / "meshes").items())

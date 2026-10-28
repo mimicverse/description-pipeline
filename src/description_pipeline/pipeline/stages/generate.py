@@ -69,12 +69,19 @@ def _capture_input(command: StageCommand, workspace: StageWorkspace) -> _Capture
     return _CaptureInput(artifact=artifact, root=root)
 
 
-def _compile_capture(capture: _CaptureInput) -> EngineeringModel:
+def _compile_capture(
+    capture: _CaptureInput,
+    mesh_root: Path,
+) -> EngineeringModel:
     """Compile directly from one accepted capture artifact without legacy adapters."""
 
     evidence_root = capture.root / "evidence"
     manifest = verify_snapshot(evidence_root)
-    model_input = derive_engineering_input(evidence_root, manifest)
+    model_input = derive_engineering_input(
+        evidence_root,
+        manifest,
+        mesh_root=mesh_root,
+    )
     return compile(model_input)
 
 
@@ -129,19 +136,30 @@ def _write_output(
     from ...sources.solidworks.appearance import AppearanceError
 
     tool, actual_executor = _actual_tool(command, claim)
-    try:
-        model = _compile_capture(capture)
-    except AppearanceError as error:
-        raise StageFailure(
-            "generate.appearance_unrepresentable",
-            str(error),
-            error_type=type(error).__name__,
-            detail=error.details,
-        ) from error
-    if destination.exists():
-        raise PipelineError(f"Generate output already exists: {destination}")
-    destination.mkdir(parents=True)
-    emission = emit(model, evidence_root=capture.root / "evidence", destination=destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix="generate-mesh-source-",
+        dir=destination.parent,
+    ) as directory:
+        try:
+            model = _compile_capture(capture, Path(directory))
+        except AppearanceError as error:
+            raise StageFailure(
+                "generate.appearance_unrepresentable",
+                str(error),
+                error_type=type(error).__name__,
+                detail=error.details,
+            ) from error
+        if destination.exists():
+            raise PipelineError(
+                f"Generate output already exists: {destination}"
+            )
+        destination.mkdir(parents=True)
+        emission = emit(
+            model,
+            mesh_source_root=Path(directory),
+            destination=destination,
+        )
     write_json(destination / "tool.json", tool)
     receipt = _receipt(
         command=command,

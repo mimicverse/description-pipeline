@@ -523,9 +523,13 @@ class CaptureAppearanceBindingTests(unittest.TestCase):
                     "occurrences": [
                         {
                             "name": COMPONENT,
-                            "appearance_raw": appearance,
                         }
                     ]
+                },
+                "geometry_raw": {
+                    COMPONENT: {
+                        "appearance_raw": appearance,
+                    }
                 },
                 "source_scopes": {COMPONENT: scope},
             },

@@ -34,7 +34,7 @@ from description_pipeline.verification.native_discovery import (
 from . import support
 from .selection_support import sealed_selection
 
-RECORD_FILE = "evidence/discovery.json"
+RECORD_FILE = "input/discovery/native-discovery.json"
 
 IDENTITY = [
     1.0,

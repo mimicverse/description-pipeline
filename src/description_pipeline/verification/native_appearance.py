@@ -17,7 +17,7 @@ from ..appearance_contract import (
     scoped_rgba,
 )
 from ..geometry.native_tessellation import native_stl_subset
-from ..io import PipelineError, confined, file_digest
+from ..io import PipelineError
 from ..sources.solidworks.naming import (
     asset_namespace,
     material_name,
@@ -1697,7 +1697,7 @@ def _resolved_faces(
     }
 
 
-def _expected_groups(root: Path, row: Mapping, resolved: Mapping) -> list[dict]:
+def _expected_groups(_root: Path, row: Mapping, resolved: Mapping) -> list[dict]:
     component = str(row["component"])
     tessellation = row.get("tessellation")
     _require(isinstance(tessellation, Mapping), f"{component} has no tessellation")
@@ -1739,12 +1739,12 @@ def _expected_groups(root: Path, row: Mapping, resolved: Mapping) -> list[dict]:
         by_rgba.setdefault(item["rgba"], []).append(item)
         next_start += span["triangle_count"]
 
-    original = confined(root / "evidence", str(row.get("path") or ""))
+    source_bytes = row.get("source_bytes")
     _require(
-        file_digest(original) == row.get("sha"),
+        isinstance(source_bytes, bytes)
+        and hashlib.sha256(source_bytes).hexdigest() == row.get("sha"),
         f"{component} source STL differs from its geometry record",
     )
-    source_bytes = original.read_bytes()
     groups = []
     for rgba, items in by_rgba.items():
         ranges = []

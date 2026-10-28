@@ -46,7 +46,8 @@ def build_sealed_delivery(
     for name in ("input", "evidence", "model", "urdf", "meshes", "reports"):
         (root / name).mkdir(parents=True)
     (root / "input" / "records").mkdir()
-    (root / "evidence" / "geometry").mkdir()
+    (root / "input" / "discovery").mkdir()
+    (root / "evidence" / "raw").mkdir()
     (root / "native-observation").mkdir()
     (root / "prepared").mkdir()
     write_json(root / "stage-request.json", {"fixture": "freeze-stage-request"})
@@ -96,7 +97,7 @@ def build_sealed_delivery(
         },
     )
     write_json(
-        root / "evidence" / "discovery.json",
+        root / "input" / "discovery" / "native-discovery.json",
         {
             "discovery": "fixture",
             "handoff_sha256": digest(native_inventory),
@@ -110,13 +111,15 @@ def build_sealed_delivery(
             "records": [],
         },
     )
-    write_json(root / "evidence" / "capture-plan.json", {"plan": "fixture"})
-    write_json(root / "evidence" / "capture.json", {"capture": "fixture"})
+    write_json(root / "input" / "capture-plan.json", {"plan": "fixture"})
     write_json(
         root / "evidence" / "native-runtime.json",
         {"runtime": "fixture"},
     )
-    (root / "evidence" / "geometry" / "part.stl").write_bytes(b"native-stl")
+    write_json(
+        root / "evidence" / "raw" / "native_capture_facts.json",
+        {},
+    )
     write_json(root / "model" / "robot.json", {"model": "fixture"})
     (root / "urdf" / "robot.urdf").write_text("<robot/>\n", encoding="utf-8")
     (root / "meshes" / "part.stl").write_bytes(b"mesh-stl")

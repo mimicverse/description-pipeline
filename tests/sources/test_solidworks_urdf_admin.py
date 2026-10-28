@@ -286,15 +286,15 @@ class MeshAssetReuseTests(unittest.TestCase):
 
 
 class HandoffHashBindingTests(unittest.TestCase):
-    def _package(self, directory, contents, *, raw_files=None, inventory_digest=None):
+    def _package(self, directory, contents, *, raw_files=None, handoff_digest=None):
         root = Path(directory) / "delivery"
         native = {name: hashlib.sha256(data).hexdigest() for name, data in contents.items()}
         payload = support.frozen_discovery_payload(
             {"namespace": "dp", "raw": {"files": dict(raw_files or {})}, "identity": {}},
             files=native,
         )
-        if inventory_digest is not None:
-            payload["native_inventory_sha256"] = inventory_digest
+        if handoff_digest is not None:
+            payload["handoff_sha256"] = handoff_digest
         return support.write_target_delivery(
             root,
             capture={},
@@ -327,7 +327,11 @@ class HandoffHashBindingTests(unittest.TestCase):
             with self.assertRaises(PipelineError):
                 solidworks_urdf._handoff_native_hashes(input_root)
         with tempfile.TemporaryDirectory() as directory:
-            input_root, _ = self._package(directory, {"a.SLDPRT": b"aaa"}, inventory_digest="0" * 64)
+            input_root, _ = self._package(
+                directory,
+                {"a.SLDPRT": b"aaa"},
+                handoff_digest="0" * 64,
+            )
             with self.assertRaises(PipelineError):
                 solidworks_urdf._handoff_native_hashes(input_root)
 

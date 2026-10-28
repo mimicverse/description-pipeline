@@ -230,6 +230,7 @@ def fixture_native_geometry(
         "source_scope": copy.deepcopy(source_scope),
         "transform_raw": [float(value) for value in transform_raw],
         "bodies": {"solid": 1, "sheet": 0},
+        "appearance_raw": None,
     }
 
 
@@ -241,10 +242,15 @@ def write_file_source_scope_authority(
 ) -> None:
     """Write one real file-backed source-scope authority tree for tests."""
 
-    from description_pipeline.io import read_data, write_json  # noqa: PLC0415
+    from description_pipeline.io import (  # noqa: PLC0415
+        digest,
+        read_data,
+        write_json,
+    )
 
     root = Path(root)
     (root / "evidence/raw").mkdir(parents=True, exist_ok=True)
+    (root / "input/discovery").mkdir(parents=True, exist_ok=True)
     discovery_components = []
     discovery_files = {}
     scene_components = []
@@ -309,16 +315,26 @@ def write_file_source_scope_authority(
         copy_files[scope["source_copy_path"]] = copy_sha256
 
     write_json(
-        root / "evidence/discovery.json",
+        root / "input/discovery/native-discovery.json",
         {
+            "schema_version": "solidworks-to-urdf.native-discovery/v1",
+            "run_id": "fixture-run",
+            "derivation": {
+                "main_assembly": "",
+                "configuration": "Default",
+                "record_roots": [],
+            },
+            "identity": {
+                "main_assembly": "",
+                "delivery_configuration": "Default",
+                "robot_name": "robot",
+            },
             "raw": {
                 "components": discovery_components,
                 "files": discovery_files,
             },
-            "files": [
-                {"path": path, "sha256": sha256}
-                for path, sha256 in discovery_files.items()
-            ],
+            "native_files": discovery_files,
+            "handoff_sha256": digest(discovery_files),
         },
     )
     write_json(
@@ -1166,14 +1182,6 @@ def cleanup(path: Path) -> None:
     shutil.rmtree(path, ignore_errors=True)
 
 
-def read_scene(snapshot: Path) -> dict:
-    """Read the raw scene a snapshot carries (shared loader when available)."""
-
-    from description_pipeline.sources.snapshot import load_scene
-
-    return load_scene(Path(snapshot))
-
-
 # ---------------------------------------------------------------------------
 # Target-tree fixtures (IF-13): delivery roots with capture blocks and a bound
 # manifest.  Shared by the migrated verification tests; block writes re-seal the
@@ -1273,6 +1281,7 @@ def write_target_delivery(
     for name in (
         "input",
         "input/cad",
+        "input/discovery",
         "input/records",
         "evidence",
         "evidence/raw",
@@ -1325,7 +1334,10 @@ def write_target_delivery(
         target = root / "input" / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text, encoding="utf-8")
-    write_json(root / "evidence/discovery.json", discovery or {})
+    write_json(
+        root / "input/discovery/native-discovery.json",
+        discovery or {},
+    )
     capture = dict(capture)
     if "material_provenance" not in capture:
         # The sealed capture block is the material authority the verifier reads
@@ -1433,11 +1445,23 @@ def frozen_discovery_payload(
     from description_pipeline.io import digest
 
     payload = copy.deepcopy(record)
-    rows = [{"path": path, "sha256": checksum} for path, checksum in sorted(files.items())]
-    payload["files"] = rows
-    payload["native_inventory_sha256"] = digest(rows)
+    payload["native_files"] = dict(sorted(files.items()))
+    payload["handoff_sha256"] = digest(files)
     identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else {}
-    payload["robot_name"] = identity.get("robot_name") or identity.get("robot_name_technical") or "robot"
+    raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
+    raw_identity = raw.get("identity") if isinstance(raw.get("identity"), dict) else {}
+    authored = raw_identity.get("robot_name")
+    if isinstance(authored, str) and authored:
+        identity["robot_name"] = authored
+        identity["robot_name_technical"] = None
+    else:
+        identity["robot_name"] = None
+        identity["robot_name_technical"] = (
+            identity.get("robot_name_technical")
+            or payload.get("robot_name")
+            or "robot"
+        )
+    payload["identity"] = identity
     return payload
 
 
@@ -1445,7 +1469,7 @@ def native_discovery_delivery(root: Path, prepared: Path, *, record: dict | None
     """Materialize one target-tree delivery from a prepared native package.
 
     The CAD originals move to ``input/cad`` at their frozen-source-relative
-    paths; the record becomes ``evidence/discovery.json`` (frozen additions
+    paths; the record becomes ``input/discovery/native-discovery.json`` (frozen additions
     applied); the embedded records move under ``input/records`` keeping their
     recorded ``package_file`` names; ``input/source.json`` is the prepared
     package's archived content identity verbatim (the fixture record only
@@ -1586,7 +1610,7 @@ def compose_delivery_inputs(
 
     Copies the genuine CAD bytes into ``input/cad/<relative>``, writes the
     sealed discovery payload (with its raw native record) at
-    ``evidence/discovery.json`` (including optional controlled-record files at
+    ``input/discovery/native-discovery.json`` (including optional controlled-record files at
     ``input/records/<name>`` carrying their payload entries). Synthetic
     consumer-fixture inputs only: it must never feed the unchanged
     canonical/E2E producers, which produce their own evidence.  Existing
@@ -1638,26 +1662,55 @@ def compose_delivery_inputs(
             )
         else:
             payload_records.append(common)
+    from description_pipeline.io import digest as canonical_digest
+
+    handoff_sha256 = canonical_digest(native_files)
+    discovery = {
+        "schema_version": DISCOVERY_SCHEMA,
+        "run_id": str(record.get("run_id") or "fixture-run"),
+        "derivation": {
+            "main_assembly": main_assembly,
+            "configuration": configuration,
+            "record_roots": [],
+        },
+        "identity": {
+            "main_assembly": main_assembly,
+            "delivery_configuration": configuration,
+            "robot_name": str(identity.get("robot_name") or "robot"),
+            "robot_name_technical": None,
+        },
+        "records": payload_records,
+        "raw": record,
+        "native_files": dict(sorted(native_files.items())),
+        "handoff_sha256": handoff_sha256,
+    }
     write_json(
-        evidence / "discovery.json",
+        delivery / "input/discovery/native-discovery.json",
+        discovery,
+    )
+    write_json(
+        delivery / "input/handoff.json",
         {
-            "schema_version": DISCOVERY_SCHEMA,
-            "run_id": str(record.get("run_id") or "fixture-run"),
-            "derivation": {
-                "main_assembly": main_assembly,
-                "configuration": configuration,
-                "record_roots": [],
+            "passed": True,
+            "input": {
+                "hardware_id": str(identity.get("hardware_id") or "fixture"),
+                "source": {
+                    "assembly": main_assembly,
+                    "configuration": configuration,
+                },
             },
-            "identity": {
-                "main_assembly": main_assembly,
-                "delivery_configuration": configuration,
-                "robot_name": str(identity.get("robot_name") or "robot"),
+            "input_receipt": {"inventory": dict(sorted(native_files.items()))},
+            "package_files": {
+                f"cad/{name}": checksum
+                for name, checksum in sorted(native_files.items())
             },
-            "records": payload_records,
-            "raw": record,
-            "native_files": dict(sorted(native_files.items())),
+            "main_assembly": main_assembly,
+            "configuration": configuration,
         },
     )
+    source_path = delivery / "input/source.json"
+    if not source_path.is_file():
+        write_json(source_path, source_record_for_robot(record))
 # ---------------------------------------------------------------------------
 # Fixture plumbing: the small shared producer for consumer-fixture inputs.
 #
@@ -2001,10 +2054,14 @@ def seal_scene_inputs(
         records=controlled,
         record_keys=record_keys,
     )
-    runtime = Path(destination) / "native-runtime.json"
-    environment = Path(destination) / "evidence/environment.json"
-    if not runtime.is_file():
-        runtime.write_bytes(environment.read_bytes())
+    source_runtime = Path(destination) / "native-runtime.json"
+    runtime = Path(destination) / "evidence/native-runtime.json"
+    if source_runtime.is_file():
+        runtime.parent.mkdir(parents=True, exist_ok=True)
+        source_runtime.replace(runtime)
+    elif not runtime.is_file():
+        runtime.parent.mkdir(parents=True, exist_ok=True)
+        runtime.write_text("{}\n", encoding="utf-8")
     from packaging.utils import canonicalize_name
 
     from description_pipeline import __version__

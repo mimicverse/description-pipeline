@@ -30,12 +30,12 @@ flowchart LR
 | `StageApplication` | 接纳、构造命令、组合六个 handler、路由对账和取消 | CAD 原生事实、网页授权 |
 | 共同 stage engine | claim、执行、候选校验、唯一 decision 及失败保全 | 各阶段领域算法 |
 | Linux handlers | 冻结、原生协调、模型生成、独立验证与发布 | Windows 会话所有权 |
-| Windows native runtime | 已保存 CAD 原生事实读取、几何观察、会话管理，以及释放后的原值投影、raw/STL 编码与证据封包 | 完整模型、URDF、独立质量结论、Git 和 PR |
+| Windows native runtime | 已保存 CAD 原生事实读取、几何观察、会话管理、原值序列化与证据封包 | 语义投影、惯量规范化、STL、完整模型、URDF、独立质量结论、Git 和 PR |
 | Windows 生命周期脚本 | 当前任务、进程归属、安装身份、ACL 和健康的现场核验 | 业务阶段决定；Linux 控制与恢复只消费其核验结果 |
 | PostgreSQL `FactStore` | 接纳、命令、执行权、effect 与阶段决定 | artifact 文件内容和 Airflow 调度状态 |
 | `ArtifactStore` | 不可变文件集合、manifest、摘要及物化 | 运行成功、阶段决定和业务显示状态 |
 
-Linux 完成上传与 Freeze 后，Windows 为 Discover 和 Capture 分别物化受控输入、建立并释放自己的原生会话。Discover 返回原生观察，Linux 形成 prepared package；Capture 返回原生证据，Linux 接纳并独立核验传输。SourceSet archive 与 prepared archive 是不同对象，分别记录摘要，并证明同一封存原件血缘。等待 Linux 时不占用 CAD 会话，不引入跨 operation 的可变来源缓存。
+Linux 完成上传与 Freeze 后，Windows 为 Discover 和 Capture 分别物化受控输入、建立并释放自己的原生会话。Discover 在同一个自有会话中打开指定主装配，从同次观察形成来源闭包和机械事实；搜索环境恢复与会话释放完成后才封存和裁剪目录。Capture 仍需依据 prepared 计划读取分组物性与轴等原生事实，不把两阶段合成跨 operation 的长驻会话。Linux 接纳 Capture 时只核必要字节、schema、身份、scope 和计划绑定；Generate 执行一次语义投影。SourceSet archive 与 prepared archive 分别绑定摘要并证明同一原件血缘，等待 Linux 时不占用 CAD。
 
 保存状态导出允许已知缺失引用形成详细来源 warning 后继续，不要求 CAD 参数化重建完整。Discover 与 Capture 共用打开状态判定：文档存在、错误类型明确允许且必要事实可读时继续；未知或严重错误仍拒绝。未授权包外来源不能被搜索结果替代。原件不保存、不重建；实际读取范围与未证明的源完整性分别记录。独立 Verify 从原始观察核对输出和 warning，报告、预览与 PR 不把保存状态导出成功等同于总体机械或硬件资格。
 
@@ -93,7 +93,7 @@ StagePending -> EffectPollTrigger -> StageTaskOperator.execute_complete
 
 Discover result 表达原生选择、prepared 输入和证据绑定，不作为第二个完整机器人模型。Generate 持久化一个 `EngineeringModel`，URDF 是其交付编码。Verify 独立读取原始证据和实际输出，不借用生成器的期望值、成功标志或缓存。共享代码限于纯数学、格式解析和无领域推导的契约基础，并用解析解、已知答案和变异反例验证。发布重验完整 certificate、execution receipt 及被验证字节。
 
-Capture 在一次原生采集中保留已保存配置、几何、轴线、配合、物性和外观事实，不执行 CAD 重建，不保留重建图、恢复日志或强制清零资格。原生事实以 manifest 绑定的 raw 成员为唯一封存来源，交付 capture 记录只保留必要投影，不重复内嵌完整 raw。外观复用同一几何遍历的对象与 face triangle spans；对象引用必须在已证明的同一文档与 occurrence 上下文中解释。Generate 离线完成坐标转换、面材质分组和 URDF 生成，Verify 从原始事实与交付字节独立复算；不得信任采集器预填的匹配答案。详细外观规则见[原生外观读数与交付](contracts.md#原生外观读数与交付)。
+Capture 在一次原生采集中保留已保存配置、几何、轴线、配合、物性和外观事实，不执行 CAD 重建，不保留重建图、恢复日志或强制清零资格。manifest 绑定的 raw 成员是唯一封存来源，不另存 capture 投影、重复环境或计划副本。外观复用同一几何遍历的对象与 face triangle spans；对象引用必须在已证明的同一文档与 occurrence 上下文中解释。Generate 在 Linux 完成坐标转换、惯量规范化、STL 物化、面材质分组和 URDF 生成。Verify 从原始事实与交付字节独立复算，不调用生成器投影作为答案。详细外观规则见[原生外观读数与交付](contracts.md#原生外观读数与交付)。
 
 Windows 的既有 `native_operation_event` 经同一 operation view 与 poll 形成 `run_display_metadata.activity`，Portal 展示当前活动、时间与历史。原生 sequence 与事件时间用于识别重复观察；activity 是显示数据，不建立第二套阶段状态、成功资格或 CAD 控制权，不增加独立轮询链。
 

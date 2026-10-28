@@ -32,11 +32,15 @@ from .request_evidence import read_request_evidence
 from .runtime import RUNTIME_HOSTS, RUNTIME_VERSIONS, python_version_is_supported, required_packages
 from .schemas import TOOL_SCHEMA, NATIVE_DISCOVERY_SCHEMA
 from .sources.snapshot import verify_snapshot
+from .sources.solidworks.capture_projection import (
+    load_native_capture_observation,
+    validate_native_capture_plan,
+)
 from .sources.solidworks.handoff import MAX_HANDOFF_BYTES, MAX_HANDOFF_FILES
 from .sources.solidworks.revision import package_inventory
 from .stages import CONTRACT, CONTRACT_FILE_SHA256, CONTRACT_SHA256, STAGE_IDS, VIEW_SCHEMA, stage_view
 
-CAPTURE_TRANSFER_SCHEMA = "solidworks-to-urdf.capture-transfer/v3"
+CAPTURE_TRANSFER_SCHEMA = "solidworks-to-urdf.capture-transfer/v4"
 
 
 NATIVE_CAPTURE_SCOPE = ("capture",)
@@ -538,25 +542,16 @@ def _validate_evidence(
         isinstance(scene, str) and scene in (manifest.get("files") or {}),
         "Evidence snapshot does not bind its scene",
     )
-    # ``freeze`` writes its evidence record inside the snapshot's own ``evidence/`` folder.
-    collection = read_data(confined(evidence, "evidence/collection.json"))
-    _require(isinstance(collection, dict), "Evidence collection must be an object")
-    _require(
-        collection.get("identity") == manifest.get("identity"),
-        "Evidence collection and snapshot identities differ",
+    identity = (
+        manifest.get("identity")
+        if isinstance(manifest.get("identity"), dict)
+        else {}
     )
-    delivered_capture = read_data(confined(evidence, "capture.json"))
-    _require(isinstance(delivered_capture, dict), "Capture evidence must be an object")
-    _require(
-        delivered_capture.get("collection") == collection,
-        "Standalone capture collection differs from the sealed collection block",
-    )
+    observation = load_native_capture_observation(root)
+    plan = read_data(confined(root, "input/capture-plan.json"))
+    validate_native_capture_plan(observation, plan)
     raw_closure = read_data(confined(evidence, "raw/dependency_closure.json"))
-    _require(
-        delivered_capture.get("dependency_closure") == raw_closure,
-        "Standalone dependency closure differs from its raw evidence",
-    )
-    identity = collection.get("identity") if isinstance(collection.get("identity"), dict) else {}
+    _require(isinstance(raw_closure, dict), "Dependency closure must be an object")
     _require(identity.get("provider") == "solidworks", "Evidence identity has the wrong provider")
     _require(identity.get("configuration") == configuration, "Evidence identity uses another configuration")
     _require(
@@ -570,7 +565,6 @@ def _validate_evidence(
         "Evidence SolidWorks revision differs from the native runtime",
     )
     _require(runtime.get("toolchain") == native_tool, "Native runtime toolchain differs from the native tool")
-    _require(runtime == collection.get("environment"), "Native runtime differs from the sealed environment block")
     for name in ("assembly", "document_id"):
         value = identity.get(name)
         _require(
@@ -578,15 +572,19 @@ def _validate_evidence(
             and _document_basename(value).casefold() == _document_basename(main_assembly).casefold(),
             f"Evidence identity {name} names another main assembly",
         )
-    capture = collection.get("capture") if isinstance(collection.get("capture"), dict) else {}
-    unchanged = capture.get("originals_unchanged")
+    input_stability = observation.get("input_stability")
+    _require(
+        isinstance(input_stability, dict),
+        "Raw Capture observation has no input stability record",
+    )
+    unchanged = input_stability.get("originals_unchanged")
     # ``freeze`` records a structured observation (files checked / states recorded) and raises on
     # any change; a boolean or empty claim is not that evidence.
     _require(
         isinstance(unchanged, dict) and int(unchanged.get("files_checked") or 0) >= 1,
         "Evidence does not prove the CAD bytes were unchanged",
     )
-    source_hashes = capture.get("source_hashes")
+    source_hashes = input_stability.get("source_hashes")
     _require(isinstance(source_hashes, dict) and source_hashes, "Evidence lacks native source hashes")
     native_source_inputs = _source_relative_inventory(native_files, main_assembly)
     source_inputs = {}
@@ -610,25 +608,15 @@ def _validate_evidence(
         identity.get("dependency_digest") == digest(sorted(source_inputs.items())),
         "Evidence dependency digest does not recompute from its source hashes",
     )
-    material = read_data(confined(evidence, "raw/material_provenance.json"))
-    _require(isinstance(material, dict), "Material provenance must be an object")
-    _require(
-        isinstance(material.get("assembly"), str)
-        and _document_basename(material["assembly"]).casefold() == _document_basename(main_assembly).casefold(),
-        "Material provenance names another main assembly",
-    )
-    _require(
-        material.get("configuration") == configuration,
-        "Material provenance uses another configuration",
-    )
-    collected_document = capture.get("collected_document")
+    collected_document = raw_closure.get("top_level")
     source_assembly = _normalize_document_path(identity.get("assembly"))
     source_document = _normalize_document_path(identity.get("document_id"))
-    source_material = _normalize_document_path(material.get("assembly"))
     collected_source = _normalize_document_path(collected_document)
     closure_source = _normalize_document_path(raw_closure.get("top_level"))
     expected_source_suffix = "\\" + _normalize_document_path(main_assembly)
-    discovery_record = read_data(confined(evidence, "discovery.json"))
+    discovery_record = read_data(
+        confined(root, "input/discovery/native-discovery.json")
+    )
     discovery_identity = discovery_record.get("identity") if isinstance(discovery_record, dict) else None
     discovery_main = discovery_identity.get("main_assembly") if isinstance(discovery_identity, dict) else None
     _require(
@@ -637,7 +625,7 @@ def _validate_evidence(
     )
     discovery_source_suffix = "\\" + _normalize_document_path(discovery_main)
     _require(
-        source_assembly == source_document == source_material
+        source_assembly == source_document
         and source_assembly.endswith(expected_source_suffix)
         and source_assembly.endswith(discovery_source_suffix),
         "Evidence source paths disagree or do not bind the selected main assembly",
@@ -648,7 +636,7 @@ def _validate_evidence(
             main_assembly,
         )
         _require(
-            source_assembly == source_document == source_material == prepared_source,
+            source_assembly == source_document == prepared_source,
             "Evidence source paths differ from the platform prepared source",
         )
     _require(
@@ -690,7 +678,7 @@ def _validate_evidence(
         and _document_basename(collected_document).casefold() == _document_basename(main_assembly).casefold(),
         "Evidence capture names another collected main assembly",
     )
-    return collection
+    return identity
 
 
 def _stage_checks(view: dict) -> dict[str, dict]:
@@ -745,12 +733,6 @@ def _prepared_input_inventory(
         _require(folded not in prepared_rows, f"Prepared input paths collide case-insensitively: {relative}")
         prepared_rows.add(folded)
         prepared[f"input/{relative}"] = checksum
-    plan_name = "input/capture-plan.json"
-    _require(
-        plan_name.removeprefix("input/").casefold() not in prepared_rows,
-        "Capture-plan archive path is ambiguous",
-    )
-    prepared[plan_name] = file_digest(confined(root, "evidence/capture-plan.json"))
     return prepared
 
 
@@ -773,7 +755,9 @@ def expected_native_check_details(
     package_files = handoff_record.get("package_files")
     prepared_inputs = _prepared_input_inventory(root, native_files, input_inventory, package_files)
     expected_input = {f"input/{name}": checksum for name, checksum in input_inventory.items()}
-    discovery_record = read_data(confined(root, "evidence/discovery.json"))
+    discovery_record = read_data(
+        confined(root, "input/discovery/native-discovery.json")
+    )
     derivation = discovery_record.get("derivation") if isinstance(discovery_record, dict) else None
     record_roots = derivation.get("record_roots") if isinstance(derivation, dict) else []
     _require(
@@ -797,7 +781,6 @@ def expected_native_check_details(
             "record_roots": record_roots,
         },
         "input.valid": {
-            "cad_revision": handoff_record.get("cad_revision"),
             "files": expected_input,
             "files_sha256": digest(package_files),
             "handoff_sha256": handoff_sha256,
@@ -879,7 +862,9 @@ def _validate_source_identity(
         and selection.get("hardware_id") == hardware,
         "Source record identity differs from the frozen handoff or transfer",
     )
-    discovery = read_data(confined(root, "evidence/discovery.json"))
+    discovery = read_data(
+        confined(root, "input/discovery/native-discovery.json")
+    )
     discovery_identity = discovery.get("identity") if isinstance(discovery, dict) else {}
     _require(
         discovery_identity.get("main_assembly") == main_assembly
@@ -997,7 +982,9 @@ def _validate_native_discovery(
     and the native file inventory it hashed; the archived input must carry the same bytes.
     """
 
-    record = read_data(confined(root, "evidence/discovery.json"))
+    record = read_data(
+        confined(root, "input/discovery/native-discovery.json")
+    )
     _require(isinstance(record, dict), "Native discovery record must be an object")
     _require(
         record.get("schema_version") == NATIVE_DISCOVERY_SCHEMA,
@@ -1035,21 +1022,17 @@ def _validate_native_discovery(
         digest(native_files) == handoff_sha256,
         "The native discovery file inventory does not digest to its handoff",
     )
-    discovery_files = record.get("files")
-    _require(
-        isinstance(discovery_files, list)
-        and discovery_files
-        and all(isinstance(item, dict) and set(item) == {"path", "sha256"} for item in discovery_files),
-        "Native discovery carries no exact file list",
-    )
+    discovery_files = [
+        {"path": name, "sha256": checksum}
+        for name, checksum in sorted(
+            (native_files or {}).items()
+        )
+    ]
+    _require(bool(discovery_files), "Native discovery carries no file inventory")
     listed = {str(item["path"]).casefold(): item["sha256"] for item in discovery_files}
     _require(
         len(listed) == len(discovery_files) and listed == {key: value[1] for key, value in native_casefold.items()},
         "Native discovery file list differs from its inventory",
-    )
-    _require(
-        record.get("native_inventory_sha256") == digest(discovery_files),
-        "Native discovery inventory digest differs from its file list",
     )
     main = native_casefold.get(main_assembly.casefold())
     _require(main is not None, f"The native discovery record does not inventory the main assembly: {main_assembly!r}")

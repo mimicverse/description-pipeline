@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from typing import ClassVar
 
-from description_pipeline.io import PipelineError, digest
+from description_pipeline.io import PipelineError, digest, write_json
 from description_pipeline.schemas import NATIVE_DISCOVERY_SCHEMA
 from description_pipeline.verification.solidworks_urdf import _dependencies
 
@@ -65,15 +65,17 @@ class CopyCoverageTests(unittest.TestCase):
         if mutate is not None:
             mutate(root, closure, originals, copies)
         native = {name: _sha(data) for name, data in originals.items()}
-        files_rows = [{"path": name, "sha256": checksum} for name, checksum in sorted(native.items())]
         discovery = {
             "schema_version": NATIVE_DISCOVERY_SCHEMA,
             "run_id": "copy-coverage",
             "contract": "native-discovery/v1",
             "namespace": "dp",
-            "robot_name": "robot",
-            "files": files_rows,
-            "native_inventory_sha256": digest(files_rows),
+            "identity": {
+                "main_assembly": "robot.SLDASM",
+                "delivery_configuration": "Default",
+                "robot_name": "robot",
+                "robot_name_technical": None,
+            },
             "derived": {},
             "raw": {
                 "files": dict(native),
@@ -82,6 +84,8 @@ class CopyCoverageTests(unittest.TestCase):
                 },
                 "selection": {"main_assembly": "robot.SLDASM"},
             },
+            "native_files": native,
+            "handoff_sha256": digest(native),
         }
         handoff = {
             "package_files": {
@@ -92,18 +96,12 @@ class CopyCoverageTests(unittest.TestCase):
             "main_assembly": "robot.SLDASM",
             "configuration": "Default",
         }
+        raw = root / "evidence/raw"
+        raw.mkdir(parents=True, exist_ok=True)
+        write_json(raw / "dependency_closure.json", closure)
         support.write_target_delivery(
             root,
-            capture={
-                "dependency_closure": closure,
-                "collection": {
-                    "capture": {
-                        "originals_unchanged": {
-                            "files_checked": len(closure["original_files"]),
-                        }
-                    }
-                },
-            },
+            capture={},
             discovery=discovery,
             handoff=handoff,
             originals={name: data.decode("utf-8") for name, data in originals.items()},

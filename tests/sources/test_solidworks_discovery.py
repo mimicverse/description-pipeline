@@ -380,7 +380,7 @@ class DiscoveryTests(unittest.TestCase):
         return verify_discovery(delivery)
 
     def _rewrite_delivery_controlled_record(self, delivery: Path, mutate) -> None:
-        discovery_path = delivery / "evidence/discovery.json"
+        discovery_path = delivery / "input/discovery/native-discovery.json"
         discovery = json.loads(discovery_path.read_text(encoding="utf-8"))
         entries = [
             item
@@ -408,6 +408,134 @@ class DiscoveryTests(unittest.TestCase):
         source["source_revision_id"] = digest(source["identity"])
         source_path.write_text(json.dumps(source, indent=2) + "\n", encoding="utf-8")
         support.seal_delivery(delivery)
+
+    def test_source_definition_rejects_malformed_raw_boundaries(self) -> None:
+        result, _source, output = self._prepare()
+        self.assertTrue(result.passed, result.findings)
+        delivery = self._deliver(output)
+        discovery_path = (
+            delivery / "input/discovery/native-discovery.json"
+        )
+        baseline = json.loads(discovery_path.read_text(encoding="utf-8"))
+
+        def set_raw(key, value):
+            def mutate(payload):
+                payload["raw"][key] = copy.deepcopy(value)
+
+            return mutate
+
+        malformed = (
+            ("properties-list", set_raw("properties", [])),
+            (
+                "document-properties-false",
+                lambda payload: payload["raw"]["properties"].__setitem__(
+                    "document",
+                    False,
+                ),
+            ),
+            (
+                "component-properties-zero",
+                lambda payload: payload["raw"]["properties"].setdefault(
+                    "components",
+                    {},
+                ).__setitem__("malformed-component", 0),
+            ),
+            ("identity-list", set_raw("identity", [])),
+            (
+                "identity-numeric",
+                lambda payload: payload["raw"].setdefault(
+                    "identity",
+                    {},
+                ).__setitem__("hardware_id", 0),
+            ),
+            (
+                "identity-control-list",
+                lambda payload: payload["raw"].setdefault(
+                    "identity",
+                    {},
+                ).__setitem__("control", []),
+            ),
+        )
+        for label, mutate in malformed:
+            with self.subTest(label=label):
+                payload = copy.deepcopy(baseline)
+                mutate(payload)
+                discovery_path.write_text(
+                    json.dumps(payload, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaises(CadError):
+                    source_definition(
+                        delivery,
+                        discovery_name=(
+                            "input/discovery/native-discovery.json"
+                        ),
+                        cad_prefix="input/cad/",
+                        records_prefix="input/",
+                    )
+
+        for label, mutate in (
+            (
+                "top-level-identity-list",
+                lambda payload: payload.__setitem__("identity", []),
+            ),
+            (
+                "top-level-derivation-string",
+                lambda payload: payload.__setitem__("derivation", ""),
+            ),
+            (
+                "record-entry-not-object",
+                lambda payload: payload.setdefault(
+                    "records",
+                    [],
+                ).append(False),
+            ),
+        ):
+            with self.subTest(label=label):
+                payload = copy.deepcopy(baseline)
+                mutate(payload)
+                discovery_path.write_text(
+                    json.dumps(payload, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaises(PipelineError):
+                    source_definition(
+                        delivery,
+                        discovery_name=(
+                            "input/discovery/native-discovery.json"
+                        ),
+                        cad_prefix="input/cad/",
+                        records_prefix="input/",
+                    )
+
+        for label, update in (
+            ("lightweight-incoherent", {"lightweight": None}),
+            ("suppression-state", {"suppression_state": 5}),
+        ):
+            with self.subTest(label=label):
+                payload = copy.deepcopy(baseline)
+                component = payload["raw"]["components"][0]
+                if label == "lightweight-incoherent":
+                    update = {
+                        "lightweight": not bool(component["lightweight"])
+                    }
+                component.update(update)
+                discovery_path.write_text(
+                    json.dumps(payload, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(
+                    PipelineError,
+                    "suppression_state",
+                ):
+                    source_definition(
+                        delivery,
+                        discovery_name=(
+                            "input/discovery/native-discovery.json"
+                        ),
+                        cad_prefix="input/cad/",
+                        records_prefix="input/",
+                    )
 
     def test_native_preparation_forwards_the_guarded_activity_sink(self):
         class ActivityBackend:
@@ -721,7 +849,7 @@ class DiscoveryTests(unittest.TestCase):
         result, _source, output = self._prepare()
         self.assertTrue(result.passed, result.findings)
         delivery = self._deliver(output)
-        discovery_path = delivery / "evidence/discovery.json"
+        discovery_path = delivery / "input/discovery/native-discovery.json"
         text = discovery_path.read_text(encoding="utf-8")
         marker = '"schema_version":' + json.dumps(DISCOVERY_SCHEMA)
         self.assertIn(marker, text)
@@ -757,7 +885,7 @@ class DiscoveryTests(unittest.TestCase):
         )
         self.assertTrue(result.passed, result.findings)
         delivery = self._deliver(output)
-        discovery_path = delivery / "evidence/discovery.json"
+        discovery_path = delivery / "input/discovery/native-discovery.json"
         discovery = json.loads(discovery_path.read_text(encoding="utf-8"))
         entry = next(
             item
@@ -1835,7 +1963,7 @@ class DiscoveryTests(unittest.TestCase):
         self.assertTrue(result.passed, result.findings)
         definition = source_definition(
             self._deliver(output),
-            discovery_name="evidence/discovery.json",
+            discovery_name="input/discovery/native-discovery.json",
             cad_prefix="input/cad/",
             records_prefix="input/",
         )
@@ -2433,7 +2561,7 @@ class DiscoveryTests(unittest.TestCase):
         # The engineered interface is derived from the raw datum alone; no saved carrier
         # exists that dropping a frame could suppress.
         self.assertTrue(report["passed"], report["errors"])
-        payload = json.loads((destination / "evidence/discovery.json").read_text(encoding="utf-8"))
+        payload = json.loads((destination / "input/discovery/native-discovery.json").read_text(encoding="utf-8"))
         self.assertIn("pinch_tcp", [frame["name"] for frame in rebuild_interface_frames(payload)])
 
     def test_jcs_must_alias_the_child_datum(self):
@@ -3291,12 +3419,19 @@ class DiscoveryTests(unittest.TestCase):
         result, _source, output = self._prepare()
         self.assertTrue(result.passed)
         without_record = self._deliver(output)
-        (without_record / "evidence" / "discovery.json").unlink()
+        (
+            without_record
+            / "input/discovery/native-discovery.json"
+        ).unlink()
         report = verify_discovery(without_record)
         self.assertFalse(report["passed"])
         self.assertIn("discovery.file", [item["code"] for item in report["errors"]])
         frozen = self._deliver(output)
-        frozen_record = json.loads((frozen / "evidence" / "discovery.json").read_text(encoding="utf-8"))
+        frozen_record = json.loads(
+            (
+                frozen / "input/discovery/native-discovery.json"
+            ).read_text(encoding="utf-8")
+        )
         # One current model: nothing is sealed beside the record the verifier rebuilds from.
         self.assertNotIn("derived", frozen_record)
 
@@ -3314,7 +3449,7 @@ class DiscoveryTests(unittest.TestCase):
         result, _source, output = self._prepare()
         self.assertTrue(result.passed)
         delivery = self._deliver(output)
-        path = delivery / "evidence" / "discovery.json"
+        path = delivery / "input/discovery/native-discovery.json"
         payload = json.loads(path.read_text(encoding="utf-8"))
         payload["raw"]["mates"][0]["entities"][0]["cylinder"]["radius"] = -1.0
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -3465,7 +3600,7 @@ class DiscoveryTests(unittest.TestCase):
         def drop_authored_hardware(payload: dict) -> None:
             payload["raw"]["identity"].pop("hardware_id")
 
-        self._tamper_delivered(delivery, "evidence/discovery.json", drop_authored_hardware)
+        self._tamper_delivered(delivery, "input/discovery/native-discovery.json", drop_authored_hardware)
         report = verify_discovery(delivery)
         self.assertFalse(report["passed"])
         self.assertIn("discovery.identity", [item["code"] for item in report["errors"]])
@@ -3484,7 +3619,7 @@ class DiscoveryTests(unittest.TestCase):
         def rebind_hardware(payload: dict) -> None:
             payload["identity"]["hardware_id"] = "m9.0"
 
-        self._tamper_delivered(delivery, "evidence/discovery.json", rebind_hardware)
+        self._tamper_delivered(delivery, "input/discovery/native-discovery.json", rebind_hardware)
         report = verify_discovery(delivery)
         self.assertFalse(report["passed"])
         self.assertIn("discovery.identity", [item["code"] for item in report["errors"]])
@@ -3502,7 +3637,7 @@ class DiscoveryTests(unittest.TestCase):
         def rebind_summary(payload: dict) -> None:
             payload["identity"]["change_summary"] = "被换掉的说明"
 
-        self._tamper_delivered(delivery, "evidence/discovery.json", rebind_summary)
+        self._tamper_delivered(delivery, "input/discovery/native-discovery.json", rebind_summary)
         report = verify_discovery(delivery)
         self.assertFalse(report["passed"])
         self.assertIn("discovery.identity", [item["code"] for item in report["errors"]])
@@ -3535,7 +3670,7 @@ class DiscoveryTests(unittest.TestCase):
         ):
             with self.subTest(case=label):
                 delivery = self._deliver(output)
-                self._tamper_delivered(delivery, "evidence/discovery.json", mutation(claim, observation))
+                self._tamper_delivered(delivery, "input/discovery/native-discovery.json", mutation(claim, observation))
                 report = verify_discovery(delivery)
                 self.assertEqual(report["passed"], expected)
                 if not expected:
@@ -3559,7 +3694,7 @@ class DiscoveryTests(unittest.TestCase):
         self.assertTrue(result.passed, result.findings)
         delivery = self._deliver(output)
         request = json.loads((delivery / "input/request.json").read_text(encoding="utf-8"))
-        payload = json.loads((delivery / "evidence/discovery.json").read_text(encoding="utf-8"))
+        payload = json.loads((delivery / "input/discovery/native-discovery.json").read_text(encoding="utf-8"))
         upload_sha256 = payload["raw"]["source_selection"]["upload_sha256"]
         selected_sha256 = payload["raw"]["source_selection"]["handoff_sha256"]
         self.assertNotEqual(upload_sha256, selected_sha256)
@@ -3603,7 +3738,11 @@ class DiscoveryTests(unittest.TestCase):
         )
         self.assertTrue(result.passed, result.findings)
         delivery = self._deliver(output)
-        payload = json.loads((delivery / "evidence" / "discovery.json").read_text(encoding="utf-8"))
+        payload = json.loads(
+            (
+                delivery / "input/discovery/native-discovery.json"
+            ).read_text(encoding="utf-8")
+        )
         original = json.dumps(
             {
                 "schema_version": "solidworks-to-urdf.request/v2",
@@ -3631,7 +3770,7 @@ class DiscoveryTests(unittest.TestCase):
             source_record["identity"]["hardware_id"] = "different_target"
             source_record["source_revision_id"] = digest(source_record["identity"])
 
-        self._tamper_delivered(delivery, "evidence/discovery.json", retarget)
+        self._tamper_delivered(delivery, "input/discovery/native-discovery.json", retarget)
         self._tamper_delivered(delivery, "input/source.json", rebind)
         self.assertEqual((delivery / "input" / "request.json").read_bytes(), original)
         report = verify_discovery(delivery)
@@ -3647,7 +3786,7 @@ class DiscoveryTests(unittest.TestCase):
         def rebind_source_summary(source_record: dict) -> None:
             source_record["metadata"]["change_summary"] = "被生成器共同换掉的说明"
 
-        self._tamper_delivered(delivery, "evidence/discovery.json", rebind_summary)
+        self._tamper_delivered(delivery, "input/discovery/native-discovery.json", rebind_summary)
         self._tamper_delivered(delivery, "input/source.json", rebind_source_summary)
         self.assertEqual((delivery / "input" / "request.json").read_bytes(), original)
         report = verify_discovery(delivery)

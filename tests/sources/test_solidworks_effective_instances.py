@@ -16,8 +16,10 @@ import numpy as np
 
 from . import _paths  # noqa: F401  (import side effect: sys.path)
 
-from description_pipeline.sources.solidworks.freeze import _effective_instance_record  # noqa: E402
-from description_pipeline.sources.solidworks.freeze import _link_group_selections  # noqa: E402
+from description_pipeline.sources.solidworks.capture_projection import (  # noqa: E402
+    _effective_instance_record,
+    _link_group_selections,
+)
 from description_pipeline.sources.solidworks.errors import ConfigError  # noqa: E402
 from description_pipeline.sources.solidworks.scene import (  # noqa: E402
     _PartReading,
@@ -318,7 +320,10 @@ class EffectiveInstanceSceneTests(unittest.TestCase):
         self.assertAlmostEqual(link["inertial"]["inertia"][0], 1e-6, places=18)
         audit = link["provenance"]["mass_properties"]
         self.assertEqual(audit["direct"]["selection"], [DEV, EASYEDA])
-        self.assertEqual(audit["direct"]["source"], "raw/link_group_mass_properties.json")
+        self.assertEqual(
+            audit["direct"]["source"],
+            "raw/native_capture_facts.json#link_group_mass_raw",
+        )
         self.assertAlmostEqual(audit["recombination"]["mass_kg"], 0.061, places=12)
         self.assertAlmostEqual(audit["direct_vs_recombination"]["mass_delta_kg"], 0.061 - 0.099, places=12)
         recombination_com = np.array([0.035 * 0.001 + 0.026 * 0.002, 0.0, 0.0]) / 0.061
@@ -443,7 +448,10 @@ class EffectiveInstanceRecordTests(unittest.TestCase):
         easyeda_row["state"] = "sheet_only"
         easyeda_row["measurement_basis"] = "cad_authored_effective_instance"
         record = _effective_instance_record(
-            scene, {"assembly": "C:/cad/robot.SLDASM", "configuration": "Default"}, {"board-1": self._parent()}
+            scene,
+            {"assembly": "C:/cad/robot.SLDASM", "configuration": "Default"},
+            {"board-1": self._parent()},
+            None,
         )
         self.assertEqual(record["schema_version"], "solidworks-to-urdf.effective-instances/v1")
         self.assertEqual(sorted(record["readings"]), ["board-1"])
@@ -465,7 +473,12 @@ class EffectiveInstanceRecordTests(unittest.TestCase):
 
     def test_effective_instance_record_is_written_empty_when_nothing_is_effective(self):
         scene = types.SimpleNamespace(mass_properties={DEV: _part_payload(0.035)})
-        record = _effective_instance_record(scene, {"assembly": "A", "configuration": "Default"}, {})
+        record = _effective_instance_record(
+            scene,
+            {"assembly": "A", "configuration": "Default"},
+            {},
+            None,
+        )
         self.assertEqual(record["readings"], {})
         self.assertEqual(record["warnings"], [])
 

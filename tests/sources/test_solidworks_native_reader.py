@@ -39,10 +39,12 @@ from description_pipeline.sources.solidworks.native import (
     _appearance_persistent_reference,
     _appearance_render_material,
     _state_render_materials_raw,
-    _project_mass_reading,
-    _project_link_group_mass,
     _raw_mass_fact,
     _temporary_configuration,
+)
+from description_pipeline.sources.solidworks.capture_projection import (
+    _project_link_group_mass,
+    _project_mass_reading,
 )
 #: SolidWorks ``MathTransform.ArrayData`` order for an identity occurrence.
 SW_IDENTITY = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0)
@@ -704,7 +706,9 @@ class _CaptureBackend(SolidWorksBackend):
     """Prepared-Capture seam over the native COM doubles."""
 
     def capture_scene_for_test(self, doc_path, coordinate_systems, on_activity=None):
-        from description_pipeline.sources.solidworks.native import project_prepared_capture
+        from description_pipeline.sources.solidworks.capture_projection import (
+            project_capture_facts,
+        )
 
         root = str(Path(doc_path).resolve().parent)
         self.prepare_prepared_capture(root, str(doc_path), "Default")
@@ -732,7 +736,7 @@ class _CaptureBackend(SolidWorksBackend):
             on_activity=on_activity,
         )
         self._fixture_source_scopes = copy.deepcopy(raw_facts["source_scopes"])
-        return project_prepared_capture(raw_facts)["scene"]
+        return project_capture_facts(raw_facts)["scene"]
 
     def capture_geometry_for_test(self, on_activity=None):
         return self.capture_prepared_geometry(
@@ -7444,7 +7448,7 @@ class LinkGroupMassPropertiesTests(unittest.TestCase):
     def test_origin_getter_reaches_projected_seal_convention(self):
         from description_pipeline.sources.solidworks.inertia_convention import (
             STANDARD,
-            normalize_capture_inertia,
+            detect_family,
         )
 
         origin = [
@@ -7485,15 +7489,12 @@ class LinkGroupMassPropertiesTests(unittest.TestCase):
         projected = _project_link_group_mass(payload)
         for read in projected["links"]["body"]["reads"]:
             self.assertEqual(read["inertia_values_about_origin_api"], origin)
-        report = normalize_capture_inertia(
-            {"link_group_mass_properties.json": projected}
-        )
-        self.assertEqual(report["detected"], STANDARD)
-        self.assertFalse(report["capture_transform"]["applied"])
+        report = detect_family({"links": projected["links"]})
+        self.assertEqual(report["family"], STANDARD)
 
     def test_origin_getter_failure_is_preserved_and_refused_independently(self):
         from description_pipeline.sources.solidworks.inertia_convention import (
-            normalize_capture_inertia,
+            detect_family,
         )
 
         reads = {
@@ -7540,9 +7541,7 @@ class LinkGroupMassPropertiesTests(unittest.TestCase):
                 "native origin failed",
             )
         with self.assertRaises(BridgeError) as caught:
-            normalize_capture_inertia(
-                {"link_group_mass_properties.json": projected}
-            )
+            detect_family({"links": projected["links"]})
         self.assertEqual(
             caught.exception.code,
             "inertia_convention_insufficient_samples",

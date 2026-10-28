@@ -1,7 +1,9 @@
 """End-to-end saved-state warning projection through Generate and Verify."""
 
 import copy
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from description_pipeline.io import read_data
@@ -24,7 +26,14 @@ class SavedStatePipelineTests(unittest.TestCase):
         )
 
         manifest = read_data(capture / "evidence/manifest.json")
-        scene = derive_engineering_input(capture / "evidence", manifest)
+        with tempfile.TemporaryDirectory(
+            prefix="saved-state-generate-meshes-"
+        ) as directory:
+            scene = derive_engineering_input(
+                capture / "evidence",
+                manifest,
+                mesh_root=Path(directory),
+            )
         warning = next(
             item
             for item in scene["provenance"]["value_warnings"]

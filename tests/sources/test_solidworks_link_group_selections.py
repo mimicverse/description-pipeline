@@ -14,8 +14,8 @@ from typing import ClassVar
 from . import _paths  # noqa: F401  (import side effect: sys.path)
 
 from description_pipeline.sources.solidworks.errors import BridgeError  # noqa: E402
-from description_pipeline.sources.solidworks.freeze import (  # noqa: E402
-    _link_group_record_from_payload,
+from description_pipeline.sources.solidworks.capture_projection import (  # noqa: E402
+    _link_group_record,
     _link_group_selections,
 )
 
@@ -151,10 +151,10 @@ class LinkGroupRecordTests(unittest.TestCase):
         }
 
     def _record(self, payload, *, configuration="Default"):
-        return _link_group_record_from_payload(
+        return _link_group_record(
             payload,
             self._selections(),
-            "C:/copy/robot.SLDASM",
+            document="C:/copy/robot.SLDASM",
             configuration=configuration,
         )
 

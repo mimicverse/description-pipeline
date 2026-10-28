@@ -440,7 +440,10 @@ def _direct_link_reads(
     if not isinstance(record, dict) or record.get("schema_version") != LINK_GROUP_SCHEMA:
         raise ConfigError(
             "the capture carries no direct link group mass properties record",
-            {"required": "raw/link_group_mass_properties.json", "schema": LINK_GROUP_SCHEMA},
+            {
+                "required": "raw/native_capture_facts.json#link_group_mass_raw",
+                "schema": LINK_GROUP_SCHEMA,
+            },
         )
     links = record.get("links")
     expected = {str(body.get("name") or body.get("id") or "") for body in bodies}
@@ -730,7 +733,7 @@ def build_scene(
                 "collisions": [],
                 "provenance": {
                     "source_entities": components,
-                    "mass": "raw/mass_properties.json",
+                    "mass": "raw/native_capture_facts.json#part_mass_raw",
                     "parts": [
                         {
                             "id": reading.name,
@@ -749,7 +752,7 @@ def build_scene(
                             "selection": direct["selection"],
                             "selection_rule": direct_meta["selection_rule"],
                             "used_api": direct_meta["used_api"],
-                            "source": "raw/link_group_mass_properties.json",
+                            "source": "raw/native_capture_facts.json#link_group_mass_raw",
                         },
                         "recombination": {
                             "mass_kg": float(combined["mass"]),
@@ -779,7 +782,9 @@ def build_scene(
         effective_names = {instance for instance, _local, _reading in top_most} | used_context
         if effective_names:
             links[-1]["provenance"]["effective_instances"] = sorted(effective_names)
-            links[-1]["provenance"]["instance_measurements"] = "raw/effective_instances.json"
+            links[-1]["provenance"]["instance_measurements"] = (
+                "raw/native_capture_facts.json#component_mass_raw"
+            )
             links[-1]["provenance"]["combination"] = "parallel_axis_from_cad_part_and_instance_readings"
 
     joint_entries = _build_joints(cfg, {link["name"] for link in links}, link_frames)
@@ -1593,28 +1598,3 @@ def _build_frames(
             }
         )
     return frames
-
-
-def load_scene(snapshot_root: Path) -> dict[str, Any]:
-    """Legacy loader for replay/tests; Generate consumes derive_engineering_input."""
-
-    from ..snapshot import verify_snapshot
-
-    root = Path(snapshot_root).resolve()
-    manifest = verify_snapshot(root)
-    from .captured import derive_engineering_input
-
-    scene = derive_engineering_input(root, manifest)
-    if not isinstance(scene, dict) or not engineering_model_schema_supported(scene.get("schema_version")):
-        raise ConfigError("unexpected scene schema", {"snapshot": str(root)})
-    if scene.get("units") != "SI":
-        raise ConfigError("only SI scenes are supported", {"units": scene.get("units")})
-    provenance = dict(scene.get("provenance") or {})
-    provenance["snapshot"] = {
-        "kind": manifest.get("kind"),
-        "evidence_class": manifest.get("evidence_class"),
-        "identity": manifest.get("identity"),
-        "files": len(manifest.get("files") or {}),
-    }
-    scene["provenance"] = provenance
-    return scene

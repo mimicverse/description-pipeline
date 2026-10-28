@@ -1767,14 +1767,25 @@ class NativeDeclarationsTests(unittest.TestCase):
                 derived["joints"] = copy.deepcopy(block.get("joints") or [])
                 derived["frames"] = copy.deepcopy(block.get("frames") or [])
                 derived["checks"] = copy.deepcopy(robot.get("checks") or {})
-                payload["robot_name"] = block.get("robot_name")
+                identity = payload.setdefault("identity", {})
+                authored_name = (raw.get("identity") or {}).get(
+                    "robot_name"
+                )
+                if isinstance(authored_name, str) and authored_name:
+                    identity["robot_name"] = authored_name
+                    identity["robot_name_technical"] = None
+                else:
+                    identity["robot_name"] = None
+                    identity["robot_name_technical"] = block.get(
+                        "robot_name"
+                    )
 
             def reseal() -> None:
                 sync_robot()
                 payload["raw"] = copy.deepcopy(raw)
                 from description_pipeline.io import write_json
 
-                (package / "evidence/discovery.json").write_bytes(json.dumps(payload).encode())
+                (package / "input/discovery/native-discovery.json").write_bytes(json.dumps(payload).encode())
                 write_json(package / "input/source.json", source)
                 support.seal_delivery(package)
 

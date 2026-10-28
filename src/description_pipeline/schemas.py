@@ -27,6 +27,25 @@ NATIVE_CAPTURE_FACTS_KEYS = frozenset(
         "notes",
     }
 )
+NATIVE_CAPTURE_OBSERVATION_SCHEMA = (
+    "solidworks-to-urdf.native-capture-facts/v2"
+)
+NATIVE_CAPTURE_OBSERVATION_KEYS = frozenset(
+    {
+        "schema_version",
+        *NATIVE_CAPTURE_FACTS_KEYS,
+        "geometry_raw",
+        "axis_references_raw",
+        "document_state",
+        "input_stability",
+    }
+)
+CAPTURE_EVIDENCE_REQUESTS = (
+    "evidence/native-runtime.json",
+    "evidence/raw/native_capture_facts.json",
+    "evidence/raw/dependency_closure.json",
+    "evidence/raw/triangles/",
+)
 NATIVE_DISCOVERY_SCHEMA = "solidworks-to-urdf.native-discovery/v1"
 NATIVE_DISCOVERY_FINDING_SCHEMA = "solidworks-to-urdf.discovery-finding/v1"
 NATIVE_IDENTITY_RESOLUTION_SCHEMA = "solidworks-to-urdf.identity-resolution/v1"

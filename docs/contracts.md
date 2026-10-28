@@ -201,8 +201,8 @@ executor。各 role 只与自己的冻结 requirement 比较，禁止假设跨 r
 |---|---|---|---|
 | `freeze` 冻结输入 | Linux | originals、ruleset、platform configuration、认证主体、主装配、配置目标、用途及必填说明；artifact closure、路径、文件类型、大小和选择有效 | `stage-request.json`、`request.json`、`inputs.json`、`ruleset.json`、`configuration.json`、`checks.json`；清单闭合、字节及摘要一致；不启动 CAD |
 | `discover` 解析结构 | Windows 原生观察 + Linux 推导 | 已验证 Freeze 输出、SourceSet、ruleset/configuration identity 和准入的 native tool source/record identity；artifact 与工具身份一致 | `native-observation/`、`prepared/`、`request.json`、`checks.json`、`result.json`；原生观察、selection、ruleset 和 prepared bytes 一致 |
-| `capture` 采集证据 | Windows 原生读取 + Linux 传输核验 | 已验证 Freeze/Discover 输出和同版 native tool requirement；prepared bytes、source inventory、tool identity 与对象归属一致 | admitted tree 的 `input/`、`evidence/`、`reports/native-tool.json`、`reports/native-stages.json`、`transfer-manifest.json`；原生事实、对象和配置绑定、几何覆盖、失败保全和资源结算通过 |
-| `generate` 生成 URDF | Linux | 精确 committed Capture artifact；snapshot、schema、provenance、source warning、source binding 与 tool identity 有效 | `model/robot.json`、`urdf/robot.urdf`、`meshes/`、`tool.json`、`reports/generate.json`；确定性、完整并绑定 Capture |
+| `capture` 采集证据 | Windows 原生读取 + Linux 传输核验 | 已验证 Freeze/Discover 输出和同版 native tool requirement；prepared bytes、source inventory、tool identity 与对象归属一致 | admitted tree 的 `input/`、`evidence/`、`reports/native-tool.json`、`reports/native-stages.json`、`transfer-manifest.json`；原生字节、必需 schema、对象/配置/计划绑定、失败保全和资源结算通过 |
+| `generate` 生成 URDF | Linux | 精确 committed Capture artifact；snapshot、schema、provenance、source warning、source binding 与 tool identity 有效 | `model/robot.json`、`urdf/robot.urdf`、`meshes/`、`tool.json`、`reports/generate.json`；一次语义投影、惯量规范化与 STL 物化，结果确定且绑定 Capture |
 | `verify` 独立验证 | Linux | 精确 committed Generate/Capture pair；原始证据和实际生成字节未变 | `verification-certificate.json`、`verification-execution.json`；全部必需且适用的检查通过，并绑定 pair、verifier、contract、policy 与 subject |
 | `publish` 提交评审 PR | Linux | Generate/Capture/Verify artifacts 与 sealed RepositorySnapshot；重验、配置目标、前置基线和干净工作区有效 | `publication-receipt.json` 与 fenced Git/PR effects；copied bytes、committed tree、remote head/base、PR 和 verified subject 一致 |
 
@@ -589,7 +589,7 @@ body、face 和三角形；每个 face 的直接返回按原始次序保留，�
 这些标志不代替对象身份和归属证明，数组位置也不代表跨次稳定身份。这里的接收者是
 `IComponent2`；`IPartDoc.GetBodies2(BodyType, BVisibleOnly)` 仍用于 Part 文档查询，
 不是 occurrence 几何的备用或替代链。
-旧几何与准备收据按原 schema 保全，不能重标版本、填充新字段或自动晋升为当前输入。
+封存几何与准备收据不可改写，不得重标 schema、补造原始字段或替换来源身份。
 
 原始三角形每项为九个有限 `binary64` 数值，单位为米、坐标位于 component-local。
 封存字节保留原值与顺序，严格核验格式版本、数量和文件长度，拒绝截断、尾随字节、
@@ -603,14 +603,16 @@ persistent reference。scene 保留实际 placement，不能为简化转换替�
 
 `prepare_prepared_capture` 只绑定已封存 prepared 的 root/configuration，不打开
 COM；Freeze 保留初次准备职责。Capture 读取 scene 与内存几何事实后，按唯一会话
-所有权协议释放 CAD，再在 Windows 离线执行原值投影、惯量规范化、raw/STL 序列化
-和封包。这部分纯计算不再持有 CAD，会话释放不代表 Windows 作业已经结束。STL 从同一 raw
+所有权协议释放 CAD，再完成原值序列化与封包。Windows 不执行语义投影、惯量规范化
+或 STL 生成；Linux Capture 接纳只核字节、schema、身份、scope 与计划绑定。
+Generate 在 Linux 对同一 raw 执行一次语义投影、惯量规范化与 STL 物化。STL 从同一 raw
 三角形派生，保留 component-local 坐标，明确法向量和浮点编码的派生来源，不能重复
 应用 occurrence placement。原生错误及已取得的 partial facts 保全，不被离线异常替代。
 
 原生事实只在 `evidence/raw/native_capture_facts.json` 封存一份，由 source manifest 和
-Capture artifact 绑定其字节；`evidence/capture.json` 保留必要投影与其他证据块，不再
-内嵌完整原生事实。Generate 与独立 Verify 读取同一原始成员，各自执行匹配、派生与
+Capture artifact 绑定其字节；不保存 `evidence/capture.json` 或其他等价投影副本。
+原始三角形的 binary64 流是保真数值编码，不冒称 COM SAFEARRAY 的内存原字节。
+Generate 与独立 Verify 读取同一原始成员，各自执行匹配、派生与
 复算；原始事实缺失、被改写或与投影冲突时，按既有工程和完整性规则拒绝。
 
 独立 consumer 从 raw 字节、face spans、原始 placement、物性和基准读数复算实际
@@ -684,7 +686,7 @@ inventory，只将受约束的相对路径定位到已登记工程副本，不�
 只保存 selection、原生对象、规则、证据和 prepared bytes 身份，不另存完整机器人模型；
 不得在采集结束后从配置或结果倒造新的计划。
 
-原生记录保留直接读数、API 状态、原生引用、配置、保存状态、环境及原始几何。厂商矩阵布局、单位和原始数值先如实保全；释放 CAD 后从固定事实离线投影到 SI，变换使用行优先 4×4 齐次矩阵及列向量乘法，保留原值到结果的规则和来源 warning。工程模型生成、闭包比较、独立工程验证、诊断解释与报告渲染在 Linux 完成；格式校验和封存摘要计算属于传输职责。
+原生记录保留直接读数、API 状态、原生引用、配置、保存状态、环境及原始几何。厂商矩阵布局、单位和原始数值先如实保全；Generate 从固定事实投影到 SI，变换使用行优先 4×4 齐次矩阵及列向量乘法，保留原值到结果的规则和来源 warning。工程模型生成、闭包比较、独立工程验证、诊断解释与报告渲染在 Linux 完成；格式校验和封存摘要计算属于传输职责。
 
 当前方向处理不引入基于右手定则的新正向选择或符号推导规则，也不引入屈曲、外展等功能动作推导正向。输出遵循 URDF 既定格式和坐标约定，并按[《MimicVerse URDF 工程标准 v1》](https://hcnd2fgke1pv.feishu.cn/docx/N3iSdpYxGo151UxgBz6csCthnSb)检查表达一致性；这些约定不能用来绕过 CAD 已有有向轴及有效作者声明。斜轴保留真实机械轴，不吸附到主轴。名称、全局向量分量或镜像标记不能单独决定正向。
 

@@ -1938,10 +1938,7 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
         evidence = source / "evidence"
         facts_path = evidence / "raw/native_capture_facts.json"
         facts = read_data(facts_path)
-        geometry = {
-            row["component"]: row
-            for row in read_data(evidence / "raw/geometry.json")
-        }
+        geometry = facts["geometry_raw"]
         for occurrence in facts["scene_raw"]["occurrences"]:
             component = str(occurrence["name"])
             scope = facts["source_scopes"][component]
@@ -1982,8 +1979,7 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                 }
 
             body_rows = []
-            spans = geometry[component]["tessellation"]["face_spans"]
-            for body in geometry[component]["tessellation"]["bodies"]:
+            for body in geometry[component]["body_inventory"]:
                 body_rows.append(
                     {
                         "component": component,
@@ -1997,21 +1993,20 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                         ),
                         "faces": [
                             {
-                                "face_index": span["face_index"],
+                                "face_index": face["face_index"],
                                 "appearance": owner(
                                     "IFace2.MaterialPropertyValues"
                                 ),
                             }
-                            for span in spans
-                            if span["body_type"] == body["body_type"]
-                            and span["body_index"] == body["body_index"]
+                            for face in geometry[component][
+                                "face_inventory"
+                            ]
+                            if face["body_type"] == body["body_type"]
+                            and face["body_index"] == body["body_index"]
                         ],
                     }
                 )
-            occurrence["appearance_raw"] = {
-                "component": component,
-                "source_document_path": scope["source_document_path"],
-                "referenced_configuration": configuration,
+            geometry[component]["appearance_raw"] = {
                 "native_active_configuration": configuration,
                 "native_active_configuration_error": None,
                 "native_referenced_display_state": "Display State 1",

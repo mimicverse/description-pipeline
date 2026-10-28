@@ -10,7 +10,10 @@ from pathlib import Path
 
 from description_pipeline.io import PipelineError, canonical, read_data
 from description_pipeline.model import EngineeringModel, compile, emit
-from description_pipeline.sources.solidworks.scene import load_scene
+from description_pipeline.sources.solidworks.captured import (
+    derive_engineering_input,
+)
+from description_pipeline.sources.snapshot import write_manifest
 from description_pipeline.verification.solidworks_urdf import _xml
 
 from tests.sources import test_solidworks_mass_authority as authority_fixtures
@@ -27,8 +30,34 @@ class EngineeringModelTests(unittest.TestCase):
         second = authority.tmp / "engineering-model-b"
         shutil.copytree(first, second)
 
-        first_input = load_scene(first)
-        second_input = load_scene(second)
+        with tempfile.TemporaryDirectory(
+            prefix="engineering-model-meshes-"
+        ) as directory:
+            mesh_root = Path(directory)
+            for snapshot in (first, second):
+                evidence = snapshot / "evidence"
+                for name in ("raw", "source", "manifest.json"):
+                    shutil.move(
+                        snapshot / name,
+                        evidence / name,
+                    )
+                previous = read_data(evidence / "manifest.json")
+                write_manifest(
+                    evidence,
+                    kind=previous["kind"],
+                    identity=previous["identity"],
+                    evidence_class=previous["evidence_class"],
+                )
+            first_input = derive_engineering_input(
+                first / "evidence",
+                read_data(first / "evidence/manifest.json"),
+                mesh_root=mesh_root,
+            )
+            second_input = derive_engineering_input(
+                second / "evidence",
+                read_data(second / "evidence/manifest.json"),
+                mesh_root=mesh_root,
+            )
         before_first = copy.deepcopy(first_input)
         before_second = copy.deepcopy(second_input)
         first_model = compile(first_input, native_warnings=[])
@@ -49,7 +78,11 @@ class EngineeringModelTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            emission = emit(model, evidence_root=source, destination=root)
+            emission = emit(
+                model,
+                mesh_source_root=source,
+                destination=root,
+            )
             self.assertEqual(emission.model_sha256, model.semantic_sha256)
 
             mutated = model.to_dict()

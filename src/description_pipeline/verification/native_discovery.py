@@ -3090,7 +3090,7 @@ def verify_discovery(package: Path) -> dict:
             errors.append({"code": "discovery.internal", "message": str(error), "detail": {}})
         return checks[-1]
 
-    record_path = package / "evidence/discovery.json"
+    record_path = package / "input/discovery/native-discovery.json"
     source_path = package / "input/source.json"
     originals_root = package / "input/cad"
 
@@ -3105,20 +3105,34 @@ def verify_discovery(package: Path) -> dict:
                 f"discovery record is not valid UTF-8 JSON: {error}",
             ) from error
         _require(payload.get("schema_version") == DISCOVERY_SCHEMA, "discovery.binding", "unexpected discovery schema")
-        files = payload.get("files")
+        files = payload.get("native_files")
         _require(
-            isinstance(files, list) and files and all(isinstance(row, dict) for row in files),
+            isinstance(files, dict)
+            and bool(files)
+            and all(
+                isinstance(name, str)
+                and bool(name)
+                and isinstance(checksum, str)
+                and bool(checksum)
+                for name, checksum in files.items()
+            ),
             "discovery.binding",
             "record carries no file inventory",
         )
         _require(
-            digest(files) == payload.get("native_inventory_sha256"),
+            digest(files) == payload.get("handoff_sha256"),
             "discovery.binding",
             "the native inventory digest does not match the file records",
         )
         manifest = read_delivery_manifest(package)
+        record_name = "input/discovery/native-discovery.json"
         entry = next(
-            (row for row in manifest["subject"]["files"] if row.get("path") == "evidence/discovery.json"), None
+            (
+                row
+                for row in manifest["subject"]["files"]
+                if row.get("path") == record_name
+            ),
+            None,
         )
         _require(
             entry is not None and entry.get("sha256") == hashlib.sha256(payload_bytes).hexdigest(),
@@ -3168,24 +3182,28 @@ def verify_discovery(package: Path) -> dict:
         )
         state["request"] = request
         identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else {}
+        robot_name = (
+            identity.get("robot_name")
+            or identity.get("robot_name_technical")
+        )
         definition = {
             "schema_version": payload.get("schema_version"),
             # The definition identity carries the generated claim; the identity
             # gate recomputes the expected value from the raw reading plus the
             # sealed selection and compares the claim against it.
             "hardware_id": identity.get("hardware_id"),
-            "robot_name": payload.get("robot_name"),
+            "robot_name": robot_name,
             "source": {
                 "assembly": source["selection"]["main_assembly"],
                 "configuration": source["selection"]["configuration"],
-                "robot_name": payload.get("robot_name"),
+                "robot_name": robot_name,
             },
         }
         state["definition"] = definition
         state["payload"] = payload
         return {
             "discovery_sha256": hashlib.sha256(payload_bytes).hexdigest(),
-            "native_inventory_sha256": payload.get("native_inventory_sha256"),
+            "native_inventory_sha256": digest(files),
             "run_id": payload.get("run_id"),
             "contract": payload.get("contract"),
         }
@@ -3194,9 +3212,8 @@ def verify_discovery(package: Path) -> dict:
         payload = state["payload"]
         inventory = _digest_files(originals_root)
         native = {
-            str(row["path"]): str(row["sha256"])
-            for row in payload.get("files") or []
-            if isinstance(row, dict) and isinstance(row.get("path"), str)
+            str(name): str(checksum)
+            for name, checksum in (payload.get("native_files") or {}).items()
         }
         for relative, checksum in sorted(native.items()):
             _require(
@@ -3248,9 +3265,8 @@ def verify_discovery(package: Path) -> dict:
         payload = state["payload"]
         raw = payload.get("raw") or {}
         native = {
-            str(row["path"]): str(row["sha256"])
-            for row in payload.get("files") or []
-            if isinstance(row, dict) and isinstance(row.get("path"), str)
+            str(name): str(checksum)
+            for name, checksum in (payload.get("native_files") or {}).items()
         }
         raw_files = raw.get("files") or {}
         carrier = raw.get("source_selection")

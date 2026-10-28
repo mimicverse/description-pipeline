@@ -16,10 +16,13 @@ from description_pipeline.geometry.native_transform import transform_from_solidw
 from description_pipeline.io import PipelineError
 from description_pipeline.schemas import NATIVE_TESSELLATION_SCHEMA
 from description_pipeline.sources.solidworks.errors import CadError
-from description_pipeline.sources.solidworks.native import (
-    materialize_native_triangles,
+from description_pipeline.sources.solidworks.capture_geometry import (
+    materialize_native_geometry,
+    seal_native_geometry,
+)
+from description_pipeline.sources.solidworks.capture_projection import (
     project_axis_references,
-    project_prepared_capture,
+    project_capture_facts,
 )
 from description_pipeline.verification.native_mesh_observations import (
     _verify_scene_binding,
@@ -85,7 +88,7 @@ class PreparedCaptureFixtureTests(unittest.TestCase):
             raw_facts["source_scopes"]
         )
         self.backend.release()
-        projected = project_prepared_capture(copy.deepcopy(raw_facts))
+        projected = project_capture_facts(copy.deepcopy(raw_facts))
         self.assertEqual(
             set(projected),
             {
@@ -97,11 +100,18 @@ class PreparedCaptureFixtureTests(unittest.TestCase):
                 "link_group_mass_properties",
             },
         )
-        destinations = {
-            component: str(self.root / "geometry" / f"{index:04d}.stl")
-            for index, component in enumerate(sorted(raw_geometry), start=1)
-        }
-        serialized = materialize_native_triangles(raw_geometry, destinations)
+        evidence_root = self.root / "evidence"
+        geometry_raw = seal_native_geometry(
+            raw_geometry,
+            raw_facts["source_scopes"],
+            evidence_root,
+        )
+        serialized = materialize_native_geometry(
+            geometry_raw,
+            raw_facts["source_scopes"],
+            evidence_root=evidence_root,
+            destination_root=self.root / "materialized",
+        )
         self.assertEqual(set(serialized), set(raw_geometry))
         for component, entry in serialized.items():
             self.assertEqual(
@@ -140,12 +150,12 @@ class PreparedCaptureFixtureTests(unittest.TestCase):
         raw_geometry[component]["triangle_values"] = raw_geometry[component][
             "triangle_values"
         ][:-1]
-        destinations = {
-            component: str(self.root / "geometry" / f"{component}.stl")
-            for component in raw_geometry
-        }
         with self.assertRaises(CadError) as caught:
-            materialize_native_triangles(raw_geometry, destinations)
+            seal_native_geometry(
+                raw_geometry,
+                raw_facts["source_scopes"],
+                self.root / "evidence",
+            )
         self.assertEqual(caught.exception.code, "cad_mesh_export_failed")
 
     def test_fixture_axis_capture_is_raw_until_offline_projection(self):
@@ -205,12 +215,18 @@ class PreparedCaptureFixtureTests(unittest.TestCase):
             raw_facts["source_scopes"]
         )
         self.backend.release()
-        destinations = {
-            component: str(evidence / "geometry" / f"{component}.stl")
-            for component in raw_geometry
-        }
+        geometry_raw = seal_native_geometry(
+            raw_geometry,
+            raw_facts["source_scopes"],
+            evidence,
+        )
         geometry = list(
-            materialize_native_triangles(raw_geometry, destinations).values()
+            materialize_native_geometry(
+                geometry_raw,
+                raw_facts["source_scopes"],
+                evidence_root=evidence,
+                destination_root=evidence,
+            ).values()
         )
         entry = geometry[0]
         component = entry["component"]

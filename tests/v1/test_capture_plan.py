@@ -11,14 +11,16 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from description_pipeline.io import PipelineError, digest, write_json
-from description_pipeline.schemas import NATIVE_DISCOVERY_SCHEMA
+from description_pipeline.schemas import (
+    CAPTURE_EVIDENCE_REQUESTS,
+    NATIVE_DISCOVERY_SCHEMA,
+)
 from description_pipeline.sources.solidworks import discovery
 from description_pipeline.sources.solidworks.capture_package import (
     consume_sealed_definition,
 )
 from description_pipeline.sources.solidworks.capture_transaction import (
     inspect_prepared_package,
-    _require_plan_against_capture,
 )
 from tests.sources.selection_support import sealed_selection
 
@@ -26,7 +28,6 @@ MAIN = "cad/robot.SLDASM"
 
 steps = SimpleNamespace(
     _consume_sealed_definition=consume_sealed_definition,
-    _require_plan_against_capture=_require_plan_against_capture,
 )
 
 
@@ -86,7 +87,7 @@ def build_package(root: Path) -> Path:
         ],
         "axis_requests": [{"name": "shoulder_pitch_joint", "axis_reference": {"point": [0, 0, 0]}}],
         "datums": ["CS_base_link"],
-        "evidence_requests": ["evidence/capture.json", "evidence/geometry/", "evidence/native-runtime.json"],
+        "evidence_requests": list(CAPTURE_EVIDENCE_REQUESTS),
     }
     write_json(root / "capture-plan.json", plan)
     return root
@@ -283,140 +284,10 @@ class CapturePlanTests(unittest.TestCase):
         with self.assertRaisesRegex(PipelineError, "unknown native selector field"):
             steps._consume_sealed_definition(self.root)
 
-    def test_capture_mass_scope_covers_material_occurrences_not_assembly_containers(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="capture-mass-scope-") as temporary:
-            staging = Path(temporary)
-            raw = staging / "evidence" / "raw"
-            raw.mkdir(parents=True)
-            plan = {
-                "objects": [
-                    {"name": "arm-1", "document": "cad/arm.SLDASM", "state": 2},
-                    {"name": "arm-1/part-1", "document": "cad/part.SLDPRT", "state": 2},
-                    {"name": "arm-1/virtual-1", "state": 2},
-                    {"name": "arm-1/virtual-asm-1", "state": 2},
-                    {"name": "arm-1/virtual-asm-1/part-2", "document": "cad/part2.SLDPRT", "state": 2},
-                ],
-                "datums": [],
-                "evidence_requests": [],
-            }
-            components = [
-                {"name": "arm-1/part-1", "document_type": "part"},
-                {"name": "arm-1/virtual-1", "document_type": "part"},
-                {"name": "arm-1/virtual-asm-1/part-2", "document_type": "part"},
-            ]
-            discovery_components = [
-                {"name2": "arm-1", "document": "cad/arm.SLDASM"},
-                {"name2": "arm-1/part-1", "document": "cad/part.SLDPRT"},
-                {
-                    "name2": "arm-1/virtual-1",
-                    "document": "c:/temp/swx/VC~~/arm/virtual.SLDPRT",
-                },
-                {
-                    "name2": "arm-1/virtual-asm-1",
-                    "document": "c:/temp/swx/VC~~/arm/virtual-asm.SLDPRT",
-                },
-                {
-                    "name2": "arm-1/virtual-asm-1/part-2",
-                    "document": "cad/part2.SLDPRT",
-                },
-                {
-                    "name2": "arm-1/suppressed-1",
-                    "document": "cad/suppressed.SLDPRT",
-                    "suppressed": True,
-                },
-            ]
-            write_json(
-                staging / "evidence" / "discovery.json",
-                {
-                    "raw": {
-                        "components": discovery_components
-                    }
-                },
-            )
-            write_json(raw / "scene_raw.json", {"components": components})
-            write_json(
-                raw / "mass_properties.json",
-                {
-                    "arm-1/part-1": {},
-                    "arm-1/virtual-1": {},
-                    "arm-1/virtual-asm-1/part-2": {},
-                },
-            )
-            steps._require_plan_against_capture(staging, plan)
-
-            write_json(raw / "mass_properties.json", {"arm-1/part-1": {}})
-            with self.assertRaisesRegex(PipelineError, "did not read every planned native instance"):
-                steps._require_plan_against_capture(staging, plan)
-
-            write_json(
-                raw / "mass_properties.json",
-                {
-                    "arm-1/part-1": {},
-                    "arm-1/virtual-1": {},
-                    "arm-1/virtual-asm-1/part-2": {},
-                    "arm-1/extra-1": {},
-                },
-            )
-            with self.assertRaisesRegex(PipelineError, "did not read every planned native instance"):
-                steps._require_plan_against_capture(staging, plan)
-
-            components[0]["document_type"] = "assembly"
-            write_json(raw / "scene_raw.json", {"components": components})
-            write_json(
-                raw / "mass_properties.json",
-                {
-                    "arm-1/part-1": {},
-                    "arm-1/virtual-1": {},
-                    "arm-1/virtual-asm-1/part-2": {},
-                },
-            )
-            with self.assertRaisesRegex(PipelineError, "did not read every planned native instance"):
-                steps._require_plan_against_capture(staging, plan)
-
-            discovery_components.append(dict(discovery_components[1]))
-            write_json(staging / "evidence" / "discovery.json", {"raw": {"components": discovery_components}})
-            with self.assertRaisesRegex(PipelineError, "repeats a sealed native instance identity"):
-                steps._require_plan_against_capture(staging, plan)
-
     def test_a_boolean_selector_state_is_refused(self) -> None:
         self._rewrite_plan(lambda plan: plan["objects"][0].update(state=True))
         with self.assertRaisesRegex(PipelineError, "native suppression state"):
             steps._consume_sealed_definition(self.root)
-
-    def test_a_virtual_container_with_only_suppressed_children_needs_no_mass(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="capture-empty-container-") as temporary:
-            staging = Path(temporary)
-            evidence = staging / "evidence"
-            raw = evidence / "raw"
-            raw.mkdir(parents=True)
-            plan = {
-                "objects": [{"name": "container-1", "state": 2}],
-                "datums": [],
-                "evidence_requests": [],
-            }
-            write_json(
-                evidence / "discovery.json",
-                {
-                    "raw": {
-                        "components": [
-                            {
-                                "instance_id": "container-1",
-                                "name2": "container-1",
-                                "document": "c:/temp/swx/VC~~/container/container.SLDPRT",
-                            },
-                            {
-                                "instance_id": "container-1/part-1",
-                                "name2": "container-1/part-1",
-                                "document": "part.SLDPRT",
-                                "suppressed": True,
-                            },
-                        ]
-                    }
-                },
-            )
-            write_json(raw / "scene_raw.json", {"components": []})
-            write_json(raw / "mass_properties.json", {})
-            steps._require_plan_against_capture(staging, plan)
 
     def test_a_source_selection_not_bound_to_the_raw_inventory_is_refused(self) -> None:
         discovery_document = json.loads(

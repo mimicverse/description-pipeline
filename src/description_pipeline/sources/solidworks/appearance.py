@@ -2560,7 +2560,12 @@ def bind_capture_appearance(
         else None
     )
     source_scopes = native_facts.get("source_scopes")
-    if not isinstance(occurrences, list) or not isinstance(source_scopes, Mapping):
+    geometry_raw = native_facts.get("geometry_raw")
+    if (
+        not isinstance(occurrences, list)
+        or not isinstance(source_scopes, Mapping)
+        or not isinstance(geometry_raw, Mapping)
+    ):
         raise _invalid_appearance(
             "",
             "cad_appearance_native_facts_invalid",
@@ -2598,6 +2603,7 @@ def bind_capture_appearance(
             "the sealed scene projection carries no component list",
         )
     projected_names: set[str] = set()
+    attached_occurrences: set[str] = set()
     for index, component in enumerate(raw_components):
         if not isinstance(component, dict):
             raise _invalid_appearance(
@@ -2624,15 +2630,37 @@ def bind_capture_appearance(
                 f"scene_raw.components[{index}]",
                 "a projected scene component has no native appearance occurrence",
             )
-        if "appearance_raw" in occurrence:
-            component["appearance_raw"] = copy.deepcopy(
-                occurrence.get("appearance_raw")
+        geometry = geometry_raw.get(name)
+        if not isinstance(geometry, Mapping):
+            raise _invalid_appearance(
+                name,
+                "cad_appearance_geometry_missing",
+                f"geometry_raw.{name}",
+                "a native occurrence has no sealed geometry appearance",
             )
-    attached_occurrences = {
-        name
-        for name, occurrence in by_occurrence.items()
-        if "appearance_raw" in occurrence
-    }
+        appearance = geometry.get("appearance_raw")
+        scope = source_scopes.get(name)
+        if appearance is None:
+            continue
+        if not isinstance(appearance, Mapping) or not isinstance(
+            scope,
+            Mapping,
+        ):
+            raise _invalid_appearance(
+                name,
+                "cad_appearance_native_facts_invalid",
+                f"geometry_raw.{name}.appearance_raw",
+                "a native occurrence has no sealed appearance or source scope",
+            )
+        component["appearance_raw"] = {
+            "component": name,
+            "source_document_path": scope.get("source_document_path"),
+            "referenced_configuration": scope.get(
+                "referenced_configuration"
+            ),
+            **copy.deepcopy(dict(appearance)),
+        }
+        attached_occurrences.add(name)
     if attached_occurrences and attached_occurrences != projected_names:
         raise _invalid_appearance(
             "",

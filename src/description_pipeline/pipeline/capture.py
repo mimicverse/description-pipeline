@@ -1148,7 +1148,7 @@ def _capture_native_transaction(
             request_path.write_bytes(
                 canonical(dict(request_evidence))
             )
-            _, input_report = capture_native_package(
+            capture_native_package(
                 package,
                 staging,
                 backend=backend,
@@ -1157,7 +1157,6 @@ def _capture_native_transaction(
                 expected_inputs=dict(expected_inputs),
                 handoff_sha256=handoff_sha256,
             )
-            receipt["cad_revision"] = (input_report["cad_revision"] or {}).get("revision")
             tool = native_tool_factory()
             return _seal_native_capture_artifact(
                 staging,
@@ -1530,10 +1529,27 @@ class CaptureHandler:
             expected_upstream_artifacts=_upstream_records(inputs),
             expected_execution=execution_record,
         )
+        from ..sources.solidworks.capture_projection import (
+            load_native_capture_observation,
+            validate_native_capture_plan,
+        )
+
+        observation = load_native_capture_observation(admitted)
+        plan = read_data(admitted / "input/capture-plan.json")
+        if not isinstance(plan, dict):
+            raise ProtocolError(
+                "capture.plan_invalid",
+                {"where": "input/capture-plan.json"},
+            )
+        validate_native_capture_plan(observation, plan)
         checks = digest(
             {
                 "effect_key": request.effect_key,
                 "manifest": manifest,
+                "native_capture_facts": file_digest(
+                    admitted
+                    / "evidence/raw/native_capture_facts.json"
+                ),
                 "object_set_sha256": digest(list(inputs.object_names)),
                 "upstream_artifacts": _upstream_records(inputs),
             }

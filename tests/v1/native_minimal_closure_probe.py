@@ -150,6 +150,7 @@ def _build_prepared_package(
     from description_pipeline.io import digest, write_json
     from description_pipeline.schemas import NATIVE_DISCOVERY_SCHEMA
     from tests.sources import support
+    from description_pipeline.schemas import CAPTURE_EVIDENCE_REQUESTS
     from tests.sources.selection_support import sealed_selection
 
     package = workspace / "prepared"
@@ -240,11 +241,7 @@ def _build_prepared_package(
         "configuration": "Default",
         "datums": ["base_datum", "arm_datum", "imu_datum"],
         "discovery_sha256": hashlib.sha256((package / "discovery/native-discovery.json").read_bytes()).hexdigest(),
-        "evidence_requests": [
-            "evidence/capture.json",
-            "evidence/geometry/",
-            "evidence/native-runtime.json",
-        ],
+        "evidence_requests": list(CAPTURE_EVIDENCE_REQUESTS),
         "groups": [
             {"components": ["base-1"], "name": "base_link"},
             {"components": ["arm-1"], "name": "arm_link"},
@@ -299,11 +296,11 @@ def _prior_native_events(
         shutil.copyfile(package / relative, target)
     shutil.copyfile(
         package / "discovery/native-discovery.json",
-        expected / "evidence/discovery.json",
+        expected / "input/discovery/native-discovery.json",
     )
     shutil.copyfile(
         package / "capture-plan.json",
-        expected / "evidence/capture-plan.json",
+        expected / "input/capture-plan.json",
     )
     write_json(expected / "evidence/manifest.json", {})
     write_json(
@@ -334,7 +331,6 @@ def _run(workspace: Path) -> dict:
 
     capture_evidence = importlib.import_module("description_pipeline.verification.capture_evidence")
     facts_module = importlib.import_module("description_pipeline.verification.native_capture_facts")
-    mesh_module = importlib.import_module("description_pipeline.verification.native_mesh_observations")
     (
         package,
         backend,
@@ -422,14 +418,14 @@ def _run(workspace: Path) -> dict:
 
     scene = capture_evidence.scene(admitted)
     source_scopes = capture_evidence.source_scopes(admitted)
-    mesh = mesh_module.verify_native_mesh_observations(admitted)
+    mesh = capture_evidence.geometry(admitted)
     facts = facts_module.verify_native_capture_facts(admitted)
     return {
         "archive_files": transfer["files"],
         "capture_components": len(scene["components"]),
         "fact_components": len(native_files),
         "facts": facts,
-        "mesh_components": mesh["components"],
+        "mesh_components": len(mesh),
         "source_scope_components": len(source_scopes),
         "transfer_main_assembly": transfer["main_assembly"],
     }

@@ -247,7 +247,7 @@ class ImportedSourceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             package = self._package(directory, {"imported_part.step": content}, [json.loads(json.dumps(baseline))])
             report = verify_discovery(package)
-            sealed_hash = hashlib.sha256((package / "evidence/discovery.json").read_bytes()).hexdigest()
+            sealed_hash = hashlib.sha256((package / "input/discovery/native-discovery.json").read_bytes()).hexdigest()
         # The binding check stays first so the passed report keeps its sealed provenance hash.
         self.assertEqual(report["checks"][0]["id"], "discovery.binding")
         self.assertEqual(report["discovery_sha256"], sealed_hash)
@@ -294,7 +294,7 @@ class ImportedSourceTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as directory:
             package = self._package(directory, {"imported_part.step": content}, [component])
-            record_path = package / "evidence/discovery.json"
+            record_path = package / "input/discovery/native-discovery.json"
             payload = json.loads(record_path.read_bytes())
             payload["raw"] = None
             record_path.write_bytes(json.dumps(payload).encode())

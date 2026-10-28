@@ -1027,7 +1027,10 @@ class CaptureHandlerTests(unittest.TestCase):
         self.assertEqual(execution.outcome, "completed")
         admitted = Path(execution.candidate_root)
         manifest = json.loads((admitted / "transfer-manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["schema_version"], "solidworks-to-urdf.capture-transfer/v3")
+        self.assertEqual(
+            manifest["schema_version"],
+            "solidworks-to-urdf.capture-transfer/v4",
+        )
         self.assertEqual(manifest["run_id"], CHILD)
         self.assertNotIn("native_stage_scope", manifest)
         self.assertEqual(manifest["execution"]["effect_key"], "capture-native")

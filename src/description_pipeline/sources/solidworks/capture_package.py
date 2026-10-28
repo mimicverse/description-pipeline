@@ -6,6 +6,7 @@ import hashlib
 from pathlib import Path
 
 from ...io import PipelineError, artifact_path_parts, digest, read_data
+from ...schemas import CAPTURE_EVIDENCE_REQUESTS
 from .discovery import (
     DISCOVERY_FILE,
     PLAN_FILE,
@@ -15,12 +16,6 @@ from .discovery import (
     sealed_embedded_virtual_document,
 )
 from .selection import selection_bindings
-
-CAPTURE_EVIDENCE_REQUESTS = (
-    "evidence/capture.json",
-    "evidence/geometry/",
-    "evidence/native-runtime.json",
-)
 
 _PLAN_KEYS = frozenset(
     {
