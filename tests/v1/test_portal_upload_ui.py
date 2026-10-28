@@ -341,7 +341,7 @@ class ReportUiContractTests(unittest.TestCase):
         self.assertIn("localStorage.setItem", app)
         self.assertIn("portal.stage.", app)
         self.assertIn("const STAGE_SELECTION_PRIORITY = [", app)
-        self.assertIn('"failed",\n  "unresolved",\n  "cancelled",\n  "running",', app)
+        self.assertIn('"unresolved",\n  "failed",\n  "cancelled",\n  "running",', app)
 
     def test_blocked_stages_are_neutral_not_failed(self) -> None:
         app = self.app()
@@ -361,7 +361,7 @@ class ReportUiContractTests(unittest.TestCase):
             'unresolved: "Unresolved"',
             'if (state === "failed" || state === "unresolved") return "bad"',
             "const STAGE_SELECTION_PRIORITY = [",
-            '"failed",\n  "unresolved",\n  "cancelled",\n  "running",',
+            '"unresolved",\n  "failed",\n  "cancelled",\n  "running",',
             'for (const state of STAGE_SELECTION_PRIORITY)',
         ):
             self.assertIn(token, app)

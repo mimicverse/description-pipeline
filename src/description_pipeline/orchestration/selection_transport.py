@@ -11,7 +11,7 @@ import zipfile
 from contextlib import suppress
 from pathlib import Path
 
-from ..io import _filesystem_path, confined, digest
+from ..io import _filesystem_path, _physical_path, confined, digest
 from ..sources.solidworks.handoff import MAX_HANDOFF_BYTES, _directory
 from ..sources.solidworks.revision import package_inventory
 from ..sources.solidworks.selection import SelectionError, seal_closure_selection, validate_file_index
@@ -158,20 +158,16 @@ class StagedSelection:
             "selection_batch_stale",
             "Provisional staging is no longer accepting the upload batch",
         )
-        with tempfile.TemporaryDirectory(prefix=".selection-upload-", dir=self.stage.parent) as temporary:
+        with tempfile.TemporaryDirectory(
+            prefix=".selection-upload-", dir=_physical_path(self.stage.parent)
+        ) as temporary:
             incoming = Path(temporary)
             sizes = _extract_batch(Path(archive), incoming, expected, remaining=MAX_HANDOFF_BYTES)
-            installed = []
+            Path(_physical_path(self.stage)).rmdir()
             try:
-                for name in sorted(expected):
-                    original = Path(_filesystem_path(confined(incoming, name)))
-                    target = Path(_filesystem_path(confined(self.stage, name, exists=False)))
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    os.link(original, target)
-                    installed.append(target)
+                os.replace(_physical_path(incoming), _physical_path(self.stage))
             except BaseException:
-                for target in installed:
-                    target.unlink(missing_ok=True)
+                Path(_physical_path(self.stage)).mkdir(exist_ok=True)
                 raise
         self.staged_files = dict(expected)
         self.sizes = sizes

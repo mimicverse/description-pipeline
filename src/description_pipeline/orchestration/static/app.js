@@ -107,8 +107,8 @@ const STEP_STATE_SHORT = {
   unresolved: "Unresolved",
 };
 const STAGE_SELECTION_PRIORITY = [
-  "failed",
   "unresolved",
+  "failed",
   "cancelled",
   "running",
   "waiting",

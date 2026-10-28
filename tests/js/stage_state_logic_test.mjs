@@ -63,7 +63,7 @@ assert.equal(
 );
 assert.equal(
   chooseStageIndex(stages("completed", "unresolved", "failed"), "run-3"),
-  2,
+  1,
 );
 assert.equal(
   chooseStageIndex(stages("completed", "blocked", "waiting"), "run-4"),
