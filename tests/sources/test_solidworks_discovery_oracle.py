@@ -149,6 +149,7 @@ def native_record() -> dict:
             {
                 "name": "shoulder_pitch_joint__coaxial",
                 "type": "concentric",
+                "entity_count": 2,
                 "suppressed": False,
                 "error_code": 0,
                 "scope": "",
@@ -179,6 +180,7 @@ def native_record() -> dict:
             {
                 "name": "shoulder_pitch_joint__locate",
                 "type": "coincident",
+                "entity_count": 2,
                 "suppressed": False,
                 "error_code": 0,
                 "scope": "",
@@ -199,6 +201,7 @@ def native_record() -> dict:
             {
                 "name": "shoulder_pitch_joint__limit",
                 "type": "limitangle",
+                "entity_count": 2,
                 "suppressed": False,
                 "error_code": 0,
                 "scope": "",
@@ -270,6 +273,7 @@ def frame_ground_mates(component: str = "base-1") -> list[dict]:
         return {
             "name": name,
             "type": kind,
+            "entity_count": 2,
             "suppressed": False,
             "error_code": 0,
             "scope": "",
@@ -768,6 +772,7 @@ class OracleSemanticsTests(unittest.TestCase):
                 {
                     "name": "base_to_sub_lock",
                     "type": "lock",
+                    "entity_count": 2,
                     "suppressed": False,
                     "error_code": 0,
                     "scope": "",
@@ -828,6 +833,7 @@ class OracleSemanticsTests(unittest.TestCase):
                 {
                     "name": "sub_to_arm_lock",
                     "type": "lock",
+                    "entity_count": 2,
                     "suppressed": False,
                     "error_code": 0,
                     "scope": "",
@@ -920,6 +926,7 @@ class OracleSemanticsTests(unittest.TestCase):
             {
                 "name": "base_arm_lock",
                 "type": "lock",
+                "entity_count": 2,
                 "suppressed": False,
                 "error_code": 0,
                 "scope": "",
@@ -1066,6 +1073,7 @@ class OracleSemanticsTests(unittest.TestCase):
                 {
                     "name": "nested_self__coaxial",
                     "type": "concentric",
+                    "entity_count": 2,
                     "suppressed": False,
                     "error_code": 0,
                     "scope": "sub-1",
@@ -1117,6 +1125,7 @@ class OracleSemanticsTests(unittest.TestCase):
         mate = {
             "name": "probe__coaxial",
             "type": "concentric",
+            "entity_count": 2,
             "suppressed": False,
             "error_code": 0,
             "scope": "",
@@ -1331,6 +1340,7 @@ class OracleSemanticsTests(unittest.TestCase):
         mate = {
             "name": "circle_axis__coaxial",
             "type": "concentric",
+            "entity_count": 2,
             "suppressed": False,
             "error_code": 0,
             "scope": "",
@@ -1379,6 +1389,7 @@ class OracleSemanticsTests(unittest.TestCase):
             return {
                 "name": "mixed_axis__coaxial",
                 "type": "concentric",
+                "entity_count": 2,
                 "suppressed": False,
                 "error_code": 0,
                 "scope": "",
@@ -1450,6 +1461,7 @@ class OracleSemanticsTests(unittest.TestCase):
             return {
                 "name": "framed_axis__coaxial",
                 "type": "concentric",
+                "entity_count": 2,
                 "suppressed": False,
                 "error_code": 0,
                 "scope": "",
@@ -1480,6 +1492,7 @@ class OracleSemanticsTests(unittest.TestCase):
             return {
                 "name": "edge_in_plane__locate",
                 "type": "coincident",
+                "entity_count": 2,
                 "suppressed": False,
                 "error_code": 0,
                 "scope": "",
@@ -1529,6 +1542,7 @@ class OracleSemanticsTests(unittest.TestCase):
             return {
                 "name": "probe__coaxial",
                 "type": "concentric",
+                "entity_count": 2,
                 "suppressed": False,
                 "error_code": 0,
                 "scope": "",
@@ -1576,6 +1590,7 @@ class OracleSemanticsTests(unittest.TestCase):
             return {
                 "name": "plane_probe__locate",
                 "type": "coincident",
+                "entity_count": 2,
                 "suppressed": False,
                 "error_code": 0,
                 "scope": "",

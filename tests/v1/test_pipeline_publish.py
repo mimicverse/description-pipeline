@@ -2140,5 +2140,49 @@ class PublishReceiptTests(unittest.TestCase):
             validate_publication_receipt(receipt, command=fixture.command, claim=fixture.claim, artifact=artifact)
 
 
+class PublicationWarningProjectionTests(unittest.TestCase):
+    def test_saved_state_warning_is_projected_into_the_pull_request(self) -> None:
+        detail = {
+            "classification": "continuable_missing_referenced_documents",
+            "open_errors": 2,
+            "open_warnings": 1048576,
+            "configuration": "Default",
+            "missing_references": {
+                "state": "observed",
+                "items": [{"name": "missing", "last_known_path": r"C:\missing.SLDPRT"}],
+            },
+            "actual_scope": {
+                "graph_nodes": 3,
+                "occurrence_count": 7,
+                "selected_files": ["a", "b", "c"],
+                "excluded_files": ["d"],
+                "unresolved_occurrences": [{"instance": "missing-1"}],
+            },
+            "source_integrity_proven": False,
+            "rebuilt": False,
+            "mechanical_qualification_complete": False,
+            "hardware_qualified": False,
+        }
+        text = publish_stage._publication_warning_text(
+            {
+                "diagnostics": [
+                    {
+                        "code": "source.saved_state_incomplete",
+                        "blocking": False,
+                        "message": "The assembly was exported from its saved state.",
+                        "detail": detail,
+                    }
+                ]
+            }
+        )
+
+        self.assertIn("source.saved_state_incomplete", text)
+        self.assertIn("errors=2, warnings=1048576", text)
+        self.assertIn("missing.SLDPRT", text)
+        self.assertIn("graph_nodes=3, occurrences=7, selected=3, excluded=1, unresolved=1", text)
+        self.assertIn("source_integrity_proven=false", text)
+        self.assertIn("not a source or hardware qualification", text)
+
+
 if __name__ == "__main__":
     unittest.main()

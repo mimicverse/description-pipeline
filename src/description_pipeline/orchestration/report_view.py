@@ -20,6 +20,7 @@ from ..geometry.native_scope import (
 )
 from ..io import PipelineError
 from ..sources.solidworks.evidence import METADATA_WARNING_CODE
+from ..sources.solidworks.saved_state import SAVED_STATE_WARNING_CODE
 from ..stages import FIXED_REQUIRED_CHECKS, stage_view
 
 REPORT_SCHEMA = "solidworks-to-urdf.report/v1"
@@ -127,6 +128,7 @@ _DIAGNOSTIC_CODE_LABELS = {
     "v14.pose_diagnostics_unread": "Saved-pose diagnostics not read (diagnostic)",
     "v14.membership_unread": "Link membership not read (diagnostic)",
     METADATA_WARNING_CODE: "Platform metadata provenance (not direct CAD readings)",
+    SAVED_STATE_WARNING_CODE: "Saved-state export has native diagnostics (not source-qualified)",
 }
 
 #: Readable descriptions for the contract's declared input/output records.
@@ -917,6 +919,8 @@ def _warning_row(stage: dict, item: dict) -> dict:
         if value is not None:
             # Authored zeros (for example an equal zero joint range) stay exact values.
             row[key] = value
+    if detail:
+        row["detail"] = detail
     residual = {
         key: detail[key]
         for key in _WARNING_RESIDUAL_KEYS
@@ -1005,19 +1009,21 @@ def _recorded_warnings(
             "Native gate diagnostics have no matching gate warnings"
         )
     if stage.get("id") == "verify":
-        metadata_diagnostics = [
+        standalone_diagnostics = [
             item
             for item in quality_diagnostics or []
             if isinstance(item, dict)
-            and item.get("code") == METADATA_WARNING_CODE
+            and item.get("code") in {METADATA_WARNING_CODE, SAVED_STATE_WARNING_CODE}
             and item.get("blocking") is False
         ]
-        if len(metadata_diagnostics) > 1:
-            raise PipelineError("Metadata provenance diagnostics are duplicated")
-        if metadata_diagnostics and not any(
-            item.get("code") == METADATA_WARNING_CODE for item in warnings if isinstance(item, dict)
-        ):
-            warnings.extend(_warning_row(stage, item) for item in metadata_diagnostics)
+        for code in {METADATA_WARNING_CODE, SAVED_STATE_WARNING_CODE}:
+            matching = [item for item in standalone_diagnostics if item.get("code") == code]
+            if len(matching) > 1:
+                raise PipelineError(f"{code} diagnostics are duplicated")
+            if matching and not any(
+                item.get("code") == code for item in warnings if isinstance(item, dict)
+            ):
+                warnings.extend(_warning_row(stage, item) for item in matching)
     return warnings
 
 

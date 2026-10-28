@@ -858,9 +858,29 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
             )
         )
         return None
+    raw_entities = mate.get("entities")
+    entity_count = mate.get("entity_count")
     entities = _mate_entities(mate)
-    if len(entities) < 2:
-        findings.append(_finding("discovery.mate_entities_unsupported", obj, "mate has fewer than two entity records"))
+    if (
+        not isinstance(raw_entities, list)
+        or len(raw_entities) != 2
+        or len(entities) != 2
+        or type(entity_count) is not int
+        or entity_count != 2
+    ):
+        findings.append(
+            _finding(
+                "discovery.mate_entities_unsupported",
+                obj,
+                "the supported mate binary contract requires exactly two raw entities "
+                "and a matching native entity_count",
+                {
+                    "entity_count": entity_count,
+                    "raw_entities": len(raw_entities) if isinstance(raw_entities, list) else None,
+                    "usable_entities": len(entities),
+                },
+            )
+        )
         return None
     first = _entity_geometry_view(entities[0], findings, obj)
     second = _entity_geometry_view(entities[1], findings, obj)
@@ -1366,12 +1386,19 @@ def _mate_entities(mate: dict) -> list[dict]:
 
 
 def _mate_pairs(mate: dict) -> list[tuple[str, str]]:
+    if (
+        not isinstance(mate.get("entities"), list)
+        or len(mate["entities"]) != 2
+        or type(mate.get("entity_count")) is not int
+        or mate.get("entity_count") != 2
+    ):
+        return []
     names: list[str] = []
     for item in _mate_entities(mate):
         name = str(item.get("component") or "")
         if name and name not in names:
             names.append(name)
-    return [(names[left], names[right]) for left in range(len(names)) for right in range(left + 1, len(names))]
+    return [(names[0], names[1])] if len(names) == 2 else []
 
 
 def _union_find(pairs: Sequence[tuple[str, str]], nodes: Sequence[str]) -> dict[str, str]:
@@ -2923,19 +2950,27 @@ def _exporter_native_pairs(record: dict, findings: list[dict]) -> dict[tuple[str
         obj = f"mate:{name}"
         entities = _mate_entities(mate)
         endpoints = tuple(sorted(str(entity.get("component")) for entity in entities))
+        raw_entities = mate.get("entities")
         detail = {
             "mate": name,
             "scope": mate.get("scope"),
             "mate_type": mate.get("type"),
             "components": list(endpoints),
         }
-        if len(entities) != 2 or len(mate.get("entities") or []) != 2:
+        if (
+            not isinstance(raw_entities, list)
+            or len(entities) != 2
+            or len(raw_entities) != 2
+            or type(mate.get("entity_count")) is not int
+            or mate.get("entity_count") != 2
+        ):
             findings.append(
                 _finding(
                     "discovery.mate_entities_unsupported",
                     obj,
-                    "native constraint cannot be checked because it does not have exactly two raw endpoints",
-                    detail,
+                    "native constraint cannot be checked because its binary contract does not "
+                    "carry exactly two raw endpoints",
+                    {**detail, "entity_count": mate.get("entity_count")},
                     blocking=False,
                 )
             )
@@ -5165,6 +5200,16 @@ def derive_native_package(
     upload_digest = source_selection.get("upload_sha256")
     upload_handoff_digest = upload_digest if _SHA256_HEX.fullmatch(str(upload_digest or "")) else None
     findings: list[dict] = []
+    from .saved_state import capture_open_matches, warning_from_selection
+
+    try:
+        saved_state_warning = warning_from_selection(source_selection)
+        if saved_state_warning is not None:
+            if not capture_open_matches(source_selection["closure"]["open_status"], record.get("open_status")):
+                raise ValueError("Discover open status differs from selection")
+            findings.append(saved_state_warning)
+    except ValueError as error:
+        raise PipelineError(f"Saved-state source evidence is incoherent: {error}") from error
     components = record.get("components")
     if not isinstance(components, list):
         findings.append(
@@ -5201,6 +5246,16 @@ def derive_native_package(
             continue
         suppressed = item.get("suppressed")
         lightweight = item.get("lightweight")
+        fixed = item.get("fixed")
+        if type(fixed) is not bool:
+            findings.append(
+                _finding(
+                    "discovery.component_fixed_invalid",
+                    f"component:{name}",
+                    "component does not carry the exact native boolean IComponent2.IsFixed reading",
+                    {"fixed": fixed, "error": item.get("fixed_error")},
+                )
+            )
         if type(suppressed) is not bool or type(lightweight) is not bool:
             findings.append(
                 _finding(

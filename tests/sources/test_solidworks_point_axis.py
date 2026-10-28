@@ -85,7 +85,13 @@ def localized_point_entity(component, point, *, frame="component-local", error=N
 def concentrate(first, second, frames, name="Concentric1"):
     findings: list[dict] = []
     result = D._mate_rows(
-        {"name": name, "type": "concentric", "limits": None, "entities": [first, second]},
+        {
+            "name": name,
+            "type": "concentric",
+            "entity_count": 2,
+            "limits": None,
+            "entities": [first, second],
+        },
         frames,
         findings,
         f"mate:{name}",

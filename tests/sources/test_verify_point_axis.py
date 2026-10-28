@@ -106,6 +106,7 @@ class PointOnAxisConcentricTests(unittest.TestCase):
         mate = {
             "name": "concentric_point__axis",
             "type": "concentric",
+            "entity_count": 2,
             "suppressed": False,
             "error_code": 0,
             "scope": "",
@@ -197,6 +198,7 @@ class PointOnAxisConcentricTests(unittest.TestCase):
         point_point = {
             "name": "point__point",
             "type": "concentric",
+            "entity_count": 2,
             "limits": None,
             "entities": [dict(point_entity), {"component": "body-c", "point": [0.0, 0.0, 0.0]}],
         }
@@ -208,6 +210,7 @@ class PointOnAxisConcentricTests(unittest.TestCase):
         plane_point = {
             "name": "plane__point",
             "type": "concentric",
+            "entity_count": 2,
             "limits": None,
             "entities": [plane_entity, dict(point_entity)],
         }
@@ -215,6 +218,7 @@ class PointOnAxisConcentricTests(unittest.TestCase):
         malformed_point = {
             "name": "cylinder__malformed",
             "type": "concentric",
+            "entity_count": 2,
             "limits": None,
             "entities": [dict(cylinder_entity), {"component": "body-b", "point": [0.0, 0.0]}],
         }
@@ -222,6 +226,7 @@ class PointOnAxisConcentricTests(unittest.TestCase):
         missing_frame = {
             "name": "cylinder__missing-frame",
             "type": "concentric",
+            "entity_count": 2,
             "limits": None,
             "entities": [dict(cylinder_entity), {"component": "nowhere", "point": [0.0, 0.0, 0.0]}],
         }

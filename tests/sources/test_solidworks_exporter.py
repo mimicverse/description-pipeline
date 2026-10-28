@@ -155,6 +155,7 @@ def raw_record() -> dict:
                 "suppressed": False,
                 "lightweight": False,
                 "suppression_state": 2,
+                "fixed": False,
             }
             for name, document in (("base-1", "base.SLDPRT"), ("arm-1", "arm.SLDPRT"))
         ],
@@ -197,6 +198,7 @@ def native_limit_mate(lower: float, upper: float) -> dict:
         "name": "hinge__limit",
         "scope": "",
         "type": "limitangle",
+        "entity_count": 2,
         "suppressed": False,
         "is_advanced_mate": True,
         "is_advanced_mate_error": None,
@@ -474,6 +476,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
             {
                 "name": "hinge__limit",
                 "type": "limitangle",
+                "entity_count": 2,
                 "suppressed": False,
                 "error_code": 0,
                 "is_advanced_mate": None,
@@ -670,6 +673,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
             {
                 "name": "cover_lock",
                 "type": "lock",
+                "entity_count": 2,
                 "limits": None,
                 "error_code": 0,
                 "suppressed": False,
@@ -692,6 +696,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
             {
                 "name": kind,
                 "type": kind,
+                "entity_count": 2,
                 "limits": None,
                 "error_code": 0,
                 "entities": [
@@ -708,6 +713,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
             {
                 "name": name,
                 "type": "lock",
+                "entity_count": 2,
                 "limits": None,
                 "error_code": 0,
                 "entities": [{"component": name}, {"component": "washer-1"}],
@@ -745,6 +751,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
             {
                 "name": "saved_pose_lock",
                 "type": "lock",
+                "entity_count": 2,
                 "limits": None,
                 "error_code": 0,
                 "entities": [{"component": "base-1"}, {"component": "arm-1"}],
@@ -764,6 +771,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
                 "name": name,
                 "scope": "",
                 "type": "parallel",
+                "entity_count": 2,
                 "limits": None,
                 "error_code": 0,
                 "entities": [
@@ -801,6 +809,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
                     {
                         "name": "nearly_axial",
                         "type": "parallel",
+                        "entity_count": 2,
                         "limits": None,
                         "error_code": 0,
                         "entities": [
@@ -832,6 +841,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
                     {
                         "name": "recorded_lock",
                         "type": "lock",
+                        "entity_count": 2,
                         "limits": None,
                         "error_code": 0,
                         "entities": [{"component": "base-1"}, {"component": "cover-1"}],
@@ -839,6 +849,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
                     {
                         "name": "incomplete_constraint",
                         "type": kind,
+                        "entity_count": 2,
                         "limits": None,
                         "error_code": error,
                         "entities": [
@@ -868,6 +879,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
                 "name": "valid_pose_hold",
                 "scope": "",
                 "type": "parallel",
+                "entity_count": 2,
                 "limits": None,
                 "error_code": 0,
                 "entities": [
@@ -878,6 +890,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
             {
                 "name": "unread_pose_hold",
                 "type": "lock",
+                "entity_count": 2,
                 "limits": None,
                 "error_code": 1,
                 "entities": [{"component": "base-1"}, {"component": "arm-1"}],
@@ -894,6 +907,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
             {
                 "name": "one_sided_parallel",
                 "type": "parallel",
+                "entity_count": 2,
                 "limits": None,
                 "error_code": 0,
                 "entities": [

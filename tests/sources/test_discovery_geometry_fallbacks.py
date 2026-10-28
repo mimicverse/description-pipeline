@@ -36,6 +36,7 @@ def component(name: str, transform=None) -> dict:
         "suppressed": False,
         "lightweight": False,
         "suppression_state": 2,
+        "fixed": False,
     }
 
 
@@ -47,6 +48,7 @@ def mate(name: str, kind: str, first: dict, second: dict) -> dict:
     return {
         "name": name,
         "type": kind,
+        "entity_count": 2,
         "error_code": 0,
         "suppressed": False,
         "scope": "",

@@ -18,6 +18,10 @@ from .geometry.native_scope import (
 )
 from .io import PipelineError, file_digest, read_data, write_json
 from .schemas import EFFECTIVE_INSTANCES_SCHEMA
+from .sources.solidworks.saved_state import (
+    SAVED_STATE_WARNING_CODE,
+    warning_from_selection,
+)
 
 REPORT_SCHEMA = "solidworks-to-urdf.structural-report/v1"
 MARKDOWN_PATH = "reports/structural-team.md"
@@ -365,12 +369,20 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
             "evidence/capture.json",
             "evidence/raw/scene_raw.json",
             "input/source.json",
+            "reports/quality.json",
         }:
             # Projected explicitly below: the raw warning entries carry their own
             # code/message and must not be double-reported by the generic walk.
             continue
         entries.extend(_findings(value, source))
     quality = sources.get("reports/quality.json")
+    if isinstance(quality, dict):
+        projected_quality = dict(quality)
+        projected_quality["diagnostics"] = [
+            item for item in (quality.get("diagnostics") if isinstance(quality.get("diagnostics"), list) else [])
+            if not isinstance(item, dict) or item.get("code") != SAVED_STATE_WARNING_CODE
+        ]
+        entries.extend(_findings(projected_quality, "reports/quality.json"))
     quality_diagnostics = (
         quality.get("diagnostics")
         if isinstance(quality, dict)
@@ -447,19 +459,68 @@ def build_structural_report(receipt: dict, *, evidence_root: Path | None = None)
                         "evidence": {"native_gate_warnings": native_warnings},
                     }
                 )
-    closure = ((receipt.get("selection") or {}).get("manifest") or {}).get("closure") or {}
-    opened = closure.get("open_status") or {}
-    if opened.get("warnings"):
+    selection_manifest = (receipt.get("selection") or {}).get("manifest")
+    saved_state_warning = None
+    if isinstance(selection_manifest, dict):
+        try:
+            saved_state_warning = warning_from_selection(selection_manifest)
+        except ValueError as error:
+            entries.append(
+                {
+                    "severity": "blocker",
+                    "code": "report.saved_state_invalid",
+                    "object": receipt.get("main_assembly"),
+                    "message": "Saved-state source evidence is incoherent",
+                    "source": "run/selection/manifest/closure/open_status",
+                    "evidence": {"error": str(error)},
+                }
+            )
+    saved_state_diagnostics = [
+        item
+        for item in (quality_diagnostics if isinstance(quality_diagnostics, list) else [])
+        if isinstance(item, dict) and item.get("code") == SAVED_STATE_WARNING_CODE
+    ]
+    if saved_state_warning is None:
+        if saved_state_diagnostics:
+            entries.append(
+                {
+                    "severity": "blocker",
+                    "code": "report.saved_state_warning_invalid",
+                    "object": receipt.get("main_assembly"),
+                    "message": "A clean source open carries a forged saved-state warning",
+                    "source": "reports/quality.json/diagnostics",
+                    "evidence": {"diagnostics": saved_state_diagnostics},
+                }
+            )
+    elif quality_diagnostics is None and not native_gate_passed:
+        entries.append(
+            {
+                **saved_state_warning,
+                "source": "run/selection/manifest/closure/open_status",
+            }
+        )
+    elif len(saved_state_diagnostics) != 1 or not (
+        saved_state_diagnostics[0].get("blocking") is False
+        and saved_state_diagnostics[0].get("message") == saved_state_warning["message"]
+        and saved_state_diagnostics[0].get("objects") == saved_state_warning["objects"]
+        and saved_state_diagnostics[0].get("detail") == saved_state_warning["detail"]
+    ):
+        entries.append(
+            {
+                "severity": "blocker",
+                "code": "report.saved_state_warning_invalid",
+                "object": receipt.get("main_assembly"),
+                "message": "Saved-state warning projection is incomplete or forged",
+                "source": "reports/quality.json/diagnostics",
+                "evidence": {"diagnostics": saved_state_diagnostics},
+            }
+        )
+    else:
         entries.append(
             {
                 "severity": "warning",
-                "code": "native.open_warnings",
-                "object": receipt.get("main_assembly"),
-                "message": (
-                    "SolidWorks returned warnings while opening the assembly; the raw bitmask remains in evidence."
-                ),
-                "source": "run/selection/manifest/closure/open_status",
-                "evidence": opened,
+                **saved_state_warning,
+                "source": "reports/quality.json/diagnostics",
             }
         )
     material_required = False

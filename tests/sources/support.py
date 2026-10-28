@@ -1742,6 +1742,7 @@ def native_hinge_mates(
         {
             "name": f"{name}__coaxial",
             "type": "concentric",
+            "entity_count": 2,
             "suppressed": False,
             "error_code": 0,
             "scope": "",
@@ -1751,6 +1752,7 @@ def native_hinge_mates(
         {
             "name": f"{name}__locate",
             "type": "coincident",
+            "entity_count": 2,
             "suppressed": False,
             "error_code": 0,
             "scope": "",
@@ -1816,6 +1818,7 @@ def native_limit_mate(
     return {
         "name": f"{name}__limit",
         "type": "limitangle",
+        "entity_count": 2,
         "suppressed": False,
         "error_code": 0,
         "scope": "",
@@ -1853,6 +1856,7 @@ def native_lock(members: Sequence[str], *, name: str = "board_rigid") -> dict:
     return {
         "name": name,
         "type": "lock",
+        "entity_count": len(members),
         "suppressed": False,
         "error_code": 0,
         "scope": "",

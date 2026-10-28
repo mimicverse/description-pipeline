@@ -58,6 +58,7 @@ from .session_artifacts import (
     session_root_pid,
     session_temp_root,
 )
+from .saved_state import normalize_open_status
 from .selection import MAX_SELECTION_FILES, SelectionError, selection_path, validate_file_index
 
 __all__ = ["MAX_SELECTION_FILES", "NativeSelectionReader"]
@@ -209,6 +210,7 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
     imports: list[dict] = []
     virtual_components: list[dict] = []
     suppressed: list[dict] = []
+    unresolved: list[dict] = []
     warnings: list[dict] = []
     problems: list[dict] = []
     hashes: dict[str, str] = {}
@@ -255,42 +257,42 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
 
     graph_entry(main)
     document_entry(main)
-    open_status = readings.get("open")
-    open_status = dict(open_status) if isinstance(open_status, Mapping) else {}
-    open_errors = open_status.get("errors")
-    if type(open_errors) is not int:
+    try:
+        open_status = normalize_open_status(readings.get("open"))
+    except ValueError as error:
         raise SelectionError(
             "selection_open_status_unreadable",
-            "the staged main open status is not an integer; a complete closure cannot be proven",
+            "the staged main open status is not a usable integer pair",
             stage_root=str(stage_root),
             problems=[
                 _problem(
                     "selection_open_status_unreadable",
-                    "the staged main open status is not an integer",
+                    "the staged main open status is not a usable integer pair",
                     document=main,
-                    open_status=open_status,
+                    open_status=readings.get("open"),
+                    error=str(error),
                 )
             ],
-            open_status=open_status,
-        )
-    if open_errors != 0:
-        # A nonzero CAD open status means references were not all resolved as
-        # saved; missing references can auto-suppress components (M3 original:
-        # two formerly active HD(2) assemblies and their 34 children), so a
-        # suppressed placement can never be assumed to be author intent here
-        # and a complete closure cannot be claimed.
+            open_status=readings.get("open"),
+        ) from error
+    open_errors = open_status["errors"]
+    open_warnings = open_status["warnings"]
+    saved_state_incomplete = (open_status["errors"] != 0 or open_status["warnings"] != 0)
+    missing_reference_open = open_errors == 2
+    if not open_status["continuable"]:
         raise SelectionError(
             "selection_open_errors",
-            "the staged main opened with CAD-reported errors; missing references may "
-            "have auto-suppressed occurrences, so a complete closure cannot be claimed",
+            "the staged main opened with unsupported CAD error bits; only the known "
+            "missing-reference error can continue from readable saved state",
             stage_root=str(stage_root),
             problems=[
                 _problem(
                     "selection_open_errors",
-                    "the staged main opened with CAD-reported errors",
+                    "the staged main opened with CAD-reported errors outside the continuable policy",
                     document=main,
                     open_errors=open_errors,
-                    open_warnings=open_status.get("warnings"),
+                    open_warnings=open_warnings,
+                    open_error_bits=open_status["error_bits"],
                 )
             ],
             open_status=open_status,
@@ -313,7 +315,8 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
     preverify = {
         "schema": "m303-probe-v4/selection",
         "open_errors": open_errors,
-        "open_warnings": open_status.get("warnings"),
+        "open_warnings": open_warnings,
+        "open_classification": open_status["classification"],
         "declarations": {key: declarations.get(key) for key in (*IDENTITY_DECLARATIONS, *OPTIONAL_DECLARATIONS)},
         "declarations_missing": missing_declarations,
         "declarations_error": declarations_error,
@@ -322,7 +325,11 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
             "source": "cad" if configuration_declared else "native_saved_configuration",
             "verbatim": configuration_value,
         },
-        "verdict": "attention" if (declarations_error or configuration_invalid) else "pass",
+        "verdict": (
+            "attention"
+            if (saved_state_incomplete or declarations_error or configuration_invalid)
+            else "pass"
+        ),
     }
     if declarations_error:
         problems.append(
@@ -385,6 +392,30 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
             )
             continue
         if state == _COMPONENT_SUPPRESSED:
+            if not resolved:
+                if missing_reference_open and not record.get("path_error") and virtual is False:
+                    unresolved.append(
+                        {
+                            "instance": instance,
+                            "document": defining_name or raw_defining,
+                            "configuration": record.get("configuration"),
+                            "suppression_state": state,
+                            "resolved_path": "",
+                            "path_error": record.get("path_error"),
+                            "state": "missing_reference",
+                        }
+                    )
+                    continue
+                problems.append(
+                    _problem(
+                        "selection_suppressed_unresolved",
+                        "a suppressed occurrence has no resolvable document and the open "
+                        "status does not prove a continuable missing reference",
+                        document=defining_name or raw_defining,
+                        instance=instance,
+                    )
+                )
+                continue
             if virtual is not False:
                 problems.append(
                     _problem(
@@ -409,16 +440,6 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
                 )
                 continue
         if state == _COMPONENT_SUPPRESSED:
-            if not resolved:
-                problems.append(
-                    _problem(
-                        "selection_suppressed_unresolved",
-                        "a suppressed occurrence has no resolvable document even though the main opened cleanly",
-                        document=defining_name or raw_defining,
-                        instance=instance,
-                    )
-                )
-                continue
             suppressed.append(
                 {
                     "document": defining_name or raw_defining,
@@ -427,7 +448,11 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
                     "name": record.get("name"),
                     "suppression_state": 0,
                     "resolved_path": resolved,
-                    "justification": "authored_suppression_clean_open",
+                    "justification": (
+                        "suppression_with_incomplete_saved_state"
+                        if saved_state_incomplete
+                        else "authored_suppression_clean_open"
+                    ),
                 }
             )
             continue
@@ -851,6 +876,27 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
         entry["resolved_edges"] = sorted(entry["resolved_edges"], key=lambda item: str(item.get("instance")))
         documents_out[name] = entry
     excluded = sorted(set(files) - set(graph))
+    if saved_state_incomplete:
+        occurrences_out = []
+        for record in occurrences:
+            if not isinstance(record, Mapping):
+                continue
+            occurrences_out.append(
+                {
+                    "instance": record.get("instance") or record.get("name"),
+                    "defining": record.get("defining"),
+                    "configuration": record.get("configuration"),
+                    "suppression_state": record.get("suppression_state"),
+                    "resolved_path": record.get("resolved_path"),
+                }
+            )
+        occurrences_out.sort(
+            key=lambda item: (
+                str(item.get("instance")),
+                str(item.get("resolved_path")),
+                str(item.get("configuration")),
+            )
+        )
     preverify["closure_ok"] = True
     return {
         "schema_version": CLOSURE_SCHEMA,
@@ -860,7 +906,8 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
         "reader_sha256": reader_sha256,
         "stored_references_phase": readings.get("stored_references_phase"),
         "search_configuration": readings.get("search") or {},
-        "open_status": readings.get("open") or {},
+        "open_status": open_status,
+        **({"observed_occurrences": occurrences_out} if saved_state_incomplete else {}),
         "saved_configuration": readings.get("saved_configuration"),
         "document_state": readings.get("document_state"),
         "preverify": preverify,
@@ -875,6 +922,14 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
         ),
         "suppressed": sorted(
             suppressed, key=lambda item: (str(item.get("document")), str(item.get("instance")))
+        ),
+        "unresolved": sorted(
+            unresolved,
+            key=lambda item: (
+                str(item.get("instance")),
+                str(item.get("document")),
+                str(item.get("resolved_path")),
+            ),
         ),
         "excluded": excluded,
         "session": readings.get("session") or {},

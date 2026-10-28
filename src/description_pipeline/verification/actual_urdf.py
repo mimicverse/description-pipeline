@@ -347,7 +347,10 @@ def _warning_comments(model: dict) -> list[str]:
             continue
         objects = item.get("objects")
         for subject in objects if isinstance(objects, list) and objects else [{}]:
-            detail = {"message": item.get("message", ""), "provenance": subject}
+            detail = {"message": item.get("message", "")}
+            if item.get("detail") is not None:
+                detail["detail"] = item["detail"]
+            detail["provenance"] = subject
             payload = json.dumps(detail, ensure_ascii=True, sort_keys=True).replace("--", r"\u002d\u002d")
             code = str(item["code"]).replace("--", "- -")
             expected.append(f"WARNING {code}: {payload} See reports/quality.json.")

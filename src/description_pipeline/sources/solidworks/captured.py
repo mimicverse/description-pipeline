@@ -18,6 +18,7 @@ def derive_engineering_input(root: Path, manifest: dict) -> dict:
         RUNTIME_EVIDENCE,
         metadata_value_warnings,
     )
+    from .saved_state import SAVED_STATE_WARNING_CODE, warning_from_capture
     from .scene import build_scene
 
     raw = read_data(confined(root, manifest["scene"]))
@@ -166,6 +167,16 @@ def derive_engineering_input(root: Path, manifest: dict) -> dict:
         return payload, digest
 
     runtime, runtime_sha256 = evidence_source(RUNTIME_EVIDENCE, "native-runtime.json")
+    prepared_capture = runtime.get("prepared_capture")
+    captured_open = (
+        prepared_capture.get("opened")
+        if isinstance(prepared_capture, dict)
+        else None
+    )
+    saved_state_warning = warning_from_capture(
+        (payload.get("raw") or {}).get("source_selection"),
+        captured_open,
+    )
     native_tool_path = confined(delivery, "reports/native-tool.json")
     native_tool = read_data(native_tool_path)
     metadata_warnings = metadata_value_warnings(
@@ -186,5 +197,15 @@ def derive_engineering_input(root: Path, manifest: dict) -> dict:
         raise PipelineError("Constructed scene value warnings must be a list")
     if any(item.get("code") == metadata_warnings[0]["code"] for item in existing if isinstance(item, dict)):
         raise PipelineError("Metadata provenance warning was emitted twice")
-    provenance["value_warnings"] = [*existing, *metadata_warnings]
+    if saved_state_warning is not None and any(
+        item.get("code") == SAVED_STATE_WARNING_CODE
+        for item in existing
+        if isinstance(item, dict)
+    ):
+        raise PipelineError("Saved-state source warning was emitted twice")
+    provenance["value_warnings"] = [
+        *existing,
+        *metadata_warnings,
+        *([saved_state_warning] if saved_state_warning is not None else []),
+    ]
     return scene

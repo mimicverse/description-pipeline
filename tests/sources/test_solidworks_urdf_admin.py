@@ -47,6 +47,7 @@ class InputSealReadinessTests(unittest.TestCase):
                             "suppressed": False,
                             "lightweight": False,
                             "suppression_state": 2,
+                            "fixed": False,
                         }
                     ],
                     "datums": [
@@ -202,6 +203,57 @@ class UrdfRobotLabelTests(unittest.TestCase):
                 (root / "urdf/robot.urdf").write_text(payload)
                 with self.assertRaisesRegex(PipelineError, "value-provenance"):
                     solidworks_urdf._xml(root, definition, model)
+
+    def test_saved_state_warning_comment_carries_native_detail(self):
+        detail = {
+            "classification": "continuable_missing_referenced_documents",
+            "open_errors": 2,
+            "open_warnings": 0,
+            "configuration": "Default",
+            "source_integrity_proven": False,
+            "rebuilt": False,
+            "mechanical_qualification_complete": False,
+            "hardware_qualified": False,
+        }
+        object_row = {
+            "object": "cad/robot.SLDASM",
+            "object_type": "assembly",
+            "state": detail["classification"],
+        }
+        warning = {
+            "code": "source.saved_state_incomplete",
+            "message": "The assembly was exported from its saved state.",
+            "objects": [object_row],
+            "detail": detail,
+        }
+        model = {
+            "name": "robot",
+            "links": [{"name": "base"}],
+            "frames": [],
+            "joints": [],
+            "provenance": {"value_warnings": [warning]},
+        }
+        definition = {"hardware_id": None, "source": {"robot_name": "robot"}}
+        payload = json.dumps(
+            {
+                "message": warning["message"],
+                "detail": detail,
+                "provenance": object_row,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+        exact = (
+            '<robot name="robot">'
+            f"<!--WARNING source.saved_state_incomplete: {payload} "
+            "See reports/quality.json.-->"
+            '<link name="base"/></robot>'
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "urdf").mkdir()
+            (root / "urdf/robot.urdf").write_text(exact)
+            self.assertEqual(solidworks_urdf._xml(root, definition, model).get("name"), "robot")
 
 
 

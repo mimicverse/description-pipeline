@@ -351,6 +351,7 @@ def component(name, document=None):
         "suppressed": False,
         "lightweight": False,
         "suppression_state": 2,
+        "fixed": False,
         "document": document or name.replace("/", "_") + ".SLDPRT",
         "transform": list(IDENTITY),
     }
@@ -438,6 +439,7 @@ def fixture():
         {
             "name": "hinge__limit",
             "type": "limitangle",
+            "entity_count": 2,
             "suppressed": False,
             "error_code": 0,
             "is_advanced_mate": True,
@@ -517,6 +519,7 @@ def lock(left, right, *, error=0, kind="lock"):
     return {
         "name": "native_lock",
         "type": kind,
+        "entity_count": 2,
         "suppressed": False,
         "error_code": error,
         "limits": None,
@@ -924,6 +927,7 @@ class NativeDeclarationsTests(unittest.TestCase):
             mate = {
                 "name": "coaxial_washer",
                 "type": "concentric",
+                "entity_count": 2,
                 "suppressed": False,
                 "error_code": 0,
                 "scope": "",
@@ -951,6 +955,7 @@ class NativeDeclarationsTests(unittest.TestCase):
             return {
                 "name": "seated_washer",
                 "type": "coincident",
+                "entity_count": 2,
                 "suppressed": False,
                 "error_code": 0,
                 "scope": "",
@@ -1130,6 +1135,7 @@ class NativeDeclarationsTests(unittest.TestCase):
             {
                 "name": "incomplete_limit_evidence",
                 "type": "limitangle",
+                "entity_count": 1,
                 "suppressed": False,
                 "error_code": 0,
                 "is_advanced_mate": True,

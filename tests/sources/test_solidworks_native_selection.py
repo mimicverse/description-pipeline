@@ -911,17 +911,80 @@ class ClosureAdmissionTests(unittest.TestCase):
             self.observe([occurrence("cover-3", "", state=0)])
         self.assertEqual(caught.exception.code, "selection_suppressed_unresolved")
 
-    def test_open_errors_refuse_the_closure(self) -> None:
-        with self.assertRaises(SelectionError) as caught:
+    def test_known_missing_reference_error_continues_from_readable_saved_state(self) -> None:
+        payload = self.observe(
+            [occurrence("arm-1", self.resolved("arm.SLDPRT"))],
+            open={"errors": 2, "warnings": 0, "missing_references": {
+                "state": "observed",
+                "items": [{"name": "construction", "last_known_path": "C:/missing/construction.SLDPRT"}],
+            }},
+        )
+        status = payload["open_status"]
+        self.assertEqual(status["classification"], "continuable_missing_referenced_documents")
+        self.assertEqual(status["errors"], 2)
+        self.assertEqual(status["error_bits"], [{"bit": 2, "name": "swFileNotFoundError"}])
+        self.assertEqual(status["missing_references"]["items"][0]["name"], "construction")
+        self.assertNotIn("source_integrity_proven", status)
+        self.assertNotIn("actual_scope", status)
+        self.assertEqual(sorted(payload["graph"]), ["arm.SLDPRT", "robot.SLDASM"])
+        self.assertFalse(payload["preverify"]["closure_ok"] is False)
+        self.assertEqual(payload["preverify"]["verdict"], "attention")
+
+    def test_unlocated_missing_reference_error_is_not_continuable(self) -> None:
+        for missing in ({"state": "observed", "items": []}, {"state": "unavailable", "items": []}):
+            with self.subTest(missing=missing), self.assertRaises(SelectionError):
+                self.observe(
+                    [occurrence("arm-1", self.resolved("arm.SLDPRT"))],
+                    open={"errors": 2, "warnings": 0, "missing_references": missing},
+                )
+
+    def test_suppressed_unresolved_occurrence_is_recorded_in_continuable_scope(self) -> None:
+        payload = self.observe(
+            [occurrence("missing-1", "", state=0)],
+            open={"errors": 2, "warnings": 0, "missing_references": {
+                "state": "observed",
+                "items": [{"name": "construction", "last_known_path": "C:/missing/construction.SLDPRT"}],
+            }},
+        )
+        self.assertEqual(payload["unresolved"][0]["instance"], "missing-1")
+        self.assertEqual(
+            payload["observed_occurrences"][0]["instance"],
+            "missing-1",
+        )
+        self.assertEqual(payload["graph"]["robot.SLDASM"]["references"], [])
+
+    def test_missing_reference_open_cannot_exclude_active_unresolved_occurrence(self) -> None:
+        with self.assertRaises(SelectionError):
             self.observe(
-                [occurrence("arm-1", self.resolved("arm.SLDPRT"))],
-                open={"errors": 2, "warnings": 0},
-            )
-        error = caught.exception
-        self.assertEqual(error.code, "selection_open_errors")
-        item = error.detail["problems"][0]
-        self.assertEqual(item["open_errors"], 2)
-        self.assertEqual(item["document"], "robot.SLDASM")
+                [occurrence("missing-1", "", state=2)], open={"errors": 2, "warnings": 0, "missing_references": {
+                "state": "observed",
+                "items": [{"name": "construction", "last_known_path": "C:/missing/construction.SLDPRT"}],
+            }})
+
+    def test_unrelated_warning_does_not_turn_unknown_occurrences_into_missing_references(self) -> None:
+        with self.assertRaises(SelectionError):
+            self.observe([occurrence("missing-1", "", state=2)], open={"errors": 0, "warnings": 1})
+
+    def test_missing_open_does_not_hide_an_occurrence_getter_error(self) -> None:
+        for field in ("path_error", "import_error"):
+            with self.subTest(field=field), self.assertRaises(SelectionError):
+                row = occurrence("missing-1", "", state=2)
+                row[field] = "RPC unavailable"
+                self.observe([row], open={"errors": 2, "warnings": 0, "missing_references": {
+                    "state": "observed",
+                    "items": [{"name": "construction", "last_known_path": "C:/missing/construction.SLDPRT"}],
+                }})
+
+    def test_unsupported_or_mixed_open_errors_refuse_the_closure(self) -> None:
+        for errors in (1, 3, 6):
+            with self.subTest(errors=errors), self.assertRaises(SelectionError) as caught:
+                self.observe(
+                    [occurrence("arm-1", self.resolved("arm.SLDPRT"))],
+                    open={"errors": errors, "warnings": 0},
+                )
+            error = caught.exception
+            self.assertEqual(error.code, "selection_open_errors")
+            self.assertEqual(error.detail["problems"][0]["open_errors"], errors)
 
     def test_unreadable_open_status_refused(self) -> None:
         with self.assertRaises(SelectionError) as caught:

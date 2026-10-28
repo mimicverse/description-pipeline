@@ -6,10 +6,60 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from description_pipeline.io import file_digest, write_json
+from description_pipeline.sources.solidworks.saved_state import warning_from_selection
 from description_pipeline.structural_report import write_structural_report
+
+from .verification_fixture import incomplete_saved_state_record
 
 
 class StructuralReportTests(unittest.TestCase):
+    def test_saved_state_warning_is_reported_and_forgery_is_a_blocker(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            selection = incomplete_saved_state_record()["source_selection"]
+            warning = warning_from_selection(selection)
+            assert warning is not None
+            diagnostic = {
+                "code": warning["code"],
+                "blocking": False,
+                "message": warning["message"],
+                "objects": warning["objects"],
+                "detail": warning["detail"],
+            }
+            write_json(root / "reports/quality.json", {"diagnostics": [diagnostic]})
+            receipt = {
+                "run_id": "saved-state",
+                "main_assembly": selection["main_assembly"],
+                "selection": {"manifest": selection},
+            }
+            pins = write_structural_report(root, receipt, evidence_root=root)
+            report = json.loads((root / pins["json"]["path"]).read_text())
+            saved = next(
+                item
+                for item in report["findings"]
+                if item["code"] == "source.saved_state_incomplete"
+            )
+            self.assertEqual(saved["severity"], "warning")
+            self.assertEqual(saved["detail"]["open_errors"], 2)
+
+            forged = dict(diagnostic)
+            forged["detail"] = {**diagnostic["detail"], "open_errors": 0}
+            write_json(root / "reports/quality.json", {"diagnostics": [forged]})
+            pins = write_structural_report(root, receipt, evidence_root=root)
+            report = json.loads((root / pins["json"]["path"]).read_text())
+            self.assertIn(
+                "report.saved_state_warning_invalid",
+                {item["code"] for item in report["findings"]},
+            )
+
+    def test_non_list_quality_diagnostics_are_reported_as_invalid(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_json(root / "reports/quality.json", {"diagnostics": 7})
+            pins = write_structural_report(root, {"run_id": "malformed"}, evidence_root=root)
+            report = json.loads((root / pins["json"]["path"]).read_text())
+            self.assertIn("report.native_identity_warning_invalid", {item["code"] for item in report["findings"]})
+
     def test_warned_urdf_is_retained_and_reported_without_changing_the_receipt(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)

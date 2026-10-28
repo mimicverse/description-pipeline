@@ -6,6 +6,7 @@ qualification or a claim about a licensed SolidWorks installation.
 
 from __future__ import annotations
 
+import copy
 import json
 import shutil
 import subprocess
@@ -24,6 +25,8 @@ from description_pipeline.request_evidence import build_request_evidence
 from description_pipeline.runtime import tool_record
 from description_pipeline.sources.solidworks.discovery import prepare_native_package
 from description_pipeline.sources.solidworks.revision import package_inventory
+from description_pipeline.sources.solidworks.saved_state import normalize_open_status
+from description_pipeline.sources.solidworks.selection import seal_closure_selection
 
 from tests.sources import support
 from tests.sources.test_solidworks_discovery import FakeBackend
@@ -371,6 +374,69 @@ class QualifiedFixtureBackend(AxisFixtureBackend):
         return rows
 
 
+class MissingReferenceFixtureBackend(QualifiedFixtureBackend):
+    """Prepared Capture fixture that reports the one continuable OpenDoc6 error."""
+
+    def open_document(self, path: str) -> dict:
+        opened = super().open_document(path)
+        opened.update(
+            normalize_open_status(
+                {
+                    "errors": 2,
+                    "warnings": 0,
+                    "missing_references": {
+                        "state": "observed",
+                        "items": [{"name": "construction", "last_known_path": "C:/missing/construction.SLDPRT"}],
+                    },
+                }
+            )
+        )
+        return opened
+
+
+def incomplete_saved_state_record() -> dict:
+    """Reseal the shared fixture with one known missing-reference open status."""
+
+    record = capture_record()
+    selection = record["source_selection"]
+    closure = copy.deepcopy(selection["closure"])
+    occurrences = [
+        {
+            "instance": edge["instance"],
+            "defining": "cad/robot.SLDASM",
+            "configuration": edge.get("configuration"),
+            "suppression_state": edge.get("suppression_state"),
+            "resolved_path": edge.get("resolved_path"),
+        }
+        for entry in closure["documents"].values()
+        for edge in entry.get("resolved_edges") or []
+    ]
+    status = normalize_open_status(
+        {
+            "errors": 2,
+            "warnings": 0,
+            "missing_references": {
+                "state": "observed",
+                "items": [{"name": "construction", "last_known_path": "C:/missing/construction.SLDPRT"}],
+            },
+        }
+    )
+    closure["open_status"] = status
+    closure["observed_occurrences"] = occurrences
+    closure["saved_configuration"] = "Default"
+    closure["unresolved"] = []
+    upload = {**selection["excluded_files"], **selection["files"]}
+    record["source_selection"] = seal_closure_selection(
+        upload,
+        selection["main_assembly"],
+        closure,
+        reader_sha256=selection["reader_sha256"],
+    )
+    record["open_status"] = status
+    record["unresolved_components"] = []
+    return record
+
+
 class HermeticNativeFixture:
     def __init__(self) -> None:
         self._assertions = unittest.TestCase()
@@ -421,7 +487,11 @@ class HermeticNativeFixture:
     def _record(self, event: dict) -> None:
         self.events.append({"at": datetime.now(UTC).isoformat(), **event})
 
-    def _prepare_and_capture(self) -> tuple[Path, dict]:
+    def _prepare_and_capture(
+        self,
+        *,
+        incomplete_saved_state: bool = False,
+    ) -> tuple[Path, dict]:
         handoff_digest = digest(package_inventory(self.handoff))
         frozen = steps.freeze_inputs(
             self.handoff,
@@ -446,7 +516,11 @@ class HermeticNativeFixture:
             },
             preparer=lambda *args, **kwargs: prepare_native_package(
                 *args,
-                backend=FakeBackend(capture_record()),
+                backend=FakeBackend(
+                    incomplete_saved_state_record()
+                    if incomplete_saved_state
+                    else capture_record()
+                ),
                 **kwargs,
             ),
             on_event=self._record,
@@ -465,7 +539,12 @@ class HermeticNativeFixture:
                 "mass": _mass_reading(0.105654866776462, (0.0, 0.0, 0.05), prepared / "cad/arm.SLDPRT"),
             },
         ]
-        backend = QualifiedFixtureBackend(
+        backend_class = (
+            MissingReferenceFixtureBackend
+            if incomplete_saved_state
+            else QualifiedFixtureBackend
+        )
+        backend = backend_class(
             prepared / MAIN_ASSEMBLY,
             components,
             dependencies=[prepared / "cad/base.SLDPRT", prepared / "cad/arm.SLDPRT"],
@@ -727,13 +806,13 @@ class HermeticNativeFixture:
             "opened and captured paths do not match the dependency closure",
         )
 
-    def test_sealed_environment_open_errors_must_be_zero(self) -> None:
+    def test_sealed_environment_rejects_unknown_open_errors(self) -> None:
         def mutate(environment):
-            environment["session_boundary"]["opened"]["errors"] = 1
+            environment["solidworks"]["prepared_capture"]["opened"]["errors"] = 1
 
         self._assert_capture_mutation_rejected(
             mutate,
-            "OpenDoc6 reported a failed or invalid open",
+            "Capture OpenDoc6 status differs",
         )
 
 if __name__ == "__main__":

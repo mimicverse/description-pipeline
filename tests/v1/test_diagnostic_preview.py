@@ -270,6 +270,44 @@ class DiagnosticPreviewTests(unittest.TestCase):
         self.assertEqual(preview["warnings"], [])
         self.assertEqual(preview["warnings_total"], 0)
 
+    def test_saved_state_quality_diagnostic_is_a_preview_warning(self) -> None:
+        diagnostic = {
+            "code": "source.saved_state_incomplete",
+            "blocking": False,
+            "severity": "warning",
+            "object": "cad/robot.SLDASM",
+            "message": "The assembly was exported from its saved state.",
+            "detail": {
+                "open_errors": 2,
+                "open_warnings": 0,
+                "source_integrity_proven": False,
+                "rebuilt": False,
+                "mechanical_qualification_complete": False,
+                "hardware_qualified": False,
+            },
+        }
+        platform = self._registered_failed_verify(
+            passed=True,
+            state="completed",
+            diagnostics=[diagnostic],
+        )
+        app = portal_module.PortalApp(
+            portal_module.PortalConfig(
+                airflow=_PermissiveAirflow(),
+                run_control_store=platform.run_control,
+            )
+        )
+        session = app.sessions.create("user", "token")
+        preview = app._preview_payload(session, DAG_RUN_ID)
+
+        warning = next(
+            row
+            for row in preview["warnings"]
+            if row["code"] == "source.saved_state_incomplete"
+        )
+        self.assertEqual(warning["detail"], diagnostic["detail"])
+        self.assertIs(warning["blocking"], False)
+
     def test_quality_diagnostic_without_explicit_nonblocking_flag_is_not_a_warning(self) -> None:
         platform = self._registered_failed_verify(
             passed=True,

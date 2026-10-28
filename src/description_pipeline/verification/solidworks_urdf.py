@@ -44,6 +44,10 @@ from ..sources.solidworks.evidence import (
     RUNTIME_EVIDENCE,
     metadata_value_warnings,
 )
+from ..sources.solidworks.saved_state import (
+    SAVED_STATE_WARNING_CODE,
+    warning_from_capture,
+)
 from ..sources.snapshot import verify_snapshot
 from ..interface_records import (
     CHECK_POLICY_V1,
@@ -417,6 +421,7 @@ def _input(root, diagnostics=None):
             "bodies": bodies,
             "joints": joints,
             "carrier": carrier_snapshot,
+            "saved_state_selection": raw.get("source_selection"),
             "frames": frames,
         },
         "checks": checks,
@@ -1956,12 +1961,28 @@ def evaluate_bundle(
     if model is not None:
         for warning in (model.get("provenance") or {}).get("value_warnings") or []:
             if isinstance(warning, dict) and warning.get("code"):
+                warning_detail = warning.get("detail")
+                warning_objects = warning.get("objects") or []
                 diagnostics.append(
                     {
                         "code": str(warning["code"]),
                         "blocking": False,
+                        "severity": str(warning.get("severity") or "warning"),
+                        "object": next(
+                            (
+                                str(item.get("object"))
+                                for item in warning_objects
+                                if isinstance(item, dict) and item.get("object")
+                            ),
+                            None,
+                        ),
                         "message": str(warning.get("message") or "non-native derived value"),
-                        "detail": {"objects": warning.get("objects") or []},
+                        "objects": warning_objects,
+                        "detail": (
+                            warning_detail
+                            if isinstance(warning_detail, dict)
+                            else {"objects": warning_objects}
+                        ),
                     }
                 )
     required = required_checks(definition)
@@ -2477,6 +2498,36 @@ def _value_warning_gate(
     mesh_namespace = asset_namespace(Path(str(source.get("assembly") or "robot")).name)
     warnings = (model.get("provenance") or {}).get("value_warnings")
     _require(isinstance(warnings, list), "Non-native value provenance warnings are missing")
+    saved_state_selection = source.get("saved_state_selection")
+    if saved_state_selection is None:
+        saved_state_warning = None
+    else:
+        runtime = evidence.runtime(root)
+        prepared_capture = runtime.get("prepared_capture") if isinstance(runtime, dict) else None
+        captured_open = (
+            prepared_capture.get("opened")
+            if isinstance(prepared_capture, dict)
+            else None
+        )
+        saved_state_warning = warning_from_capture(
+            saved_state_selection,
+            captured_open,
+        )
+    actual_saved_state = [
+        item
+        for item in warnings
+        if isinstance(item, dict) and item.get("code") == SAVED_STATE_WARNING_CODE
+    ]
+    if saved_state_warning is None:
+        _require(
+            not actual_saved_state,
+            "A clean saved-state export carries an unexpected source-integrity warning",
+        )
+    else:
+        _require(
+            actual_saved_state == [saved_state_warning],
+            "Saved-state source warning is missing, duplicated, or differs from native evidence",
+        )
     actual: dict[str, list[dict]] = {}
     actual_messages: dict[str, list[str]] = {}
     for item in warnings:
@@ -2602,6 +2653,9 @@ def _value_warning_gate(
         )
         for object_row in warning["objects"]:
             add(warning["code"], object_row)
+    if saved_state_warning is not None:
+        for object_row in saved_state_warning["objects"]:
+            add(saved_state_warning["code"], object_row)
 
     for body in bodies:
         source_name = str(body.get("source_name") or body["name"])
@@ -3201,6 +3255,11 @@ def _value_warning_gate(
         ),
         "units.si_conversion": "Delivered values use SI units after conversion from native CAD units.",
         METADATA_WARNING_CODE: METADATA_WARNING_MESSAGE,
+        **(
+            {SAVED_STATE_WARNING_CODE: saved_state_warning["message"]}
+            if saved_state_warning is not None
+            else {}
+        ),
     }
     _require(
         set(actual) == set(expected),

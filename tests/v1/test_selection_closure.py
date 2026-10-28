@@ -88,6 +88,16 @@ class ClosureSealContractTests(unittest.TestCase):
             ),
             "session_open": lambda closure: closure["session"].update(closed=False),
             "open_status_bad": lambda closure: closure.update(open_status={"errors": "many", "warnings": 0}),
+            "open_status_unsupported": lambda closure: closure.update(
+                open_status={"errors": 1, "warnings": 0}
+            ),
+            "open_status_forged": lambda closure: closure.update(
+                open_status={
+                    "errors": 2,
+                    "warnings": 0,
+                    "classification": "clean_open",
+                }
+            ),
             "coherence_edge_missing": drop_edge,
             "edge_unknown_kind": lambda closure: closure["documents"][MAIN]["resolved_edges"][0].update(kind="guessed"),
             "edge_without_instance": lambda closure: closure["documents"][MAIN]["resolved_edges"][0].update(

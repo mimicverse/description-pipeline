@@ -33,6 +33,7 @@ from description_pipeline.sources.solidworks.discovery import (  # noqa: E402
     _joint_facts,
     _identity,
     _interface_frames,
+    _mate_pairs,
     _mate_rows,
     _resolve_record,
     _unit,
@@ -111,6 +112,7 @@ def _grounding_mates() -> list[dict]:
         {
             "name": "base_ground_axis",
             "type": "concentric",
+            "entity_count": 2,
             "suppressed": False,
             "error_code": 0,
             "scope": "",
@@ -132,6 +134,7 @@ def _grounding_mates() -> list[dict]:
         {
             "name": "base_ground_plane",
             "type": "coincident",
+            "entity_count": 2,
             "suppressed": False,
             "error_code": 0,
             "scope": "",
@@ -153,6 +156,7 @@ def _grounding_mates() -> list[dict]:
         {
             "name": "base_ground_parallel",
             "type": "parallel",
+            "entity_count": 2,
             "suppressed": False,
             "error_code": 0,
             "scope": "",
@@ -234,6 +238,7 @@ def record() -> dict:
             {
                 "name": "shoulder_pitch_joint__coaxial",
                 "type": "concentric",
+                "entity_count": 2,
                 "suppressed": False,
                 "error_code": 0,
                 "scope": "",
@@ -256,6 +261,7 @@ def record() -> dict:
             {
                 "name": "shoulder_pitch_joint__locate",
                 "type": "coincident",
+                "entity_count": 2,
                 "suppressed": False,
                 "error_code": 0,
                 "scope": "",
@@ -830,6 +836,7 @@ class DiscoveryTests(unittest.TestCase):
                 {
                     "name": "base_mount_lock",
                     "type": "lock",
+                    "entity_count": 2,
                     "suppressed": False,
                     "error_code": 0,
                     "limits": None,
@@ -851,6 +858,7 @@ class DiscoveryTests(unittest.TestCase):
             return {
                 "name": "base_ground_pin",
                 "type": "coincident",
+                "entity_count": 2,
                 "suppressed": False,
                 "error_code": 0,
                 "scope": "",
@@ -894,6 +902,7 @@ class DiscoveryTests(unittest.TestCase):
         mate = {
             "name": "base_ground_pin",
             "type": "coincident",
+            "entity_count": 2,
             "suppressed": False,
             "error_code": 0,
             "scope": "",
@@ -924,6 +933,7 @@ class DiscoveryTests(unittest.TestCase):
         mate = {
             "name": "unmarked_empty",
             "type": "coincident",
+            "entity_count": 2,
             "suppressed": False,
             "error_code": 0,
             "scope": "",
@@ -1003,6 +1013,7 @@ class DiscoveryTests(unittest.TestCase):
                 {
                     "name": "arm_ground_axis",
                     "type": "concentric",
+                    "entity_count": 2,
                     "suppressed": False,
                     "error_code": 0,
                     "scope": "",
@@ -1077,6 +1088,7 @@ class DiscoveryTests(unittest.TestCase):
                 {
                     "name": "base_ground_only_frame",
                     "type": "coincident",
+                    "entity_count": 1,
                     "suppressed": False,
                     "error_code": 0,
                     "scope": "",
@@ -1097,6 +1109,7 @@ class DiscoveryTests(unittest.TestCase):
                 {
                     "name": "base_ground_two_frames",
                     "type": "coincident",
+                    "entity_count": 2,
                     "suppressed": False,
                     "error_code": 0,
                     "scope": "",
@@ -1128,6 +1141,7 @@ class DiscoveryTests(unittest.TestCase):
                 {
                     "name": "base_ground_vertex",
                     "type": "coincident",
+                    "entity_count": 2,
                     "suppressed": False,
                     "error_code": 0,
                     "scope": "",
@@ -1248,6 +1262,7 @@ class DiscoveryTests(unittest.TestCase):
                         {
                             "name": "base_container_lock",
                             "type": "lock",
+                            "entity_count": 2,
                             "suppressed": False,
                             "error_code": 0,
                             "limits": None,
@@ -2762,6 +2777,7 @@ class DiscoveryTests(unittest.TestCase):
             return {
                 "name": "shaft",
                 "type": "concentric",
+                "entity_count": 2,
                 "suppressed": False,
                 "error_code": 0,
                 "scope": "",
@@ -2815,6 +2831,48 @@ class DiscoveryTests(unittest.TestCase):
         self.assertIsNone(circle_only["point"])
         self.assertIsNone(circle_only["entity"])
 
+    def test_multi_entity_mate_is_rejected_without_pair_expansion(self):
+        frames = _component_frames(record(), [])
+        entity = {
+            "component": "base-1",
+            "feature": "Cyl1",
+            "cylinder": {
+                "point": [0.0, 0.0, 0.1],
+                "direction": [0.0, 0.0, 1.0],
+                "radius": 0.006,
+            },
+        }
+        mate = {
+            "name": "three_entities",
+            "type": "concentric",
+            "entity_count": 3,
+            "suppressed": False,
+            "error_code": 0,
+            "scope": "",
+            "limits": None,
+            "entities": [entity, entity, entity],
+        }
+        findings = []
+
+        self.assertIsNone(_mate_rows(mate, frames, findings, "mate:three_entities"))
+        self.assertEqual(_mate_pairs(mate), [])
+        self.assertEqual(findings[0]["code"], "discovery.mate_entities_unsupported")
+        self.assertEqual(findings[0]["detail"]["entity_count"], 3)
+
+    def test_is_fixed_must_be_a_native_boolean(self):
+        result, _source, _output = self._prepare(
+            mutate=lambda payload: payload["components"][0].update(
+                {"fixed": 1, "fixed_error": {"code": "cad_component_fixed_invalid"}}
+            )
+        )
+        finding = next(
+            item
+            for item in result.findings
+            if item["code"] == "discovery.component_fixed_invalid"
+        )
+        self.assertEqual(finding["object"], "component:base-1")
+        self.assertFalse(result.passed)
+
     def test_concentric_circle_geometry_gates_stay_fail_closed(self):
         frames = _component_frames(record(), [])
         base = {
@@ -2829,6 +2887,7 @@ class DiscoveryTests(unittest.TestCase):
                 {
                     "name": "shaft",
                     "type": "concentric",
+                    "entity_count": 2,
                     "suppressed": False,
                     "error_code": 0,
                     "scope": "",
@@ -2881,6 +2940,7 @@ class DiscoveryTests(unittest.TestCase):
             return {
                 "name": "seat",
                 "type": "coincident",
+                "entity_count": 2,
                 "suppressed": False,
                 "error_code": 0,
                 "scope": "",
@@ -2925,6 +2985,7 @@ class DiscoveryTests(unittest.TestCase):
                 {
                     "name": "seat",
                     "type": "coincident",
+                    "entity_count": 2,
                     "suppressed": False,
                     "error_code": 0,
                     "scope": "",

@@ -52,6 +52,10 @@ from ..sources.solidworks.native_limits import (
     rotation_window_policy,
     validate_native_limit,
 )
+from ..sources.solidworks.saved_state import (
+    capture_open_matches,
+    validate_open_status,
+)
 from ..sources.solidworks.session_artifacts import (
     SESSION_DOCUMENT_API,
     embedded_virtual_component_under_root,
@@ -306,7 +310,20 @@ def _entities(mate: dict) -> list[dict]:
     return [item for item in mate.get("entities") or [] if isinstance(item, dict)]
 
 
+def _exact_two_entities(mate: dict) -> bool:
+    entities = mate.get("entities")
+    return bool(
+        isinstance(entities, list)
+        and len(entities) == 2
+        and all(isinstance(item, dict) for item in entities)
+        and type(mate.get("entity_count")) is int
+        and mate.get("entity_count") == 2
+    )
+
+
 def _names(mate: dict) -> list[str]:
+    if not _exact_two_entities(mate):
+        return []
     out: list[str] = []
     for item in _entities(mate):
         name = str(item.get("component") or "")
@@ -800,6 +817,13 @@ def _require_suppression_states(record: dict) -> None:
         )
         suppressed = item.get("suppressed")
         lightweight = item.get("lightweight")
+        fixed = item.get("fixed")
+        _require(
+            type(fixed) is bool,
+            "discovery.component_fixed_invalid",
+            "a component must carry the exact native boolean IComponent2.IsFixed reading",
+            {"component": name, "fixed": fixed, "error": item.get("fixed_error")},
+        )
         _require(
             type(suppressed) is bool and type(lightweight) is bool,
             "discovery.suppression_state",
@@ -881,6 +905,97 @@ def _require_source_selection(payload: dict) -> None:
         chosen = raw_selection.get("main_assembly")
         if chosen is not None and str(chosen).replace("\\", "/") != manifest.get("main_assembly"):
             raise _Failure("discovery.selection", "the raw main choice differs from the sealed selection", None)
+
+
+def _require_saved_state_open(payload: dict) -> dict:
+    """Bind the native Discover open result to the already sealed selection result."""
+
+    raw = payload.get("raw") if isinstance(payload, dict) else None
+    if not isinstance(raw, dict):
+        raise _Failure("discovery.saved_state", "the raw native record is missing")
+    selection = raw.get("source_selection")
+    closure = selection.get("closure") if isinstance(selection, dict) else None
+    status = closure.get("open_status") if isinstance(closure, dict) else None
+    try:
+        sealed = validate_open_status(status)
+    except ValueError as error:
+        raise _Failure(
+            "discovery.saved_state",
+            "the sealed selection carries no coherent native open status",
+        ) from error
+    observed = raw.get("open_status")
+    if observed is None:
+        if (sealed["errors"] != 0 or sealed["warnings"] != 0):
+            raise _Failure(
+                "discovery.saved_state",
+                "an incomplete saved-state export carries no Discover open observation",
+            )
+    else:
+        try:
+            if not capture_open_matches(sealed, observed):
+                raise ValueError("status differs")
+        except ValueError as error:
+            raise _Failure(
+                "discovery.saved_state",
+                "Discover OpenDoc6 status differs from the sealed selection",
+            ) from error
+    unresolved = raw.get("unresolved_components")
+    if (sealed["errors"] != 0 or sealed["warnings"] != 0) and (
+        not isinstance(unresolved, list)
+        or any(not isinstance(item, dict) for item in unresolved)
+    ):
+        raise _Failure(
+            "discovery.saved_state",
+            "an incomplete saved-state export carries no unresolved occurrence facts",
+        )
+    if (sealed["errors"] == 0 and sealed["warnings"] == 0) and unresolved not in (None, []):
+        raise _Failure(
+            "discovery.saved_state",
+            "a clean native open cannot carry unresolved occurrence facts",
+        )
+    if any(item.get("suppression_state") != 0 for item in unresolved or []):
+        raise _Failure(
+            "discovery.saved_state",
+            "an active unresolved occurrence has unreadable required engineering facts",
+        )
+    if (sealed["errors"] != 0 or sealed["warnings"] != 0):
+        scoped = closure.get("observed_occurrences")
+        if not isinstance(scoped, list):
+            raise _Failure("discovery.saved_state", "the saved-state occurrence scope is missing")
+        expected = {
+            row.get("instance"): (row.get("configuration"), row.get("suppression_state"))
+            for row in scoped if isinstance(row, dict)
+        }
+        observed_rows = [
+            (row.get("instance_id") or row.get("name2"), row.get("configuration"), row.get("suppression_state"))
+            for row in raw.get("components") or [] if isinstance(row, dict)
+        ] + [
+            (row.get("instance"), row.get("configuration"), row.get("suppression_state"))
+            for row in unresolved or []
+        ]
+        expected_unresolved = {row.get("instance") for row in closure.get("unresolved", [])}
+        observed_unresolved = {row.get("instance") for row in unresolved}
+        if expected_unresolved != observed_unresolved:
+            raise _Failure(
+                "discovery.saved_state",
+                "Discover unresolved occurrence scope differs from the sealed selection",
+            )
+        observed_scope = {name: (configuration, suppression) for name, configuration, suppression in observed_rows}
+        if len(observed_scope) != len(observed_rows) or observed_scope != expected:
+            raise _Failure(
+                "discovery.saved_state",
+                "Discover occurrence scope differs from the sealed selection",
+                {
+                    "expected": sorted(str(name) for name in expected),
+                    "observed": sorted(str(name) for name in observed_scope),
+                },
+            )
+    return {
+        "classification": sealed["classification"],
+        "open_errors": sealed["errors"],
+        "open_warnings": sealed["warnings"],
+        "unresolved_components": len(unresolved or []),
+    }
 
 
 def _frames(record: dict) -> dict[str, list[list[float]] | None]:
@@ -1294,14 +1409,14 @@ def _rows_for(mate: dict, frames) -> dict | None:
     kind = str(mate.get("type") or "").strip().lower()
     if kind not in SUPPORTED_MATES:
         return None
+    if not _exact_two_entities(mate):
+        return None
     entities = _entities(mate)
     nested = _nested_self_frame_entity(mate)
     if nested is not None:
         # The scope's own frame entity resolves through the scope occurrence transform,
         # exactly like the same relation written as an ordinary in-scope pair.
         entities = [{**entity, "assembly_frame": False} if entity is nested else entity for entity in entities]
-    if len(entities) < 2:
-        return None
     first, second = entities[0], entities[1]
     for entity in (first, second):
         if _rejected_entity(entity, frames):
@@ -3586,6 +3701,22 @@ def verify_discovery(package: Path) -> dict:
                 {"mate": mate.get("name")},
             )
             kind = str(mate.get("type") or "").strip().lower()
+            if kind in SUPPORTED_MATES:
+                _require(
+                    _exact_two_entities(mate),
+                    "discovery.graph",
+                    "a supported mate must carry exactly two raw entities and native entity_count 2",
+                    {
+                        "mate": mate.get("name"),
+                        "type": kind,
+                        "entity_count": mate.get("entity_count"),
+                        "raw_entities": (
+                            len(mate.get("entities"))
+                            if isinstance(mate.get("entities"), list)
+                            else None
+                        ),
+                    },
+                )
             _require(
                 mate.get("native_limit") is None or kind in {"limitdistance", "limitangle"},
                 "discovery.graph", "a non-limit mate carries native position-limit evidence",
@@ -4505,6 +4636,7 @@ def verify_discovery(package: Path) -> dict:
     dependent = (
         ("discovery.suppression_state", suppression),
         ("discovery.selection", source_selection),
+        ("discovery.saved_state", lambda: _require_saved_state_open(state.get("payload") or {})),
         ("discovery.files", files),
         ("discovery.imported_sources", imported_sources),
         ("discovery.identity", identity),
@@ -4535,6 +4667,7 @@ def verify_discovery(package: Path) -> dict:
         dependent = (
             ("discovery.suppression_state", suppression),
             ("discovery.selection", source_selection),
+            ("discovery.saved_state", lambda: _require_saved_state_open(state.get("payload") or {})),
             ("discovery.files", files),
             ("discovery.imported_sources", imported_sources),
             ("discovery.identity", identity),

@@ -849,6 +849,60 @@ class ReportViewTests(unittest.TestCase):
         self.assertEqual(warning["objects"], [metadata_object])
         self.assertIs(warning["blocking"], False)
 
+    def test_saved_state_quality_diagnostic_survives_the_verify_report_projection(self) -> None:
+        job = passed_job()
+        object_row = {
+            "object_type": "assembly",
+            "object": "cad/robot.SLDASM",
+            "state": "continuable_missing_referenced_documents",
+        }
+        detail = {
+            "classification": "continuable_missing_referenced_documents",
+            "open_errors": 2,
+            "open_warnings": 0,
+            "configuration": "Default",
+            "source_integrity_proven": False,
+            "rebuilt": False,
+            "mechanical_qualification_complete": False,
+            "hardware_qualified": False,
+            "missing_references": {"state": "unavailable", "items": []},
+            "actual_scope": {
+                "main_assembly": "cad/robot.SLDASM",
+                "selected_files": ["cad/robot.SLDASM"],
+                "excluded_files": [],
+                "graph_nodes": 1,
+                "occurrence_count": 0,
+                "unresolved_occurrences": [],
+            },
+        }
+        job["result"]["quality"]["diagnostics"] = [
+            {
+                "code": "source.saved_state_incomplete",
+                "blocking": False,
+                "severity": "warning",
+                "object": "cad/robot.SLDASM",
+                "message": "The assembly was exported from its saved state.",
+                "objects": [object_row],
+                "detail": detail,
+            }
+        ]
+
+        report = build_report(job)
+        verify = next(stage for stage in report["stages"] if stage["id"] == "verify")
+        warning = next(
+            row
+            for row in verify["warnings"]
+            if row["code"] == "source.saved_state_incomplete"
+        )
+
+        self.assertEqual(
+            warning["label"],
+            "Saved-state export has native diagnostics (not source-qualified)",
+        )
+        self.assertEqual(warning["object"], "cad/robot.SLDASM")
+        self.assertEqual(warning["detail"], detail)
+        self.assertIs(warning["blocking"], False)
+
 
 if __name__ == "__main__":
     unittest.main()

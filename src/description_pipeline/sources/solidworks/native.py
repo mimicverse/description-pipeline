@@ -32,6 +32,7 @@ from .protocol import (
     RawComponent,
     RawScene,
 )
+from .saved_state import normalize_open_status
 from .session_artifacts import (
     SESSION_DOCUMENT_API,
     embedded_virtual_component_marker,
@@ -2812,6 +2813,30 @@ def _imported_path_reading(component) -> tuple[str | None, str | None]:
     return (value if value.strip() else None), None
 
 
+def _require_missing_component(component, name, native_path):
+    """Admit only a known absent native reference, never an unreadable source."""
+
+    imported_path, imported_error = _imported_path_reading(component)
+    virtual = _property(component, "IsVirtual")
+    if (
+        native_path not in (None, "")
+        or virtual is not False
+        or imported_path is not None
+        or imported_error is not None
+    ):
+        raise CadError(
+            "cad_component_source_unread",
+            "a missing-reference warning cannot replace source identity evidence",
+            {
+                "component": name,
+                "path": _raw_scalar(native_path),
+                "is_virtual": _raw_scalar(virtual),
+                "imported_path": imported_path,
+                "imported_path_error": imported_error,
+            },
+        )
+
+
 def _component_source_document(component, source_root, *, native_path=None):
     """Bind an occurrence to a delivered file, including native linked imports.
 
@@ -3206,6 +3231,7 @@ class SolidWorksBackend(CadBackend):
         self._scene_source_root = None
         self._scene_document_key = None
         self._prepared_capture_root = None
+        self._saved_state_main_path: str | None = None
         self.notes = {}
         #: ``GetSaveFlag`` per working-tree document, recorded as evidence.
         self.save_flags: dict[str, object] = {}
@@ -3424,6 +3450,7 @@ class SolidWorksBackend(CadBackend):
                 {"assembly": str(document)},
             )
         self._prepared_capture_root = str(root)
+        self._saved_state_main_path = normalize_document_path(str(document))
         search_root = self.configure_staged_search(str(root))
         self.prepare_source(str(document), configuration)
         sealed = self.seal_documents(documents)
@@ -3596,6 +3623,7 @@ class SolidWorksBackend(CadBackend):
         self._session_artifact_root_owners.clear()
         self._scene_document_key = None
         self._prepared_capture_root = None
+        self._saved_state_main_path = None
         self._part_mass_properties = {}
         self.save_flags.clear()
         self.save_flag_errors.clear()
@@ -3699,8 +3727,39 @@ class SolidWorksBackend(CadBackend):
     def open_document(self, path):
         # Silent + read-only in the owned application for this phase.
         doc, errors, warnings = self._open_document_raw(path)
-        if doc is None or errors.value:
+        if doc is None:
             raise self._open_failure(path, errors.value, warnings.value)
+        try:
+            open_status = normalize_open_status(
+                {
+                    "errors": errors.value,
+                    "warnings": warnings.value,
+                    "missing_references": (
+                        self._missing_reference_evidence(path)
+                        if errors.value == 2 else {"state": "unavailable", "items": []}
+                    ),
+                }
+            )
+        except ValueError as error:
+            raise self._open_failure(
+                path,
+                errors.value if type(errors.value) is int else None,
+                warnings.value if type(warnings.value) is int else None,
+                exception=str(error),
+            ) from error
+        selected_main = (
+            self._prepared_capture_root is not None
+            and self._saved_state_main_path is not None
+            and normalize_document_path(os.path.abspath(str(path)))
+            == self._saved_state_main_path
+        )
+        if not open_status["continuable"] or (
+            open_status["errors"] != 0 and not selected_main
+        ):
+            raise self._open_failure(
+                path, open_status["errors"], open_status["warnings"],
+                missing_references=open_status["missing_references"],
+            )
         try:
             title = _method(doc, "GetTitle")
         except Exception as error:  # noqa: BLE001 - title is diagnostic only
@@ -3712,8 +3771,7 @@ class SolidWorksBackend(CadBackend):
             "opened": title,
             "path": _method(doc, "GetPathName"),
             "read_only": _raw_scalar(_method(doc, "IsOpenedReadOnly")),
-            "errors": errors.value,
-            "warnings": warnings.value,
+            **open_status,
         }
         if title_error is not None:
             result["title_error"] = title_error
@@ -3740,47 +3798,40 @@ class SolidWorksBackend(CadBackend):
         doc = _method(self._app_for_path(path), "OpenDoc6", path, kind, 3, configuration, errors, warnings)
         return doc, errors, warnings
 
-    def _unresolved_references(self, path, limit=32):
-        """Best-effort unresolved dependency names and last-known paths.
+    def _missing_reference_evidence(self, path):
+        """Retain all enumerated native missing references and any read failure."""
 
-        Read-only diagnostics for open failures: bounded, never raised, and
-        ``None`` when the enumeration is unavailable so the original open error
-        keeps its exact reporting.
-        """
-
+        evidence = {"state": "unavailable", "items": []}
         try:
             raw = _method(self._app_for_path(path), "GetDocumentDependencies2", path, True, True, True)
-        except Exception:  # noqa: BLE001 - diagnostics must never mask the open error
-            return None
-        try:
-            items = list(raw or ())
+            if not isinstance(raw, (list, tuple)) or len(raw) % 3:
+                raise ValueError("dependency enumeration is not a sequence of native triples")
             unresolved = []
-            for index in range(0, len(items) - 2, 3):
-                name = items[index]
-                if not _is_text_name(name):
+            for index in range(0, len(raw), 3):
+                name, native_path = raw[index:index + 2]
+                if not _is_text_name(name) or not isinstance(native_path, str):
+                    raise ValueError("dependency enumeration contains an unreadable name or path")
+                if os.path.isfile(native_path):
                     continue
-                try:
-                    exists = os.path.isfile(str(items[index + 1]))
-                except Exception:  # noqa: BLE001
-                    exists = False
-                if exists:
-                    continue
-                unresolved.append({"name": str(name), "last_known_path": str(items[index + 1])})
-                if len(unresolved) >= limit:
-                    break
-            return unresolved
-        except Exception:  # noqa: BLE001 - malformed diagnostics cannot replace the CAD error
-            return None
+                unresolved.append({"name": name, "last_known_path": native_path})
+            return {
+                **evidence,
+                "state": "observed",
+                "items": unresolved,
+            }
+        except Exception as error:  # noqa: BLE001 - preserve the original native open result
+            return {**evidence, "error": _native_error_record(error)}
 
-    def _open_failure(self, path, errors, warnings, exception=None):
+    def _open_failure(self, path, errors, warnings, exception=None, missing_references=None):
         """Strict open failure; the detail carries unresolved references when readable."""
 
         detail = {"errors": errors, "warnings": warnings}
         if exception:
             detail["exception"] = exception
-        unresolved = self._unresolved_references(path)
-        if unresolved is not None:
-            detail["unresolved_references"] = unresolved
+        missing = missing_references if missing_references is not None else self._missing_reference_evidence(path)
+        detail["missing_references"] = missing
+        if missing["state"] == "observed":
+            detail["unresolved_references"] = missing["items"]
         return CadError("cad_document_open_failed", path, detail)
 
     def _placement(self, component):
@@ -4870,13 +4921,13 @@ class SolidWorksBackend(CadBackend):
                     )
                 name = raw_name
                 note("walk", current_object=_activity_object(name))
+                path = _method(comp, "GetPathName")
                 part = _component_document(comp)
                 if part is None:
                     raise CadError("cad_component_unresolved", name)
                 # SetReadOnlyState can change native state. Defer it until the
                 # occurrence tree has been captured as primitives and released;
                 # phase-two document acquisition enforces read-only before reads.
-                path = _method(comp, "GetPathName")
                 if not path or not os.path.isfile(path):
                     # Without a file on disk there is no revision to hash or copy, so the
                     # snapshot could not name what it read.
@@ -7217,12 +7268,25 @@ class SolidWorksBackend(CadBackend):
                 readings["stored_references_count"] = len(stored)
                 readings["documents_before"] = int(_method(app, "GetDocumentCount"))
                 entry = self._probe_document(str(stage / main_assembly))
-                readings["open"] = {
+                raw_open = {
                     "already_open": entry.get("already_open"),
                     "open_exception": entry.get("open_exception"),
                     "errors": entry.get("errors"),
                     "warnings": entry.get("warnings"),
                 }
+                missing = (
+                    self._missing_reference_evidence(str(stage / main_assembly))
+                    if entry.get("errors") == 2 else {"state": "unavailable", "items": []}
+                )
+                try:
+                    readings["open"] = normalize_open_status(
+                        {
+                            **raw_open,
+                            "missing_references": missing,
+                        }
+                    )
+                except ValueError as error:
+                    readings["open"] = {**raw_open, "status_error": str(error)}
                 doc = entry.get("doc")
                 if doc is None:
                     raise CadError(
@@ -7383,7 +7447,11 @@ class SolidWorksBackend(CadBackend):
             if exc.code != "document_not_open":
                 raise
         else:
-            return {"doc": doc, "errors": 0, "warnings": 0, "open_exception": None, "already_open": True}
+            return {
+                "doc": doc, "errors": None, "warnings": None,
+                "open_exception": "the initial open status is unavailable for an already-open document",
+                "already_open": True,
+            }
         try:
             doc, errors, warnings = self._open_document_raw(path)
         except Exception as exc:  # noqa: BLE001 - a per-open failure is recorded, not fatal
@@ -7570,13 +7638,34 @@ class SolidWorksBackend(CadBackend):
                     )
                 errors, warnings = raw_errors.value, raw_warnings.value
                 main_entry = {**main_entry, "doc": doc, "errors": errors, "warnings": warnings}
-            if main_entry.get("doc") is None or type(errors) is not int or errors != 0:
+            if main_entry.get("doc") is None or type(errors) is not int or type(warnings) is not int:
                 raise self._open_failure(
                     str(main_path),
                     errors if type(errors) is int else None,
                     warnings if type(warnings) is int else None,
                     exception=main_entry.get("open_exception"),
                 )
+            missing = (
+                self._missing_reference_evidence(str(main_path))
+                if errors == 2 else {"state": "unavailable", "items": []}
+            )
+            try:
+                open_status = normalize_open_status(
+                    {
+                        "errors": errors,
+                        "warnings": warnings,
+                        "missing_references": missing,
+                    }
+                )
+            except ValueError as status_error:
+                raise self._open_failure(
+                    str(main_path),
+                    errors,
+                    warnings,
+                    exception=str(status_error),
+                ) from status_error
+            if not open_status["continuable"]:
+                raise self._open_failure(str(main_path), errors, warnings, missing_references=missing)
             doc = main_entry["doc"]
             notes: list[str] = []
             activity.emit("read_document_state", current_object=_activity_object(main_path, source_root), force=True)
@@ -7594,6 +7683,7 @@ class SolidWorksBackend(CadBackend):
             identity_properties = _custom_properties(doc, configuration)
             doc = active = None
             components = []
+            unresolved_components = []
             by_component = {}
             by_document: dict[str, str] = {}
             owner_hashes: dict[str, str] = {}
@@ -7662,6 +7752,39 @@ class SolidWorksBackend(CadBackend):
                     # capture, not be silently traversed as a resolved occurrence.
                     state = _component_state(component)
                     document_path = _method(component, "GetPathName")
+                    loaded_document = _method(component, "GetModelDoc2")
+                    if state != COMPONENT_SUPPRESSED and loaded_document is None:
+                        raise CadError(
+                            "cad_component_unresolved",
+                            "an active occurrence has no loaded document for required engineering facts",
+                            {"component": path_name, "path": document_path, "suppression_state": state},
+                        )
+                    if (
+                        open_status["errors"] == 2 and state == COMPONENT_SUPPRESSED
+                        and document_path in (None, "")
+                    ):
+                        _require_missing_component(component, path_name, document_path)
+                        unresolved_components.append(
+                            {
+                                "instance": path_name,
+                                "document": (
+                                    normalize_document_path(str(document_path))
+                                    if _is_text_name(document_path)
+                                    else ""
+                                ),
+                                "configuration": str(
+                                    _property(component, "ReferencedConfiguration") or ""
+                                ),
+                                "suppression_state": state,
+                                "reason": (
+                                    "solidworks_returned_no_loaded_document"
+                                    if loaded_document is None
+                                    else "solidworks_returned_no_readable_file"
+                                ),
+                            }
+                        )
+                        components_done += 1
+                        continue
                     source_document = _component_source_document(component, source_root)
                     # The native materialization identity is recorded inside
                     # source_provenance. Reading it from the outer record would
@@ -7728,13 +7851,31 @@ class SolidWorksBackend(CadBackend):
                         ]
                         global_matrix = _compose_frames(parent_matrix, local_matrix)
                         transform = [value for row in global_matrix for value in row]
+                    fixed = None
+                    fixed_error = None
+                    try:
+                        fixed = _method(component, "IsFixed")
+                    except Exception as error:  # noqa: BLE001 - preserve the getter failure
+                        fixed_error = _native_error_record(error)
+                    else:
+                        if type(fixed) is not bool:
+                            fixed_error = {
+                                "code": "cad_component_fixed_invalid",
+                                "message": "IComponent2.IsFixed did not return bool",
+                                "detail": {
+                                    "value_type": type(fixed).__name__,
+                                    "value": repr(fixed),
+                                },
+                            }
+                            fixed = None
                     entry = {
                         "name2": path_name,
                         "instance_id": path_name,
                         "document": source_document["document"]
                         or (normalize_document_path(str(document_path)) if _is_text_name(document_path) else ""),
                         "configuration": str(_property(component, "ReferencedConfiguration") or ""),
-                        "fixed": bool(_method(component, "IsFixed")),
+                        "fixed": fixed,
+                        "fixed_error": fixed_error,
                         "suppressed": state == COMPONENT_SUPPRESSED,
                         "suppression_state": state,
                         "lightweight": state in (1, 4),
@@ -8264,6 +8405,8 @@ class SolidWorksBackend(CadBackend):
                     "mode": main_entry.get("selection_mode"),
                     "main_assembly": _relative_document(main_path, source_root),
                 },
+                "open_status": open_status,
+                "unresolved_components": unresolved_components,
                 "notes": notes,
             }
 

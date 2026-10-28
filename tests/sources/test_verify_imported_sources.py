@@ -72,6 +72,7 @@ def foreign_component(name, *, containing=None):
         "suppressed": False,
         "lightweight": False,
         "suppression_state": 2,
+        "fixed": False,
         "source_provenance": foreign_provenance(),
         **({"solver_observation": {"context": {"document": containing}}} if containing is not None else {}),
     }
@@ -240,6 +241,7 @@ class ImportedSourceTests(unittest.TestCase):
             "suppressed": False,
             "lightweight": False,
             "suppression_state": 2,
+            "fixed": False,
             "source_provenance": accepted_provenance("imported_part.step", sha),
         }
         with tempfile.TemporaryDirectory() as directory:

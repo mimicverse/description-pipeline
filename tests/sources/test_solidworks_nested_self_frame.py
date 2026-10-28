@@ -47,6 +47,7 @@ def component(name, document):
         "suppressed": False,
         "lightweight": False,
         "suppression_state": 2,
+        "fixed": False,
     }
 
 
@@ -58,6 +59,7 @@ def mate(name, mtype, scope, first, second):
     return {
         "name": name,
         "type": mtype,
+        "entity_count": 2,
         "scope": scope,
         "suppressed": False,
         "error_code": 0,

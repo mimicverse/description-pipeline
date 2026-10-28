@@ -665,6 +665,7 @@ class _App:
         key = os.path.normcase(os.path.abspath(str(path)))
         errors.value = self._open_errors.get(key, 0)
         warnings.value = 0
+        self._not_preopened.discard(key)
         return self._docs.get(key) or self._component_document(key)
 
     def GetDocumentDependencies2(self, path, _traverse, _search, _read_only):
@@ -1670,6 +1671,22 @@ class SolverObservationTests(unittest.TestCase):
             # observation never overwrites the recorded IsFixed value.
             self.assertEqual(entries["base-1"]["solver_observation"]["constrained_status"]["value"], 3)
             self.assertEqual(entries["wrench-1"]["solver_observation"]["constrained_status"]["value"], 3)
+
+    def test_non_boolean_is_fixed_is_preserved_as_an_explicit_error(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            component = _Component("base-1", base)
+            component._fixed = 1
+            assembly = _write(root, "robot.SLDASM")
+            doc = _Doc(assembly, children=[component])
+
+            record = _read(root, _App({assembly: doc}))
+            entry = record["components"][0]
+
+            self.assertIsNone(entry["fixed"])
+            self.assertEqual(entry["fixed_error"]["code"], "cad_component_fixed_invalid")
+            self.assertEqual(entry["fixed_error"]["detail"]["value_type"], "int")
 
     def test_solver_observation_preserves_unreadable_readings_without_failing(self) -> None:
         class _RaisingSolving(_Component):
@@ -5646,7 +5663,7 @@ class MainAssemblySelectionTests(unittest.TestCase):
 
             self.assertEqual(caught.exception.code, "native_discovery_assembly_missing")
 
-    def test_marked_main_must_pass_the_strict_open_with_diagnostics(self) -> None:
+    def test_known_missing_reference_open_continues_with_exact_diagnostics(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             assembly = _write(root, "robot.SLDASM")
@@ -5671,18 +5688,82 @@ class MainAssemblySelectionTests(unittest.TestCase):
                 },
             )
 
-            with self.assertRaises(CadError) as caught:
-                _read(root, app)
-
-            error = caught.exception
-            self.assertEqual(error.code, "cad_document_open_failed")
-            self.assertEqual(error.detail["errors"], 2)
+            record = _read(root, app)
+            status = record["open_status"]
+            self.assertEqual(status["classification"], "continuable_missing_referenced_documents")
+            self.assertEqual(status["errors"], 2)
             self.assertEqual(
-                error.detail["unresolved_references"],
+                status["missing_references"]["items"],
                 [{"name": "imported_part", "last_known_path": r"C:\missing\imported_part.SLDPRT"}],
             )
+            self.assertNotIn("source_integrity_proven", status)
 
-    def test_open_failure_without_dependency_enumeration_keeps_original_error(self) -> None:
+    def test_missing_reference_evidence_retains_every_enumerated_path(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            assembly = _write(root, "robot.SLDASM")
+            missing = [
+                {"name": f"part-{index:02d}", "last_known_path": f"C:/missing/part-{index:02d}.SLDPRT"}
+                for index in range(40)
+            ]
+            app = _App(
+                {assembly: _Doc(assembly, doc_type=2)},
+                open_errors={assembly: 2},
+                not_preopened={assembly},
+                dependencies={
+                    assembly: tuple(
+                        value for item in missing
+                        for value in (item["name"], item["last_known_path"], True)
+                    )
+                },
+            )
+            self.assertEqual(_read(root, app)["open_status"]["missing_references"]["items"], missing)
+
+    def test_missing_reference_warning_does_not_hide_unknown_component_source(self) -> None:
+        for source_kind in ("absent", "external", "unknown_virtual", "import_error"):
+            with self.subTest(source_kind=source_kind), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                assembly = _write(root, "robot.SLDASM")
+                component = _Component("missing-1", "", suppressed=True)
+                component._doc = None
+                component.GetImportedPath = lambda: None
+                if source_kind == "external":
+                    component._path = str(root.parent / "outside.SLDPRT")
+                    component._suppression = 2
+                elif source_kind == "unknown_virtual":
+                    component.IsVirtual = None
+                elif source_kind == "import_error":
+                    component.GetImportedPath = _raiser(RuntimeError("import path unreadable"))
+                doc = _Doc(assembly, doc_type=2, children=[component])
+                app = _App({assembly: doc}, open_errors={assembly: 2}, not_preopened={assembly},
+                    dependencies={assembly: ("construction", "C:/missing/construction.SLDPRT", True)})
+                if source_kind == "absent":
+                    record = _read(root, app)
+                    self.assertEqual(record["unresolved_components"][0]["instance"], "missing-1")
+                else:
+                    with self.assertRaises(CadError) as caught:
+                        _read(root, app)
+                    self.assertEqual(
+                        caught.exception.code,
+                        "cad_component_unresolved" if source_kind == "external" else "cad_component_source_unread",
+                    )
+
+    def test_missing_reference_open_cannot_skip_an_active_unloaded_component(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            assembly = _write(root, "robot.SLDASM")
+            component = _Component("active-1", "")
+            component._doc = None
+            component.GetImportedPath = lambda: None
+            app = _App(
+                {assembly: _Doc(assembly, doc_type=2, children=[component])},
+                open_errors={assembly: 2}, not_preopened={assembly},
+                    dependencies={assembly: ("construction", "C:/missing/construction.SLDPRT", True)},
+            )
+            with self.assertRaises(CadError):
+                _read(root, app)
+
+    def test_missing_reference_enumeration_failure_is_explicitly_unavailable(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             assembly = _write(root, "robot.SLDASM")
@@ -5700,24 +5781,25 @@ class MainAssemblySelectionTests(unittest.TestCase):
 
             with self.assertRaises(CadError) as caught:
                 _read(root, app)
+            self.assertEqual(caught.exception.detail["errors"], 2)
+            missing = caught.exception.detail["missing_references"]
+            self.assertEqual(missing["state"], "unavailable")
+            self.assertEqual(missing["items"], [])
+            self.assertIn("RPC unavailable", str(missing["error"]))
 
-            error = caught.exception
-            self.assertEqual(error.code, "cad_document_open_failed")
-            self.assertEqual(error.detail["errors"], 2)
-            self.assertNotIn("unresolved_references", error.detail)
-
-    def test_malformed_dependency_reply_cannot_mask_open_failure(self) -> None:
+    def test_malformed_dependency_reply_keeps_open_status_unavailable(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             assembly = _write(root, "robot.SLDASM")
             doc = _Doc(assembly, doc_type=2)
-            app = _App({assembly: doc}, open_errors={assembly: 2}, not_preopened={assembly})
+            app = _App({assembly: doc}, open_errors={assembly: 2}, not_preopened={assembly},
+                    dependencies={assembly: ("construction", "C:/missing/construction.SLDPRT", True)})
             app.GetDocumentDependencies2 = lambda *args: 7
             with self.assertRaises(CadError) as caught:
                 _read(root, app)
-            self.assertEqual(caught.exception.code, "cad_document_open_failed")
             self.assertEqual(caught.exception.detail["errors"], 2)
-            self.assertNotIn("unresolved_references", caught.exception.detail)
+            self.assertEqual(caught.exception.detail["missing_references"]["state"], "unavailable")
+            self.assertIn("native triples", str(caught.exception.detail["missing_references"]["error"]))
 
     def test_unreadable_open_status_blocks_the_selected_root(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -5737,7 +5819,7 @@ class MainAssemblySelectionTests(unittest.TestCase):
             self.assertEqual(error.code, "cad_document_open_failed")
             self.assertIsNone(error.detail["errors"])
 
-    def test_transitively_open_declared_main_needs_a_fresh_exact_status(self) -> None:
+    def test_transitively_open_main_uses_its_fresh_exact_missing_reference_status(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             carried = _write(root, "robot.SLDASM")
@@ -5749,14 +5831,93 @@ class MainAssemblySelectionTests(unittest.TestCase):
             carrier = _write(root, "carrier.SLDASM")
             component = _Component("robot-1", carried, doc=carried_doc)
             carrier_doc = _Doc(carrier, doc_type=2, children=[component])
-            app = _App({carrier: carrier_doc}, open_errors={carried: 2})
+            app = _App(
+                {carrier: carrier_doc}, open_errors={carried: 2},
+                dependencies={carried: ("construction", "C:/missing/construction.SLDPRT", True)},
+            )
 
-            with self.assertRaises(CadError) as caught:
-                _read(root, app)
+            record = _read(root, app)
+            self.assertEqual(record["open_status"]["errors"], 2)
+            self.assertEqual(
+                record["open_status"]["classification"],
+                "continuable_missing_referenced_documents",
+            )
 
-            error = caught.exception
-            self.assertEqual(error.code, "cad_document_open_failed")
-            self.assertEqual(error.detail["errors"], 2)
+    def test_main_gate_still_refuses_unknown_or_mixed_open_errors(self) -> None:
+        for error_value in (1, 3, 6):
+            with self.subTest(error_value=error_value), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                assembly = _write(root, "robot.SLDASM")
+                doc = _Doc(
+                    assembly,
+                    doc_type=2,
+                    properties={"dp.hardware_id": "m3.0", "dp.delivery_configuration": "Default"},
+                )
+                app = _App(
+                    {assembly: doc},
+                    open_errors={assembly: error_value},
+                    not_preopened={assembly},
+                )
+                with self.assertRaises(CadError) as caught:
+                    _read(root, app)
+                self.assertEqual(caught.exception.code, "cad_document_open_failed")
+                self.assertEqual(caught.exception.detail["errors"], error_value)
+
+    def test_already_open_document_does_not_fabricate_zero_status(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            assembly = _write(root, "robot.SLDASM")
+            app = _App({assembly: _Doc(assembly, doc_type=2)})
+            backend = SolidWorksBackend(session_factory=lambda: _Session(app))
+            with _com_stubs():
+                backend.seal_documents([assembly])
+                entry = backend._probe_document(str(assembly))
+            self.assertTrue(entry["already_open"])
+            self.assertIsNone(entry["errors"])
+            self.assertIsNone(entry["warnings"])
+
+    def test_clean_reference_open_keeps_selected_main_status(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            assembly = _write(root, "robot.SLDASM")
+            part = _write(root, "part.SLDPRT")
+            app = _App(
+                {assembly: _Doc(assembly, doc_type=2), part: _Doc(part)},
+                open_errors={assembly: 2}, not_preopened={assembly, part},
+                dependencies={assembly: ("construction", "C:/missing/construction.SLDPRT", True)},
+            )
+            backend = SolidWorksBackend(session_factory=lambda: _Session(app))
+            with _com_stubs():
+                backend.prepare_prepared_capture(root, assembly, "Default")
+                opened = backend.open_document(str(assembly))
+                reference_opened = backend.open_document(str(part))
+            self.assertEqual(opened["errors"], 2)
+            self.assertEqual(reference_opened["errors"], 0)
+
+    def test_prepared_capture_allows_missing_error_only_for_the_bound_main(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            assembly = _write(root, "robot.SLDASM")
+            part = _write(root, "part.SLDPRT")
+            app = _App(
+                {
+                    assembly: _Doc(assembly, doc_type=2),
+                    part: _Doc(part),
+                },
+                open_errors={assembly: 2, part: 2},
+                dependencies={assembly: ("construction", "C:/missing/construction.SLDPRT", True)},
+                not_preopened={assembly, part},
+            )
+            backend = SolidWorksBackend(session_factory=lambda: _Session(app))
+            with _com_stubs():
+                backend.prepare_prepared_capture(root, assembly, "Default")
+                opened = backend.open_document(str(assembly))
+                self.assertEqual(opened["errors"], 2)
+                self.assertNotIn("source_integrity_proven", opened)
+                with self.assertRaises(CadError) as caught:
+                    backend.open_document(str(part))
+                self.assertEqual(caught.exception.code, "cad_document_open_failed")
+                self.assertEqual(caught.exception.detail["errors"], 2)
 
 
 class EntityGeometryTests(unittest.TestCase):
