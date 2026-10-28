@@ -30,7 +30,13 @@ from .feishu_oauth import (
     recorded_display_name,
     valid_actor_principal,
 )
-from ..pipeline.contracts import DispatchConf, ProtocolError
+from ..io import digest
+from ..pipeline.contracts import (
+    DispatchCommand,
+    DispatchConf,
+    ProtocolError,
+    StageCommand,
+)
 from .request_context import (
     CLEAR_BODY_SCOPE_KEY,
     CREATE_BODY_SCOPE_KEY,
@@ -372,6 +378,124 @@ def registered_recovery_block(record: dict | None) -> tuple[str, str] | None:
     return "registration_missing", RECOVERY_TEMPORARY_DISCONNECTION
 
 
+def validated_canonical_projection(
+    projection: object,
+    *,
+    dag_id: str,
+    dag_run_id: str,
+    canonical_run_id: str,
+) -> dict | None:
+    """Authenticate one registered run from the existing admission and command contracts."""
+
+    if not isinstance(projection, dict):
+        return None
+    try:
+        from ..pipeline.admission import (  # noqa: PLC0415 - authorization runtime only
+            AdmissionSpec,
+            build_freeze_command,
+            build_run_admission,
+        )
+
+        request = projection.get("request")
+        spec = AdmissionSpec.from_record(request)
+        admission = build_run_admission(spec)
+        if (
+            projection.get("run_id") != canonical_run_id
+            or admission.run_id != canonical_run_id
+            or projection.get("request_id") != admission.request_id
+            or projection.get("parent_run_id") != admission.parent_run_id
+            or projection.get("from_stage") != admission.from_stage
+            or request != spec.to_record()
+            or projection.get("request_digest") != admission.request_digest
+            or projection.get("created_at") != admission.created_at.isoformat()
+        ):
+            return None
+
+        technical = projection.get("technical")
+        commands = technical.get("commands") if isinstance(technical, dict) else None
+        stages = projection.get("stages")
+        if (
+            not isinstance(commands, list)
+            or not all(isinstance(command, dict) for command in commands)
+            or not isinstance(stages, list)
+            or not all(isinstance(stage, dict) for stage in stages)
+        ):
+            return None
+
+        dispatch_rows = [
+            command for command in commands if command.get("kind") == "dispatch"
+        ]
+        freeze_rows = [
+            command
+            for command in commands
+            if command.get("kind") == "stage" and command.get("stage") == "freeze"
+        ]
+        freeze_stages = [stage for stage in stages if stage.get("stage") == "freeze"]
+        if len(dispatch_rows) != 1 or len(freeze_rows) != 1 or len(freeze_stages) != 1:
+            return None
+
+        dispatch_row = dispatch_rows[0]
+        dispatch = DispatchCommand.from_record(dispatch_row.get("request"))
+        freeze = StageCommand.from_record(freeze_stages[0].get("command"))
+        if (
+            freeze != build_freeze_command(spec)
+            or dispatch.run_id != canonical_run_id
+            or dispatch.dag_id != dag_id
+            or dispatch.dag_run_id != dag_run_id
+            or dispatch.freeze_command_id != freeze.command_id
+            or dispatch.expected_executor_sha256 != spec.dispatch_executor_sha256
+        ):
+            return None
+
+        expected_dispatch_id = "dispatch:" + digest(
+            {
+                "admission_sha256": spec.admission_sha256,
+                "dag_id": dag_id,
+                "dag_run_id": dag_run_id,
+                "freeze_command_id": freeze.command_id,
+                "run_id": canonical_run_id,
+            }
+        )
+        if (
+            dispatch.command_id != expected_dispatch_id
+            or dispatch_row.get("command_id") != dispatch.command_id
+            or dispatch_row.get("run_id") != canonical_run_id
+            or dispatch_row.get("request") != dispatch.to_record()
+            or dispatch_row.get("request_digest") != dispatch.request_digest
+            or dispatch_row.get("idempotency_key") != dispatch.idempotency_key
+            or dispatch_row.get("expected_executor_sha256")
+            != dispatch.expected_executor_sha256
+            or dispatch_row.get("predecessor_decision_id") is not None
+        ):
+            return None
+
+        freeze_row = freeze_rows[0]
+        if (
+            freeze_row.get("command_id") != freeze.command_id
+            or freeze_row.get("run_id") != canonical_run_id
+            or any(
+                freeze_row.get(field) != getattr(freeze, field)
+                for field in (
+                    "config_snapshot_sha256",
+                    "contract_sha256",
+                    "policy_sha256",
+                )
+            )
+            or any(
+                dispatch_row.get(field) != freeze_row.get(field)
+                for field in (
+                    "config_snapshot_sha256",
+                    "contract_sha256",
+                    "policy_sha256",
+                )
+            )
+        ):
+            return None
+    except Exception:  # noqa: BLE001 - damaged authority always fails closed
+        return None
+    return projection
+
+
 def recorded_canonical_projection(dag_id: str, dag_run_id: str) -> dict | None:
     """Read the exact platform projection used by the Portal recovery gate."""
 
@@ -394,29 +518,12 @@ def recorded_canonical_projection(dag_id: str, dag_run_id: str) -> dict | None:
             projection = read_run_projection(connection, canonical_run_id)
     except Exception:  # noqa: BLE001 - authorization fails closed on unavailable authority
         return None
-    if not isinstance(projection, dict):
-        return None
-    if projection.get("run_id") != canonical_run_id:
-        return None
-    request = projection.get("request")
-    technical = projection.get("technical")
-    commands = technical.get("commands") if isinstance(technical, dict) else None
-    if not isinstance(request, dict) or not isinstance(commands, list):
-        return None
-    dispatches = [
-        command
-        for command in commands
-        if isinstance(command, dict)
-        and command.get("kind") == "dispatch"
-        and isinstance(command.get("request"), dict)
-        and command.get("run_id") == canonical_run_id
-        and command["request"].get("run_id") == canonical_run_id
-        and command["request"].get("dag_id") == dag_id
-        and command["request"].get("dag_run_id") == dag_run_id
-    ]
-    if len(dispatches) != 1:
-        return None
-    return projection
+    return validated_canonical_projection(
+        projection,
+        dag_id=dag_id,
+        dag_run_id=dag_run_id,
+        canonical_run_id=canonical_run_id,
+    )
 
 
 def retry_allowed(

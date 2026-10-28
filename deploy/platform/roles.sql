@@ -42,7 +42,10 @@ GRANT SELECT ON
     TO operator_ro;
 GRANT SELECT ON
     :"platform_schema".run_admission,
+    :"platform_schema".run_display_metadata,
+    :"platform_schema".artifact,
     :"platform_schema".command,
+    :"platform_schema".command_input_artifact,
     :"platform_schema".stage_decision,
     :"platform_schema".effect_intent,
     :"platform_schema".effect_fact,

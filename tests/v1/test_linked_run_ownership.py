@@ -6,7 +6,10 @@ import asyncio
 import json
 import os
 import sys
+import tempfile
 import unittest
+from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -20,8 +23,17 @@ from description_pipeline.orchestration.run_ownership import (
     recorded_canonical_projection,
     registered_recovery_block,
     retry_allowed,
+    validated_canonical_projection,
 )
-from description_pipeline.pipeline.contracts import DispatchConf
+from description_pipeline.io import digest
+from description_pipeline.pipeline.admission import (
+    build_freeze_command,
+    build_run_admission,
+)
+from description_pipeline.pipeline.contracts import (
+    DispatchCommand,
+    DispatchConf,
+)
 from description_pipeline.schemas import AIRFLOW_DISPATCH_CONF_SCHEMA
 
 RUN_ID = "run-worker"
@@ -92,6 +104,95 @@ def canonical_projection(
             ]
         },
     }
+
+
+def typed_canonical_projection(*, state: str = "running") -> dict:
+    from tests.v1.test_pipeline_admission import AdmissionHarness  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory(prefix="canonical-projection-") as directory:
+        harness = AdmissionHarness(Path(directory))
+        run_id = native_run_id(DAG_RUN_ID)
+        spec = replace(
+            harness.spec,
+            run_id=run_id,
+            request_id=DAG_RUN_ID,
+            principal=PRINCIPAL,
+        )
+        admission = build_run_admission(spec)
+        freeze = build_freeze_command(spec)
+        conf = DispatchConf(
+            schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
+            run_id=run_id,
+            freeze_command_id=freeze.command_id,
+        )
+        conf_artifact = harness.store.seal_dispatch_conf(
+            conf,
+            producer_run_id=run_id,
+            producer_tool_sha256=spec.dispatch_executor_sha256,
+        )
+        dispatch = DispatchCommand.create(
+            command_id="dispatch:"
+            + digest(
+                {
+                    "admission_sha256": spec.admission_sha256,
+                    "dag_id": "solidworks_to_urdf",
+                    "dag_run_id": DAG_RUN_ID,
+                    "freeze_command_id": freeze.command_id,
+                    "run_id": run_id,
+                }
+            ),
+            run_id=run_id,
+            freeze_command_id=freeze.command_id,
+            idempotency_key=f"{run_id}/dispatch",
+            dag_id="solidworks_to_urdf",
+            dag_run_id=DAG_RUN_ID,
+            conf_artifact=conf_artifact,
+            expected_executor_sha256=spec.dispatch_executor_sha256,
+        )
+        freeze_row = {
+            "command_id": freeze.command_id,
+            "run_id": freeze.run_id,
+            "kind": freeze.kind,
+            "stage": freeze.stage,
+            "request": freeze.request,
+            "request_digest": freeze.request_digest,
+            "idempotency_key": freeze.idempotency_key,
+            "config_snapshot_sha256": freeze.config_snapshot_sha256,
+            "contract_sha256": freeze.contract_sha256,
+            "policy_sha256": freeze.policy_sha256,
+            "expected_executor_sha256": freeze.expected_executor_sha256,
+            "predecessor_decision_id": freeze.predecessor_decision_id,
+        }
+        dispatch_row = {
+            "command_id": dispatch.command_id,
+            "run_id": dispatch.run_id,
+            "kind": "dispatch",
+            "stage": None,
+            "request": dispatch.to_record(),
+            "request_digest": dispatch.request_digest,
+            "idempotency_key": dispatch.idempotency_key,
+            "config_snapshot_sha256": freeze.config_snapshot_sha256,
+            "contract_sha256": freeze.contract_sha256,
+            "policy_sha256": freeze.policy_sha256,
+            "expected_executor_sha256": dispatch.expected_executor_sha256,
+            "predecessor_decision_id": None,
+        }
+    return {
+        "run_id": run_id,
+        "request_id": admission.request_id,
+        "parent_run_id": admission.parent_run_id,
+        "from_stage": admission.from_stage,
+        "request": spec.to_record(),
+        "request_digest": admission.request_digest,
+        "created_at": admission.created_at.isoformat(),
+        "state": state,
+        "stages": [{"stage": "freeze", "command": freeze.to_record()}],
+        "technical": {"commands": [freeze_row, dispatch_row]},
+    }
+
+
+def clone_projection(projection: dict) -> dict:
+    return json.loads(json.dumps(projection, default=dict))
 
 
 class LinkedRunOwnershipTests(unittest.TestCase):
@@ -438,7 +539,7 @@ class LinkedRunOwnershipTests(unittest.TestCase):
 
     def test_canonical_projection_read_is_read_only_and_bound_to_airflow(self) -> None:
         run_id = native_run_id(DAG_RUN_ID)
-        projection = canonical_projection(run_id=run_id)
+        projection = typed_canonical_projection()
         connection = MagicMock()
         connection.__enter__.return_value = connection
         psycopg2 = SimpleNamespace(connect=MagicMock(return_value=connection))
@@ -463,10 +564,8 @@ class LinkedRunOwnershipTests(unittest.TestCase):
         connection.set_session.assert_called_once_with(readonly=True)
         read.assert_called_once_with(connection, run_id)
 
-        drift = canonical_projection(
-            run_id=run_id,
-            dag_run_id="another-dag-run",
-        )
+        drift = clone_projection(projection)
+        drift["technical"]["commands"][1]["request"]["dag_run_id"] = "another-dag-run"
         with (
             patch.dict(os.environ, {"PLATFORM_OPERATOR_DSN": "operator-ro-dsn"}),
             patch.dict(sys.modules, {"psycopg2": psycopg2}),
@@ -481,6 +580,83 @@ class LinkedRunOwnershipTests(unittest.TestCase):
                     DAG_RUN_ID,
                 )
             )
+
+    def test_canonical_projection_reuses_admission_dispatch_and_freeze_validators(
+        self,
+    ) -> None:
+        run_id = native_run_id(DAG_RUN_ID)
+        projection = typed_canonical_projection()
+
+        def validate(candidate: object) -> dict | None:
+            return validated_canonical_projection(
+                candidate,
+                dag_id="solidworks_to_urdf",
+                dag_run_id=DAG_RUN_ID,
+                canonical_run_id=run_id,
+            )
+
+        self.assertIs(validate(projection), projection)
+        cases: list[tuple[str, dict]] = []
+
+        invalid_admission = clone_projection(projection)
+        invalid_admission["request"]["unknown"] = "field"
+        cases.append(("invalid admission", invalid_admission))
+
+        invalid_dispatch_request = clone_projection(projection)
+        invalid_dispatch_request["technical"]["commands"][1]["request"][
+            "freeze_command_id"
+        ] = "freeze:drifted"
+        cases.append(("dispatch validator", invalid_dispatch_request))
+
+        dispatch_dag_drift = clone_projection(projection)
+        dispatch_dag_drift["technical"]["commands"][1]["request"]["dag_id"] = (
+            "another_dag"
+        )
+        cases.append(("dispatch dag", dispatch_dag_drift))
+
+        dispatch_run_drift = clone_projection(projection)
+        dispatch_run_drift["technical"]["commands"][1]["request"][
+            "dag_run_id"
+        ] = "another-dag-run"
+        cases.append(("dispatch run", dispatch_run_drift))
+
+        dispatch_identity_drift = clone_projection(projection)
+        dispatch_identity_drift["technical"]["commands"][1]["command_id"] = (
+            "dispatch:drifted"
+        )
+        cases.append(("dispatch identity", dispatch_identity_drift))
+
+        request_digest_drift = clone_projection(projection)
+        request_digest_drift["technical"]["commands"][1]["request_digest"] = "0" * 64
+        cases.append(("dispatch row digest", request_digest_drift))
+
+        expected_executor_drift = clone_projection(projection)
+        expected_executor_drift["technical"]["commands"][1][
+            "expected_executor_sha256"
+        ] = "0" * 64
+        cases.append(("dispatch executor", expected_executor_drift))
+
+        duplicate_dispatch = clone_projection(projection)
+        duplicate_dispatch["technical"]["commands"].append(
+            clone_projection(duplicate_dispatch["technical"]["commands"][1])
+        )
+        cases.append(("duplicate dispatch", duplicate_dispatch))
+
+        missing_technical_freeze = clone_projection(projection)
+        missing_technical_freeze["technical"]["commands"].pop(0)
+        cases.append(("missing technical freeze", missing_technical_freeze))
+
+        missing_freeze_stage = clone_projection(projection)
+        missing_freeze_stage["stages"] = []
+        cases.append(("missing freeze stage", missing_freeze_stage))
+
+        freeze_identity_drift = clone_projection(projection)
+        freeze_identity_drift["stages"][0]["command"]["command_id"] = "freeze:drifted"
+        cases.append(("freeze stage identity", freeze_identity_drift))
+
+        for name, candidate in cases:
+            with self.subTest(name=name):
+                self.assertIsNone(validate(candidate))
 
     def test_buffer_replays_the_exact_current_dispatch_body(self) -> None:
         raw = create_body()

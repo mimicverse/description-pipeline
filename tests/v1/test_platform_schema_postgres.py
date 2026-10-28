@@ -32,9 +32,11 @@ from description_pipeline.platform.facts import (
     FactStoreError,
     RunControlStore,
 )
+from description_pipeline.platform.queries import read_run_projection
 from description_pipeline.schemas import (
     AIRFLOW_DISPATCH_CONF_SCHEMA,
     DIAGNOSTIC_ADMISSION_SCHEMA,
+    RUN_ADMISSION_SCHEMA,
 )
 
 PG_AVAILABLE = pgserver is not None and psycopg2 is not None
@@ -196,6 +198,7 @@ class PlatformSchemaPostgresTests(unittest.TestCase):
         request: dict | None = None,
     ) -> None:
         request = request or {"purpose": "engineering"}
+        request_id = f"request-{run_id}"
         with self._connect() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -205,11 +208,20 @@ class PlatformSchemaPostgresTests(unittest.TestCase):
                 """,
                 (
                     run_id,
-                    f"request-{run_id}",
+                    request_id,
                     parent_run_id,
                     from_stage,
                     json.dumps(request),
-                    digest({"run_id": run_id}),
+                    digest(
+                        {
+                            "from_stage": from_stage,
+                            "parent_run_id": parent_run_id,
+                            "request": request,
+                            "request_id": request_id,
+                            "run_id": run_id,
+                            "schema_version": RUN_ADMISSION_SCHEMA,
+                        }
+                    ),
                 ),
             )
 
@@ -1175,7 +1187,15 @@ class PlatformSchemaPostgresTests(unittest.TestCase):
             clear=False,
         ):
             projection = collect_projection()
+            operator_dsn = os.environ["PLATFORM_OPERATOR_DSN"]
+            with psycopg2.connect(operator_dsn) as connection:
+                shared_projection = read_run_projection(
+                    connection,
+                    "run-gate",
+                )
         run_rows = [row for row in projection["rows"] if row["object_kind"] == "run"]
+        self.assertEqual(shared_projection["run_id"], "run-gate")
+        self.assertEqual(shared_projection["state"], "running")
         self.assertEqual(
             [(row["run_id"], row["state"], row["bucket"]) for row in run_rows],
             [("run-gate", "incomplete", "in_flight")],
