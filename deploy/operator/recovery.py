@@ -658,10 +658,12 @@ def absolute_text(value, where: str) -> Path:
 
 def require_no_links(path: Path, where: str) -> None:
     path = Path(path)
+    if not path.is_absolute():
+        path = Path.cwd() / path
     current = Path(path.anchor)
     for part in path.parts[1:]:
         current /= part
-        if current.exists():
+        if current.exists() or is_link(current):
             require(
                 not is_link(current),
                 "recovery_target_path_unsafe",
@@ -675,6 +677,15 @@ def require_real_file(path: Path, where: str, code: str) -> None:
         path.is_file(),
         code,
         f"{where} is missing or not a regular file: {path}",
+    )
+
+
+def require_external_key(path: Path) -> None:
+    require_real_file(path, "external recovery key", "recovery_key_unavailable")
+    require(
+        path.stat().st_mode & 0o077 == 0,
+        "recovery_key_unavailable",
+        "external recovery key must not be group/world accessible",
     )
 
 
@@ -2272,7 +2283,41 @@ def database_probe(
         "recovery_dsn_authority_mismatch",
         "database authority probe is malformed",
     )
-    return document
+    # Application roles cannot read cluster settings/control data. Probe the same
+    # endpoint with the bootstrap role already used for recovery and pg_dump.
+    cluster = psql_json(
+        context,
+        socket_dir=Path(dsn["socket_dir"]),
+        port=dsn["port"],
+        user=BOOTSTRAP_ROLE,
+        database=dsn["database"],
+        query=(
+            "SELECT json_build_object("
+            "'database', current_database(),"
+            "'database_oid', (SELECT oid::text FROM pg_database "
+            "WHERE datname = current_database()),"
+            "'server_version_num', current_setting('server_version_num'),"
+            "'data_directory', current_setting('data_directory'),"
+            "'system_identifier', "
+            "(SELECT system_identifier::text FROM pg_control_system()))"
+        ),
+    )
+    require(
+        isinstance(cluster, dict)
+        and document.get("database") == dsn["database"]
+        and document.get("role") == dsn["user"]
+        and all(
+            cluster.get(key) == document.get(key)
+            for key in ("database", "database_oid", "server_version_num")
+        ),
+        "recovery_dsn_authority_mismatch",
+        "application and bootstrap probes do not identify the same database",
+    )
+    return {
+        **document,
+        "data_directory": cluster.get("data_directory"),
+        "system_identifier": cluster.get("system_identifier"),
+    }
 
 
 def capture_database_authority(
@@ -2322,7 +2367,17 @@ def capture_database_authority(
         f"source database is not PostgreSQL {POSTGRES_MAJOR}",
     )
     data_dir = postgres_root / "data"
+    require_real_dir(data_dir, "source PostgreSQL data directory", "recovery_dsn_authority_mismatch")
     controls = pg_control(data_dir, context)
+    for name, probe in probes.items():
+        require(
+            isinstance(probe.get("data_directory"), str)
+            and Path(probe["data_directory"]).is_absolute()
+            and Path(probe["data_directory"]).resolve() == data_dir.resolve()
+            and probe.get("system_identifier") == controls["system_identifier"],
+            "recovery_dsn_authority_mismatch",
+            f"{name} does not connect to the declared source cluster",
+        )
     endpoints_record = []
     for name, dsn in sorted(parsed.items()):
         fingerprint = hashlib.sha256(
@@ -5559,16 +5614,21 @@ def capture_windows_recovery(
         timeout=180,
         commands=commands,
     )
-    task = status.get("task")
+    try:
+        identity = install_record.endpoint_identity_from_status(status, context.release_document)
+    except (SystemExit, ValueError, KeyError) as error:
+        raise RecoveryError(
+            "windows_recovery_identity_mismatch",
+            "Windows status does not prove the installed endpoint identity",
+        ) from error
+    expected = context.install_record["ends"]["windows"]
     require(
-        isinstance(task, dict) and task.get("state") in {"Disabled", "Ready"},
-        "windows_recovery_maintenance_changed",
-        "Windows task is not stopped before backup",
-    )
-    require(
-        isinstance(status.get("identity"), dict),
-        "windows_recovery_state_invalid",
-        "Windows status carries no installed identity",
+        identity == expected
+        and install_record._windows_identity_matches(
+            context.install_record, status["identity"], target_required=False
+        ),
+        "windows_recovery_identity_mismatch",
+        "Windows status differs from the Linux install record",
     )
     endpoint_config_remote = _windows_normalize(binding["endpoint_config"])
     endpoint_config_local = stage / "endpoint.json"
@@ -5639,6 +5699,22 @@ def capture_windows_recovery(
             commands=commands,
         )
         require(local.is_file() and not local.is_symlink(), "windows_recovery_state_invalid", f"{label} is unavailable")
+
+    _, receipt = strict_json_file(stage / "install-receipt.json", "Windows install receipt")
+    require(
+        (stage / "install-id").read_text(encoding="ascii").strip() == expected["install_id"]
+        and isinstance(receipt, dict)
+        and receipt.get("schema_version") == "solidworks-to-urdf.windows-install-receipt/v2"
+        and receipt.get("passed") is True
+        and receipt.get("install_id") == expected["install_id"]
+        and receipt.get("config_digest") == expected["config_digest"]
+        and all(
+            receipt.get(key) == release_document.get(key) == expected["release"][key]
+            for key in ("version", "source_commit", "source_sha256")
+        ),
+        "windows_recovery_identity_mismatch",
+        "Windows install files differ from the Linux install record",
+    )
 
     native_remote = state_root + "/native-operations"
     native_local = stage / "native-operations"
@@ -5765,6 +5841,29 @@ try {{
     return document["exists"]
 
 
+WINDOWS_RESTORE_PATH_GUARD = r"""
+function Assert-NoReparseAncestor([string]$Path) {
+  $current = [System.IO.Path]::GetFullPath($Path)
+  while ($current) {
+    $item = $null
+    try {
+      $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+    } catch [System.Management.Automation.ItemNotFoundException] {
+    }
+    if ($null -ne $item -and
+        ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+      @{passed=$false;code='windows_target_path_unsafe';path=$current} |
+        ConvertTo-Json -Compress
+      exit 1
+    }
+    $parent = [System.IO.Path]::GetDirectoryName($current)
+    if (-not $parent -or $parent -eq $current) { break }
+    $current = $parent
+  }
+}
+"""
+
+
 def _windows_create_parents(
     *,
     ssh_host: str,
@@ -5775,9 +5874,13 @@ def _windows_create_parents(
     encoded = base64.b64encode(
         json.dumps(paths, separators=(",", ":")).encode("utf-8")
     ).decode("ascii")
-    script = rf"""
+    script = WINDOWS_RESTORE_PATH_GUARD + rf"""
+$ErrorActionPreference = 'Stop'
 $paths = ConvertFrom-Json ([Text.Encoding]::UTF8.GetString(
   [Convert]::FromBase64String('{encoded}')))
+foreach ($path in @($paths)) {{
+  Assert-NoReparseAncestor ([string]$path)
+}}
 foreach ($path in @($paths)) {{
   $parent = Split-Path -Parent $path
   if ($parent) {{
@@ -5786,14 +5889,20 @@ foreach ($path in @($paths)) {{
 }}
 @{{passed=$true;created=$true}} | ConvertTo-Json -Compress
 """
-    document, _ = _run_windows_powershell(
+    document, completed = _run_windows_powershell(
         ssh_host=ssh_host,
         script=script,
         timeout=timeout,
         commands=commands,
     )
     require(
-        document.get("passed") is True,
+        document.get("code") != "windows_target_path_unsafe",
+        "recovery_target_path_unsafe",
+        "Windows target crosses a symbolic link or junction",
+        document,
+    )
+    require(
+        completed.returncode == 0 and document.get("passed") is True,
         "windows_recovery_transport_unknown",
         "Windows target directories could not be prepared",
     )
@@ -5817,7 +5926,7 @@ def _windows_restore_target_empty(
     encoded = base64.b64encode(
         json.dumps(payload, separators=(",", ":")).encode("utf-8")
     ).decode("ascii")
-    script = rf"""
+    script = WINDOWS_RESTORE_PATH_GUARD + rf"""
 $ErrorActionPreference = 'Stop'
 $request = ConvertFrom-Json ([Text.Encoding]::UTF8.GetString(
   [Convert]::FromBase64String('{encoded}')))
@@ -5826,6 +5935,9 @@ function Deny-Target([string]$Code, [string]$Path) {{
   exit 1
 }}
 try {{
+  foreach ($path in (@($request.files) + @($request.roots))) {{
+    Assert-NoReparseAncestor ([string]$path)
+  }}
   $tasks = @(Get-ScheduledTask -ErrorAction Stop)
   $matching = @($tasks | Where-Object {{
     [string]::Equals(
@@ -5884,6 +5996,12 @@ try {{
         script=script,
         timeout=timeout,
         commands=commands,
+    )
+    require(
+        document.get("code") != "windows_target_path_unsafe",
+        "recovery_target_path_unsafe",
+        "Windows target crosses a symbolic link or junction",
+        document,
     )
     if (
         completed.returncode in (0, 1)
@@ -6466,12 +6584,7 @@ def backup_command(
     key_file = Path(key_file)
     require(out.is_absolute(), "recovery_target_path_unsafe", "--out must be absolute")
     require_no_links(out, "backup output")
-    require_real_file(key_file, "external backup key", "recovery_key_unavailable")
-    require(
-        key_file.stat().st_mode & 0o077 == 0,
-        "recovery_key_unavailable",
-        "external backup key must not be group/world accessible",
-    )
+    require_external_key(key_file)
     context = load_backup_context(config_path)
     source_roots_for_key = [
         Path(context.resolved["storage"][name])
@@ -8206,7 +8319,7 @@ def prepare_extraction(
     key: Path,
     status_dir: Path,
 ) -> tuple[Path, tempfile.TemporaryDirectory]:
-    require_real_file(key, "external recovery key", "recovery_key_unavailable")
+    require_external_key(key)
     key_id = hashlib.sha256(key.read_bytes()).hexdigest()
     require(
         key_id == manifest["archive"]["key_id"],
@@ -8379,6 +8492,7 @@ def path_exists(path: Path) -> bool:
 
 
 def require_empty_target_directory(path: Path, where: str) -> None:
+    require_no_links(path, where)
     if not path_exists(path):
         return
     require(
@@ -8422,6 +8536,7 @@ def validate_target_filesystem(manifest: dict, plan: dict) -> None:
             f"secret target already exists: {target}",
         )
     for root in manifest["roots"]:
+        require_no_links(Path(root["path"]), f"target root {root['name']}")
         if "reconstructible_runtime" in root:
             continue
         target = Path(plan["roots"][root["name"]])
@@ -9386,6 +9501,7 @@ def copy_extracted_directory(
     members: list[dict],
     archive_prefix: str,
 ) -> None:
+    require_no_links(target, "directory restore target")
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if path_exists(target):
         require(
@@ -9464,6 +9580,7 @@ def restore_exact_files(
             "recovery_member_hash_mismatch",
         )
         target = Path(entry["path"])
+        require_no_links(target, "exact file restore target")
         require(
             not path_exists(target),
             "recovery_target_not_empty",
@@ -11449,11 +11566,7 @@ def restore_command(
             "recovery_archive_hash_mismatch",
             "encrypted recovery archive digest differs from the manifest",
         )
-        require_real_file(
-            key,
-            "external recovery key",
-            "recovery_key_unavailable",
-        )
+        require_external_key(key)
         require(
             hashlib.sha256(key.read_bytes()).hexdigest() == manifest["archive"]["key_id"],
             "recovery_key_unavailable",

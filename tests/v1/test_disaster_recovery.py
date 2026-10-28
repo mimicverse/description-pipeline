@@ -259,18 +259,13 @@ class CheckpointTreeVerificationTests(unittest.TestCase):
 
 
 def windows_recovery_fixture(context, staging: Path) -> tuple[dict, dict]:
-    del context
+    identity = context.install_record["ends"]["windows"]
     windows = staging / "windows"
     windows.mkdir(parents=True, exist_ok=True, mode=0o700)
     archive_name = "description-1.0.0-windows-cp312-x86_64.zip"
     archive_bytes = b"windows runtime"
-    install_id = "win-" + "1" * 32
-    release = {
-        "version": "1.0.0",
-        "source_commit": "a" * 40,
-        "source_sha256": "b" * 64,
-        "role": "native",
-    }
+    install_id = identity["install_id"]
+    release = identity["release"]
     binding = {
         "endpoint_config": "C:/description/config/endpoint.json",
         "release_file": "C:/description/release/release.json",
@@ -289,9 +284,15 @@ def windows_recovery_fixture(context, staging: Path) -> tuple[dict, dict]:
         "endpoint.json": recovery.canonical_json(endpoint),
         "endpoint.token": b"t" * 64 + b"\n",
         "install-id": install_id.encode("ascii") + b"\n",
-        "install-receipt.json": b'{"passed":true}\n',
+        "install-receipt.json": recovery.canonical_json({
+            "schema_version": "solidworks-to-urdf.windows-install-receipt/v2",
+            "passed": True,
+            "install_id": install_id,
+            "config_digest": identity["config_digest"],
+            **{key: release[key] for key in ("version", "source_commit", "source_sha256")},
+        }),
         "release.json": recovery.canonical_json(
-            {"artifacts": {archive_name: hashlib.sha256(archive_bytes).hexdigest()}}
+            {**release, "artifacts": {archive_name: hashlib.sha256(archive_bytes).hexdigest()}}
         ),
         "instance-lifecycle.ps1": b"# lifecycle\n",
         "bootstrap-managed-root.ps1": b"# bootstrap\n",
@@ -337,7 +338,7 @@ def windows_recovery_fixture(context, staging: Path) -> tuple[dict, dict]:
         },
         "identity": {
             "install_id": install_id,
-            "config_digest": "d" * 64,
+            "config_digest": identity["config_digest"],
             "release": release,
         },
         "listener": None,
@@ -643,6 +644,7 @@ if query:
             "database_oid": "16384",
             "role": option("-U"),
             "server_version_num": "140024",
+            **identity,
         }
     else:
         payload = catalog
@@ -1248,7 +1250,7 @@ def make_context(root: Path, fake_bin: Path) -> recovery.BackupContext:
     dsn_file = source / "secrets" / "postgres.dsn"
     feishu_secret = source / "secrets" / "feishu.json"
     endpoint_token = source / "secrets" / "endpoint.token"
-    socket_dir = source / "airflow-pg" / "socket"
+    socket_dir = postgres_root / "socket"
     socket_dir.mkdir(parents=True)
     (postgres_root / "data").mkdir(parents=True)
     write(postgres_root / "data" / "PG_VERSION", "14\n")
@@ -1445,7 +1447,7 @@ def make_context(root: Path, fake_bin: Path) -> recovery.BackupContext:
     context = recovery.BackupContext(
         config_path=config_path,
         resolved=resolved,
-        install_record={"install_id": install_id},
+        install_record=record,
         snapshot={
             "install_id": install_id,
             "resolved": resolved,
@@ -4216,6 +4218,261 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 status_dir=self.root / "status-pg15",
             )
         self.assertEqual(raised.exception.code, "recovery_postgres_version_mismatch")
+
+    def test_windows_capture_binds_every_identity_to_linux_install(self):
+        original = self.root / "windows-original"
+        state, _ = windows_recovery_fixture(self.context, original)
+        originals = {path.name: path.read_bytes() for path in (original / "windows").iterdir() if path.is_file()}
+
+        def transfer(*, source, destination, **_kwargs):
+            source_path = original / "windows" / str(source).rsplit("/", 1)[-1]
+            if source_path.is_dir():
+                shutil.copytree(source_path, destination)
+            else:
+                shutil.copy2(source_path, destination)
+
+        cases = [
+            "valid",
+            "install_id",
+            "config_digest",
+            "release",
+            "target_identity",
+            "install-id",
+            "receipt-install_id",
+            "receipt-config_digest",
+            "receipt-source_commit",
+            "release-source_commit",
+        ]
+        for index, field in enumerate(cases):
+            with self.subTest(field=field):
+                for name, payload in originals.items():
+                    (original / "windows" / name).write_bytes(payload)
+                status = copy.deepcopy(state["status"])
+                if field in {"install_id", "config_digest"}:
+                    status["identity"][field] = "f" * 64
+                elif field == "release":
+                    status["identity"]["release"]["source_commit"] = "f" * 40
+                elif field == "target_identity":
+                    status["identity"][field] = NativeTargetIdentity.create(
+                        install_id="win-" + "f" * 32, pipeline_id="solidworks-to-urdf"
+                    ).to_record()
+                elif field == "install-id":
+                    (original / "windows" / field).write_text("win-" + "f" * 32 + "\n")
+                elif field.startswith(("receipt-", "release-")):
+                    filename = "install-receipt.json" if field.startswith("receipt-") else "release.json"
+                    path = original / "windows" / filename
+                    document = json.loads(path.read_bytes())
+                    document[field.split("-", 1)[1]] = "f" * 64
+                    path.write_bytes(recovery.canonical_json(document))
+                staging = self.root / f"capture-{index}"
+                with (
+                    mock.patch.object(recovery, "_windows_scp", side_effect=transfer),
+                    mock.patch.object(recovery, "_windows_public_verb", return_value=status),
+                    mock.patch.object(recovery, "_windows_path_exists", return_value=False),
+                    mock.patch.object(recovery, "_windows_acl_document", return_value={"passed": True}),
+                ):
+                    if field == "valid":
+                        self.real_capture_windows_recovery(
+                            self.context, backup_id="capture", staging=staging, commands=[]
+                        )
+                        self.assertTrue((staging / "windows" / "state.json").is_file())
+                    else:
+                        with self.assertRaises(recovery.RecoveryError) as raised:
+                            self.real_capture_windows_recovery(
+                                self.context, backup_id="capture", staging=staging, commands=[]
+                            )
+                        self.assertEqual(raised.exception.code, "windows_recovery_identity_mismatch")
+                        self.assertFalse((staging / "windows" / "state.json").exists())
+
+    def test_database_probe_uses_bootstrap_only_for_same_endpoint_control_reads(self):
+        dsn = {
+            "socket_dir": "/cluster/socket",
+            "port": 5432,
+            "database": "airflow_meta",
+            "user": "platform_service",
+            "password": "application-secret",
+        }
+        application = {
+            "database": "airflow_meta",
+            "database_oid": "123",
+            "role": "platform_service",
+            "server_version_num": "140024",
+        }
+        cluster = {**application, "data_directory": "/cluster/data", "system_identifier": "123456"}
+        with mock.patch.object(recovery, "psql_json", side_effect=[application, cluster]) as probe:
+            actual = recovery.database_probe(mock.sentinel.context, dsn)
+        self.assertEqual(actual["system_identifier"], "123456")
+        original, control = [call.kwargs for call in probe.call_args_list]
+        for arguments in (original, control):
+            self.assertEqual(arguments["socket_dir"], Path(dsn["socket_dir"]))
+            self.assertEqual(arguments["port"], dsn["port"])
+            self.assertEqual(arguments["database"], dsn["database"])
+        self.assertEqual(original["user"], dsn["user"])
+        self.assertEqual(original["password"], dsn["password"])
+        self.assertEqual(control["user"], recovery.BOOTSTRAP_ROLE)
+        self.assertNotIn("password", control)
+        self.assertIn("pg_control_system()", control["query"])
+        self.assertIn("current_setting('data_directory')", control["query"])
+        for changed in ({"role": "other"}, {"database": "other"}):
+            with (
+                self.subTest(changed=changed),
+                mock.patch.object(recovery, "psql_json", side_effect=[{**application, **changed}, cluster]),
+                self.assertRaises(recovery.RecoveryError),
+            ):
+                recovery.database_probe(mock.sentinel.context, dsn)
+
+    def test_backup_and_extraction_reject_public_or_link_keys(self):
+        link = self.root / "external-link.key"
+        link.symlink_to(self.key)
+        for mode in (0o640, 0o604, 0o660, 0o644, "link"):
+            self.key.chmod(0o600 if mode == "link" else mode)
+            key = link if mode == "link" else self.key
+            for action in (
+                lambda key=key: recovery.backup_command(
+                    config_path=self.context.config_path,
+                    backup_id="unsafe-key",
+                    key_file=key,
+                    out=self.root / "unsafe-backup",
+                ),
+                lambda key=key: recovery.prepare_extraction(
+                    {}, self.root / "manifest.json", key, self.root / "extract"
+                ),
+            ):
+                with self.subTest(mode=mode, action=action):
+                    with self.assertRaises(recovery.RecoveryError) as raised:
+                        action()
+                    self.assertIn(raised.exception.code, {"recovery_key_unavailable", "recovery_target_path_unsafe"})
+            self.assertFalse((self.root / "unsafe-backup").exists())
+            self.assertFalse((self.root / "extract").exists())
+
+    @unittest.skipUnless(shutil.which("pwsh") or os.environ.get("PWSH_EXECUTABLE"), "PowerShell is unavailable")
+    def test_windows_restore_checks_all_ancestors_before_target_writes(self):
+        powershell = os.environ.get("PWSH_EXECUTABLE") or shutil.which("pwsh")
+        external = self.root / "windows-outside"
+        external.mkdir()
+        alias = self.root / "windows-alias"
+        alias.symlink_to(external, target_is_directory=True)
+        target = alias / "new-parent" / "target"
+
+        def execute(*, script, **_kwargs):
+            script = "function Get-ScheduledTask {}\n" + script
+            completed = subprocess.run(
+                [powershell, "-NoProfile", "-NonInteractive", "-Command", script],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertTrue(completed.stdout.strip(), completed.stderr)
+            return json.loads(completed.stdout.strip().splitlines()[-1]), completed
+
+        with mock.patch.object(recovery, "_run_windows_powershell", side_effect=execute):
+            for action in (
+                lambda: recovery._windows_create_parents(
+                    ssh_host="fixture", paths=[str(target)], timeout=30, commands=[]
+                ),
+                lambda: recovery._windows_restore_target_empty(
+                    ssh_host="fixture",
+                    binding={"task_name": "fixture", "task_path": "fixture"},
+                    paths=[str(target)],
+                    roots=[str(target.parent)],
+                    timeout=30,
+                    commands=[],
+                ),
+            ):
+                with self.subTest(action=action):
+                    with self.assertRaises(recovery.RecoveryError) as raised:
+                        action()
+                    self.assertEqual(raised.exception.code, "recovery_target_path_unsafe")
+                    self.assertEqual(list(external.iterdir()), [])
+            safe = self.root / "windows-safe" / "target"
+            recovery._windows_create_parents(ssh_host="fixture", paths=[str(safe)], timeout=30, commands=[])
+            recovery._windows_restore_target_empty(
+                ssh_host="fixture",
+                binding={"task_name": "fixture", "task_path": "fixture"},
+                paths=[str(safe)],
+                roots=[str(safe.parent)],
+                timeout=30,
+                commands=[],
+            )
+            self.assertTrue(safe.parent.is_dir())
+
+    def test_source_database_must_match_local_control_identity(self):
+        context = recovery.command_context(self.context.postgres_root / "root/usr/lib/postgresql/14/bin", None, [])
+        for changed in ({"data_directory": "/elsewhere/data"}, {"system_identifier": "9999999999"}):
+            with self.subTest(changed=changed):
+                probe = {
+                    "database": "airflow_meta",
+                    "database_oid": "16384",
+                    "role": "fixture",
+                    "server_version_num": "140024",
+                    "data_directory": str(self.context.postgres_root / "data"),
+                    "system_identifier": "1111111111",
+                    **changed,
+                }
+                with (
+                    mock.patch.object(recovery, "database_probe", return_value=probe),
+                    self.assertRaises(recovery.RecoveryError) as raised,
+                ):
+                    recovery.capture_database_authority(
+                        self.context.resolved,
+                        self.context.derived_env,
+                        postgres_root=self.context.postgres_root,
+                        context=context,
+                    )
+                self.assertEqual(raised.exception.code, "recovery_dsn_authority_mismatch")
+
+    def test_restore_refuses_link_ancestors_before_creating_targets(self):
+        external = self.root / "outside"
+        external.mkdir()
+        alias = self.root / "alias"
+        alias.symlink_to(external, target_is_directory=True)
+        source = self.root / "payload"
+        write(source / "secret", "private")
+        target = alias / "new-parent" / "restored"
+        manifest = {
+            "roots": [{"name": "release_root", "path": str(target), "reconstructible_runtime": True}],
+            "files": [], "secrets": [], "members": [], "database": {"dump": {"bytes": 1}},
+        }
+        plan = {"postgres": {"data_dir": str(self.root)}, "roots": {}}
+        for action in (
+            lambda: recovery.validate_target_filesystem(manifest, plan),
+            lambda: recovery.require_empty_target_directory(target, "target"),
+            lambda: recovery.copy_extracted_directory(source, target, [], "state"),
+            lambda: recovery.restore_exact_files(
+                {"files": [{"name": "secret", "member": "secret", "path": str(target), "mode": 0o600}], "secrets": []},
+                source,
+            ),
+        ):
+            with self.subTest(action=action):
+                with self.assertRaises(recovery.RecoveryError) as raised:
+                    action()
+                self.assertEqual(raised.exception.code, "recovery_target_path_unsafe")
+                self.assertEqual(list(external.iterdir()), [])
+
+    def test_restore_refuses_public_or_link_keys_before_extraction(self):
+        out, manifest = self.backup()
+        self.isolate_source()
+        manifest_path = out / "recovery-manifest.json"
+        roots = {row["name"]: row["path"] for row in manifest["roots"] if "reconstructible_runtime" not in row}
+        plan = self.target_plan(recovery.sha256_file(manifest_path), roots)
+        link = self.root / "linked.key"
+        link.symlink_to(self.key)
+        for mode in (0o640, 0o604, 0o660, 0o644, "link"):
+            with self.subTest(mode=mode):
+                self.key.chmod(0o600 if mode == "link" else mode)
+                key = link if mode == "link" else self.key
+                with (
+                    mock.patch.object(recovery, "prepare_extraction") as extract,
+                    self.assertRaises(recovery.RecoveryError) as raised,
+                ):
+                    recovery.restore_command(
+                        manifest_path=manifest_path,
+                        key=key,
+                        target_plan_path=plan,
+                        status_dir=self.root / f"status-key-{mode}",
+                    )
+                self.assertIn(raised.exception.code, {"recovery_key_unavailable", "recovery_target_path_unsafe"})
+                extract.assert_not_called()
 
     def test_multiple_database_authorities_are_refused(self) -> None:
         fake = recovery.CommandContext(
