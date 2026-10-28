@@ -5,11 +5,18 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import ntpath
 import re
 import struct
 from fractions import Fraction
 
-from ..io import PipelineError
+from ..io import PipelineError, digest
+from ..sources.solidworks.session_artifacts import (
+    SESSION_DOCUMENT_API,
+    SESSION_SOURCE_IDENTITY_FIELDS,
+    session_materialization_under_root,
+    session_root_pid,
+)
 
 
 def native_binary64_sqrt(value: Fraction) -> float:
@@ -274,6 +281,36 @@ SOURCE_SCOPE_FIELDS = frozenset(
         "virtual_native_api_pid",
     }
 )
+SESSION_SOURCE_SCOPE_EXTRA = frozenset({"session_source"})
+SESSION_SOURCE_FIELDS = frozenset(
+    {
+        "kind",
+        "state",
+        "owner",
+        "owner_sha256",
+        "occurrence",
+        "defining_anchor",
+        "configuration",
+        "is_virtual",
+        "used_api",
+        "session_document_path",
+        "session_temp_root",
+        "native_api_pid",
+        "author_imported_path",
+        "author_imported_error",
+        "author_imported_relative",
+        "author_imported_exists",
+    }
+)
+
+
+def _same_evidence_path(left: object, right: object) -> bool:
+    return bool(
+        isinstance(left, str)
+        and isinstance(right, str)
+        and ntpath.normcase(ntpath.normpath(left.replace("/", "\\")))
+        == ntpath.normcase(ntpath.normpath(right.replace("/", "\\")))
+    )
 
 
 def _virtual_component_relative_path(value: object) -> str | None:
@@ -298,7 +335,14 @@ def native_source_scope_is_valid(
 ) -> bool:
     """Validate one sealed source scope without trusting tessellation scope."""
 
-    if not isinstance(value, dict) or set(value) != SOURCE_SCOPE_FIELDS:
+    if not isinstance(value, dict):
+        return False
+    expected_fields = SOURCE_SCOPE_FIELDS | (
+        SESSION_SOURCE_SCOPE_EXTRA
+        if value.get("source_document_identity_kind") == "session_source_sha256"
+        else frozenset()
+    )
+    if set(value) != expected_fields:
         return False
     component_name = value["component"]
     path = value["source_document_path"]
@@ -307,6 +351,68 @@ def native_source_scope_is_valid(
     session_path = value["virtual_session_document_path"]
     path_virtual_relative = _virtual_component_relative_path(path)
     session_virtual_relative = _virtual_component_relative_path(session_path)
+    session_source = value.get("session_source")
+    session_source_valid = (
+        isinstance(session_source, dict)
+        and set(session_source) == SESSION_SOURCE_FIELDS
+        and session_source.get("kind") == "native_import_materialization"
+        and session_source.get("state") == "cached_materialization"
+        and isinstance(session_source.get("owner"), str)
+        and bool(session_source["owner"])
+        and isinstance(session_source.get("owner_sha256"), str)
+        and bool(_HEX64.fullmatch(session_source["owner_sha256"]))
+        and isinstance(session_source.get("occurrence"), str)
+        and bool(session_source["occurrence"])
+        and (
+            session_source.get("defining_anchor") is None
+            or isinstance(session_source.get("defining_anchor"), str)
+        )
+        and isinstance(session_source.get("configuration"), str)
+        and bool(session_source["configuration"])
+        and session_source.get("is_virtual") is False
+        and session_source.get("used_api") == SESSION_DOCUMENT_API
+        and _same_evidence_path(value["source_document_path"], session_source.get("session_document_path"))
+        and isinstance(session_source.get("session_temp_root"), str)
+        and type(session_source.get("native_api_pid")) is int
+        and session_source["native_api_pid"] > 0
+        and session_root_pid(session_source["session_temp_root"])
+        == session_source.get("native_api_pid")
+        and session_materialization_under_root(
+            session_source.get("session_document_path"),
+            session_source.get("session_temp_root"),
+        )
+        and isinstance(session_source.get("author_imported_path"), (str, type(None)))
+        and isinstance(session_source.get("author_imported_error"), (str, type(None)))
+        and isinstance(session_source.get("author_imported_relative"), (str, type(None)))
+        and isinstance(session_source.get("author_imported_exists"), (bool, type(None)))
+        and (
+            session_source["author_imported_error"] is None
+            or bool(session_source["author_imported_error"].strip())
+        )
+        and (
+            (
+                session_source["author_imported_path"] is None
+                and session_source["author_imported_exists"] is None
+                and session_source["author_imported_relative"] is None
+            )
+            or (
+                isinstance(session_source["author_imported_path"], str)
+                and bool(session_source["author_imported_path"].strip())
+                and ntpath.isabs(session_source["author_imported_path"])
+                and session_source["author_imported_error"] is None
+                and type(session_source["author_imported_exists"]) is bool
+                and (
+                    session_source["author_imported_relative"] is None
+                    or (
+                        isinstance(session_source["author_imported_relative"], str)
+                        and bool(session_source["author_imported_relative"].strip())
+                    )
+                )
+            )
+        )
+        and value["source_document_identity_sha256"]
+        == digest({key: session_source[key] for key in SESSION_SOURCE_IDENTITY_FIELDS})
+    )
     file_identity = (
         value["source_document_identity_kind"] == "file_sha256"
         and isinstance(value["source_document_sha256"], str)
@@ -342,6 +448,19 @@ def native_source_scope_is_valid(
         and type(value["virtual_native_api_pid"]) is int
         and value["virtual_native_api_pid"] > 0
     )
+    session_identity = (
+        value["source_document_identity_kind"] == "session_source_sha256"
+        and copy_path is None
+        and value["source_document_sha256"] is None
+        and value["source_copy_sha256"] is None
+        and path_is_text
+        and session_source_valid
+        and value["virtual_owner"] is None
+        and value["virtual_owner_sha256"] is None
+        and value["virtual_session_document_path"] is None
+        and value["virtual_session_temp_root"] is None
+        and value["virtual_native_api_pid"] is None
+    )
     return (
         value["rule_version"] == NATIVE_SOURCE_SCOPE_RULE
         and isinstance(component_name, str)
@@ -351,7 +470,7 @@ def native_source_scope_is_valid(
         and path_is_text
         and isinstance(value["source_document_identity_sha256"], str)
         and bool(_HEX64.fullmatch(value["source_document_identity_sha256"]))
-        and (file_identity or virtual_identity)
+        and (file_identity or virtual_identity or session_identity)
         and isinstance(value["referenced_configuration"], str)
         and bool(value["referenced_configuration"])
     )

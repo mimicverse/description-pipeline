@@ -97,6 +97,10 @@ from .native_limits import (
     rotation_window_policy,
     validate_native_limit,
 )
+from .session_artifacts import (
+    session_source_identity,
+    session_source_identity_sha256,
+)
 from .direction import canonicalize_axis
 from .naming import robot_name as format_robot_name
 from .revision import package_inventory
@@ -706,6 +710,65 @@ def _projected_mate_reference(block, component, owner, frames):
     return projected
 
 
+def _validate_inplace_record(mate: dict) -> None:
+    """Validate raw IMateInPlace observations without interpreting a constraint."""
+
+    def require(condition):
+        if not condition:
+            raise CadError(
+                "cad_inplace_record_invalid", "in-place native observations are malformed", {"mate": mate.get("name")}
+            )
+
+    def reading(item, value_type):
+        require(isinstance(item, dict) and set(item) == {"value", "error"})
+        value, error = item["value"], item["error"]
+        require(error is None or (
+            isinstance(error, dict) and isinstance(error.get("code"), str) and bool(error["code"])
+            and isinstance(error.get("message"), str) and bool(error["message"]) and value is None
+        ))
+        require(value is None or type(value) is value_type)
+        return value
+
+    def component(item):
+        value = reading(item, dict)
+        if value is not None:
+            require(set(value) == {"name2", "path", "configuration"})
+            for field in value.values():
+                reading(field, str)
+
+    require(
+        mate.get("type") == "inplace" and mate.get("native_feature_type") == "MateInPlace"
+        and mate.get("native_interface") == "IMateInPlace"
+    )
+    require(type(mate.get("suppressed")) is bool and type(mate.get("error_code")) is int)
+    require(mate.get("entities") == [] and "alignment" not in mate and "type_index" not in mate)
+    for key in ("limits", "native_limit", "is_advanced_mate", "is_advanced_mate_error", "is_advanced_mate_api"):
+        require(key in mate and mate[key] is None)
+    raw = mate.get("inplace")
+    require(isinstance(raw, dict) and set(raw) == {"component", "entities"})
+    component(raw["component"])
+    entities = raw["entities"]
+    count = mate.get("entity_count")
+    require(type(count) is int and count > 0 and isinstance(entities, list) and len(entities) == count)
+    for index, entity in enumerate(entities):
+        require(isinstance(entity, dict) and set(entity) == {"index", "component_name", "entity_type", "entity"})
+        require(type(entity["index"]) is int and entity["index"] == index)
+        reading(entity["component_name"], str)
+        entity_type = reading(entity["entity_type"], int)
+        geometry = reading(entity["entity"], dict)
+        if geometry is not None:
+            typed_fields = {2: {"plane_params": 6}, 4: {"transform_raw": 16}}.get(entity_type, {})
+            require(set(geometry) == {"interface_iid", "component"} | set(typed_fields))
+            reading(geometry["interface_iid"], str)
+            component(geometry["component"])
+            for field, count in typed_fields.items():
+                values = reading(geometry[field], list)
+                require(values is None or (
+                    len(values) == count
+                    and all(type(value) in (int, float) and math.isfinite(value) for value in values)
+                ))
+
+
 def _project_native_record(record: dict) -> dict:
     """Project calculated native semantics from one preserved local raw record.
 
@@ -890,6 +953,35 @@ def _project_native_record(record: dict) -> dict:
                     "expected": owner_configuration,
                 },
             )
+        if mate.get("type") == "inplace" or "inplace" in mate:
+            _validate_inplace_record(mate)
+            raw = mate["inplace"]
+            bindings = [raw["component"]] + [
+                entity["entity"]["value"]["component"]
+                for entity in raw["entities"] if entity["entity"]["value"] is not None
+            ]
+            for observation in bindings:
+                component = observation["value"]
+                if component is None or component["name2"]["value"] is None:
+                    continue
+                name = component["name2"]["value"]
+                scoped = name if not scope or name.startswith(scope + "/") else scope + "/" + name
+                target = by_component.get(scoped)
+                observed_path = component["path"]["value"]
+                native_path = ((target or {}).get("source_provenance") or {}).get("native_document_path")
+                path_conflict = (
+                    observed_path is not None and native_path is not None
+                    and ntpath.normcase(ntpath.normpath(observed_path)) != ntpath.normcase(ntpath.normpath(native_path))
+                )
+                if target is None or (
+                    component["configuration"]["value"] is not None
+                    and component["configuration"]["value"] != target.get("configuration")
+                ) or path_conflict:
+                    raise CadError(
+                        "cad_inplace_binding_conflict", "in-place component does not bind its owning scope",
+                        {"mate": mate.get("name"), "scope": scope, "component": component},
+                    )
+            continue
         entities = mate.get("entities")
         if not isinstance(entities, list):
             raise CadError(
@@ -3038,19 +3130,21 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
             drive_source = "controlled"
         if drive is not None:
             spec = drive["value"]
-            effort = _controlled_number(spec.get("effort")) if isinstance(spec, dict) else None
-            velocity_value = _controlled_number(spec.get("velocity")) if isinstance(spec, dict) else None
-            if effort is None or velocity_value is None:
+            drive_values = {
+                key: _controlled_number(spec[key]) for key in ("effort", "velocity")
+                if isinstance(spec, dict) and spec.get(key) is not None
+            }
+            if not isinstance(spec, dict) or any(value is None for value in drive_values.values()):
                 findings.append(
                     _finding(
                         "discovery.joint_drive_invalid",
                         obj,
-                        "drive record lacks finite effort/velocity",
+                        "present drive record values must be finite numbers",
                         {"file": drive["file"]},
                     )
                 )
                 continue
-            if effort < 0.0 or velocity_value < 0.0:
+            if any(value < 0.0 for value in drive_values.values()):
                 findings.append(
                     _finding(
                         "discovery.joint_drive_invalid",
@@ -3060,10 +3154,7 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                     )
                 )
                 continue
-            if isinstance(limits, dict):
-                limits.update(effort=effort, velocity=velocity_value)
-            elif joint_type == "continuous":
-                limits = {"effort": effort, "velocity": velocity_value}
+            limits = {**(limits or {}), **drive_values}
         if joint_type != "continuous" and limits is not None and limits["lower"] == limits["upper"]:
             findings.append(
                 _finding(
@@ -3313,6 +3404,35 @@ def _exporter_memberships(record: dict, declaration: dict, findings: list[dict])
                         blocking=False,
                     )
                 )
+    for mate in record.get("mates") or []:
+        if not isinstance(mate, dict) or mate.get("type") != "inplace" or mate.get("suppressed") is True:
+            continue
+        scope = mate.get("scope")
+        scoped_material = sorted(
+            name for name in material if scope == "" or name == scope or name.startswith(str(scope) + "/")
+        )
+        owners = {assigned[name] for name in scoped_material}
+        safe_internal_scope = (
+            type(mate.get("error_code")) is int and mate["error_code"] == 0
+            and isinstance(scope, str) and (scope == "" or scope in active)
+            and bool(scoped_material) and len(owners) == 1 and None not in owners
+        )
+        findings.append(
+            _finding(
+                "discovery.inplace_constraint_unmeasured",
+                f"mate:{mate.get('name')}",
+                "in-place observations are retained without constraint rows; only a completely assigned "
+                "single-link owner scope permits saved-state export",
+                {
+                    "native_feature_type": mate.get("native_feature_type"), "scope": scope,
+                    "configuration": mate.get("configuration"), "error_code": mate.get("error_code"),
+                    "components": scoped_material, "declared_links": sorted(owner for owner in owners if owner),
+                    "native_observations": mate.get("inplace"),
+                    "constraint_rows_used": False,
+                },
+                blocking=not safe_internal_scope,
+            )
+        )
     uncovered = sorted(name for name in material if assigned[name] is None)
     if uncovered:
         findings.append(
@@ -3664,6 +3784,10 @@ def _exporter_native_pairs(record: dict, findings: list[dict]) -> dict[tuple[str
     pairs: dict[tuple[str, str], dict] = {}
     for index, mate in enumerate(record.get("mates") or []):
         if not isinstance(mate, dict) or mate.get("suppressed"):
+            continue
+        if mate.get("type") == "inplace":
+            # The declaration membership pass checks the complete owning scope.
+            # These native endpoints never prove rank or unselected membership.
             continue
         name = str(mate.get("name") or index)
         obj = f"mate:{name}"
@@ -4443,8 +4567,9 @@ def _exporter_joint_facts(
                         blocking=False,
                     )
                 )
-            if not isinstance(limits, dict) or not all(
-                valid(limits.get(key)) and limits[key] >= 0 for key in ("effort", "velocity")
+            if not isinstance(limits, dict) or any(
+                limits.get(key) is not None and (not valid(limits[key]) or limits[key] < 0)
+                for key in ("effort", "velocity")
             ):
                 findings.append(
                     _finding(
@@ -4454,7 +4579,7 @@ def _exporter_joint_facts(
                         limits,
                     )
                 )
-            elif any(limits[key] == 0 for key in ("effort", "velocity")):
+            elif any(limits.get(key) == 0 for key in ("effort", "velocity")):
                 findings.append(
                     _finding(
                         "discovery.joint_drive_unspecified",
@@ -5672,7 +5797,9 @@ def _evidence_summary(resolved: dict, embedded: dict) -> dict[str, Any]:
         "anchor": embedded.get("anchor"),
         "key": str(embedded.get("key") or ""),
         "reference": str(embedded.get("reference") or ""),
-        "declared_values": {key: value[key] for key in ("lower", "upper", "effort", "velocity") if key in value},
+        "declared_values": {
+            key: value[key] for key in ("lower", "upper", "effort", "velocity") if value.get(key) is not None
+        },
     }
 
 
@@ -5829,8 +5956,8 @@ def _capture_plan_selector(
     Fully sealed embedded-virtual occurrences keep their absolute session path
     in the raw diagnostic record only.  Their occurrence name and suppression
     state are the portable selector.  A cached 3D Interconnect materialization
-    is retained in Discovery evidence for diagnosis but is not a capture input.
-    A delivered document must remain a portable staged path, so any other
+    is a documentless selector bound to its stable session identity.  A
+    delivered document must remain a portable staged path, so any other
     non-portable value is refused instead of being silently removed.
     """
 
@@ -5841,16 +5968,25 @@ def _capture_plan_selector(
     if isinstance(provenance, dict) and (
         provenance.get("state") == "cached_materialization" or provenance.get("kind") == "native_import_materialization"
     ):
-        error = PipelineError(f"Cached 3D Interconnect import is not an accepted capture input: {name}")
-        error.details = {
-            "object": name,
-            "reason": "cached_materialization",
-            "state": provenance.get("state"),
-            "kind": provenance.get("kind"),
-            "used_api": provenance.get("used_api"),
-            "is_virtual": provenance.get("is_virtual"),
+        try:
+            identity = session_source_identity(
+                component,
+                native_files=native_files,
+            )
+        except ValueError as error:
+            raise PipelineError(
+                f"Cached 3D Interconnect import has no stable capture identity: {name}"
+            ) from error
+        state = component.get("suppression_state")
+        if type(state) is not int or state not in {0, 1, 2, 3, 4}:
+            raise PipelineError(
+                "A cached materialization selector carries no truthful suppression state"
+            )
+        return {
+            "name": name,
+            "state": state,
+            "session_source_sha256": session_source_identity_sha256(identity),
         }
-        raise error
     selector = {"name": name}
     document = component.get("document")
     session_document = sealed_embedded_virtual_document(component, name, native_files)
@@ -6631,12 +6767,13 @@ def source_definition(
                     if joint["type"] == "continuous"
                     else ("lower", "upper", "effort", "velocity")
                 )
+                if joint["limits"].get(key) is not None
             }
             raw_limits = joint.get("declared_limits")
             declared_values = {}
             if isinstance(raw_limits, dict):
                 for field in ("lower", "upper", "effort", "velocity"):
-                    if field not in raw_limits:
+                    if raw_limits.get(field) is None:
                         continue
                     value = _controlled_number(raw_limits[field])
                     if value is None:
@@ -6656,17 +6793,19 @@ def source_definition(
                     "declared_values": {field: declared_values[field] for field in ("lower", "upper")},
                     "native_observation_errors": [],
                 }
-            if all(field in declared_values for field in ("effort", "velocity")):
+            if any(field in declared_values for field in ("effort", "velocity")):
                 entry["drive_evidence"] = {
                     **common_evidence,
-                    "declared_values": {field: declared_values[field] for field in ("effort", "velocity")},
+                    "declared_values": {
+                        field: declared_values[field] for field in ("effort", "velocity") if field in declared_values
+                    },
                 }
                 entry["drive_source"] = "controlled"
         elif joint["type"] == "continuous":
             if joint.get("drive") is not None:
                 entry["limits"] = {
-                    "effort": float(joint["drive"]["value"]["effort"]),
-                    "velocity": float(joint["drive"]["value"]["velocity"]),
+                    key: float(joint["drive"]["value"][key]) for key in ("effort", "velocity")
+                    if joint["drive"]["value"].get(key) is not None
                 }
         else:
             entry["limits"] = {
@@ -6674,8 +6813,10 @@ def source_definition(
                 "upper": float(joint["limits"]["upper"]),
             }
             if joint.get("drive") is not None:
-                entry["limits"]["effort"] = float(joint["drive"]["value"]["effort"])
-                entry["limits"]["velocity"] = float(joint["drive"]["value"]["velocity"])
+                entry["limits"].update({
+                    key: float(joint["drive"]["value"][key]) for key in ("effort", "velocity")
+                    if joint["drive"]["value"].get(key) is not None
+                })
         limit_evidence = joint.get("limit_evidence")
         if isinstance(limit_evidence, dict):
             embedded = next(

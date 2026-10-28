@@ -186,7 +186,7 @@ executor。各 role 只与自己的冻结 requirement 比较，禁止假设跨 r
 
 用户明确授权工程用途在旋转关节读不到可用原生或非零作者位置范围时，使用独立版本化规则 `engineering_rotation_default_window/v1`，数值为弧度制 `[-π, π]`，来源标为 `default_policy`。原生读数以及非零作者声明优先；多值冲突或原生／作者非零冲突仍 fail-closed。默认规则必须保留原始作者值和原生缺失或读取错误证据，仅适用于旋转关节，不能应用于移动关节、fixed 或 continuous 关节。`engineering_position_range_qualified=false`、`hardware_qualified=false`，`engineering_position_range` 资格保持 `unqualified`。URDF、模型来源、质量报告、预览和 PR 必须显示同一来源 warning，明确默认窗口不是 CAD 原生机械限位。
 
-驱动规格缺失时，规范化事实保持缺失，URDF 省略 `effort` 和 `velocity`，不能填零占位或编造能力。明确读取的作者零值仍按原值序列化并保留既有资格警告；零值不等于缺失。检查预览的省略编码须通过同版锁定消费者的实际加载检查；加载通过只建立该消费者的模型一致性，不扩大到其他消费者或工程用途。
+用户 2026-10-29 授权缺失驱动参数采用版本化规则 `drive.missing_zero/v1`：对运动关节中分别缺失的 `effort`、`velocity`，仅在 Linux 生成规范化模型时写入 `0`，URDF 由该模型编码。原始 CAD/作者读数保持原样；已有有效值优先，包括明确读取的零值。无效、读取失败和冲突仍按原有门处理，不能伪装成缺失。固定关节不增加限位或驱动字段。模型在既有 provenance 中记录 `drive_defaults` 的规则、字段和 `drive_qualified=false`，不建立第二份驱动状态。逐关节、逐字段生成 `drive.default_zero` warning，保留原始缺项、输出零值及“平台默认占位、驱动能力未建立”的含义；不得标为 `native` 或受控作者驱动值。原生作者零值继续按原值序列化并保留原有警告，与默认占位分开。独立 Verify 从原始缺项复算适用字段、零值与来源，核验实际 URDF 和 warning；报告、URDF、预览及 PR 引用同一证书中的结论。两种用途均不因零占位建立驱动规格或硬件能力，仍须通过同版锁定消费者的实际加载与适用运动检查。
 
 独立验证从冻结请求、本次 CAD 原始实例、连接、轴线、原生声明和限位观察，以及实际采用的版本化规则重建预期。核验规则适用条件、原值到结果的完整变换和物理一致性，不能只比较两份生成声明。逐实例、单关节和适用组合的非零运动、来源、配置、几何、物理闭合、消费者加载和报告绑定均须执行。分析采样不建立机械可达性或实机安全资格，手工结果不得提供验证预期。
 
@@ -709,6 +709,10 @@ Windows native worker owner 分别记录和验证，任一相同或不同都不�
 启动、上传、恢复或 native execution 权限。
 
 状态、健康及漂移查询不得安装、下载或修复持久工具链文件。已绑定的工具缺失或不可执行时如实报告，不通过自动安装掩盖漂移。
+
+选择闭包的 `imports` 对 `cached_materialization` 绑定单一 `session_source_sha256`：以本项目唯一 canonical UTF-8 编码计算冻结 owner 及 SHA、完整 occurrence、defining anchor、configuration、原生 API 和精确 `is_virtual=false` 的摘要。Capture plan 不包含旧缓存文档路径，只传实例和摘要；新受控会话须由相同冻结 owner 重现全部对应对象。每个会话分别记录和核验当次临时路径、`swxPID` 根与真实 owned PID，不能要求两次会话的临时路径或 PID 相同。几何从当次原生实体采集，临时缓存文件不归档为上传来源。作者导入路径、存在状态和读取错误保真：包内精确来源核验冻结字节；现存包外文件、包内哈希冲突及错绑定拒绝；无法取得原始导入来源且必要保存状态仍可读取时 warning 后继续。`source.native_cached_materialization` 贯通来源 scope、模型、URDF、独立 Verify、报告、预览和 PR，明确原始来源完整性未建立；不得按 basename 绑定，不建立第二来源或配置状态。
+
+作者来源读取状态逐会话独立核验：明确空路径、非空读取错误及确认不存在的历史路径分别保留，不能互相转换，也不要求跨会话的错误文字一致。非空路径的存在性未知、路径与读取错误同时出现、空路径却附带存在性或相对路径，以及字段缺失或状态矛盾均拒绝。读取错误只降低原始来源完整性资格，不改变已证明的冻结 owner、实例、配置和当次原生几何绑定。
 
 选择闭包的 `virtual_components` 单独记录内嵌虚拟组件：`state=embedded_virtual_component`、`binding=owner_embedded_geometry`、`kind=native_embedded_virtual_component`。每项保留 `IComponent2.GetPathName/GetImportedPath/IsVirtual` 的直接读取依据，要求 `is_virtual=true`，并绑定可达上传图中的 `owner` 及其 SHA-256、精确 `instance`、可空的 `owner_anchor`、引用 `configuration`、`session_document_path`、`session_temp_root` 和正整数 `native_api_pid`。原生端从实际 SolidWorks API 读取进程 ID，并核对它与会话根 `swxNNNN` 的进程编号一致；文档须位于该受控会话的 `VC~~` 内，路径形状本身不是归属证明。不得携带非空作者导入路径或读取错误，不得与 `imports` 中的 `IC~~` 缓存共享实例身份。后续会话可以产生不同临时路径，但须重新读取原生对象，并以相同所属装配字节、实例与配置对应封存记录；原生采集和独立验证双向核对当前对象与封存清单，拒绝遗漏、额外对象和冲突绑定。临时文档不进入上传文件图，Linux 只验证封存证据，不访问 Windows 临时目录。
 

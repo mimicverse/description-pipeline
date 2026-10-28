@@ -9,6 +9,7 @@ from pathlib import Path
 
 from description_pipeline.geometry.native_scope import (
     NATIVE_SOURCE_SCOPE_RULE,
+    native_source_scope_is_valid,
     native_scope_identity_sha256,
 )
 from description_pipeline.geometry.native_tessellation import (
@@ -20,6 +21,10 @@ from description_pipeline.io import (
     digest,
     read_data,
     write_json,
+)
+from description_pipeline.sources.solidworks.evidence import (
+    CACHED_MATERIALIZATION_WARNING_CODE,
+    cached_materialization_warnings,
 )
 from description_pipeline.schemas import (
     NATIVE_CAPTURE_OBSERVATION_SCHEMA,
@@ -318,6 +323,109 @@ class SourceScopeTests(unittest.TestCase):
         write_json(discovery_path, discovery)
         return source_path
 
+    def _use_cached_source(self) -> str:
+        discovery_document_path = (
+            r"C:\Users\operator\AppData\Local\Temp"
+            r"\swx777\IC~~\part.step.SLDPRT"
+        )
+        discovery_root = r"C:\Users\operator\AppData\Local\Temp\swx777"
+        source_path = (
+            r"C:\Users\operator\AppData\Local\Temp"
+            r"\swx778\IC~~\part.step.SLDPRT"
+        )
+        source_root = r"C:\Users\operator\AppData\Local\Temp\swx778"
+        owner = "Part.SLDASM"
+        identity = {
+            "kind": "native_import_materialization",
+            "state": "cached_materialization",
+            "owner": owner,
+            "owner_sha256": self.source_sha256,
+            "occurrence": "part-1",
+            "defining_anchor": None,
+            "configuration": "Default",
+            "is_virtual": False,
+            "used_api": (
+                "IComponent2.GetPathName/"
+                "IComponent2.GetImportedPath/"
+                "IComponent2.IsVirtual"
+            ),
+        }
+        session = {
+            **identity,
+            "session_document_path": source_path,
+            "session_temp_root": source_root,
+            "native_api_pid": 778,
+            "author_imported_path": None,
+            "author_imported_error": None,
+            "author_imported_relative": None,
+            "author_imported_exists": None,
+        }
+        scope = {
+            "rule_version": NATIVE_SOURCE_SCOPE_RULE,
+            "component": "part-1",
+            "source_document_path": source_path,
+            "source_copy_path": None,
+            "source_document_sha256": None,
+            "source_copy_sha256": None,
+            "source_document_identity_sha256": digest(identity),
+            "source_document_identity_kind": "session_source_sha256",
+            "referenced_configuration": "Default",
+            "occurrence_scope": "part-1",
+            "virtual_owner": None,
+            "virtual_owner_sha256": None,
+            "virtual_session_document_path": None,
+            "virtual_session_temp_root": None,
+            "virtual_native_api_pid": None,
+            "session_source": session,
+        }
+        facts_path = self.root / "evidence/raw/native_capture_facts.json"
+        observation = read_data(facts_path)
+        observation["source_scopes"]["part-1"] = scope
+        observation["geometry_raw"]["part-1"][
+            "source_scope_sha256"
+        ] = native_scope_identity_sha256(scope)
+        for row in (
+            observation["scene_raw"]["occurrences"][0],
+            observation["scene_raw"]["components"][0],
+        ):
+            row["path"] = source_path
+        write_json(facts_path, observation)
+        write_json(
+            self.root / "evidence/native-runtime.json",
+            {
+                "solidworks": {
+                    "sessions": {
+                        "copy": {
+                            "pid": 778,
+                            "state": "active",
+                        }
+                    }
+                }
+            },
+        )
+
+        discovery_file = self.root / "input/discovery/native-discovery.json"
+        discovery = read_data(discovery_file)
+        discovery["raw"]["components"][0].update(
+            document=discovery_document_path.replace("\\", "/"),
+            configuration="Default",
+            source_provenance={
+                **identity,
+                "session_document_path": discovery_document_path,
+                "session_temp_root": discovery_root,
+                "native_api_pid": 777,
+                "author_imported_path": None,
+                "author_imported_error": None,
+                "author_imported_relative": None,
+                "author_imported_exists": None,
+            },
+        )
+        discovery["raw"]["files"] = {owner: self.source_sha256}
+        discovery["native_files"] = {owner: self.source_sha256}
+        discovery["handoff_sha256"] = digest({owner: self.source_sha256})
+        write_json(discovery_file, discovery)
+        return source_path
+
     def test_file_scope_returns_the_exact_sealed_mapping(self) -> None:
         self.assertEqual(source_scopes(self.root), {"part-1": self.scope})
 
@@ -375,6 +483,179 @@ class SourceScopeTests(unittest.TestCase):
             "Virtual source owner/path/root differs",
         ):
             source_scopes(self.root)
+
+    def test_cached_session_scope_carries_the_current_owned_occurrence(self) -> None:
+        session_path = (
+            r"C:\Users\operator\AppData\Local\Temp"
+            r"\swx777\IC~~\part.step.SLDPRT"
+        )
+        session_root = r"C:\Users\operator\AppData\Local\Temp\swx777"
+        identity = {
+            "kind": "native_import_materialization",
+            "state": "cached_materialization",
+            "owner": "Part.SLDASM",
+            "owner_sha256": self.source_sha256,
+            "occurrence": "part-1",
+            "defining_anchor": None,
+            "configuration": "Default",
+            "is_virtual": False,
+            "used_api": (
+                "IComponent2.GetPathName/"
+                "IComponent2.GetImportedPath/"
+                "IComponent2.IsVirtual"
+            ),
+        }
+        scope = {
+            "rule_version": NATIVE_SOURCE_SCOPE_RULE,
+            "component": "part-1",
+            "source_document_path": session_path,
+            "source_copy_path": None,
+            "source_document_sha256": None,
+            "source_copy_sha256": None,
+            "source_document_identity_sha256": digest(identity),
+            "source_document_identity_kind": "session_source_sha256",
+            "referenced_configuration": "Default",
+            "occurrence_scope": "part-1",
+            "virtual_owner": None,
+            "virtual_owner_sha256": None,
+            "virtual_session_document_path": None,
+            "virtual_session_temp_root": None,
+            "virtual_native_api_pid": None,
+            "session_source": {
+                **identity,
+                "session_document_path": session_path,
+                "session_temp_root": session_root,
+                "native_api_pid": 777,
+                "author_imported_path": None,
+                "author_imported_error": None,
+                "author_imported_relative": None,
+                "author_imported_exists": None,
+            },
+        }
+        self.assertTrue(native_source_scope_is_valid(scope, "part-1"))
+        scope["session_source"]["session_temp_root"] = (
+            r"C:\Users\operator\AppData\Local\Temp\swx778"
+        )
+        self.assertFalse(native_source_scope_is_valid(scope, "part-1"))
+
+    def test_cached_scope_flows_through_capture_evidence(self) -> None:
+        source_path = self._use_cached_source()
+        scope = source_scopes(self.root)["part-1"]
+        self.assertEqual(scope["source_document_identity_kind"], "session_source_sha256")
+        self.assertEqual(scope["source_document_path"], source_path)
+        self.assertIsNone(scope["source_copy_path"])
+        self.assertIsNone(scope["source_document_sha256"])
+        self.assertEqual(scope["session_source"]["native_api_pid"], 778)
+
+    def test_cached_source_cannot_downgrade_to_file_identity_to_remove_its_warning(self) -> None:
+        self._use_cached_source()
+        facts_path = self.root / "evidence/raw/native_capture_facts.json"
+        observation = read_data(facts_path)
+        observation["source_scopes"]["part-1"] = dict(self.scope)
+        observation["geometry_raw"]["part-1"]["source_scope_sha256"] = native_scope_identity_sha256(self.scope)
+        write_json(facts_path, observation)
+        with self.assertRaisesRegex(PipelineError, "Source identity kind differs"):
+            source_scopes(self.root)
+
+    def test_cached_scope_projects_a_stable_source_warning(self) -> None:
+        self._use_cached_source()
+        warnings = cached_materialization_warnings(source_scopes(self.root))
+        self.assertEqual(len(warnings), 1)
+        self.assertEqual(warnings[0]["code"], CACHED_MATERIALIZATION_WARNING_CODE)
+        self.assertEqual(warnings[0]["objects"][0]["object"], "part-1")
+        self.assertEqual(
+            warnings[0]["objects"][0]["session_source_sha256"],
+            source_scopes(self.root)["part-1"]["source_document_identity_sha256"],
+        )
+
+    def test_cached_source_preserves_each_sessions_author_error_in_warning(self) -> None:
+        self._use_cached_source()
+        facts_path = self.root / "evidence/raw/native_capture_facts.json"
+        discovery_path = self.root / "input/discovery/native-discovery.json"
+        facts, discovery = read_data(facts_path), read_data(discovery_path)
+        capture_error = "RuntimeError: capture author read failed"
+        scope = facts["source_scopes"]["part-1"]
+        scope["session_source"]["author_imported_error"] = capture_error
+        facts["geometry_raw"]["part-1"]["source_scope_sha256"] = native_scope_identity_sha256(scope)
+        discovery["raw"]["components"][0]["source_provenance"]["author_imported_error"] = (
+            "RuntimeError: discovery author read failed"
+        )
+        write_json(facts_path, facts)
+        write_json(discovery_path, discovery)
+        warnings = cached_materialization_warnings(source_scopes(self.root))
+        self.assertEqual(warnings[0]["objects"][0]["author_imported_error"], capture_error)
+        scope["session_source"]["author_imported_exists"] = False
+        facts["geometry_raw"]["part-1"]["source_scope_sha256"] = native_scope_identity_sha256(scope)
+        write_json(facts_path, facts)
+        with self.assertRaisesRegex(PipelineError, "Source scope"):
+            source_scopes(self.root)
+
+    def test_cached_scope_rejects_a_capture_runtime_pid_mismatch(self) -> None:
+        self._use_cached_source()
+        runtime_path = self.root / "evidence/native-runtime.json"
+        runtime = read_data(runtime_path)
+        runtime["solidworks"]["sessions"]["copy"]["pid"] = 779
+        write_json(runtime_path, runtime)
+        with self.assertRaisesRegex(PipelineError, "Cached source"):
+            source_scopes(self.root)
+
+    def test_cached_scope_distinguishes_missing_and_existing_external_author(self) -> None:
+        self._use_cached_source()
+        facts_path = self.root / "evidence/raw/native_capture_facts.json"
+        discovery_path = self.root / "input/discovery/native-discovery.json"
+        facts = read_data(facts_path)
+        discovery = read_data(discovery_path)
+        external = r"D:\missing\imported_part.step"
+        facts["source_scopes"]["part-1"]["session_source"].update(
+            author_imported_path=external,
+            author_imported_error=None,
+            author_imported_relative=None,
+            author_imported_exists=False,
+        )
+        facts["geometry_raw"]["part-1"]["source_scope_sha256"] = (
+            native_scope_identity_sha256(facts["source_scopes"]["part-1"])
+        )
+        discovery["raw"]["components"][0]["source_provenance"].update(
+            author_imported_path=external,
+            author_imported_error=None,
+            author_imported_relative=None,
+            author_imported_exists=False,
+        )
+        write_json(facts_path, facts)
+        write_json(discovery_path, discovery)
+        self.assertEqual(source_scopes(self.root)["part-1"]["component"], "part-1")
+
+        facts["source_scopes"]["part-1"]["session_source"][
+            "author_imported_exists"
+        ] = True
+        facts["geometry_raw"]["part-1"]["source_scope_sha256"] = (
+            native_scope_identity_sha256(facts["source_scopes"]["part-1"])
+        )
+        discovery["raw"]["components"][0]["source_provenance"][
+            "author_imported_exists"
+        ] = True
+        write_json(facts_path, facts)
+        write_json(discovery_path, discovery)
+        with self.assertRaisesRegex(PipelineError, "existing external author"):
+            source_scopes(self.root)
+
+
+    def test_cached_identity_uses_canonical_utf8_for_unicode_native_names(self) -> None:
+        from description_pipeline.sources.solidworks.session_artifacts import session_source_identity_sha256
+        from description_pipeline.sources.solidworks.session_artifacts import SESSION_SOURCE_IDENTITY_FIELDS
+
+        self._use_cached_source()
+        observation = read_data(self.root / "evidence/raw/native_capture_facts.json")
+        scope = observation["source_scopes"]["part-1"]
+        scope["component"] = scope["occurrence_scope"] = "module-1/\u90e8\u4ef6-1"
+        scope["session_source"].update(
+            owner="\u88c5\u914d.SLDASM", occurrence=scope["component"], configuration="\u9ed8\u8ba4"
+        )
+        scope["referenced_configuration"] = "\u9ed8\u8ba4"
+        identity = {key: scope["session_source"][key] for key in SESSION_SOURCE_IDENTITY_FIELDS}
+        scope["source_document_identity_sha256"] = session_source_identity_sha256(identity)
+        self.assertEqual(scope["source_document_identity_sha256"], digest(identity))
+        self.assertTrue(native_source_scope_is_valid(scope, scope["component"]))
 
 
 if __name__ == "__main__":

@@ -824,6 +824,7 @@ def _capture_prepared_local(
     native_files: Mapping[str, str],
     backend: Any,
     worker_version: str,
+    expected_session_sources: Mapping[str, str] | None = None,
     on_activity=None,
 ) -> dict[str, Any]:
     """Capture one already sealed prepared assembly in a single owned session."""
@@ -944,6 +945,8 @@ def _capture_prepared_local(
             document,
             cfg["coordinate_systems"],
             groups=cfg["groups"],
+            expected_session_sources=expected_session_sources or {},
+            native_files=native_files,
             on_activity=activity.publish,
             require_material=True,
         )
@@ -1088,6 +1091,7 @@ def capture_prepared(
     native_files: Mapping[str, str],
     backend: Any,
     worker_version: str,
+    expected_session_sources: Mapping[str, str] | None = None,
     on_activity=None,
 ) -> dict[str, Any]:
     """Capture one sealed prepared package through the single production path."""
@@ -1101,5 +1105,6 @@ def capture_prepared(
             native_files=native_files,
             backend=backend,
             worker_version=worker_version,
+            expected_session_sources=expected_session_sources,
             on_activity=on_activity,
         )

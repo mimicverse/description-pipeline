@@ -211,8 +211,10 @@ def capture_native_package(
     """Inspect, archive and capture one complete prepared package."""
 
     _state(on_event, "capture", "running")
+    expected_session_sources: dict[str, str] = {}
 
     def inspect_and_archive():
+        nonlocal expected_session_sources
         if package_inventory(package) != expected_inputs:
             raise PipelineError(
                 "Prepared inputs changed after discovery"
@@ -283,6 +285,11 @@ def capture_native_package(
             selected,
             reader_sha256=source_selection.get("reader_sha256"),
         )
+        expected_session_sources = {
+            str(item["name"]): str(item["session_source_sha256"])
+            for item in plan.get("objects") or []
+            if isinstance(item, dict) and "session_source_sha256" in item
+        }
         prepared_files = package_inventory(package)
         _archive_input(package, staging)
         report["package_files"] = {
@@ -343,6 +350,7 @@ def capture_native_package(
         native_files=definition["native_files"],
         backend=backend,
         worker_version=__version__,
+        expected_session_sources=expected_session_sources,
         on_activity=on_activity,
     )
     checked(

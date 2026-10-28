@@ -123,6 +123,8 @@ class CadBackend:
         groups: Sequence[dict],
         on_activity=None,
         require_material: bool = True,
+        expected_session_sources: Mapping[str, str] | None = None,
+        native_files: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
         """Read raw scene, mass, pose, configuration and source facts in COM."""
 

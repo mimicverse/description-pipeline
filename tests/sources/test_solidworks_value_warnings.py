@@ -12,7 +12,11 @@ from xml.etree import ElementTree as ET
 
 import numpy as np
 
-from description_pipeline.io import PipelineError, write_json
+from description_pipeline.io import PipelineError, digest, write_json
+from description_pipeline.sources.solidworks.evidence import (
+    CACHED_MATERIALIZATION_WARNING_CODE,
+    cached_materialization_warnings,
+)
 from description_pipeline.sources.solidworks.naming import (
     mesh_path,
     visual_name,
@@ -280,6 +284,76 @@ class ValueWarningTests(unittest.TestCase):
     def test_valid_cad_derived_warning_inventory_passes(self):
         result = _value_warning_gate(self.root, self.source, self.model)
         self.assertEqual(result["objects"], 7)
+
+    def test_cached_materialization_warning_is_recomputed_from_source_scope(self):
+        session_path = (
+            r"C:\Users\operator\AppData\Local\Temp"
+            r"\swx777\IC~~\part.step.SLDPRT"
+        )
+        session_root = r"C:\Users\operator\AppData\Local\Temp\swx777"
+        identity = {
+            "kind": "native_import_materialization",
+            "state": "cached_materialization",
+            "owner": "robot.SLDASM",
+            "owner_sha256": "a" * 64,
+            "occurrence": "part-1",
+            "defining_anchor": None,
+            "configuration": "Default",
+            "is_virtual": False,
+            "used_api": (
+                "IComponent2.GetPathName/"
+                "IComponent2.GetImportedPath/"
+                "IComponent2.IsVirtual"
+            ),
+        }
+        scope = {
+            "rule_version": "native-open-edge-scope-binding-v1",
+            "component": "part-1",
+            "source_document_path": session_path,
+            "source_copy_path": None,
+            "source_document_sha256": None,
+            "source_copy_sha256": None,
+            "source_document_identity_sha256": digest(identity),
+            "source_document_identity_kind": "session_source_sha256",
+            "referenced_configuration": "Default",
+            "occurrence_scope": "part-1",
+            "virtual_owner": None,
+            "virtual_owner_sha256": None,
+            "virtual_session_document_path": None,
+            "virtual_session_temp_root": None,
+            "virtual_native_api_pid": None,
+            "session_source": {
+                **identity,
+                "session_document_path": session_path,
+                "session_temp_root": session_root,
+                "native_api_pid": 777,
+                "author_imported_path": None,
+                "author_imported_error": "RuntimeError: author read failed",
+                "author_imported_relative": None,
+                "author_imported_exists": None,
+            },
+        }
+        warning = cached_materialization_warnings({"part-1": scope})[0]
+        model = copy.deepcopy(self.model)
+        model["provenance"]["value_warnings"].append(warning)
+        result = _value_warning_gate(
+            self.root,
+            self.source,
+            model,
+            source_scopes={"part-1": scope},
+        )
+        self.assertEqual(result["objects"], 8)
+        model["provenance"]["value_warnings"][-1]["objects"][0]["author_imported_error"] = None
+        with self.assertRaisesRegex(PipelineError, CACHED_MATERIALIZATION_WARNING_CODE):
+            _value_warning_gate(self.root, self.source, model, source_scopes={"part-1": scope})
+        model["provenance"]["value_warnings"].pop()
+        with self.assertRaisesRegex(PipelineError, CACHED_MATERIALIZATION_WARNING_CODE):
+            _value_warning_gate(
+                self.root,
+                self.source,
+                model,
+                source_scopes={"part-1": scope},
+            )
 
     def test_metadata_warning_is_compared_as_an_exact_existing_value_warning(self):
         metadata_group = metadata_value_warning()
@@ -615,7 +689,7 @@ class ValueWarningTests(unittest.TestCase):
                 "parent": "base_link",
                 "child": "base_link",
                 "axis": [0.0, 0.0, -1.0],
-                "limits": {"lower": -0.3, "upper": 0.7, "unit": "rad"},
+                "limits": {"lower": -0.3, "upper": 0.7, "unit": "rad", "effort": 1.0, "velocity": 2.0},
                 "drive": {"effort": 1.0, "velocity": 2.0},
                 "axis_provenance": provenance,
             }
@@ -686,8 +760,8 @@ class ValueWarningTests(unittest.TestCase):
                         "model_frame": "child",
                         "q_sign": 1,
                         "range_transform": "not_applied",
-                        "limits_before": {"lower": -0.3, "upper": 0.7, "unit": "rad"},
-                        "limits_after": {"lower": -0.3, "upper": 0.7, "unit": "rad"},
+                        "limits_before": {"lower": -0.3, "upper": 0.7, "unit": "rad", "effort": 1.0, "velocity": 2.0},
+                        "limits_after": {"lower": -0.3, "upper": 0.7, "unit": "rad", "effort": 1.0, "velocity": 2.0},
                         "drive_before": {"effort": 1.0, "velocity": 2.0},
                         "drive_after": {"effort": 1.0, "velocity": 2.0},
                         "limits_status": "present",
@@ -876,7 +950,8 @@ class ValueWarningTests(unittest.TestCase):
     def test_unclassified_joint_has_a_direct_warning_fixture(self):
         source = copy.deepcopy(self.source)
         model = copy.deepcopy(self.model)
-        source["joints"] = [{"name": "waist_joint", "source_name": "waist_joint", "type": "revolute"}]
+        source["joints"] = [{"name": "waist_joint", "source_name": "waist_joint", "type": "revolute",
+                             "limits": {"effort": 1.0, "velocity": 2.0}}]
         model["joints"] = [{"name": "waist_joint"}]
         warnings = model["provenance"]["value_warnings"]
         next(item for item in warnings if item["code"] == "geometry.derived_from_native")["objects"].append(
@@ -972,6 +1047,7 @@ class ValueWarningTests(unittest.TestCase):
                 "name": "left_shoulder_pitch_joint",
                 "source_name": "left_shoulder_pitch_joint",
                 "type": "revolute",
+                "limits": {"effort": 1.0, "velocity": 2.0},
                 "axis_provenance": {
                     "status": "local_class_aligned",
                     "motion": "pitch",

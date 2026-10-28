@@ -7,6 +7,7 @@ and which capture options.  They are written as evidence, not inferred later.
 
 from __future__ import annotations
 
+import copy
 import ntpath
 import platform
 import sys
@@ -21,6 +22,77 @@ METADATA_WARNING_MESSAGE = (
     "each field is bound to recorded evidence."
 )
 RUNTIME_EVIDENCE = "evidence/native-runtime.json"
+INPLACE_WARNING_CODE = "source.inplace_observations"
+INPLACE_WARNING_MESSAGE = (
+    "In-place mate observations are incomplete constraint evidence; native values, nulls and read errors "
+    "are retained without supplying joint constraints or mechanical qualification."
+)
+
+
+def inplace_observation_warnings(raw: dict) -> list[dict]:
+    """Format raw observations only; source admission and Verify prove scope separately."""
+
+    objects = [
+        {
+            "object_type": "mate", "object": mate["name"], "scope": mate["scope"],
+            "field": "inplace", "actual": copy.deepcopy(mate["inplace"]),
+            "configuration": mate["configuration"], "native_error_code": mate["error_code"],
+            "source": "IMateInPlace native observations", "constraint_rows_used": False,
+            "mechanical_qualification_complete": False,
+        }
+        for mate in raw.get("mates") or []
+        if mate.get("type") == "inplace" and mate.get("suppressed") is False
+    ]
+    return [{"code": INPLACE_WARNING_CODE, "message": INPLACE_WARNING_MESSAGE, "objects": objects}] if objects else []
+
+CACHED_MATERIALIZATION_WARNING_CODE = "source.native_cached_materialization"
+CACHED_MATERIALIZATION_WARNING_MESSAGE = (
+    "Geometry comes from a verified native cached materialization; "
+    "the author import path is metadata and source completeness is not qualified."
+)
+
+
+def cached_materialization_warnings(source_scopes: object) -> list[dict[str, Any]]:
+    """Project verified cached-session scopes into stable non-blocking rows."""
+
+    if not isinstance(source_scopes, dict):
+        return []
+    objects = []
+    for component, scope in sorted(source_scopes.items()):
+        if not isinstance(scope, dict):
+            continue
+        if scope.get("source_document_identity_kind") != "session_source_sha256":
+            continue
+        session = scope.get("session_source")
+        if not isinstance(session, dict):
+            continue
+        objects.append(
+            {
+                "object_type": "component",
+                "object": str(component),
+                "owner": session.get("owner"),
+                "owner_sha256": session.get("owner_sha256"),
+                "occurrence": session.get("occurrence"),
+                "defining_anchor": session.get("defining_anchor"),
+                "configuration": session.get("configuration"),
+                "session_source_sha256": scope.get(
+                    "source_document_identity_sha256"
+                ),
+                "author_imported_path": session.get("author_imported_path"),
+                "author_imported_error": session.get("author_imported_error"),
+                "author_imported_relative": session.get("author_imported_relative"),
+                "author_imported_exists": session.get("author_imported_exists"),
+            }
+        )
+    if not objects:
+        return []
+    return [
+        {
+            "code": CACHED_MATERIALIZATION_WARNING_CODE,
+            "message": CACHED_MATERIALIZATION_WARNING_MESSAGE,
+            "objects": objects,
+        }
+    ]
 
 _RULE_TEXT = {
     "metadata.platform_execution": (

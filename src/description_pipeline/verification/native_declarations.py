@@ -741,7 +741,10 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                         "a continuous joint has native position-limit evidence",
                         {"joint": name, "mate": mate.get("name")},
                     )
-        invalid = [key for key in ("effort", "velocity") if not (_number(limits.get(key)) and limits[key] >= 0)]
+        invalid = [
+            key for key in ("effort", "velocity")
+            if limits.get(key) is not None and not (_number(limits[key]) and limits[key] >= 0)
+        ]
         bounds_present = [key for key in ("lower", "upper") if limits.get(key) is not None]
         invalid_bounds = [key for key in bounds_present if not _number(limits.get(key))]
         bounds_usable = joint["type"] in {"revolute", "prismatic"} and all(
@@ -1170,6 +1173,76 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
             "direction": positive,
         }
 
+    def inplace_scopes():
+        """Prove that unmeasured in-place evidence cannot affect a declared joint."""
+
+        from .native_discovery import _check_inplace_observations
+
+        components, leaves, members = state["components"], state["leaves"], state["members"]
+        observed = []
+        for mate in raw.get("mates") or []:
+            if not isinstance(mate, dict) or mate.get("type") != "inplace":
+                continue
+            _check_inplace_observations(mate)
+            if mate["suppressed"]:
+                continue
+            scope = mate.get("scope")
+            _require(
+                isinstance(scope, str) and (scope == "" or scope in components),
+                "v14.inplace_scope", "in-place owner scope is unknown", mate=mate.get("name"),
+            )
+            material = set(leaves) if scope == "" else _expanded(scope, leaves)
+            endpoints = [mate["inplace"]["component"]]
+            endpoints.extend(
+                endpoint["entity"]["value"]["component"]
+                for endpoint in mate["inplace"]["entities"] if endpoint["entity"]["value"] is not None
+            )
+            for endpoint in endpoints:
+                binding = endpoint["value"]
+                if binding is None or binding["name2"]["value"] is None:
+                    continue
+                native_name = binding["name2"]["value"]
+                name = native_name if not scope or native_name.startswith(scope + "/") else scope + "/" + native_name
+                target = components.get(name)
+                observed_path = binding["path"]["value"]
+                expected_path = ((target or {}).get("source_provenance") or {}).get("native_document_path")
+                matches_document = (
+                    observed_path is None or expected_path is None
+                    or ntpath.normcase(ntpath.normpath(observed_path))
+                    == ntpath.normcase(ntpath.normpath(expected_path))
+                )
+                _require(
+                    target is not None and matches_document and (
+                        binding["configuration"]["value"] is None
+                        or binding["configuration"]["value"] == target.get("configuration")
+                    ),
+                    "v14.inplace_binding", "an in-place component binds outside its owning scope or configuration",
+                    mate=mate.get("name"), component=binding, scope=scope,
+                )
+            owners = [name for name, assigned in members.items() if material and material <= assigned]
+            _require(
+                type(mate.get("error_code")) is int and mate["error_code"] == 0 and len(owners) == 1,
+                "v14.inplace_scope",
+                "unmeasured in-place scope is unassigned, crosses declared links, or has a native solve error",
+                mate=mate.get("name"), scope=scope, material=sorted(material), owners=owners,
+            )
+            detail = {
+                "mate": mate.get("name"), "native_feature_type": mate.get("native_feature_type"),
+                "scope": scope, "configuration": mate.get("configuration"), "declared_link": owners[0],
+                "components": sorted(material), "native_observations": mate["inplace"], "constraint_rows_used": False,
+            }
+            observed.append(detail)
+            diagnostics.append(
+                {
+                    "code": "v14.inplace_constraint_unmeasured", "blocking": False,
+                    "message": (
+                        "in-place native observations belong to one fully assigned link and supply no constraint rows"
+                    ),
+                    "detail": detail,
+                }
+            )
+        return {"observations": observed}
+
     def pose_diagnostics():
         from .native_discovery import _frames
 
@@ -1333,6 +1406,8 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
 
     if check("declarations.binding", boundary) and check("declarations.topology", topology):
         check("declarations.membership", membership)
+        if any(isinstance(mate, dict) and mate.get("type") == "inplace" for mate in raw.get("mates") or []):
+            check("declarations.inplace_scope", inplace_scopes)
         for name in state["links"]:
             check("declarations.frame." + name, lambda n=name: frame(n))
             metadata = state["links"][name].get("joint")

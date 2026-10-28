@@ -30,12 +30,15 @@ from .protocol import CadBackend
 from .saved_state import normalize_open_status
 from .session_artifacts import (
     SESSION_DOCUMENT_API,
+    current_session_source_matches,
     embedded_virtual_component_marker,
     embedded_virtual_component_path,
     embedded_virtual_component_root,
     session_artifact_path,
     session_materialization_path,
     session_root_pid,
+    session_source_identity,
+    session_source_identity_sha256,
     session_temp_root,
 )
 
@@ -60,6 +63,7 @@ IMASSPROPERTYOVERRIDEOPTIONS_IID = "{82E1635E-B650-4C8B-84C8-D5FFBF660E49}"
 ICUSTOMPROPERTYMANAGER_IID = "{F1938D94-0D1F-4E88-9874-164B1E6568F1}"
 IFEATURE_IID = "{83A33D38-27C5-11CE-BFD4-00400513BB57}"
 IMATE2_IID = "{B09D234A-7581-408E-B3B3-FC0A514AAFA8}"
+IMATEINPLACE_IID = "{1C4BC27B-4B76-4390-AE66-4A21A96C0C9C}"
 IMATEENTITY2_IID = "{CE7FE69D-BCFA-441F-A37D-E740546458A4}"
 IBODY2_IID = "{3A075BFD-9962-4431-8321-7AF4903C55AD}"
 IFACE2_IID = "{4A8BA4D8-DA25-4B75-8E2D-4922B74D81ED}"
@@ -92,8 +96,6 @@ RETURN_VIEWS = {
     "GetNextSubFeature": IFEATURE_IID,
     "GetFirstSubFeature": IFEATURE_IID,
     "GetFeature": IFEATURE_IID,
-    "GetSpecificFeature2": IMATE2_IID,
-    "MateEntity": IMATEENTITY2_IID,
     "GetSurface": ISURFACE_IID,
     "GetCurve": ICURVE_IID,
     "GetTotalTransform": IMATHTRANSFORM_IID,
@@ -389,6 +391,8 @@ def _indexed_property(obj, name, *args):
         raise CadError("cad_member_missing", name) from error
     if raw is None:
         return None
+    if isinstance(raw, (str, bool, int, float)):
+        return raw
     result = _win32().Dispatch(raw)
     bound = _return_view(name, result)
     return bound if bound is not None else result
@@ -2487,8 +2491,100 @@ def _urdf_exporter_pid_bindings(xml_text, extension, source_root, *, native_api_
     return bindings
 
 
+def _inplace_read(operation):
+    """Preserve one native value, null return or precise read failure."""
+
+    try:
+        return {"value": _json_raw_value(operation()), "error": None}
+    except Exception as error:  # noqa: BLE001 - partial native evidence is retained
+        failure = _native_error_record(error)
+        if type(getattr(error, "hresult", None)) is int:
+            failure["hresult"] = error.hresult
+        return {"value": None, "error": failure}
+
+
+def _inplace_component(component):
+    if component is None:
+        return None
+    component = _component(component)
+    return {
+        "name2": _inplace_read(lambda: _property(component, "Name2")),
+        "path": _inplace_read(lambda: _method(component, "GetPathName")),
+        "configuration": _inplace_read(lambda: _property(component, "ReferencedConfiguration")),
+    }
+
+
+def _inplace_entity(target, entity_type):
+    if target is None:
+        return None
+    record = {
+        "interface_iid": _inplace_read(lambda: str(target._oleobj_.GetTypeInfo().GetTypeAttr().iid)),
+        "component": _inplace_read(
+            lambda: _inplace_component(_method(_interface(target, IENTITY_IID), "GetComponent"))
+        ),
+    }
+    if type(entity_type) is int and entity_type == 2:
+        record["plane_params"] = _inplace_read(
+            lambda: _property(_method(_interface(target, IFACE2_IID), "GetSurface"), "PlaneParams")
+        )
+    elif type(entity_type) is int and entity_type == 4:
+        record["transform_raw"] = _inplace_read(lambda: _property(_property(target, "Transform"), "ArrayData"))
+    return record
+
+
+def _inplace_mate_record(feature, specific, entity_count, *, scope, configuration):
+    """Read IMateInPlace without inventing IMate2 fields or solver constraints."""
+
+    name = str(_property(feature, "Name") or "")
+    suppressed = _method(feature, "IsSuppressed")
+    error_code = _method(feature, "GetErrorCode")
+    if type(suppressed) is not bool or type(error_code) is not int:
+        raise CadError(
+            "cad_mate_unreadable",
+            "in-place mate suppression or solve state is unreadable",
+            {"mate": name, "suppressed": _json_raw_value(suppressed), "error_code": _json_raw_value(error_code)},
+        )
+    entities = []
+    for index in range(entity_count):
+        entity_type = _inplace_read(lambda i=index: _indexed_property(specific, "MateEntityType", i))
+        entities.append(
+            {
+                "index": index,
+                "component_name": _inplace_read(lambda i=index: _indexed_property(specific, "MateComponentName", i)),
+                "entity_type": entity_type,
+                "entity": _inplace_read(
+                    lambda i=index, kind=entity_type["value"]: _inplace_entity(
+                        _indexed_property(specific, "MateEntity", i), kind
+                    )
+                ),
+            }
+        )
+    return {
+        "name": name,
+        "type": "inplace",
+        "native_feature_type": "MateInPlace",
+        "native_interface": "IMateInPlace",
+        "scope": scope,
+        "configuration": configuration,
+        "suppressed": suppressed,
+        "error_code": error_code,
+        "entity_count": entity_count,
+        # In-place endpoints are not IMateEntity2 and contribute no ordinary mate rows.
+        "entities": [],
+        "limits": None,
+        "native_limit": None,
+        "is_advanced_mate": None,
+        "is_advanced_mate_error": None,
+        "is_advanced_mate_api": None,
+        "inplace": {
+            "component": _inplace_read(lambda: _inplace_component(_property(specific, "Component"))),
+            "entities": entities,
+        },
+    }
+
+
 def _mate_specific(feature, strict=False):
-    """Return ``(IMate2, entity_count)`` for a mate feature.
+    """Return the actual mate interface and its native entity count.
 
     ``GetSpecificFeature2`` and ``GetMateEntityCount`` are parameterless vendor
     *methods* (SW2026 typelib: ``IMate2.GetMateEntityCount()``).  A recognised
@@ -2514,7 +2610,13 @@ def _mate_specific(feature, strict=False):
             )
         return None
     try:
-        specific = _method(feature, "GetSpecificFeature2")
+        specific = _specific_feature_object(feature)
+        if specific is None:
+            raise ValueError("GetSpecificFeature2 returned null")
+        specific = _interface(
+            specific,
+            IMATEINPLACE_IID if type_name == "MateInPlace" else IMATE2_IID,
+        )
         raw_count = _method(specific, "GetMateEntityCount")
     except Exception as error:  # noqa: BLE001
         raise CadError(
@@ -2550,7 +2652,7 @@ def _mate_features(doc):
                 ) from error
             found = _mate_specific(feature, strict=inside_group)
             if found is not None:
-                features.append((feature, found[0], found[1]))
+                features.append((feature, found[0], found[1], type_name))
             try:
                 sub = _dynamic(_method(feature, "GetFirstSubFeature"))
             except Exception as error:  # noqa: BLE001
@@ -2648,6 +2750,7 @@ def _component_source_document(component, source_root, *, native_path=None):
         "is_virtual": None,
         "author_imported_path": None,
         "author_imported_error": None,
+        "author_imported_exists": None,
         "used_api": SESSION_DOCUMENT_API,
     }
     reference = {"resolved_path": native_path, "is_virtual": None}
@@ -2672,7 +2775,20 @@ def _component_source_document(component, source_root, *, native_path=None):
         return result
     imported_path, imported_error = _imported_path_reading(component)
     provenance["author_imported_path"] = imported_path
+    if imported_path is not None and imported_error is None:
+        try:
+            os.stat(imported_path)
+        except FileNotFoundError:
+            provenance["author_imported_exists"] = False
+        except OSError as error:
+            raise CadError(
+                "cad_import_path_unreadable", "the author import path availability is unreadable",
+                {"path": imported_path, "errno": error.errno, "error": str(error)},
+            ) from error
+        else:
+            provenance["author_imported_exists"] = True
     reference["imported_path"] = imported_path
+    reference["import_path_exists"] = provenance["author_imported_exists"]
     if imported_error is not None:
         provenance["author_imported_error"] = imported_error
         reference["import_error"] = imported_error
@@ -2706,7 +2822,13 @@ def _component_source_document(component, source_root, *, native_path=None):
                 "inside the owning session temporary root"
             )
     elif session_materialization_path(native_path) and virtual is False:
-        author_relative = _relative_document(imported_path, source_root) if imported_path else None
+        try:
+            author_relative = (
+                Path(imported_path).resolve().relative_to(Path(source_root).resolve()).as_posix()
+                if imported_path else None
+            )
+        except (OSError, ValueError):
+            author_relative = None
         provenance.update(
             {
                 "state": "cached_materialization",
@@ -4526,6 +4648,8 @@ class SolidWorksBackend(CadBackend):
         groups,
         on_activity=None,
         require_material=True,
+        expected_session_sources: Mapping[str, str] | None = None,
+        native_files: Mapping[str, str] | None = None,
     ):
         facts = {}
         try:
@@ -4537,6 +4661,23 @@ class SolidWorksBackend(CadBackend):
                     {"document": str(doc_path)},
                 )
             source_root = Path(self._prepared_capture_root)
+            expected_sources = (
+                dict(expected_session_sources)
+                if isinstance(expected_session_sources, Mapping)
+                else {}
+            )
+            frozen_native_files = (
+                dict(native_files)
+                if isinstance(native_files, Mapping)
+                else {}
+            )
+            if expected_sources and not frozen_native_files:
+                raise CadError(
+                    "cad_cached_materialization_inventory_missing",
+                    "cached session sources require the frozen native inventory",
+                    {"sources": sorted(expected_sources)},
+                )
+            matched_expected_sources: set[str] = set()
             try:
                 Path(doc_path).resolve().relative_to(source_root)
             except (OSError, ValueError) as error:
@@ -4613,7 +4754,7 @@ class SolidWorksBackend(CadBackend):
             self._scene_document_key = self._record_source_document(doc_path, str(_property(config, "Name")))
             root = _component(_method(config, "GetRootComponent3", True))
             stack = [
-                (component, doc_path)
+                (component, doc_path, doc_path, None)
                 for component in list(_method(root, "GetChildren") or ())
             ]
             borrowed_components = []
@@ -4686,7 +4827,7 @@ class SolidWorksBackend(CadBackend):
 
             record_datums(doc, "", None)
             while stack:
-                raw_component, owner_path = stack.pop()
+                raw_component, defining_path, owner_path, anchor = stack.pop()
                 comp = _component(raw_component)
                 suppression_state = _measured_component_state(comp)
                 if suppression_state == COMPONENT_SUPPRESSED:
@@ -4730,6 +4871,11 @@ class SolidWorksBackend(CadBackend):
                     )
                     provenance["occurrence"] = name
                     provenance["native_api_pid"] = native_api_pid
+                    provenance["defining_anchor"] = anchor
+                    provenance["defining_document"] = (
+                        _relative_document(defining_path, source_root)
+                        or normalize_document_path(str(defining_path))
+                    )
                     self._source_provenance[name] = provenance
                 session_document = (
                     isinstance(provenance, dict)
@@ -4750,6 +4896,36 @@ class SolidWorksBackend(CadBackend):
                         "a component has no readable ReferencedConfiguration",
                         {"component": name, "raw_value": repr(referenced)},
                     )
+                if isinstance(provenance, dict):
+                    provenance["configuration"] = str(referenced)
+                expected_source = expected_sources.get(name)
+                if (
+                    isinstance(provenance, dict)
+                    and provenance.get("state") == "cached_materialization"
+                ):
+                    if not expected_source or not current_session_source_matches(
+                        provenance,
+                        expected_source,
+                        native_api_pid,
+                        frozen_native_files,
+                    ):
+                        raise CadError(
+                            "cad_cached_materialization_identity_mismatch",
+                            "a cached materialization does not match the sealed stable identity in the current session",
+                            {
+                                "component": name,
+                                "expected_sha256": expected_source,
+                                "source_provenance": provenance,
+                                "native_api_pid": native_api_pid,
+                            },
+                        )
+                    matched_expected_sources.add(name)
+                elif expected_source is not None:
+                    raise CadError(
+                        "cad_cached_materialization_identity_mismatch",
+                        "a sealed cached occurrence did not remain a cached materialization",
+                        {"component": name, "expected_sha256": expected_source, "source_provenance": provenance},
+                    )
                 # Configuration changes can invalidate borrowed occurrence interfaces.
                 # Finish the assembly traversal using primitives before any selection.
                 children = list(_method(comp, "GetChildren") or ())
@@ -4766,8 +4942,23 @@ class SolidWorksBackend(CadBackend):
                     if _method(part, "GetType") != 2:
                         raise CadError("cad_component_type", name)
                     document_type = "assembly"
+                    if (
+                        session_document
+                        and provenance is not None
+                        and provenance.get("state") == "cached_materialization"
+                    ):
+                        child_owner_path = owner_path
+                        child_anchor = name
+                    else:
+                        child_owner_path = (
+                            path
+                            if _relative_document(path, source_root)
+                            else owner_path
+                        )
+                        child_anchor = anchor
                     stack.extend(
-                        (child, path) for child in children
+                        (child, path, child_owner_path, child_anchor)
+                        for child in children
                     )
                 else:
                     if _method(part, "GetType") != 1:
@@ -4816,8 +5007,15 @@ class SolidWorksBackend(CadBackend):
                     }
                 )
 
+            unexpected_sources = sorted(set(expected_sources) - matched_expected_sources)
+            if unexpected_sources:
+                raise CadError(
+                    "cad_cached_materialization_missing",
+                    "a sealed cached occurrence is absent or did not rematerialize in the current session",
+                    {"components": unexpected_sources},
+                )
             borrowed_components.clear()
-            raw_component = owner_path = comp = children = part = root = stack = None
+            raw_component = defining_path = owner_path = anchor = comp = children = part = root = stack = None
             note("walk", completed=len(occurrences), total=len(occurrences), force=True)
             for index, occurrence in enumerate(occurrences, start=1):
                 name, path = occurrence["name"], occurrence["path"]
@@ -6619,6 +6817,7 @@ class SolidWorksBackend(CadBackend):
         )
         provenance = self._source_provenance.get(component) or {}
         state = provenance.get("state")
+        session_source = None
         if (
             state == "embedded_virtual_component"
             and provenance.get("is_virtual") is True
@@ -6641,6 +6840,36 @@ class SolidWorksBackend(CadBackend):
                 "session_temp_root"
             )
             virtual_native_api_pid = provenance.get("native_api_pid")
+        elif state == "cached_materialization":
+            try:
+                identity = session_source_identity(
+                    {
+                        "instance_id": component,
+                        "configuration": configured[1],
+                        "source_provenance": provenance,
+                    }
+                )
+            except ValueError:
+                return None
+            source_sha256 = None
+            identity_sha256 = session_source_identity_sha256(identity)
+            identity_kind = "session_source_sha256"
+            source_copy_path = None
+            virtual_owner = None
+            virtual_owner_sha256 = None
+            virtual_session_document_path = None
+            virtual_session_temp_root = None
+            virtual_native_api_pid = None
+            session_source = {
+                **identity,
+                "session_document_path": source_path,
+                "session_temp_root": provenance.get("session_temp_root"),
+                "native_api_pid": provenance.get("native_api_pid"),
+                "author_imported_path": provenance.get("author_imported_path"),
+                "author_imported_error": provenance.get("author_imported_error"),
+                "author_imported_relative": provenance.get("author_imported_relative"),
+                "author_imported_exists": provenance.get("author_imported_exists"),
+            }
         elif state is None:
             if not os.path.isfile(source_entry[0]):
                 return None
@@ -6690,6 +6919,7 @@ class SolidWorksBackend(CadBackend):
             ),
             "virtual_session_temp_root": virtual_session_temp_root,
             "virtual_native_api_pid": virtual_native_api_pid,
+            **({"session_source": session_source} if session_source is not None else {}),
         }
 
     def source_scopes(self, components):
@@ -7471,6 +7701,11 @@ class SolidWorksBackend(CadBackend):
                         "transform_raw": local_transform_raw,
                         "parent_occurrence": prefix,
                     }
+                    if (
+                        isinstance(provenance, dict)
+                        and provenance.get("state") == "cached_materialization"
+                    ):
+                        provenance["configuration"] = entry["configuration"]
                     if "source_provenance" in source_document:
                         entry["source_provenance"] = source_document["source_provenance"]
                     entry["defining_anchor"] = anchor
@@ -7522,7 +7757,7 @@ class SolidWorksBackend(CadBackend):
                     components_done += 1
                 mate_list = list(_mate_features(assembly))
                 mates_total += len(mate_list)
-                for feature, specific, entity_count in mate_list:
+                for feature, specific, entity_count, feature_type in mate_list:
                     name = str(_property(feature, "Name") or "")
                     activity.emit(
                         "read_mates",
@@ -7530,6 +7765,18 @@ class SolidWorksBackend(CadBackend):
                         completed=mates_done,
                         total=mates_total,
                     )
+                    if feature_type == "MateInPlace":
+                        mates.append(
+                            _inplace_mate_record(
+                                feature,
+                                specific,
+                                entity_count,
+                                scope=prefix or "",
+                                configuration=referenced_configuration,
+                            )
+                        )
+                        mates_done += 1
+                        continue
                     try:
                         type_index = _property(specific, "Type")
                         if type(type_index) is not int:
@@ -7564,7 +7811,7 @@ class SolidWorksBackend(CadBackend):
                         if suppressed:
                             continue
                         try:
-                            entity = _dynamic(_method(specific, "MateEntity", entity_index))
+                            entity = _interface(_method(specific, "MateEntity", entity_index), IMATEENTITY2_IID)
                             reference = _component(_property(entity, "ReferenceComponent"))
                             reference_full = str(_method(reference, "GetPathName") or "")
                             reference_name = str(_property(reference, "Name2") or "")

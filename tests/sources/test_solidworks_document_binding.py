@@ -549,8 +549,6 @@ class ReturnViewRegistryTests(unittest.TestCase):
         "GetNextSubFeature": native.IFEATURE_IID,
         "GetFirstSubFeature": native.IFEATURE_IID,
         "GetFeature": native.IFEATURE_IID,
-        "GetSpecificFeature2": native.IMATE2_IID,
-        "MateEntity": native.IMATEENTITY2_IID,
         "GetSurface": native.ISURFACE_IID,
         "GetCurve": native.ICURVE_IID,
         "GetTotalTransform": native.IMATHTRANSFORM_IID,

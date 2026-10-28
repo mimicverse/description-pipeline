@@ -16,6 +16,7 @@ from collections.abc import Mapping
 from ...io import PipelineError, artifact_path_parts, digest
 from .session_artifacts import (
     SESSION_DOCUMENT_API,
+    SESSION_SOURCE_IDENTITY_FIELDS,
     embedded_virtual_component_under_root,
     has_session_document_marker,
     session_document_marker,
@@ -406,6 +407,29 @@ def seal_closure_selection(
                 raise SelectionError(
                     "selection_closure_invalid",
                     "A cached materialization is author metadata only; it never binds a staged source",
+                )
+            identity = {
+                key: item.get(key)
+                for key in SESSION_SOURCE_IDENTITY_FIELDS
+            }
+            if (
+                not set(item) >= SESSION_SOURCE_IDENTITY_FIELDS
+                or identity.get("kind") != "native_import_materialization"
+                or identity.get("state") != "cached_materialization"
+                or identity.get("is_virtual") is not False
+                or identity.get("used_api") != SESSION_DOCUMENT_API
+                or not isinstance(identity.get("configuration"), str)
+                or not identity["configuration"]
+                or not isinstance(identity.get("owner"), str)
+                or not isinstance(identity.get("owner_sha256"), str)
+                or not isinstance(identity.get("occurrence"), str)
+                or identity.get("occurrence") != item.get("instance")
+                or not isinstance(item.get("session_source_sha256"), str)
+                or digest(identity) != item.get("session_source_sha256")
+            ):
+                raise SelectionError(
+                    "selection_closure_invalid",
+                    "A cached materialization has no stable session identity",
                 )
             materialization = item.get("materialization")
             if not isinstance(materialization, str) or not materialization.strip():

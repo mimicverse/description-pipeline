@@ -28,6 +28,12 @@ VIRTUAL_CAPTURE_DOCUMENT = (
 VIRTUAL_SELECTION_DOCUMENT = (
     VIRTUAL_SELECTION_ROOT + r"\VC~~\waist\Copy of 复件 (2) 零件10^waist.SLDPRT"
 )
+CACHED_OWNER = "robot.SLDASM"
+CACHED_OCCURRENCE = "imported_part.step-1"
+CACHED_CAPTURE_ROOT = r"C:\Users\operator\AppData\Local\Temp\swx1001"
+CACHED_SELECTION_ROOT = r"C:\Users\operator\AppData\Local\Temp\swx2002"
+CACHED_CAPTURE_DOCUMENT = CACHED_CAPTURE_ROOT + r"\IC~~\imported_part.step.SLDPRT"
+CACHED_SELECTION_DOCUMENT = CACHED_SELECTION_ROOT + r"\IC~~\imported_part.step.SLDPRT"
 
 
 def canonical(files):
@@ -147,6 +153,92 @@ def virtual_carrier(owner_sha, virtual_components=None):
         virtual_components=list(virtual_components)
         if virtual_components is not None
         else [virtual_slot(owner_sha)],
+    )
+
+
+def cached_identity(owner_sha, **overrides):
+    identity = {
+        "kind": "native_import_materialization",
+        "state": "cached_materialization",
+        "owner": CACHED_OWNER,
+        "owner_sha256": owner_sha,
+        "occurrence": CACHED_OCCURRENCE,
+        "defining_anchor": None,
+        "configuration": "Default",
+        "is_virtual": False,
+        "used_api": IMPORT_API,
+    }
+    identity.update(overrides)
+    return identity
+
+
+def cached_slot(owner_sha, **overrides):
+    identity = cached_identity(owner_sha)
+    slot = {
+        "document": CACHED_OWNER,
+        "owner": CACHED_OWNER,
+        "owner_anchor": None,
+        "defining_anchor": None,
+        "owner_sha256": owner_sha,
+        "instance": CACHED_OCCURRENCE,
+        "occurrence": CACHED_OCCURRENCE,
+        "name": CACHED_OCCURRENCE,
+        "kind": identity["kind"],
+        "state": identity["state"],
+        "configuration": identity["configuration"],
+        "is_virtual": False,
+        "used_api": identity["used_api"],
+        "binding": "author_metadata_only",
+        "materialization": CACHED_SELECTION_DOCUMENT,
+        "session_temp_root": CACHED_SELECTION_ROOT,
+        "native_api_pid": 2002,
+        "suppression_state": 2,
+        "author_imported_path": None,
+        "author_imported_error": None,
+        "session_source_sha256": digest(identity),
+        "author_imported_exists": None,
+        "author_imported_relative": None,
+    }
+    slot.update(overrides)
+    if "session_source_sha256" not in overrides:
+        slot["session_source_sha256"] = digest(
+            {key: slot[key] for key in identity}
+        )
+    return slot
+
+
+def cached_component(owner_sha, **overrides):
+    provenance = {
+        **cached_identity(owner_sha),
+        "native_document_path": CACHED_CAPTURE_DOCUMENT,
+        "materialization_path": CACHED_CAPTURE_DOCUMENT,
+        "session_document_path": CACHED_CAPTURE_DOCUMENT,
+        "session_temp_root": CACHED_CAPTURE_ROOT,
+        "native_api_pid": 1001,
+        "author_imported_path": None,
+        "author_imported_error": None,
+        "author_imported_exists": None,
+        "author_imported_relative": None,
+    }
+    component = {
+        "name2": CACHED_OCCURRENCE,
+        "document": CACHED_CAPTURE_DOCUMENT,
+        "configuration": "Default",
+        "suppressed": False,
+        "lightweight": False,
+        "suppression_state": 2,
+        "source_provenance": provenance,
+    }
+    component.update(overrides)
+    return component
+
+
+def cached_carrier(owner_sha, slot=None):
+    return sealed_selection(
+        {CACHED_OWNER: owner_sha},
+        CACHED_OWNER,
+        edges={CACHED_OWNER: []},
+        imports=[slot or cached_slot(owner_sha)],
     )
 
 
@@ -450,6 +542,156 @@ class ImportedSourceTests(unittest.TestCase):
         self.assertTrue(check["passed"], check["details"])
         self.assertEqual(check["details"].get("embedded_virtual_components"), 1)
         self.assertEqual(check["details"].get("cached_materializations"), 0)
+
+    def test_cached_materialization_is_accepted_through_the_sealed_carrier(self):
+        content = b"cached owner bytes"
+        owner_sha = hashlib.sha256(content).hexdigest()
+        with tempfile.TemporaryDirectory() as directory:
+            package = self._package(
+                directory,
+                {CACHED_OWNER: content},
+                [cached_component(owner_sha)],
+                extra_raw={"source_selection": cached_carrier(owner_sha)},
+            )
+            report = verify_discovery(package)
+        check = self._check(report)
+        self.assertTrue(check["passed"], check["details"])
+        self.assertEqual(check["details"].get("cached_materializations"), 1)
+        self.assertEqual(
+            check["details"].get("imported_occurrences"),
+            1,
+        )
+
+    def test_cached_materialization_rejects_identity_envelope_mismatches(self):
+        content = b"cached owner bytes"
+        owner_sha = hashlib.sha256(content).hexdigest()
+        cases = (
+            (
+                "owner_bytes",
+                lambda component, slot: component["source_provenance"].update(
+                    owner_sha256="f" * 64
+                ),
+            ),
+            (
+                "configuration",
+                lambda component, slot: component.update(configuration="Other"),
+            ),
+            (
+                "current_session",
+                lambda component, slot: component["source_provenance"].update(
+                    session_document_path=(
+                        r"C:\Users\operator\AppData\Local\Temp"
+                        r"\swx9999\IC~~\imported_part.step.SLDPRT"
+                    )
+                ),
+            ),
+            (
+                "slot_api",
+                lambda component, slot: slot.update(used_api="basename"),
+            ),
+            (
+                "slot_identity_digest",
+                lambda component, slot: slot.update(
+                    session_source_sha256="0" * 64
+                ),
+            ),
+        )
+        for label, mutate in cases:
+            with self.subTest(case=label):
+                component = cached_component(owner_sha)
+                carrier = cached_carrier(owner_sha, cached_slot(owner_sha))
+                mutate(component, carrier["closure"]["imports"][0])
+                with tempfile.TemporaryDirectory() as directory:
+                    package = self._package(
+                        directory,
+                        {CACHED_OWNER: content},
+                        [component],
+                        extra_raw={"source_selection": carrier},
+                    )
+                    report = verify_discovery(package)
+                self.assertFalse(self._check(report)["passed"], report)
+                self.assertIn(
+                    "discovery.imported_source_unbound",
+                    {item["code"] for item in report["errors"]},
+                )
+
+    def test_cached_materialization_distinguishes_missing_and_existing_external_author(self):
+        content = b"cached owner bytes"
+        owner_sha = hashlib.sha256(content).hexdigest()
+        external = r"D:\old\imported_part.step"
+        component = cached_component(owner_sha)
+        component["source_provenance"].update(
+            author_imported_path=external,
+            author_imported_error=None,
+            author_imported_exists=False,
+            author_imported_in_source_root=False,
+        )
+        slot = cached_slot(owner_sha, author_imported_path=external, author_imported_exists=False)
+        with tempfile.TemporaryDirectory() as directory:
+            package = self._package(
+                directory,
+                {CACHED_OWNER: content},
+                [component],
+                extra_raw={"source_selection": cached_carrier(owner_sha, slot)},
+            )
+            report = verify_discovery(package)
+        self.assertTrue(self._check(report)["passed"], report)
+
+        component["source_provenance"]["author_imported_exists"] = True
+        with tempfile.TemporaryDirectory() as directory:
+            package = self._package(
+                directory,
+                {CACHED_OWNER: content},
+                [component],
+                extra_raw={"source_selection": cached_carrier(owner_sha, slot)},
+            )
+            report = verify_discovery(package)
+        self.assertFalse(self._check(report)["passed"], report)
+
+    def test_cached_author_read_errors_remain_session_local(self):
+        content = b"cached owner bytes"
+        owner_sha = hashlib.sha256(content).hexdigest()
+        for selection_error, discovery_error in (
+            (None, "RuntimeError: discovery author read failed"),
+            ("RuntimeError: selection author read failed", None),
+            ("RuntimeError: selection author read failed", "RuntimeError: discovery author read failed"),
+        ):
+            with self.subTest(selection_error=selection_error, discovery_error=discovery_error):
+                component = cached_component(owner_sha)
+                component["source_provenance"]["author_imported_error"] = discovery_error
+                slot = cached_slot(owner_sha, author_imported_error=selection_error)
+                with tempfile.TemporaryDirectory() as directory:
+                    package = self._package(
+                        directory, {CACHED_OWNER: content}, [component],
+                        extra_raw={"source_selection": cached_carrier(owner_sha, slot)},
+                    )
+                    report = verify_discovery(package)
+                self.assertTrue(self._check(report)["passed"], report)
+
+    def test_cached_author_unknown_and_contradictory_records_are_rejected(self):
+        content = b"cached owner bytes"
+        owner_sha = hashlib.sha256(content).hexdigest()
+        cases = (
+            {"author_imported_path": r"D:\old\part.step", "author_imported_exists": None},
+            {"author_imported_path": None, "author_imported_exists": False},
+            {
+                "author_imported_path": r"D:\old\part.step", "author_imported_exists": False,
+                "author_imported_error": "RuntimeError: read failed",
+            },
+            {"author_imported_error": ""},
+        )
+        for fields in cases:
+            for target in ("selection", "discovery"):
+                with self.subTest(fields=fields, target=target):
+                    component, slot = cached_component(owner_sha), cached_slot(owner_sha)
+                    (slot if target == "selection" else component["source_provenance"]).update(fields)
+                    with tempfile.TemporaryDirectory() as directory:
+                        package = self._package(
+                            directory, {CACHED_OWNER: content}, [component],
+                            extra_raw={"source_selection": cached_carrier(owner_sha, slot)},
+                        )
+                        report = verify_discovery(package)
+                    self.assertFalse(self._check(report)["passed"], report)
 
     def test_embedded_virtual_component_requires_exact_native_and_carrier_evidence(self):
         content = b"virtual owner bytes"

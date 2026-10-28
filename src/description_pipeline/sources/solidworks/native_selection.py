@@ -17,6 +17,8 @@ from ...io import PipelineError, _filesystem_path, digest
 from .handoff import MAX_HANDOFF_BYTES, _directory
 from .session_artifacts import (
     SESSION_DOCUMENT_API,
+    _session_identity,
+    session_source_identity_sha256,
     embedded_virtual_component_path,
     embedded_virtual_component_root,
     has_session_document_marker,
@@ -527,6 +529,7 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
                         "document": label,
                         "owner": owner,
                         "owner_anchor": raw_anchor,
+                        "defining_anchor": raw_anchor,
                         "owner_sha256": files[owner],
                         "instance": instance,
                         "name": record.get("name"),
@@ -657,6 +660,21 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
                                 "evidence": "in-stage author import source retained",
                             }
                         )
+                cached_identity_sha256 = None
+                if isinstance(owner, str) and owner in files and isinstance(owner_sha256, str):
+                    try:
+                        cached_identity_sha256 = session_source_identity_sha256(
+                            _session_identity(
+                                owner=owner,
+                                owner_sha256=owner_sha256,
+                                occurrence=instance,
+                                defining_anchor=raw_anchor,
+                                configuration=record.get("configuration"),
+                                native_files=files,
+                            )
+                        )
+                    except (ValueError, SelectionError):
+                        cached_identity_sha256 = None
                 imports.append(
                     {
                         # Verbatim raw evidence: the defining label (a session
@@ -668,21 +686,33 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
                         "document": label,
                         "owner": owner,
                         "owner_anchor": raw_anchor,
+                        "defining_anchor": raw_anchor,
                         "owner_sha256": owner_sha256,
                         "bound_source": bound_source,
                         "defining_materialization": raw_defining if cached_defining else None,
                         "instance": instance,
                         "name": record.get("name"),
                         "author_imported_path": imported,
+                        "author_imported_error": record.get("import_error"),
+                        "author_imported_relative": bound_source,
+                        "author_imported_exists": record.get("import_path_exists"),
                         "author_metadata_in_stage": author_in_stage,
                         "is_virtual": virtual if type(virtual) is bool else None,
                         "materialization": resolved,
                         "session_temp_root": cached_root,
                         "native_api_pid": native_api_pid,
+                        "occurrence": instance,
                         "configuration": record.get("configuration"),
                         "suppression_state": state,
                         "state": "cached_materialization",
+                        "kind": "native_import_materialization",
                         "binding": "author_metadata_only",
+                        "used_api": SESSION_DOCUMENT_API,
+                        **(
+                            {"session_source_sha256": cached_identity_sha256}
+                            if cached_identity_sha256 is not None
+                            else {}
+                        ),
                     }
                 )
                 warnings.append(
@@ -700,6 +730,9 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
                         "materialization": resolved,
                         "session_temp_root": session_temp_root(resolved),
                         "author_imported_path": imported,
+                        "author_imported_error": record.get("import_error"),
+                        "author_imported_relative": record.get("author_imported_relative"),
+                        "author_imported_exists": record.get("import_path_exists"),
                         "author_metadata_in_stage": author_in_stage,
                         "needs_absence_test": True,
                     }
