@@ -18,7 +18,7 @@ from typing import Any, Protocol, get_args
 from ..artifacts import ArtifactStore
 from ..interface_records import validate_config_snapshot
 from ..io import PipelineError, digest, read_data
-from ..platform.facts import FactConflict, FactStore
+from ..platform.facts import FactStore
 from ..orchestration.native_operation_client import (
     NativeOperationClient,
     NativeOperationDiscoverPort,
@@ -30,6 +30,7 @@ from ..orchestration.native_operation_client import (
 )
 from ..repository.publish import REPOSITORY_SNAPSHOT_METADATA
 from ..runtime import tool_record
+from ..stages import STAGE_IDS
 from ..schemas import AIRFLOW_DISPATCH_CONF_SCHEMA
 from .admission import (
     AdmissionSpec,
@@ -84,14 +85,6 @@ from .stages.publish import PublishHandler
 from .verify import VerifyHandler
 from .verify_contract import CERTIFICATE_FILENAME
 
-STAGES: tuple[StageId, ...] = (
-    "freeze",
-    "discover",
-    "capture",
-    "generate",
-    "verify",
-    "publish",
-)
 _EFFECT_KINDS = frozenset(get_args(EffectKind))
 _REQUIRED_RECONCILIATION_KINDS = (
     "native_operation",
@@ -356,8 +349,6 @@ def _registered_native_target_from_environment(
 class AdmissionFactPort(Protocol):
     def load_admission(self, run_id: str) -> RunAdmission | None: ...
 
-    def load_admission_by_request_id(self, request_id: str) -> RunAdmission | None: ...
-
     def admit_run(
         self,
         admission: RunAdmission,
@@ -596,7 +587,7 @@ class StageApplication:
             )
         self.cancellation_controllers = MappingProxyType(controllers)
         for name, values in (("handlers", handlers), ("builders", builders)):
-            unknown = set(values) - set(STAGES)
+            unknown = set(values) - set(STAGE_IDS)
             if unknown:
                 raise ApplicationError(
                     "application.registry_invalid",
@@ -610,8 +601,8 @@ class StageApplication:
 
     def missing_capabilities(self) -> dict[str, list[str]]:
         return {
-            "handlers": [stage for stage in STAGES if stage not in self.handlers],
-            "builders": [stage for stage in STAGES if stage not in self.builders],
+            "handlers": [stage for stage in STAGE_IDS if stage not in self.handlers],
+            "builders": [stage for stage in STAGE_IDS if stage not in self.builders],
             "reconciliation": (
                 [
                     kind
@@ -747,13 +738,7 @@ class StageApplication:
                 "Repository snapshot metadata differs from AdmissionSpec",
             )
 
-    def admit(
-        self,
-        spec: AdmissionSpec,
-        *,
-        dispatch_dag_id: str = "solidworks_to_urdf",
-        dispatch_dag_run_id: str | None = None,
-    ) -> AdmissionOutcome:
+    def admit(self, spec: AdmissionSpec) -> AdmissionOutcome:
         """Atomically register admission, Freeze and technical Airflow dispatch."""
 
         if not isinstance(spec, AdmissionSpec):
@@ -793,21 +778,13 @@ class StageApplication:
             spec,
             command,
             conf_artifact,
-            dispatch_dag_id=dispatch_dag_id,
-            dispatch_dag_run_id=dispatch_dag_run_id,
         )
-        try:
-            stored_command, stored_dispatch, _intent = self.facts.admit_run(
-                admission,
-                command,
-                dispatch_command,
-                conf_artifact,
-            )
-        except FactConflict:
-            existing = self.load_admission_outcome(spec.run_id)
-            if existing is None:
-                raise
-            return existing
+        stored_command, stored_dispatch, _intent = self.facts.admit_run(
+            admission,
+            command,
+            dispatch_command,
+            conf_artifact,
+        )
         if stored_command != command or stored_dispatch != dispatch_command:
             raise ApplicationError(
                 "application.admission_conflict",
@@ -823,14 +800,11 @@ class StageApplication:
     def _dispatch_identity(
         spec: AdmissionSpec,
         command: StageCommand,
-        *,
-        dispatch_dag_id: str = "solidworks_to_urdf",
-        dispatch_dag_run_id: str | None = None,
     ) -> dict[str, str]:
         return {
             "admission_sha256": spec.admission_sha256,
-            "dag_id": dispatch_dag_id,
-            "dag_run_id": dispatch_dag_run_id or spec.request_id,
+            "dag_id": "solidworks_to_urdf",
+            "dag_run_id": spec.request_id,
             "freeze_command_id": command.command_id,
             "run_id": spec.run_id,
         }
@@ -840,24 +814,15 @@ class StageApplication:
         spec: AdmissionSpec,
         command: StageCommand,
         conf_artifact: ArtifactRef,
-        *,
-        dispatch_dag_id: str = "solidworks_to_urdf",
-        dispatch_dag_run_id: str | None = None,
     ) -> DispatchCommand:
-        dag_run_id = dispatch_dag_run_id or spec.request_id
-        dispatch_identity = self._dispatch_identity(
-            spec,
-            command,
-            dispatch_dag_id=dispatch_dag_id,
-            dispatch_dag_run_id=dag_run_id,
-        )
+        dispatch_identity = self._dispatch_identity(spec, command)
         return DispatchCommand.create(
             command_id="dispatch:" + digest(dispatch_identity),
             run_id=spec.run_id,
             freeze_command_id=command.command_id,
             idempotency_key=f"{spec.run_id}/dispatch",
-            dag_id=dispatch_dag_id,
-            dag_run_id=dag_run_id,
+            dag_id="solidworks_to_urdf",
+            dag_run_id=spec.request_id,
             conf_artifact=conf_artifact,
             expected_executor_sha256=spec.dispatch_executor_sha256,
         )
@@ -1024,22 +989,6 @@ class StageApplication:
             target_effect_id=target_effect_id,
         )
 
-    def admission_by_request_id(self, request_id: str) -> RunAdmission | None:
-        """Read one existing admission by its stable request key."""
-
-        if not isinstance(request_id, str) or not request_id:
-            raise ApplicationError(
-                "application.request_id_invalid",
-                "A non-empty request id is required",
-            )
-        loader = getattr(self.facts, "load_admission_by_request_id", None)
-        if not callable(loader):
-            raise ApplicationError(
-                "application.request_lookup_missing",
-                "The fact store cannot resolve request-id admission identity",
-            )
-        return loader(request_id)
-
     def _load_spec(self, run_id: str) -> tuple[AdmissionSpec, RunAdmission]:
         admission = self.facts.load_admission(run_id)
         if admission is None:
@@ -1109,8 +1058,8 @@ class StageApplication:
         tuple[VerifiedPredecessor, ...],
         VerifiedDiscoverResult | None,
     ]:
-        index = STAGES.index(stage)
-        previous = predecessors.get(STAGES[index - 1]) if index else None
+        index = STAGE_IDS.index(stage)
+        previous = predecessors.get(STAGE_IDS[index - 1]) if index else None
         supporting: tuple[VerifiedPredecessor, ...] = ()
         if stage == "capture":
             supporting = (predecessors["freeze"],)
@@ -1208,7 +1157,7 @@ class StageApplication:
     def run_stage(self, run_id: str, stage: StageId) -> StageAttemptResult:
         """Execute one admitted stage or return its canonical pending wait."""
 
-        if stage not in STAGES:
+        if stage not in STAGE_IDS:
             raise ApplicationError("application.stage_invalid", f"Unknown stage {stage!r}")
         self._validate_airflow_task_binding(run_id, stage)
         spec, admission = self._load_spec(run_id)
@@ -1222,8 +1171,8 @@ class StageApplication:
         predecessors: dict[StageId, VerifiedPredecessor] = {}
         discover_result: VerifiedDiscoverResult | None = None
         verify_result: VerifiedVerifyResult | None = None
-        target_index = STAGES.index(stage)
-        for current_stage in STAGES[: target_index + 1]:
+        target_index = STAGE_IDS.index(stage)
+        for current_stage in STAGE_IDS[: target_index + 1]:
             command = self._build_command(
                 spec,
                 current_stage,
@@ -1386,11 +1335,11 @@ class StageApplication:
     def execute_run(self, run_id: str, *, through: StageId = "publish") -> ApplicationOutcome:
         """Run stages one at a time from one admission; no downstream work is hidden in a handler."""
 
-        if through not in STAGES:
+        if through not in STAGE_IDS:
             raise ApplicationError("application.stage_invalid", f"Unknown stage {through!r}")
         last: StageAttemptResult | None = None
         completed_stage: StageId | None = None
-        for stage in STAGES[: STAGES.index(through) + 1]:
+        for stage in STAGE_IDS[: STAGE_IDS.index(through) + 1]:
             last = self.run_stage(run_id, stage)
             outcome, payload = _stage_attempt_record(last)
             if outcome != "completed":
@@ -1414,35 +1363,6 @@ class StageApplication:
             payload=last.to_record(),
             missing_capabilities=self.missing_capabilities(),
         )
-
-
-def build_stage_application(
-    *,
-    services: StageServices,
-    facts: AdmissionFactPort,
-    artifacts: ArtifactStore,
-    handlers: Mapping[StageId, StageHandler],
-    builders: Mapping[StageId, CommandBuilder] | None = None,
-    clock: Callable[[], datetime] = _utc_now,
-    reconciler: EffectReconciliationService | None = None,
-    reconciliation_adapters: Mapping[str, EffectReconciliationAdapter] | None = None,
-    cancellation_controllers: Mapping[str, CancellationControlPort] | None = None,
-    native_target_identity: NativeTargetIdentity | None = None,
-) -> StageApplication:
-    """Construct one immutable application from explicit ports; no hidden fallback exists."""
-
-    return StageApplication(
-        services=services,
-        facts=facts,
-        artifacts=artifacts,
-        handlers=handlers,
-        builders=builders or {},
-        clock=clock,
-        reconciler=reconciler,
-        reconciliation_adapters=reconciliation_adapters,
-        cancellation_controllers=cancellation_controllers,
-        native_target_identity=native_target_identity,
-    )
 
 
 def application_from_environment(
@@ -1656,7 +1576,6 @@ def application_from_environment(
         native_target_identity=registered_target,
     )
 __all__ = [
-    "STAGES",
     "AdmissionOutcome",
     "AirflowTaskBinding",
     "ApplicationError",
@@ -1668,5 +1587,4 @@ __all__ = [
     "EffectWakeupHint",
     "StageApplication",
     "application_from_environment",
-    "build_stage_application",
 ]

@@ -18,20 +18,19 @@ import re
 import sys
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from contextlib import contextmanager
 from pathlib import Path
 
 from ...geometry.native_scope import NATIVE_SOURCE_SCOPE_RULE
-from ...geometry.native_transform import transform_from_solidworks as _shared_transform
-from ...schemas import NATIVE_CAPTURE_FACTS_KEYS, NATIVE_DISCOVERY_SCHEMA
-from .errors import CadError, EnvironmentError_
-from .protocol import (
-    CadBackend,
-    Matrix,
-    RawComponent,
-    RawScene,
+from ...geometry.native_transform import (
+    rigid_matrix_from_row_major,
+    transform_from_solidworks as _shared_transform,
 )
+from ...schemas import NATIVE_DISCOVERY_SCHEMA
+from .errors import CadError, EnvironmentError_
+from .protocol import CadBackend
+from .saved_state import normalize_open_status
 from .session_artifacts import (
     SESSION_DOCUMENT_API,
     embedded_virtual_component_marker,
@@ -742,26 +741,6 @@ def pin_search_folders(app, root, folder_type=SEARCH_FOLDER_DOCUMENT_TYPE):
             evidence,
         )
     return evidence
-
-
-def _stage_relative(root, value) -> str | None:
-    """Path of ``value`` under ``root`` in portable form, or ``None``."""
-
-    try:
-        relative = Path(str(value)).resolve().relative_to(Path(str(root)).resolve())
-    except (OSError, ValueError):
-        return None
-    return relative.as_posix()
-
-
-def _index_spelling(index, relative) -> str | None:
-    """The upload-index spelling of a staged-relative path (case-tolerant)."""
-
-    if relative in index:
-        return relative
-    folded = relative.casefold()
-    matches = [name for name in index if name.casefold() == folded]
-    return matches[0] if len(matches) == 1 else None
 
 
 def _matches_assembly_root(reference, root, reference_full, reference_name, assembly_full) -> bool:
@@ -2247,28 +2226,10 @@ def _frame_matrix(values):
     """
 
     try:
-        numbers = [float(value) for value in values or ()]
+        numbers = rigid_matrix_from_row_major(values)
     except (TypeError, ValueError):
         return None
-    if len(numbers) != 16 or not all(math.isfinite(value) for value in numbers):
-        return None
     rows = [numbers[0:4], numbers[4:8], numbers[8:12], numbers[12:16]]
-    if any(abs(rows[3][i] - (1.0 if i == 3 else 0.0)) > 1e-9 for i in range(4)):
-        return None
-    rotation = [[rows[i][j] for j in range(3)] for i in range(3)]
-    if any(
-        abs(sum(rotation[k][i] * rotation[k][j] for k in range(3)) - (1.0 if i == j else 0.0)) > 1e-9
-        for i in range(3)
-        for j in range(3)
-    ):
-        return None
-    determinant = (
-        rotation[0][0] * (rotation[1][1] * rotation[2][2] - rotation[1][2] * rotation[2][1])
-        - rotation[0][1] * (rotation[1][0] * rotation[2][2] - rotation[1][2] * rotation[2][0])
-        + rotation[0][2] * (rotation[1][0] * rotation[2][1] - rotation[1][1] * rotation[2][0])
-    )
-    if abs(determinant - 1.0) > 1e-9:
-        return None
     return rows
 
 
@@ -2676,7 +2637,8 @@ def _urdf_exporter_pid_bindings(xml_text, extension, source_root, *, native_api_
                     raise ValueError("GetObjectByPersistReference3 returned no object")
                 component = _component(_dynamic(resolved))
                 row["name2"] = str(_property(component, "Name2") or "") or None
-                row.update(_component_source_document(component, source_root))
+                source_document = _component_source_document(component, source_root)
+                row.update({key: value for key, value in source_document.items() if key != "native_reference"})
                 if isinstance(row.get("source_provenance"), dict) and type(native_api_pid) is int:
                     row["source_provenance"]["native_api_pid"] = native_api_pid
                 row["configuration"] = str(_property(component, "ReferencedConfiguration") or "") or None
@@ -2812,6 +2774,31 @@ def _imported_path_reading(component) -> tuple[str | None, str | None]:
     return (value if value.strip() else None), None
 
 
+def _require_missing_component(component, name, native_path):
+    """Admit only a known absent native reference, never an unreadable source."""
+
+    imported_path, imported_error = _imported_path_reading(component)
+    virtual = _property(component, "IsVirtual")
+    if (
+        native_path not in (None, "")
+        or virtual is not False
+        or imported_path is not None
+        or imported_error is not None
+    ):
+        raise CadError(
+            "cad_component_source_unread",
+            "a missing-reference warning cannot replace source identity evidence",
+            {
+                "component": name,
+                "path": _raw_scalar(native_path),
+                "is_virtual": _raw_scalar(virtual),
+                "imported_path": imported_path,
+                "imported_path_error": imported_error,
+            },
+        )
+    return {"resolved_path": native_path or "", "is_virtual": virtual, "imported_path": imported_path}
+
+
 def _component_source_document(component, source_root, *, native_path=None):
     """Bind an occurrence to a delivered file, including native linked imports.
 
@@ -2846,7 +2833,8 @@ def _component_source_document(component, source_root, *, native_path=None):
         "author_imported_error": None,
         "used_api": SESSION_DOCUMENT_API,
     }
-    result = {"document": None, "source_provenance": provenance}
+    reference = {"resolved_path": native_path, "is_virtual": None}
+    result = {"document": None, "source_provenance": provenance, "native_reference": reference}
     virtual = None
     try:
         reading = _property(component, "IsVirtual")
@@ -2854,9 +2842,12 @@ def _component_source_document(component, source_root, *, native_path=None):
     except Exception as error:  # noqa: BLE001 - an unreadable virtual flag stays unknown
         provenance["virtual_error"] = f"{type(error).__name__}: {error}"[:200]
     provenance["is_virtual"] = virtual
+    reference["is_virtual"] = virtual
+    if "virtual_error" in provenance:
+        reference["virtual_error"] = provenance["virtual_error"]
     relative = _relative_document(native_path, source_root)
     if relative and virtual is False:
-        return {"document": relative}
+        return {"document": relative, "native_reference": reference}
     if relative and virtual is None:
         provenance["error"] = (
             "ValueError: a delivered document requires an explicit False IsVirtual reading"
@@ -2864,8 +2855,10 @@ def _component_source_document(component, source_root, *, native_path=None):
         return result
     imported_path, imported_error = _imported_path_reading(component)
     provenance["author_imported_path"] = imported_path
+    reference["imported_path"] = imported_path
     if imported_error is not None:
         provenance["author_imported_error"] = imported_error
+        reference["import_error"] = imported_error
     if virtual is True:
         if provenance.get("author_imported_error") is not None:
             provenance["error"] = (
@@ -3198,7 +3191,6 @@ class SolidWorksBackend(CadBackend):
         self._staged_search_applied: set = set()
         self._staged_search_evidence: list[dict] = []
         self._components = set()
-        self._component_transforms = {}
         self._source_components = {}
         self._source_provenance = {}
         self._source_scope_overrides = {}
@@ -3206,6 +3198,7 @@ class SolidWorksBackend(CadBackend):
         self._scene_source_root = None
         self._scene_document_key = None
         self._prepared_capture_root = None
+        self._saved_state_main_path: str | None = None
         self.notes = {}
         #: ``GetSaveFlag`` per working-tree document, recorded as evidence.
         self.save_flags: dict[str, object] = {}
@@ -3424,6 +3417,7 @@ class SolidWorksBackend(CadBackend):
                 {"assembly": str(document)},
             )
         self._prepared_capture_root = str(root)
+        self._saved_state_main_path = normalize_document_path(str(document))
         search_root = self.configure_staged_search(str(root))
         self.prepare_source(str(document), configuration)
         sealed = self.seal_documents(documents)
@@ -3588,7 +3582,6 @@ class SolidWorksBackend(CadBackend):
         if self._owner_thread is not None and self._owner_thread is not threading.current_thread():
             raise EnvironmentError_("cad_thread_mismatch", "Release CAD references on their owning STA thread")
         self._components.clear()
-        self._component_transforms.clear()
         self._source_components.clear()
         self._source_documents.clear()
         self._session_document_paths.clear()
@@ -3596,6 +3589,7 @@ class SolidWorksBackend(CadBackend):
         self._session_artifact_root_owners.clear()
         self._scene_document_key = None
         self._prepared_capture_root = None
+        self._saved_state_main_path = None
         self._part_mass_properties = {}
         self.save_flags.clear()
         self.save_flag_errors.clear()
@@ -3699,8 +3693,39 @@ class SolidWorksBackend(CadBackend):
     def open_document(self, path):
         # Silent + read-only in the owned application for this phase.
         doc, errors, warnings = self._open_document_raw(path)
-        if doc is None or errors.value:
+        if doc is None:
             raise self._open_failure(path, errors.value, warnings.value)
+        try:
+            open_status = normalize_open_status(
+                {
+                    "errors": errors.value,
+                    "warnings": warnings.value,
+                    "missing_references": (
+                        self._missing_reference_evidence(path)
+                        if errors.value == 2 else {"state": "unavailable", "items": []}
+                    ),
+                }
+            )
+        except ValueError as error:
+            raise self._open_failure(
+                path,
+                errors.value if type(errors.value) is int else None,
+                warnings.value if type(warnings.value) is int else None,
+                exception=str(error),
+            ) from error
+        selected_main = (
+            self._prepared_capture_root is not None
+            and self._saved_state_main_path is not None
+            and normalize_document_path(os.path.abspath(str(path)))
+            == self._saved_state_main_path
+        )
+        if not open_status["continuable"] or (
+            open_status["errors"] != 0 and not selected_main
+        ):
+            raise self._open_failure(
+                path, open_status["errors"], open_status["warnings"],
+                missing_references=open_status["missing_references"],
+            )
         try:
             title = _method(doc, "GetTitle")
         except Exception as error:  # noqa: BLE001 - title is diagnostic only
@@ -3712,8 +3737,7 @@ class SolidWorksBackend(CadBackend):
             "opened": title,
             "path": _method(doc, "GetPathName"),
             "read_only": _raw_scalar(_method(doc, "IsOpenedReadOnly")),
-            "errors": errors.value,
-            "warnings": warnings.value,
+            **open_status,
         }
         if title_error is not None:
             result["title_error"] = title_error
@@ -3740,47 +3764,40 @@ class SolidWorksBackend(CadBackend):
         doc = _method(self._app_for_path(path), "OpenDoc6", path, kind, 3, configuration, errors, warnings)
         return doc, errors, warnings
 
-    def _unresolved_references(self, path, limit=32):
-        """Best-effort unresolved dependency names and last-known paths.
+    def _missing_reference_evidence(self, path):
+        """Retain all enumerated native missing references and any read failure."""
 
-        Read-only diagnostics for open failures: bounded, never raised, and
-        ``None`` when the enumeration is unavailable so the original open error
-        keeps its exact reporting.
-        """
-
+        evidence = {"state": "unavailable", "items": []}
         try:
             raw = _method(self._app_for_path(path), "GetDocumentDependencies2", path, True, True, True)
-        except Exception:  # noqa: BLE001 - diagnostics must never mask the open error
-            return None
-        try:
-            items = list(raw or ())
+            if not isinstance(raw, (list, tuple)) or len(raw) % 3:
+                raise ValueError("dependency enumeration is not a sequence of native triples")
             unresolved = []
-            for index in range(0, len(items) - 2, 3):
-                name = items[index]
-                if not _is_text_name(name):
+            for index in range(0, len(raw), 3):
+                name, native_path = raw[index:index + 2]
+                if not _is_text_name(name) or not isinstance(native_path, str):
+                    raise ValueError("dependency enumeration contains an unreadable name or path")
+                if os.path.isfile(native_path):
                     continue
-                try:
-                    exists = os.path.isfile(str(items[index + 1]))
-                except Exception:  # noqa: BLE001
-                    exists = False
-                if exists:
-                    continue
-                unresolved.append({"name": str(name), "last_known_path": str(items[index + 1])})
-                if len(unresolved) >= limit:
-                    break
-            return unresolved
-        except Exception:  # noqa: BLE001 - malformed diagnostics cannot replace the CAD error
-            return None
+                unresolved.append({"name": name, "last_known_path": native_path})
+            return {
+                **evidence,
+                "state": "observed",
+                "items": unresolved,
+            }
+        except Exception as error:  # noqa: BLE001 - preserve the original native open result
+            return {**evidence, "error": _native_error_record(error)}
 
-    def _open_failure(self, path, errors, warnings, exception=None):
+    def _open_failure(self, path, errors, warnings, exception=None, missing_references=None):
         """Strict open failure; the detail carries unresolved references when readable."""
 
         detail = {"errors": errors, "warnings": warnings}
         if exception:
             detail["exception"] = exception
-        unresolved = self._unresolved_references(path)
-        if unresolved is not None:
-            detail["unresolved_references"] = unresolved
+        missing = missing_references if missing_references is not None else self._missing_reference_evidence(path)
+        detail["missing_references"] = missing
+        if missing["state"] == "observed":
+            detail["unresolved_references"] = missing["items"]
         return CadError("cad_document_open_failed", path, detail)
 
     def _placement(self, component):
@@ -4745,14 +4762,12 @@ class SolidWorksBackend(CadBackend):
                     "the native source document is not read-only",
                     {"path": document, "state": raw_state},
                 )
-            source_sha256 = _hash(document)
             try:
                 native_api_pid = int(_method(self._app_obj(), "GetProcessID"))
             except Exception:  # noqa: BLE001 - unresolved PID keeps source scope incomplete
                 native_api_pid = None
             self._record_save_flag(doc, doc_path)
             self._components = set()
-            self._component_transforms = {}
             self._source_components = {}
             self._source_provenance = {}
             self._source_scope_overrides = {}
@@ -4766,8 +4781,6 @@ class SolidWorksBackend(CadBackend):
                 "scene_raw": {
                     "document": str(document),
                     "configuration": configuration,
-                    "source_sha256": source_sha256,
-                    "document_state": raw_state,
                     "occurrences": None,
                     "components": None,
                     "coordinate_systems": None,
@@ -4858,7 +4871,8 @@ class SolidWorksBackend(CadBackend):
             while stack:
                 raw_component, owner_path = stack.pop()
                 comp = _component(raw_component)
-                if _measured_component_state(comp) == COMPONENT_SUPPRESSED:
+                suppression_state = _measured_component_state(comp)
+                if suppression_state == COMPONENT_SUPPRESSED:
                     continue
                 borrowed_components.append(comp)
                 raw_name = _property(comp, "Name2")
@@ -4870,13 +4884,13 @@ class SolidWorksBackend(CadBackend):
                     )
                 name = raw_name
                 note("walk", current_object=_activity_object(name))
+                path = _method(comp, "GetPathName")
                 part = _component_document(comp)
                 if part is None:
                     raise CadError("cad_component_unresolved", name)
                 # SetReadOnlyState can change native state. Defer it until the
                 # occurrence tree has been captured as primitives and released;
                 # phase-two document acquisition enforces read-only before reads.
-                path = _method(comp, "GetPathName")
                 if not path or not os.path.isfile(path):
                     # Without a file on disk there is no revision to hash or copy, so the
                     # snapshot could not name what it read.
@@ -4972,13 +4986,13 @@ class SolidWorksBackend(CadBackend):
                     session_document=session_document,
                 )
                 self._source_components[name] = (document_key, str(referenced))
-                self._component_transforms[name] = copy.deepcopy(placement)
                 occurrences.append(
                     {
                         "name": name,
                         "path": path,
                         "transform_raw": copy.deepcopy(placement),
                         "referenced_configuration": str(referenced),
+                        "suppression_state": suppression_state,
                         "is_fixed": fixed,
                         "is_fixed_error": fixed_error,
                         "document_type": document_type,
@@ -6120,7 +6134,6 @@ class SolidWorksBackend(CadBackend):
                         "errors": [],
                         "bodies": {"solid": 0, "sheet": 0},
                         "source_scope": source_scopes[component],
-                        "transform_raw": _json_raw_value(self._component_transforms.get(component)),
                         "appearance_raw": None,
                     }
                 note(
@@ -6159,7 +6172,6 @@ class SolidWorksBackend(CadBackend):
         errors: list[dict[str, object]] = []
         body_counts = {"solid": 0, "sheet": 0}
         face_count = 0
-        occurrence_transform = self._component_transforms.get(component)
         used_api = (
             "IComponent2.GetBodies3/IBody2.GetFaces/"
             "IFace2.GetTessTriangles(True)"
@@ -6767,7 +6779,6 @@ class SolidWorksBackend(CadBackend):
             "state": state,
             "representation": "cad_face_display_triangles_raw",
             "source_scope": source_scope,
-            "transform_raw": _json_raw_value(occurrence_transform),
             "bodies": body_counts,
             "appearance_raw": appearance_raw,
         }
@@ -7163,227 +7174,81 @@ class SolidWorksBackend(CadBackend):
 
 
 
-    def closure_readings(self, stage_root, main_assembly, index):
-        """Raw native readings for the staged closure walk (mechanical only).
+    @contextmanager
+    def _discover_session(self, source_root, source_files):
+        """Own one observation window and finish restoration before admission."""
 
-        Pins the session search scope to ``stage_root``, seals the staged
-        inventory, opens the staged main read-only and records every
-        occurrence's identity, referenced configuration, raw suppression
-        state, resolved document path and virtual/import readings, plus
-        pre-open query-A stored references over every staged native document.
-        The session search scope is restored before return and both the
-        restoration outcome and the per-session pinning evidence are recorded.
-        State 5 and unreadable/invalid states are recorded, not raised:
-        admission policy (``native_selection``) refuses with the exact
-        instance.  Nothing is saved, moved or exported.
-        """
-
-        stage = Path(stage_root).resolve()
-        names = sorted(str(name) for name in index)
-        self.configure_staged_search(stage)
-        sealed = self.seal_documents([str(stage / name) for name in names])
-        readings: dict = {"stage_root": str(stage), "main_assembly": str(main_assembly), "sealed": sealed}
-        session_info: dict = {}
-        pinned: dict = {}
+        if getattr(self._local, "depth", 0):
+            raise CadError("cad_discovery_nested_session", "Discover must own its complete native session")
+        self.configure_staged_search(source_root)
+        self.seal_documents([str(source_root / name) for name in source_files])
+        observation = {}
+        pinned = {}
         restored_folders = None
         restored_raw = None
         restore_error = None
         with self.session():
             app = self._app_obj()
-            session_info = {
+            identity = {
                 "native_api_pid": int(_method(app, "GetProcessID")),
                 "solidworks_revision": str(_method(app, "RevisionNumber")),
             }
-            evidence = self.staged_search_evidence()
-            pinned = dict(evidence[-1]) if evidence else {}
+            search = self.staged_search_evidence()
+            pinned = dict(search[-1]) if search else {}
             try:
-                # Query A over every staged native document BEFORE any document is
-                # opened: once an assembly is open, a false-Searchflag query reports
-                # the in-session resolution rather than the saved author references.
-                # The pre-open result is the verbatim stored-reference evidence.
                 stored = {}
-                for name in names:
+                for name in sorted(source_files):
                     if not name.lower().endswith((".sldasm", ".sldprt")):
                         continue
                     try:
-                        entries = closed_document_dependencies(app, str(stage / name))
+                        entries = closed_document_dependencies(app, str(source_root / name))
                         stored[name] = [
                             {"name": item.get("name"), "location": item.get("location")} for item in entries
                         ]
-                    except Exception as error:  # noqa: BLE001 - recorded; closure policy refuses elsewhere
+                    except Exception as error:  # noqa: BLE001 - admission retains the native read failure
                         stored[name] = {"error": f"{type(error).__name__}: {error}"[:200]}
-                readings["stored_references"] = stored
-                readings["stored_references_phase"] = "preopen"
-                readings["stored_references_count"] = len(stored)
-                readings["documents_before"] = int(_method(app, "GetDocumentCount"))
-                entry = self._probe_document(str(stage / main_assembly))
-                readings["open"] = {
-                    "already_open": entry.get("already_open"),
-                    "open_exception": entry.get("open_exception"),
-                    "errors": entry.get("errors"),
-                    "warnings": entry.get("warnings"),
-                }
-                doc = entry.get("doc")
-                if doc is None:
-                    raise CadError(
-                        "cad_staged_main_unopenable",
-                        "the staged main assembly could not be opened read-only in the owned session",
-                        {"main_assembly": str(main_assembly), "open": readings["open"]},
-                    )
-                document_state_before = _discovery_document_state(doc)
-                _manager, configuration = _active_configuration_view(doc)
-                # CU pre-verification input: the main document's declared delivery
-                # identity (dp.*), read-only with the primitive configuration name.
-                # An unreadable declaration set is recorded, never raised; the
-                # admission policy (native_selection) refuses it fail-closed.
-                try:
-                    _context_manager, _context_configuration, configuration_name = _configuration_context(doc)
-                    readings["configuration_name_error"] = None
-                except CadError as error:
-                    configuration_name = ""
-                    readings["configuration_name_error"] = f"{type(error).__name__}: {error}"[:200]
-                try:
-                    identity_properties = _custom_properties(doc, configuration_name)
-                except Exception as error:  # noqa: BLE001 - recorded; admission refuses unreadable declarations
-                    identity_properties = None
-                    readings["identity_properties_error"] = f"{type(error).__name__}: {error}"[:200]
-                else:
-                    readings["identity_properties_error"] = None
-                readings["identity_properties"] = identity_properties
-                # Delivery-configuration evidence in the same shape as the native
-                # discovery record: the actual saved configuration name plus the
-                # before/after saved-state observations of the opened document.
-                # Persisted as read - unknowns and read errors stay explicit.
-                # The "after" snapshot is taken when the native walk below has
-                # completed and before the document is closed.
-                readings["saved_configuration"] = str(configuration_name or "") or None
-                root = _component(_method(configuration, "GetRootComponent3", True))
-                occurrences = []
-                stack = [
-                    (child, "", 0, str(main_assembly), None, str(main_assembly))
-                    for child in reversed(_as_list(_method(root, "GetChildren")))
-                ]
-                while stack:
-                    item, context, depth, defining, anchor, native_owner = stack.pop()
-                    if depth > 40:
-                        raise CadError("cad_assembly_too_deep", str(stage / main_assembly), {"depth": depth})
-                    component = _component(item)
-                    name = str(_property(component, "Name2") or _property(component, "Name") or "")
-                    instance = name if not context or name.startswith(context + "/") else f"{context}/{name}"
-                    record = {
-                        "instance": instance,
-                        "name": name,
-                        "depth": depth,
-                        "defining": defining,
-                        "defining_anchor": anchor,
-                        "native_owner": native_owner,
-                    }
-                    referenced = _property(component, "ReferencedConfiguration")
-                    record["configuration"] = str(referenced) if referenced is not None else None
-                    try:
-                        state = _method(component, "GetSuppression2")
-                        record["suppression_state"] = int(state) if type(state) is int else None
-                        if record["suppression_state"] is None:
-                            record["state_error"] = f"non-integer reading: {state!r}"[:200]
-                    except Exception as error:  # noqa: BLE001 - recorded for the policy refusal
-                        record["suppression_state"] = None
-                        record["state_error"] = f"{type(error).__name__}: {error}"[:200]
-                    try:
-                        record["resolved_path"] = str(_method(component, "GetPathName") or "")
-                    except Exception as error:  # noqa: BLE001 - recorded for the policy refusal
-                        record["resolved_path"] = ""
-                        record["path_error"] = f"{type(error).__name__}: {error}"[:200]
-                    virtual = None
-                    try:
-                        reading = _property(component, "IsVirtual")
-                        virtual = reading if type(reading) is bool else None
-                    except Exception:  # noqa: BLE001 - an unreadable virtual flag stays unknown
-                        virtual = None
-                    record["is_virtual"] = virtual
-                    resolved = record["resolved_path"]
-                    relative = _stage_relative(stage, resolved) if resolved else None
-                    record["resolved_relative"] = relative
-                    materialized = session_materialization_path(resolved) or (
-                        virtual is True and embedded_virtual_component_path(resolved)
-                    )
-                    anchor_for_children = instance if materialized else anchor
-                    child_owner = native_owner
-                    if not materialized and relative:
-                        child_owner = _index_spelling(index, relative) or native_owner
-                    if (
-                        (not resolved)
-                        or relative is None
-                        or virtual is True
-                        or session_artifact_path(resolved)
-                    ):
-                        imported, import_error = _imported_path_reading(component)
-                        record["imported_path"] = imported
-                        if import_error is not None:
-                            record["import_error"] = import_error
-                    occurrences.append(record)
-                    if record["suppression_state"] == COMPONENT_SUPPRESSED:
-                        continue
-                    child_defining = relative or resolved or defining
-                    for child in reversed(_as_list(_method(component, "GetChildren"))):
-                        stack.append((child, instance, depth + 1, child_defining, anchor_for_children, child_owner))
-                readings["occurrences"] = occurrences
-                readings["documents_after"] = int(_method(app, "GetDocumentCount"))
-                readings["document_state"] = {
-                    "before": document_state_before,
-                    "after": _discovery_document_state(doc),
-                    "used_api": (
-                        "IModelDoc2.GetSaveFlag/IModelDocExtension.NeedsRebuild2/"
-                        "IConfiguration.Name/IConfiguration.NeedsRebuild"
-                    ),
-                }
+                observation.update({
+                    "stored_references": stored,
+                    "stored_references_phase": "preopen",
+                })
+                yield observation
             finally:
                 try:
                     _method(app, "SetSearchFolders", SEARCH_FOLDER_DOCUMENT_TYPE, ";".join(pinned.get("before") or []))
                     restored = read_search_folders(app, SEARCH_FOLDER_DOCUMENT_TYPE)
-                    restored_folders = restored["folders"]
-                    restored_raw = restored["raw"]
-                except Exception as error:  # noqa: BLE001 - recorded, never masked
+                    restored_folders, restored_raw = restored["folders"], restored["raw"]
+                except Exception as error:  # noqa: BLE001 - release still runs before the refusal
                     restore_error = f"{type(error).__name__}: {error}"[:300]
         before_folders = list(pinned.get("before") or [])
         restored_ok = restored_folders is not None and sorted(
             str(item).casefold() for item in restored_folders
         ) == sorted(str(item).casefold() for item in before_folders)
-        readings["search"] = {
+        observation["search"] = {
             "folder_type": pinned.get("folder_type", SEARCH_FOLDER_DOCUMENT_TYPE),
             "apis": ["ISldWorks.GetSearchFolders", "ISldWorks.SetSearchFolders"],
             "before": before_folders,
             "before_raw": pinned.get("before_raw"),
-            "pinned": pinned.get("pinned", [str(stage)]),
+            "pinned": pinned.get("pinned", [str(source_root)]),
             "observed_after_pin": pinned.get("observed_after_pin", []),
             "after_raw": pinned.get("after_raw"),
             "set_return": pinned.get("set_return"),
             "restored": restored_ok,
             "restored_raw": restored_raw,
             "restore_error": restore_error,
-            "evidence": [dict(item) for item in self.staged_search_evidence()],
         }
-        readings["session"] = {**session_info, "sealed": True, "closed": True}
-        return readings
-
+        observation["session"] = {**identity, "sealed": True, "closed": True}
 
     def _probe_document(self, path):
         """Open the selected assembly without strict gating.
 
-        Documents already open in the owned session are reused.  Otherwise the
-        read-only open is attempted and its CAD-reported errors are recorded
+        The exact selected-root read-only open is attempted once, even if a
+        native application reports a resident document. Its errors are recorded
         instead of raised; the selected document is validated strictly before
         anything downstream reads it.  Only the exact vendor integer status is
         recorded: an unreadable VARIANT leaves the counts unset and blocks the
         selected root instead of coercing to zero.
         """
 
-        try:
-            doc = self._document_by_path(path)
-        except CadError as exc:
-            if exc.code != "document_not_open":
-                raise
-        else:
-            return {"doc": doc, "errors": 0, "warnings": 0, "open_exception": None, "already_open": True}
         try:
             doc, errors, warnings = self._open_document_raw(path)
         except Exception as exc:  # noqa: BLE001 - a per-open failure is recorded, not fatal
@@ -7392,7 +7257,6 @@ class SolidWorksBackend(CadBackend):
                 "errors": None,
                 "warnings": None,
                 "open_exception": f"{type(exc).__name__}: {exc}"[:300],
-                "already_open": False,
             }
         if type(errors.value) is int and type(warnings.value) is int:
             counts = (errors.value, warnings.value)
@@ -7405,15 +7269,7 @@ class SolidWorksBackend(CadBackend):
             "errors": counts[0],
             "warnings": counts[1],
             "open_exception": None,
-            "already_open": False,
         }
-
-    def _main_entry(self, path):
-        """The selected assembly opened read-only; per-open failures are recorded."""
-
-        entry = self._probe_document(str(path))
-        entry["path"] = path
-        return entry
 
     def discover_native(self, frozen_source: Path, settings: dict, *, on_activity=None) -> dict:
         """Read the raw native record for CAD-only discovery (owned session).
@@ -7539,44 +7395,47 @@ class SolidWorksBackend(CadBackend):
                 )
             selected_path = candidates[0]
             selection_mode = "sole_candidate"
+        from .revision import package_inventory
+
+        source_files = package_inventory(source_root)
         activity.emit("session_start", force=True)
-        with self.session():
+        with self._discover_session(source_root, source_files) as observation:
             native_api_pid = int(_method(self._app_obj(), "GetProcessID"))
             # Exactly the selected frozen entry is opened; zero or several
             # assemblies already failed before this session started.
             activity.emit("open_document", current_object=_activity_object(selected_path, source_root), force=True)
-            main_entry = self._main_entry(selected_path)
-            main_entry["selection_mode"] = selection_mode
-            main_path = main_entry["path"]
+            main_path = selected_path
+            main_entry = self._probe_document(str(main_path))
             errors = main_entry.get("errors")
             warnings = main_entry.get("warnings")
-            if main_entry.get("already_open"):
-                # A document already open in the owned session may have been
-                # loaded as a transitive dependency of another document; only a
-                # fresh exact-root open reports this document's own status.
-                try:
-                    doc, raw_errors, raw_warnings = self._open_document_raw(str(main_path))
-                except Exception as exc:  # noqa: BLE001 - reported as the strict open failure
-                    raise self._open_failure(
-                        str(main_path), None, None, exception=f"{type(exc).__name__}: {exc}"[:300]
-                    ) from exc
-                if doc is None:
-                    raise self._open_failure(
-                        str(main_path), None, None, exception="exact-root open returned no document"
-                    )
-                if type(raw_errors.value) is not int or type(raw_warnings.value) is not int:
-                    raise self._open_failure(
-                        str(main_path), None, None, exception="exact-root open status is not an integer"
-                    )
-                errors, warnings = raw_errors.value, raw_warnings.value
-                main_entry = {**main_entry, "doc": doc, "errors": errors, "warnings": warnings}
-            if main_entry.get("doc") is None or type(errors) is not int or errors != 0:
+            if main_entry.get("doc") is None or type(errors) is not int or type(warnings) is not int:
                 raise self._open_failure(
                     str(main_path),
                     errors if type(errors) is int else None,
                     warnings if type(warnings) is int else None,
                     exception=main_entry.get("open_exception"),
                 )
+            missing = (
+                self._missing_reference_evidence(str(main_path))
+                if errors == 2 else {"state": "unavailable", "items": []}
+            )
+            try:
+                open_status = normalize_open_status(
+                    {
+                        "errors": errors,
+                        "warnings": warnings,
+                        "missing_references": missing,
+                    }
+                )
+            except ValueError as status_error:
+                raise self._open_failure(
+                    str(main_path),
+                    errors,
+                    warnings,
+                    exception=str(status_error),
+                ) from status_error
+            if not open_status["continuable"]:
+                raise self._open_failure(str(main_path), errors, warnings, missing_references=missing)
             doc = main_entry["doc"]
             notes: list[str] = []
             activity.emit("read_document_state", current_object=_activity_object(main_path, source_root), force=True)
@@ -7594,6 +7453,7 @@ class SolidWorksBackend(CadBackend):
             identity_properties = _custom_properties(doc, configuration)
             doc = active = None
             components = []
+            unresolved_components = []
             by_component = {}
             by_document: dict[str, str] = {}
             owner_hashes: dict[str, str] = {}
@@ -7637,10 +7497,14 @@ class SolidWorksBackend(CadBackend):
                 components_total += len(root_children)
                 for raw in root_children:
                     component = _component(raw)
-                    name = str(_property(component, "Name2") or "")
-                    if not name:
-                        components_done += 1
-                        continue
+                    raw_name = _property(component, "Name2")
+                    if not _is_text_name(raw_name):
+                        raise CadError(
+                            "cad_component_identity_unreadable",
+                            "a component has no readable Name2",
+                            {"raw_name": _raw_scalar(raw_name)},
+                        )
+                    name = str(raw_name)
                     # The scoped instance identity must be byte-identical to the
                     # selection walk's stitching rule so the
                     # closure carrier's occurrence strings compare exactly.
@@ -7662,7 +7526,46 @@ class SolidWorksBackend(CadBackend):
                     # capture, not be silently traversed as a resolved occurrence.
                     state = _component_state(component)
                     document_path = _method(component, "GetPathName")
-                    source_document = _component_source_document(component, source_root)
+                    reference_context = {
+                        "defining": _relative_document(assembly_path, source_root) or str(assembly_path),
+                        "defining_anchor": anchor,
+                        "native_owner": _relative_document(owner_path, source_root) or str(owner_path),
+                    }
+                    loaded_document = _method(component, "GetModelDoc2")
+                    if state != COMPONENT_SUPPRESSED and loaded_document is None:
+                        raise CadError(
+                            "cad_component_unresolved",
+                            "an active occurrence has no loaded document for required engineering facts",
+                            {"component": path_name, "path": document_path, "suppression_state": state},
+                        )
+                    if (
+                        open_status["errors"] == 2 and state == COMPONENT_SUPPRESSED
+                        and document_path in (None, "")
+                    ):
+                        reference = _require_missing_component(component, path_name, document_path)
+                        unresolved_components.append(
+                            {
+                                "instance": path_name,
+                                "native_reference": {**reference, **reference_context},
+                                "document": (
+                                    normalize_document_path(str(document_path))
+                                    if _is_text_name(document_path)
+                                    else ""
+                                ),
+                                "configuration": str(
+                                    _property(component, "ReferencedConfiguration") or ""
+                                ),
+                                "suppression_state": state,
+                                "reason": (
+                                    "solidworks_returned_no_loaded_document"
+                                    if loaded_document is None
+                                    else "solidworks_returned_no_readable_file"
+                                ),
+                            }
+                        )
+                        components_done += 1
+                        continue
+                    source_document = _component_source_document(component, source_root, native_path=document_path)
                     # The native materialization identity is recorded inside
                     # source_provenance. Reading it from the outer record would
                     # make cached descendants lose their defining anchor.
@@ -7728,13 +7631,32 @@ class SolidWorksBackend(CadBackend):
                         ]
                         global_matrix = _compose_frames(parent_matrix, local_matrix)
                         transform = [value for row in global_matrix for value in row]
+                    fixed = None
+                    fixed_error = None
+                    try:
+                        fixed = _method(component, "IsFixed")
+                    except Exception as error:  # noqa: BLE001 - preserve the getter failure
+                        fixed_error = _native_error_record(error)
+                    else:
+                        if type(fixed) is not bool:
+                            fixed_error = {
+                                "code": "cad_component_fixed_invalid",
+                                "message": "IComponent2.IsFixed did not return bool",
+                                "detail": {
+                                    "value_type": type(fixed).__name__,
+                                    "value": repr(fixed),
+                                },
+                            }
+                            fixed = None
                     entry = {
                         "name2": path_name,
                         "instance_id": path_name,
+                        "native_reference": {**source_document["native_reference"], **reference_context},
                         "document": source_document["document"]
                         or (normalize_document_path(str(document_path)) if _is_text_name(document_path) else ""),
                         "configuration": str(_property(component, "ReferencedConfiguration") or ""),
-                        "fixed": bool(_method(component, "IsFixed")),
+                        "fixed": fixed,
+                        "fixed_error": fixed_error,
                         "suppressed": state == COMPONENT_SUPPRESSED,
                         "suppression_state": state,
                         "lightweight": state in (1, 4),
@@ -7753,7 +7675,7 @@ class SolidWorksBackend(CadBackend):
                     components.append(entry)
                     # Keep primitives beyond this traversal scope. Later
                     # configuration changes must not reuse borrowed occurrences.
-                    by_component[path_name] = (str(document_path), _method(component, "GetModelDoc2") is not None)
+                    by_component[path_name] = (str(document_path), loaded_document is not None)
                     by_document[path_name] = entry["document"]
                     children = list(_method(component, "GetChildren") or [])
                     if children:
@@ -7765,9 +7687,9 @@ class SolidWorksBackend(CadBackend):
                             # empty transform stays a blocking native finding
                             # downstream.
                             notes.append(f"transform:{path_name}:subtree_skipped_unreadable_parent")
-                        part = _method(component, "GetModelDoc2") if transform else None
+                        part = loaded_document if transform else None
                         if part is not None:
-                            referenced = str(_property(component, "ReferencedConfiguration") or "")
+                            referenced = entry["configuration"]
                             # A containment chain that repeats a document (an assembly
                             # holding itself, directly or through its ancestors) is a
                             # reference cycle: recursing would never converge and the
@@ -8178,12 +8100,17 @@ class SolidWorksBackend(CadBackend):
             files = {}
             hash_plan = []
             planned = set()
-            for path in (main_path, *[Path(item[0]) for item in by_component.values()]):
+            observed_paths = [
+                Path(by_component[entry["name2"]][0]) for entry in components if not entry["suppressed"]
+            ]
+            for path in (main_path, *observed_paths):
                 relative = _relative_document(path, source_root)
                 if relative and relative not in planned:
                     planned.add(relative)
                     hash_plan.append((path, relative))
             for entry in components:
+                if entry["suppressed"]:
+                    continue
                 provenance = entry.get("source_provenance", {})
                 relative = provenance.get("document") if provenance.get("state") == "resolved" else None
                 if relative and relative not in planned:
@@ -8224,7 +8151,7 @@ class SolidWorksBackend(CadBackend):
                 force=True,
                 params={"components": len(components), "mates": len(mates), "datums": len(datums)},
             )
-            return {
+            record = {
                 "schema_version": NATIVE_DISCOVERY_SCHEMA,
                 "contract": "native-discovery/v1",
                 "namespace": "dp",
@@ -8261,25 +8188,15 @@ class SolidWorksBackend(CadBackend):
                 "properties": property_buckets,
                 "files": files,
                 "selection": {
-                    "mode": main_entry.get("selection_mode"),
+                    "mode": selection_mode,
                     "main_assembly": _relative_document(main_path, source_root),
                 },
+                "open_status": open_status,
+                "unresolved_components": unresolved_components,
                 "notes": notes,
             }
-
-
-
-
-def _frame_from_raw(values: Sequence[float], *, field: str) -> Matrix:
-    try:
-        return tuple(transform_from_solidworks(values))  # type: ignore[return-value]
-    except CadError as error:
-        detail = error.detail if isinstance(error.detail, dict) else {"detail": error.detail}
-        raise CadError(error.code, error.message, {**detail, "field": field}) from error
-
-
-
-
+        record.update(observation)
+        return record
 def _native_error_record(error):
     detail = getattr(error, "detail", None)
     return {
@@ -8363,832 +8280,3 @@ def _compose_link_group_selections(groups, leaves, provider_names):
             "uncovered_leaves": uncovered,
         }
     return selections
-
-
-def _project_scene(raw_scene):
-    if not isinstance(raw_scene, dict):
-        raise CadError("cad_prepared_scene_facts_invalid", "scene_raw is not an object")
-    projected_by_name = {}
-    occurrences = raw_scene.get("occurrences")
-    components = raw_scene.get("components")
-    if not isinstance(occurrences, list) or not isinstance(components, list):
-        raise CadError("cad_prepared_scene_facts_invalid", "scene_raw occurrences are missing")
-    for occurrence in occurrences:
-        if not isinstance(occurrence, dict) or not isinstance(occurrence.get("name"), str):
-            raise CadError("cad_prepared_scene_facts_invalid", "a raw occurrence has no identity")
-        projected_by_name[occurrence["name"]] = _frame_from_raw(
-            occurrence.get("transform_raw"),
-            field=f"occurrences[{occurrence['name']}].transform_raw",
-        )
-    projected_components = []
-    for occurrence in components:
-        name = occurrence.get("name") if isinstance(occurrence, dict) else None
-        if name not in projected_by_name:
-            raise CadError("cad_prepared_scene_facts_invalid", "a component has no raw occurrence")
-        is_fixed = occurrence.get("is_fixed")
-        if type(is_fixed) is not bool:
-            raise CadError(
-                "cad_component_fixed_invalid",
-                "a raw component has no native boolean IsFixed value",
-                {
-                    "component": name,
-                    "value": repr(is_fixed),
-                    "error": copy.deepcopy(occurrence.get("is_fixed_error")),
-                },
-            )
-        projected_components.append(
-            RawComponent(
-                name=name,
-                path=str(occurrence.get("path") or ""),
-                transform=projected_by_name[name],
-                is_fixed=is_fixed,
-                document_type=str(occurrence.get("document_type") or ""),
-            )
-        )
-    coordinate_systems = {}
-    raw_datums = raw_scene.get("coordinate_systems")
-    if not isinstance(raw_datums, dict):
-        raise CadError("cad_prepared_scene_facts_invalid", "scene_raw coordinate systems are missing")
-    for key, datum in raw_datums.items():
-        if not isinstance(datum, dict):
-            raise CadError("cad_prepared_scene_facts_invalid", "a raw coordinate system is malformed")
-        datum_errors = datum.get("read_errors")
-        if not isinstance(datum_errors, dict):
-            raise CadError("cad_prepared_scene_facts_invalid", "a raw coordinate system has no error map")
-        if datum_errors:
-            first_error = next(iter(datum_errors.values()), {})
-            raise CadError(
-                str(first_error.get("code") or "cad_coordinate_system_invalid"),
-                str(first_error.get("message") or "raw coordinate-system data is invalid"),
-                {
-                    "coordinate_system": key,
-                    "array_data": copy.deepcopy(datum.get("array_data")),
-                    "error": copy.deepcopy(first_error),
-                },
-            )
-        local = _frame_from_raw(datum.get("array_data"), field=f"coordinate_systems[{key}].array_data")
-        owner = str(datum.get("owner") or "")
-        if owner:
-            placement_raw = datum.get("occurrence_transform_raw")
-            if not isinstance(placement_raw, list) or len(placement_raw) != 16:
-                raise CadError(
-                    "cad_coordinate_system_owner_unbound",
-                    "a component coordinate system has no raw occurrence placement",
-                    {"coordinate_system": key, "component": owner},
-                )
-            placement = _frame_from_raw(
-                placement_raw,
-                field=f"coordinate_systems[{key}].occurrence_transform_raw",
-            )
-            composed = _compose_frames(
-                [placement[offset : offset + 4] for offset in range(0, 16, 4)],
-                [local[offset : offset + 4] for offset in range(0, 16, 4)],
-            )
-            local = tuple(value for row in composed for value in row)
-        coordinate_systems[str(key)] = local
-    return RawScene(
-        document=str(raw_scene.get("document") or ""),
-        components=projected_components,
-        coordinate_systems=coordinate_systems,
-        mass_properties={},
-        notes=copy.deepcopy(raw_scene.get("notes") or {}),
-    )
-
-
-def _project_real(value, *, component, field):
-    if type(value) not in (int, float) or not math.isfinite(float(value)):
-        raise CadError(
-            f"cad_mass_property_{field}_invalid",
-            f"{field} must be a finite non-boolean number",
-            {"component": component, "value": _raw_scalar(value)},
-        )
-    return float(value)
-
-
-def _project_mass_reading(raw):
-    if not isinstance(raw, dict):
-        raise CadError("cad_mass_projection_invalid", "a raw mass reading is not an object")
-    read_errors = raw.get("read_errors")
-    if not isinstance(read_errors, dict):
-        raise CadError("cad_mass_projection_invalid", "a raw mass reading has no read-error map")
-    for field, error in read_errors.items():
-        if not isinstance(error, dict):
-            raise CadError("cad_mass_projection_invalid", "a raw mass read error is malformed", {"field": field})
-        if field in {"volume_m3", "density_kg_m3"}:
-            continue
-        if field == "material" and error.get("code") == "cad_material_provenance_missing":
-            continue
-        raise CadError(
-            str(error.get("code") or "cad_mass_read_failed"),
-            str(error.get("message") or f"native {field} read failed"),
-            copy.deepcopy(error.get("detail")),
-        )
-    native_raw = raw.get("native_raw")
-    if not isinstance(native_raw, dict):
-        raise CadError("cad_mass_projection_invalid", "a raw mass reading has no native getter values")
-    overrides = native_raw.get("overrides")
-    if (
-        not isinstance(overrides, dict)
-        or set(overrides) != {"OverrideMass", "OverrideCenterOfMass", "OverrideMomentsOfInertia"}
-        or any(type(value) is not bool for value in overrides.values())
-    ):
-        raise CadError("cad_mass_override_invalid", "native mass override flags are malformed", overrides)
-    if raw.get("mode") != "effective_instance" and any(overrides.values()):
-        raise CadError("cad_mass_override", "pure-CAD export refuses overrides", overrides)
-    if (
-        raw.get("mode") == "effective_instance"
-        and raw.get("state") == "sheet_only"
-        and not (isinstance(overrides, dict) and any(value is True for value in overrides.values()))
-    ):
-        raise CadError(
-            "cad_effective_instance_flags_invalid",
-            "a sheet-only effective instance needs an active override",
-            {"overrides": overrides},
-        )
-    component = str(
-        (raw.get("reference") or {}).get("part_document")
-        or (raw.get("reference") or {}).get("document")
-        or "mass"
-    )
-    mass = _project_real(native_raw.get("mass_kg"), component=component, field="mass")
-    com_raw = native_raw.get("center_of_mass_m")
-    if not isinstance(com_raw, list) or len(com_raw) != 3:
-        raise CadError(
-            "cad_mass_property_center_invalid",
-            "center_of_mass_m must be a three-value array",
-            {"component": component, "value": _raw_scalar(com_raw)},
-        )
-    com = [_project_real(value, component=component, field="center") for value in com_raw]
-    if mass <= 0.0:
-        raise CadError("cad_mass_projection_invalid", "a raw mass or center is invalid")
-    inertia, _axis = _inertia_from_raw(native_raw.get("inertia_values"), component)
-    reference = copy.deepcopy(raw.get("reference") or {})
-    for key, source_key in (("volume_m3", "volume_m3"), ("density_kg_m3", "density_kg_m3")):
-        value = native_raw.get(source_key)
-        reference[key] = (
-            _project_real(value, component=component, field=key) if value is not None else None
-        )
-    projected = {
-        "mass": mass,
-        "com": com,
-        "inertia": inertia,
-        "reference": reference,
-    }
-    for key in ("mode", "role", "state", "measurement_basis", "document_type"):
-        if raw.get(key) is not None:
-            projected[key] = raw[key]
-    return projected
-
-
-def _project_effective_reading(raw):
-    projected = copy.deepcopy(raw)
-    native_raw = projected.pop("native_raw", None)
-    part_measurement_raw = projected.pop("part_measurement_raw", None)
-    if not isinstance(native_raw, dict):
-        return projected
-    read_errors = projected.get("read_errors")
-    if not isinstance(read_errors, dict):
-        raise CadError("cad_mass_projection_invalid", "an effective-instance reading has no error map")
-    override_error = read_errors.get("overrides")
-    if isinstance(override_error, dict):
-        raise CadError(
-            str(override_error.get("code") or "cad_mass_override_unreadable"),
-            str(override_error.get("message") or "native mass override flags are unreadable"),
-            copy.deepcopy(override_error.get("detail")),
-        )
-    projected.pop("read_errors", None)
-    overrides = native_raw.get("overrides")
-    if (
-        not isinstance(overrides, dict)
-        or set(overrides) != {"OverrideMass", "OverrideCenterOfMass", "OverrideMomentsOfInertia"}
-        or any(type(value) is not bool for value in overrides.values())
-    ):
-        raise CadError("cad_mass_override_invalid", "native mass override flags are malformed", overrides)
-    reference = projected.get("reference")
-    if (
-        isinstance(reference, dict)
-        and reference.get("measurement_basis") == "cad_authored_effective_instance"
-        and not any(overrides.values())
-    ):
-        raise CadError(
-            "cad_effective_instance_flags_invalid",
-            "an authored effective instance needs an active override",
-            {"overrides": overrides},
-        )
-    selected_components = reference.get("selected_components") if isinstance(reference, dict) else None
-    component = str(
-        selected_components[0]
-        if isinstance(selected_components, list) and selected_components
-        else "effective_instance"
-    )
-    mass = _project_real(native_raw.get("mass_kg"), component=component, field="mass")
-    com_raw = native_raw.get("center_of_mass_m")
-    if not isinstance(com_raw, list) or len(com_raw) != 3:
-        raise CadError(
-            "cad_mass_property_center_invalid",
-            "center_of_mass_m must be a three-value array",
-            {"component": component, "value": _raw_scalar(com_raw)},
-        )
-    com = [_project_real(value, component=component, field="center") for value in com_raw]
-    if mass <= 0.0:
-        raise CadError("cad_mass_projection_invalid", "an effective-instance mass or center is invalid")
-    inertia, _axis = _inertia_from_raw(native_raw.get("inertia_values"), component)
-    projected["mass"] = mass
-    projected["com"] = com
-    projected["inertia"] = [list(row) for row in inertia]
-    if isinstance(part_measurement_raw, dict):
-        part = _project_mass_reading(part_measurement_raw)
-        reference = part.get("reference") or {}
-        projected["part_measurement"] = {
-            "mass_kg": part["mass"],
-            "center_of_mass_m": list(part["com"]),
-            "inertia_kg_m2": [list(row) for row in part["inertia"]],
-            "scope": reference.get("scope"),
-            "used_api": reference.get("used_api"),
-            "product_convention": reference.get("product_convention"),
-            **{
-                key: reference[key]
-                for key in ("volume_m3", "density_kg_m3")
-                if key in reference
-            },
-        }
-    return projected
-
-
-def _project_component_mass(raw):
-    if raw is None:
-        return None
-    if not isinstance(raw, dict):
-        raise CadError("cad_component_mass_projection_invalid", "raw component mass facts are not an object")
-    projected = copy.deepcopy(raw)
-    for row in projected.get("instances") or []:
-        if not isinstance(row, dict):
-            raise CadError("cad_component_mass_projection_invalid", "a raw component mass row is malformed")
-        name = str(row.get("name") or "component")
-        row["context_mass_kg"] = _project_real(row.get("context_mass_kg"), component=name, field="mass")
-        volume = row.get("context_volume_m3")
-        if volume is not None:
-            row["context_volume_m3"] = _project_real(volume, component=name, field="volume")
-        overrides = row.get("overrides")
-        if (
-            not isinstance(overrides, dict)
-            or set(overrides) != {"OverrideMass", "OverrideCenterOfMass", "OverrideMomentsOfInertia"}
-            or any(type(value) is not bool for value in overrides.values())
-        ):
-            raise CadError(
-                "cad_component_mass_projection_invalid",
-                "a raw component override row is malformed",
-                {"component": name},
-            )
-        if isinstance(row.get("effective"), dict):
-            row["effective"] = _project_effective_reading(row["effective"])
-    return projected
-
-
-def _project_link_group_mass(raw):
-    if not isinstance(raw, dict) or not isinstance(raw.get("links"), dict):
-        raise CadError("cad_link_group_projection_invalid", "raw link-group mass facts are missing")
-    links = {}
-    for body_name, body in raw["links"].items():
-        if not isinstance(body, dict) or not isinstance(body.get("reads"), list) or len(body["reads"]) != 2:
-            raise CadError(
-                "cad_link_group_projection_invalid",
-                "a raw link-group reading does not contain two reads",
-                {"body": body_name},
-            )
-        reads = []
-        essential_errors = (
-            "mass_kg",
-            "center_of_mass_m",
-            "inertia_values",
-            "overrides",
-        )
-        for read_index, read in enumerate(body["reads"]):
-            if not isinstance(read, dict):
-                raise CadError("cad_link_group_projection_invalid", "a raw link-group read is not an object")
-            read_errors = read.get("read_errors")
-            if not isinstance(read_errors, dict):
-                raise CadError("cad_link_group_projection_invalid", "a raw link-group read has no error map")
-            for field in essential_errors:
-                native_error = read_errors.get(field)
-                if native_error is None:
-                    continue
-                if not isinstance(native_error, dict):
-                    raise CadError(
-                        "cad_link_group_projection_invalid",
-                        "a raw link-group field error is malformed",
-                        {"body": body_name, "read": read_index, "field": field},
-                    )
-                native_detail = native_error.get("detail")
-                location = {
-                    "body": body_name,
-                    "read": read_index,
-                    "field": field,
-                }
-                if isinstance(native_detail, dict):
-                    detail = {**copy.deepcopy(native_detail), **location}
-                else:
-                    detail = {
-                        "native_detail": copy.deepcopy(native_detail),
-                        **location,
-                    }
-                raise CadError(
-                    str(native_error.get("code") or "cad_mass_read_failed"),
-                    str(native_error.get("message") or f"native {field} read failed"),
-                    detail,
-                )
-            overrides = read.get("overrides")
-            if (
-                not isinstance(overrides, dict)
-                or set(overrides) != {"OverrideMass", "OverrideCenterOfMass", "OverrideMomentsOfInertia"}
-                or any(type(value) is not bool for value in overrides.values())
-            ):
-                raise CadError("cad_mass_override_invalid", "native mass override flags are malformed", overrides)
-            mass = _project_real(read.get("mass_kg"), component=str(body_name), field="mass")
-            com_raw = read.get("com_m")
-            if not isinstance(com_raw, list) or len(com_raw) != 3:
-                raise CadError(
-                    "cad_mass_property_center_invalid",
-                    "a raw link-group COM must be a three-value array",
-                    {"body": body_name, "value": _raw_scalar(com_raw)},
-                )
-            com = [
-                _project_real(value, component=str(body_name), field="center")
-                for value in com_raw
-            ]
-            if mass <= 0.0:
-                raise CadError("cad_link_group_projection_invalid", "a raw link-group mass or center is invalid")
-            inertia, _axis = _inertia_from_raw(read.get("inertia_values_raw"), str(body_name))
-            origin_raw = read.get("inertia_values_about_origin_api")
-            projected_read = {
-                "mass_kg": mass,
-                "com_m": com,
-                "inertia_tensor_about_com": [list(row) for row in inertia],
-                "overrides": dict(overrides),
-                "inertia_values_about_origin_api": copy.deepcopy(origin_raw),
-            }
-            for key in ("volume_m3", "density_kg_m3"):
-                if key in read:
-                    projected_read[key] = read[key]
-            reads.append(projected_read)
-        tensor_delta = max(
-            abs(reads[0]["inertia_tensor_about_com"][row][column] - reads[1]["inertia_tensor_about_com"][row][column])
-            for row in range(3)
-            for column in range(3)
-        )
-        links[body_name] = {
-            "selection": [str(item) for item in body.get("selection") or []],
-            "reads": reads,
-            "reproducibility": {
-                "mass_delta_kg": abs(reads[0]["mass_kg"] - reads[1]["mass_kg"]),
-                "com_delta_norm_m": math.dist(reads[0]["com_m"], reads[1]["com_m"]),
-                "tensor_delta_max_abs": tensor_delta,
-            },
-        }
-    return {
-        "assembly": str(raw.get("assembly") or ""),
-        "configuration": str(raw.get("configuration") or ""),
-        "used_api": str(raw.get("used_api") or ""),
-        "selection_rule": str(raw.get("selection_rule") or ""),
-        "links": links,
-    }
-
-
-def _project_cylinder_axis(raw):
-    read_errors = raw.get("read_errors")
-    if not isinstance(read_errors, dict):
-        raise CadError("cad_axis_reference_invalid", "raw cylinder axis has no error map")
-    if read_errors:
-        raise CadError(
-            "cad_axis_reference_unreadable",
-            "raw cylinder-axis selection is incomplete",
-            {"component": raw.get("component"), "errors": copy.deepcopy(read_errors)},
-        )
-    candidates = raw.get("face_candidates")
-    if not isinstance(candidates, list):
-        raise CadError("cad_axis_reference_invalid", "raw cylinder axis has no face candidates")
-    cylindrical = []
-    for candidate in candidates:
-        if not isinstance(candidate, dict):
-            raise CadError("cad_axis_reference_invalid", "a raw axis candidate is malformed")
-        errors = candidate.get("read_errors")
-        if not isinstance(errors, dict):
-            raise CadError("cad_axis_reference_invalid", "a raw axis candidate has no error map")
-        if "is_cylinder" in errors:
-            raise CadError(
-                "cad_axis_reference_unreadable",
-                "ISurface.IsCylinder could not be read",
-                copy.deepcopy(errors["is_cylinder"]),
-            )
-        is_cylinder = candidate.get("is_cylinder")
-        if type(is_cylinder) is not bool:
-            raise CadError(
-                "cad_axis_reference_invalid",
-                "ISurface.IsCylinder did not return bool",
-                {"value": repr(is_cylinder)},
-            )
-        if not is_cylinder:
-            continue
-        if "surface" in errors or "cylinder_params" in errors:
-            raise CadError(
-                "cad_axis_reference_unreadable",
-                "a native cylindrical face did not expose CylinderParams",
-                copy.deepcopy(errors),
-            )
-        cylindrical.append(candidate)
-    if len(cylindrical) != 1:
-        raise CadError(
-            "cad_axis_reference_ambiguous" if cylindrical else "cad_axis_reference_not_cylinder",
-            "the selector does not identify exactly one native cylindrical face",
-            {
-                "component": raw.get("component"),
-                "feature_name": raw.get("feature_name"),
-                "face_index": raw.get("face_index"),
-                "cylindrical_face_count": len(cylindrical),
-            },
-        )
-    candidate = cylindrical[0]
-    raw_params = candidate.get("cylinder_params_raw")
-    if not isinstance(raw_params, (list, tuple)) or any(type(value) not in (int, float) for value in raw_params):
-        raise CadError("cad_axis_reference_not_cylinder", "CylinderParams did not return native numeric values")
-    try:
-        params = [float(value) for value in raw_params]
-    except Exception as error:  # noqa: BLE001
-        raise CadError(
-            "cad_axis_reference_not_cylinder",
-            "CylinderParams is not a numeric array",
-            {"raw_values": copy.deepcopy(raw_params)},
-        ) from error
-    if len(params) != 7 or not all(map(math.isfinite, params)):
-        raise CadError(
-            "cad_axis_reference_not_cylinder",
-            "CylinderParams must contain seven finite values",
-            {"raw_values": copy.deepcopy(raw_params)},
-        )
-    point, direction, radius = params[0:3], params[3:6], params[6]
-    norm = math.hypot(*direction)
-    if abs(norm - 1.0) > 1e-6 or radius <= 0.0:
-        raise CadError(
-            "cad_axis_reference_not_cylinder",
-            "native cylinder parameters require a unit axis and positive radius",
-            {
-                "component": raw.get("component"),
-                "face_index": candidate.get("face_index"),
-                "radius": radius,
-                "axis_norm": norm,
-            },
-        )
-    result = {
-        "kind": "cylinder",
-        "component": str(raw.get("component") or ""),
-        "body_type": str(raw.get("body_type_native")),
-        "selector": copy.deepcopy(raw.get("selector") or {}),
-        "surface": "cylinder",
-        "coordinate_frame": "component_local",
-        "direction_semantics": "undirected_axis_line",
-        "body_index": candidate.get("body_index"),
-        "face_index": candidate.get("face_index"),
-        "cylinder_params_raw": params,
-        "is_cylinder_raw": candidate["is_cylinder"],
-        "axis_point_m": point,
-        "axis_direction": [value / norm for value in direction],
-        "radius_m": radius,
-        "used_api": str(raw.get("used_api") or ""),
-    }
-    if candidate.get("feature_name") is not None:
-        result["feature_name"] = candidate["feature_name"]
-    if candidate.get("persist_reference_b64") is not None:
-        result["persist_reference_b64"] = candidate["persist_reference_b64"]
-    return result
-
-
-def project_axis_references(raw_rows):
-    """Project captured axis raw values after the owned CAD session closes."""
-
-    if not isinstance(raw_rows, list):
-        raise CadError("cad_axis_reference_invalid", "raw axis rows are not a list")
-    projected = []
-    for raw in raw_rows:
-        if not isinstance(raw, dict) or not isinstance(raw.get("joint"), str) or not raw["joint"]:
-            raise CadError("cad_axis_reference_invalid", "a raw axis row has no joint identity")
-        kind = raw.get("kind")
-        if kind == "reference_axis":
-            result = _project_reference_axis(raw)
-        elif kind == "cylinder":
-            result = _project_cylinder_axis(raw)
-        else:
-            raise CadError("cad_axis_reference_invalid", "a raw axis row has no supported kind")
-        projected.append({"joint": raw["joint"], **result})
-    return projected
-
-
-def project_prepared_capture(raw_facts) -> dict:
-    """Project one sealed native fact set after the owned session closes."""
-
-    if not isinstance(raw_facts, dict) or set(raw_facts) != NATIVE_CAPTURE_FACTS_KEYS:
-        raise CadError(
-            "cad_prepared_capture_facts",
-            "raw Capture facts have an unknown shape",
-            {
-                "expected": sorted(NATIVE_CAPTURE_FACTS_KEYS),
-                "received": sorted(raw_facts) if isinstance(raw_facts, dict) else None,
-            },
-        )
-    scene = _project_scene(raw_facts["scene_raw"])
-    part_mass_raw = raw_facts["part_mass_raw"]
-    if not isinstance(part_mass_raw, dict):
-        raise CadError("cad_prepared_capture_facts", "part_mass_raw is not an object")
-    notes = raw_facts["notes"] if isinstance(raw_facts["notes"], dict) else {}
-    for component in scene.components:
-        if component.name in part_mass_raw:
-            continue
-        error = notes.get("mass_error:" + component.name)
-        if isinstance(error, dict):
-            raise CadError(
-                str(error.get("code") or "cad_mass_property_unavailable"),
-                str(error.get("message") or "part mass getter failed"),
-                copy.deepcopy(error.get("detail")),
-            )
-        raise CadError(
-            "cad_prepared_capture_facts",
-            "part mass getter produced neither raw facts nor an error",
-            {"component": component.name},
-        )
-    scene.mass_properties = {
-        name: _project_mass_reading(row)
-        for name, row in part_mass_raw.items()
-    }
-    scene.notes = copy.deepcopy(raw_facts["notes"])
-    assembly_mass_raw = raw_facts["assembly_mass_raw"]
-    if assembly_mass_raw is None:
-        error = notes.get("assembly_mass_error")
-        if isinstance(error, dict):
-            raise CadError(
-                str(error.get("code") or "cad_mass_property_unavailable"),
-                str(error.get("message") or "assembly mass getter failed"),
-                copy.deepcopy(error.get("detail")),
-            )
-        raise CadError(
-            "cad_prepared_capture_facts",
-            "assembly mass getter produced neither raw facts nor an error",
-        )
-    if not isinstance(assembly_mass_raw, dict):
-        raise CadError("cad_prepared_capture_facts", "assembly_mass_raw is not an object")
-    component_mass_raw = raw_facts["component_mass_raw"]
-    if component_mass_raw is None:
-        error = notes.get("component_mass_error")
-        if isinstance(error, dict):
-            raise CadError(
-                str(error.get("code") or "cad_mass_property_unavailable"),
-                str(error.get("message") or "component mass getter failed"),
-                copy.deepcopy(error.get("detail")),
-            )
-        raise CadError(
-            "cad_prepared_capture_facts",
-            "component mass getter produced neither raw facts nor an error",
-        )
-    if not isinstance(component_mass_raw, dict):
-        raise CadError("cad_prepared_capture_facts", "component_mass_raw is not an object")
-    component_mass = copy.deepcopy(component_mass_raw)
-    effective_instances = {}
-    effective_error = None
-    if isinstance(notes.get("component_mass_error"), dict):
-        effective_error = copy.deepcopy(notes["component_mass_error"])
-    if isinstance(component_mass, dict):
-        for row in component_mass.get("instances") or []:
-            if not isinstance(row, dict):
-                continue
-            name = str(row.get("name") or "")
-            effective = row.get("effective")
-            if name and isinstance(effective, dict):
-                effective_instances[name] = _project_effective_reading(effective)
-            read_errors = row.get("read_errors")
-            if name and (row.get("effective_error") is not None or read_errors):
-                first_error = next(iter(read_errors.values()), {}) if isinstance(read_errors, dict) else {}
-                effective_error = effective_error or {
-                    "reason": str(
-                        row.get("effective_error")
-                        or (first_error.get("code") if isinstance(first_error, dict) else None)
-                        or "cad_component_mass_read_error"
-                    ),
-                    "message": f"effective instance {name} was not readable",
-                }
-        if component_mass.get("errors"):
-            effective_error = effective_error or {
-                "reason": "cad_component_mass_context_partial",
-                "message": "component mass context retained native read errors",
-            }
-    for name, row in part_mass_raw.items():
-        if isinstance(row, dict) and row.get("mode") == "effective_instance":
-            effective_instances[str(name)] = _project_effective_reading(row)
-    component_mass = _project_component_mass(component_mass_raw)
-    assembly_mass = _project_mass_reading(assembly_mass_raw)
-    return {
-        "scene": scene,
-        "assembly_mass": assembly_mass,
-        "component_mass": component_mass,
-        "effective_instances": effective_instances,
-        "effective_instances_error": effective_error,
-        "link_group_mass_properties": _project_link_group_mass(raw_facts["link_group_mass_raw"]),
-    }
-
-
-def _raw_geometry_record(
-    component: str,
-    facts: object,
-) -> tuple[list[float], list[dict], list[dict], dict, str, list[float]]:
-    if not isinstance(facts, Mapping):
-        raise CadError(
-            "cad_mesh_export_failed",
-            "prepared geometry facts are not a mapping",
-            {"component": component, "returned": type(facts).__name__},
-        )
-    if facts.get("component") != component:
-        raise CadError(
-            "cad_mesh_export_failed",
-            "prepared geometry facts name another component",
-            {"component": component, "reported": facts.get("component")},
-        )
-    if facts.get("state") != "observed" or facts.get("errors") or facts.get("empty_faces"):
-        raise CadError(
-            "cad_native_tessellation_unreadable",
-            "prepared geometry is incomplete",
-            {
-                "component": component,
-                "state": facts.get("state"),
-                "errors": copy.deepcopy(facts.get("errors") or []),
-                "empty_faces": copy.deepcopy(facts.get("empty_faces") or []),
-            },
-        )
-    triangle_values = facts.get("triangle_values")
-    body_inventory = facts.get("body_inventory")
-    face_inventory = facts.get("face_inventory")
-    body_counts = facts.get("bodies")
-    transform_raw = facts.get("transform_raw")
-    used_api = facts.get("used_api")
-    source_scope = facts.get("source_scope")
-    if (
-        not isinstance(triangle_values, list)
-        or not triangle_values
-        or len(triangle_values) % 9
-        or any(
-            type(value) not in (int, float)
-            or not math.isfinite(float(value))
-            for value in triangle_values
-        )
-        or not isinstance(body_inventory, list)
-        or not isinstance(face_inventory, list)
-        or not isinstance(body_counts, dict)
-        or set(body_counts) != {"solid", "sheet"}
-        or not isinstance(transform_raw, list)
-        or len(transform_raw) != 16
-        or any(
-            type(value) not in (int, float)
-            or not math.isfinite(float(value))
-            for value in transform_raw
-        )
-        or not isinstance(used_api, str)
-        or not used_api
-        or not isinstance(source_scope, dict)
-    ):
-        raise CadError(
-            "cad_mesh_export_failed",
-            "prepared geometry facts are malformed",
-            {"component": component},
-        )
-    return (
-        [float(value) for value in triangle_values],
-        copy.deepcopy(body_inventory),
-        copy.deepcopy(face_inventory),
-        dict(body_counts),
-        used_api,
-        [float(value) for value in transform_raw],
-    )
-
-
-def _publish_canonical_artifact(temporary: Path, target: Path, digest: str) -> None:
-    if target.is_file():
-        if _hash(target) != digest:
-            raise CadError(
-                "cad_mesh_digest_collision",
-                "two different geometry payloads resolved to one SHA-256 path",
-                {"temporary": str(temporary), "target": str(target)},
-            )
-        temporary.unlink()
-        return
-    target.parent.mkdir(parents=True, exist_ok=True)
-    os.replace(temporary, target)
-
-
-def materialize_native_triangles(
-    raw_geometry: Mapping[str, Mapping],
-    destinations: Mapping[str, str],
-) -> dict[str, dict]:
-    """Write raw native triangles and materialize STL after CAD release."""
-
-    from ...geometry.native_tessellation import (
-        build_native_tessellation,
-        materialize_native_stl,
-        native_stl_relative_path,
-        native_triangle_relative_path,
-        parse_native_tessellation,
-        write_native_triangle_stream,
-    )
-
-    if not isinstance(raw_geometry, Mapping) or not isinstance(destinations, Mapping):
-        raise CadError(
-            "cad_mesh_export_failed",
-            "geometry serialization requires component mappings",
-            {
-                "raw_geometry": type(raw_geometry).__name__,
-                "destinations": type(destinations).__name__,
-            },
-        )
-    if set(raw_geometry) != set(destinations):
-        raise CadError(
-            "cad_mesh_export_failed",
-            "geometry serialization has a different occurrence set",
-            {
-                "raw_geometry": sorted(raw_geometry),
-                "destinations": sorted(destinations),
-            },
-        )
-    serialized = {}
-    for component in sorted(raw_geometry):
-        (
-            triangle_values,
-            body_inventory,
-            face_inventory,
-            body_counts,
-            used_api,
-            transform_raw,
-        ) = _raw_geometry_record(component, raw_geometry[component])
-        source_scope = raw_geometry[component].get("source_scope")
-        triangles = len(triangle_values) // 9
-        requested = Path(destinations[component])
-        evidence_root = (
-            requested.parent.parent
-            if requested.parent.name == "geometry"
-            else requested.parent
-        )
-        raw_directory = evidence_root / "raw" / "triangles"
-        stl_directory = evidence_root / "geometry"
-        raw_temporary = raw_directory / f".{requested.stem}.partial.triangles"
-        stl_temporary = stl_directory / f".{requested.stem}.partial.stl"
-        if raw_temporary == stl_temporary:
-            raise CadError(
-                "cad_mesh_export_failed",
-                "native triangle and STL destinations must differ",
-                {"component": component, "path": str(requested)},
-            )
-        try:
-            write_native_triangle_stream(raw_temporary, triangle_values)
-            tessellation = build_native_tessellation(
-                component,
-                body_inventory,
-                face_inventory,
-                source_scope=source_scope,
-            )
-            spans = parse_native_tessellation(
-                component,
-                tessellation,
-                body_counts,
-                triangles,
-                source_scope=source_scope,
-                warnings=[],
-            )
-            materialize_native_stl(raw_temporary, stl_temporary, spans)
-            raw_sha = _hash(raw_temporary)
-            stl_sha = _hash(stl_temporary)
-            raw_relative = native_triangle_relative_path(raw_sha)
-            stl_relative = native_stl_relative_path(stl_sha)
-            raw_path = evidence_root / raw_relative
-            stl_path = evidence_root / stl_relative
-            _publish_canonical_artifact(raw_temporary, raw_path, raw_sha)
-            _publish_canonical_artifact(stl_temporary, stl_path, stl_sha)
-        except CadError:
-            raise
-        except Exception as error:  # noqa: BLE001 - preserve the failing component
-            raise CadError(
-                "cad_mesh_serialization_failed",
-                "native triangle serialization failed after CAD release",
-                {
-                    "component": component,
-                    "raw_path": str(raw_temporary),
-                    "stl_path": str(stl_temporary),
-                    "error": f"{type(error).__name__}: {error}"[:500],
-                },
-            ) from error
-        serialized[component] = {
-            "component": component,
-            "raw_path": raw_relative,
-            "raw_sha": raw_sha,
-            "path": stl_relative,
-            "sha": stl_sha,
-            "triangles": triangles,
-            "bodies": body_counts,
-            "used_api": used_api,
-            "tessellation": tessellation,
-            "transform_raw": transform_raw,
-        }
-    return serialized

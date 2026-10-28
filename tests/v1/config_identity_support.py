@@ -187,7 +187,11 @@ def stub_directory(root: Path) -> Path:
     return target
 
 
-def run_writer(root: Path, snapshot: Path) -> tuple[subprocess.CompletedProcess, dict]:
+def run_writer(
+    root: Path,
+    snapshot: Path,
+    record_file: Path | None = None,
+) -> tuple[subprocess.CompletedProcess, dict]:
     stubs = stub_directory(root)
     record_path = root / "airflow-connection.json"
     env = runtime_env(root)
@@ -195,15 +199,18 @@ def run_writer(root: Path, snapshot: Path) -> tuple[subprocess.CompletedProcess,
         STUB_AIRFLOW_RECORD=str(record_path),
         PYTHONPATH=os.pathsep.join([str(stubs), str(ROOT), str(ROOT / "src")]),
     )
+    command = [
+        sys.executable,
+        str(WRITER),
+        "--state-root",
+        str(root / "state"),
+        "--snapshot",
+        str(snapshot),
+    ]
+    if record_file is not None:
+        command += ["--record-file", str(record_file)]
     result = subprocess.run(
-        [
-            sys.executable,
-            str(WRITER),
-            "--state-root",
-            str(root / "state"),
-            "--snapshot",
-            str(snapshot),
-        ],
+        command,
         capture_output=True,
         text=True,
         env=env,

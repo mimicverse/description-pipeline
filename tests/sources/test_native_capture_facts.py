@@ -3,18 +3,35 @@
 from __future__ import annotations
 
 import copy
-import json
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+
+from description_pipeline.geometry.native_scope import (
+    native_scope_identity_sha256,
+)
+from description_pipeline.geometry.native_tessellation import (
+    native_triangle_relative_path,
+    write_native_triangle_stream,
+)
 from description_pipeline.geometry.native_transform import transform_from_solidworks
 from description_pipeline.io import PipelineError, write_json
-from description_pipeline.schemas import EFFECTIVE_INSTANCES_SCHEMA
+from description_pipeline.schemas import (
+    EFFECTIVE_INSTANCES_SCHEMA,
+    NATIVE_CAPTURE_OBSERVATION_SCHEMA,
+)
 from description_pipeline.sources.snapshot import verify_snapshot, write_manifest
+from description_pipeline.sources.solidworks import capture_projection
+from description_pipeline.sources.solidworks.errors import BridgeError, CadError
 from description_pipeline.verification import capture_evidence
 from description_pipeline.verification.native_capture_facts import verify_native_capture_facts
-from description_pipeline.verification.solidworks_physics import verify_urdf_mass_equality
+from description_pipeline.verification.solidworks_physics import (
+    _require_link_repeatability,
+    verify_urdf_mass_equality,
+)
 
 
 class NativeCaptureFactsTests(unittest.TestCase):
@@ -98,6 +115,7 @@ class NativeCaptureFactsTests(unittest.TestCase):
             "virtual_native_api_pid": None,
         }
         raw_facts = {
+            "schema_version": NATIVE_CAPTURE_OBSERVATION_SCHEMA,
             "scene_raw": {
                 "document": "/source/root.SLDASM",
                 "configuration": "Default",
@@ -106,6 +124,7 @@ class NativeCaptureFactsTests(unittest.TestCase):
                         "name": "base",
                         "path": "/source/base.SLDPRT",
                         "transform_raw": self.identity,
+                        "suppression_state": 2,
                         "is_fixed": True,
                         "document_type": "part",
                     }
@@ -115,6 +134,7 @@ class NativeCaptureFactsTests(unittest.TestCase):
                         "name": "base",
                         "path": "/source/base.SLDPRT",
                         "transform_raw": self.identity,
+                        "suppression_state": 2,
                         "is_fixed": True,
                         "document_type": "part",
                     }
@@ -127,6 +147,7 @@ class NativeCaptureFactsTests(unittest.TestCase):
                         "configuration": "Default",
                         "document": "/source/base.SLDPRT",
                         "array_data": self.identity,
+                        "read_errors": {},
                         "occurrence_transform_raw": self.identity,
                     }
                 },
@@ -162,6 +183,54 @@ class NativeCaptureFactsTests(unittest.TestCase):
                 },
             },
             "source_scopes": {"base": source_scope},
+            "geometry_raw": {
+                "base": {
+                    "stream_path": "",
+                    "stream_sha256": "",
+                    "triangle_count": 1,
+                    "body_inventory": [
+                        {
+                            "body_type": 0,
+                            "body_index": 0,
+                            "body_name": "base",
+                            "face_count": 1,
+                        }
+                    ],
+                    "face_inventory": [
+                        {
+                            "body_type": 0,
+                            "body_index": 0,
+                            "face_index": 0,
+                            "triangle_start": 0,
+                            "triangle_count": 1,
+                        }
+                    ],
+                    "body_counts": {"solid": 1, "sheet": 0},
+                    "used_api": "fixture",
+                    "source_scope_sha256": native_scope_identity_sha256(
+                        source_scope
+                    ),
+                    "appearance_raw": None,
+                }
+            },
+            "axis_references_raw": [],
+            "document_state": {
+                "before": {
+                    "path": "/source/root.SLDASM",
+                    "active_configuration": "Default",
+                    "read_only": True,
+                    "save_flag": False,
+                },
+                "after": {
+                    "path": "/source/root.SLDASM",
+                    "active_configuration": "Default",
+                    "read_only": True,
+                    "save_flag": False,
+                },
+            },
+            "input_stability": {
+                "originals_unchanged": {"files_checked": 1},
+            },
             "notes": {},
         }
         projected_mass = {
@@ -258,22 +327,39 @@ class NativeCaptureFactsTests(unittest.TestCase):
         detected: str = "solidworks_standard",
         applied: bool = False,
     ):
+        del detected, applied
+        triangle_values = [
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+        ]
+        temporary_stream = self.root / "evidence/raw/fixture.triangles"
+        count = write_native_triangle_stream(
+            temporary_stream,
+            triangle_values,
+        )
+        stream_sha256 = hashlib.sha256(
+            temporary_stream.read_bytes()
+        ).hexdigest()
+        stream_path = native_triangle_relative_path(stream_sha256)
+        target = self.root / "evidence" / stream_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary_stream.replace(target)
+        geometry = self.raw_facts["geometry_raw"]["base"]
+        geometry.update(
+            stream_path=stream_path,
+            stream_sha256=stream_sha256,
+            triangle_count=count,
+        )
         write_json(
             self.root / "evidence/raw/native_capture_facts.json",
             self.raw_facts,
-        )
-        write_json(
-            self.root / "evidence/raw/scene_raw.json",
-            self.raw_facts["scene_raw"],
-        )
-        write_json(self.root / "evidence/capture.json", self.capture)
-        write_json(
-            self.root / "evidence/raw/inertia_convention.json",
-            {
-                "schema_version": "solidworks-to-urdf.inertia-convention/v1",
-                "detected": detected,
-                "capture_transform": {"applied": applied},
-            },
         )
         write_manifest(
             self.root / "evidence",
@@ -285,93 +371,170 @@ class NativeCaptureFactsTests(unittest.TestCase):
             evidence_class="fixture",
         )
 
-    def test_projected_values_are_bound_to_raw_facts(self):
-        capture = json.loads(
-            (self.root / "evidence/capture.json").read_text(encoding="utf-8")
+    def write_urdf(self, body: str) -> None:
+        (self.root / "urdf/robot.urdf").write_text(
+            f'<robot name="fixture">{body}</robot>',
+            encoding="utf-8",
         )
-        self.assertNotIn("native_capture_facts", capture)
-        self.assertTrue(
-            (self.root / "evidence/raw/native_capture_facts.json").is_file()
-        )
+
+    def test_raw_values_reconstruct_and_close_mass(self):
         result = verify_native_capture_facts(self.root)
         self.assertTrue(result["native_capture_facts"])
         self.assertEqual(result["inertia_family"], "solidworks_standard")
         self.assertEqual(verify_urdf_mass_equality(self.root)["urdf_mass_kg"], 2.0)
 
-    def test_projected_mass_tamper_fails_with_raw_facts_unchanged(self):
-        self.capture["components"][0]["mass_properties"]["mass"] = 2.01
+    def test_urdf_mass_reconciles_to_the_raw_whole_value_exactly(self) -> None:
+        details = verify_urdf_mass_equality(self.root)
+        self.assertEqual(details["whole_cad_mass_kg"], 2.0)
+        self.assertEqual(details["urdf_mass_kg"], 2.0)
+        self.assertEqual(details["delta_kg"], 0.0)
+        self.assertEqual(details["atol_kg"], 1e-12)
+        self.assertEqual(details["rtol"], 0.0)
+
+        self.write_urdf(
+            '<link name="base"><inertial><mass value="2.000001"/>'
+            "</inertial></link>"
+        )
+        with self.assertRaisesRegex(PipelineError, "differs"):
+            verify_urdf_mass_equality(self.root)
+
+    def test_urdf_mass_parser_rejects_malformed_inertial_inventory(self) -> None:
+        cases = {
+            "no-inertial": '<link name="base"/>',
+            "multiple-inertial": (
+                '<link name="base"><inertial><mass value="2.0"/></inertial>'
+                '<inertial><mass value="2.0"/></inertial></link>'
+            ),
+            "missing-mass": '<link name="base"><inertial/></link>',
+            "duplicate-mass": (
+                '<link name="base"><inertial><mass value="2.0"/>'
+                '<mass value="2.0"/></inertial></link>'
+            ),
+            "nonnumeric-mass": (
+                '<link name="base"><inertial><mass value="invalid"/>'
+                "</inertial></link>"
+            ),
+        }
+        for label, body in cases.items():
+            with self.subTest(label=label):
+                self.write_urdf(body)
+                with self.assertRaises(PipelineError):
+                    verify_urdf_mass_equality(self.root)
+
+    def test_urdf_mass_counts_only_actual_links(self) -> None:
+        self.write_urdf(
+            '<link name="base"><inertial><mass value="2.0"/></inertial></link>'
+            '<link name="sensor_frame"/>'
+            "<extension><inertial><mass value=\"100.0\"/></inertial></extension>"
+        )
+        details = verify_urdf_mass_equality(self.root)
+        self.assertEqual(details["urdf_mass_kg"], 2.0)
+        self.assertEqual(details["inertials"], 1)
+
+    def test_material_provenance_warning_reconstructs_from_raw_facts(self) -> None:
+        self.assertEqual(
+            capture_evidence.material_provenance(self.root)["warnings"],
+            [],
+        )
+        assignment = {
+            "schema_version": "swbridge.material-assignment/v1",
+            "configuration": "Default",
+            "unverified_reason": "cad_material_provenance_missing",
+            "message": "explicit physical material is missing",
+            "missing_body_indices": [0],
+        }
+        self.raw_facts["part_mass_raw"]["base"]["reference"][
+            "material_assignment"
+        ] = copy.deepcopy(assignment)
         self.write_capture()
-        with self.assertRaisesRegex(PipelineError, "projected mass differs"):
-            verify_native_capture_facts(self.root)
 
-    def test_projected_transform_tamper_fails_with_raw_facts_unchanged(self):
-        self.capture["scene"]["components"][0]["transform"][3] = 0.25
-        self.write_capture()
-        with self.assertRaisesRegex(PipelineError, "transform differs"):
-            verify_native_capture_facts(self.root)
+        record = capture_evidence.material_provenance(self.root)
+        self.assertEqual(
+            [warning["code"] for warning in record["warnings"]],
+            ["cad_material_provenance_missing"],
+        )
+        warning = record["warnings"][0]
+        self.assertIs(warning["blocking"], False)
+        self.assertEqual(warning["component"], "base")
+        self.assertEqual(warning["material_assignment"], assignment)
+        self.assertEqual(warning["measured"]["mass_kg"], 2.0)
+        self.assertEqual(warning["measured"]["center_of_mass_m"], [0.1, 0.2, 0.0])
+        self.assertTrue(
+            verify_native_capture_facts(self.root)["native_capture_facts"]
+        )
 
-    def test_projected_datum_tamper_fails_with_raw_facts_unchanged(self):
-        self.capture["scene"]["coordinate_systems"]["base::Datum"][3] = 0.25
-        self.write_capture()
-        with self.assertRaisesRegex(PipelineError, "datum matrix differs"):
-            verify_native_capture_facts(self.root)
+    def test_link_group_repeatability_records_and_rejects_raw_drift(self) -> None:
+        baseline = copy.deepcopy(self.raw_facts)
+        record = capture_evidence.link_group_mass_properties(self.root)
+        row = record["links"]["base"]
+        tensors = [
+            np.asarray(read["inertia_tensor_about_com"], dtype=float)
+            for read in row["reads"]
+        ]
+        _require_link_repeatability(
+            "base",
+            row["reads"],
+            tensors,
+            row["reproducibility"],
+        )
 
-    def test_duplicate_projected_rows_cannot_hide_a_conflicting_first_value(self):
-        component = copy.deepcopy(self.capture["components"][0])
-        conflicting_component = copy.deepcopy(component)
-        conflicting_component["mass_properties"]["mass"] = 99.0
-        self.capture["components"] = [conflicting_component, component]
-        self.write_capture()
-        with self.assertRaisesRegex(PipelineError, "component reading is duplicated"):
-            verify_native_capture_facts(self.root)
-
-        self.capture["components"] = [component]
-        matrix = copy.deepcopy(self.capture["scene"]["coordinate_systems"]["base::Datum"])
-        conflicting_datum = {"name": "base::Datum", "matrix": copy.deepcopy(matrix)}
-        conflicting_datum["matrix"][3] = 99.0
-        correct_datum = {"name": "base::Datum", "matrix": matrix}
-        self.capture["datums"] = [conflicting_datum, correct_datum]
-        self.write_capture()
-        with self.assertRaisesRegex(PipelineError, "datum record is duplicated"):
-            capture_evidence.datums(self.root)
-
-    def test_each_projected_mass_surface_rejects_small_tampering(self):
-        def inertia(capture):
-            capture["components"][0]["mass_properties"]["inertia"][0][1] = 1e-13
-
-        def com(capture):
-            capture["components"][0]["mass_properties"]["com"][0] += 1e-13
-
-        def assembly(capture):
-            capture["mass_closure"]["top_level"]["mass"] += 1e-13
-
-        def link(capture):
-            capture["link_group_mass_properties"]["links"]["base"]["reads"][0][
-                "mass_kg"
-            ] += 1e-13
-
-        base_capture = copy.deepcopy(self.capture)
-        for mutate, message in (
-            (inertia, "projected inertia differs"),
-            (com, "projected COM differs"),
-            (assembly, "assembly: projected mass differs"),
-            (link, "link-group base read 0: projected mass differs"),
-        ):
-            with self.subTest(message=message):
-                capture = copy.deepcopy(base_capture)
-                mutate(capture)
-                self.capture = capture
+        mutations = (
+            (
+                "mass",
+                lambda read: read.__setitem__("mass_kg", 2.001),
+                lambda read: read.__setitem__("mass_kg", 2.001),
+            ),
+            (
+                "com",
+                lambda read: read["com_m"].__setitem__(0, 0.101),
+                lambda read: read["com_m"].__setitem__(0, 0.101),
+            ),
+            (
+                "tensor",
+                lambda read: read["inertia_values_raw"].__setitem__(0, 1.00001),
+                lambda read: read["inertia_tensor_about_com"][0].__setitem__(
+                    0,
+                    1.00001,
+                ),
+            ),
+        )
+        for label, mutate_raw, mutate_projected in mutations:
+            with self.subTest(label=label):
+                facts = copy.deepcopy(baseline)
+                reads = facts["link_group_mass_raw"]["links"]["base"]["reads"]
+                reads[1] = copy.deepcopy(reads[0])
+                mutate_raw(reads[1])
+                self.raw_facts = facts
                 self.write_capture()
-                with self.assertRaisesRegex(PipelineError, message):
-                    verify_native_capture_facts(self.root)
+
+                with self.assertRaisesRegex(
+                    BridgeError,
+                    "neither product convention fits",
+                ):
+                    capture_evidence.link_group_mass_properties(self.root)
+
+                projected = copy.deepcopy(row)
+                projected["reads"][1] = copy.deepcopy(projected["reads"][0])
+                mutate_projected(projected["reads"][1])
+                tensors = [
+                    np.asarray(
+                        read["inertia_tensor_about_com"],
+                        dtype=float,
+                    )
+                    for read in projected["reads"]
+                ]
+                with self.assertRaisesRegex(PipelineError, "do not repeat"):
+                    _require_link_repeatability(
+                        "base",
+                        projected["reads"],
+                        tensors,
+                        projected["reproducibility"],
+                    )
 
     def test_positive_products_are_normalized_from_raw_facts(self):
-        capture = copy.deepcopy(self.capture)
         raw_facts = copy.deepcopy(self.raw_facts)
         positive_about = [1.0, 0.04, 0.0, 0.04, 2.0, 0.0, 0.0, 0.0, 3.0]
         positive_origin = [1.08, 0.08, 0.0, 0.08, 2.02, 0.0, 0.0, 0.0, 3.10]
-        normalized_about = [[1.0, -0.04, 0.0], [-0.04, 2.0, 0.0], [0.0, 0.0, 3.0]]
-        normalized_origin = [1.08, -0.08, 0.0, -0.08, 2.02, 0.0, 0.0, 0.0, 3.10]
         for raw in (
             raw_facts["part_mass_raw"]["base"],
             raw_facts["assembly_mass_raw"],
@@ -380,78 +543,388 @@ class NativeCaptureFactsTests(unittest.TestCase):
         for read in raw_facts["link_group_mass_raw"]["links"]["base"]["reads"]:
             read["inertia_values_raw"] = positive_about
             read["inertia_values_about_origin_api"] = positive_origin
-        capture["components"][0]["mass_properties"]["inertia"] = normalized_about
-        capture["mass_closure"]["top_level"]["inertia"] = normalized_about
-        for read in capture["link_group_mass_properties"]["links"]["base"]["reads"]:
-            read["inertia_tensor_about_com"] = normalized_about
-            read["inertia_values_about_origin_api"] = normalized_origin
-        self.capture = capture
         self.raw_facts = raw_facts
-        self.write_capture(detected="solidworks_positive", applied=True)
+        self.write_capture()
         result = verify_native_capture_facts(self.root)
         self.assertTrue(result["inertia_transform_applied"])
 
-    def test_effective_projected_tamper_fails_with_raw_facts_unchanged(self):
-        capture = copy.deepcopy(self.capture)
-        raw_facts = copy.deepcopy(self.raw_facts)
-        raw = raw_facts["component_mass_raw"]["instances"][0]
+    def test_effective_instance_projection_uses_raw_component_context(self) -> None:
+        raw = self.raw_facts["component_mass_raw"]["instances"][0]
+        overrides = {
+            "OverrideMass": True,
+            "OverrideCenterOfMass": False,
+            "OverrideMomentsOfInertia": False,
+        }
         raw["effective"] = {
             "native_raw": {
                 "mass_kg": 1.0,
                 "center_of_mass_m": [0.01, 0.0, 0.0],
-                "inertia_values": [0.1, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0, 0.0, 0.3],
-                "overrides": self.overrides,
+                "inertia_values": [
+                    0.1,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.2,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.3,
+                ],
+                "overrides": overrides,
             },
-            "reference": {"scope": "assembly_component_group"},
+            "reference": {
+                "scope": "assembly_component_group",
+                "part_document": "/source/base.SLDPRT",
+                "assembly_document": "/source/root.SLDASM",
+                "configuration": "Default",
+                "overrides": overrides,
+            },
             "read_errors": {},
         }
-        projected_effective = {
-            "mass": 1.0,
-            "com": [0.01, 0.0, 0.0],
-            "inertia": [[0.1, 0.0, 0.0], [0.0, 0.2, 0.0], [0.0, 0.0, 0.3]],
-        }
-        capture["mass_closure"]["component_context"]["instances"][0]["effective"] = (
-            projected_effective
+        self.write_capture()
+        result = verify_native_capture_facts(self.root)
+        self.assertTrue(result["native_capture_facts"])
+        effective = capture_evidence.effective_instances(self.root)
+        self.assertEqual(set(effective["readings"]), {"base"})
+        self.assertEqual(
+            [row["code"] for row in effective["warnings"]],
+            ["cad_instance_override_effective"],
         )
-        capture["effective_instances"]["readings"] = {"base": projected_effective}
-        capture["scene"]["notes"]["effective_instances"] = {"base": projected_effective}
-        self.capture = capture
-        self.raw_facts = raw_facts
+
+    def test_explicit_mass_and_link_read_errors_fail_closed(self) -> None:
+        self.raw_facts["part_mass_raw"]["base"]["read_errors"] = {
+            "mass_kg": {
+                "code": "cad_mass_read_failed",
+                "message": "unreadable",
+            }
+        }
         self.write_capture()
-        verify_native_capture_facts(self.root)
-        projected_effective["inertia"][0][1] = 1e-13
-        self.write_capture()
-        with self.assertRaisesRegex(
-            PipelineError, "effective instance base: projected inertia differs"
-        ):
+        with self.assertRaisesRegex(PipelineError, "raw mass_kg read failed"):
             verify_native_capture_facts(self.root)
 
-    def test_near_symmetric_raw_inertia_preserves_each_offdiagonal(self):
-        capture = copy.deepcopy(self.capture)
-        raw_facts = copy.deepcopy(self.raw_facts)
-        raw_facts["assembly_mass_raw"] = copy.deepcopy(
-            raw_facts["assembly_mass_raw"]
-        )
-        raw = raw_facts["part_mass_raw"]["base"]["native_raw"]
-        raw["inertia_values"] = [1.0, 1e-13, 0.0, 2e-13, 2.0, 0.0, 0.0, 0.0, 3.0]
-        capture["components"][0]["mass_properties"]["inertia"] = [
-            [1.0, 1e-13, 0.0],
-            [2e-13, 2.0, 0.0],
-            [0.0, 0.0, 3.0],
+        self.raw_facts["part_mass_raw"]["base"]["read_errors"] = {}
+        self.raw_facts["link_group_mass_raw"]["links"]["base"]["reads"][0][
+            "read_errors"
+        ] = {
+            "mass_kg": {
+                "code": "cad_mass_read_failed",
+                "message": "unreadable",
+            }
+        }
+        self.write_capture()
+        with self.assertRaisesRegex(
+            PipelineError,
+            "link-group base read 0 mass_kg failed: cad_mass_read_failed",
+        ):
+            capture_evidence.link_group_mass_properties(self.root)
+
+    def test_axis_unread_state_cannot_be_masked_by_valid_values(self) -> None:
+        self.raw_facts["axis_references_raw"] = [
+            {
+                "joint": "hinge",
+                "kind": "reference_axis",
+                "component": "base",
+                "selector": {"kind": "reference_axis", "component": "base"},
+                "coordinate_frame": "component_local",
+                "read_errors": {},
+                "used_api": "fixture",
+                "suppressed_raw": False,
+                "feature_error_code_raw": False,
+                "endpoints_raw": [0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            }
         ]
-        self.capture = capture
-        self.raw_facts = raw_facts
         self.write_capture()
-        verify_native_capture_facts(self.root)
-        capture["components"][0]["mass_properties"]["inertia"][1][0] = 1e-13
+        with self.assertRaisesRegex(PipelineError, "feature error"):
+            capture_evidence.axes(self.root)
+
+        row = self.raw_facts["axis_references_raw"][0]
+        row.update(
+            kind="cylinder",
+            feature_name="Cyl1",
+            body_type_native="solid",
+            face_candidates=[
+                {
+                    "body_index": 0,
+                    "face_index": 0,
+                    "feature_name": "Cyl1",
+                    "is_cylinder": True,
+                    "cylinder_params_raw": [
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                        0.01,
+                    ],
+                    "read_errors": {
+                        "is_cylinder": {
+                            "code": "cad_axis_reference_unreadable"
+                        }
+                    },
+                }
+            ],
+        )
         self.write_capture()
-        with self.assertRaisesRegex(PipelineError, "projected inertia differs"):
-            verify_native_capture_facts(self.root)
+        with self.assertRaisesRegex(PipelineError, "candidate type is unreadable"):
+            capture_evidence.axes(self.root)
+
+        candidate = row["face_candidates"][0]
+        candidate["read_errors"] = {}
+        for field, value in (
+            ("body_index", False),
+            ("body_index", -1),
+            ("body_index", "0"),
+            ("face_index", False),
+            ("face_index", -1),
+            ("face_index", "0"),
+        ):
+            with self.subTest(field=field, value=value):
+                malformed = copy.deepcopy(row)
+                malformed["face_candidates"][0][field] = value
+                with self.assertRaisesRegex(CadError, "identity"):
+                    capture_projection._project_cylinder_axis(
+                        copy.deepcopy(malformed)
+                    )
+                with self.assertRaisesRegex(PipelineError, "identity"):
+                    capture_evidence._axis_cylinder(
+                        copy.deepcopy(malformed)
+                    )
+
+    def test_link_group_origin_error_is_preserved_without_a_vote(self) -> None:
+        links = self.raw_facts["link_group_mass_raw"]["links"]
+        reads = links["base"]["reads"]
+        reads[0] = copy.deepcopy(reads[0])
+        reads[1] = copy.deepcopy(reads[1])
+        origin_error = {
+            "code": "RuntimeError",
+            "message": "origin getter unavailable",
+        }
+        reads[0]["inertia_values_about_origin_api"] = copy.deepcopy(
+            origin_error
+        )
+        reads[0]["read_errors"][
+            "inertia_values_about_origin_api"
+        ] = copy.deepcopy(origin_error)
+        links["base_secondary"] = {
+            "selection": ["base"],
+            "reads": [
+                copy.deepcopy(reads[1]),
+                copy.deepcopy(reads[1]),
+            ],
+        }
+        self.write_capture()
+
+        projected = capture_evidence.link_group_mass_properties(self.root)
+        self.assertEqual(
+            projected["links"]["base"]["reads"][0][
+                "inertia_values_about_origin_api"
+            ],
+            origin_error,
+        )
+        self.assertIsInstance(
+            projected["links"]["base"]["reads"][1][
+                "inertia_values_about_origin_api"
+            ],
+            list,
+        )
+        self.assertTrue(
+            verify_native_capture_facts(self.root)["native_capture_facts"]
+        )
+        producer = capture_projection._project_link_group_mass(
+            copy.deepcopy(self.raw_facts["link_group_mass_raw"])
+        )
+        self.assertEqual(
+            producer["links"]["base"]["reads"][0][
+                "inertia_values_about_origin_api"
+            ],
+            origin_error,
+        )
+
+        facts = copy.deepcopy(self.raw_facts)
+        facts["link_group_mass_raw"]["links"]["base"]["reads"][0][
+            "inertia_values_about_origin_api"
+        ] = {}
+        self.raw_facts = facts
+        self.write_capture()
+        with self.assertRaisesRegex(BridgeError, "origin.*malformed"):
+            capture_evidence.link_group_mass_properties(self.root)
+
+        facts = copy.deepcopy(self.raw_facts)
+        read = facts["link_group_mass_raw"]["links"]["base"]["reads"][0]
+        read["inertia_values_about_origin_api"] = copy.deepcopy(
+            origin_error
+        )
+        read["read_errors"]["inertia_values_about_origin_api"][
+            "message"
+        ] = "a different native result"
+        with self.assertRaisesRegex(
+            CadError,
+            "differs from its read-error entry",
+        ):
+            capture_projection._project_link_group_mass(
+                copy.deepcopy(facts["link_group_mass_raw"])
+            )
+        self.raw_facts = facts
+        self.write_capture()
+        with self.assertRaisesRegex(
+            BridgeError,
+            "origin error differs",
+        ):
+            capture_evidence.link_group_mass_properties(self.root)
+
+    def test_datum_error_map_must_be_an_exact_object(self) -> None:
+        baseline = copy.deepcopy(self.raw_facts)
+        missing = object()
+        for label, value in (
+            ("missing", missing),
+            ("list", []),
+            ("false", False),
+            ("zero", 0),
+            ("empty-string", ""),
+        ):
+            with self.subTest(label=label):
+                facts = copy.deepcopy(baseline)
+                datum = facts["scene_raw"]["coordinate_systems"]["base::Datum"]
+                if value is missing:
+                    datum.pop("read_errors")
+                else:
+                    datum["read_errors"] = value
+
+                with self.assertRaisesRegex(CadError, "error map"):
+                    capture_projection._project_scene(
+                        copy.deepcopy(facts["scene_raw"])
+                    )
+
+                self.raw_facts = facts
+                self.write_capture()
+                with self.assertRaisesRegex(PipelineError, "error map"):
+                    capture_evidence.scene(self.root)
+                with self.assertRaisesRegex(PipelineError, "error map"):
+                    verify_native_capture_facts(self.root)
+
+        class ErrorMap(dict):
+            pass
+
+        facts = copy.deepcopy(baseline)
+        facts["scene_raw"]["coordinate_systems"]["base::Datum"][
+            "read_errors"
+        ] = ErrorMap()
+        with self.assertRaisesRegex(CadError, "error map"):
+            capture_projection._project_scene(
+                copy.deepcopy(facts["scene_raw"])
+            )
+
+    def test_datum_owner_must_not_be_coerced_to_global_scope(self) -> None:
+        baseline = copy.deepcopy(self.raw_facts)
+        for label, owner in (
+            ("zero", 0),
+            ("false", False),
+            ("list", []),
+            ("object", {}),
+        ):
+            with self.subTest(label=label):
+                facts = copy.deepcopy(baseline)
+                facts["scene_raw"]["coordinate_systems"]["base::Datum"][
+                    "owner"
+                ] = owner
+
+                with self.assertRaisesRegex(CadError, "string owner"):
+                    capture_projection._project_scene(
+                        copy.deepcopy(facts["scene_raw"])
+                    )
+
+                self.raw_facts = facts
+                self.write_capture()
+                with self.assertRaisesRegex(PipelineError, "string owner"):
+                    capture_evidence.scene(self.root)
+                with self.assertRaisesRegex(PipelineError, "string owner"):
+                    verify_native_capture_facts(self.root)
+
+    def test_valid_fixed_state_rejects_a_non_null_fixed_error(self) -> None:
+        baseline = copy.deepcopy(self.raw_facts)
+        error = {
+            "code": "cad_component_fixed_invalid",
+            "message": "unreadable",
+        }
+        for field in ("occurrences", "components"):
+            with self.subTest(field=field):
+                facts = copy.deepcopy(baseline)
+                facts["scene_raw"][field][0]["is_fixed_error"] = copy.deepcopy(
+                    error
+                )
+
+                with self.assertRaisesRegex(CadError, "fixed"):
+                    capture_projection._project_scene(
+                        copy.deepcopy(facts["scene_raw"])
+                    )
+
+                self.raw_facts = facts
+                self.write_capture()
+                with self.assertRaisesRegex(PipelineError, "fixed"):
+                    capture_evidence.scene(self.root)
+                with self.assertRaisesRegex(PipelineError, "fixed"):
+                    verify_native_capture_facts(self.root)
 
     def test_missing_sealed_native_facts_member_is_rejected(self):
         (self.root / "evidence/raw/native_capture_facts.json").unlink()
         with self.assertRaises(PipelineError):
             verify_native_capture_facts(self.root)
+
+    def test_raw_document_state_is_independently_bound_without_save_flag_gate(
+        self,
+    ) -> None:
+        baseline = copy.deepcopy(self.raw_facts)
+        for label, mutate in (
+            (
+                "foreign-path",
+                lambda facts: facts["document_state"]["before"].__setitem__(
+                    "path",
+                    "/foreign/foreign.SLDASM",
+                ),
+            ),
+            (
+                "other-configuration",
+                lambda facts: facts["document_state"]["after"].__setitem__(
+                    "active_configuration",
+                    "Other",
+                ),
+            ),
+            (
+                "writable",
+                lambda facts: facts["document_state"]["before"].__setitem__(
+                    "read_only",
+                    False,
+                ),
+            ),
+        ):
+            with self.subTest(label=label):
+                facts = copy.deepcopy(baseline)
+                mutate(facts)
+                self.raw_facts = facts
+                self.write_capture()
+                with self.assertRaises(PipelineError):
+                    verify_native_capture_facts(self.root)
+
+        facts = copy.deepcopy(baseline)
+        facts["document_state"]["before"]["save_flag"] = True
+        facts["document_state"]["after"]["save_flag"] = True
+        self.raw_facts = facts
+        self.write_capture()
+        self.assertTrue(
+            verify_native_capture_facts(self.root)["native_capture_facts"]
+        )
+
+    def test_raw_scene_rejects_retired_duplicate_state_fields(self) -> None:
+        baseline = copy.deepcopy(self.raw_facts)
+        for field in ("document_state", "source_sha256"):
+            with self.subTest(field=field):
+                facts = copy.deepcopy(baseline)
+                facts["scene_raw"][field] = {}
+                self.raw_facts = facts
+                self.write_capture()
+                with self.assertRaises(PipelineError):
+                    verify_native_capture_facts(self.root)
 
     def test_raw_member_tamper_breaks_the_source_manifest(self):
         path = self.root / "evidence/raw/native_capture_facts.json"

@@ -19,60 +19,39 @@ from description_pipeline.orchestration import portal as portal_module
 from description_pipeline.orchestration.airflow_client import native_run_id
 from description_pipeline.orchestration.feishu_oauth import build_actor_name
 from description_pipeline.stages import STAGE_IDS
+from description_pipeline.io import write_json
 
 from .portal_read_support import RegisteredPlatform
 from .protocol_support import protocol_events
 
 RUN = "7c9b44b3-0b9c-5ffe-9f4f-4bbdafb4a865"
 SUBJECT = "a" * 64
-HANDOFF = "b" * 64
-
-
-def _publish_receipt(*, submission_state: str = "published", quality_subject: str = SUBJECT) -> dict:
-    return {
-        "run_id": RUN,
-        "stage": "publish",
-        "state": submission_state,
-        "passed": True,
-        "subject_sha256": SUBJECT,
-        "handoff_sha256": HANDOFF,
-        "quality": {"passed": True, "subject_sha256": quality_subject},
-        "submission": {
-            "passed": True,
-            "state": submission_state,
-            "subject_sha256": SUBJECT,
-            "commit": "c" * 40,
-            "base": "feature/robot",
-            "repository_slug": "example/robot",
-            "branch": "work/description/robot/0123456789abcdef01234567",
-            "url": "https://github.com/example/robot/pull/1",
-        },
-    }
-
-
-def _register_delivery(
-    platform: RegisteredPlatform,
-    *,
-    run_id: str = RUN,
-    submission_state: str = "published",
-    quality_subject: str = SUBJECT,
-) -> None:
-    """One registered six-stage delivery: records, sealed capture identity and check events."""
+def _register_delivery(platform: RegisteredPlatform, *, run_id: str = RUN) -> None:
+    """Register six stages with their sealed certificate and publication receipt."""
     platform.admit(run_id)
     platform.register_capture(run_id)
-    for stage in ("freeze", "discover", "generate"):
+    for stage in ("freeze", "discover", "generate", "verify", "publish"):
         platform.stage(run_id, stage)
-    platform.stage(
-        run_id,
-        "verify",
-        receipt={
-            "subject_sha256": SUBJECT,
-            "handoff_sha256": HANDOFF,
-            "quality": {"passed": True, "subject_sha256": SUBJECT},
-        },
+    write_json(
+        platform.tree(run_id, "verify") / "verification-certificate.json",
+        {"passed": True, "decision": "PASS", "checks": [], "diagnostics": []},
     )
-    platform.stage(
-        run_id, "publish", receipt=_publish_receipt(submission_state=submission_state, quality_subject=quality_subject)
+    write_json(
+        platform.tree(run_id, "publish") / "publication-receipt.json",
+        {
+            "publication_subject_sha256": SUBJECT,
+            "base_ref": "feature/robot",
+            "repository": "example/robot",
+            "branch_ref": "work/description/robot/0123456789abcdef01234567",
+            "candidate_parents": ["d" * 40],
+            "pr_effect": {
+                "observation": {
+                    "number": 1,
+                    "head_oid": "c" * 40,
+                    "url": "https://github.com/example/robot/pull/1",
+                },
+            },
+        },
     )
     platform.events(run_id, protocol_events(subject=SUBJECT))
 

@@ -16,6 +16,7 @@ from types import MappingProxyType
 from typing import Any, Literal
 
 from ..io import PipelineError, canonical, digest
+from ..stages import STAGE_IDS
 from ..schemas import (
     AIRFLOW_DISPATCH_CONF_SCHEMA,
     CANCEL_REQUEST_SCHEMA,
@@ -30,7 +31,6 @@ from ..schemas import (
     STAGE_RESULT_SCHEMA,
 )
 
-STAGES = ("freeze", "discover", "capture", "generate", "verify", "publish")
 StageId = Literal["freeze", "discover", "capture", "generate", "verify", "publish"]
 Outcome = Literal["completed", "failed", "cancelled"]
 EffectKind = Literal["airflow_dispatch", "native_operation", "git_ref_update", "pr_upsert"]
@@ -182,7 +182,7 @@ def _require_digest(value: object, code: str, where: str) -> str:
 
 
 def _require_stage(value: object, code: str, where: str) -> StageId:
-    if value not in STAGES:
+    if value not in STAGE_IDS:
         raise ProtocolError(code, {"where": where, "value": value})
     return value  # type: ignore[return-value]
 
@@ -1711,7 +1711,7 @@ def project_run_status(
 ) -> RunStatus:
     """Derive a run status from ordered stage decisions and effect facts."""
 
-    if len(stage_outcomes) != len(STAGES):
+    if len(stage_outcomes) != len(STAGE_IDS):
         raise ProtocolError("run_status.invalid", {"reason": "six-stage-outcomes-required"})
     unresolved_effect_states = list(effect_states)
     for state in pending_effect_states:

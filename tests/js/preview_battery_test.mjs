@@ -70,7 +70,7 @@ const {
     runId: "portal-20261015T000000-aa11bb22",
     subjectSha256: "a".repeat(64),
     tool,
-    qualitySchema: "solidworks-to-urdf.quality/v1",
+    certificateSchema: "solidworks-to-urdf.quality/v1",
     qualificationStates: [
       { fact_id: "drive_sizing", status: "unqualified" },
       { fact_id: "machine_qualification", status: "out_of_scope" },
@@ -110,13 +110,18 @@ const {
 {
   const staticDir = path.join(here, "..", "..", "src", "description_pipeline", "orchestration", "static");
   const viewer = readFileSync(path.join(staticDir, "viewer.js"), "utf8");
+  assert.ok(viewer.includes("materialStyle("));
+  assert.ok(viewer.includes("transparent: style.opacity < 1"));
+  assert.ok(viewer.includes("opacity: style.opacity"));
   const app = readFileSync(path.join(staticDir, "app.js"), "utf8");
   assert.ok(viewer.includes('parseNumber(limit.getAttribute("effort"), null)'));
   assert.ok(!viewer.includes('parseNumber(limit.getAttribute("effort"), 0)'));
   assert.ok(app.includes("not provided (drive capability not established)"));
   assert.ok(!app.includes("policy_preview_window"));
   assert.ok(!app.includes("declared_preview_window"));
-  assert.ok(app.includes('loadPreviewArtifactJson(artifactUrl, preview.files, "tool.json", signal)'));
+  assert.ok(app.includes('["tool", preview.files, "tool.json"]'));
+  assert.ok(app.includes("Cannot read registered preview artifact"));
+  assert.ok(app.includes('key.textContent = "Preview artifact"'));
   assert.ok(app.includes('["Purpose", purposeLabel(run.purpose)]'));
   assert.ok(app.includes("purpose: preview.purpose"));
   assert.ok(!app.includes('"reports/tool.json"'));
@@ -131,7 +136,7 @@ const {
   const quick = stageSummaryRows("generate", {
     files: {},
     stage: null,
-    quality: null,
+    certificate: null,
     pr: null,
     subjectSha256: record.subject_sha256,
   });

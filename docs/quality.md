@@ -6,6 +6,8 @@
 
 验证器只读取封存输入、原始观察和实际产物，独立重建成员、拓扑、基准、轴线、限位与物理预期，再检查规范化模型、XML、网格及独立进程中的 MuJoCo 加载。生成方的采集计划、模型和报告是待核对的声明，不能成为预期答案。
 
+已知缺失引用的保存状态导出按[契约](contracts.md#缺失引用与保存状态导出)保留详细 warning 并继续。独立验证证明的是本次实际读取且纳入交付的范围及其转换一致性，不能把加载后可见集合自称为源装配完整集合。源完整性未证明与隐藏对象未知必须明确展示；这不恢复参数化重建前置，也不免除纳入对象的必需事实与检查。
+
 验证不会重新打开 CAD，也不是第二次物理实验。它证明封存观察与交付的规定一致性；CAD 的实物真实性与规格适用性由[机械规范](mechanical-handoff-spec.md#review)中的工程责任确定。
 
 检查策略定义固定门与按对象展开的门，以及适用条件、容差和证据要求。报告保存策略摘要、完整预期检查集合、实际结果、测量值、单位、阈值和证据引用。预期集合由策略固定门与原始证据的按对象展开形成；报告检查集合必须与其完全相等，缺失、重复和额外未知检查均失败，不能由生成器或调用者删减。
@@ -151,11 +153,11 @@ Capture 在一个自有只读会话中读取已保存 CAD 的原生事实，随�
 
 几何唯一主读取链为 `IComponent2.GetBodies3(BodyType, BodiesInfo)` → `IBody2.GetFaces` → `IFace2.GetTessTriangles(True)`。`True` 表示不进行系统单位到用户单位转换，原始坐标以米计且位于 component local frame。每个实际 occurrence 分别读取，不按文档与配置提前合并，以免丢失 assembly-level feature 的几何差异。同次返回的 body 与 `BodiesInfo` 须等长并按位置绑定，逐 body 封存原生 `body_info_raw`（`0 = user body`、`1 = normal body`）；未知或无效分类保持读取失败，不能静默补值、丢项或切换到 Part 几何。Part 文档的 `IPartDoc.GetBodies2` 保持其独立查询职责。装配 placement 单独保留 `GetTotalTransform(False).ArrayData` 的原始 16 项，离线按 SolidWorks 变换语义转换，不将原始 SW16 当作 canonical 4×4。
 
-`native-triangles/v1` 保留完整 body／face inventory、face span、实例来源 scope、placement 原值和原始 binary64 三角形流。原始流使用 `SWTESS64` 固定头、版本、数量及逐三角九项坐标；文件按实际 payload 摘要登记为 `raw/triangles/{sha}.triangles`。释放 CAD 后生成 `geometry/{sha}.stl`，仅对已经实际读得的相同 payload 按摘要复用文件，各 occurrence 的 placement 和来源绑定独立保留。派生的 STL 法向、binary32 坐标和 scope-local 身份必须携带对象及字段级 warning。
+`native-triangles/v1` 保留完整 body／face inventory、face span、实例来源 scope、placement 原值和原始 binary64 三角形流。原始流使用 `SWTESS64` 固定头、版本、数量及逐三角九项坐标；文件按实际 payload 摘要登记为 `raw/triangles/{sha}.triangles`。释放 CAD 后由 Linux Generate 生成 `geometry/{sha}.stl`，仅对已经实际读得的相同 payload 按摘要复用文件，各 occurrence 的 placement 和来源绑定独立保留。派生的 STL 法向、binary32 坐标和 scope-local 身份必须携带对象及字段级 warning。
 
 独立消费者从原始三角流、face span、来源 scope 和 SW16 重新核对实际 STL 的三角形数量、顺序、坐标、法向、归属及摘要，并核对场景 placement。原生读取失败、缺失必要几何、非法数值、错误归属或交付字节不对应原始事实均失败。拓扑审计记录实际观察，不把显示三角形天然宣称为闭合流形或精度证明；当前 CAD 的独立工程检查保持，`50 µm` 曲面等价仅用于下文声明适用输入的独立参考回归，不是生产或正式发布前置。
 
-原始证据记录 immutable `raw/source_scopes.json`：file source 分开保存原文件与冻结 copy 的 hash/path；virtual source 保存 path-derived identity、owner hash、session document/root 和 PID。包级验证将 scope 与 discovery、scene、capture、geometry、dependency closure 和实际冻结字节交叉核对。Discovery 与 Capture 可使用不同的虚拟 session、root 和 PID；owner、实例、配置及相对身份必须一致，各自 session 的文档路径、root 与 PID 须内部绑定自洽。不另建几何或状态权威。
+原始证据统一封存在不可变 `evidence/raw/native_capture_facts.json`，其中 `source_scopes` 保存来源身份，`scene_raw` 保存原生场景观察，`geometry_raw` 绑定原生三角形流。Windows 只负责原生读取、序列化和封包；Linux Generate 单次投影工程模型并物化 STL。file source 分开保存原文件与冻结 copy 的 hash/path；virtual source 保存 path-derived identity、owner hash、session document/root 和 PID。包级验证将原始 scope 与 canonical Discovery、raw scene/geometry、dependency closure 和实际冻结字节交叉核对。Discovery 与 Capture 可使用不同的虚拟 session、root 和 PID；owner、实例、配置及相对身份必须一致，各自 session 的文档路径、root 与 PID 须内部绑定自洽。不另建几何或状态权威。
 
 <a id="qualification"></a>
 ## 警告与资格
@@ -166,7 +168,7 @@ Capture 在一个自有只读会话中读取已保存 CAD 的原生事实，随�
 
 CAD 原名的格式、词根、缩写或重名违规只产生命名 warning，不单独阻断；生成器必须按固定规则修正。验收同时验证：全部输出名称符合对应类别规范；定义唯一；parent／child 等全部引用闭合；material 定义与引用一致；网格 URI、实际文件及清单一致；跨产物引用同名同义。添加非规范名、中文／非法字符、左右缩写、重复名、未知词根、实例重排、重复规范化和重跑用例，证明告警可定位、修正确定且幂等。输出非法名或断裂引用是实现缺陷，不能用 warning 放行；真实原生身份错误与命名违规分别报告。
 
-报告将检查结果与资格结论分开。`passed` 只表示必需检查集合已通过；资格项在质量报告中以策略定义的 `fact_id`、范围及原生 `object_id` 唯一定位，使用 `established / unqualified / out_of_scope`，引用建立或未建立结论的证据；页面和 PR 使用同一身份，不以显示文本作机器键。模型一致性事实与 `engineering_position_range`、`drive_sizing`、`machine_qualification` 分别记录，前两项按关节、末项按交付主体定位。外部实物真实性或批准不能由自动项标记为已建立。阶段、检查和复用状态遵循[状态契约](contracts.md#recovery)。
+报告将检查结果与资格结论分开。`passed` 只表示必需检查集合已通过；资格项在唯一验证证书中以策略定义的 `fact_id`、范围及原生 `object_id` 唯一定位，使用 `established / unqualified / out_of_scope`，引用建立或未建立结论的证据；页面和 PR 使用同一身份，不以显示文本作机器键。模型一致性事实与 `engineering_position_range`、`drive_sizing`、`machine_qualification` 分别记录，前两项按关节、末项按交付主体定位。外部实物真实性或批准不能由自动项标记为已建立。阶段、检查和复用状态遵循[状态契约](contracts.md#recovery)。
 
 | 保留事实 | 可继续的条件 | 未建立的资格 |
 |---|---|---|

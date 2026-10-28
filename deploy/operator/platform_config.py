@@ -40,7 +40,10 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from render_operator import PORT_DEFAULTS  # noqa: E402  (single deploy-layer port source, DEP-01)
+from render_operator import (  # noqa: E402  (single deploy-layer port source, DEP-01)
+    PORT_DEFAULTS,
+    require_distinct_local_ports,
+)
 
 PLATFORM_SCHEMA = "solidworks-to-urdf.platform/v1"
 SNAPSHOT_SCHEMA = "solidworks-to-urdf.config-snapshot/v1"
@@ -136,6 +139,17 @@ def string_list(value, where: str, *, allow_empty: bool) -> list[str]:
     return value
 
 
+def auth_string_list(value, where: str, *, allow_empty: bool) -> list[str]:
+    """Identity-list entries must survive CSV environment serialization unchanged."""
+
+    items = string_list(value, where, allow_empty=allow_empty)
+    require(
+        all(not any(character == "," or character.isspace() for character in item) for item in items),
+        f"{where} entries must not contain comma or whitespace",
+    )
+    return items
+
+
 def tcp_port(value, where: str) -> int:
     require(type(value) is int and 0 < value < 65536, f"{where} must be a TCP port (1-65535)")
     return value
@@ -198,16 +212,24 @@ def validate_platform(document) -> dict:
         field: windows_path(instance[field], f"windows.instance.{field}")
         for field in ("package_root", "output_root", "state_root")
     }
-    require(
-        len({origin_port, endpoint_port, tunnel_port}) == 3,
-        "configured ports must not collide (origin / endpoint / tunnel_loopback)",
-    )
+    try:
+        require_distinct_local_ports(
+            {
+                "operator_https": origin_port,
+                "portal": PORT_DEFAULTS["OPERATOR_UPSTREAM_PORT"],
+                "airflow_api": PORT_DEFAULTS["AIRFLOW_API_PORT"],
+                "tunnel_loopback": tunnel_port,
+                "postgres": PORT_DEFAULTS["POSTGRES_PORT"],
+            }
+        )
+    except ValueError as error:
+        die(str(error))
 
     auth = document["auth"]
     require_keys(auth, allowed=_AUTH_KEYS, required=_AUTH_KEYS, where="auth")
     absolute_path(auth["feishu_secret_file"], "auth.feishu_secret_file")
-    string_list(auth["tenant_keys"], "auth.tenant_keys", allow_empty=False)
-    string_list(auth["admin_open_ids"], "auth.admin_open_ids", allow_empty=True)
+    auth_string_list(auth["tenant_keys"], "auth.tenant_keys", allow_empty=False)
+    auth_string_list(auth["admin_open_ids"], "auth.admin_open_ids", allow_empty=True)
 
     targets = document["targets"]
     require(isinstance(targets, dict) and bool(targets), "targets must be a non-empty object")

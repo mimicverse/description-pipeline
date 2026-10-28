@@ -59,12 +59,12 @@ import json
 import math
 import re
 import shutil
-import unicodedata
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 from collections.abc import Mapping, Sequence
 
+from ...geometry.native_transform import rigid_matrix_from_row_major
 from ...io import PipelineError, artifact_path_parts, confined, digest, inventory, parse_data, read_data
 from ...interface_records import PURPOSE_ENGINEERING, PURPOSE_INSPECTION_PREVIEW
 from ...request_evidence import read_request_evidence
@@ -87,7 +87,15 @@ from .direction import canonicalize_axis
 from .naming import robot_name as format_robot_name
 from .revision import package_inventory
 from ...schemas import (
+    CAPTURE_EVIDENCE_REQUESTS,
+    NATIVE_DISCOVERY_BUDGET_KEYS,
+    NATIVE_DISCOVERY_CONTROL_KEYS,
+    NATIVE_DISCOVERY_DERIVATION_KEYS,
+    NATIVE_DISCOVERY_ENVELOPE_KEYS,
     NATIVE_DISCOVERY_FINDING_SCHEMA,
+    NATIVE_DISCOVERY_IDENTITY_KEYS,
+    NATIVE_DISCOVERY_OPTIONAL_ENVELOPE_KEYS,
+    NATIVE_DISCOVERY_RECORD_KEYS,
     NATIVE_DISCOVERY_SCHEMA,
     NATIVE_IDENTITY_RESOLUTION_SCHEMA,
     SOURCE_RECORD_SCHEMA,
@@ -113,29 +121,6 @@ GENERATOR_VERSION = "1"
 NATIVE_READER_GENERATOR = "solidworks-native-reader"
 _DATE_ID = re.compile(r"[0-9]{8}\Z")
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}\Z")
-_FINDING_KEYS = frozenset({"schema_version", "code", "object", "message", "detail", "blocking"})
-_IDENTITY_RESOLUTION_KEYS = frozenset(
-    {
-        "schema_version",
-        "run_id",
-        "handoff_sha256",
-        "sources",
-        "hardware_id",
-        "revision",
-        "parent_revision",
-    }
-)
-_IDENTITY_RESOLUTION_SOURCES = frozenset(
-    {"hardware_id", "revision", "parent_revision", "owner", "change_summary", "control"}
-)
-_IDENTITY_SOURCE_ORIGINS = {
-    "hardware_id": frozenset({"cad", "platform_configuration", "absent"}),
-    "revision": frozenset({"cad", "absent"}),
-    "parent_revision": frozenset({"cad", "absent"}),
-    "owner": frozenset({"cad", "absent"}),
-    "change_summary": frozenset({"cad", "submission", "absent"}),
-    "control": frozenset({"cad", "absent"}),
-}
 
 #: The prepared package must satisfy the same joint geometry gate as an
 #: authored package: a movable joint frame has to sit on the native shaft.
@@ -288,20 +273,24 @@ def _saved_configuration_observed(record: dict, name: str) -> bool:
     return all(proven(reading) for reading in readings)
 
 
-def _snake(value: Any) -> str | None:
-    """Return a stable snake_case identifier, or ``None`` when nothing remains."""
+def _validate_property_objects(record: dict) -> None:
+    def object_or_absent(value, field):
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise CadError(
+                "cad_property_unreadable",
+                "raw properties must be objects when present",
+                {"field": field, "value_type": type(value).__name__},
+            )
+        return value
 
-    if not _text(value):
-        return None
-    folded = unicodedata.normalize("NFKD", str(value))
-    folded = "".join(ch for ch in folded if not unicodedata.combining(ch))
-    folded = re.sub(r"[^0-9A-Za-z]+", "_", folded).strip("_").lower()
-    folded = re.sub(r"_{2,}", "_", folded)
-    if not folded:
-        return None
-    if folded[0].isdigit():
-        folded = "n_" + folded
-    return folded
+    properties = object_or_absent(record.get("properties"), "properties")
+    for section in ("document", "components", "mates"):
+        bucket = object_or_absent(properties.get(section), f"properties.{section}")
+        if section != "document":
+            for name, value in bucket.items():
+                object_or_absent(value, f"properties.{section}.{name}")
 
 
 def _property(record: dict, section: str, key: str) -> Any:
@@ -315,10 +304,84 @@ def _scalar(record: dict, namespace: str, key: str, *, section: str = "document"
 
 
 def _identity_value(record: dict, namespace: str, key: str) -> Any:
-    value = (record.get("identity") or {}).get(key)
-    if value is None or value == "":
-        value = _scalar(record, namespace, key)
-    return value
+    """One optional identity value, preserving absent and malformed distinctly."""
+
+    identity = record.get("identity")
+    if identity is None:
+        identity = {}
+    elif not isinstance(identity, dict):
+        raise CadError(
+            "cad_identity_invalid",
+            "raw identity evidence is not an object",
+            {"value_type": type(identity).__name__},
+        )
+    properties = record.get("properties")
+    if properties is None:
+        properties = {}
+    elif not isinstance(properties, dict):
+        raise CadError(
+            "cad_property_unreadable",
+            "raw property evidence is not an object",
+            {"value_type": type(properties).__name__},
+        )
+    bucket = properties.get("document")
+    if bucket is None:
+        bucket = {}
+    elif not isinstance(bucket, dict):
+        raise CadError(
+            "cad_property_unreadable",
+            "raw document properties are not an object",
+            {"value_type": type(bucket).__name__},
+        )
+
+    candidates: list[str] = []
+
+    def add(value) -> None:
+        if value is None:
+            return
+        if not isinstance(value, str) or not value.strip():
+            raise CadError(
+                "cad_identity_invalid",
+                "a supplied identity value must be non-empty text",
+                {"field": key, "value": repr(value)[:300], "value_type": type(value).__name__},
+            )
+        normalized = value
+        if key == "change_summary":
+            normalized = normalized.replace("\r\n", "\n").replace("\r", "\n")
+        candidates.append(normalized.strip())
+
+    if key.startswith("control."):
+        control_key = key.split(".", 1)[1]
+        control = identity.get("control")
+        if control is not None and not isinstance(control, dict):
+            raise CadError(
+                "cad_identity_invalid",
+                "raw control identity is not an object",
+                {"field": key, "value_type": type(control).__name__},
+            )
+        if isinstance(control, dict):
+            unknown = set(control) - {"system", "reference"}
+            if unknown:
+                raise CadError(
+                    "cad_identity_invalid",
+                    "raw control identity carries unknown fields",
+                    {"field": key, "unknown": sorted(str(value) for value in unknown)},
+                )
+            if control_key in control:
+                add(control[control_key])
+    elif key in identity:
+        add(identity[key])
+
+    property_key = f"{namespace}.{key}"
+    if property_key in bucket:
+        add(bucket[property_key])
+    if len(set(candidates)) > 1:
+        raise CadError(
+            "cad_identity_conflict",
+            "native identity readings disagree",
+            {"field": key, "values": candidates},
+        )
+    return candidates[0] if candidates else None
 
 
 def _unit(vector) -> list[float] | None:
@@ -359,36 +422,6 @@ def _validate_native_record(value: Any, path: str = "raw") -> None:
         "native evidence contains a nonfinite or non-JSON value",
         {"field": path, "value": repr(value)},
     )
-
-
-def _require_exact_keys(value: object, keys: frozenset[str], what: str) -> dict:
-    if not isinstance(value, dict):
-        raise PipelineError(f"{what} must be an object")
-    missing = sorted(keys - set(value))
-    unknown = sorted(set(value) - keys)
-    if missing or unknown:
-        raise PipelineError(f"{what} must carry exact keys; missing={missing}, unknown={unknown}")
-    return value
-
-
-def _require_optional_text(value: object, what: str, *, multiline: bool = False) -> str | None:
-    if value is None:
-        return None
-    valid = _authored_multiline_text(value) if multiline else _authored_text(value)
-    if not valid:
-        raise PipelineError(f"{what} must be non-empty text without invalid control characters")
-    return value
-
-
-def _require_text_map(value: object, what: str) -> dict[str, str]:
-    if not isinstance(value, dict):
-        raise PipelineError(f"{what} must be an object")
-    result: dict[str, str] = {}
-    for key, item in value.items():
-        if not _authored_text(key) or not _authored_text(item):
-            raise PipelineError(f"{what} must map non-empty text to non-empty text")
-        result[key] = item
-    return result
 
 
 def _cross(left: Sequence[float], right: Sequence[float]) -> list[float]:
@@ -439,11 +472,8 @@ def _component_frames(record: dict, findings: list[dict]) -> dict[str, list[list
         name = str(item.get("name2") or "")
         if not name or item.get("suppressed"):
             continue
-        try:
-            values = [float(value) for value in item.get("transform") or ()]
-        except (TypeError, ValueError):
-            values = []
-        if len(values) != 16 or not all(math.isfinite(value) for value in values):
+        values = _rigid_matrix(item.get("transform"))
+        if values is None:
             frames[name] = None
             findings.append(
                 _finding(
@@ -452,8 +482,8 @@ def _component_frames(record: dict, findings: list[dict]) -> dict[str, list[list
                     "component has no finite recorded 4x4 assembly transform",
                 )
             )
-        else:
-            frames[name] = [values[0:4], values[4:8], values[8:12], values[12:16]]
+            continue
+        frames[name] = [values[0:4], values[4:8], values[8:12], values[12:16]]
     return frames
 
 
@@ -560,6 +590,13 @@ def _finite_vector(value: Any, length: int) -> list[float] | None:
             return None
         numbers.append(number)
     return numbers
+
+
+def _rigid_matrix(value: Any) -> list[float] | None:
+    try:
+        return list(rigid_matrix_from_row_major(value))
+    except (TypeError, ValueError):
+        return None
 
 
 def _controlled_number(value: Any) -> float | None:
@@ -858,9 +895,29 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
             )
         )
         return None
+    raw_entities = mate.get("entities")
+    entity_count = mate.get("entity_count")
     entities = _mate_entities(mate)
-    if len(entities) < 2:
-        findings.append(_finding("discovery.mate_entities_unsupported", obj, "mate has fewer than two entity records"))
+    if (
+        not isinstance(raw_entities, list)
+        or len(raw_entities) != 2
+        or len(entities) != 2
+        or type(entity_count) is not int
+        or entity_count != 2
+    ):
+        findings.append(
+            _finding(
+                "discovery.mate_entities_unsupported",
+                obj,
+                "the supported mate binary contract requires exactly two raw entities "
+                "and a matching native entity_count",
+                {
+                    "entity_count": entity_count,
+                    "raw_entities": len(raw_entities) if isinstance(raw_entities, list) else None,
+                    "usable_entities": len(entities),
+                },
+            )
+        )
         return None
     first = _entity_geometry_view(entities[0], findings, obj)
     second = _entity_geometry_view(entities[1], findings, obj)
@@ -940,11 +997,12 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
             point = _point([float(value) for value in (cylinder.get("point") or cylinder.get("center")) or ()], frame)
         except (TypeError, ValueError):
             point = None
-        if direction is None or point is None or len(point) != 3:
+        radius = _controlled_number(cylinder.get("radius"))
+        if direction is None or point is None or len(point) != 3 or radius is None or radius <= 0:
             fail(
                 "discovery.mate_entities_unsupported",
                 "recorded cylinder is not usable",
-                {"feature": entity.get("feature")},
+                {"feature": entity.get("feature"), "radius": cylinder.get("radius")},
             )
             return None
         return point, direction
@@ -985,11 +1043,12 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
             centre = _point([float(value) for value in circle.get("center") or ()], frame)
         except (TypeError, ValueError):
             centre = None
-        if normal is None or centre is None or len(centre) != 3:
+        radius = _controlled_number(circle.get("radius"))
+        if normal is None or centre is None or len(centre) != 3 or radius is None or radius <= 0:
             fail(
                 "discovery.mate_entities_unsupported",
                 "recorded circular edge is not usable",
-                {"feature": entity.get("feature")},
+                {"feature": entity.get("feature"), "radius": circle.get("radius")},
             )
             return None
         return centre, normal
@@ -1366,12 +1425,19 @@ def _mate_entities(mate: dict) -> list[dict]:
 
 
 def _mate_pairs(mate: dict) -> list[tuple[str, str]]:
+    if (
+        not isinstance(mate.get("entities"), list)
+        or len(mate["entities"]) != 2
+        or type(mate.get("entity_count")) is not int
+        or mate.get("entity_count") != 2
+    ):
+        return []
     names: list[str] = []
     for item in _mate_entities(mate):
         name = str(item.get("component") or "")
         if name and name not in names:
             names.append(name)
-    return [(names[left], names[right]) for left in range(len(names)) for right in range(left + 1, len(names))]
+    return [(names[0], names[1])] if len(names) == 2 else []
 
 
 def _union_find(pairs: Sequence[tuple[str, str]], nodes: Sequence[str]) -> dict[str, str]:
@@ -2113,7 +2179,17 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
         declared_limit = None
         declared_bounds = None
         declared_ref = properties.get(f"{NAMESPACE}.joint.limits_record")
-        if _text(declared_ref):
+        if f"{NAMESPACE}.joint.limits_record" in properties:
+            if not _text(declared_ref):
+                findings.append(
+                    _finding(
+                        "discovery.joint_limits_invalid",
+                        obj,
+                        "controlled limits record reference must be non-empty text",
+                        {"value": declared_ref, "value_type": type(declared_ref).__name__},
+                    )
+                )
+                continue
             declared_limit = _resolve_record(settings, str(declared_ref), findings, obj)
             if declared_limit is None:
                 continue
@@ -2208,7 +2284,7 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
             limit_source = "native"
             if declared_bounds is not None:
                 declared_lower, declared_upper = declared_bounds
-                if declared_bounds not in {(0.0, 0.0), (limits["lower"], limits["upper"])}:
+                if declared_bounds != (limits["lower"], limits["upper"]):
                     findings.append(
                         _finding(
                             "discovery.joint_limits_conflict",
@@ -2285,7 +2361,17 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
         drive = None
         drive_source = "absent"
         drive_ref = properties.get(f"{NAMESPACE}.joint.drive_record")
-        if _text(drive_ref):
+        if f"{NAMESPACE}.joint.drive_record" in properties:
+            if not _text(drive_ref):
+                findings.append(
+                    _finding(
+                        "discovery.joint_drive_invalid",
+                        obj,
+                        "controlled drive record reference must be non-empty text",
+                        {"value": drive_ref, "value_type": type(drive_ref).__name__},
+                    )
+                )
+                continue
             drive = _resolve_record(settings, str(drive_ref), findings, obj)
             if drive is None:
                 continue
@@ -2630,7 +2716,7 @@ def _exporter_memberships(record: dict, declaration: dict, findings: list[dict])
                     datum_selector,
                 )
             )
-        if datum is None or _finite_vector(datum.get("array"), 16) is None:
+        if datum is None or _rigid_matrix(datum.get("array")) is None:
             findings.append(
                 _finding(
                     "discovery.exporter_frame_missing",
@@ -2852,8 +2938,8 @@ def _apply_mate_direction(record: dict, bodies: list[dict], joints: list[dict], 
             if len(ownerless) == 1:
                 parent_datum = ownerless[0]
         child_datum = _body_datum(record, child) if child else None
-        parent_array = _finite_vector(parent_datum.get("array"), 16) if parent_datum else None
-        child_array = _finite_vector(child_datum.get("array"), 16) if child_datum else None
+        parent_array = _rigid_matrix(parent_datum.get("array")) if parent_datum else None
+        child_array = _rigid_matrix(child_datum.get("array")) if child_datum else None
         local = _axis_in_child(joint, child_datum) if child_datum else None
         if parent_array is None or child_array is None or local is None:
             findings.append(
@@ -2923,19 +3009,27 @@ def _exporter_native_pairs(record: dict, findings: list[dict]) -> dict[tuple[str
         obj = f"mate:{name}"
         entities = _mate_entities(mate)
         endpoints = tuple(sorted(str(entity.get("component")) for entity in entities))
+        raw_entities = mate.get("entities")
         detail = {
             "mate": name,
             "scope": mate.get("scope"),
             "mate_type": mate.get("type"),
             "components": list(endpoints),
         }
-        if len(entities) != 2 or len(mate.get("entities") or []) != 2:
+        if (
+            not isinstance(raw_entities, list)
+            or len(entities) != 2
+            or len(raw_entities) != 2
+            or type(mate.get("entity_count")) is not int
+            or mate.get("entity_count") != 2
+        ):
             findings.append(
                 _finding(
                     "discovery.mate_entities_unsupported",
                     obj,
-                    "native constraint cannot be checked because it does not have exactly two raw endpoints",
-                    detail,
+                    "native constraint cannot be checked because its binary contract does not "
+                    "carry exactly two raw endpoints",
+                    {**detail, "entity_count": mate.get("entity_count")},
                     blocking=False,
                 )
             )
@@ -3130,7 +3224,7 @@ def _exporter_axis(
         component = next(
             (item for item in record.get("components") or [] if item.get("name2") == selector["component"]), None
         )
-        transform = _finite_vector(component.get("transform"), 16) if component else None
+        transform = _rigid_matrix(component.get("transform")) if component else None
         if transform is None:
             findings.append(
                 _finding(
@@ -3149,7 +3243,7 @@ def _exporter_axis(
         )
         return axis, selector
     datum = _body_datum(record, body)
-    transform = _finite_vector(datum.get("array"), 16) if datum else None
+    transform = _rigid_matrix(datum.get("array")) if datum else None
     local = _unit_vector(declared.get("axis"))
     if local is None or transform is None:
         findings.append(
@@ -3172,7 +3266,7 @@ def _exporter_axis(
             )
         )
     parent_datum = _body_datum(record, parent_body) if parent_body is not None else None
-    parent_transform = _finite_vector(parent_datum.get("array"), 16) if parent_datum else None
+    parent_transform = _rigid_matrix(parent_datum.get("array")) if parent_datum else None
     if parent_transform is None:
         findings.append(
             _finding(
@@ -3259,8 +3353,8 @@ def _exporter_origin(declared: dict, child: dict, parent: dict, record: dict, fi
         return
     xyz, rpy = _finite_vector(origin.get("xyz"), 3), _finite_vector(origin.get("rpy"), 3)
     parent_datum, child_datum = _body_datum(record, parent), _body_datum(record, child)
-    left = _finite_vector(parent_datum.get("array"), 16) if parent_datum else None
-    right = _finite_vector(child_datum.get("array"), 16) if child_datum else None
+    left = _rigid_matrix(parent_datum.get("array")) if parent_datum else None
+    right = _rigid_matrix(child_datum.get("array")) if child_datum else None
     if xyz is None or rpy is None or left is None or right is None:
         findings.append(
             _finding(
@@ -3571,7 +3665,10 @@ def _exporter_joint_facts(
                     continue
                 native_lower, native_upper = next(iter(native_values))
                 declared_values = (float(limits.get("lower")), float(limits.get("upper"))) if bounds_usable else None
-                if declared_values not in {None, (0.0, 0.0), (native_lower, native_upper)}:
+                if declared_values is not None and declared_values != (
+                    native_lower,
+                    native_upper,
+                ):
                     findings.append(
                         _finding(
                             "discovery.joint_limits_conflict",
@@ -3786,11 +3883,39 @@ def _body_records(
         anchor = material[0]
         item = components.get(anchor, {})
         identity = str(item.get("instance_id") or f"{item.get('document') or ''}#{anchor}")
-        declared = {
-            str(value).strip()
-            for member in members
-            if _text(value := (properties.get(member) or {}).get(f"{NAMESPACE}.body_datum"))
-        }
+        declared: set[str] = set()
+        invalid_datum = False
+        for member in members:
+            member_properties = properties.get(member) or {}
+            key = f"{NAMESPACE}.body_datum"
+            if not isinstance(member_properties, dict):
+                findings.append(
+                    _finding(
+                        "discovery.body_datum_invalid",
+                        f"body:{root}",
+                        "component properties for a body datum must be an object",
+                        {"component": member, "value_type": type(member_properties).__name__},
+                    )
+                )
+                invalid_datum = True
+                break
+            if key not in member_properties:
+                continue
+            value = member_properties[key]
+            if not _text(value):
+                findings.append(
+                    _finding(
+                        "discovery.body_datum_invalid",
+                        f"body:{root}",
+                        "a declared body datum must be non-empty text",
+                        {"component": member, "value": value, "value_type": type(value).__name__},
+                    )
+                )
+                invalid_datum = True
+                break
+            declared.add(str(value).strip())
+        if invalid_datum:
+            continue
         if len(declared) > 1:
             findings.append(
                 _finding(
@@ -4546,6 +4671,21 @@ def _identity(
     """
 
     namespace = NAMESPACE
+    authored = {
+        key: _identity_value(record, namespace, key)
+        for key in (
+            "hardware_id",
+            "revision",
+            "parent_revision",
+            "owner",
+            "change_summary",
+            "delivery_configuration",
+            "main_assembly",
+            "robot_name",
+            "control.system",
+            "control.reference",
+        )
+    }
     sources: dict[str, str] = {}
     derived: list[str] = []
 
@@ -4561,7 +4701,7 @@ def _identity(
     sub_hardware = submitted(submission.hardware_id) if submission is not None else None
     sub_summary = submitted(submission.change_summary) if submission is not None else None
 
-    hardware = _identity_value(record, namespace, "hardware_id")
+    hardware = authored["hardware_id"]
     hardware = str(hardware).strip() if _text(hardware) else None
     if hardware is None:
         if sub_hardware is not None:
@@ -4599,7 +4739,7 @@ def _identity(
                 {"value": hardware},
             )
         )
-    revision = _identity_value(record, namespace, "revision")
+    revision = authored["revision"]
     revision = str(revision).strip() if _text(revision) else None
     if revision is not None:
         sources["revision"] = "cad"
@@ -4621,7 +4761,7 @@ def _identity(
                 {"value": revision},
             )
         )
-    owner = _identity_value(record, namespace, "owner")
+    owner = authored["owner"]
     owner = str(owner).strip() if _text(owner) else None
     if owner is not None:
         sources["owner"] = "cad"
@@ -4642,7 +4782,7 @@ def _identity(
                 {"value": owner},
             )
         )
-    summary = _identity_value(record, namespace, "change_summary")
+    summary = authored["change_summary"]
     summary = str(summary).strip() if _text(summary) else None
     if summary is not None:
         sources["change_summary"] = "cad"
@@ -4672,12 +4812,10 @@ def _identity(
                 {"value": summary},
             )
         )
-    control = (record.get("identity") or {}).get("control")
-    if not isinstance(control, dict):
-        control = {
-            "system": _scalar(record, namespace, "control.system"),
-            "reference": _scalar(record, namespace, "control.reference"),
-        }
+    control = {
+        "system": authored["control.system"],
+        "reference": authored["control.reference"],
+    }
     system = str(control["system"]).strip() if _text(control.get("system")) else None
     reference = str(control["reference"]).strip() if _text(control.get("reference")) else None
     if system is None or reference is None:
@@ -4716,7 +4854,7 @@ def _identity(
         sources["control"] = "cad"
     delivery = (
         configuration
-        or _identity_value(record, namespace, "delivery_configuration")
+        or authored["delivery_configuration"]
         or record.get("saved_configuration")
     )
     if not _text(delivery):
@@ -4735,7 +4873,7 @@ def _identity(
             )
         )
         delivery = None
-    main = assembly or _identity_value(record, namespace, "main_assembly")
+    main = assembly or authored["main_assembly"]
     main = str(main).replace("\\", "/") if _text(main) else None
     if main is None or main not in native_files:
         findings.append(
@@ -4746,7 +4884,7 @@ def _identity(
                 {"assembly": main},
             )
         )
-    authored_name = _identity_value(record, namespace, "robot_name")
+    authored_name = authored["robot_name"]
     if _text(authored_name):
         robot_name = str(authored_name).strip()
         if _SNAKE.fullmatch(robot_name) is None:
@@ -4775,7 +4913,7 @@ def _identity(
                 blocking=False,
             )
         )
-    parent = _identity_value(record, namespace, "parent_revision")
+    parent = authored["parent_revision"]
     if _text(parent):
         parent_value = str(parent).strip()
         sources["parent_revision"] = "cad"
@@ -5092,6 +5230,203 @@ def native_component_identity(component: dict) -> str:
     return values[0]
 
 
+def _validate_component_states(record: dict, findings: list[dict]) -> None:
+    """Validate the raw component state/flags once for derivation and rebuilds."""
+
+    components = record.get("components")
+    if not isinstance(components, list):
+        findings.append(
+            _finding(
+                "discovery.suppression_state_invalid",
+                "assembly",
+                "the native record carries no component list to classify",
+                {"components": type(components).__name__},
+            )
+        )
+        return
+    for item in components:
+        if not isinstance(item, dict):
+            findings.append(
+                _finding(
+                    "discovery.suppression_state_invalid",
+                    "assembly",
+                    "a raw component entry is not an object",
+                    {"entry": repr(item)[:200]},
+                )
+            )
+            continue
+        name = str(item.get("name2") or "?")
+        state = item.get("suppression_state")
+        if type(state) is not int or state not in {0, 1, 2, 3, 4}:
+            findings.append(
+                _finding(
+                    "discovery.suppression_state_invalid",
+                    f"component:{name}",
+                    "every component must carry the documented raw suppression state "
+                    "(integer 0..4); state 5 and missing, boolean or undocumented values are refused",
+                    {"suppression_state": state},
+                )
+            )
+            continue
+        suppressed = item.get("suppressed")
+        lightweight = item.get("lightweight")
+        fixed = item.get("fixed")
+        if type(fixed) is not bool:
+            findings.append(
+                _finding(
+                    "discovery.component_fixed_invalid",
+                    f"component:{name}",
+                    "component does not carry the exact native boolean IComponent2.IsFixed reading",
+                    {"fixed": fixed, "error": item.get("fixed_error")},
+                )
+            )
+        if type(suppressed) is not bool or type(lightweight) is not bool:
+            findings.append(
+                _finding(
+                    "discovery.suppression_state_invalid",
+                    f"component:{name}",
+                    "every component must carry boolean suppressed and lightweight flags",
+                    {
+                        "suppressed": suppressed,
+                        "lightweight": lightweight,
+                    },
+                )
+            )
+            continue
+        if suppressed != (state == 0) or lightweight != (state in {1, 4}):
+            findings.append(
+                _finding(
+                    "discovery.suppression_state_incoherent",
+                    f"component:{name}",
+                    "the emitted suppression flags must agree with the raw suppression state",
+                    {
+                        "suppression_state": state,
+                        "suppressed": suppressed,
+                        "lightweight": lightweight,
+                    },
+                )
+            )
+            continue
+        if state in {1, 4}:
+            findings.append(
+                _finding(
+                    "discovery.suppression_lightweight",
+                    f"component:{name}",
+                    "a lightweight component cannot be independently measured; the native capture must fully load it",
+                    {"component": name, "suppression_state": state},
+                )
+            )
+
+
+def _validate_source_definition_record(payload: object) -> dict:
+    """Strictly validate the raw evidence consumed by one source rebuild."""
+
+    if not isinstance(payload, dict) or payload.get("schema_version") != DISCOVERY_SCHEMA:
+        raise PipelineError("native discovery record has an unexpected schema")
+    if set(payload) - NATIVE_DISCOVERY_OPTIONAL_ENVELOPE_KEYS != NATIVE_DISCOVERY_ENVELOPE_KEYS:
+        raise PipelineError(
+            "native discovery envelope must carry exact keys"
+        )
+    identity_payload = payload.get("identity")
+    if (
+        not isinstance(identity_payload, dict)
+        or set(identity_payload) != NATIVE_DISCOVERY_IDENTITY_KEYS
+    ):
+        raise PipelineError(
+            "native discovery identity must carry exact keys"
+        )
+    control_payload = identity_payload.get("control")
+    if control_payload is not None and (
+        not isinstance(control_payload, dict)
+        or set(control_payload) != NATIVE_DISCOVERY_CONTROL_KEYS
+    ):
+        raise PipelineError(
+            "native discovery control identity must carry exact keys"
+        )
+    derivation_payload = payload.get("derivation")
+    if (
+        not isinstance(derivation_payload, dict)
+        or set(derivation_payload) != NATIVE_DISCOVERY_DERIVATION_KEYS
+    ):
+        raise PipelineError(
+            "native discovery derivation must carry exact keys"
+        )
+    records = payload.get("records")
+    if (
+        not isinstance(records, list)
+        or any(
+            not isinstance(item, dict)
+            or set(item) != NATIVE_DISCOVERY_RECORD_KEYS
+            for item in records
+        )
+    ):
+        raise PipelineError(
+            "native discovery records must be an object list"
+        )
+    budget = payload.get("budget")
+    if budget is not None and (
+        not isinstance(budget, dict)
+        or set(budget) != NATIVE_DISCOVERY_BUDGET_KEYS
+    ):
+        raise PipelineError("native discovery budget index is malformed")
+    raw = payload.get("raw")
+    if not isinstance(raw, dict):
+        raise PipelineError("native discovery raw record must be an object")
+    _validate_native_record(raw)
+    _validate_property_objects(raw)
+    identity = raw.get("identity")
+    if identity is not None and not isinstance(identity, dict):
+        raise CadError(
+            "cad_identity_invalid",
+            "raw identity evidence is not an object",
+            {"value_type": type(identity).__name__},
+        )
+    control = identity.get("control") if isinstance(identity, dict) else None
+    if control is not None and not isinstance(control, dict):
+        raise CadError(
+            "cad_identity_invalid",
+            "raw control identity is not an object",
+            {"value_type": type(control).__name__},
+        )
+    if isinstance(control, dict) and set(control) - {"system", "reference"}:
+        raise CadError(
+            "cad_identity_invalid",
+            "raw control identity carries unknown fields",
+            {
+                "unknown": sorted(
+                    str(value)
+                    for value in set(control) - {"system", "reference"}
+                )
+            },
+        )
+    for key in (
+        "hardware_id",
+        "revision",
+        "parent_revision",
+        "owner",
+        "change_summary",
+        "delivery_configuration",
+        "main_assembly",
+        "robot_name",
+        "control.system",
+        "control.reference",
+    ):
+        value = _identity_value(raw, NAMESPACE, key)
+        if value is not None and (
+            not isinstance(value, str) or not value.strip()
+        ):
+            raise CadError(
+                "cad_identity_invalid",
+                "a supplied identity value must be non-empty text",
+                {
+                    "field": key,
+                    "value": repr(value)[:300],
+                    "value_type": type(value).__name__,
+                },
+            )
+    return raw
+
+
 def derive_native_package(
     frozen_source: Path,
     output: Path,
@@ -5124,6 +5459,7 @@ def derive_native_package(
     handoff_sha256 = digest(native_files)
     _check_authored_files(native_files)
     _validate_native_record(record)
+    _validate_property_objects(record)
     record_files = record.get("files")
     if not isinstance(record_files, dict) or not record_files:
         raise PipelineError(
@@ -5162,65 +5498,17 @@ def derive_native_package(
     upload_digest = source_selection.get("upload_sha256")
     upload_handoff_digest = upload_digest if _SHA256_HEX.fullmatch(str(upload_digest or "")) else None
     findings: list[dict] = []
-    components = record.get("components")
-    if not isinstance(components, list):
-        findings.append(
-            _finding(
-                "discovery.suppression_state_invalid",
-                "assembly",
-                "the native record carries no component list to classify",
-                {"components": type(components).__name__},
-            )
-        )
-    for item in components if isinstance(components, list) else []:
-        if not isinstance(item, dict):
-            findings.append(
-                _finding(
-                    "discovery.suppression_state_invalid",
-                    "assembly",
-                    "a raw component entry is not an object",
-                    {"entry": repr(item)[:200]},
-                )
-            )
-            continue
-        name = str(item.get("name2") or "?")
-        state = item.get("suppression_state")
-        if type(state) is not int or state not in {0, 1, 2, 3, 4}:
-            findings.append(
-                _finding(
-                    "discovery.suppression_state_invalid",
-                    f"component:{name}",
-                    "every component must carry the documented raw suppression state "
-                    "(integer 0..4); state 5 and missing, boolean or undocumented values are refused",
-                    {"suppression_state": state},
-                )
-            )
-            continue
-        suppressed = item.get("suppressed")
-        lightweight = item.get("lightweight")
-        if type(suppressed) is not bool or type(lightweight) is not bool:
-            findings.append(
-                _finding(
-                    "discovery.suppression_state_invalid",
-                    f"component:{name}",
-                    "every component must carry boolean suppressed and lightweight flags",
-                    {"suppressed": suppressed, "lightweight": lightweight},
-                )
-            )
-            continue
-        if suppressed != (state == 0) or lightweight != (state in {1, 4}):
-            findings.append(
-                _finding(
-                    "discovery.suppression_state_incoherent",
-                    f"component:{name}",
-                    "the emitted suppression flags must agree with the raw suppression state",
-                    {
-                        "suppression_state": state,
-                        "suppressed": suppressed,
-                        "lightweight": lightweight,
-                    },
-                )
-            )
+    from .saved_state import capture_open_matches, warning_from_selection
+
+    try:
+        saved_state_warning = warning_from_selection(source_selection)
+        if saved_state_warning is not None:
+            if not capture_open_matches(source_selection["closure"]["open_status"], record.get("open_status")):
+                raise ValueError("Discover open status differs from selection")
+            findings.append(saved_state_warning)
+    except ValueError as error:
+        raise PipelineError(f"Saved-state source evidence is incoherent: {error}") from error
+    _validate_component_states(record, findings)
     known_occurrences = {
         str(item.get("name2"))
         for item in record.get("components") or []
@@ -5410,11 +5698,7 @@ def derive_native_package(
                     if isinstance(item, dict) and item.get("coordinate_system")
                 }
             ),
-            "evidence_requests": [
-                "evidence/capture.json",
-                "evidence/geometry/",
-                "evidence/native-runtime.json",
-            ],
+            "evidence_requests": list(CAPTURE_EVIDENCE_REQUESTS),
         },
     )
     source_record = _source_record(identity, identity_sources, upload_handoff_digest, records)
@@ -5576,7 +5860,7 @@ def source_definition(
 
     package = Path(package)
     payload = read_data(package / discovery_name)
-    raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
+    raw = _validate_source_definition_record(payload)
     identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else {}
     derivation = payload.get("derivation") if isinstance(payload.get("derivation"), dict) else {}
     records = [item for item in payload.get("records") or [] if isinstance(item, dict)]
@@ -5601,6 +5885,7 @@ def source_definition(
             "main_assembly": identity.get("main_assembly") or derivation.get("main_assembly"),
             "delivery_configuration": identity.get("delivery_configuration") or derivation.get("configuration"),
         }
+        _validate_component_states(raw, findings)
         checks, _budget_entry = _budgets(raw, settings, findings)
         bodies, joints, frames, _names = _derive_carriers(raw, view, settings, findings)
     blocking = [item for item in findings if item.get("blocking")]

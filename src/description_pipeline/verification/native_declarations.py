@@ -971,7 +971,7 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                 lower, upper = next(iter(ranges))
                 author_bounds_usable = all(_number(limits.get(key)) for key in ("lower", "upper"))
                 author_range = (float(limits["lower"]), float(limits["upper"])) if author_bounds_usable else None
-                if author_range not in {None, (0.0, 0.0)} and (
+                if author_range is not None and (
                     abs(author_range[0] - lower) > 1e-12 or abs(author_range[1] - upper) > 1e-12
                 ):
                     raise DeclarationError(

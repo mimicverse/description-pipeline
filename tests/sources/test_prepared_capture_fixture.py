@@ -3,27 +3,19 @@
 from __future__ import annotations
 
 import copy
-import struct
 import tempfile
 import unittest
 from pathlib import Path
 
-from description_pipeline.geometry.native_tessellation import (
-    parse_native_tessellation,
-    read_native_triangle_stream,
-)
-from description_pipeline.geometry.native_transform import transform_from_solidworks
-from description_pipeline.io import PipelineError
 from description_pipeline.schemas import NATIVE_TESSELLATION_SCHEMA
 from description_pipeline.sources.solidworks.errors import CadError
-from description_pipeline.sources.solidworks.native import (
-    materialize_native_triangles,
-    project_axis_references,
-    project_prepared_capture,
+from description_pipeline.sources.solidworks.capture_geometry import (
+    materialize_native_geometry,
+    seal_native_geometry,
 )
-from description_pipeline.verification.native_mesh_observations import (
-    _verify_scene_binding,
-    _verify_stl,
+from description_pipeline.sources.solidworks.capture_projection import (
+    project_axis_references,
+    project_capture_facts,
 )
 from tests.sources import support
 
@@ -85,7 +77,7 @@ class PreparedCaptureFixtureTests(unittest.TestCase):
             raw_facts["source_scopes"]
         )
         self.backend.release()
-        projected = project_prepared_capture(copy.deepcopy(raw_facts))
+        projected = project_capture_facts(copy.deepcopy(raw_facts))
         self.assertEqual(
             set(projected),
             {
@@ -97,11 +89,18 @@ class PreparedCaptureFixtureTests(unittest.TestCase):
                 "link_group_mass_properties",
             },
         )
-        destinations = {
-            component: str(self.root / "geometry" / f"{index:04d}.stl")
-            for index, component in enumerate(sorted(raw_geometry), start=1)
-        }
-        serialized = materialize_native_triangles(raw_geometry, destinations)
+        evidence_root = self.root / "evidence"
+        geometry_raw = seal_native_geometry(
+            raw_geometry,
+            raw_facts["source_scopes"],
+            evidence_root,
+        )
+        serialized = materialize_native_geometry(
+            geometry_raw,
+            raw_facts["source_scopes"],
+            evidence_root=evidence_root,
+            destination_root=self.root / "materialized",
+        )
         self.assertEqual(set(serialized), set(raw_geometry))
         for component, entry in serialized.items():
             self.assertEqual(
@@ -116,7 +115,6 @@ class PreparedCaptureFixtureTests(unittest.TestCase):
                     "bodies",
                     "used_api",
                     "tessellation",
-                    "transform_raw",
                 },
             )
             self.assertEqual(entry["component"], component)
@@ -140,12 +138,12 @@ class PreparedCaptureFixtureTests(unittest.TestCase):
         raw_geometry[component]["triangle_values"] = raw_geometry[component][
             "triangle_values"
         ][:-1]
-        destinations = {
-            component: str(self.root / "geometry" / f"{component}.stl")
-            for component in raw_geometry
-        }
         with self.assertRaises(CadError) as caught:
-            materialize_native_triangles(raw_geometry, destinations)
+            seal_native_geometry(
+                raw_geometry,
+                raw_facts["source_scopes"],
+                self.root / "evidence",
+            )
         self.assertEqual(caught.exception.code, "cad_mesh_export_failed")
 
     def test_fixture_axis_capture_is_raw_until_offline_projection(self):
@@ -189,119 +187,6 @@ class PreparedCaptureFixtureTests(unittest.TestCase):
         )[0]
         self.assertEqual(reference["raw_endpoints_m"], reference_raw["endpoints_raw"])
         self.assertEqual(reference["axis_direction"], [0.0, 0.0, 1.0])
-
-    def _mesh_consumer_artifacts(self, name: str):
-        evidence = self.root.parent / name
-        (evidence / "raw").mkdir(parents=True)
-        raw_facts = self.backend.collect_prepared_scene(
-            self.document,
-            [],
-            groups=[
-                {"name": "base_link", "components": ["base-1"]},
-                {"name": "arm_link", "components": ["arm-1"]},
-            ],
-        )
-        raw_geometry = self.backend.capture_prepared_geometry(
-            raw_facts["source_scopes"]
-        )
-        self.backend.release()
-        destinations = {
-            component: str(evidence / "geometry" / f"{component}.stl")
-            for component in raw_geometry
-        }
-        geometry = list(
-            materialize_native_triangles(raw_geometry, destinations).values()
-        )
-        entry = geometry[0]
-        component = entry["component"]
-        source_scope = raw_geometry[component]["source_scope"]
-        spans = parse_native_tessellation(
-            component,
-            entry["tessellation"],
-            entry["bodies"],
-            entry["triangles"],
-            source_scope=source_scope,
-            warnings=[],
-        )
-        occurrence = {
-            "name": component,
-            "path": source_scope["source_document_path"],
-            "transform": list(
-                transform_from_solidworks(entry["transform_raw"])
-            ),
-            "is_fixed": False,
-            "document_type": "part",
-        }
-        return evidence, entry, source_scope, spans, occurrence
-
-    def test_independent_mesh_consumer_rejects_raw_stl_and_transform_tampering(
-        self,
-    ):
-        evidence, entry, _source_scope, spans, _occurrence = (
-            self._mesh_consumer_artifacts("raw-tamper")
-        )
-        old_raw = evidence / entry["raw_path"]
-        raw_bytes = bytearray(old_raw.read_bytes())
-        first_coordinate = struct.unpack_from("<d", raw_bytes, 24)[0]
-        struct.pack_into("<d", raw_bytes, 24, first_coordinate + 1.0)
-        old_raw.write_bytes(raw_bytes)
-        raw_triangles = read_native_triangle_stream(
-            old_raw,
-            expected_count=entry["triangles"],
-        )
-        with self.assertRaisesRegex(
-            PipelineError,
-            "STL record .* does not bind its raw triangle",
-        ):
-            _verify_stl(
-                entry["component"],
-                evidence / entry["path"],
-                old_raw,
-                raw_triangles,
-                entry["triangles"],
-                spans,
-            )
-
-        evidence, entry, _source_scope, spans, _occurrence = (
-            self._mesh_consumer_artifacts("stl-tamper")
-        )
-        raw_path = evidence / entry["raw_path"]
-        old_stl = evidence / entry["path"]
-        stl_bytes = bytearray(old_stl.read_bytes())
-        stl_bytes[-1] ^= 1
-        old_stl.write_bytes(stl_bytes)
-        raw_triangles = read_native_triangle_stream(
-            raw_path,
-            expected_count=entry["triangles"],
-        )
-        with self.assertRaisesRegex(
-            PipelineError,
-            "STL record .* does not bind its raw triangle",
-        ):
-            _verify_stl(
-                entry["component"],
-                old_stl,
-                raw_path,
-                raw_triangles,
-                entry["triangles"],
-                spans,
-            )
-
-        _evidence, entry, source_scope, _spans, occurrence = (
-            self._mesh_consumer_artifacts("transform-tamper")
-        )
-        occurrence["transform"][3] += 0.01
-        with self.assertRaisesRegex(
-            PipelineError,
-            "offline occurrence transform differs",
-        ):
-            _verify_scene_binding(
-                entry["component"],
-                occurrence,
-                entry["transform_raw"],
-                source_scope,
-            )
-
 
 if __name__ == "__main__":
     unittest.main()

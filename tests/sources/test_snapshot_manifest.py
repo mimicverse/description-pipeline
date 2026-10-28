@@ -6,7 +6,11 @@ import unittest
 from pathlib import Path
 
 from description_pipeline.io import PipelineError, file_digest, write_json
-from description_pipeline.sources.snapshot import SCHEMA, load_scene, verify_snapshot, write_manifest
+from description_pipeline.sources.snapshot import (
+    SCHEMA,
+    verify_snapshot,
+    write_manifest,
+)
 
 IDENTITY = {"provider": "fixture", "revision": "fixture-1"}
 
@@ -32,8 +36,6 @@ class RetiredNamespaceTests(unittest.TestCase):
             write_json(root / "manifest.json", {**manifest, "schema_version": "description.source/v1"})
             with self.assertRaises(PipelineError):
                 verify_snapshot(root)
-            with self.assertRaises(PipelineError):
-                load_scene(root)
 
     def test_retired_model_ids_are_refused(self) -> None:
         from description_pipeline.model import validate_engineering_model
@@ -59,7 +61,6 @@ class WriteManifestTests(unittest.TestCase):
             manifest = build(root, extra={"parts/base.stl": "binary"})
             self.assertEqual(manifest["schema_version"], SCHEMA)
             self.assertEqual(verify_snapshot(root), manifest)
-            self.assertEqual(load_scene(root), {"links": []})
             self.assertIn("parts/base.stl", manifest["files"])
 
     def test_invalid_inputs_are_refused(self):
@@ -108,6 +109,14 @@ class VerifySnapshotTests(unittest.TestCase):
                 "missing identity": ({**complete, "identity": {}}, "source identity is missing"),
                 "no declared files": ({**complete, "files": {}}, "no declared files"),
                 "changed file": ({**complete, "files": {"scene.json": "0" * 64}}, "incomplete or changed"),
+                "unknown envelope": (
+                    {**complete, "unknown_claim": {"second_authority": True}},
+                    "fields are incomplete or unknown",
+                ),
+                "unhashable scene": (
+                    {**complete, "scene": []},
+                    "scene is not bound by manifest",
+                ),
             }
             for label, (manifest, fragment) in cases.items():
                 with self.subTest(case=label):
@@ -136,7 +145,7 @@ class VerifySnapshotTests(unittest.TestCase):
             with self.assertRaisesRegex(PipelineError, "scene is not bound by manifest"):
                 verify_snapshot(root)
 
-    def test_a_scene_that_is_not_an_object_is_refused(self):
+    def test_a_fixture_scene_remains_manifest_bound(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "scene.json").write_text("[1, 2]", encoding="utf-8")
@@ -152,8 +161,6 @@ class VerifySnapshotTests(unittest.TestCase):
                 },
             )
             self.assertEqual(verify_snapshot(root)["kind"], "fixture")
-            with self.assertRaisesRegex(PipelineError, "must be an object"):
-                load_scene(root)
 
 
 if __name__ == "__main__":

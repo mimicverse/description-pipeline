@@ -142,12 +142,14 @@ def native_limit_inventory_complete(mates) -> bool:
     return True
 
 
-def _finite(value) -> float:
+def finite_number(value) -> float:
+    """One strict finite JSON number from native evidence."""
+
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise NativeLimitInvalidError("native limit number is not numeric")
+        raise NativeLimitInvalidError("native number is not numeric")
     number = float(value)
     if not math.isfinite(number):
-        raise NativeLimitInvalidError("native limit number is not finite")
+        raise NativeLimitInvalidError("native number is not finite")
     return number
 
 
@@ -160,7 +162,7 @@ def _value_record(record, key: str, expected_api: str, unit: str) -> float:
         raise NativeLimitInvalidError(f"{key} came from another API")
     if record.get("unit") != unit:
         raise NativeLimitInvalidError(f"{key} uses the wrong unit")
-    return _finite(record.get("value"))
+    return finite_number(record.get("value"))
 
 
 def _binding(entity, index: int) -> tuple[str, str | None, int | None]:
@@ -183,7 +185,15 @@ def _binding(entity, index: int) -> tuple[str, str | None, int | None]:
         raise NativeLimitReadError("limit mate entity reference could not be read")
     feature = entity.get("feature")
     face_index = entity.get("face_index")
-    if not ((isinstance(feature, str) and feature) or type(face_index) is int):
+    if (
+        (feature is not None and (
+            not isinstance(feature, str) or not feature
+        ))
+        or (face_index is not None and (
+            type(face_index) is not int or face_index < 0
+        ))
+        or (feature is None and face_index is None)
+    ):
         raise NativeLimitReadError("limit mate entity has no readable feature or face selector")
     return (
         component,
@@ -343,8 +353,8 @@ def validate_native_limit(
     if (
         set(limits) != expected_limit_keys
         or limits.get("unit") != unit
-        or _finite(limits.get("lower")) != minimum
-        or _finite(limits.get("upper")) != maximum
+        or finite_number(limits.get("lower")) != minimum
+        or finite_number(limits.get("upper")) != maximum
     ):
         raise NativeLimitInvalidError("legacy limits do not equal the validated native limit")
     entities = mate.get("entities")

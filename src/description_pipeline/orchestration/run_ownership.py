@@ -20,6 +20,7 @@ in-place recovery entirely.  Unknown or mapped-ambiguous failures always require
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -29,7 +30,13 @@ from .feishu_oauth import (
     recorded_display_name,
     valid_actor_principal,
 )
-from .request_context import CLEAR_BODY_SCOPE_KEY, CREATE_BODY_SCOPE_KEY, bound_request
+from ..pipeline.contracts import DispatchConf, ProtocolError
+from .request_context import (
+    CLEAR_BODY_SCOPE_KEY,
+    CREATE_BODY_SCOPE_KEY,
+    bound_request,
+    valid_dag_run_id,
+)
 
 #: The pinned route module that owns the DAG-run handlers; matching module+name means a future
 #: route rename fails closed instead of matching some other handler.
@@ -83,6 +90,106 @@ class RecoveryAssessment:
     classification: str
     reason: str
     cleared_tasks: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CreateDispatchBinding:
+    """The persisted admission and dispatch facts bound by one create body."""
+
+    principal: str
+    run_id: str
+    parent_run_id: str | None
+    parent_dag_run_id: str | None
+    dag_id: str
+    dag_run_id: str
+    freeze_command_id: str
+
+
+def recorded_create_binding(
+    dag_run_id: str,
+    conf: DispatchConf,
+) -> CreateDispatchBinding | None:
+    """Read the exact admitted run and dispatch command as the operator role."""
+
+    dsn = os.environ.get("PLATFORM_OPERATOR_DSN")
+    if not dsn:
+        return None
+    try:
+        import psycopg2  # noqa: PLC0415 - Airflow runtime dependency only
+
+        with psycopg2.connect(
+            dsn,
+            connect_timeout=5,
+        ) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT admission.request->>'principal', admission.run_id,
+                       admission.parent_run_id,
+                       dispatch.request->>'dag_id',
+                       dispatch.request->>'dag_run_id',
+                       dispatch.request->>'freeze_command_id',
+                       parent_dispatch.request->>'dag_id',
+                       parent_dispatch.request->>'dag_run_id'
+                FROM run_admission AS admission
+                JOIN command AS dispatch
+                  ON dispatch.run_id = admission.run_id
+                 AND dispatch.kind = 'dispatch'
+                LEFT JOIN command AS parent_dispatch
+                  ON parent_dispatch.run_id = admission.parent_run_id
+                 AND parent_dispatch.kind = 'dispatch'
+                WHERE admission.run_id = %s
+                  AND dispatch.request->>'dag_run_id' = %s
+                  AND dispatch.request->>'freeze_command_id' = %s
+                """,
+                (conf.run_id, dag_run_id, conf.freeze_command_id),
+            )
+            rows = cursor.fetchall()
+    except Exception:
+        return None
+    if len(rows) != 1:
+        return None
+    (
+        principal,
+        run_id,
+        parent_run_id,
+        dag_id,
+        stored_run_id,
+        freeze_command_id,
+        parent_dag_id,
+        parent_dag_run_id,
+    ) = rows[0]
+    if (
+        not isinstance(principal, str)
+        or not valid_actor_principal(principal)
+        or (parent_run_id is not None and not isinstance(parent_run_id, str))
+        or run_id != conf.run_id
+        or dag_run_id != stored_run_id
+        or freeze_command_id != conf.freeze_command_id
+        or not isinstance(dag_id, str)
+        or not dag_id
+        or (
+            parent_run_id is None
+            and (parent_dag_id is not None or parent_dag_run_id is not None)
+        )
+        or (
+            parent_run_id is not None
+            and (
+                parent_dag_id != dag_id
+                or not isinstance(parent_dag_run_id, str)
+                or not valid_dag_run_id(parent_dag_run_id)
+            )
+        )
+    ):
+        return None
+    return CreateDispatchBinding(
+        principal=principal,
+        run_id=run_id,
+        parent_run_id=parent_run_id,
+        parent_dag_run_id=parent_dag_run_id,
+        dag_id=dag_id,
+        dag_run_id=stored_run_id,
+        freeze_command_id=freeze_command_id,
+    )
 
 
 def recorded_actor_principal(actor: object) -> str | None:
@@ -247,15 +354,32 @@ def owner_retry_allowed(user: Any, dag_id: str, run_id: str) -> bool:
 
 
 def owner_create_allowed(user: Any, dag_id: str) -> bool:
-    """A linked run may reuse only a terminal parent owned by this authenticated user."""
+    """Allow create only for the caller's exact persisted admission and dispatch."""
+
     request = bound_request()
     candidate = getattr(request, "scope", {}).get(CREATE_BODY_SCOPE_KEY)
     if not isinstance(candidate, dict) or candidate.get("safe") is not True:
         return False
-    parent = candidate.get("parent_dag_run_id")
+    try:
+        conf = DispatchConf.from_record(candidate.get("conf"))
+    except (ProtocolError, TypeError, ValueError):
+        return False
+    binding = recorded_create_binding(candidate.get("dag_run_id"), conf)
+    if (
+        binding is None
+        or binding.dag_id != dag_id
+        or binding.run_id != conf.run_id
+        or binding.dag_run_id != candidate.get("dag_run_id")
+        or binding.freeze_command_id != conf.freeze_command_id
+        or binding.principal != user.get_id()
+    ):
+        return False
+    parent = binding.parent_run_id
     if parent is None:
         return True
-    facts = recorded_run_facts(dag_id, parent)
+    if binding.parent_dag_run_id is None:
+        return False
+    facts = recorded_run_facts(dag_id, binding.parent_dag_run_id)
     return bool(
         facts and facts[0] is not None and facts[0] == user.get_id() and _state_value(facts[1]) in {"success", "failed"}
     )

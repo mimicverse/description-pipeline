@@ -1443,7 +1443,38 @@ function Invoke-RestMethod {
   return $script:HealthProbeResponse
 }
 
+foreach ($relative in @(
+    'packages/unknown.bin', 'results/.unknown', 'state/unknown.json',
+    'state/lifecycle/unknown.json', 'state/locks/maintenance.lock')) {
+  $residuePath = Join-Path $installRoot $relative
+  $null = New-Item -ItemType Directory -Path (Split-Path -Parent $residuePath) -Force
+  [System.IO.File]::WriteAllText($residuePath, 'unknown-user-data')
+  $residueRefusal = Invoke-Refusal { Invoke-Install $installBinding }
+  Check ('install.unknown_root_contents_refused_' + $relative) (
+    $residueRefusal.code -ceq 'install_target_not_empty' -and
+    [System.IO.File]::ReadAllText($residuePath) -ceq 'unknown-user-data' -and
+    $null -eq $script:FixtureTask -and
+    -not (Test-Path -LiteralPath (Join-Path $installRoot '.description-managed-root.json')) -and
+    -not (Test-Path -LiteralPath (Join-Path $installRoot 'state/install-id')) -and
+    -not (Test-Path -LiteralPath (Join-Path $installRoot 'state/install-receipt.json')) -and
+    @(Get-ChildItem -LiteralPath (Join-Path $installRoot 'state') -Recurse -Force |
+      Where-Object { $_.Name -like '.install-*' }).Count -eq 0)
+  Remove-Item -LiteralPath $residuePath -Force
+}
+Remove-Item -LiteralPath (Join-Path $installRoot 'state/locks') -Force
+foreach ($relative in @('packages', 'results', 'state/lifecycle')) {
+  $targetPath = Join-Path $installRoot $relative
+  Remove-Item -LiteralPath $targetPath -Force
+  [System.IO.File]::WriteAllText($targetPath, 'unknown-user-file')
+  $fileRefusal = Invoke-Refusal { Invoke-Install $installBinding }
+  Check ('install.file_root_refused_' + $relative) (
+    $fileRefusal.code -ceq 'install_target_not_empty' -and
+    [System.IO.File]::ReadAllText($targetPath) -ceq 'unknown-user-file')
+  Remove-Item -LiteralPath $targetPath -Force
+}
+$null = New-Item -ItemType Directory -Path (Join-Path $installRoot 'state/lifecycle')
 $installResult = Invoke-Install $installBinding
+Check 'install.empty_lifecycle_and_missing_data_roots_accepted' ($installResult.passed -eq $true)
 $installReceipt = Read-InstallReceipt (
   Join-Path $installRoot 'state/install-receipt.json')
 Check 'install.receipt_uses_task_definition_v2' (
@@ -1967,6 +1998,106 @@ Set-Item Function:\Write-JsonAtomic -Value $originalWriteJsonAtomic
 $script:FailTaskObserverAfterRemove = $false
 $script:TaskObserverFailed = $false
 Microsoft.PowerShell.Management\Remove-Item -LiteralPath $observerRoot -Recurse -Force
+
+# ---- first-install ACL failures and same-version recovery ------------------
+$installRoot = Join-Path $root 'first-install-acl'
+$null = New-Item -ItemType Directory -Path (Join-Path $installRoot 'state') -Force
+$installToken = Join-Path $installRoot 'endpoint.token'
+[System.IO.File]::WriteAllText($installToken, ('x' * 40))
+$installConfigPath = Join-Path $installRoot 'endpoint.json'
+Write-TestConfig $installConfigPath $installRoot $installToken
+$installArchive = Join-Path $installRoot $archiveName
+[System.IO.File]::WriteAllText($installArchive, 'acl-archive')
+$installReleasePath = Join-Path $installRoot 'release.json'
+Write-TestRelease $installReleasePath $archiveName (Sha256 $installArchive)
+$aclSeed = New-TestBindingPath $installRoot $installConfigPath $installReleasePath $python
+$aclBindingPath = Join-Path $installRoot 'state/windows-binding.json'
+Copy-Item -LiteralPath $aclSeed -Destination $aclBindingPath
+$installBinding = Read-Binding $aclBindingPath
+$script:FixtureTask = $null
+$aclReceiptPath = Join-Path $installRoot 'state/install-receipt.json'
+$aclIdPath = Join-Path $installRoot 'state/install-id'
+$aclGeneration = Join-Path $installRoot 'state/lifecycle/generation'
+function Assert-ProtectedAcl([string]$Path, [string]$ServiceSid) {
+  Add-ProtectedAclObservation 'assert' $Path
+  if ((Normalize-PathIdentity $Path) -ceq $script:FailAclPath) {
+    $script:ReceiptPresentAtAclFailure = Test-Path -LiteralPath $aclReceiptPath
+    throw 'injected final ACL assertion failure'
+  }
+}
+foreach ($failurePath in @(
+    (Join-Path $installRoot 'state/bootstrap-managed-root.ps1'), $aclReceiptPath)) {
+  $script:FailAclPath = Normalize-PathIdentity $failurePath
+  $script:ReceiptPresentAtAclFailure = $null
+  $aclDetail = $null
+  try { $null = Invoke-Install $installBinding } catch {
+    $aclDetail = $_.Exception.Data['detail']
+  }
+  $isReceipt = ($failurePath -ceq $aclReceiptPath)
+  Check ('install.final_acl_failure_cleans_' + (Split-Path -Leaf $failurePath)) (
+    $null -ne $aclDetail -and
+    $aclDetail.cleanup.passed -eq $true -and
+    $script:ReceiptPresentAtAclFailure -eq $isReceipt -and
+    $null -eq $script:FixtureTask -and
+    -not (Test-Path -LiteralPath $aclGeneration) -and
+    -not (Test-Path -LiteralPath $aclReceiptPath) -and
+    -not (Test-Path -LiteralPath $aclIdPath) -and
+    (Test-Path -LiteralPath $aclBindingPath -PathType Leaf))
+}
+
+# A failed receipt removal must not turn the retained receipt into a half pair.
+$script:FailAclPath = Normalize-PathIdentity $aclReceiptPath
+function Remove-Item {
+  [CmdletBinding()]
+  param([string]$LiteralPath, [switch]$Recurse, [switch]$Force)
+  if ((Normalize-PathIdentity $LiteralPath) -ceq (Normalize-PathIdentity $aclReceiptPath)) {
+    throw 'injected receipt removal failure'
+  }
+  Microsoft.PowerShell.Management\Remove-Item @PSBoundParameters
+}
+$receiptCleanupDetail = $null
+try { $null = Invoke-Install $installBinding } catch {
+  $receiptCleanupDetail = $_.Exception.Data['detail']
+}
+Check 'install.receipt_cleanup_failure_preserves_install_id' (
+  $null -ne $receiptCleanupDetail -and
+  $receiptCleanupDetail.cleanup.passed -eq $false -and
+  $receiptCleanupDetail.cleanup.steps.receipt.passed -eq $false -and
+  $receiptCleanupDetail.cleanup.steps.install_id.attempted -eq $false -and
+  (Test-Path -LiteralPath $aclReceiptPath -PathType Leaf) -and
+  (Test-Path -LiteralPath $aclIdPath -PathType Leaf))
+Remove-Item Function:\Remove-Item
+Microsoft.PowerShell.Management\Remove-Item -LiteralPath $aclReceiptPath -Force
+Microsoft.PowerShell.Management\Remove-Item -LiteralPath $aclIdPath -Force
+$script:FailAclPath = ''
+$aclRetry = Invoke-Install $installBinding
+Check 'install.acl_failure_same_target_clean_retry' (
+  $aclRetry.passed -eq $true -and
+  (Test-Path -LiteralPath $aclReceiptPath -PathType Leaf) -and
+  (Test-Path -LiteralPath $aclIdPath -PathType Leaf))
+
+# Restore keeps a complete validated identity pair and its business data.
+$recoveredId = Read-InstallId $aclIdPath
+$businessPaths = @('packages/input.bin', 'results/result.bin', 'state/business.json')
+foreach ($relative in $businessPaths) {
+  [System.IO.File]::WriteAllText((Join-Path $installRoot $relative), 'restored-business-data')
+}
+$script:FixtureTask = $null
+Remove-Item -LiteralPath $aclGeneration -Recurse -Force
+$script:FailAclPath = Normalize-PathIdentity $aclReceiptPath
+$restoredFailure = Invoke-Refusal { Invoke-Install $installBinding }
+Check 'install.restored_pair_preserved_after_acl_failure' (
+  $restoredFailure.threw -and
+  (Read-InstallId $aclIdPath) -ceq $recoveredId -and
+  (Test-Path -LiteralPath $aclReceiptPath -PathType Leaf))
+$script:FailAclPath = ''
+$restoredInstall = Invoke-Install $installBinding
+Check 'install.valid_restored_pair_accepts_business_data' (
+  $restoredInstall.passed -eq $true -and
+  $restoredInstall.identity.install_id -ceq $recoveredId -and
+  @($businessPaths | Where-Object {
+    [System.IO.File]::ReadAllText((Join-Path $installRoot $_)) -cne 'restored-business-data'
+  }).Count -eq 0)
 
 # ---- one-line error envelope and exit classes -------------------------------
 $pwshPath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName

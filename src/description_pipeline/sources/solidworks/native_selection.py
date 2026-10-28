@@ -1,42 +1,9 @@
-"""Native closure admission for the provisionally staged upload inventory.
+"""Pure closure admission projected from the one native Discover observation.
 
-The whole uploaded folder is staged first (per-file hash-verified by the
-endpoint); this reader then performs **one** closure walk over the staged
-bytes in the backend's owned session:
-
-* the session search scope is pinned to the staged root
-  (``SolidWorksBackend.configure_staged_search`` /
-  ``ISldWorks.SetSearchFolders``) before any document is opened,
-* closed no-search ``GetDocumentDependencies2(path, False, False, False)``
-  stored references are recorded verbatim **before any document is opened**
-  (query A over every staged native document; once an assembly is open, a
-  false-Searchflag query reports the in-session resolution, not the saved
-  author references) and are evidence only, never admission,
-* the sealed staged main is opened read-only and every occurrence's actual
-  resolved document (and, for imports, the materialization/author-metadata
-  readings) is recorded,
-* admission is the native closure: every resolved document must lie under the
-  staged root and be a staged upload-index file with matching sha256; any
-  out-of-stage, unresolved or unbound-import edge refuses the run with the
-  verbatim stored/resolved paths,
-* the CU pre-verification (W6, the W5 probe-v4 check set) reads the main
-  document's declared delivery identity (``dp.*``) in the same read-only pass
-  and refuses when a required declaration is absent or the property set is
-  unreadable: submitted values never replace CAD-authored declarations, and
-  no definition exchange or native capture runs on such a package.  The
-  sealed selection record carries the ``preverify`` block as its receipt.
-
-No basename or suffix substitution exists anywhere in this module: engine
-reported paths are mapped to upload-index names by their exact staged
-relative location.  A suppressed placement (state 0) loads nothing: it is
-recorded as evidence and omitted from the closure graph.  A lightweight
-placement (state 1/4) stays graph-admissible and is flagged; measurement paths
-refuse it elsewhere.  State 5 (internal-ID mismatch) and unreadable or
-undocumented states refuse the run with the exact instance.
-
-The return contract is documented in
-``reviews/incident094339/native-closure-reader-contract-20261011.md`` (agreed
-with worker B, 2026-10-11).
+The native reader owns pre-open references, exact main opening, occurrence
+readings, search restoration and release. This module never starts CAD. It
+maps those same primitives to the sealed selection using exact staged paths;
+unknown bindings and unreadable required facts refuse rather than substitute.
 """
 from __future__ import annotations
 
@@ -58,9 +25,10 @@ from .session_artifacts import (
     session_root_pid,
     session_temp_root,
 )
+from .saved_state import normalize_open_status
 from .selection import MAX_SELECTION_FILES, SelectionError, selection_path, validate_file_index
 
-__all__ = ["MAX_SELECTION_FILES", "NativeSelectionReader"]
+__all__ = ["MAX_SELECTION_FILES", "project_native_closure"]
 
 CLOSURE_SCHEMA = "solidworks-to-urdf.native-closure/v1"
 
@@ -209,6 +177,7 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
     imports: list[dict] = []
     virtual_components: list[dict] = []
     suppressed: list[dict] = []
+    unresolved: list[dict] = []
     warnings: list[dict] = []
     problems: list[dict] = []
     hashes: dict[str, str] = {}
@@ -255,42 +224,42 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
 
     graph_entry(main)
     document_entry(main)
-    open_status = readings.get("open")
-    open_status = dict(open_status) if isinstance(open_status, Mapping) else {}
-    open_errors = open_status.get("errors")
-    if type(open_errors) is not int:
+    try:
+        open_status = normalize_open_status(readings.get("open"))
+    except ValueError as error:
         raise SelectionError(
             "selection_open_status_unreadable",
-            "the staged main open status is not an integer; a complete closure cannot be proven",
+            "the staged main open status is not a usable integer pair",
             stage_root=str(stage_root),
             problems=[
                 _problem(
                     "selection_open_status_unreadable",
-                    "the staged main open status is not an integer",
+                    "the staged main open status is not a usable integer pair",
                     document=main,
-                    open_status=open_status,
+                    open_status=readings.get("open"),
+                    error=str(error),
                 )
             ],
-            open_status=open_status,
-        )
-    if open_errors != 0:
-        # A nonzero CAD open status means references were not all resolved as
-        # saved; missing references can auto-suppress components (M3 original:
-        # two formerly active HD(2) assemblies and their 34 children), so a
-        # suppressed placement can never be assumed to be author intent here
-        # and a complete closure cannot be claimed.
+            open_status=readings.get("open"),
+        ) from error
+    open_errors = open_status["errors"]
+    open_warnings = open_status["warnings"]
+    saved_state_incomplete = (open_status["errors"] != 0 or open_status["warnings"] != 0)
+    missing_reference_open = open_errors == 2
+    if not open_status["continuable"]:
         raise SelectionError(
             "selection_open_errors",
-            "the staged main opened with CAD-reported errors; missing references may "
-            "have auto-suppressed occurrences, so a complete closure cannot be claimed",
+            "the staged main opened with unsupported CAD error bits; only the known "
+            "missing-reference error can continue from readable saved state",
             stage_root=str(stage_root),
             problems=[
                 _problem(
                     "selection_open_errors",
-                    "the staged main opened with CAD-reported errors",
+                    "the staged main opened with CAD-reported errors outside the continuable policy",
                     document=main,
                     open_errors=open_errors,
-                    open_warnings=open_status.get("warnings"),
+                    open_warnings=open_warnings,
+                    open_error_bits=open_status["error_bits"],
                 )
             ],
             open_status=open_status,
@@ -313,7 +282,8 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
     preverify = {
         "schema": "m303-probe-v4/selection",
         "open_errors": open_errors,
-        "open_warnings": open_status.get("warnings"),
+        "open_warnings": open_warnings,
+        "open_classification": open_status["classification"],
         "declarations": {key: declarations.get(key) for key in (*IDENTITY_DECLARATIONS, *OPTIONAL_DECLARATIONS)},
         "declarations_missing": missing_declarations,
         "declarations_error": declarations_error,
@@ -322,7 +292,11 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
             "source": "cad" if configuration_declared else "native_saved_configuration",
             "verbatim": configuration_value,
         },
-        "verdict": "attention" if (declarations_error or configuration_invalid) else "pass",
+        "verdict": (
+            "attention"
+            if (saved_state_incomplete or declarations_error or configuration_invalid)
+            else "pass"
+        ),
     }
     if declarations_error:
         problems.append(
@@ -385,6 +359,30 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
             )
             continue
         if state == _COMPONENT_SUPPRESSED:
+            if not resolved:
+                if missing_reference_open and not record.get("path_error") and virtual is False:
+                    unresolved.append(
+                        {
+                            "instance": instance,
+                            "document": defining_name or raw_defining,
+                            "configuration": record.get("configuration"),
+                            "suppression_state": state,
+                            "resolved_path": "",
+                            "path_error": record.get("path_error"),
+                            "state": "missing_reference",
+                        }
+                    )
+                    continue
+                problems.append(
+                    _problem(
+                        "selection_suppressed_unresolved",
+                        "a suppressed occurrence has no resolvable document and the open "
+                        "status does not prove a continuable missing reference",
+                        document=defining_name or raw_defining,
+                        instance=instance,
+                    )
+                )
+                continue
             if virtual is not False:
                 problems.append(
                     _problem(
@@ -409,16 +407,6 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
                 )
                 continue
         if state == _COMPONENT_SUPPRESSED:
-            if not resolved:
-                problems.append(
-                    _problem(
-                        "selection_suppressed_unresolved",
-                        "a suppressed occurrence has no resolvable document even though the main opened cleanly",
-                        document=defining_name or raw_defining,
-                        instance=instance,
-                    )
-                )
-                continue
             suppressed.append(
                 {
                     "document": defining_name or raw_defining,
@@ -427,7 +415,11 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
                     "name": record.get("name"),
                     "suppression_state": 0,
                     "resolved_path": resolved,
-                    "justification": "authored_suppression_clean_open",
+                    "justification": (
+                        "suppression_with_incomplete_saved_state"
+                        if saved_state_incomplete
+                        else "authored_suppression_clean_open"
+                    ),
                 }
             )
             continue
@@ -851,6 +843,27 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
         entry["resolved_edges"] = sorted(entry["resolved_edges"], key=lambda item: str(item.get("instance")))
         documents_out[name] = entry
     excluded = sorted(set(files) - set(graph))
+    if saved_state_incomplete:
+        occurrences_out = []
+        for record in occurrences:
+            if not isinstance(record, Mapping):
+                continue
+            occurrences_out.append(
+                {
+                    "instance": record.get("instance") or record.get("name"),
+                    "defining": record.get("defining"),
+                    "configuration": record.get("configuration"),
+                    "suppression_state": record.get("suppression_state"),
+                    "resolved_path": record.get("resolved_path"),
+                }
+            )
+        occurrences_out.sort(
+            key=lambda item: (
+                str(item.get("instance")),
+                str(item.get("resolved_path")),
+                str(item.get("configuration")),
+            )
+        )
     preverify["closure_ok"] = True
     return {
         "schema_version": CLOSURE_SCHEMA,
@@ -860,7 +873,8 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
         "reader_sha256": reader_sha256,
         "stored_references_phase": readings.get("stored_references_phase"),
         "search_configuration": readings.get("search") or {},
-        "open_status": readings.get("open") or {},
+        "open_status": open_status,
+        **({"observed_occurrences": occurrences_out} if saved_state_incomplete else {}),
         "saved_configuration": readings.get("saved_configuration"),
         "document_state": readings.get("document_state"),
         "preverify": preverify,
@@ -876,61 +890,60 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
         "suppressed": sorted(
             suppressed, key=lambda item: (str(item.get("document")), str(item.get("instance")))
         ),
+        "unresolved": sorted(
+            unresolved,
+            key=lambda item: (
+                str(item.get("instance")),
+                str(item.get("document")),
+                str(item.get("resolved_path")),
+            ),
+        ),
         "excluded": excluded,
         "session": readings.get("session") or {},
-        "sealed_count": len(readings.get("sealed") or []),
-        "documents_before": readings.get("documents_before"),
-        "documents_after": readings.get("documents_after"),
     }
 
 
-class NativeSelectionReader:
-    """One-shot closure reader over the provisionally staged upload inventory.
+def project_native_closure(stage, main_assembly, upload_files, record, *, reader_sha256):
+    """Admit the released observation without another native walk or open."""
 
-    ``observe(stage, main_assembly, upload_files)`` runs exactly one closure
-    walk in the backend's owned session and returns the evidence payload; the
-    session is closed before it returns.  Inject ``walker`` in tests (a
-    callable ``(stage_root, main, files) -> readings``); inject ``backend`` to
-    reuse a configured ``SolidWorksBackend`` (its staged search pin applies).
-    ``cad_ownership_file`` pinpoints the default backend's CAD ownership
-    ledger, so an endpoint-side reader shares the endpoint's single
-    state-root ledger instead of the library default.  Admission is
-    fail-closed; see the module docstring for the rules.
-    """
-
-    def __init__(self, *, walker=None, backend=None, reader_sha256=None, cad_ownership_file=None):
-        if walker is not None and backend is not None:
-            raise SelectionError("selection_reader_invalid", "Inject either a walker or a backend, not both")
-        if cad_ownership_file is not None and (walker is not None or backend is not None):
-            raise SelectionError(
-                "selection_reader_invalid", "A CAD ownership file applies only to the default backend"
-            )
-        if reader_sha256 is not None and (
-            not isinstance(reader_sha256, str) or _SHA.fullmatch(reader_sha256) is None
-        ):
-            raise SelectionError("selection_reader_invalid", "reader_sha256 must be a SHA-256 digest")
-        if walker is None:
-            if backend is None:
-                from .native import SolidWorksBackend
-
-                backend = SolidWorksBackend(
-                    cad_ownership_file=None if cad_ownership_file is None else Path(cad_ownership_file)
-                )
-            walker = backend.closure_readings
-        if not callable(walker):
-            raise SelectionError("selection_reader_invalid", "The closure walker must be callable")
-        self._walker = walker
-        self._reader_sha256 = reader_sha256
-
-    def observe(self, stage, main_assembly, upload_files):
-        """One native closure walk; the evidence payload or a fail-closed refusal."""
-
-        stage_root = _stage_root(stage)
-        files = validate_file_index(upload_files)
-        main = selection_path(main_assembly)
-        if not main.lower().endswith(".sldasm") or main not in files:
-            raise SelectionError("selection_main_invalid", "Choose an indexed SolidWorks assembly", path=main)
-        readings = self._walker(stage_root, main, files)
-        if not isinstance(readings, Mapping):
-            raise SelectionError("selection_reader_result_invalid", "The closure walk returned no readings")
-        return _closure_payload(stage_root, main, files, readings, self._reader_sha256)
+    stage_root = _stage_root(stage)
+    files = validate_file_index(upload_files)
+    main = selection_path(main_assembly)
+    if not main.lower().endswith(".sldasm") or main not in files:
+        raise SelectionError("selection_main_invalid", "Choose an indexed SolidWorks assembly", path=main)
+    if not isinstance(reader_sha256, str) or _SHA.fullmatch(reader_sha256) is None:
+        raise SelectionError("selection_reader_invalid", "reader_sha256 must be a SHA-256 digest")
+    if not isinstance(record, Mapping):
+        raise SelectionError("selection_reader_result_invalid", "Native Discover returned no observation")
+    components = record.get("components")
+    unresolved = record.get("unresolved_components")
+    if not isinstance(components, list) or not isinstance(unresolved, list):
+        raise SelectionError("selection_reader_result_invalid", "Native occurrence observations are missing")
+    occurrences = []
+    for row in [*components, *unresolved]:
+        reference = row.get("native_reference") if isinstance(row, Mapping) else None
+        if not isinstance(reference, Mapping):
+            raise SelectionError("selection_reader_result_invalid", "A native occurrence has no source reading")
+        instance = row.get("instance_id") or row.get("name2") or row.get("instance")
+        occurrences.append({
+            **reference,
+            "instance": instance,
+            "name": instance,
+            "configuration": row.get("configuration"),
+            "suppression_state": row.get("suppression_state"),
+        })
+    properties = record.get("properties")
+    if not isinstance(properties, Mapping) or not isinstance(properties.get("document"), Mapping):
+        raise SelectionError("selection_identity_unreadable", "The native document property set is unreadable")
+    readings = {
+        "occurrences": occurrences,
+        "open": record.get("open_status"),
+        "identity_properties": properties["document"],
+        "saved_configuration": record.get("saved_configuration"),
+        "document_state": record.get("document_state"),
+        "stored_references": record.get("stored_references"),
+        "stored_references_phase": record.get("stored_references_phase"),
+        "search": record.get("search"),
+        "session": record.get("session"),
+    }
+    return _closure_payload(stage_root, main, files, readings, reader_sha256)

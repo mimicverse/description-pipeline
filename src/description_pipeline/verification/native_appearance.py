@@ -17,7 +17,7 @@ from ..appearance_contract import (
     scoped_rgba,
 )
 from ..geometry.native_tessellation import native_stl_subset
-from ..io import PipelineError, confined, file_digest
+from ..io import PipelineError
 from ..sources.solidworks.naming import (
     asset_namespace,
     material_name,
@@ -962,48 +962,6 @@ def _state_owner_display_state(
     return owner_state
 
 
-def _target_faces(
-    target: object,
-    all_faces: set[tuple[int, int, int]],
-) -> set[tuple[int, int, int]]:
-    _require(isinstance(target, Mapping), "A display-state appearance target is malformed")
-    scope = target.get("scope")
-    if scope == "occurrence":
-        return set(all_faces)
-    if scope == "body":
-        key = _face_key(target.get("body_type"), target.get("body_index"), 0)
-        return {face for face in all_faces if face[:2] == key[:2]}
-    if scope == "face":
-        key = _face_key(
-            target.get("body_type"),
-            target.get("body_index"),
-            target.get("face_index"),
-        )
-        _require(key in all_faces, "A face appearance target is not a delivered face")
-        return {key}
-    if scope == "feature":
-        source_owner = target.get("source_owner")
-        face_keys = target.get("face_keys")
-        _require(
-            isinstance(source_owner, Mapping)
-            and isinstance(face_keys, list)
-            and bool(face_keys),
-            "A feature appearance target has no native owner or face binding",
-        )
-        result = set()
-        for face in face_keys:
-            _require(isinstance(face, Mapping), "A feature face key is malformed")
-            key = _face_key(
-                face.get("body_type"),
-                face.get("body_index"),
-                face.get("face_index"),
-            )
-            _require(key in all_faces, "A feature face key is not a delivered face")
-            result.add(key)
-        return result
-    raise PipelineError("A display-state appearance target has an unknown scope")
-
-
 def _colorref(value: object, transparency: object):
     _require(
         type(value) is int
@@ -1697,7 +1655,7 @@ def _resolved_faces(
     }
 
 
-def _expected_groups(root: Path, row: Mapping, resolved: Mapping) -> list[dict]:
+def _expected_groups(_root: Path, row: Mapping, resolved: Mapping) -> list[dict]:
     component = str(row["component"])
     tessellation = row.get("tessellation")
     _require(isinstance(tessellation, Mapping), f"{component} has no tessellation")
@@ -1739,12 +1697,12 @@ def _expected_groups(root: Path, row: Mapping, resolved: Mapping) -> list[dict]:
         by_rgba.setdefault(item["rgba"], []).append(item)
         next_start += span["triangle_count"]
 
-    original = confined(root / "evidence", str(row.get("path") or ""))
+    source_bytes = row.get("source_bytes")
     _require(
-        file_digest(original) == row.get("sha"),
+        isinstance(source_bytes, bytes)
+        and hashlib.sha256(source_bytes).hexdigest() == row.get("sha"),
         f"{component} source STL differs from its geometry record",
     )
-    source_bytes = original.read_bytes()
     groups = []
     for rgba, items in by_rgba.items():
         ranges = []

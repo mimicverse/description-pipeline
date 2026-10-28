@@ -20,6 +20,7 @@ from ..pipeline.contracts import (
     StageId,
     StageResult,
 )
+from ..stages import STAGE_IDS
 from .airflow_effect_trigger import EffectPollTrigger
 
 if TYPE_CHECKING:
@@ -115,14 +116,7 @@ class StageTaskOperator(BaseOperator):
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
-        if stage not in {
-            "freeze",
-            "discover",
-            "capture",
-            "generate",
-            "verify",
-            "publish",
-        }:
+        if stage not in STAGE_IDS:
             raise ValueError(f"Unknown stage {stage!r}")
         if self.task_id != stage:
             raise ValueError("StageTaskOperator task_id must equal stage")

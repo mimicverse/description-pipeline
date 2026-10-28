@@ -53,7 +53,6 @@ def environment(*, copy_pid: int = 100) -> dict:
             "visible": True,
         },
         "prepared_capture": {
-            "mode": "single_read_only_prepared_capture",
             "policy": {
                 "mode": "prepared_read_only_copy",
                 "source_root": r"C:\captures",
@@ -70,29 +69,6 @@ def environment(*, copy_pid: int = 100) -> dict:
                 "read_only": True,
                 "errors": 0,
                 "warnings": 0,
-            },
-            "state_before": {
-                "path": r"C:\captures\robot.SLDASM",
-                "title": None,
-                "title_error": {
-                    "code": "cad_title_unavailable",
-                    "message": "title is diagnostic only",
-                },
-                "save_flag": None,
-                "save_flag_error": {
-                    "code": "cad_save_flag_unavailable",
-                    "message": "save flag is diagnostic only",
-                },
-                "saved": None,
-                "active_configuration": "Default",
-                "configurations": None,
-                "configurations_error": {
-                    "code": "cad_configuration_names_unavailable",
-                    "message": "configuration names are diagnostic only",
-                },
-                "read_only": True,
-                "lightweight": None,
-                "unsupported": ["lightweight"],
             },
         },
     }
@@ -197,18 +173,22 @@ class MetadataProvenanceTests(unittest.TestCase):
         with self.assertRaisesRegex(PipelineError, "runtime differs"):
             self.warnings(runtime=runtime)
 
-    def test_unknown_state_diagnostics_are_allowed_without_fabricated_success(self) -> None:
+    def test_prepared_runtime_keeps_only_policy_and_opened_metadata(self) -> None:
         runtime = runtime_environment()
-        state = runtime["prepared_capture"]["state_before"]
-        self.assertIsNone(state["title"])
-        self.assertIsNone(state["configurations"])
-        self.assertIsNone(state["save_flag"])
-        self.assertIsNone(state["saved"])
+        self.assertEqual(
+            set(runtime["prepared_capture"]),
+            {"policy", "opened"},
+        )
+        objects = self.objects(runtime=runtime)
+        fields = {field for row in objects for field in row["fields"]}
+        self.assertNotIn("/prepared_capture/state_before/path", fields)
 
-        warnings = self.warnings(runtime=runtime)
-        self.assertTrue(warnings)
-        files = {row["file"] for row in warnings[0]["objects"]}
-        self.assertEqual(files, {"evidence/native-runtime.json"})
+        runtime["prepared_capture"]["state_before"] = {}
+        with self.assertRaisesRegex(
+            PipelineError,
+            "prepared_capture metadata must contain only policy and opened",
+        ):
+            self.warnings(runtime=runtime)
 
     def test_single_prepared_copy_session_fields_are_projected(self) -> None:
         objects = self.objects(runtime=runtime_environment())

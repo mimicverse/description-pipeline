@@ -7,7 +7,7 @@ const logicSource = readFileSync(new URL("preview_logic.js", staticDir), "utf8")
 const logic = await import(
   `data:text/javascript;base64,${Buffer.from(logicSource, "utf8").toString("base64")}`
 );
-const { previewDiagnosticState, registeredQualityArtifact, warningSourceRows } = logic;
+const { previewDiagnosticState, registeredVerificationArtifact, warningSourceRows } = logic;
 const app = readFileSync(new URL("app.js", staticDir), "utf8");
 
 const warning = {
@@ -62,6 +62,23 @@ for (const row of rows) {
   assert.equal(row.rule_id, "engineering_rotation_default_window/v1");
   assert.equal(row.rule_version, "v1");
 }
+for (const row of rows) {
+  assert.equal(row.extra.native_cad_ranges, false);
+  assert.equal(row.extra.hardware_qualified, false);
+  assert.equal(row.extra.engineering_position_range_qualified, false);
+}
+const saved = warningSourceRows({
+  code: "source.saved_state_incomplete",
+  detail: {
+    missing_references: { items: [{ path: "missing.SLDPRT" }] },
+    actual_scope: { occurrence_count: 7 },
+    source_integrity_proven: false,
+  },
+});
+assert.equal(saved.length, 1);
+assert.deepEqual(saved[0].extra.missing_references.items, [{ path: "missing.SLDPRT" }]);
+assert.equal(saved[0].extra.actual_scope.occurrence_count, 7);
+assert.equal(saved[0].extra.source_integrity_proven, false);
 assert.deepEqual(rows[0].native_observation_errors, [
   { mate: "native_limit", reason: "unreadable" },
 ]);
@@ -71,19 +88,19 @@ assert.equal(rows[0].anchor, '"limits"');
 assert.equal(rows[0].key, "limits");
 assert.equal(rows[0].reference, "joints/left.json#limits");
 assert.deepEqual(
-  registeredQualityArtifact(
-    { report_files: { "reports/quality.json": "a".repeat(64) } },
+  registeredVerificationArtifact(
+    { report_files: { "verification-certificate.json": "a".repeat(64) } },
     "run/id",
   ),
   {
-    name: "reports/quality.json",
+    name: "verification-certificate.json",
     sha256: "a".repeat(64),
-    href: "/api/runs/run%2Fid/artifacts/reports/quality.json",
+    href: "/api/runs/run%2Fid/artifacts/verification-certificate.json",
   },
 );
-assert.equal(registeredQualityArtifact({ report_files: {} }, "run"), null);
+assert.equal(registeredVerificationArtifact({ report_files: {} }, "run"), null);
 assert.equal(
-  registeredQualityArtifact({ report_files: { "reports/quality.json": "A".repeat(64) } }, "run"),
+  registeredVerificationArtifact({ report_files: { "verification-certificate.json": "A".repeat(64) } }, "run"),
   null,
 );
 assert.deepEqual(previewDiagnosticState({ verified: false, warnings: [] }), {
@@ -91,7 +108,25 @@ assert.deepEqual(previewDiagnosticState({ verified: false, warnings: [] }), {
   unverified: true,
   warnings: [],
   warnings_total: 0,
+  reason: "",
+  mechanical_passed: false,
 });
+assert.deepEqual(
+  previewDiagnosticState({
+    verified: false,
+    reason: "run_unresolved",
+    mechanical_passed: true,
+    warnings: [],
+  }),
+  {
+    visible: true,
+    unverified: true,
+    warnings: [],
+    warnings_total: 0,
+    reason: "run_unresolved",
+    mechanical_passed: true,
+  },
+);
 
 const renderer = app.slice(
   app.indexOf("function renderPreviewDiagnostic"),
@@ -102,8 +137,8 @@ for (const token of [
   "diagnostic.warnings.length",
   "Source warnings",
   "appendWarningSourceRows",
-  "registeredQualityArtifact",
-  "Open registered quality report",
+  "registeredVerificationArtifact",
+  "Open verification certificate",
   "link.textContent",
   "replaceChildren()",
   "textContent",

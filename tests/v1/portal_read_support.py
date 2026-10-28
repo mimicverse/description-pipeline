@@ -21,19 +21,17 @@ from description_pipeline.interface_records import (
 from description_pipeline.pipeline.contracts import ArtifactRef
 from description_pipeline.request_evidence import (
     build_request_evidence,
-    write_request_evidence,
+    request_evidence_bytes,
 )
 from description_pipeline.runtime import tool_record
 from description_pipeline.schemas import (
     TOOL_SCHEMA,
     VERIFICATION_CERTIFICATE_SCHEMA,
 )
-from description_pipeline.stages import CONTRACT, CONTRACT_SHA256, stage_view
+from description_pipeline.stages import CONTRACT, CONTRACT_SHA256, STAGE_IDS, stage_view
 
 from .protocol_support import protocol_events
 from .source_record_support import source_record
-
-STAGES = ("freeze", "discover", "capture", "generate", "verify", "publish")
 
 
 def build_sealed_delivery(
@@ -48,7 +46,8 @@ def build_sealed_delivery(
     for name in ("input", "evidence", "model", "urdf", "meshes", "reports"):
         (root / name).mkdir(parents=True)
     (root / "input" / "records").mkdir()
-    (root / "evidence" / "geometry").mkdir()
+    (root / "input" / "discovery").mkdir()
+    (root / "evidence" / "raw").mkdir()
     (root / "native-observation").mkdir()
     (root / "prepared").mkdir()
     write_json(root / "stage-request.json", {"fixture": "freeze-stage-request"})
@@ -98,7 +97,7 @@ def build_sealed_delivery(
         },
     )
     write_json(
-        root / "evidence" / "discovery.json",
+        root / "input" / "discovery" / "native-discovery.json",
         {
             "discovery": "fixture",
             "handoff_sha256": digest(native_inventory),
@@ -112,18 +111,19 @@ def build_sealed_delivery(
             "records": [],
         },
     )
-    write_json(root / "evidence" / "capture-plan.json", {"plan": "fixture"})
-    write_json(root / "evidence" / "capture.json", {"capture": "fixture"})
+    write_json(root / "input" / "capture-plan.json", {"plan": "fixture"})
     write_json(
         root / "evidence" / "native-runtime.json",
         {"runtime": "fixture"},
     )
-    (root / "evidence" / "geometry" / "part.stl").write_bytes(b"native-stl")
+    write_json(
+        root / "evidence" / "raw" / "native_capture_facts.json",
+        {},
+    )
     write_json(root / "model" / "robot.json", {"model": "fixture"})
     (root / "urdf" / "robot.urdf").write_text("<robot/>\n", encoding="utf-8")
     (root / "meshes" / "part.stl").write_bytes(b"mesh-stl")
     write_json(root / "tool.json", tool_record())
-    write_json(root / "reports" / "quality.json", {"quality": "fixture"})
     write_json(
         root / "reports" / "generate.json",
         {"fixture": "generate-receipt"},
@@ -176,17 +176,18 @@ def build_sealed_delivery(
         {"fixture": "publication-observation"},
     )
     (root / "candidate.bundle").write_bytes(b"fixture-candidate\n")
-    write_request_evidence(
-        root / "input" / "request.json",
-        build_request_evidence(
-            purpose="engineering",
-            request_id="fixture-sealed-delivery",
-            target_hardware=hardware_id,
-            change_summary="fixture",
-            main_assembly="cad/robot.SLDASM",
-            handoff_digest=digest(package_files),
-            platform_config_digest="c" * 64,
-        ),
+    (root / "input" / "request.json").write_bytes(
+        request_evidence_bytes(
+            build_request_evidence(
+                purpose="engineering",
+                request_id="fixture-sealed-delivery",
+                target_hardware=hardware_id,
+                change_summary="fixture",
+                main_assembly="cad/robot.SLDASM",
+                handoff_digest=digest(package_files),
+                platform_config_digest="c" * 64,
+            )
+        )
     )
     write_delivery_manifest(
         root,
@@ -513,7 +514,7 @@ class RegisteredPlatform:
         stage_rows: list[dict] = []
         by_stage: dict[str, dict[str, dict]] = {}
         members: dict[str, dict] = {}
-        for stage in STAGES:
+        for stage in STAGE_IDS:
             row = registered.get(stage)
             if not isinstance(row, dict):
                 stage_rows.append(
@@ -771,7 +772,7 @@ class RegisteredPlatform:
         )
         quality = {}
         try:
-            parsed = json.loads(files.get("reports/quality.json", b"{}"))
+            parsed = json.loads(files.get("verification-certificate.json", b"{}"))
             quality = parsed if isinstance(parsed, dict) else {}
         except ValueError:
             quality = {}

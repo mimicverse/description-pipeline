@@ -208,12 +208,12 @@ from airflow.settings import Session
 
 with Session() as session:
     pool = session.query(Pool).filter(Pool.pool == "windows_native").one_or_none()
-    sys.exit(0 if pool is not None and int(pool.slots) == 1 else 1)
+    sys.exit(0 if pool is not None and int(pool.slots) == 1 and pool.include_deferred else 1)
 PY
   then
-    report PASS "native pool windows_native capacity=1"
+    report PASS "native pool windows_native capacity=1 including deferred tasks"
   else
-    report FAIL "native pool windows_native is missing or its capacity is not 1"
+    report FAIL "native pool windows_native must have capacity 1 including deferred tasks"
   fi
 else
   report FAIL "native pool cannot be verified: AIRFLOW_VENV is not executable"
@@ -266,14 +266,21 @@ if command -v curl >/dev/null 2>&1; then
     2??|3??) report PASS "portal serves the unauthenticated login entry on 127.0.0.1:${PORTAL_PORT} (HTTP $code)" ;;
     *) report FAIL "portal is not serving its login entry on 127.0.0.1:${PORTAL_PORT} (HTTP $code)" ;;
   esac
-  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -k "https://127.0.0.1:${OPERATOR_HTTPS_PORT}/operator-healthz" || true)"
-  [ "$code" = "200" ] && report PASS "proxy liveness on https://127.0.0.1:${OPERATOR_HTTPS_PORT}/operator-healthz" \
-    || report FAIL "proxy liveness HTTP $code"
-  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -k "https://127.0.0.1:${OPERATOR_HTTPS_PORT}/" || true)"
-  case "$code" in
-    2??|3??) report PASS "operator URL serves the login entry over TLS (HTTP $code)" ;;
-    *) report FAIL "operator URL is not serving its login entry over TLS (HTTP $code)" ;;
-  esac
+fi
+
+OPERATOR_ORIGIN="${OPERATOR_URL%/}"
+if TLS_DIAG="$("$CONTROL_PYTHON" -I -B -S "$HERE/tls_probe.py" \
+    --url "$OPERATOR_ORIGIN/operator-healthz" --cafile "$OPERATOR_TLS_CERT" \
+    --expect-status 200 2>&1)"; then
+  report PASS "proxy liveness passed verified TLS and origin-host identity (${TLS_DIAG})"
+else
+  report FAIL "proxy liveness failed verified TLS or origin-host identity: ${TLS_DIAG:-no response}"
+fi
+if TLS_DIAG="$("$CONTROL_PYTHON" -I -B -S "$HERE/tls_probe.py" \
+    --url "$OPERATOR_ORIGIN/" --cafile "$OPERATOR_TLS_CERT" 2>&1)"; then
+  report PASS "operator URL serves its login entry over verified TLS (${TLS_DIAG})"
+else
+  report FAIL "operator URL failed verified TLS or origin-host identity: ${TLS_DIAG:-no response}"
 fi
 
 # Check the complete current browser module bundle against installed bytes. A
@@ -314,34 +321,9 @@ fi
 
 # The Feishu auth manager must answer with its JSON contract, and an explicitly unconfigured
 # manager is NOT READY: preparation may run without credentials, commissioning may not.
-if FEISHU_DIAG="$("$CONTROL_PYTHON" - "$OPERATOR_HTTPS_PORT" <<'PY'
-import json, ssl, sys, urllib.error, urllib.request
-
-context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-context.check_hostname = False
-context.verify_mode = ssl.CERT_NONE
-url = f"https://127.0.0.1:{sys.argv[1]}/auth/feishu/health"
-try:
-    with urllib.request.urlopen(url, timeout=10, context=context) as response:
-        status, raw = response.status, response.read()
-except urllib.error.HTTPError as error:
-    status, raw = error.code, error.read()
-except Exception:
-    raise SystemExit(1)
-try:
-    body = json.loads(raw or b"{}")
-except ValueError:
-    print(f"HTTP {status} non-JSON response")
-    raise SystemExit(1)
-if status == 200 and body.get("configured") is True:
-    raise SystemExit(0)
-if status == 503 and body.get("configured") is False:
-    print("HTTP 503 " + json.dumps(body, sort_keys=True))
-    raise SystemExit(2)
-print(f"HTTP {status} " + json.dumps(body, sort_keys=True))
-raise SystemExit(1)
-PY
-)"; then
+if FEISHU_DIAG="$("$CONTROL_PYTHON" -I -B -S "$HERE/tls_probe.py" \
+    --url "$OPERATOR_ORIGIN/auth/feishu/health" --cafile "$OPERATOR_TLS_CERT" \
+    --mode feishu-health 2>&1)"; then
   report PASS "Feishu SSO health reports configured (200 JSON)"
 else
   FEISHU_RC=$?

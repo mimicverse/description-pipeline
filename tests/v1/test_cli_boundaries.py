@@ -35,6 +35,14 @@ class CliBoundaryTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             cli.parser().parse_args(["run", "run-1", "--repository", "repo"])
 
+    def test_admit_has_no_unpersisted_dispatch_override(self) -> None:
+        for argv in (
+            ["admit", "spec.json", "--dispatch-dag-id", "other"],
+            ["admit", "spec.json", "--dispatch-dag-run-id", "other"],
+        ):
+            with self.subTest(argv=argv), self.assertRaises(SystemExit):
+                cli.parser().parse_args(argv)
+
     def test_version_banner_has_one_installable_program_identity(self) -> None:
         output = io.StringIO()
         with redirect_stdout(output), self.assertRaises(SystemExit) as raised:

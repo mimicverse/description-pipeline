@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from ..artifacts import ArtifactStore, ArtifactStoreError
+from ..artifacts.store import path_has_link_ancestor
 from ..interface_records import (
     REQUEST_PURPOSES,
     check_policy_digest,
@@ -25,8 +26,10 @@ from ..io import PipelineError, artifact_path_parts, canonical, digest, file_dig
 from ..request_evidence import normalize_change_summary
 from ..repository.publish import (
     CommitSpec,
+    PublicationError,
     materialize_repository_snapshot,
     seal_repository_snapshot,
+    validate_git_remote,
 )
 from ..repository.review_branch import review_branch
 from ..runtime import python_version_is_supported, scoped_executor_sha256, tool_record
@@ -54,6 +57,7 @@ from .freeze import RulesetCatalog, RulesetRoot
 from .native_target import load_registered_native_target
 from .publish_contract import REPOSITORY_SNAPSHOT_KIND, REPOSITORY_SNAPSHOT_METADATA
 from ..orchestration.feishu_oauth import valid_actor_principal
+from ..platform.facts import FactConflict
 
 _SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")
 _GIT_OBJECT = re.compile(r"\A[0-9a-f]{40}\Z")
@@ -245,12 +249,13 @@ def _real_directory(value: object, where: str) -> Path:
     if not isinstance(value, (str, Path)):
         raise ProtocolError("admission_ingestion.invalid", {"where": where})
     path = Path(value)
-    if not path.is_absolute() or path.is_symlink() or path.is_junction() or not path.is_dir():
+    if not path.is_absolute():
         raise ProtocolError("admission_ingestion.invalid", {"where": where})
-    resolved = path.resolve()
-    if any(parent.is_symlink() for parent in resolved.parents):
+    if path_has_link_ancestor(path):
         raise ProtocolError("admission_ingestion.invalid", {"where": where, "reason": "symlink-parent"})
-    return resolved
+    if not path.is_dir():
+        raise ProtocolError("admission_ingestion.invalid", {"where": where})
+    return path.resolve()
 
 
 def _canonical_mapping(value: object, where: str) -> dict[str, Any]:
@@ -598,6 +603,18 @@ def _spec_administrative_intent(spec: AdmissionSpec) -> dict[str, Any]:
     }
 
 
+def _durable_admission_identity(spec: AdmissionSpec) -> dict[str, Any]:
+    """Compare every prepared fact while ignoring only clock-derived timestamps."""
+
+    identity = copy.deepcopy(spec.identity_record())
+    identity.pop("created_at", None)
+    commit = identity.get("publish_intent", {}).get("commit")
+    if isinstance(commit, dict):
+        commit.pop("authored_at", None)
+        commit.pop("committed_at", None)
+    return identity
+
+
 def _freeze_successor_request_intent(
     request: ProductionFreezeSuccessorRequest,
     originals: VerifiedArtifact,
@@ -705,6 +722,18 @@ class PreparedAdmission:
                     "fields": differences,
                 },
             )
+        identity_differences = _intent_differences(
+            _durable_admission_identity(self.spec),
+            _durable_admission_identity(outcome_spec),
+        )
+        if identity_differences:
+            raise ProtocolError(
+                "admission_ingestion.identity_conflict",
+                {
+                    "run_id": self.spec.run_id,
+                    "fields": identity_differences,
+                },
+            )
         if outcome.admission != build_run_admission(outcome_spec):
             raise ProtocolError(
                 "admission_ingestion.outcome_invalid",
@@ -766,7 +795,12 @@ class PreparedAdmission:
                     "admission": expected_target.to_record(),
                 },
             )
-        outcome = application.admit(self.spec)
+        try:
+            outcome = application.admit(self.spec)
+        except FactConflict:
+            outcome = application.load_admission_outcome(self.spec.run_id)
+            if outcome is None:
+                raise
         self.validate_outcome(outcome)
         return outcome
 
@@ -815,8 +849,7 @@ class ProductionAdmissionFactory:
     def _load_platform(self) -> tuple[dict[str, Any], str, bytes]:
         if (
             not self.platform_snapshot.is_file()
-            or self.platform_snapshot.is_symlink()
-            or any(parent.is_symlink() for parent in self.platform_snapshot.resolve().parents)
+            or path_has_link_ancestor(self.platform_snapshot)
         ):
             raise ProtocolError("admission_ingestion.config_missing")
         raw = self.platform_snapshot.read_bytes()
@@ -1094,10 +1127,16 @@ class ProductionAdmissionFactory:
             repositories.get(repository_slug),
             f"resolved.derived.repositories[{repository_slug}]",
         )
-        origin_url = _text(
-            _git(checkout, "remote", "get-url", "origin"),
-            "repository.origin",
-        )
+        try:
+            origin_url = validate_git_remote(
+                checkout,
+                repository_slug,
+            )
+        except PublicationError as error:
+            raise ProtocolError(
+                "admission_ingestion.repository_target_invalid",
+                {"repository": repository_slug},
+            ) from error
         base_oid = _git_optional(
             checkout,
             "rev-parse",

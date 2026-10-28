@@ -22,6 +22,7 @@ from pathlib import Path
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
+from description_pipeline.schemas import AIRFLOW_DISPATCH_CONF_SCHEMA
 from tests.v1._airflow_env import pinned_airflow_home
 
 # Absolute and outside the checkout, fixed before Airflow is imported.
@@ -62,6 +63,14 @@ if AIRFLOW_AVAILABLE:
     )
 
 JWT_SECRET = "feishu-auth-manager-tests-" + "0" * 40
+CREATE_RUN_ID = "run-worker"
+CREATE_FREEZE_COMMAND_ID = "freeze:worker"
+CREATE_DAG_RUN_ID = "portal-20261028T120000-1234abcd"
+CREATE_CONF = {
+    "schema_version": AIRFLOW_DISPATCH_CONF_SCHEMA,
+    "run_id": CREATE_RUN_ID,
+    "freeze_command_id": CREATE_FREEZE_COMMAND_ID,
+}
 
 
 class _RoutedRequest:
@@ -77,7 +86,18 @@ class _RoutedRequest:
     ) -> None:
         self.scope = {"type": "http", "endpoint": endpoint, "method": http_method}
         if getattr(endpoint, "__name__", None) == "trigger_dag_run":
-            self.scope[request_context.CREATE_BODY_SCOPE_KEY] = {"safe": True, "parent_dag_run_id": None}
+            self.scope[request_context.CREATE_BODY_SCOPE_KEY] = (
+                request_context.evaluate_create_candidate(
+                    json.dumps(
+                        {
+                            "dag_run_id": CREATE_DAG_RUN_ID,
+                            "logical_date": None,
+                            "conf": CREATE_CONF,
+                        }
+                    ).encode(),
+                    oversize=False,
+                )
+            )
         if clear_body_safe is not None:
             self.scope[request_context.CLEAR_BODY_SCOPE_KEY] = {"safe": clear_body_safe}
         self.path_params = {"dag_id": dag_id}
@@ -140,6 +160,22 @@ class FeishuAuthManagerTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.root = Path(self.metadata.name)
+        self._create_binding = run_ownership.CreateDispatchBinding(
+            principal="cli_app:tenant-a:ou_worker",
+            run_id=CREATE_RUN_ID,
+            parent_run_id=None,
+            parent_dag_run_id=None,
+            dag_id=auth.ALLOWED_DAG_ID,
+            dag_run_id=CREATE_DAG_RUN_ID,
+            freeze_command_id=CREATE_FREEZE_COMMAND_ID,
+        )
+        create_binding = mock.patch.object(
+            run_ownership,
+            "recorded_create_binding",
+            side_effect=lambda *_args: self._create_binding,
+        )
+        create_binding.start()
+        self.addCleanup(create_binding.stop)
 
     def manager(self, environ: dict[str, str] | None = None) -> auth.FeishuAuthManager:
         """The manager is built exactly as the api-server builds it, against the isolated metadata."""
@@ -429,8 +465,13 @@ class FeishuAuthManagerTests(unittest.TestCase):
             app_id="cli_app", open_id="ou_admin", name="Admin", avatar_url="", tenant_key="tenant-a"
         )
         self._record_run("linked-parent", owner.get_name(), state="success")
+        self._create_binding = dataclasses.replace(
+            self._create_binding,
+            principal=owner.get_id(),
+            parent_run_id="linked-parent",
+            parent_dag_run_id="linked-parent",
+        )
         request = _RoutedRequest(trigger_dag_run, auth.ALLOWED_DAG_ID)
-        request.scope[request_context.CREATE_BODY_SCOPE_KEY] = {"safe": True, "parent_dag_run_id": "linked-parent"}
         with request_context.use_request(request):
             for user, expected in ((owner, True), (other, False), (admin, True)):
                 self.assertEqual(
@@ -572,6 +613,10 @@ class FeishuAuthManagerTests(unittest.TestCase):
         self.assertFalse(decide("PUT", run, bulk_dag_runs, run_id="run-own"))
         self.assertFalse(decide("DELETE", run, delete_dag_run, run_id="run-own"))
         # Manual create is the only proven POST route; no run context never grants ownership.
+        self._create_binding = dataclasses.replace(
+            self._create_binding,
+            principal=owner.get_id(),
+        )
         self.assertTrue(decide("POST", run, trigger_dag_run))
         self.assertTrue(decide("POST", run, trigger_dag_run, clear_body_safe=None))
         self.assertFalse(decide("POST", run, bulk_dag_runs))

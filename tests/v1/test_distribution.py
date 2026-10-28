@@ -154,8 +154,26 @@ class DistributionTests(unittest.TestCase):
             0,
         )
 
+    def test_ci_checkouts_bind_the_reviewed_pull_request_head(self):
+        workflow = (ROOT / ".github/workflows/verify.yml").read_text(encoding="utf-8")
+        self.assertEqual(
+            workflow.count(
+                "ref: ${{ github.event.pull_request.head.sha || github.sha }}"
+            ),
+            workflow.count("uses: actions/checkout@v4"),
+        )
+
     def test_windows_paths_and_case_collisions_are_rejected_on_linux(self):
-        for names in (["../outside"], ["..\\..\\outside"], ["C:\\outside"], ["/outside"], ["a.py", "A.py"]):
+        for names in (
+            ["../outside"],
+            ["..\\..\\outside"],
+            ["C:\\outside"],
+            ["/outside"],
+            ["a.py", "A.py"],
+            ["a", "./a"],
+            ["a/b", "a//b"],
+            ["a/b", "a/./b"],
+        ):
             with self.subTest(names=names), self.assertRaises(PipelineError):
                 safe_members(names)
 
@@ -317,6 +335,62 @@ class DistributionTests(unittest.TestCase):
                 with self.assertRaises(PipelineError) as raised:
                     verify_release(root, identity)
                 self.assertIn("repeats demo", str(raised.exception))
+
+    def test_role_archives_require_their_complete_file_manifest(self):
+        for platform in ("linux", "windows"):
+            with tempfile.TemporaryDirectory() as directory, self.subTest(platform=platform):
+                root = Path(directory)
+                identity = complete_release(root)
+                archive_path = root / f"description-{VERSION}-{platform}-cp312-x86_64.zip"
+                with zipfile.ZipFile(archive_path) as source:
+                    members = {
+                        name: source.read(name)
+                        for name in source.namelist()
+                        if name != "files.json"
+                    }
+                with zipfile.ZipFile(archive_path, "w") as archive:
+                    for name, payload in members.items():
+                        archive.writestr(name, payload)
+                write_json(
+                    root / "release.json",
+                    {**identity, "artifacts": inventory(root, exclude=("release.json",))},
+                )
+                with self.assertRaisesRegex(PipelineError, "complete file manifest"):
+                    verify_release(root, identity)
+
+    def test_role_archives_reject_additional_bound_members(self):
+        for platform, nested in (
+            ("linux", False), ("windows", False),
+            ("linux", True), ("windows", True),
+        ):
+            with tempfile.TemporaryDirectory() as directory, self.subTest(platform=platform, nested=nested):
+                root = Path(directory)
+                identity = complete_release(root)
+                archive_path = root / f"description-{VERSION}-{platform}-cp312-x86_64.zip"
+                with zipfile.ZipFile(archive_path) as source:
+                    members = {name: source.read(name) for name in source.namelist()}
+                if nested:
+                    wheel = next(name for name in members if name.startswith("wheels/demo-"))
+                    members[wheel.replace("wheels/", "wheels/sub/")] = members.pop(wheel)
+                else:
+                    members["unexpected.txt"] = b"unexpected\n"
+                members["files.json"] = json.dumps(
+                    {
+                        name: hashlib.sha256(payload).hexdigest()
+                        for name, payload in members.items()
+                        if name != "files.json"
+                    },
+                    sort_keys=True,
+                ).encode()
+                with zipfile.ZipFile(archive_path, "w") as archive:
+                    for name, payload in members.items():
+                        archive.writestr(name, payload)
+                write_json(
+                    root / "release.json",
+                    {**identity, "artifacts": inventory(root, exclude=("release.json",))},
+                )
+                with self.assertRaisesRegex(PipelineError, "unexpected members"):
+                    verify_release(root, identity)
 
     def test_role_wheels_must_match_the_archive_target(self):
         cases = {

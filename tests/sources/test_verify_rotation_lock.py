@@ -15,6 +15,7 @@ class VerifierRotationLockTests(unittest.TestCase):
         self.mate = {
             "name": "coaxial__concentric",
             "type": "concentric",
+            "entity_count": 2,
             "suppressed": False,
             "error_code": 0,
             "scope": "",
@@ -40,6 +41,7 @@ class VerifierRotationLockTests(unittest.TestCase):
         return {
             "name": "seated__coincident",
             "type": "coincident",
+            "entity_count": 2,
             "suppressed": False,
             "error_code": 0,
             "scope": "",

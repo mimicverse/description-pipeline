@@ -30,10 +30,12 @@ from description_pipeline.orchestration.native_operation_runtime import (
     DISCOVER_KIND,
 )
 from description_pipeline.orchestration.discover_protocol import (
-    ArchiveDiscoverAdapter,
     admit_observation_bundle,
     seal_observation_bundle,
+    seal_source_archive,
+    run_windows_discover,
 )
+from tests.v1.archive_discover_adapter import ArchiveDiscoverAdapter
 from description_pipeline.orchestration.native_operation_client import (
     native_discover_operation_id,
 )
@@ -79,12 +81,12 @@ from description_pipeline.sources.solidworks.discover_stage import (
     NativeDiscoverRequest,
     admit_native_observation,
 )
-from tests.sources.selection_support import closure_evidence
+from tests.sources.selection_support import closure_evidence, observation_from_closure_fixture
 from tests.sources.test_solidworks_discovery import FakeBackend, record as native_record
 
 MAIN = "cad/robot.SLDASM"
 SELECTED_EDGES = {
-    MAIN: ["cad/base.SLDPRT", "cad/arm.SLDPRT", "spare/base.SLDPRT"],
+    MAIN: ["cad/base.SLDPRT", "cad/arm.SLDPRT"],
     "cad/base.SLDPRT": [],
     "cad/arm.SLDPRT": [],
     "spare/base.SLDPRT": [],
@@ -132,14 +134,14 @@ def _artifact(kind: str, root: Path, *, run_id: str | None = None, stage: str | 
     )
 
 
-class ClosureReader:
+class NativeObservationFixture:
     def __init__(self, *, transform=None, refusal=None, reader_sha256=TOOL_SHA256) -> None:
         self.transform = transform
         self.refusal = refusal
         self.reader_sha256 = reader_sha256
         self.calls = 0
 
-    def observe(self, stage, main_assembly, upload_files):
+    def closure_facts(self, stage, main_assembly, upload_files):
         self.calls += 1
         if self.refusal is not None:
             raise self.refusal
@@ -156,13 +158,20 @@ class ClosureReader:
 
 
 class CountingBackend(FakeBackend):
-    def __init__(self, payload: dict) -> None:
+    def __init__(self, payload: dict, *, observation_fixture=None) -> None:
         super().__init__(payload)
         self.calls = 0
+        self.observation_fixture = observation_fixture or NativeObservationFixture()
 
     def discover_native(self, frozen_source, settings, *, on_activity=None):
+        from description_pipeline.sources.solidworks.revision import package_inventory
+
         self.calls += 1
-        return super().discover_native(frozen_source, settings, on_activity=on_activity)
+        record = super().discover_native(frozen_source, settings, on_activity=on_activity)
+        closure = self.observation_fixture.closure_facts(
+            frozen_source, settings["main_assembly"], package_inventory(frozen_source),
+        )
+        return observation_from_closure_fixture(record, closure)
 
 
 class EffectLedger:
@@ -492,7 +501,7 @@ class DiscoverHarness:
         self.freeze_ref = _artifact(FREEZE_RESULT_KIND, self.freeze, run_id="run-discover", stage="freeze")
         self.record = native_record()
         self.record["files"] = {
-            name: self.source_files[name] for name in (MAIN, "cad/base.SLDPRT", "cad/arm.SLDPRT", "spare/base.SLDPRT")
+            name: self.source_files[name] for name in (MAIN, "cad/base.SLDPRT", "cad/arm.SLDPRT")
         }
 
     def request(self, **overrides):
@@ -601,10 +610,11 @@ class DiscoverHarness:
 
     def port(self, *, reader=None, backend=None, native_tool=None) -> ArchiveDiscoverAdapter:
         backend = backend or CountingBackend(copy.deepcopy(self.record))
+        if reader is not None:
+            backend.observation_fixture = reader
         return ArchiveDiscoverAdapter(
             artifacts=self.store,
             native_tool=native_tool or NATIVE_TOOL,
-            selection_reader_factory=lambda: reader or ClosureReader(),
             backend_factory=lambda _root, _files: backend,
         )
 
@@ -656,7 +666,7 @@ class DiscoverDomainTests(unittest.TestCase):
         self.assertTrue((root / "native-observation/observation.json").is_file())
         result = read_data(root / "result.json")
         self.assertTrue(result["passed"])
-        self.assertIn("spare/base.SLDPRT", result["selection"]["files"])
+        self.assertNotIn("spare/base.SLDPRT", result["selection"]["files"])
         self.assertNotIn("unused/base.SLDPRT", result["selection"]["files"])
 
     def test_nonterminal_native_submission_returns_one_effect_deferral(self) -> None:
@@ -1163,12 +1173,12 @@ class DiscoverDomainTests(unittest.TestCase):
                     evidence_for_variant(index, filename, transform)
                 )
 
-    def test_package_outside_reference_is_refused_before_native_record_read(self) -> None:
+    def test_package_outside_reference_is_refused_before_observation_sealing(self) -> None:
         def outside(evidence):
             evidence["documents"][MAIN]["resolved_edges"][0]["resolved_path"] = "C:\\outside\\cad\\base.SLDPRT"
             return evidence
 
-        reader = ClosureReader(transform=outside)
+        reader = NativeObservationFixture(transform=outside)
         backend = CountingBackend(copy.deepcopy(self.harness.record))
         claim, effects = self.harness.effect_port(self.command)
         with self.assertRaises(StageFailure) as raised:
@@ -1178,10 +1188,13 @@ class DiscoverDomainTests(unittest.TestCase):
                 self.harness.workspace(),
                 effects=effects,
             )
-        self.assertIn(raised.exception.reason_code, {"selection_closure_invalid", "discover.native_refused"})
+        self.assertIn(
+            raised.exception.reason_code,
+            {"selection_resolved_outside_stage", "selection_closure_invalid", "discover.native_refused"},
+        )
         self.assertIsInstance(raised.exception.__cause__, NativeDiscoverRefusal)
         self.assertEqual(reader.calls, 1)
-        self.assertEqual(backend.calls, 0)
+        self.assertEqual(backend.calls, 1)
 
     def test_failure_evidence_write_cannot_replace_the_domain_failure(self) -> None:
         def outside(evidence):
@@ -1200,13 +1213,16 @@ class DiscoverDomainTests(unittest.TestCase):
             patch.object(discover_module, "_write_canonical", side_effect=fail_native_evidence),
             self.assertRaises(StageFailure) as raised,
         ):
-            DiscoverHandler(self.harness.port(reader=ClosureReader(transform=outside))).execute(
+            DiscoverHandler(self.harness.port(reader=NativeObservationFixture(transform=outside))).execute(
                 self.command,
                 claim,
                 self.harness.workspace(),
                 effects=effects,
             )
-        self.assertIn(raised.exception.reason_code, {"selection_closure_invalid", "discover.native_refused"})
+        self.assertIn(
+            raised.exception.reason_code,
+            {"selection_resolved_outside_stage", "selection_closure_invalid", "discover.native_refused"},
+        )
         self.assertEqual(raised.exception.unavailable_reason, "native_failure_evidence_unavailable")
         self.assertIsInstance(raised.exception.__cause__, NativeDiscoverRefusal)
 
@@ -1235,17 +1251,19 @@ class DiscoverDomainTests(unittest.TestCase):
             evidence["virtual_components"].append(slot)
             return evidence
 
-        claim, effects = self.harness.effect_port(self.command)
-        execution = DiscoverHandler(self.harness.port(reader=ClosureReader(transform=add_virtual))).execute(
-            self.command,
-            claim,
-            self.harness.workspace(),
-            effects=effects,
+        archive = seal_source_archive(
+            self.harness.source, self.harness.source_files, self.harness.root / "virtual-source.zip",
         )
-        self.assertEqual(execution.outcome, "completed")
-        result = read_data(Path(execution.candidate_root) / "result.json")
+        backend = CountingBackend(
+            copy.deepcopy(self.harness.record),
+            observation_fixture=NativeObservationFixture(transform=add_virtual),
+        )
+        observation = run_windows_discover(
+            archive, self.harness.native_request(self.command), self.harness.root / "virtual-observation",
+            native_tool=NATIVE_TOOL, backend_factory=lambda root, files: backend,
+        )
         self.assertEqual(
-            result["selection"]["closure"]["virtual_components"][0]["state"],
+            observation.selection["closure"]["virtual_components"][0]["state"],
             "embedded_virtual_component",
         )
 

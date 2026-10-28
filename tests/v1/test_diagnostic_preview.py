@@ -147,7 +147,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         (tree / "urdf/robot.urdf").write_bytes(URDF)
         (tree / "reports").mkdir()
         write_json(
-            tree / "reports/quality.json",
+            tree / "verification-certificate.json",
             {
                 "passed": passed,
                 "subject_sha256": hashlib.sha256(URDF).hexdigest(),
@@ -157,10 +157,19 @@ class DiagnosticPreviewTests(unittest.TestCase):
         )
         (tree / "input").mkdir()
         write_json(tree / "input/handoff.json", {"passed": True, "warnings": INPUT_WARNINGS["warnings"]})
+        (tree / "input/discovery").mkdir()
         (tree / "evidence").mkdir()
-        write_json(tree / "evidence/discovery.json", DISCOVERY_FINDINGS)
+        write_json(
+            tree / "input/discovery/native-discovery.json",
+            DISCOVERY_FINDINGS,
+        )
         members = []
-        for path in ("urdf/robot.urdf", "reports/quality.json", "input/handoff.json", "evidence/discovery.json"):
+        for path in (
+            "urdf/robot.urdf",
+            "verification-certificate.json",
+            "input/handoff.json",
+            "input/discovery/native-discovery.json",
+        ):
             data = (tree / path).read_bytes()
             members.append({"path": path, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()})
         platform.stage(
@@ -170,7 +179,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
             receipt={
                 "subject_sha256": hashlib.sha256(URDF).hexdigest(),
                 "artifacts": members,
-                "error": "URDF verification failed; see reports/quality.json",
+                "error": "URDF verification failed; see verification-certificate.json",
             },
         )
         return platform
@@ -193,7 +202,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
 
         self.assertIs(preview["verified"], True)
         self.assertEqual(preview["warnings_total"], 1)
-        self.assertEqual(preview["warnings"][0]["source"], "quality")
+        self.assertEqual(preview["warnings"][0]["source"], "verification")
         self.assertEqual(preview["warnings"][0]["code"], "limits.preview_policy")
         self.assertEqual(preview["warnings"][0]["object"], "joint:r_elbow")
         self.assertEqual(preview["warnings"][0]["detail"], PREVIEW_LIMIT_WARNING["detail"])
@@ -265,12 +274,49 @@ class DiagnosticPreviewTests(unittest.TestCase):
             )
         )
         session = app.sessions.create("user", "token")
+        with self.assertRaises(portal_module.PortalError) as caught:
+            app._preview_payload(session, DAG_RUN_ID)
+        self.assertIn("blocking", caught.exception.message)
+
+    def test_saved_state_quality_diagnostic_is_a_preview_warning(self) -> None:
+        diagnostic = {
+            "code": "source.saved_state_incomplete",
+            "blocking": False,
+            "severity": "warning",
+            "object": "cad/robot.SLDASM",
+            "message": "The assembly was exported from its saved state.",
+            "detail": {
+                "open_errors": 2,
+                "open_warnings": 0,
+                "source_integrity_proven": False,
+                "rebuilt": False,
+                "mechanical_qualification_complete": False,
+                "hardware_qualified": False,
+            },
+        }
+        platform = self._registered_failed_verify(
+            passed=True,
+            state="completed",
+            diagnostics=[diagnostic],
+        )
+        app = portal_module.PortalApp(
+            portal_module.PortalConfig(
+                airflow=_PermissiveAirflow(),
+                run_control_store=platform.run_control,
+            )
+        )
+        session = app.sessions.create("user", "token")
         preview = app._preview_payload(session, DAG_RUN_ID)
 
-        self.assertEqual(preview["warnings"], [])
-        self.assertEqual(preview["warnings_total"], 0)
+        warning = next(
+            row
+            for row in preview["warnings"]
+            if row["code"] == "source.saved_state_incomplete"
+        )
+        self.assertEqual(warning["detail"], diagnostic["detail"])
+        self.assertIs(warning["blocking"], False)
 
-    def test_quality_diagnostic_without_explicit_nonblocking_flag_is_not_a_warning(self) -> None:
+    def test_certificate_diagnostic_without_explicit_blocking_flag_is_refused(self) -> None:
         platform = self._registered_failed_verify(
             passed=True,
             state="completed",
@@ -283,10 +329,9 @@ class DiagnosticPreviewTests(unittest.TestCase):
             )
         )
         session = app.sessions.create("user", "token")
-        preview = app._preview_payload(session, DAG_RUN_ID)
-
-        self.assertEqual(preview["warnings"], [])
-        self.assertEqual(preview["warnings_total"], 0)
+        with self.assertRaises(portal_module.PortalError) as caught:
+            app._preview_payload(session, DAG_RUN_ID)
+        self.assertIn("blocking", caught.exception.message)
 
     def test_preview_limits_warnings_but_reports_the_full_total(self) -> None:
         diagnostics = [
@@ -432,7 +477,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         build_sealed_delivery(tree, run_id=child)
         manifest = read_delivery_manifest(tree)
         write_json(
-            tree / "reports/quality.json",
+            tree / "verification-certificate.json",
             {
                 "passed": False,
                 "subject_sha256": hashlib.sha256(URDF).hexdigest(),
@@ -442,15 +487,22 @@ class DiagnosticPreviewTests(unittest.TestCase):
         handoff = json.loads((tree / "input/handoff.json").read_text(encoding="utf-8"))
         handoff["warnings"] = INPUT_WARNINGS["warnings"]
         write_json(tree / "input/handoff.json", handoff)
-        discovery = json.loads((tree / "evidence/discovery.json").read_text(encoding="utf-8"))
+        discovery = json.loads(
+            (
+                tree / "input/discovery/native-discovery.json"
+            ).read_text(encoding="utf-8")
+        )
         discovery["findings"] = DISCOVERY_FINDINGS["findings"]
-        write_json(tree / "evidence/discovery.json", discovery)
+        write_json(
+            tree / "input/discovery/native-discovery.json",
+            discovery,
+        )
         write_delivery_manifest(tree, contract=manifest["contract"], policy=manifest["policy"])
         manifest = read_delivery_manifest(tree)
-        report = (tree / "reports/quality.json").read_bytes()
+        report = (tree / "verification-certificate.json").read_bytes()
         artifacts = [dict(record) for record in manifest["subject"]["files"]] + [
             {
-                "path": "reports/quality.json",
+                "path": "verification-certificate.json",
                 "bytes": len(report),
                 "sha256": hashlib.sha256(report).hexdigest(),
             }
@@ -466,7 +518,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
                 "stage": "verify",
                 "state": "failed",
                 "passed": False,
-                "error": "URDF verification failed; see reports/quality.json",
+                "error": "URDF verification failed; see verification-certificate.json",
                 "subject_sha256": manifest["subject"]["digest"],
                 "artifacts": artifacts,
             },
@@ -495,7 +547,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         def start_response(status, headers):
             captured["status"] = status
 
-        body = b"".join(app._artifact(environ, start_response, DAG_RUN_ID, "reports/quality.json"))
+        body = b"".join(app._artifact(environ, start_response, DAG_RUN_ID, "verification-certificate.json"))
         self.assertEqual(captured["status"], "200 OK")
         self.assertEqual(
             json.loads(body.decode("utf-8"))["passed"],
@@ -530,6 +582,8 @@ class DiagnosticPreviewTests(unittest.TestCase):
         self.assertIn("previewDiagnosticState(preview)", app)
         self.assertIn("Source warnings", app)
         self.assertIn("appendWarningSourceRows", app)
+        self.assertIn("Cannot read registered preview artifact", app)
+        self.assertIn('key.textContent = "Preview artifact"', app)
         self.assertIn("replaceChildren()", app)
         self.assertIn("must not be published", app)
         self.assertNotIn("innerHTML", app)

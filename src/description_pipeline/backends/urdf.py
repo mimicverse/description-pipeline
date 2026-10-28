@@ -110,12 +110,15 @@ def generate_urdf(model: EngineeringModel, source: Path, destination: Path) -> P
             objects = warning.get("objects")
             subjects = objects if isinstance(objects, list) and objects else [{}]
             for subject in subjects:
-                detail = {"message": warning.get("message", ""), "provenance": subject}
+                detail = {"message": warning.get("message", "")}
+                if warning.get("detail") is not None:
+                    detail["detail"] = warning["detail"]
+                detail["provenance"] = subject
                 # JSON escapes retain exact source names without admitting an
                 # XML comment terminator from an authored name or message.
                 payload = json.dumps(detail, ensure_ascii=True, sort_keys=True).replace("--", r"\u002d\u002d")
                 code = str(warning["code"]).replace("--", "- -")
-                document.append(ET.Comment(f"WARNING {code}: {payload} See reports/quality.json."))
+                document.append(ET.Comment(f"WARNING {code}: {payload} See reports/verification-certificate.json."))
     for link in data["links"]:
         node = ET.SubElement(document, "link", name=link["name"])
         inertia = link["inertial"]

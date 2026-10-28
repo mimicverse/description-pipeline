@@ -127,7 +127,7 @@ def build_runtime(
     executors: dict[str, NativeOperationExecutor] | None = None,
     install_id: str | None = None,
 ) -> NativeOperationRuntime:
-    """Compose Discover production execution and any explicitly supplied Capture."""
+    """Compose the production Discover and Capture executors."""
 
     ownership_file = _cad_ownership_file()
     os.environ.setdefault("DESCRIPTION_CAD_OWNERSHIP_FILE", str(ownership_file))

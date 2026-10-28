@@ -13,7 +13,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import unquote, urlsplit
 
+from ..artifacts.store import path_has_link_ancestor
 from ..delivery import subject_digest
 from ..io import PipelineError, digest, inventory, read_data, write_json
 from ..schemas import REPOSITORY_SNAPSHOT_SCHEMA
@@ -40,6 +42,8 @@ GIT_ATTRIBUTES = (
 ).encode("ascii")
 _OID = re.compile(r"\A[0-9a-f]{40}\Z")
 _HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
+_CONTROL_OR_SPACE = re.compile(r"[\x00-\x20\x7f]")
+_SCP_REMOTE = re.compile(r"\A(?:[^/@:]+@)?([^/:]+):(.+)\Z")
 REPOSITORY_SNAPSHOT_FILE = "repository.bundle"
 REPOSITORY_SNAPSHOT_METADATA = "snapshot.json"
 PROTECTED_PUBLICATION_BRANCHES = frozenset({"main", "refs/heads/main"})
@@ -67,6 +71,126 @@ def validate_publication_target(*, base_ref: str, branch_ref: str) -> None:
             "publish.target_forbidden",
             {"base_ref": base_ref, "branch_ref": branch_ref, "reason": reason},
         )
+
+
+def _repository_target_from_remote(remote: str) -> tuple[str, str]:
+    """Return the GitHub host and ``owner/repository`` without credentials."""
+
+    if not isinstance(remote, str) or not remote or _CONTROL_OR_SPACE.search(remote):
+        raise PublicationError("publish.remote_invalid")
+    host = None
+    path = None
+    if "://" in remote:
+        try:
+            parsed = urlsplit(remote)
+            _ = parsed.port
+        except ValueError as error:
+            raise PublicationError("publish.remote_invalid") from error
+        scheme = parsed.scheme.casefold()
+        if scheme not in {"https", "ssh"} or parsed.query or parsed.fragment:
+            raise PublicationError("publish.remote_invalid")
+        if parsed.password is not None or (
+            scheme == "https" and parsed.username is not None
+        ):
+            raise PublicationError("publish.remote_credentials")
+        if not parsed.hostname:
+            raise PublicationError("publish.remote_invalid")
+        host = parsed.hostname.casefold()
+        path = unquote(parsed.path)
+    else:
+        scp = _SCP_REMOTE.fullmatch(remote)
+        if scp is None:
+            raise PublicationError("publish.remote_invalid")
+        host = scp.group(1).casefold()
+        path = scp.group(2)
+    relative = path.strip("/")
+    if relative.casefold().endswith(".git"):
+        relative = relative[:-4]
+    parts = relative.split("/")
+    if len(parts) != 2 or any(not item or item in {".", ".."} for item in parts):
+        raise PublicationError("publish.remote_invalid")
+    return host, "/".join(parts)
+
+
+def validate_repository_remote(
+    repository_slug: str,
+    fetch_url: str,
+    push_url: str,
+) -> str:
+    """Require fetch, push and configured slug to name one exact Git repository."""
+
+    if (
+        not isinstance(repository_slug, str)
+        or repository_slug.count("/") != 1
+        or _CONTROL_OR_SPACE.search(repository_slug)
+    ):
+        raise PublicationError("publish.remote_invalid", {"where": "repository_slug"})
+    if fetch_url != push_url:
+        raise PublicationError("publish.remote_target_mismatch")
+    host, actual = _repository_target_from_remote(fetch_url)
+    if host != "github.com":
+        raise PublicationError(
+            "publish.remote_target_mismatch",
+            {"expected": "github.com", "actual": host},
+        )
+    if actual != repository_slug:
+        raise PublicationError(
+            "publish.remote_target_mismatch",
+            {"expected": repository_slug, "actual": actual},
+        )
+    return fetch_url
+
+
+def _remote_urls(repository: Path) -> tuple[str, str]:
+    """Read one fetch and one push URL after rejecting Git URL rewrites."""
+
+    rewrites = _run(
+        repository,
+        "config",
+        "--get-regexp",
+        r"^url\..*\.insteadof$",
+        check=False,
+    )
+    if rewrites.returncode not in {0, 1}:
+        raise PublicationError("publish.remote_invalid")
+    if rewrites.returncode == 0 and rewrites.stdout.strip():
+        raise PublicationError("publish.remote_rewrite")
+    try:
+        fetch_urls = [
+            item
+            for item in _text_run(
+                repository,
+                "remote",
+                "get-url",
+                "--all",
+                "origin",
+            ).splitlines()
+            if item
+        ]
+        push_urls = [
+            item
+            for item in _text_run(
+                repository,
+                "remote",
+                "get-url",
+                "--push",
+                "--all",
+                "origin",
+            ).splitlines()
+            if item
+        ]
+    except subprocess.CalledProcessError as error:
+        raise PublicationError("publish.remote_invalid") from error
+    if len(fetch_urls) != 1 or len(push_urls) != 1:
+        raise PublicationError("publish.remote_target_mismatch")
+    return fetch_urls[0], push_urls[0]
+
+
+def validate_git_remote(repository: Path, repository_slug: str) -> str:
+    """Validate the effective Git fetch and push targets for one repository."""
+
+    fetch_url, push_url = _remote_urls(repository)
+    return validate_repository_remote(repository_slug, fetch_url, push_url)
 
 
 def _run(repository: Path, *args: str, check: bool = True, env=None) -> subprocess.CompletedProcess:
@@ -181,8 +305,8 @@ def seal_repository_snapshot(
 
     validate_publication_target(base_ref=base_ref, branch_ref=branch_ref)
     source = Path(repository).resolve()
-    actual_origin = _text_run(source, "remote", "get-url", "origin")
-    if actual_origin != origin_url:
+    actual_origin, actual_push = _remote_urls(source)
+    if actual_origin != origin_url or actual_push != origin_url:
         raise PublicationError("publish.origin_mismatch", {"expected": origin_url, "actual": actual_origin})
     validate_ref(source, base_ref)
     validate_ref(source, branch_ref)
@@ -267,6 +391,9 @@ def materialize_repository_snapshot(
         raise PublicationError("publish.snapshot_destination", {"path": str(destination)})
     _run(destination.parent, "clone", "--quiet", str(bundle), str(destination), check=True)
     _run(destination, "remote", "set-url", "origin", expected_origin_url)
+    fetch_url, push_url = _remote_urls(destination)
+    if fetch_url != expected_origin_url or push_url != expected_origin_url:
+        raise PublicationError("publish.origin_mismatch")
     for oid in (expected.base_oid, expected.head_oid):
         if oid is not None and _run(destination, "cat-file", "-e", f"{oid}^{{commit}}", check=False).returncode != 0:
             raise PublicationError("publish.snapshot_object_missing", {"oid": oid})
@@ -281,6 +408,9 @@ def clone_publication_repository(origin_url: str, destination: Path) -> Publicat
         raise PublicationError("publish.reconciliation_destination", {"path": str(destination)})
     destination.parent.mkdir(parents=True, exist_ok=True)
     _run(destination.parent, "clone", "--quiet", origin_url, str(destination), check=True)
+    fetch_url, push_url = _remote_urls(destination)
+    if fetch_url != origin_url or push_url != origin_url:
+        raise PublicationError("publish.origin_mismatch")
     return PublicationRepository(destination, expected_origin=origin_url)
 
 
@@ -407,17 +537,25 @@ class GitHubCliPullRequestClient:
 
     def _gh(self, *args: str, input_path: Path | None = None) -> str:
         command = ["gh", *args]
+        env = {**os.environ, "GH_HOST": "github.com"}
         if input_path is not None:
             with input_path.open("rb") as stream:
                 result = subprocess.run(
                     command,
                     cwd=self.repository,
+                    env=env,
                     input=stream.read(),
                     check=True,
                     capture_output=True,
                 )
         else:
-            result = subprocess.run(command, cwd=self.repository, check=True, capture_output=True)
+            result = subprocess.run(
+                command,
+                cwd=self.repository,
+                env=env,
+                check=True,
+                capture_output=True,
+            )
         return result.stdout.decode("utf-8").strip()
 
     @staticmethod
@@ -583,17 +721,23 @@ class PublicationRepository:
     """A local checkout bound to one exact origin and remote state."""
 
     def __init__(self, path: Path, *, expected_origin: str) -> None:
-        self.path = Path(path).resolve()
-        if not self.path.is_dir() or self.path.is_symlink():
-            raise PublicationError("publish.repository_missing", {"path": str(self.path)})
+        supplied = Path(path)
+        if path_has_link_ancestor(supplied) or not supplied.is_dir():
+            raise PublicationError("publish.repository_missing", {"path": str(supplied)})
+        self.path = supplied.resolve()
         self.expected_origin = expected_origin
 
     def validate(self) -> None:
-        actual = _text_run(self.path, "remote", "get-url", "origin")
-        if actual != self.expected_origin:
-            raise PublicationError("publish.origin_mismatch", {"expected": self.expected_origin, "actual": actual})
+        self._validate_remote(self.path)
         if _text_run(self.path, "status", "--porcelain"):
             raise PublicationError("publish.repository_dirty", {"path": str(self.path)})
+
+    def _validate_remote(self, path: Path) -> None:
+        fetch_url, push_url = _remote_urls(path)
+        if fetch_url != push_url:
+            raise PublicationError("publish.remote_target_mismatch")
+        if fetch_url != self.expected_origin:
+            raise PublicationError("publish.origin_mismatch", {"expected": self.expected_origin})
 
     def fetch_expected(self, ref: str, expected_oid: str) -> None:
         validate_ref(self.path, ref)
@@ -645,6 +789,11 @@ class PublicationRepository:
                     "parents": facts[1:] if len(facts) > 1 else [],
                 },
             )
+
+    def read_blob(self, *, commit: str, path: str) -> bytes:
+        """Read exact file bytes from an already verified candidate commit."""
+
+        return _run(self.path, "cat-file", "blob", f"{commit}:{path}").stdout
 
     def candidate(
         self,
@@ -833,6 +982,8 @@ class PublicationRepository:
         expected_head_oid: str | None,
     ) -> None:
         validate_publication_target(base_ref=base_ref, branch_ref=branch_ref)
+        self.validate()
+        self._validate_remote(Path(candidate.worktree))
         lease = f"--force-with-lease=refs/heads/{branch_ref}:{expected_head_oid or ''}"
         _run(
             candidate.worktree,

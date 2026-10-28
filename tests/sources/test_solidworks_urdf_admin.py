@@ -47,6 +47,7 @@ class InputSealReadinessTests(unittest.TestCase):
                             "suppressed": False,
                             "lightweight": False,
                             "suppression_state": 2,
+                            "fixed": False,
                         }
                     ],
                     "datums": [
@@ -184,7 +185,7 @@ class UrdfRobotLabelTests(unittest.TestCase):
             "<!--WARNING units.si_conversion: "
             '{"message": "Delivered values use SI units.", '
             '"provenance": {"field": "units", "object": "robot", "source": "native_derived"}} '
-            "See reports/quality.json.-->"
+            "See reports/verification-certificate.json.-->"
             '<link name="base"/></robot>'
         )
         with tempfile.TemporaryDirectory() as directory:
@@ -202,6 +203,57 @@ class UrdfRobotLabelTests(unittest.TestCase):
                 (root / "urdf/robot.urdf").write_text(payload)
                 with self.assertRaisesRegex(PipelineError, "value-provenance"):
                     solidworks_urdf._xml(root, definition, model)
+
+    def test_saved_state_warning_comment_carries_native_detail(self):
+        detail = {
+            "classification": "continuable_missing_referenced_documents",
+            "open_errors": 2,
+            "open_warnings": 0,
+            "configuration": "Default",
+            "source_integrity_proven": False,
+            "rebuilt": False,
+            "mechanical_qualification_complete": False,
+            "hardware_qualified": False,
+        }
+        object_row = {
+            "object": "cad/robot.SLDASM",
+            "object_type": "assembly",
+            "state": detail["classification"],
+        }
+        warning = {
+            "code": "source.saved_state_incomplete",
+            "message": "The assembly was exported from its saved state.",
+            "objects": [object_row],
+            "detail": detail,
+        }
+        model = {
+            "name": "robot",
+            "links": [{"name": "base"}],
+            "frames": [],
+            "joints": [],
+            "provenance": {"value_warnings": [warning]},
+        }
+        definition = {"hardware_id": None, "source": {"robot_name": "robot"}}
+        payload = json.dumps(
+            {
+                "message": warning["message"],
+                "detail": detail,
+                "provenance": object_row,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+        exact = (
+            '<robot name="robot">'
+            f"<!--WARNING source.saved_state_incomplete: {payload} "
+            "See reports/verification-certificate.json.-->"
+            '<link name="base"/></robot>'
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "urdf").mkdir()
+            (root / "urdf/robot.urdf").write_text(exact)
+            self.assertEqual(solidworks_urdf._xml(root, definition, model).get("name"), "robot")
 
 
 
@@ -234,15 +286,15 @@ class MeshAssetReuseTests(unittest.TestCase):
 
 
 class HandoffHashBindingTests(unittest.TestCase):
-    def _package(self, directory, contents, *, raw_files=None, inventory_digest=None):
+    def _package(self, directory, contents, *, raw_files=None, handoff_digest=None):
         root = Path(directory) / "delivery"
         native = {name: hashlib.sha256(data).hexdigest() for name, data in contents.items()}
         payload = support.frozen_discovery_payload(
             {"namespace": "dp", "raw": {"files": dict(raw_files or {})}, "identity": {}},
             files=native,
         )
-        if inventory_digest is not None:
-            payload["native_inventory_sha256"] = inventory_digest
+        if handoff_digest is not None:
+            payload["handoff_sha256"] = handoff_digest
         return support.write_target_delivery(
             root,
             capture={},
@@ -275,7 +327,11 @@ class HandoffHashBindingTests(unittest.TestCase):
             with self.assertRaises(PipelineError):
                 solidworks_urdf._handoff_native_hashes(input_root)
         with tempfile.TemporaryDirectory() as directory:
-            input_root, _ = self._package(directory, {"a.SLDPRT": b"aaa"}, inventory_digest="0" * 64)
+            input_root, _ = self._package(
+                directory,
+                {"a.SLDPRT": b"aaa"},
+                handoff_digest="0" * 64,
+            )
             with self.assertRaises(PipelineError):
                 solidworks_urdf._handoff_native_hashes(input_root)
 

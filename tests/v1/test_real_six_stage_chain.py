@@ -26,9 +26,7 @@ except ImportError:
 from description_pipeline.artifacts import ArtifactStore
 from description_pipeline.interface_records import config_snapshot_digest
 from description_pipeline.io import digest, read_data, write_json
-from description_pipeline.orchestration.discover_protocol import (
-    ArchiveDiscoverAdapter,
-)
+from tests.v1.archive_discover_adapter import ArchiveDiscoverAdapter
 from description_pipeline.orchestration.native_operation_client import (
     NativeOperationClient,
     NativeOperationEndpoint,
@@ -99,7 +97,7 @@ from tests.v1.verification_fixture import (
     _portable_tool,
 )
 from tests.v1.test_pipeline_discover import (
-    ClosureReader,
+    NativeObservationFixture,
     CountingBackend,
 )
 from tests.v1.test_pipeline_publish import PublishFixture, _PullRequests
@@ -222,6 +220,12 @@ class RealSixStageChainTests(unittest.TestCase):
 
         self.publish = PublishFixture()
         self.addCleanup(self.publish.temporary.cleanup)
+        git_target = patch(
+            "description_pipeline.pipeline.ingestion.validate_git_remote",
+            return_value=str(self.publish.remote),
+        )
+        git_target.start()
+        self.addCleanup(git_target.stop)
         self.root = self.publish.root
         self.store = self.publish.store
         self.portable = _portable_tool()
@@ -403,7 +407,7 @@ class RealSixStageChainTests(unittest.TestCase):
                 },
                 "targets": {
                     "nd_fixture": {
-                        "repository_slug": "mimicverse/robot",
+                        "repository_slug": "example/robot",
                         "base": "main",
                     }
                 },
@@ -413,7 +417,7 @@ class RealSixStageChainTests(unittest.TestCase):
                 "retention": {"unreferenced_evidence_days": None},
                 "derived": {
                     "repositories": {
-                        "mimicverse/robot": str(repository),
+                        "example/robot": str(repository),
                     },
                     "discovery": {
                         "record_roots": [str(self.rules_root / "root-000")]
@@ -542,12 +546,12 @@ class RealSixStageChainTests(unittest.TestCase):
             ArchiveDiscoverAdapter(
                 artifacts=self.store,
                 native_tool=self.native,
-                selection_reader_factory=lambda: ClosureReader(
-                    transform=_capture_component_closure,
-                    reader_sha256=self.native["source_sha256"],
-                ),
                 backend_factory=lambda _root, _files: CountingBackend(
-                    copy.deepcopy(capture_record())
+                    copy.deepcopy(capture_record()),
+                    observation_fixture=NativeObservationFixture(
+                        transform=_capture_component_closure,
+                        reader_sha256=self.native["source_sha256"],
+                    ),
                 ),
             )
         )
@@ -621,6 +625,10 @@ class RealSixStageChainTests(unittest.TestCase):
                 admitted,
             )
             self.assertEqual(
+                admitted.dispatch_command.dag_run_id,
+                request.request_id,
+            )
+            self.assertEqual(
                 spec.originals.inventory_sha256,
                 request.receipt.handoff_sha256,
             )
@@ -676,13 +684,13 @@ class RealSixStageChainTests(unittest.TestCase):
             native_tool_factory=lambda: copy.deepcopy(self.native),
             executors={
                 DISCOVER_KIND: DiscoverOperationExecutor(
-                    selection_reader_factory=lambda: ClosureReader(
+                    backend_factory=lambda _root, _files: CountingBackend(
+                    copy.deepcopy(capture_record()),
+                    observation_fixture=NativeObservationFixture(
                         transform=_capture_component_closure,
                         reader_sha256=self.native["source_sha256"],
                     ),
-                    backend_factory=lambda _root, _files: CountingBackend(
-                        copy.deepcopy(capture_record())
-                    ),
+                ),
                 ),
                 CAPTURE_KIND: CaptureOperationExecutor(
                     backend_factory=_qualified_backend

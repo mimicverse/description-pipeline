@@ -16,6 +16,7 @@ from datetime import datetime
 from typing import Protocol
 
 from ..io import PipelineError, digest
+from ..stages import STAGE_IDS
 from ..pipeline.admission import (
     AdmissionSpec,
     VerifiedDiscoverResult,
@@ -48,7 +49,6 @@ from ..pipeline.contracts import (
     StagePending,
     StageQualification,
     StageResult,
-    STAGES,
     StageStatus,
     project_run_status,
     project_stage_status,
@@ -155,7 +155,7 @@ def _run_state_from_canonical_facts(
     """Consume the common stage/run projectors; this layer only loads raw DB facts."""
 
     if request.get("schema_version") != DIAGNOSTIC_ADMISSION_SCHEMA:
-        outcomes = tuple(decisions.get(stage) for stage in STAGES)
+        outcomes = tuple(decisions.get(stage) for stage in STAGE_IDS)
         return project_run_status(
             stage_outcomes=outcomes,
             effect_states=effect_states,
@@ -949,24 +949,6 @@ class FactStore(RunControlStore):
         with self._transaction() as connection:
             return self._load_admission_cursor(connection.cursor(), run_id)
 
-    def load_admission_by_request_id(self, request_id: str) -> RunAdmission | None:
-        """Read the immutable admission identity for one stable request key."""
-
-        if not isinstance(request_id, str) or not request_id:
-            raise FactStoreError("A request id is required")
-        with self._transaction() as connection:
-            cursor = connection.cursor()
-            cursor.execute(
-                """
-                SELECT run_id, request_id, parent_run_id, from_stage, request, request_digest, created_at
-                FROM run_admission
-                WHERE request_id = %s
-                """,
-                (request_id,),
-            )
-            row = cursor.fetchone()
-        return None if row is None else self._admission_from_row(row)
-
     def admit_diagnostic(
         self,
         spec: DiagnosticAdmissionSpec,
@@ -1232,7 +1214,7 @@ class FactStore(RunControlStore):
         return command
 
     def load_stage_command(self, run_id: str, stage: str) -> StageCommand:
-        if stage not in STAGES:
+        if stage not in STAGE_IDS:
             raise FactStoreError(f"The stage {stage!r} is not a canonical pipeline stage")
         with self._transaction() as connection:
             cursor = connection.cursor()
@@ -1567,7 +1549,7 @@ class FactStore(RunControlStore):
         seen = set()
         while current.predecessor_decision_id is not None:
             chain_key = (current.run_id, current.predecessor_decision_id)
-            if chain_key in seen or len(seen) >= len(STAGES):
+            if chain_key in seen or len(seen) >= len(STAGE_IDS):
                 raise FactConflict("The command predecessor chain is cyclic or too deep")
             seen.add(chain_key)
             decision_row = self._decision_by_id_cursor(cursor, current.predecessor_decision_id)
@@ -1580,7 +1562,7 @@ class FactStore(RunControlStore):
             if (
                 decision.outcome != "completed"
                 or predecessor.run_id != command.run_id
-                or STAGES.index(predecessor.stage) >= STAGES.index(current.stage)
+                or STAGE_IDS.index(predecessor.stage) >= STAGE_IDS.index(current.stage)
             ):
                 raise FactConflict("The predecessor decision is not an earlier completed stage of this run")
             chain.append(predecessor)
@@ -2966,35 +2948,108 @@ class FactStore(RunControlStore):
                 cursor,
                 claim.command_id,
             )
-            self._verify_open_claim_cursor(cursor, claim)
+            self._close_open_claim_cursor(
+                cursor,
+                claim,
+                closure_code=closure_code,
+                closed_at=closed_at,
+            )
+
+    def close_open_claim_for_command(
+        self,
+        command_id: str,
+        *,
+        closure_code: str,
+        closed_at: datetime,
+    ) -> bool:
+        """Atomically close one command's open claim, or report that it is already absent."""
+
+        if not isinstance(command_id, str) or not command_id:
+            raise FactStoreError("A command id is required for claim closure")
+        if closure_code not in {"completed", "definite_failure"}:
+            raise FactStoreError("A technical command closes only as completed or definite_failure")
+        if not isinstance(closed_at, datetime) or closed_at.tzinfo is None:
+            raise FactStoreError("Claim closure time must be timezone-aware")
+        with self._transaction() as connection:
+            cursor = connection.cursor()
+            command = self._lock_command_scope_cursor(cursor, command_id)
+            if (
+                command[1] == "dispatch"
+                and self._load_dispatch_command_cursor(cursor, command_id)
+                is None
+            ):
+                raise FactStoreError("The execution claim command is missing")
+            self._lock_effect_ledger_cursor(cursor, command_id)
             cursor.execute(
                 """
-                UPDATE execution_claim
-                SET closed_at = %s, closure_code = %s, last_seen_at = %s
-                WHERE claim_id = %s
-                  AND command_id = %s
-                  AND fence = %s
-                  AND owner_sha256 = %s
-                  AND executor_sha256 = %s
-                  AND closed_at IS NULL
-                RETURNING claim_id
+                SELECT claim_id, command_id, fence, owner_sha256, executor_sha256,
+                       lane_key, expires_at, scope, effect_scope_id
+                FROM execution_claim
+                WHERE command_id = %s AND closed_at IS NULL
+                FOR UPDATE
                 """,
-                (
-                    closed_at,
-                    closure_code,
-                    closed_at,
-                    claim.claim_id,
-                    claim.command_id,
-                    claim.fence,
-                    claim.owner_sha256,
-                    claim.executor_sha256,
-                ),
+                (command_id,),
             )
-            closed_rows = cursor.fetchall()
-            if len(closed_rows) != 1:
-                raise FactConflict(
-                    "The execution claim changed before closure"
-                )
+            row = cursor.fetchone()
+            if row is None:
+                return False
+            claim = ExecutionClaim(
+                claim_id=row[0],
+                command_id=row[1],
+                fence=row[2],
+                owner_sha256=row[3],
+                executor_sha256=row[4],
+                lane_key=row[5],
+                expires_at=row[6],
+                scope=row[7],
+                effect_scope_id=row[8],
+            )
+            self._require_execution_claim(claim, "General claim closure")
+            self._close_open_claim_cursor(
+                cursor,
+                claim,
+                closure_code=closure_code,
+                closed_at=closed_at,
+            )
+            return True
+
+    def _close_open_claim_cursor(
+        self,
+        cursor,
+        claim: ExecutionClaim,
+        *,
+        closure_code: str,
+        closed_at: datetime,
+    ) -> None:
+        self._verify_open_claim_cursor(cursor, claim)
+        cursor.execute(
+            """
+            UPDATE execution_claim
+            SET closed_at = %s, closure_code = %s, last_seen_at = %s
+            WHERE claim_id = %s
+              AND command_id = %s
+              AND fence = %s
+              AND owner_sha256 = %s
+              AND executor_sha256 = %s
+              AND closed_at IS NULL
+            RETURNING claim_id
+            """,
+            (
+                closed_at,
+                closure_code,
+                closed_at,
+                claim.claim_id,
+                claim.command_id,
+                claim.fence,
+                claim.owner_sha256,
+                claim.executor_sha256,
+            ),
+        )
+        closed_rows = cursor.fetchall()
+        if len(closed_rows) != 1:
+            raise FactConflict(
+                "The execution claim changed before closure"
+            )
 
     def append_effect_fact(
         self,

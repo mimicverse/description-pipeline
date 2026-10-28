@@ -351,6 +351,7 @@ def component(name, document=None):
         "suppressed": False,
         "lightweight": False,
         "suppression_state": 2,
+        "fixed": False,
         "document": document or name.replace("/", "_") + ".SLDPRT",
         "transform": list(IDENTITY),
     }
@@ -438,6 +439,7 @@ def fixture():
         {
             "name": "hinge__limit",
             "type": "limitangle",
+            "entity_count": 2,
             "suppressed": False,
             "error_code": 0,
             "is_advanced_mate": True,
@@ -517,6 +519,7 @@ def lock(left, right, *, error=0, kind="lock"):
     return {
         "name": "native_lock",
         "type": kind,
+        "entity_count": 2,
         "suppressed": False,
         "error_code": error,
         "limits": None,
@@ -924,6 +927,7 @@ class NativeDeclarationsTests(unittest.TestCase):
             mate = {
                 "name": "coaxial_washer",
                 "type": "concentric",
+                "entity_count": 2,
                 "suppressed": False,
                 "error_code": 0,
                 "scope": "",
@@ -951,6 +955,7 @@ class NativeDeclarationsTests(unittest.TestCase):
             return {
                 "name": "seated_washer",
                 "type": "coincident",
+                "entity_count": 2,
                 "suppressed": False,
                 "error_code": 0,
                 "scope": "",
@@ -1130,6 +1135,7 @@ class NativeDeclarationsTests(unittest.TestCase):
             {
                 "name": "incomplete_limit_evidence",
                 "type": "limitangle",
+                "entity_count": 1,
                 "suppressed": False,
                 "error_code": 0,
                 "is_advanced_mate": True,
@@ -1242,6 +1248,27 @@ class NativeDeclarationsTests(unittest.TestCase):
         report = verify_declarations(raw, purpose=PURPOSE_ENGINEERING)
         self.assertFalse(report["passed"])
         self.assertIn("v14.native_limits_conflict", {item["code"] for item in report["errors"]})
+
+    def test_engineering_native_range_conflicts_with_zero_author_range(self) -> None:
+        raw = fixture()
+
+        def zero_position(root):
+            for item in root.iter():
+                kind = item.find(NS_TAG + "AttributeType")
+                if (
+                    (item.get(Z_TAG + "Id") or "").startswith("joint_limit_")
+                    and kind is not None
+                    and kind.text in {"lower", "upper"}
+                ):
+                    item.find(NS_TAG + "Value").text = "0"
+
+        rewrite(raw, zero_position)
+        report = verify_declarations(raw, purpose=PURPOSE_ENGINEERING)
+        self.assertFalse(report["passed"])
+        self.assertIn(
+            "v14.native_limits_conflict",
+            {item["code"] for item in report["errors"]},
+        )
 
     def test_engineering_unreadable_native_limit_defaults_and_retains_errors(self) -> None:
         raw = zero_limit_values(fixture())
@@ -1723,6 +1750,8 @@ class NativeDeclarationsTests(unittest.TestCase):
             # fixture's source record coherent with the raw reading.
             source["metadata"]["change_summary"] = raw["identity"]["change_summary"]
             source["metadata"]["change_summary_source"] = "cad"
+            source["metadata"]["owner"] = raw["identity"]["owner"]
+            source["metadata"]["control"] = copy.deepcopy(raw["identity"]["control"])
             support.write_target_delivery(
                 package,
                 capture={},
@@ -1732,20 +1761,31 @@ class NativeDeclarationsTests(unittest.TestCase):
             )
 
             def sync_robot() -> None:
-                derived = payload.setdefault("derived", {})
+                derived = payload.setdefault("raw", {}).setdefault("derived", {})
                 block = robot.get("source") or {}
                 derived["bodies"] = copy.deepcopy(block.get("bodies") or [])
                 derived["joints"] = copy.deepcopy(block.get("joints") or [])
                 derived["frames"] = copy.deepcopy(block.get("frames") or [])
                 derived["checks"] = copy.deepcopy(robot.get("checks") or {})
-                payload["robot_name"] = block.get("robot_name")
+                identity = payload.setdefault("identity", {})
+                authored_name = (raw.get("identity") or {}).get(
+                    "robot_name"
+                )
+                if isinstance(authored_name, str) and authored_name:
+                    identity["robot_name"] = authored_name
+                    identity["robot_name_technical"] = None
+                else:
+                    identity["robot_name"] = None
+                    identity["robot_name_technical"] = block.get(
+                        "robot_name"
+                    )
 
             def reseal() -> None:
                 sync_robot()
                 payload["raw"] = copy.deepcopy(raw)
                 from description_pipeline.io import write_json
 
-                (package / "evidence/discovery.json").write_bytes(json.dumps(payload).encode())
+                (package / "input/discovery/native-discovery.json").write_bytes(json.dumps(payload).encode())
                 write_json(package / "input/source.json", source)
                 support.seal_delivery(package)
 
@@ -1756,22 +1796,24 @@ class NativeDeclarationsTests(unittest.TestCase):
             self.assertNotIn("discovery.budgets", {check["id"] for check in report["checks"]})
 
             authored = copy.deepcopy(raw["identity"])
+            identity_keys = list(payload["identity"])
             source["metadata"]["revision"] = None
             reseal()
-            unsealed = verify_discovery(package)
-            self.assertTrue(unsealed["passed"], unsealed["errors"])
-            self.assertNotIn("discovery.revision", {item["id"] for item in unsealed["checks"]})
-            self.assertEqual(
-                [item["code"] for item in unsealed["diagnostics"]],
-                ["discovery.revision_absent"],
+            mismatched = verify_discovery(package)
+            self.assertIn(
+                "discovery.revision",
+                {item["code"] for item in mismatched["errors"]},
             )
-            self.assertTrue(all(item["blocking"] is False for item in unsealed["diagnostics"]))
 
             raw["identity"] = dict.fromkeys(authored)
-            payload["identity"] = copy.deepcopy(raw["identity"])
+            payload["identity"] = dict.fromkeys(payload["identity"])
             robot["hardware_id"] = None
             robot["source"]["robot_name"] = "robot"
             payload["identity"]["robot_name_technical"] = "robot"
+            source["metadata"]["owner"] = None
+            source["metadata"]["control"] = None
+            source["metadata"]["change_summary"] = None
+            source["metadata"]["change_summary_source"] = "generated"
             reseal()
             unsealed = verify_discovery(package)
             self.assertTrue(unsealed["passed"], unsealed["errors"])
@@ -1803,14 +1845,21 @@ class NativeDeclarationsTests(unittest.TestCase):
                 reseal()
                 self.assertIn("discovery.identity", {item["code"] for item in verify_discovery(package)["errors"]})
                 raw["identity"] = dict.fromkeys(authored)
-                payload["identity"] = copy.deepcopy(raw["identity"])
+                payload["identity"] = dict.fromkeys(identity_keys)
                 robot["hardware_id"] = None
                 robot["source"]["robot_name"] = "robot"
                 payload["identity"]["robot_name_technical"] = "robot"
             raw["identity"] = authored
-            payload["identity"] = copy.deepcopy(authored)
+            payload["identity"] = {
+                key: copy.deepcopy(authored.get(key))
+                for key in identity_keys
+            }
             robot["hardware_id"] = "fixture"
             robot["source"]["robot_name"] = "fixture"
+            source["metadata"]["owner"] = authored["owner"]
+            source["metadata"]["control"] = copy.deepcopy(authored["control"])
+            source["metadata"]["change_summary"] = authored["change_summary"]
+            source["metadata"]["change_summary_source"] = "cad"
             source["metadata"]["revision"] = "r9"
             reseal()
             self.assertIn("discovery.revision", {item["code"] for item in verify_discovery(package)["errors"]})
@@ -1826,6 +1875,7 @@ class NativeDeclarationsTests(unittest.TestCase):
             budget_bytes = json.dumps(budget).encode()
             (package / "input/records/budget.json").write_bytes(budget_bytes)
             payload["budget"] = {
+                "reference": "budget.json#",
                 "package_file": "records/budget.json",
                 "key": "",
                 "sha256": hashlib.sha256(budget_bytes).hexdigest(),

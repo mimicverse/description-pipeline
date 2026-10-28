@@ -12,29 +12,86 @@ from types import SimpleNamespace
 from ...io import PipelineError, confined, digest, inventory, read_data
 
 
-def derive_engineering_input(root: Path, manifest: dict) -> dict:
+def _raw_scene_record(scene) -> dict:
+    return {
+        "document": scene.document,
+        "components": [
+            {
+                "name": component.name,
+                "path": component.path,
+                "transform": list(component.transform),
+                "is_fixed": component.is_fixed,
+                "document_type": component.document_type,
+            }
+            for component in scene.components
+        ],
+        "coordinate_systems": {
+            name: list(matrix)
+            for name, matrix in scene.coordinate_systems.items()
+        },
+        "mass_properties": scene.mass_properties,
+        "notes": scene.notes,
+    }
+
+
+def derive_engineering_input(
+    root: Path,
+    manifest: dict,
+    *,
+    mesh_root: Path,
+) -> dict:
     """Construct Generate input using only a verified SolidWorks snapshot."""
     from .evidence import (
         RUNTIME_EVIDENCE,
         metadata_value_warnings,
     )
+    from .capture_geometry import materialize_native_geometry
+    from .capture_projection import (
+        load_native_capture_observation,
+        project_native_capture_observation,
+    )
+    from .saved_state import SAVED_STATE_WARNING_CODE, warning_from_capture
     from .scene import build_scene
 
-    raw = read_data(confined(root, manifest["scene"]))
     from .discovery import source_definition
 
+    verified_streams = {}
+    observation = load_native_capture_observation(
+        root,
+        verified_streams=verified_streams,
+    )
     delivery = Path(root)
     delivery = delivery.parent if delivery.name == "evidence" else delivery
-    payload = read_data(confined(delivery, "evidence/discovery.json"))
+    payload = read_data(
+        confined(delivery, "input/discovery/native-discovery.json")
+    )
+    if not isinstance(payload, dict):
+        raise PipelineError("Captured discovery record must be an object")
     main = str((payload.get("derivation") or {}).get("main_assembly") or "")
     config = source_definition(
         delivery,
-        discovery_name="evidence/discovery.json",
+        discovery_name="input/discovery/native-discovery.json",
         cad_prefix="input/cad/",
         records_prefix="input/",
     )
-    if not isinstance(raw, dict) or not isinstance(config, dict):
-        raise PipelineError("Captured readings and source configuration must be objects")
+    if not isinstance(config, dict):
+        raise PipelineError("Captured source configuration must be an object")
+    projection_source = {
+        **config,
+        "groups": [
+            {
+                "name": str(body.get("name") or body.get("id") or ""),
+                "components": list(body.get("components") or []),
+            }
+            for body in config.get("bodies") or []
+            if isinstance(body, dict)
+        ],
+    }
+    projected = project_native_capture_observation(
+        observation,
+        projection_source,
+    )
+    raw = _raw_scene_record(projected["scene"])
     if not main or config.get("assembly") != str(confined(delivery.resolve(), "input/cad/" + main)):
         raise PipelineError("Captured source configuration names another assembly")
     admitted = str(manifest["identity"].get("assembly") or "").replace("\\", "/")
@@ -42,29 +99,25 @@ def derive_engineering_input(root: Path, manifest: dict) -> dict:
         raise PipelineError("Captured source configuration names another assembly")
     if config.get("configuration") != manifest["identity"].get("configuration"):
         raise PipelineError("Captured source configuration names another configuration")
-    masses = read_data(confined(root, "raw/mass_properties.json"))
-    datums = read_data(confined(root, "raw/coordinate_systems.json"))
-    if raw.get("mass_properties") != masses or raw.get("coordinate_systems") != datums:
-        raise PipelineError("Captured scene readings differ from their dedicated raw records")
-    if "raw/link_group_mass_properties.json" not in manifest["files"]:
-        raise PipelineError(
-            "The capture carries no direct link group mass properties record; "
-            "this workflow requires a capture made by the direct-link-readout pipeline"
-        )
-    link_groups = read_data(confined(root, "raw/link_group_mass_properties.json"))
-    geometry = (
-        read_data(confined(root, "raw/geometry.json"))
-        if "raw/geometry.json" in manifest["files"]
-        else []
+    masses = projected["scene"].mass_properties
+    datums = raw["coordinate_systems"]
+    link_groups = projected["link_group_mass_properties"]
+    geometry = list(
+        materialize_native_geometry(
+            observation["geometry_raw"],
+            observation["source_scopes"],
+            evidence_root=root,
+            destination_root=mesh_root,
+            verified_streams=verified_streams,
+        ).values()
     )
-    if "raw/native_capture_facts.json" in manifest["files"]:
-        from .appearance import bind_capture_appearance
+    from .appearance import bind_capture_appearance
 
-        raw, geometry = bind_capture_appearance(
-            raw,
-            geometry,
-            read_data(confined(root, "raw/native_capture_facts.json")),
-        )
+    raw, geometry = bind_capture_appearance(
+        raw,
+        geometry,
+        observation,
+    )
     components = raw.get("components")
     if not isinstance(components, list) or not all(isinstance(row, dict) for row in components):
         raise PipelineError("Captured component readings must be objects")
@@ -104,7 +157,10 @@ def derive_engineering_input(root: Path, manifest: dict) -> dict:
                 ),
                 face_spans=face_spans,
             )
-            source_path = confined(root, str(entry.get("path") or ""))
+            source_path = confined(
+                mesh_root,
+                str(entry.get("path") or ""),
+            )
             source_bytes = source_path.read_bytes()
             if hashlib.sha256(source_bytes).hexdigest() != entry.get("sha"):
                 raise PipelineError(
@@ -166,6 +222,16 @@ def derive_engineering_input(root: Path, manifest: dict) -> dict:
         return payload, digest
 
     runtime, runtime_sha256 = evidence_source(RUNTIME_EVIDENCE, "native-runtime.json")
+    prepared_capture = runtime.get("prepared_capture")
+    captured_open = (
+        prepared_capture.get("opened")
+        if isinstance(prepared_capture, dict)
+        else None
+    )
+    saved_state_warning = warning_from_capture(
+        (payload.get("raw") or {}).get("source_selection"),
+        captured_open,
+    )
     native_tool_path = confined(delivery, "reports/native-tool.json")
     native_tool = read_data(native_tool_path)
     metadata_warnings = metadata_value_warnings(
@@ -186,5 +252,15 @@ def derive_engineering_input(root: Path, manifest: dict) -> dict:
         raise PipelineError("Constructed scene value warnings must be a list")
     if any(item.get("code") == metadata_warnings[0]["code"] for item in existing if isinstance(item, dict)):
         raise PipelineError("Metadata provenance warning was emitted twice")
-    provenance["value_warnings"] = [*existing, *metadata_warnings]
+    if saved_state_warning is not None and any(
+        item.get("code") == SAVED_STATE_WARNING_CODE
+        for item in existing
+        if isinstance(item, dict)
+    ):
+        raise PipelineError("Saved-state source warning was emitted twice")
+    provenance["value_warnings"] = [
+        *existing,
+        *metadata_warnings,
+        *([saved_state_warning] if saved_state_warning is not None else []),
+    ]
     return scene

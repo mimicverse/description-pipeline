@@ -102,7 +102,7 @@ from description_pipeline.schemas import (
 
 from .split_capture_fixture import fixture_backend
 from .test_pipeline_discover import (
-    ClosureReader,
+    NativeObservationFixture,
     CountingBackend,
     DiscoverHarness,
 )
@@ -575,7 +575,7 @@ class CaptureHandlerTests(unittest.TestCase):
         )
         discover_execution = DiscoverHandler(
             self.stage_fixture.port(
-                reader=ClosureReader(
+                reader=NativeObservationFixture(
                     transform=_capture_component_closure,
                     reader_sha256=self.expected_native_tool_sha256,
                 ),
@@ -1027,7 +1027,10 @@ class CaptureHandlerTests(unittest.TestCase):
         self.assertEqual(execution.outcome, "completed")
         admitted = Path(execution.candidate_root)
         manifest = json.loads((admitted / "transfer-manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["schema_version"], "solidworks-to-urdf.capture-transfer/v3")
+        self.assertEqual(
+            manifest["schema_version"],
+            "solidworks-to-urdf.capture-transfer/v4",
+        )
         self.assertEqual(manifest["run_id"], CHILD)
         self.assertNotIn("native_stage_scope", manifest)
         self.assertEqual(manifest["execution"]["effect_key"], "capture-native")

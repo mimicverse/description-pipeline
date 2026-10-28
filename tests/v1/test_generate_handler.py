@@ -58,12 +58,11 @@ class GenerateHandlerTests(unittest.TestCase):
         evidence.mkdir(parents=True)
         shutil.copytree(self.capture / "input", artifact_source / "input")
         shutil.copytree(self.capture / "raw", evidence / "raw")
-        shutil.copytree(self.capture / "source", evidence / "source")
-        shutil.copytree(self.capture / "evidence", evidence / "evidence")
-        shutil.copytree(self.capture / "geometry", evidence / "geometry")
-        shutil.copyfile(self.capture / "evidence" / "discovery.json", evidence / "discovery.json")
         shutil.copytree(self.capture / "reports", artifact_source / "reports")
-        shutil.copyfile(self.capture / "native-runtime.json", evidence / "native-runtime.json")
+        shutil.copyfile(
+            self.capture / "evidence/native-runtime.json",
+            evidence / "native-runtime.json",
+        )
         source_manifest = read_data(self.capture / "manifest.json")
         write_manifest(
             evidence,
@@ -125,10 +124,7 @@ class GenerateHandlerTests(unittest.TestCase):
         native_facts_path = evidence / "raw/native_capture_facts.json"
         native_facts = read_data(native_facts_path)
         if all_false:
-            geometry = {
-                row["component"]: row
-                for row in read_data(evidence / "raw/geometry.json")
-            }
+            geometry = dict(native_facts["geometry_raw"])
             for occurrence in native_facts["scene_raw"]["occurrences"]:
                 component = str(occurrence["name"])
                 scope = native_facts["source_scopes"][component]
@@ -168,12 +164,11 @@ class GenerateHandlerTests(unittest.TestCase):
                         "read_errors": {},
                     }
 
-                occurrence["appearance_raw"] = {
-                    "component": component,
-                    "source_document_path": scope["source_document_path"],
-                    "referenced_configuration": configuration,
+                geometry[component]["appearance_raw"] = {
                     "native_active_configuration": configuration,
                     "native_active_configuration_error": None,
+                    "native_referenced_display_state": None,
+                    "native_referenced_display_state_error": None,
                     "document": owner(
                         "IModelDocExtension.GetMaterialPropertyValues"
                     ),
@@ -191,8 +186,24 @@ class GenerateHandlerTests(unittest.TestCase):
                                 "IBody2.MaterialPropertyValues2",
                                 active=True,
                             ),
+                            "faces": [
+                                {
+                                    "component": component,
+                                    "face_index": face["face_index"],
+                                    "appearance": owner(
+                                        "IFace2.MaterialPropertyValues2",
+                                        active=True,
+                                    ),
+                                }
+                                for face in geometry[component][
+                                    "face_inventory"
+                                ]
+                                if face["body_type"] == body["body_type"]
+                                and face["body_index"]
+                                == body["body_index"]
+                            ],
                         }
-                        for body in geometry[component]["tessellation"]["bodies"]
+                        for body in geometry[component]["body_inventory"]
                     ],
                 }
             write_json(native_facts_path, native_facts)
@@ -235,13 +246,12 @@ class GenerateHandlerTests(unittest.TestCase):
 
     def test_generate_is_work_root_independent_and_survives_scratch_loss(self) -> None:
         first_workspace, first_claim = self._workspace("attempt-a", 1)
-        with (
-            patch(
-                "description_pipeline.sources.solidworks.scene.load_scene",
-                side_effect=AssertionError("transitional load_scene must not run"),
-            ),
-        ):
-            first = self.handler.execute(self.command, first_claim, first_workspace, effects=object())
+        first = self.handler.execute(
+            self.command,
+            first_claim,
+            first_workspace,
+            effects=object(),
+        )
         first_files = inventory(Path(first.candidate_root))
         shutil.rmtree(first_workspace.root)
 
@@ -373,6 +383,60 @@ class GenerateHandlerTests(unittest.TestCase):
         (workspace.inputs[self.capture_ref.artifact_id] / "input/request.json").unlink()
         with self.assertRaises(PipelineError):
             self.handler.execute(self.command, claim, workspace, effects=object())
+        self.assertFalse((workspace.root / "output").exists())
+
+    def test_generate_rejects_state_drift_without_rederiving_discovery(
+        self,
+    ) -> None:
+        source = self.root / "invalid-discovery-state"
+        shutil.copytree(
+            self.store.materialize(
+                self.capture_ref,
+                self.root / "invalid-discovery-source",
+            ),
+            source,
+        )
+        discovery_path = (
+            source / "input/discovery/native-discovery.json"
+        )
+        discovery = read_data(discovery_path)
+        component = discovery["raw"]["components"][0]
+        component["lightweight"] = not component["lightweight"]
+        write_json(discovery_path, discovery)
+        (source / "manifest.json").unlink()
+        invalid = self.store.seal_tree(
+            source,
+            kind=CAPTURE_ARTIFACT_KIND,
+            producer_run_id="capture-run",
+            producer_stage="capture",
+            producer_tool_sha256=digest({"tool": "capture"}),
+        )
+        command = self._command_for_capture(invalid)
+        workspace, claim = self._workspace(
+            "invalid-discovery-attempt",
+            1,
+            capture_ref=invalid,
+        )
+        claim = replace(claim, command_id=command.command_id)
+        from description_pipeline.sources.solidworks import discovery
+
+        with (
+            patch.object(
+                discovery,
+                "derive_native_package",
+                side_effect=AssertionError("Discover was rerun"),
+            ),
+            self.assertRaisesRegex(
+                PipelineError,
+                "discovery.suppression_state_incoherent",
+            ),
+        ):
+            self.handler.execute(
+                command,
+                claim,
+                workspace,
+                effects=object(),
+            )
         self.assertFalse((workspace.root / "output").exists())
 
     def test_formal_generate_requires_a_predecessor_before_output(self) -> None:
@@ -538,16 +602,21 @@ class GenerateVerifyClosureTests(unittest.TestCase):
         payload = copy.deepcopy(original_model)
         mutation(payload)
         manifest = verify_snapshot(self.fixture.capture_root / "evidence")
-        payload["semantic_identity"] = derive_engineering_input(
-            self.fixture.capture_root / "evidence",
-            manifest,
-        )["semantic_identity"]
-        model = EngineeringModel.from_dict(payload)
-        emission = emit(
-            model,
-            evidence_root=self.fixture.capture_root / "evidence",
-            destination=source,
-        )
+        with tempfile.TemporaryDirectory(
+            prefix="mutated-generate-meshes-"
+        ) as directory:
+            mesh_root = Path(directory)
+            payload["semantic_identity"] = derive_engineering_input(
+                self.fixture.capture_root / "evidence",
+                manifest,
+                mesh_root=mesh_root,
+            )["semantic_identity"]
+            model = EngineeringModel.from_dict(payload)
+            emission = emit(
+                model,
+                mesh_source_root=mesh_root,
+                destination=source,
+            )
         shutil.copyfile(self.fixture.generate_source / "tool.json", source / "tool.json")
         receipt = read_data(self.fixture.generate_source / GENERATE_RECEIPT)
         receipt.update(

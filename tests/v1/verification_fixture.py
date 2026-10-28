@@ -6,6 +6,7 @@ qualification or a claim about a licensed SolidWorks installation.
 
 from __future__ import annotations
 
+import copy
 import json
 import shutil
 import subprocess
@@ -24,6 +25,8 @@ from description_pipeline.request_evidence import build_request_evidence
 from description_pipeline.runtime import tool_record
 from description_pipeline.sources.solidworks.discovery import prepare_native_package
 from description_pipeline.sources.solidworks.revision import package_inventory
+from description_pipeline.sources.solidworks.saved_state import normalize_open_status
+from description_pipeline.sources.solidworks.selection import seal_closure_selection
 
 from tests.sources import support
 from tests.sources.test_solidworks_discovery import FakeBackend
@@ -371,6 +374,69 @@ class QualifiedFixtureBackend(AxisFixtureBackend):
         return rows
 
 
+class MissingReferenceFixtureBackend(QualifiedFixtureBackend):
+    """Prepared Capture fixture that reports the one continuable OpenDoc6 error."""
+
+    def open_document(self, path: str) -> dict:
+        opened = super().open_document(path)
+        opened.update(
+            normalize_open_status(
+                {
+                    "errors": 2,
+                    "warnings": 0,
+                    "missing_references": {
+                        "state": "observed",
+                        "items": [{"name": "construction", "last_known_path": "C:/missing/construction.SLDPRT"}],
+                    },
+                }
+            )
+        )
+        return opened
+
+
+def incomplete_saved_state_record() -> dict:
+    """Reseal the shared fixture with one known missing-reference open status."""
+
+    record = capture_record()
+    selection = record["source_selection"]
+    closure = copy.deepcopy(selection["closure"])
+    occurrences = [
+        {
+            "instance": edge["instance"],
+            "defining": "cad/robot.SLDASM",
+            "configuration": edge.get("configuration"),
+            "suppression_state": edge.get("suppression_state"),
+            "resolved_path": edge.get("resolved_path"),
+        }
+        for entry in closure["documents"].values()
+        for edge in entry.get("resolved_edges") or []
+    ]
+    status = normalize_open_status(
+        {
+            "errors": 2,
+            "warnings": 0,
+            "missing_references": {
+                "state": "observed",
+                "items": [{"name": "construction", "last_known_path": "C:/missing/construction.SLDPRT"}],
+            },
+        }
+    )
+    closure["open_status"] = status
+    closure["observed_occurrences"] = occurrences
+    closure["saved_configuration"] = "Default"
+    closure["unresolved"] = []
+    upload = {**selection["excluded_files"], **selection["files"]}
+    record["source_selection"] = seal_closure_selection(
+        upload,
+        selection["main_assembly"],
+        closure,
+        reader_sha256=selection["reader_sha256"],
+    )
+    record["open_status"] = status
+    record["unresolved_components"] = []
+    return record
+
+
 class HermeticNativeFixture:
     def __init__(self) -> None:
         self._assertions = unittest.TestCase()
@@ -421,7 +487,11 @@ class HermeticNativeFixture:
     def _record(self, event: dict) -> None:
         self.events.append({"at": datetime.now(UTC).isoformat(), **event})
 
-    def _prepare_and_capture(self) -> tuple[Path, dict]:
+    def _prepare_and_capture(
+        self,
+        *,
+        incomplete_saved_state: bool = False,
+    ) -> tuple[Path, dict]:
         handoff_digest = digest(package_inventory(self.handoff))
         frozen = steps.freeze_inputs(
             self.handoff,
@@ -446,7 +516,11 @@ class HermeticNativeFixture:
             },
             preparer=lambda *args, **kwargs: prepare_native_package(
                 *args,
-                backend=FakeBackend(capture_record()),
+                backend=FakeBackend(
+                    incomplete_saved_state_record()
+                    if incomplete_saved_state
+                    else capture_record()
+                ),
                 **kwargs,
             ),
             on_event=self._record,
@@ -465,7 +539,12 @@ class HermeticNativeFixture:
                 "mass": _mass_reading(0.105654866776462, (0.0, 0.0, 0.05), prepared / "cad/arm.SLDPRT"),
             },
         ]
-        backend = QualifiedFixtureBackend(
+        backend_class = (
+            MissingReferenceFixtureBackend
+            if incomplete_saved_state
+            else QualifiedFixtureBackend
+        )
+        backend = backend_class(
             prepared / MAIN_ASSEMBLY,
             components,
             dependencies=[prepared / "cad/base.SLDPRT", prepared / "cad/arm.SLDPRT"],
@@ -598,10 +677,15 @@ class HermeticNativeFixture:
         self.assertIs(verified["passed"], True)
         self.assertEqual(verified["subject_sha256"], generated_subject)
         self.assertEqual(read_delivery_manifest(self.root / "verify")["subject"]["digest"], generated_subject)
-        quality = json.loads((self.root / "verify/reports/quality.json").read_text(encoding="utf-8"))
+        certificate = json.loads(
+            (
+                self.root
+                / "verify/reports/verification-certificate.json"
+            ).read_text(encoding="utf-8")
+        )
         metadata_diagnostics = [
             diagnostic
-            for diagnostic in quality["diagnostics"]
+            for diagnostic in certificate["diagnostics"]
             if diagnostic.get("code") == "metadata.non_native"
         ]
         self.assertEqual(len(metadata_diagnostics), 1)
@@ -619,7 +703,7 @@ class HermeticNativeFixture:
         return original_handoff, native, verified
 
     def test_published_subject_supports_self_contained_cli_check(self) -> None:
-        from description_pipeline.verification.solidworks_urdf import check_bundle
+        from description_pipeline.verification.solidworks_urdf import evaluate_bundle
 
         _original_handoff, _native, verified = self._generate_and_verify()
         published = self.root / "self-contained"
@@ -629,35 +713,31 @@ class HermeticNativeFixture:
         shutil.copy2(self.root / "verify/manifest.json", published / "manifest.json")
         (published / "reports").mkdir()
         shutil.copy2(
-            self.root / "verify/reports/quality.json",
-            published / "reports/quality.json",
+            self.root / "verify/reports/verification-certificate.json",
+            published / "reports/verification-certificate.json",
+        )
+        shutil.copy2(
+            self.root / "verify/reports/verification-execution.json",
+            published / "reports/verification-execution.json",
         )
 
-        report = check_bundle(published)
+        report = evaluate_bundle(published)
         self.assertIs(report["passed"], True, report.get("checks"))
         self.assertEqual(report["subject_sha256"], verified["subject_sha256"])
 
-        shutil.copy2(
-            self.root / "verify/reports/native-stages.json",
-            published / "reports/native-stages.json",
-        )
-        partial_receipts = check_bundle(published)
-        self.assertIs(partial_receipts["passed"], False)
-        (published / "reports/native-stages.json").unlink()
-
-        with_required_receipts = check_bundle(
+        with_required_receipts = evaluate_bundle(
             published,
             require_native_receipts=True,
         )
         self.assertIs(with_required_receipts["passed"], False)
 
     def test_verify_rereads_the_subject_and_native_receipts_before_success(self) -> None:
-        from description_pipeline.verification import solidworks_urdf as quality
+        from description_pipeline.pipeline import verify as pipeline_verify
 
         _original_handoff, native, _verified = self._generate_and_verify()
         seed = self.root / "generate"
         expected_subject = read_delivery_manifest(seed)["subject"]["digest"]
-        original_check = quality.check_bundle
+        original_check = pipeline_verify.evaluate_bundle
 
         def check_then_append_to_tool(*args, **kwargs):
             report = original_check(*args, **kwargs)
@@ -665,7 +745,11 @@ class HermeticNativeFixture:
             tool.write_bytes(tool.read_bytes() + b"\n")
             return report
 
-        with patch.object(quality, "check_bundle", side_effect=check_then_append_to_tool):
+        with patch.object(
+            pipeline_verify,
+            "evaluate_bundle",
+            side_effect=check_then_append_to_tool,
+        ):
             receipt = solidworks.verify(
                 seed,
                 self.root / "verify-race",
@@ -727,13 +811,13 @@ class HermeticNativeFixture:
             "opened and captured paths do not match the dependency closure",
         )
 
-    def test_sealed_environment_open_errors_must_be_zero(self) -> None:
+    def test_sealed_environment_rejects_unknown_open_errors(self) -> None:
         def mutate(environment):
-            environment["session_boundary"]["opened"]["errors"] = 1
+            environment["solidworks"]["prepared_capture"]["opened"]["errors"] = 1
 
         self._assert_capture_mutation_rejected(
             mutate,
-            "OpenDoc6 reported a failed or invalid open",
+            "Capture OpenDoc6 status differs",
         )
 
 if __name__ == "__main__":

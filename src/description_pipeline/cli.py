@@ -11,9 +11,10 @@ from pathlib import Path
 from . import __version__
 from .io import PipelineError, pin_utf8_streams, read_data
 from .pipeline.admission import AdmissionSpec
-from .pipeline.application import AdmissionOutcome, ApplicationOutcome, STAGES, StageApplication
+from .pipeline.application import AdmissionOutcome, ApplicationOutcome, StageApplication
 from .pipeline.contracts import FailureEnvelope, StagePending, StageResult
 from .runtime import tool_record
+from .stages import STAGE_IDS
 
 ApplicationFactory = Callable[[], StageApplication]
 CLI_VERSION_PREFIX = "description-pipeline"
@@ -29,15 +30,13 @@ def parser() -> argparse.ArgumentParser:
 
     admit = operations.add_parser("admit", help="admit one immutable AdmissionSpec")
     admit.add_argument("spec", type=Path)
-    admit.add_argument("--dispatch-dag-id", default="solidworks_to_urdf")
-    admit.add_argument("--dispatch-dag-run-id")
 
     stage = operations.add_parser("stage", help="execute one already-registered stage command")
     stage.add_argument("command_id")
 
     run = operations.add_parser("run", help="execute admitted stages through one boundary")
     run.add_argument("run_id")
-    run.add_argument("--through", choices=STAGES, default="publish")
+    run.add_argument("--through", choices=STAGE_IDS, default="publish")
 
     operations.add_parser("doctor", help="show the actual portable runtime identity")
     return commands
@@ -75,11 +74,7 @@ def main(
             application = (application_factory or _default_application)()
             if arguments.operation == "admit":
                 spec = AdmissionSpec.from_record(read_data(arguments.spec))
-                admitted = application.admit(
-                    spec,
-                    dispatch_dag_id=arguments.dispatch_dag_id,
-                    dispatch_dag_run_id=arguments.dispatch_dag_run_id,
-                )
+                admitted = application.admit(spec)
                 result = {
                     "passed": True,
                     "outcome": "admitted",

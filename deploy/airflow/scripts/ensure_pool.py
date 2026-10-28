@@ -8,8 +8,9 @@ and frozen interface IF-02.  The DAG's native tasks wait on pool
 installation creates it idempotently right after ``airflow db migrate``.
 
 Idempotency: a missing pool is created with its slots and description; an
-existing pool keeps its other fields (description, include_deferred) and only
-has its capacity enforced to the contract value.  The pool is re-read after
+existing pool keeps its description while capacity and deferred occupancy are
+enforced. Deferred native work retains its pool slot without occupying an
+Airflow worker. The pool is re-read after
 commit and verified; anything else exits non-zero so installation fails closed.
 """
 
@@ -42,16 +43,15 @@ def ensure_pool(name, slots, description, *, session_factory=None, pool_class=No
         pool = session.query(pool_class).filter(pool_class.pool == name).one_or_none()
         created = pool is None
         if created:
-            pool = pool_class(pool=name, slots=slots, description=description, include_deferred=False)
+            pool = pool_class(pool=name, slots=slots, description=description, include_deferred=True)
             session.add(pool)
-        elif int(pool.slots) != int(slots):
-            # The capacity is part of the frozen stage contract; enforce it and
-            # leave every other field (description, include_deferred) untouched.
+        else:
             pool.slots = slots
+            pool.include_deferred = True
         session.commit()
         verified = session.query(pool_class).filter(pool_class.pool == name).one_or_none()
-        if verified is None or int(verified.slots) != int(slots):
-            raise SystemExit(f"pool {name!r} does not carry the required capacity {slots}")
+        if verified is None or int(verified.slots) != int(slots) or not verified.include_deferred:
+            raise SystemExit(f"pool {name!r} must retain deferred tasks within capacity {slots}")
         return {"name": name, "slots": int(verified.slots), "created": created}
 
 

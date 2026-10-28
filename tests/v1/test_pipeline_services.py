@@ -11,6 +11,7 @@ from description_pipeline.artifacts import ArtifactStore
 from description_pipeline.io import digest
 from description_pipeline.pipeline.contracts import (
     ExecutionClaim,
+    ProtocolError,
     StageCandidate,
     StageCommand,
     StageDecision,
@@ -218,6 +219,27 @@ class CanonicalStageServicesTests(unittest.TestCase):
         )
         output = self.artifacts.materialize(result.output_artifact, self.root / "verified-output")
         self.assertEqual((output / "model.txt").read_text(encoding="utf-8"), "generated\n")
+
+    def test_work_root_rejects_a_linked_parent(self) -> None:
+        real = self.root / "real-work"
+        real.mkdir()
+        linked = self.root / "linked-work"
+        try:
+            linked.symlink_to(real, target_is_directory=True)
+        except OSError as error:
+            self.skipTest(f"The host cannot create a symbolic link: {error}")
+        with self.assertRaisesRegex(ProtocolError, "workspace.invalid"):
+            CanonicalStageServices(
+                facts=self.facts,
+                artifacts=self.artifacts,
+                work_root=linked / "child",
+                claim_policy=ClaimPolicy(
+                    owner_sha256=self.owner,
+                    executor_sha256=self.executor,
+                    lease=timedelta(minutes=5),
+                ),
+                clock=lambda: self.now,
+            )
 
     def test_existing_decision_returns_without_new_domain_execution(self) -> None:
         first = self.execute()

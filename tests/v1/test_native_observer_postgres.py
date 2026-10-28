@@ -278,7 +278,7 @@ class NativeObserverPostgresTests(unittest.TestCase):
                 self.fixture.current_native_tool
             ),
             output_contract=(
-                "solidworks-to-urdf.capture-transfer/v3"
+                "solidworks-to-urdf.capture-transfer/v4"
             ),
             target_id=runtime.target_identity.target_id,
         )
@@ -355,7 +355,7 @@ class NativeObserverPostgresTests(unittest.TestCase):
         return NativeOperationResult(
             artifact_path=target,
             artifact_name=CAPTURE_ARCHIVE,
-            output_contract="solidworks-to-urdf.capture-transfer/v3",
+            output_contract="solidworks-to-urdf.capture-transfer/v4",
             resource_terminated=True,
         )
 

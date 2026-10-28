@@ -31,18 +31,26 @@ exporter state is a proven ``absent`` runs the mate-inference suite.  Gate owner
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 import ntpath
 import re
 from pathlib import Path, PurePosixPath
 
-import yaml
-
 from ..delivery import read_delivery_manifest, read_source_record
+from ..geometry.native_transform import rigid_matrix_from_row_major
 from ..interface_records import validate_request_record
 from ..io import PipelineError, confined, digest, parse_data
-from ..schemas import NATIVE_DISCOVERY_SCHEMA, exporter_declaration_present
+from ..schemas import (
+    NATIVE_DISCOVERY_BUDGET_KEYS,
+    NATIVE_DISCOVERY_CONTROL_KEYS,
+    NATIVE_DISCOVERY_DERIVATION_KEYS,
+    NATIVE_DISCOVERY_ENVELOPE_KEYS,
+    NATIVE_DISCOVERY_IDENTITY_KEYS,
+    NATIVE_DISCOVERY_OPTIONAL_ENVELOPE_KEYS,
+    NATIVE_DISCOVERY_RECORD_KEYS,
+    NATIVE_DISCOVERY_SCHEMA,
+    exporter_declaration_present,
+)
 from ..sources.solidworks.direction import canonicalize_axis
 from ..sources.solidworks.naming import robot_name as format_robot_name
 from ..sources.solidworks.native_limits import (
@@ -54,6 +62,10 @@ from ..sources.solidworks.native_limits import (
     native_limit_inventory_complete,
     rotation_window_policy,
     validate_native_limit,
+)
+from ..sources.solidworks.saved_state import (
+    capture_open_matches,
+    validate_open_status,
 )
 from ..sources.solidworks.session_artifacts import (
     SESSION_DOCUMENT_API,
@@ -109,12 +121,27 @@ def _require(condition: bool, code: str, message: str, detail=None) -> None:
         raise _Failure(code, message, detail)
 
 
-def _read_json(path: Path) -> dict:
-    return json.loads(path.read_text(encoding="utf-8"))
+def _validate_property_objects(raw: dict) -> None:
+    def object_or_absent(value, field):
+        _require(
+            value is None or isinstance(value, dict),
+            "discovery.properties",
+            "raw properties must be objects when present",
+            {"field": field, "value_type": type(value).__name__},
+        )
+        return {} if value is None else value
+
+    properties = object_or_absent(raw.get("properties"), "properties")
+    for section in ("document", "components", "mates"):
+        bucket = object_or_absent(properties.get(section), f"properties.{section}")
+        if section != "document":
+            for name, value in bucket.items():
+                object_or_absent(value, f"properties.{section}.{name}")
 
 
 def _authored_identity(raw: dict, namespace: str) -> dict:
     """Read optional authored metadata without inventing a publication identity."""
+    _validate_property_objects(raw)
     identity = raw.get("identity")
     properties = (raw.get("properties") or {}).get("document") or {}
     _require(identity is None or isinstance(identity, dict), "discovery.identity", "raw identity is not an object")
@@ -313,7 +340,20 @@ def _entities(mate: dict) -> list[dict]:
     return [item for item in mate.get("entities") or [] if isinstance(item, dict)]
 
 
+def _exact_two_entities(mate: dict) -> bool:
+    entities = mate.get("entities")
+    return bool(
+        isinstance(entities, list)
+        and len(entities) == 2
+        and all(isinstance(item, dict) for item in entities)
+        and type(mate.get("entity_count")) is int
+        and mate.get("entity_count") == 2
+    )
+
+
 def _names(mate: dict) -> list[str]:
+    if not _exact_two_entities(mate):
+        return []
     out: list[str] = []
     for item in _entities(mate):
         name = str(item.get("component") or "")
@@ -807,6 +847,13 @@ def _require_suppression_states(record: dict) -> None:
         )
         suppressed = item.get("suppressed")
         lightweight = item.get("lightweight")
+        fixed = item.get("fixed")
+        _require(
+            type(fixed) is bool,
+            "discovery.component_fixed_invalid",
+            "a component must carry the exact native boolean IComponent2.IsFixed reading",
+            {"component": name, "fixed": fixed, "error": item.get("fixed_error")},
+        )
         _require(
             type(suppressed) is bool and type(lightweight) is bool,
             "discovery.suppression_state",
@@ -890,6 +937,97 @@ def _require_source_selection(payload: dict) -> None:
             raise _Failure("discovery.selection", "the raw main choice differs from the sealed selection", None)
 
 
+def _require_saved_state_open(payload: dict) -> dict:
+    """Bind the native Discover open result to the already sealed selection result."""
+
+    raw = payload.get("raw") if isinstance(payload, dict) else None
+    if not isinstance(raw, dict):
+        raise _Failure("discovery.saved_state", "the raw native record is missing")
+    selection = raw.get("source_selection")
+    closure = selection.get("closure") if isinstance(selection, dict) else None
+    status = closure.get("open_status") if isinstance(closure, dict) else None
+    try:
+        sealed = validate_open_status(status)
+    except ValueError as error:
+        raise _Failure(
+            "discovery.saved_state",
+            "the sealed selection carries no coherent native open status",
+        ) from error
+    observed = raw.get("open_status")
+    if observed is None:
+        if (sealed["errors"] != 0 or sealed["warnings"] != 0):
+            raise _Failure(
+                "discovery.saved_state",
+                "an incomplete saved-state export carries no Discover open observation",
+            )
+    else:
+        try:
+            if not capture_open_matches(sealed, observed):
+                raise ValueError("status differs")
+        except ValueError as error:
+            raise _Failure(
+                "discovery.saved_state",
+                "Discover OpenDoc6 status differs from the sealed selection",
+            ) from error
+    unresolved = raw.get("unresolved_components")
+    if (sealed["errors"] != 0 or sealed["warnings"] != 0) and (
+        not isinstance(unresolved, list)
+        or any(not isinstance(item, dict) for item in unresolved)
+    ):
+        raise _Failure(
+            "discovery.saved_state",
+            "an incomplete saved-state export carries no unresolved occurrence facts",
+        )
+    if (sealed["errors"] == 0 and sealed["warnings"] == 0) and unresolved not in (None, []):
+        raise _Failure(
+            "discovery.saved_state",
+            "a clean native open cannot carry unresolved occurrence facts",
+        )
+    if any(item.get("suppression_state") != 0 for item in unresolved or []):
+        raise _Failure(
+            "discovery.saved_state",
+            "an active unresolved occurrence has unreadable required engineering facts",
+        )
+    if (sealed["errors"] != 0 or sealed["warnings"] != 0):
+        scoped = closure.get("observed_occurrences")
+        if not isinstance(scoped, list):
+            raise _Failure("discovery.saved_state", "the saved-state occurrence scope is missing")
+        expected = {
+            row.get("instance"): (row.get("configuration"), row.get("suppression_state"))
+            for row in scoped if isinstance(row, dict)
+        }
+        observed_rows = [
+            (row.get("instance_id") or row.get("name2"), row.get("configuration"), row.get("suppression_state"))
+            for row in raw.get("components") or [] if isinstance(row, dict)
+        ] + [
+            (row.get("instance"), row.get("configuration"), row.get("suppression_state"))
+            for row in unresolved or []
+        ]
+        expected_unresolved = {row.get("instance") for row in closure.get("unresolved", [])}
+        observed_unresolved = {row.get("instance") for row in unresolved}
+        if expected_unresolved != observed_unresolved:
+            raise _Failure(
+                "discovery.saved_state",
+                "Discover unresolved occurrence scope differs from the sealed selection",
+            )
+        observed_scope = {name: (configuration, suppression) for name, configuration, suppression in observed_rows}
+        if len(observed_scope) != len(observed_rows) or observed_scope != expected:
+            raise _Failure(
+                "discovery.saved_state",
+                "Discover occurrence scope differs from the sealed selection",
+                {
+                    "expected": sorted(str(name) for name in expected),
+                    "observed": sorted(str(name) for name in observed_scope),
+                },
+            )
+    return {
+        "classification": sealed["classification"],
+        "open_errors": sealed["errors"],
+        "open_warnings": sealed["warnings"],
+        "unresolved_components": len(unresolved or []),
+    }
+
+
 def _frames(record: dict) -> dict[str, list[list[float]] | None]:
     _require_suppression_states(record)
     frames: dict[str, list[list[float]] | None] = {}
@@ -900,13 +1038,12 @@ def _frames(record: dict) -> dict[str, list[list[float]] | None]:
         suppressed = item.get("suppressed")
         if not isinstance(name, str) or not isinstance(suppressed, bool) or suppressed:
             continue
-        values = [_number(value) for value in item.get("transform") or ()]
-        numbers = [value for value in values if value is not None]
-        frames[name] = (
-            [numbers[0:4], numbers[4:8], numbers[8:12], numbers[12:16]]
-            if len(values) == 16 and len(numbers) == 16
-            else None
-        )
+        try:
+            numbers = list(rigid_matrix_from_row_major(item.get("transform")))
+        except (TypeError, ValueError):
+            frames[name] = None
+        else:
+            frames[name] = [numbers[0:4], numbers[4:8], numbers[8:12], numbers[12:16]]
     return frames
 
 
@@ -1301,14 +1438,14 @@ def _rows_for(mate: dict, frames) -> dict | None:
     kind = str(mate.get("type") or "").strip().lower()
     if kind not in SUPPORTED_MATES:
         return None
+    if not _exact_two_entities(mate):
+        return None
     entities = _entities(mate)
     nested = _nested_self_frame_entity(mate)
     if nested is not None:
         # The scope's own frame entity resolves through the scope occurrence transform,
         # exactly like the same relation written as an ordinary in-scope pair.
         entities = [{**entity, "assembly_frame": False} if entity is nested else entity for entity in entities]
-    if len(entities) < 2:
-        return None
     first, second = entities[0], entities[1]
     for entity in (first, second):
         if _rejected_entity(entity, frames):
@@ -1877,6 +2014,7 @@ def rebuild_rigid_bodies(record: dict) -> list[dict]:
 
     if isinstance(record.get("raw"), dict):
         record = record["raw"]
+    _validate_property_objects(record)
     by_material, _by_component = _cluster_bindings(record)
     attached = _frame_attached_members(record)
     properties = (record.get("properties") or {}).get("components") or {}
@@ -1884,11 +2022,25 @@ def rebuild_rigid_bodies(record: dict) -> list[dict]:
     bodies: list[dict] = []
     for group, full in by_material.items():
         members = sorted(str(value) for value in full)
-        declared = {
-            str(value).strip()
-            for member in members
-            if isinstance((value := (properties.get(member) or {}).get("dp.body_datum")), str) and value.strip()
-        }
+        declared: set[str] = set()
+        for member in members:
+            member_properties = properties.get(member) or {}
+            _require(
+                isinstance(member_properties, dict),
+                "discovery.body_rebuild",
+                "component properties for a body datum must be an object",
+                {"component": member, "value_type": type(member_properties).__name__},
+            )
+            if "dp.body_datum" not in member_properties:
+                continue
+            value = member_properties["dp.body_datum"]
+            _require(
+                isinstance(value, str) and bool(value.strip()),
+                "discovery.body_rebuild",
+                "a declared body datum must be non-empty text",
+                {"component": member, "value": value, "value_type": type(value).__name__},
+            )
+            declared.add(value.strip())
         _require(
             len(declared) <= 1,
             "discovery.body_rebuild",
@@ -1915,20 +2067,22 @@ def rebuild_rigid_bodies(record: dict) -> list[dict]:
         )
         if explicit is not None:
             scope = {*members, *({""} if proven and explicit == "CS_base_link" else set())}
-            chosen = next(
-                (
-                    datum
-                    for datum in datums
-                    if str(datum.get("name") or "") == explicit and str(datum.get("owner") or "") in scope
-                ),
-                None,
-            )
+            matches = [
+                datum
+                for datum in datums
+                if str(datum.get("name") or "") == explicit and str(datum.get("owner") or "") in scope
+            ]
             _require(
-                chosen is not None,
+                len(matches) == 1,
                 "discovery.body_rebuild",
                 "the declared body datum does not bind exactly one coordinate system owned by this body",
-                {"components": members, "datum": explicit},
+                {
+                    "components": members,
+                    "datum": explicit,
+                    "matches": len(matches),
+                },
             )
+            chosen = matches[0]
         elif len(owned) == 1:
             chosen = owned[0]
         elif owned:
@@ -2448,8 +2602,19 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
         )
         author_limits = None
         author_evidence = None
+        limits_record_key = f"{namespace}.joint.limits_record"
         author_reference = properties.get(f"{namespace}.joint.limits_record")
-        if isinstance(author_reference, str) and author_reference.strip():
+        if limits_record_key in properties:
+            _require(
+                isinstance(author_reference, str) and bool(author_reference.strip()),
+                "discovery.joint_limits_invalid",
+                "controlled limits record reference must be non-empty text",
+                {
+                    "pair": [left, right],
+                    "value": author_reference,
+                    "value_type": type(author_reference).__name__,
+                },
+            )
             entry = _find_record_entry(payload, author_reference)
             value = _record_value(package, entry["entry"], entry["key"])
             _require(
@@ -2527,7 +2692,10 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
                 {"pair": [left, right], "unit": native_limits.get("unit")},
             )
             limits = {"lower": float(native_limits["lower"]), "upper": float(native_limits["upper"])}
-            if author_limits not in {None, (0.0, 0.0), (limits["lower"], limits["upper"])}:
+            if author_limits is not None and author_limits != (
+                limits["lower"],
+                limits["upper"],
+            ):
                 raise _Failure(
                     "discovery.joint_limits_conflict",
                     "native range disagrees with the saved author declaration",
@@ -2564,10 +2732,21 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
                 "the joint has no native position range",
                 {"pair": [left, right]},
             )
-        drive_reference = properties.get(f"{namespace}.joint.drive_record")
+        drive_record_key = f"{namespace}.joint.drive_record"
+        drive_reference = properties.get(drive_record_key)
         drive = None
         drive_evidence = None
-        if isinstance(drive_reference, str) and drive_reference.strip():
+        if drive_record_key in properties:
+            _require(
+                isinstance(drive_reference, str) and bool(drive_reference.strip()),
+                "discovery.joint_drive_invalid",
+                "controlled drive record reference must be non-empty text",
+                {
+                    "pair": [left, right],
+                    "value": drive_reference,
+                    "value_type": type(drive_reference).__name__,
+                },
+            )
             entry = _find_record_entry(payload, drive_reference)
             value = _record_value(package, entry["entry"], entry["key"])
             _require(
@@ -2746,13 +2925,9 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
 
 def _frame(values) -> list[list[float]] | None:
     try:
-        raw = list(values or ())
-    except TypeError:
+        numbers = list(rigid_matrix_from_row_major(values))
+    except (TypeError, ValueError):
         return None
-    values_as_numbers = [_number(value) for value in raw]
-    if len(values_as_numbers) != 16 or any(value is None for value in values_as_numbers):
-        return None
-    numbers = [value for value in values_as_numbers if value is not None]
     return [numbers[0:4], numbers[4:8], numbers[8:12], numbers[12:16]]
 
 
@@ -2781,6 +2956,15 @@ def _close(left, right, tolerance: float = 1e-9) -> bool:
 def _record_value(package: Path, entry: dict, key: str):
     from ..interface_records import record_archive_path
 
+    original_file = entry.get("file")
+    if not isinstance(original_file, str) and isinstance(entry.get("reference"), str):
+        original_file = str(entry["reference"]).partition("#")[0]
+    _require(
+        isinstance(original_file, str) and bool(original_file),
+        "discovery.record",
+        "embedded record has no original filename",
+        {"file": entry.get("package_file")},
+    )
     relative = record_archive_path(str(entry.get("package_file") or ""))
     candidates = [package / relative, package / "input" / relative]
     target = next((candidate for candidate in candidates if candidate.is_file()), candidates[0])
@@ -2794,11 +2978,14 @@ def _record_value(package: Path, entry: dict, key: str):
         "embedded record bytes changed",
         {"file": entry.get("package_file")},
     )
-    text = payload.decode("utf-8", errors="replace")
     try:
-        data = json.loads(text)
-    except ValueError:
-        data = yaml.safe_load(text)
+        data = parse_data(payload, Path(original_file))
+    except PipelineError as error:
+        raise _Failure(
+            "discovery.record",
+            f"embedded record is not valid UTF-8 JSON/YAML: {error}",
+            {"file": entry.get("package_file")},
+        ) from error
     node = data
     for part in [piece for piece in str(key or "").split(".") if piece]:
         _require(
@@ -2809,18 +2996,6 @@ def _record_value(package: Path, entry: dict, key: str):
         )
         node = node[part]
     return node
-
-
-def _primary_name(mates: list[dict]) -> str:
-    """Mirror of the documented primary-mate rule: limits, then shaft, then order."""
-
-    for mate in mates:
-        if isinstance(mate.get("limits"), dict):
-            return str(mate.get("name") or "")
-    for mate in mates:
-        if any(isinstance(item.get("cylinder"), dict) for item in _entities(mate)):
-            return str(mate.get("name") or "")
-    return str(mates[0].get("name") or "") if mates else ""
 
 
 def _joint_properties(raw: dict, mates: list[dict]) -> tuple[dict, dict]:
@@ -2913,29 +3088,100 @@ def verify_discovery(package: Path) -> dict:
             errors.append({"code": "discovery.internal", "message": str(error), "detail": {}})
         return checks[-1]
 
-    record_path = package / "evidence/discovery.json"
+    record_path = package / "input/discovery/native-discovery.json"
     source_path = package / "input/source.json"
     originals_root = package / "input/cad"
 
     def binding():
         _require(record_path.is_file(), "discovery.file", "the discovery record is missing")
         payload_bytes = record_path.read_bytes()
-        payload = json.loads(payload_bytes.decode("utf-8"))
+        try:
+            payload = parse_data(payload_bytes, record_path)
+        except PipelineError as error:
+            raise _Failure(
+                "discovery.binding",
+                f"discovery record is not valid UTF-8 JSON: {error}",
+            ) from error
         _require(payload.get("schema_version") == DISCOVERY_SCHEMA, "discovery.binding", "unexpected discovery schema")
-        files = payload.get("files")
         _require(
-            isinstance(files, list) and files and all(isinstance(row, dict) for row in files),
+            set(payload) - NATIVE_DISCOVERY_OPTIONAL_ENVELOPE_KEYS
+            == NATIVE_DISCOVERY_ENVELOPE_KEYS,
+            "discovery.binding",
+            "discovery envelope must carry exact keys",
+        )
+        identity_claim = payload.get("identity")
+        _require(
+            isinstance(identity_claim, dict)
+            and set(identity_claim) == NATIVE_DISCOVERY_IDENTITY_KEYS,
+            "discovery.binding",
+            "discovery identity must carry exact keys",
+        )
+        control_claim = identity_claim.get("control")
+        _require(
+            control_claim is None
+            or (
+                isinstance(control_claim, dict)
+                and set(control_claim) == NATIVE_DISCOVERY_CONTROL_KEYS
+            ),
+            "discovery.binding",
+            "discovery control identity must carry exact keys",
+        )
+        derivation_claim = payload.get("derivation")
+        _require(
+            isinstance(derivation_claim, dict)
+            and set(derivation_claim) == NATIVE_DISCOVERY_DERIVATION_KEYS,
+            "discovery.binding",
+            "discovery derivation must carry exact keys",
+        )
+        record_claims = payload.get("records")
+        _require(
+            isinstance(record_claims, list)
+            and all(
+                isinstance(item, dict)
+                and set(item) == NATIVE_DISCOVERY_RECORD_KEYS
+                for item in record_claims
+            ),
+            "discovery.binding",
+            "discovery records must carry exact keys",
+        )
+        budget_claim = payload.get("budget")
+        _require(
+            budget_claim is None
+            or (
+                isinstance(budget_claim, dict)
+                and set(budget_claim) == NATIVE_DISCOVERY_BUDGET_KEYS
+            ),
+            "discovery.binding",
+            "discovery budget index must carry exact keys",
+        )
+        files = payload.get("native_files")
+        _require(
+            isinstance(files, dict)
+            and bool(files)
+            and all(
+                isinstance(name, str)
+                and bool(name)
+                and isinstance(checksum, str)
+                and bool(checksum)
+                for name, checksum in files.items()
+            ),
             "discovery.binding",
             "record carries no file inventory",
         )
         _require(
-            digest(files) == payload.get("native_inventory_sha256"),
+            digest(files) == payload.get("handoff_sha256"),
             "discovery.binding",
             "the native inventory digest does not match the file records",
         )
         manifest = read_delivery_manifest(package)
+        record_name = "input/discovery/native-discovery.json"
         entry = next(
-            (row for row in manifest["subject"]["files"] if row.get("path") == "evidence/discovery.json"), None
+            (
+                row
+                for row in manifest["subject"]["files"]
+                if row.get("path") == record_name
+            ),
+            None,
         )
         _require(
             entry is not None and entry.get("sha256") == hashlib.sha256(payload_bytes).hexdigest(),
@@ -2961,6 +3207,7 @@ def verify_discovery(package: Path) -> dict:
             {"field": "main_assembly"},
         )
         raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
+        _validate_property_objects(raw)
         sealed_selection = (
             raw.get("source_selection") if isinstance(raw.get("source_selection"), dict) else {}
         )
@@ -2984,24 +3231,28 @@ def verify_discovery(package: Path) -> dict:
         )
         state["request"] = request
         identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else {}
+        robot_name = (
+            identity.get("robot_name")
+            or identity.get("robot_name_technical")
+        )
         definition = {
             "schema_version": payload.get("schema_version"),
             # The definition identity carries the generated claim; the identity
             # gate recomputes the expected value from the raw reading plus the
             # sealed selection and compares the claim against it.
             "hardware_id": identity.get("hardware_id"),
-            "robot_name": payload.get("robot_name"),
+            "robot_name": robot_name,
             "source": {
                 "assembly": source["selection"]["main_assembly"],
                 "configuration": source["selection"]["configuration"],
-                "robot_name": payload.get("robot_name"),
+                "robot_name": robot_name,
             },
         }
         state["definition"] = definition
         state["payload"] = payload
         return {
             "discovery_sha256": hashlib.sha256(payload_bytes).hexdigest(),
-            "native_inventory_sha256": payload.get("native_inventory_sha256"),
+            "native_inventory_sha256": digest(files),
             "run_id": payload.get("run_id"),
             "contract": payload.get("contract"),
         }
@@ -3010,9 +3261,8 @@ def verify_discovery(package: Path) -> dict:
         payload = state["payload"]
         inventory = _digest_files(originals_root)
         native = {
-            str(row["path"]): str(row["sha256"])
-            for row in payload.get("files") or []
-            if isinstance(row, dict) and isinstance(row.get("path"), str)
+            str(name): str(checksum)
+            for name, checksum in (payload.get("native_files") or {}).items()
         }
         for relative, checksum in sorted(native.items()):
             _require(
@@ -3064,9 +3314,8 @@ def verify_discovery(package: Path) -> dict:
         payload = state["payload"]
         raw = payload.get("raw") or {}
         native = {
-            str(row["path"]): str(row["sha256"])
-            for row in payload.get("files") or []
-            if isinstance(row, dict) and isinstance(row.get("path"), str)
+            str(name): str(checksum)
+            for name, checksum in (payload.get("native_files") or {}).items()
         }
         raw_files = raw.get("files") or {}
         carrier = raw.get("source_selection")
@@ -3323,6 +3572,13 @@ def verify_discovery(package: Path) -> dict:
 
         request = state["request"]
 
+        for key in ("owner", "control"):
+            _require(
+                metadata.get(key) == authored[key],
+                "discovery.identity",
+                "sealed source metadata differs from native evidence",
+                {"field": key},
+            )
         for key in ("revision", "parent_revision", "owner", "control"):
             _require(
                 claimed.get(key) == authored[key],
@@ -3418,6 +3674,19 @@ def verify_discovery(package: Path) -> dict:
             "generated metadata differs from native evidence",
             {"field": "change_summary"},
         )
+        _require(
+            metadata.get("change_summary") == summary,
+            "discovery.identity",
+            "sealed source metadata differs from native evidence",
+            {"field": "change_summary"},
+        )
+        if summary is None:
+            _require(
+                metadata.get("change_summary_source") == "generated",
+                "discovery.identity",
+                "sealed source metadata has a false change-summary origin",
+                {"field": "change_summary_source"},
+            )
 
         # The delivery configuration is qualified by native state, not by the
         # name it carries.  The requirement is derived from the sealed selection
@@ -3497,14 +3766,18 @@ def verify_discovery(package: Path) -> dict:
         source = read_source_record(package)
         metadata = source.get("metadata") or {}
         authored = state.get("authored_identity")
-        if isinstance(authored, dict) and not authored.get("missing"):
-            declared = metadata.get("revision")
-            _require(
-                declared in (None, authored.get("revision")),
-                "discovery.revision",
-                "revision metadata differs from native author metadata",
-                {"field": "revision"},
-            )
+        _require(
+            isinstance(authored, dict),
+            "discovery.revision",
+            "native authored identity is unavailable for revision verification",
+        )
+        declared = metadata.get("revision")
+        _require(
+            declared == authored.get("revision"),
+            "discovery.revision",
+            "revision metadata differs from native author metadata",
+            {"field": "revision", "declared": declared, "native": authored.get("revision")},
+        )
         return {
             "revision": metadata.get("revision"),
             "label_source": (source.get("selection") or {}).get("hardware_source"),
@@ -3514,11 +3787,7 @@ def verify_discovery(package: Path) -> dict:
         payload = state["payload"]
         entry = payload.get("budget")
         _require(isinstance(entry, dict), "discovery.budgets", "the package carries no design budget record binding")
-        value = _record_value(
-            package,
-            {"package_file": entry.get("package_file"), "sha256": entry.get("sha256")},
-            str(entry.get("key") or ""),
-        )
+        value = _record_value(package, entry, str(entry.get("key") or ""))
         _require(isinstance(value, dict), "discovery.budgets", "the design budget record entry is not an object")
         for key in ("expected_mass_kg", "expected_extent_m"):
             item = value.get(key)
@@ -3576,6 +3845,22 @@ def verify_discovery(package: Path) -> dict:
                 {"mate": mate.get("name")},
             )
             kind = str(mate.get("type") or "").strip().lower()
+            if kind in SUPPORTED_MATES:
+                _require(
+                    _exact_two_entities(mate),
+                    "discovery.graph",
+                    "a supported mate must carry exactly two raw entities and native entity_count 2",
+                    {
+                        "mate": mate.get("name"),
+                        "type": kind,
+                        "entity_count": mate.get("entity_count"),
+                        "raw_entities": (
+                            len(mate.get("entities"))
+                            if isinstance(mate.get("entities"), list)
+                            else None
+                        ),
+                    },
+                )
             _require(
                 mate.get("native_limit") is None or kind in {"limitdistance", "limitangle"},
                 "discovery.graph", "a non-limit mate carries native position-limit evidence",
@@ -4495,6 +4780,7 @@ def verify_discovery(package: Path) -> dict:
     dependent = (
         ("discovery.suppression_state", suppression),
         ("discovery.selection", source_selection),
+        ("discovery.saved_state", lambda: _require_saved_state_open(state.get("payload") or {})),
         ("discovery.files", files),
         ("discovery.imported_sources", imported_sources),
         ("discovery.identity", identity),
@@ -4525,6 +4811,7 @@ def verify_discovery(package: Path) -> dict:
         dependent = (
             ("discovery.suppression_state", suppression),
             ("discovery.selection", source_selection),
+            ("discovery.saved_state", lambda: _require_saved_state_open(state.get("payload") or {})),
             ("discovery.files", files),
             ("discovery.imported_sources", imported_sources),
             ("discovery.identity", identity),
@@ -4545,7 +4832,7 @@ def verify_discovery(package: Path) -> dict:
             if identifier == "discovery.revision":
                 authored = state.get("authored_identity") or {}
                 declared = (read_source_record(package).get("metadata") or {}).get("revision")
-                if not declared:
+                if not declared and authored.get("revision") is None:
                     # The CAD revision label is optional raw metadata; its absence is a
                     # readiness warning, never a passed check.
                     diagnostics.append(

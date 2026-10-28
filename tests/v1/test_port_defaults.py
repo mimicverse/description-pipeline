@@ -29,10 +29,15 @@ LITERALS = ("8791", "18765", "5433", "8765", "8788", "8443", "8780")
 PATTERN = re.compile(r"(?<![\w.])(" + "|".join(LITERALS) + r")(?![\w.])")
 
 
-def _deploy_defaults() -> dict:
+def _deploy_module():
     spec = importlib.util.spec_from_file_location("deploy_render_operator", ROOT / DEPLOY_OWNER)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    return module
+
+
+def _deploy_defaults() -> dict:
+    module = _deploy_module()
     return module.PORT_DEFAULTS
 
 
@@ -90,6 +95,44 @@ class PortDefaultsTests(unittest.TestCase):
             ("deploy/airflow/systemd/description-solidworks-tunnel.service", "@TUNNEL_LOOPBACK_PORT@"),
         ):
             self.assertIn(token, (ROOT / relative).read_text())
+
+    def test_actual_local_listener_ports_are_a_single_collision_rule(self):
+        module = _deploy_module()
+        module.require_distinct_local_ports(
+            {
+                "operator_https": 8443,
+                "portal": 8788,
+                "airflow_api": 8791,
+                "tunnel_loopback": 18765,
+                "postgres": 5433,
+            }
+        )
+        module.require_distinct_local_ports(
+            {
+                "operator_https": 8443,
+                "portal": None,
+                "airflow_api": 8791,
+                "tunnel_loopback": 18765,
+                "postgres": 5433,
+            }
+        )
+        for field, value in (
+            ("operator_https", 8791),
+            ("portal", 8443),
+            ("airflow_api", 5433),
+            ("tunnel_loopback", 8788),
+            ("postgres", 18765),
+        ):
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "must not collide"):
+                ports = {
+                    "operator_https": 8443,
+                    "portal": 8788,
+                    "airflow_api": 8791,
+                    "tunnel_loopback": 18765,
+                    "postgres": 5433,
+                }
+                ports[field] = value
+                module.require_distinct_local_ports(ports)
 
 
 if __name__ == "__main__":

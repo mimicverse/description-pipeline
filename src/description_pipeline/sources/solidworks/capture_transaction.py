@@ -34,7 +34,6 @@ from .discovery import (
     FINDINGS_FILE,
     IDENTITY_FILE,
     PLAN_FILE,
-    native_component_identity,
 )
 from .freeze import capture_prepared
 from .revision import package_inventory
@@ -62,7 +61,6 @@ def inspect_prepared_package(package: Path) -> dict:
         "input": None,
         "resolved": None,
         "input_receipt": None,
-        "cad_revision": None,
     }
     path = package / "source.json"
     try:
@@ -89,7 +87,6 @@ def inspect_prepared_package(package: Path) -> dict:
         )
         return report
     identity = source["identity"]
-    metadata = source["metadata"]
     report["main_assembly"] = identity["main_assembly"]
     report["configuration"] = identity["configuration"]
     report["input"] = {
@@ -98,13 +95,6 @@ def inspect_prepared_package(package: Path) -> dict:
             "assembly": identity["main_assembly"],
             "configuration": identity["configuration"],
         },
-    }
-    report["cad_revision"] = {
-        "hardware_id": identity["hardware_id"],
-        "revision": metadata["revision"],
-        "owner": metadata["owner"],
-        "control": metadata["control"],
-        "change_summary": metadata["change_summary"],
     }
     report["input_receipt"] = {"inventory": dict(sorted(receipt.items()))}
     return report
@@ -172,96 +162,13 @@ def _archive_input(package: Path, staging: Path) -> None:
     source_path = package / "source.json"
     if source_path.is_file():
         shutil.copyfile(source_path, destination / "source.json")
-    sidecars = [DISCOVERY_FILE, FINDINGS_FILE]
+    sidecars = [DISCOVERY_FILE, FINDINGS_FILE, PLAN_FILE]
     if confined(package, IDENTITY_FILE, exists=False).is_file():
         sidecars.append(IDENTITY_FILE)
     for relative in sidecars:
         target = confined(destination, relative, exists=False)
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(confined(package, relative), target)
-
-
-def _rehome_evidence(staging: Path, package: Path) -> None:
-    """Project one native snapshot into the delivery evidence layout."""
-
-    evidence = staging / "evidence"
-    blocks = {
-        "scene": "raw/scene_raw.json",
-        "mass_closure": "raw/mass_closure.json",
-        "material_provenance": "raw/material_provenance.json",
-        "dependency_closure": "raw/dependency_closure.json",
-        "link_group_mass_properties": (
-            "raw/link_group_mass_properties.json"
-        ),
-        "effective_instances": "raw/effective_instances.json",
-        "geometry": "raw/geometry.json",
-        "axes": "raw/axis_references.json",
-        "collection": "evidence/collection.json",
-    }
-    capture = {
-        name: read_data(evidence / relative)
-        for name, relative in blocks.items()
-    }
-    capture["components"] = [
-        {"name": str(name), "mass_properties": value}
-        for name, value in sorted(
-            (read_data(evidence / "raw/mass_properties.json") or {}).items()
-        )
-    ]
-    capture["datums"] = [
-        {"name": str(name), "matrix": matrix}
-        for name, matrix in sorted(
-            (
-                read_data(
-                    evidence / "raw/coordinate_systems.json"
-                )
-                or {}
-            ).items()
-        )
-    ]
-    (evidence / PLAN_FILE).write_bytes((package / PLAN_FILE).read_bytes())
-    write_json(evidence / "capture.json", capture)
-    write_json(
-        evidence / "native-runtime.json",
-        read_data(evidence / "evidence/environment.json"),
-    )
-    payload = read_data(package / DISCOVERY_FILE)
-    identity = (
-        payload.get("identity")
-        if isinstance(payload.get("identity"), dict)
-        else {}
-    )
-    rows = [
-        {"path": name, "sha256": checksum}
-        for name, checksum in sorted(
-            (payload.get("native_files") or {}).items()
-        )
-    ]
-    write_json(
-        evidence / "discovery.json",
-        {
-            **payload,
-            "files": rows,
-            "native_inventory_sha256": digest(rows),
-            "robot_name": (
-                identity.get("robot_name")
-                or identity.get("robot_name_technical")
-                or "robot"
-            ),
-        },
-    )
-    manifest_path = evidence / "manifest.json"
-    manifest = read_data(manifest_path)
-    files = dict(manifest.get("files") or {})
-    for name in (
-        PLAN_FILE,
-        "capture.json",
-        "discovery.json",
-        "native-runtime.json",
-    ):
-        files[name] = file_digest(evidence / name)
-    manifest["files"] = dict(sorted(files.items()))
-    write_json(manifest_path, manifest)
 
 
 def _snapshot_details(staging: Path, manifest: dict) -> dict:
@@ -290,136 +197,6 @@ def _snapshot_details(staging: Path, manifest: dict) -> dict:
     }
 
 
-def _require_plan_against_capture(
-    staging: Path,
-    plan: dict,
-) -> None:
-    """Require planned objects, datums and evidence in the actual capture."""
-
-    evidence = staging / "evidence"
-    captured = read_data(evidence / "raw" / "mass_properties.json")
-    captured_names = {str(name) for name in (captured or {})}
-    discovery = read_data(evidence / "discovery.json")
-    raw_discovery = (
-        discovery.get("raw")
-        if isinstance(discovery, dict)
-        else None
-    )
-    native_components = (
-        raw_discovery.get("components")
-        if isinstance(raw_discovery, dict)
-        else None
-    )
-    if (
-        not isinstance(native_components, list)
-        or any(
-            not isinstance(item, dict)
-            for item in native_components
-        )
-    ):
-        raise PipelineError(
-            "The capture carries no valid sealed native component inventory"
-        )
-    all_native_list = [
-        native_component_identity(item)
-        for item in native_components
-    ]
-    if len(set(all_native_list)) != len(all_native_list):
-        raise PipelineError(
-            "The capture repeats a sealed native instance identity"
-        )
-    all_native_names = set(all_native_list)
-    active_native = [
-        item for item in native_components if not item.get("suppressed")
-    ]
-    planned_list = [str(item["name"]) for item in plan["objects"]]
-    native_list = [
-        native_component_identity(item) for item in active_native
-    ]
-    if (
-        len(set(planned_list)) != len(planned_list)
-        or len(set(native_list)) != len(native_list)
-    ):
-        raise PipelineError(
-            "The capture repeats a sealed native instance identity"
-        )
-    planned_names = set(planned_list)
-    native_names = set(native_list)
-    native_documents = {
-        native_component_identity(item): str(
-            item.get("document") or ""
-        )
-        for item in active_native
-    }
-    container_names = {
-        name
-        for name in native_names
-        if native_documents[name].lower().endswith(".sldasm")
-        or any(
-            other != name and other.startswith(name + "/")
-            for other in all_native_names
-        )
-    }
-    planned_mass_names = {
-        name for name in native_names if name not in container_names
-    }
-    scene = read_data(evidence / "raw" / "scene_raw.json")
-    scene_components = (
-        scene.get("components") if isinstance(scene, dict) else None
-    )
-    if (
-        not isinstance(scene_components, list)
-        or any(
-            not isinstance(item, dict)
-            for item in scene_components
-        )
-    ):
-        raise PipelineError(
-            "The capture scene has no valid native component inventory"
-        )
-    scene_list = [str(item.get("name")) for item in scene_components]
-    if len(set(scene_list)) != len(scene_list):
-        raise PipelineError(
-            "The capture scene repeats a native component identity"
-        )
-    scene_types = {
-        str(item.get("name")): item.get("document_type")
-        for item in scene_components
-    }
-    if (
-        planned_names != native_names
-        or captured_names != planned_mass_names
-        or set(scene_types) != planned_mass_names
-        or any(kind != "part" for kind in scene_types.values())
-    ):
-        raise PipelineError(
-            "The capture did not read every planned native instance"
-        )
-    if plan["datums"]:
-        systems = read_data(
-            evidence / "raw" / "coordinate_systems.json"
-        )
-        known = {str(name) for name in (systems or {})}
-        if not set(map(str, plan["datums"])) <= known:
-            raise PipelineError(
-                "The capture did not read every planned datum"
-            )
-    for requested in plan["evidence_requests"]:
-        requested = str(requested)
-        target = evidence / requested.removeprefix("evidence/")
-        if requested.endswith("/"):
-            if not target.is_dir():
-                raise PipelineError(
-                    "The capture did not produce a planned evidence item: "
-                    f"{requested}"
-                )
-        elif not target.is_file():
-            raise PipelineError(
-                "The capture did not produce a planned evidence item: "
-                f"{requested}"
-            )
-
-
 def capture_native_package(
     package: Path,
     staging: Path,
@@ -429,6 +206,7 @@ def capture_native_package(
     backend: Any,
     on_event=None,
     on_activity=None,
+    resource_boundary: dict[str, bool] | None = None,
 ):
     """Inspect, archive and capture one complete prepared package."""
 
@@ -543,7 +321,6 @@ def capture_native_package(
             "passed": value[1]["passed"],
             "handoff_sha256": handoff_sha256,
             "files_sha256": digest(value[1]["package_files"]),
-            "cad_revision": value[1]["cad_revision"],
             "warnings": value[1].get("warnings", []),
             "files": {
                 "input/" + path: checksum
@@ -556,6 +333,8 @@ def capture_native_package(
         package_inventory(package) == original_files,
         "Prepared inputs changed before native capture",
     )
+    if resource_boundary is not None:
+        resource_boundary["entered"] = True
     capture_prepared(
         definition["source"],
         staging / "evidence",
@@ -566,9 +345,6 @@ def capture_native_package(
         worker_version=__version__,
         on_activity=on_activity,
     )
-    verify_snapshot(staging / "evidence")
-    _rehome_evidence(staging, package)
-    _require_plan_against_capture(staging, definition["plan"])
     checked(
         on_event,
         "capture",

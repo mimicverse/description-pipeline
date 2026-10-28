@@ -27,12 +27,6 @@ from .native_limits import ENGINEERING_DEFAULT_POLICY_ID, PREVIEW_POLICY_ID
 from ...schemas import ENGINEERING_MODEL_SCHEMA, LINK_GROUP_MASS_SCHEMA as LINK_GROUP_SCHEMA
 
 
-def engineering_model_schema_supported(value: object) -> bool:
-    """Whether a payload declares the one current engineering model id."""
-
-    return value == ENGINEERING_MODEL_SCHEMA
-
-
 Matrix3 = tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]
 Vector3 = tuple[float, float, float]
 
@@ -257,51 +251,6 @@ class _PartReading:
         return {"mass": self.mass, "com": self.link_com, "inertia": self.link_inertia}
 
 
-def assembly_leaf_total(components: Sequence[Any], readings: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    """Combine the raw per-component readings about the assembly COM (parallel axis).
-
-    This is what the assembly *should* weigh if the leaf files on disk are the ones SolidWorks
-    measured.  The capture records it next to the assembly document's own reading so a repaired or
-    re-materialed leaf (a file that no longer matches the tree the assembly was built from) shows up
-    as a difference instead of an invisible undercount.
-    """
-
-    entries = []
-    for component in components:
-        payload = readings.get(str(component.name))
-        if payload is None:
-            raise ConfigError("a component has no mass property reading", {"component": str(component.name)})
-        # The identity link frame keeps the reading in assembly coordinates.
-        part = _PartReading(str(component.name), component.transform, payload, identity_matrix(), (0.0, 0.0, 0.0))
-        entries.append(part.mass_entry())
-    combined = combine_mass_properties(entries)
-    return {
-        "mass": float(combined["mass"]),
-        "com": [float(value) for value in combined["com"]],
-        "inertia": [[float(value) for value in row] for row in combined["inertia"]],
-    }
-
-
-def closure_delta(top_level: dict[str, Any], leaf_total: dict[str, Any]) -> dict[str, float]:
-    """Difference between the assembly's own reading and the recombined leaf readings."""
-
-    top_mass = float(top_level["mass"])
-    leaf_mass = float(leaf_total["mass"])
-    com_top = [float(value) for value in top_level["com"]]
-    com_leaf = [float(value) for value in leaf_total["com"]]
-    inertia_top = [[float(value) for value in row] for row in top_level["inertia"]]
-    inertia_leaf = [[float(value) for value in row] for row in leaf_total["inertia"]]
-    scale = max(max(abs(value) for row in inertia_top for value in row), 1e-12)
-    worst = max(abs(inertia_top[i][j] - inertia_leaf[i][j]) for i in range(3) for j in range(3))
-    return {
-        "mass_abs": abs(top_mass - leaf_mass),
-        "mass_rel": abs(top_mass - leaf_mass) / max(abs(top_mass), abs(leaf_mass), 1e-12),
-        "com_abs_max": max(abs(com_top[i] - com_leaf[i]) for i in range(3)),
-        "inertia_abs_max": worst,
-        "inertia_rel": worst / scale,
-    }
-
-
 def map_from_row_major(values: Sequence[float]) -> tuple[Matrix3, Vector3]:
     """Split a row-major 4x4 into (rotation, translation)."""
 
@@ -440,7 +389,10 @@ def _direct_link_reads(
     if not isinstance(record, dict) or record.get("schema_version") != LINK_GROUP_SCHEMA:
         raise ConfigError(
             "the capture carries no direct link group mass properties record",
-            {"required": "raw/link_group_mass_properties.json", "schema": LINK_GROUP_SCHEMA},
+            {
+                "required": "raw/native_capture_facts.json#link_group_mass_raw",
+                "schema": LINK_GROUP_SCHEMA,
+            },
         )
     links = record.get("links")
     expected = {str(body.get("name") or body.get("id") or "") for body in bodies}
@@ -730,7 +682,7 @@ def build_scene(
                 "collisions": [],
                 "provenance": {
                     "source_entities": components,
-                    "mass": "raw/mass_properties.json",
+                    "mass": "raw/native_capture_facts.json#part_mass_raw",
                     "parts": [
                         {
                             "id": reading.name,
@@ -749,7 +701,7 @@ def build_scene(
                             "selection": direct["selection"],
                             "selection_rule": direct_meta["selection_rule"],
                             "used_api": direct_meta["used_api"],
-                            "source": "raw/link_group_mass_properties.json",
+                            "source": "raw/native_capture_facts.json#link_group_mass_raw",
                         },
                         "recombination": {
                             "mass_kg": float(combined["mass"]),
@@ -779,7 +731,9 @@ def build_scene(
         effective_names = {instance for instance, _local, _reading in top_most} | used_context
         if effective_names:
             links[-1]["provenance"]["effective_instances"] = sorted(effective_names)
-            links[-1]["provenance"]["instance_measurements"] = "raw/effective_instances.json"
+            links[-1]["provenance"]["instance_measurements"] = (
+                "raw/native_capture_facts.json#component_mass_raw"
+            )
             links[-1]["provenance"]["combination"] = "parallel_axis_from_cad_part_and_instance_readings"
 
     joint_entries = _build_joints(cfg, {link["name"] for link in links}, link_frames)
@@ -1593,28 +1547,3 @@ def _build_frames(
             }
         )
     return frames
-
-
-def load_scene(snapshot_root: Path) -> dict[str, Any]:
-    """Legacy loader for replay/tests; Generate consumes derive_engineering_input."""
-
-    from ..snapshot import verify_snapshot
-
-    root = Path(snapshot_root).resolve()
-    manifest = verify_snapshot(root)
-    from .captured import derive_engineering_input
-
-    scene = derive_engineering_input(root, manifest)
-    if not isinstance(scene, dict) or not engineering_model_schema_supported(scene.get("schema_version")):
-        raise ConfigError("unexpected scene schema", {"snapshot": str(root)})
-    if scene.get("units") != "SI":
-        raise ConfigError("only SI scenes are supported", {"units": scene.get("units")})
-    provenance = dict(scene.get("provenance") or {})
-    provenance["snapshot"] = {
-        "kind": manifest.get("kind"),
-        "evidence_class": manifest.get("evidence_class"),
-        "identity": manifest.get("identity"),
-        "files": len(manifest.get("files") or {}),
-    }
-    scene["provenance"] = provenance
-    return scene

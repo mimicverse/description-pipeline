@@ -590,16 +590,25 @@ class AdmissionProjectionTests(unittest.TestCase):
                 "main_assembly": self.harness.spec.main_assembly,
             },
             "prepared_sha256": digest({"prepared": 1}),
+            "prepared_files": {"input/robot.SLDASM": self.harness.originals.inventory["cad/robot.SLDASM"]},
+            "findings": [],
             "native_observation_sha256": digest({"observation": 1}),
             "source_set_artifact": self.harness.originals_ref.to_record(),
             "ruleset_artifact": self.harness.ruleset_ref.to_record(),
             "configuration_artifact": self.harness.configuration_ref.to_record(),
             "native_tool": self.harness.native_tool,
             "passed": True,
+            "discovery_file": "input/discovery/native-discovery.json",
+            "findings_file": "input/discovery/findings.json",
         }
         discover_payload["selection"]["handoff_sha256"] = digest(discover_payload["selection"]["files"])
         discover = self.harness.predecessor("discover", discover_command, discover_payload)
         discover_result = VerifiedDiscoverResult.from_record(discover, discover_payload)
+        with self.assertRaises(ProtocolError):
+            VerifiedDiscoverResult.from_record(
+                discover,
+                {**discover_payload, "unexpected_projection_field": True},
+            )
         self.assertEqual(
             discover_result.native_tool_source_sha256,
             self.harness.spec.native_tool_source_sha256,
@@ -854,12 +863,16 @@ class AdmissionProjectionTests(unittest.TestCase):
                 "main_assembly": self.harness.spec.main_assembly,
             },
             "prepared_sha256": digest({"prepared": 1}),
+            "prepared_files": {"input/robot.SLDASM": self.harness.originals.inventory["cad/robot.SLDASM"]},
+            "findings": [],
             "native_observation_sha256": digest({"observation": 1}),
             "source_set_artifact": self.harness.originals_ref.to_record(),
             "ruleset_artifact": self.harness.ruleset_ref.to_record(),
             "configuration_artifact": self.harness.configuration_ref.to_record(),
             "native_tool": self.harness.native_tool,
             "passed": True,
+            "discovery_file": "input/discovery/native-discovery.json",
+            "findings_file": "input/discovery/findings.json",
         }
         discover_payload["selection"]["handoff_sha256"] = digest(discover_payload["selection"]["files"])
         discover = self.harness.predecessor("discover", discover_command, discover_payload)
@@ -924,12 +937,16 @@ class AdmissionProjectionTests(unittest.TestCase):
                 "main_assembly": self.harness.spec.main_assembly,
             },
             "prepared_sha256": digest({"prepared": 1}),
+            "prepared_files": {"input/robot.SLDASM": self.harness.originals.inventory["cad/robot.SLDASM"]},
+            "findings": [],
             "native_observation_sha256": digest({"observation": 1}),
             "source_set_artifact": self.harness.originals_ref.to_record(),
             "ruleset_artifact": self.harness.ruleset_ref.to_record(),
             "configuration_artifact": self.harness.configuration_ref.to_record(),
             "native_tool": self.harness.native_tool,
             "passed": True,
+            "discovery_file": "input/discovery/native-discovery.json",
+            "findings_file": "input/discovery/findings.json",
         }
         discover_payload["selection"]["handoff_sha256"] = digest(discover_payload["selection"]["files"])
         discover = self.harness.predecessor("discover", discover_command, discover_payload)
@@ -957,17 +974,31 @@ class AdmissionProjectionTests(unittest.TestCase):
             },
             "actual_verifier_sha256": self.harness.spec.executors.verify,
             "capture_artifact": capture.result.output_artifact.to_record(),
+            "checks": [{"id": "fixture", "state": "passed", "passed": True}],
+            "closure_sha256": digest(
+                {
+                    "capture_artifact": capture.result.output_artifact.to_record(),
+                    "generate_artifact": generate.result.output_artifact.to_record(),
+                }
+            ),
             "config_snapshot_sha256": self.harness.spec.platform_config_sha256,
             "contract_sha256": self.harness.spec.contract_sha256,
             "decision": "PASS",
+            "diagnostics": [],
+            "evaluation_subject_sha256": digest({"evaluation": "fixture"}),
             "generate_artifact": generate.result.output_artifact.to_record(),
+            "generate_receipt_sha256": "f" * 64,
             "passed": True,
+            "pipeline_id": "solidworks-to-urdf",
             "policy_sha256": self.harness.spec.policy_sha256,
             "purpose": self.harness.spec.purpose,
+            "qualifications": [],
             "request": verify_request,
             "request_sha256": digest(verify_request),
+            "required_checks": ["fixture"],
             "schema_version": VERIFICATION_CERTIFICATE_SCHEMA,
             "subject_sha256": generate.result.output_artifact.set_sha256,
+            "subject_status": "bound",
         }
         certificate["verification_key"] = digest(certificate)
         certificate_bytes = canonical(certificate)
@@ -985,6 +1016,20 @@ class AdmissionProjectionTests(unittest.TestCase):
             self.harness._verified(verify.result.output_artifact),
             certificate_bytes,
         )
+        forged_proof = {
+            **{key: value for key, value in certificate.items() if key != "verification_key"},
+            "unexpected_projection_field": True,
+        }
+        forged_certificate = {
+            **forged_proof,
+            "verification_key": digest(forged_proof),
+        }
+        with self.assertRaises(ProtocolError):
+            VerifiedVerifyResult.from_artifact_bytes(
+                verify,
+                self.harness._verified(verify.result.output_artifact),
+                canonical(forged_certificate),
+            )
         with self.assertRaises(ProtocolError):
             VerifiedVerifyResult.from_artifact_bytes(
                 verify,

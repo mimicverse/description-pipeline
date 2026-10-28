@@ -1388,78 +1388,6 @@ def _state_owner_display_state(
     return owner_state
 
 
-def _target_face_keys(
-    target: object,
-    *,
-    component: str,
-    path: str,
-    all_faces: Sequence[tuple[int, int, int]],
-) -> set[tuple[int, int, int]]:
-    if not isinstance(target, Mapping):
-        raise _appearance_resolution_error(
-            component,
-            "cad_appearance_render_target_invalid",
-            path,
-            "a display-state appearance target is not an object",
-        )
-    scope = target.get("scope")
-    if scope == "occurrence":
-        return set(all_faces)
-    body_key = _face_key(
-        target.get("body_type"),
-        target.get("body_index"),
-        0,
-    )
-    if scope == "body" and body_key is not None:
-        return {
-            face
-            for face in all_faces
-            if face[:2] == body_key[:2]
-        }
-    if scope == "face":
-        face_key = _face_key(
-            target.get("body_type"),
-            target.get("body_index"),
-            target.get("face_index"),
-        )
-        if face_key is not None:
-            return {face_key} if face_key in all_faces else set()
-    if scope == "feature":
-        face_keys = target.get("face_keys")
-        if isinstance(face_keys, list):
-            result = set()
-            for index, raw_face in enumerate(face_keys):
-                if not isinstance(raw_face, Mapping):
-                    raise _appearance_resolution_error(
-                        component,
-                        "cad_appearance_render_target_invalid",
-                        f"{path}.face_keys[{index}]",
-                        "a feature appearance target has a malformed face key",
-                    )
-                face_key = _face_key(
-                    raw_face.get("body_type"),
-                    raw_face.get("body_index"),
-                    raw_face.get("face_index"),
-                )
-                if face_key is None:
-                    raise _appearance_resolution_error(
-                        component,
-                        "cad_appearance_render_target_invalid",
-                        f"{path}.face_keys[{index}]",
-                        "a feature appearance target has an invalid face key",
-                    )
-                if face_key in all_faces:
-                    result.add(face_key)
-            return result
-    raise _appearance_resolution_error(
-        component,
-        "cad_appearance_render_target_invalid",
-        path,
-        "a display-state appearance target has no exact delivered-face binding",
-        observed=dict(target),
-    )
-
-
 def resolve_deliverable_appearance(
     raw: object,
     *,
@@ -2560,7 +2488,12 @@ def bind_capture_appearance(
         else None
     )
     source_scopes = native_facts.get("source_scopes")
-    if not isinstance(occurrences, list) or not isinstance(source_scopes, Mapping):
+    geometry_raw = native_facts.get("geometry_raw")
+    if (
+        not isinstance(occurrences, list)
+        or not isinstance(source_scopes, Mapping)
+        or not isinstance(geometry_raw, Mapping)
+    ):
         raise _invalid_appearance(
             "",
             "cad_appearance_native_facts_invalid",
@@ -2598,6 +2531,7 @@ def bind_capture_appearance(
             "the sealed scene projection carries no component list",
         )
     projected_names: set[str] = set()
+    attached_occurrences: set[str] = set()
     for index, component in enumerate(raw_components):
         if not isinstance(component, dict):
             raise _invalid_appearance(
@@ -2624,15 +2558,37 @@ def bind_capture_appearance(
                 f"scene_raw.components[{index}]",
                 "a projected scene component has no native appearance occurrence",
             )
-        if "appearance_raw" in occurrence:
-            component["appearance_raw"] = copy.deepcopy(
-                occurrence.get("appearance_raw")
+        geometry = geometry_raw.get(name)
+        if not isinstance(geometry, Mapping):
+            raise _invalid_appearance(
+                name,
+                "cad_appearance_geometry_missing",
+                f"geometry_raw.{name}",
+                "a native occurrence has no sealed geometry appearance",
             )
-    attached_occurrences = {
-        name
-        for name, occurrence in by_occurrence.items()
-        if "appearance_raw" in occurrence
-    }
+        appearance = geometry.get("appearance_raw")
+        scope = source_scopes.get(name)
+        if appearance is None:
+            continue
+        if not isinstance(appearance, Mapping) or not isinstance(
+            scope,
+            Mapping,
+        ):
+            raise _invalid_appearance(
+                name,
+                "cad_appearance_native_facts_invalid",
+                f"geometry_raw.{name}.appearance_raw",
+                "a native occurrence has no sealed appearance or source scope",
+            )
+        component["appearance_raw"] = {
+            "component": name,
+            "source_document_path": scope.get("source_document_path"),
+            "referenced_configuration": scope.get(
+                "referenced_configuration"
+            ),
+            **copy.deepcopy(dict(appearance)),
+        }
+        attached_occurrences.add(name)
     if attached_occurrences and attached_occurrences != projected_names:
         raise _invalid_appearance(
             "",

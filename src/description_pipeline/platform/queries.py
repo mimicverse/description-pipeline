@@ -6,10 +6,10 @@ from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
 
+from ..stages import STAGE_IDS
 from ..artifacts import ArtifactStore
 from ..io import PipelineError
 from ..pipeline.contracts import (
-    STAGES,
     ArtifactRef,
     FailureEnvelope,
     RunAdmission,
@@ -20,7 +20,13 @@ from ..pipeline.contracts import (
     project_stage_status,
     qualify_stage,
 )
-from ..pipeline.effects import EffectFact, EffectIntent, EffectState, project_effect_state
+from ..pipeline.effects import (
+    EffectFact,
+    EffectIntent,
+    EffectResumePhase,
+    EffectState,
+    project_effect_state,
+)
 from ..pipeline.diagnostic import DIAGNOSTIC_ADMISSION_SCHEMA, DiagnosticAdmissionSpec
 from ..schemas import (
     DIAGNOSTIC_COMMAND_REQUEST_SCHEMA,
@@ -193,6 +199,10 @@ def _effect_fact(row: tuple) -> EffectFact:
         payload_artifact_id=row[8],
         payload_digest=row[9],
         observed_at=row[10],
+        metadata_artifact_id=row[11],
+        resume_phase=(
+            EffectResumePhase(row[12]) if row[12] is not None else None
+        ),
     )
 
 
@@ -462,7 +472,8 @@ def read_run_projection(
             """
             SELECT fact.fact_id, fact.effect_id, fact.seq, fact.claim_id,
                    fact.fence, fact.fact_type, fact.source, fact.state_class,
-                   fact.payload_artifact_id, fact.payload_digest, fact.observed_at
+                   fact.payload_artifact_id, fact.payload_digest, fact.observed_at,
+                   fact.metadata_artifact_id, fact.resume_phase
             FROM effect_fact AS fact
             JOIN effect_intent AS effect
               ON effect.effect_id = fact.effect_id
@@ -552,7 +563,7 @@ def read_run_projection(
                 claim["fence"],
                 claim["yield_effect_id"],
             )
-    for stage in STAGES:
+    for stage in STAGE_IDS:
         command = next(
             (
                 command
@@ -621,7 +632,7 @@ def read_run_projection(
         pending_effect_states = tuple(
             "unknown" for _effect_id in pending_effects
         )
-        stage_index = STAGES.index(stage)
+        stage_index = STAGE_IDS.index(stage)
         predecessor_completed = (
             stage_index == 0
             or diagnostic_target == stage
@@ -726,7 +737,7 @@ def render_stage_summary(projection: Mapping[str, Any]) -> list[dict[str, Any]]:
     return [
         {
             "stage": row["stage"],
-            "state": row["decision"]["outcome"] if row.get("decision") else "waiting",
+            "state": row.get("state") or "waiting",
             "command_id": row["decision"]["command_id"]
             if row.get("decision")
             else (row.get("command") or {}).get("command_id"),

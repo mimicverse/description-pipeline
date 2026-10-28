@@ -6,7 +6,17 @@ from pathlib import Path
 
 from ..io import PipelineError, confined, inventory, read_data, write_json
 
-SCHEMA = "solidworks-to-urdf.source/v1"
+SCHEMA = "solidworks-to-urdf.source/v2"
+MANIFEST_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "identity",
+        "evidence_class",
+        "scene",
+        "files",
+    }
+)
 
 
 def write_manifest(root: Path, *, kind: str, identity: dict, evidence_class: str) -> dict:
@@ -14,7 +24,7 @@ def write_manifest(root: Path, *, kind: str, identity: dict, evidence_class: str
         raise PipelineError(f"Unknown evidence class: {evidence_class}")
     if not kind or not identity:
         raise PipelineError("Snapshot requires source kind and identity")
-    scene = "raw/scene_raw.json" if kind == "solidworks" else "scene.json"
+    scene = "raw/native_capture_facts.json" if kind == "solidworks" else "scene.json"
     confined(root, scene)
     manifest = {
         "schema_version": SCHEMA,
@@ -32,6 +42,8 @@ def verify_snapshot(root: Path) -> dict:
     manifest = read_data(confined(root, "manifest.json"))
     if not isinstance(manifest, dict) or manifest.get("schema_version") != SCHEMA:
         raise PipelineError("Unsupported source manifest schema")
+    if set(manifest) != MANIFEST_KEYS:
+        raise PipelineError("Source manifest fields are incomplete or unknown")
     if manifest.get("evidence_class") not in {"cad", "fixture", "imported"}:
         raise PipelineError("Snapshot evidence class is missing or invalid")
     if manifest.get("evidence_class") == "cad" and manifest.get("kind") != "solidworks":
@@ -49,23 +61,12 @@ def verify_snapshot(root: Path) -> dict:
             set(actual) ^ set(declared) | {key for key in actual.keys() & declared if actual[key] != declared[key]}
         )
         raise PipelineError(f"Source snapshot is incomplete or changed: {changed}")
-    if manifest.get("scene") not in declared:
+    scene = manifest.get("scene")
+    if not isinstance(scene, str) or not scene or scene not in declared:
         raise PipelineError("Source scene is not bound by manifest")
     if manifest.get("kind") == "solidworks" and (
-        manifest.get("scene") != "raw/scene_raw.json"
+        manifest.get("scene") != "raw/native_capture_facts.json"
         or "scene.json" in declared
     ):
         raise PipelineError("SolidWorks snapshots must bind the raw readings only")
     return manifest
-
-
-def load_scene(root: Path) -> dict:
-    manifest = verify_snapshot(root)
-    if manifest["kind"] == "solidworks":
-        from .solidworks.captured import derive_engineering_input
-
-        return derive_engineering_input(root, manifest)
-    scene = read_data(confined(root, manifest["scene"]))
-    if not isinstance(scene, dict):
-        raise PipelineError("Source scene must be an object")
-    return scene

@@ -44,6 +44,10 @@ from ..sources.solidworks.evidence import (
     RUNTIME_EVIDENCE,
     metadata_value_warnings,
 )
+from ..sources.solidworks.saved_state import (
+    SAVED_STATE_WARNING_CODE,
+    warning_from_capture,
+)
 from ..sources.snapshot import verify_snapshot
 from ..interface_records import (
     CHECK_POLICY_V1,
@@ -229,7 +233,9 @@ def require_qualified_report(report, definition, root=None):
             and len(executed) == len(expected)
             and set(executed) == set(expected)
             and required_rows_complete(expected, rows),
-            "URDF verification failed or required checks were not executed; see reports/quality.json",
+            "URDF verification failed or required checks were not executed; "
+            "see reports/verification-certificate.json and "
+            "reports/verification-execution.json",
         )
         qualifications = report.get("qualifications")
         facts = qualification_facts(definition)
@@ -292,13 +298,14 @@ def _input(root, diagnostics=None):
         )
         carrier = declarations["carrier"]
         bodies, joints = carrier["bodies"], carrier["joints"]
+        discovery_name = "input/discovery/native-discovery.json"
         declaration_evidence = {
             "kind": "native_declaration",
-            "file": "evidence/discovery.json",
-            "sha256": file_digest(root / "evidence/discovery.json"),
+            "file": discovery_name,
+            "sha256": file_digest(root / discovery_name),
             "anchor": raw["exporter"]["raw_xml_sha256"],
             "key": "raw.exporter.raw_xml",
-            "reference": "evidence/discovery.json#raw.exporter.raw_xml",
+            "reference": f"{discovery_name}#raw.exporter.raw_xml",
         }
         for joint in joints:
             raw_limits = joint.get("declared_limits")
@@ -368,8 +375,15 @@ def _input(root, diagnostics=None):
         "Handoff and source record disagree on the configuration",
     )
     raw_identity = (discovery_record.get("raw") or {}).get("identity") or {}
+    generated_identity = (
+        discovery_record.get("identity")
+        if isinstance(discovery_record.get("identity"), dict)
+        else {}
+    )
     robot_name = (
         raw_identity.get("robot_name")
+        or generated_identity.get("robot_name")
+        or generated_identity.get("robot_name_technical")
         or discovery_record.get("robot_name")
         or discovery_record.get("robot_name_technical")
     )
@@ -401,7 +415,7 @@ def _input(root, diagnostics=None):
 
         value = _record_value(
             Path(root),
-            {"package_file": budget_entry.get("package_file"), "sha256": budget_entry.get("sha256")},
+            budget_entry,
             str(budget_entry.get("key") or ""),
         )
         _require(isinstance(value, dict), "Discovery record budget entry is not an object")
@@ -417,6 +431,7 @@ def _input(root, diagnostics=None):
             "bodies": bodies,
             "joints": joints,
             "carrier": carrier_snapshot,
+            "saved_state_selection": raw.get("source_selection"),
             "frames": frames,
         },
         "checks": checks,
@@ -574,27 +589,15 @@ def _native(root, manifest):
         manifest["kind"] == "solidworks" and manifest["evidence_class"] == "cad",
         "A release requires native SolidWorks evidence",
     )
-    collection = evidence.collection(root)
-    _require(collection.get("identity") == manifest["identity"], "Collection and archived source identities differ")
     environment = evidence.runtime(root)
     _require(isinstance(environment, dict), "Capture environment is unavailable")
-    _require(environment == collection.get("environment"), "Environment evidence differs")
     revision = str(environment["solidworks"]["revision"])
     _require(revision.split(".")[0] == "34", "Native inertia API qualification currently covers SolidWorks 34 only")
-    _require((collection.get("limits") or {}).get("native_cad") is True, "Native capture was not recorded")
     return {
         "solidworks_revision": revision,
         "configuration": manifest["identity"]["configuration"],
     }
 
-
-
-def _same_native_path(left, right) -> bool:
-    return bool(
-        isinstance(left, str)
-        and isinstance(right, str)
-        and ntpath.normcase(ntpath.abspath(left)) == ntpath.normcase(ntpath.abspath(right))
-    )
 
 
 def _native_discovery(package, diagnostics=None):
@@ -662,15 +665,17 @@ def _dependencies(root, definition):
     _require(closure["configuration"] == definition["source"]["configuration"], "Captured another configuration")
     original = closure["original_files"]
     _require(bool(original) and bool(closure["mapping"]), "Missing dependency mapping")
-    actual = {"source/" + name: checksum for name, checksum in inventory(root / "evidence/source").items()}
-    _require(actual == closure["copy_files"], "Collected CAD changed")
-    # The frozen tree carries the dependency-closure copies under
-    # ``evidence/source``; the discovery inventory binds the frozen originals
-    # under ``input/cad``.
+    actual = {
+        "source/" + name: checksum
+        for name, checksum in inventory(root / "input/cad").items()
+    }
+    _require(actual == closure["copy_files"], "Archived CAD changed")
+    # The retained package originals under ``input/cad`` are the sole CAD byte
+    # authority. The dependency-closure ``source/`` prefix records the
+    # prepared-copy namespace used during Capture; it is not a second tree.
     _handoff_native_hashes(root)
-    # Every retained source is copied byte-for-byte from the sealed prepared
-    # inventory.  Original identity and copy identity are both checked against
-    # the same upload index below.
+    # Original identity and prepared-copy identity are both checked against the
+    # same upload index below.
     handoff = evidence.handoff(root)
     package_files = handoff.get("package_files")
     _require(isinstance(package_files, dict) and bool(package_files), "The frozen upload index is missing")
@@ -755,9 +760,12 @@ def _handoff_native_hashes(root: Path) -> set[str]:
     """
 
     payload = evidence.discovery(root)
-    native = payload.get("files") if isinstance(payload, dict) else None
-    _require(isinstance(native, list) and bool(native), "The archived native file inventory is missing")
-    frozen = {str(row["path"]): str(row["sha256"]) for row in native}
+    native = payload.get("native_files") if isinstance(payload, dict) else None
+    _require(
+        isinstance(native, dict) and bool(native),
+        "The archived native file inventory is missing",
+    )
+    frozen = {str(path): str(checksum) for path, checksum in native.items()}
     for relative, checksum in sorted(frozen.items()):
         path = confined(root / "input/cad", relative)
         _require(path.is_file(), f"A frozen native file is missing from the archived input: {relative}")
@@ -766,7 +774,7 @@ def _handoff_native_hashes(root: Path) -> set[str]:
             f"A frozen native file differs from its recorded bytes: {relative}",
         )
     _require(
-        digest(native) == payload.get("native_inventory_sha256"),
+        digest(native) == payload.get("handoff_sha256"),
         "The native inventory digest does not match the discovery record",
     )
     raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
@@ -1543,12 +1551,12 @@ def _geometry(root, body, node, model_link, geometry, components, body_pose, urd
             type(row.get("triangles")) is int and row["triangles"] > 0,
             "Geometry receipt carries no triangle count",
         )
-        original = confined(root / "evidence", row["path"])
+        source_bytes = row.get("source_bytes")
         _require(
-            file_digest(original) == row["sha"],
+            isinstance(source_bytes, bytes)
+            and hashlib.sha256(source_bytes).hexdigest() == row["sha"],
             "Source mesh identity differs",
         )
-        source_bytes = original.read_bytes()
         stats = stl.read_bytes(source_bytes)
         _require(
             stats.binary and stats.triangles == row["triangles"],
@@ -1928,7 +1936,7 @@ def evaluate_bundle(
         from .native_mesh_observations import verify_native_mesh_observations
 
         def _verify_native_tessellation():
-            native_details = verify_native_mesh_observations(root)
+            native_details = verify_native_mesh_observations(root, model)
             projected = native_gate_warning_diagnostics(native_details)
             diagnostics.extend(projected)
             return native_details
@@ -1956,12 +1964,28 @@ def evaluate_bundle(
     if model is not None:
         for warning in (model.get("provenance") or {}).get("value_warnings") or []:
             if isinstance(warning, dict) and warning.get("code"):
+                warning_detail = warning.get("detail")
+                warning_objects = warning.get("objects") or []
                 diagnostics.append(
                     {
                         "code": str(warning["code"]),
                         "blocking": False,
+                        "severity": str(warning.get("severity") or "warning"),
+                        "object": next(
+                            (
+                                str(item.get("object"))
+                                for item in warning_objects
+                                if isinstance(item, dict) and item.get("object")
+                            ),
+                            None,
+                        ),
                         "message": str(warning.get("message") or "non-native derived value"),
-                        "detail": {"objects": warning.get("objects") or []},
+                        "objects": warning_objects,
+                        "detail": (
+                            warning_detail
+                            if isinstance(warning_detail, dict)
+                            else {"objects": warning_objects}
+                        ),
                     }
                 )
     required = required_checks(definition)
@@ -2165,19 +2189,12 @@ def _verify_model(
     require_native_receipts=False,
 ):
     from .solidworks_physics import verify_physics
-    from ..sources.solidworks.appearance import bind_capture_appearance
-
     source = definition["source"]
     carrier = source.get("carrier")
     native_geometry_rows = evidence.geometry(root)
     source_manifest = verify_snapshot(root / "evidence")
     native_appearance = source_manifest.get("evidence_class") != "fixture"
     if "raw/native_capture_facts.json" in (source_manifest.get("files") or {}):
-        raw, native_geometry_rows = bind_capture_appearance(
-            raw,
-            native_geometry_rows,
-            evidence.native_capture_facts(root),
-        )
         from .native_appearance import verify_native_appearance
 
         gates.add(
@@ -2477,6 +2494,36 @@ def _value_warning_gate(
     mesh_namespace = asset_namespace(Path(str(source.get("assembly") or "robot")).name)
     warnings = (model.get("provenance") or {}).get("value_warnings")
     _require(isinstance(warnings, list), "Non-native value provenance warnings are missing")
+    saved_state_selection = source.get("saved_state_selection")
+    if saved_state_selection is None:
+        saved_state_warning = None
+    else:
+        runtime = evidence.runtime(root)
+        prepared_capture = runtime.get("prepared_capture") if isinstance(runtime, dict) else None
+        captured_open = (
+            prepared_capture.get("opened")
+            if isinstance(prepared_capture, dict)
+            else None
+        )
+        saved_state_warning = warning_from_capture(
+            saved_state_selection,
+            captured_open,
+        )
+    actual_saved_state = [
+        item
+        for item in warnings
+        if isinstance(item, dict) and item.get("code") == SAVED_STATE_WARNING_CODE
+    ]
+    if saved_state_warning is None:
+        _require(
+            not actual_saved_state,
+            "A clean saved-state export carries an unexpected source-integrity warning",
+        )
+    else:
+        _require(
+            actual_saved_state == [saved_state_warning],
+            "Saved-state source warning is missing, duplicated, or differs from native evidence",
+        )
     actual: dict[str, list[dict]] = {}
     actual_messages: dict[str, list[str]] = {}
     for item in warnings:
@@ -2602,6 +2649,9 @@ def _value_warning_gate(
         )
         for object_row in warning["objects"]:
             add(warning["code"], object_row)
+    if saved_state_warning is not None:
+        for object_row in saved_state_warning["objects"]:
+            add(saved_state_warning["code"], object_row)
 
     for body in bodies:
         source_name = str(body.get("source_name") or body["name"])
@@ -2955,8 +3005,18 @@ def _value_warning_gate(
                 and native_row.get("sha") == shape.get("sha256"),
                 "Visual mesh identity differs from the raw geometry evidence",
             )
-        current_sha256 = file_digest(confined(root / "evidence", str(shape.get("filename") or "")))
-        _require(shape.get("sha256") == current_sha256, "Visual digest differs from capture evidence")
+            current_sha256 = str(native_row["sha"])
+        else:
+            current_sha256 = file_digest(
+                confined(
+                    root / "evidence",
+                    str(shape.get("filename") or ""),
+                )
+            )
+            _require(
+                shape.get("sha256") == current_sha256,
+                "Visual digest differs from capture evidence",
+            )
         if shape.get("rgba") is not None:
             _require(
                 provenance.get("material_source") == "native_appearance",
@@ -3201,6 +3261,11 @@ def _value_warning_gate(
         ),
         "units.si_conversion": "Delivered values use SI units after conversion from native CAD units.",
         METADATA_WARNING_CODE: METADATA_WARNING_MESSAGE,
+        **(
+            {SAVED_STATE_WARNING_CODE: saved_state_warning["message"]}
+            if saved_state_warning is not None
+            else {}
+        ),
     }
     _require(
         set(actual) == set(expected),
@@ -3293,28 +3358,3 @@ def _expectation_bounds(bounds):
     )
     _require(0 <= bounds[0] < bounds[1], "Design bounds must be nonnegative and strictly ordered")
     return list(bounds)
-
-
-def check_bundle(
-    root: Path,
-    *,
-    native_receipts=None,
-    require_native_receipts: bool = False,
-) -> dict:
-    """Recompute all gates and require an exact binding to the saved report."""
-    report = evaluate_bundle(
-        root,
-        native_receipts=native_receipts,
-        require_native_receipts=require_native_receipts,
-    )
-    try:
-        saved = read_data(confined(Path(root), "reports/quality.json"))
-        # The quality report is a JSON document: bind in the JSON data model so a
-        # recomputed tuple cannot make every saved report differ from itself.
-        _require(saved == json.loads(json.dumps(report)), "Saved quality report differs from recomputation")
-    except (OSError, ValueError) as error:
-        report["checks"].append(
-            {"id": "report.binding", "state": "failed", "passed": False, "details": {"error": str(error)}}
-        )
-        report["passed"] = False
-    return report

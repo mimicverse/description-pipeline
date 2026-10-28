@@ -27,29 +27,19 @@ decisive samples that disagree, or too few decisive samples refuse the whole
 capture: fail closed, never a default family, never a majority vote
 (2026-10-15 design review points 1-2).
 
-``normalize_capture_inertia`` is called once per capture, at the single point
-where the native raw evidence is finalized (``freeze._seal_inertia_convention``).
-A standard capture is kept byte-identical; a positive capture has the products
-of inertia of every recorded tensor negated exactly once (all capture
-documents, see ``_FLIPPERS``), and the sealed evidence gains
-``raw/inertia_convention.json`` with the per-sample residuals, votes, counts,
-and the applied transform.  The transform is its own inverse: negating the
-products again restores the raw bytes, so the record is reversible and
-auditable.
+The family decision is consumed by the in-memory Generate projection. Raw
+Capture evidence remains byte-identical for both families.
 """
 
 from __future__ import annotations
 
 import math
 from typing import Any
-from collections.abc import Callable
 
 from .errors import BridgeError, EXIT_CAD
 
 STANDARD = "solidworks_standard"
 POSITIVE = "solidworks_positive"
-
-SCHEMA = "solidworks-to-urdf.inertia-convention/v1"
 
 #: The winning family must fit within this fraction of the tensor scale.
 #: Measured winning residuals are ~4e-19 on ~1e-2 tensors (relative ~1e-16);
@@ -75,8 +65,6 @@ MIN_DECISIVE_SAMPLES = 2
 MIN_DECISIVE_LINKS = 1
 
 _OFF_DIAGONAL = ((0, 1), (0, 2), (1, 2))
-#: Row-major flat positions of the off-diagonal entries in a 9-value tensor.
-_FLAT_OFF_DIAGONAL = (1, 2, 3, 5, 6, 7)
 
 
 def _finite(value: Any) -> bool:
@@ -114,8 +102,52 @@ def dual_read_sample(read: dict, where: str) -> dict | None:
     if not isinstance(read, dict):
         raise _refuse("inertia_convention_malformed", f"{where}: the link read is not an object")
     origin = read.get("inertia_values_about_origin_api")
-    if origin is None or isinstance(origin, dict):
+    read_errors = read.get("read_errors")
+    if read_errors is not None and not isinstance(read_errors, dict):
+        raise _refuse(
+            "inertia_convention_malformed",
+            f"{where}: the link read has no error map",
+            {"where": where},
+        )
+    recorded_origin_error = (
+        read_errors.get("inertia_values_about_origin_api")
+        if isinstance(read_errors, dict)
+        else None
+    )
+    if isinstance(origin, dict):
+        if (
+            not isinstance(origin.get("code"), str)
+            or not origin["code"].strip()
+        ):
+            raise _refuse(
+                "inertia_convention_malformed",
+                f"{where}: inertia_values_about_origin_api error is malformed",
+                {"where": where},
+            )
+        if (
+            isinstance(read_errors, dict)
+            and recorded_origin_error != origin
+        ):
+            raise _refuse(
+                "inertia_convention_malformed",
+                f"{where}: origin error differs from its read-error entry",
+                {"where": where},
+            )
         return None
+    if origin is None:
+        if recorded_origin_error is not None:
+            raise _refuse(
+                "inertia_convention_malformed",
+                f"{where}: origin error has no matching origin value",
+                {"where": where},
+            )
+        return None
+    if recorded_origin_error is not None:
+        raise _refuse(
+            "inertia_convention_malformed",
+            f"{where}: origin error conflicts with a recorded tensor",
+            {"where": where},
+        )
     if (
         not isinstance(origin, list)
         or len(origin) != 9
@@ -253,177 +285,4 @@ def detect_family(link_record: dict) -> dict:
         "missing_origin_read": missing,
         "decisive": len(decisive),
         "decisive_links": decisive_links,
-    }
-
-
-def _negate_matrix(tensor: Any) -> None:
-    if (
-        isinstance(tensor, list)
-        and len(tensor) == 3
-        and all(isinstance(row, list) and len(row) == 3 for row in tensor)
-    ):
-        for row, column in _OFF_DIAGONAL:
-            tensor[row][column] = -tensor[row][column]
-            tensor[column][row] = -tensor[column][row]
-
-
-def _negate_flat(tensor: Any) -> None:
-    if isinstance(tensor, list) and len(tensor) == 9:
-        for index in _FLAT_OFF_DIAGONAL:
-            tensor[index] = -tensor[index]
-
-
-def _flip_measurement(block: Any) -> None:
-    if isinstance(block, dict):
-        _negate_matrix(block.get("inertia_kg_m2"))
-
-
-def _flip_reading(reading: Any) -> None:
-    if not isinstance(reading, dict):
-        return
-    _negate_matrix(reading.get("inertia"))
-    _flip_measurement(reading.get("part_measurement"))
-
-
-def _flip_reading_map(readings: Any) -> None:
-    if isinstance(readings, dict):
-        for reading in readings.values():
-            _flip_reading(reading)
-
-
-def _flip_mass_properties(document: dict) -> None:
-    for payload in document.values():
-        if isinstance(payload, dict):
-            _negate_matrix(payload.get("inertia"))
-
-
-def _flip_scene_raw(document: dict) -> None:
-    _flip_mass_properties(document.get("mass_properties") or {})
-    notes = document.get("notes")
-    if isinstance(notes, dict):
-        _flip_reading_map(notes.get("effective_instances"))
-
-
-def _flip_effective_instances(document: dict) -> None:
-    _flip_reading_map(document.get("readings"))
-    warnings = document.get("warnings")
-    if isinstance(warnings, list):
-        for warning in warnings:
-            if isinstance(warning, dict):
-                _flip_measurement(warning.get("measurement"))
-                _flip_measurement(warning.get("part_measurement"))
-
-
-def _flip_mass_closure(document: dict) -> None:
-    top = document.get("top_level")
-    if isinstance(top, dict):
-        _negate_matrix(top.get("inertia"))
-    context = document.get("component_context")
-    instances = context.get("instances") if isinstance(context, dict) else None
-    if isinstance(instances, list):
-        for row in instances:
-            if isinstance(row, dict):
-                _flip_reading(row.get("effective"))
-
-
-def _flip_material_provenance(document: dict) -> None:
-    warnings = document.get("warnings")
-    if isinstance(warnings, list):
-        for warning in warnings:
-            if isinstance(warning, dict):
-                measured = warning.get("measured")
-                if isinstance(measured, dict):
-                    _negate_matrix(measured.get("inertia_kg_m2"))
-
-
-def _flip_link_group(document: dict) -> None:
-    links = document.get("links")
-    if not isinstance(links, dict):
-        return
-    for entry in links.values():
-        reads = entry.get("reads") if isinstance(entry, dict) else None
-        if not isinstance(reads, list):
-            continue
-        for read in reads:
-            if isinstance(read, dict):
-                _negate_matrix(read.get("inertia_tensor_about_com"))
-                _negate_flat(read.get("inertia_values_about_origin_api"))
-
-
-#: The complete tensor coverage of one capture: every raw native document that
-#: records an inertia tensor, keyed by the file name in ``raw/``.  This registry
-#: is the one place a new tensor recording must be added; the coverage is pinned
-#: by ``tests/sources/test_solidworks_inertia_convention.py`` walking a real
-#: capture's raw set.
-_FLIPPERS: dict[str, Callable[[dict], None]] = {
-    "mass_properties.json": _flip_mass_properties,
-    "scene_raw.json": _flip_scene_raw,
-    "effective_instances.json": _flip_effective_instances,
-    "mass_closure.json": _flip_mass_closure,
-    "material_provenance.json": _flip_material_provenance,
-    "link_group_mass_properties.json": _flip_link_group,
-}
-
-
-def normalize_capture_inertia(documents: dict[str, Any]) -> dict:
-    """Detect, normalize once, and return the sealed convention record.
-
-    ``documents`` maps each raw evidence file name to its parsed document and
-    is mutated in place: a positive-products capture has every recorded tensor's
-    products negated exactly once (standard captures are untouched).  The
-    returned record is written to ``raw/inertia_convention.json`` by the caller.
-    """
-
-    link_record = documents.get("link_group_mass_properties.json")
-    if not isinstance(link_record, dict):
-        raise _refuse(
-            "inertia_convention_unverified",
-            "the capture carries no link-group mass record to prove the product convention",
-        )
-    decision = detect_family(link_record)
-    applied = decision["family"] == POSITIVE
-    if applied:
-        for name, flipper in _FLIPPERS.items():
-            document = documents.get(name)
-            if isinstance(document, dict):
-                flipper(document)
-        # The flip is an involution: the normalized record must now prove the
-        # standard family, or the capture is refused instead of sealed.
-        recheck = detect_family(link_record)
-        if recheck["family"] != STANDARD:
-            raise _refuse(
-                "inertia_convention_normalization_failed",
-                "the normalized capture does not prove the standard product convention",
-                {"detected_after_normalization": recheck["family"]},
-            )
-    return {
-        "schema_version": SCHEMA,
-        "detected": decision["family"],
-        "capture_transform": {
-            "applied": applied,
-            "operation": "negate_products_of_inertia" if applied else None,
-            "target_convention": STANDARD,
-            "reversible": True,
-            "note": (
-                "negating the off-diagonal entries of every recorded tensor again restores the "
-                "raw capture bytes"
-            ),
-        },
-        "thresholds": {
-            "match_rtol": MATCH_RTOL,
-            "noise_rtol": NOISE_RTOL,
-            "signal_rtol": SIGNAL_RTOL,
-            "separation_min": SEPARATION_MIN,
-            "min_decisive_samples": MIN_DECISIVE_SAMPLES,
-            "min_decisive_links": MIN_DECISIVE_LINKS,
-        },
-        "samples": {
-            "readings": decision["readings"],
-            "usable": decision["usable"],
-            "decisive": decision["decisive"],
-            "undecidable": decision["usable"] - decision["decisive"],
-            "missing_origin_read": decision["missing_origin_read"],
-            "decisive_links": decision["decisive_links"],
-        },
-        "links": decision["samples"],
     }

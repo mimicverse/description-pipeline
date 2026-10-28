@@ -950,7 +950,6 @@ class NativeOperationExecutor(Protocol):
 class DiscoverOperationExecutor:
     """The production Discover operation over the existing native core."""
 
-    selection_reader_factory: Callable | None = None
     backend_factory: Callable | None = None
     cad_ownership_file: Path | None = None
     on_activity: Callable | None = None
@@ -969,7 +968,6 @@ class DiscoverOperationExecutor:
                 native_request,
                 workspace / "discover",
                 native_tool=native_tool,
-                selection_reader_factory=self.selection_reader_factory,
                 backend_factory=self.backend_factory,
                 cad_ownership_file=self.cad_ownership_file,
                 on_activity=self.on_activity,
@@ -1069,11 +1067,12 @@ class CaptureOperationExecutor:
 
             transaction = _capture_native_transaction
         output = workspace / "capture-output"
-        backend = (
-            self.backend_factory(staged.stage)
-            if self.backend_factory is not None
-            else None
-        )
+        if self.backend_factory is None:
+            from ..sources.solidworks.native import SolidWorksBackend
+
+            backend = SolidWorksBackend()
+        else:
+            backend = self.backend_factory(staged.stage)
         try:
             result = dict(
                 transaction(
@@ -2396,7 +2395,6 @@ class NativeOperationRuntime:
         if not self._stopping:
             self._stopping = True
             self._queue.put(None)
-        self._queue.join()
         self._thread.join(timeout=30)
         if self._thread.is_alive():
             raise NativeOperationUnresolved(

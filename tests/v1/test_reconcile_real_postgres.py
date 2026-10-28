@@ -341,6 +341,13 @@ class CanonicalReconcileRealPostgresTests(unittest.TestCase):
             adapter=_KnownEffectAdapter(),
         )
         self.assertEqual(reconciled.settlement.state, EffectState.SATISFIED)
+        projection = self._portal_projection()
+        projected_effect = next(
+            effect
+            for effect in projection["technical"]["effects"]
+            if effect["effect_id"] == effect_id
+        )
+        self.assertEqual(projected_effect["state"], "satisfied")
         claim = self._query(
             """
             SELECT claim_id, fence, owner_sha256, executor_sha256,

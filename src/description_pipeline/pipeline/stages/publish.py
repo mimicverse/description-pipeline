@@ -62,9 +62,11 @@ from ..publish_contract import PUBLISH_OUTPUT_CONTRACT, REPOSITORY_SNAPSHOT_KIND
 from ..reconciliation import EffectReconciliationEvidence
 from ..verify import current_verifier_sha256
 from ..verify_contract import (
+    CERTIFICATE_FIELDS,
     CERTIFICATE_FILENAME as VERIFY_CERTIFICATE,
     EXECUTION_RECEIPT_FILENAME as VERIFY_EXECUTION,
     VERIFY_ARTIFACT_KIND,
+    validate_certificate_diagnostics,
 )
 
 PUBLISH_RECEIPT_SCHEMA = PUBLICATION_RECEIPT_SCHEMA
@@ -387,32 +389,7 @@ def _certificate(
     certificate = _require_object(read_data(certificate_path), "verification certificate")
     if raw != canonical(certificate):
         raise PipelineError("Verification certificate is not canonically encoded")
-    required = {
-        "actual_verifier",
-        "actual_verifier_sha256",
-        "capture_artifact",
-        "checks",
-        "closure_sha256",
-        "config_snapshot_sha256",
-        "contract_sha256",
-        "decision",
-        "diagnostics",
-        "evaluation_subject_sha256",
-        "generate_artifact",
-        "generate_receipt_sha256",
-        "passed",
-        "pipeline_id",
-        "policy_sha256",
-        "purpose",
-        "qualifications",
-        "request",
-        "request_sha256",
-        "required_checks",
-        "schema_version",
-        "subject_sha256",
-        "subject_status",
-        "verification_key",
-    }
+    required = CERTIFICATE_FIELDS
     if set(certificate) != required:
         raise PipelineError("Verification certificate fields are incomplete or unknown")
     proof = dict(certificate)
@@ -428,6 +405,7 @@ def _certificate(
         raise PipelineError("Verification certificate verifier identity differs")
     if certificate["decision"] != "PASS" or certificate["passed"] is not True:
         raise PipelineError("Publish requires a passing verification certificate")
+    validate_certificate_diagnostics(certificate)
     checks = certificate["checks"]
     required_checks = certificate["required_checks"]
     if (
@@ -479,8 +457,6 @@ def _certificate(
         "command_id",
         "fence",
         "finished_at",
-        "raw_checks",
-        "raw_diagnostics",
         "request",
         "request_sha256",
         "run_id",
@@ -488,6 +464,7 @@ def _certificate(
         "stage",
         "started_at",
         "execution_id",
+        "execution_details",
     }
     if (
         set(execution) != required_execution
@@ -501,6 +478,58 @@ def _certificate(
     ):
         raise PipelineError("Verification execution receipt differs from its certificate")
     return certificate, execution
+
+
+def _publication_warning_text(certificate: Mapping[str, Any]) -> str:
+    """Render every recorded warning without dropping its source or qualification."""
+
+    validate_certificate_diagnostics(certificate)
+    warnings = [
+        item for item in certificate.get("diagnostics") or []
+        if item.get("blocking") is False
+    ]
+    if not warnings:
+        return ""
+    lines = ["", f"Verification warnings ({len(warnings)} recorded):"]
+    shown = 0
+    remaining = 48000
+    for item in warnings:
+        evidence = {key: value for key, value in item.items() if key not in {"code", "message"}}
+        block = (
+            f"- `{item['code']}`: {item.get('message') or ''}\n\n```json\n"
+            + json.dumps(evidence, ensure_ascii=True, sort_keys=True, indent=2)
+            + "\n```"
+        )
+        if len(block) > remaining:
+            break
+        lines.append(block)
+        remaining -= len(block) + 1
+        shown += 1
+    if shown < len(warnings):
+        lines.append(
+            f"{len(warnings) - shown} additional warning records are preserved in the certificate; "
+            "this PR summary is abbreviated."
+        )
+    lines.append("See `reports/verification-certificate.json` for the complete verified evidence.")
+    return "\n".join(lines)
+
+
+def _publication_text(
+    request: PublishDomainRequest,
+    *,
+    certificate: Mapping[str, Any],
+    certificate_sha256: str,
+    subject_sha256: str,
+) -> tuple[str, str]:
+    body = (
+        request.commit.body.rstrip()
+        + _publication_warning_text(certificate)
+        + "\n\n"
+        + f"Verification-Certificate-SHA256: {certificate_sha256}\n"
+        + f"Publication-Subject-SHA256: {subject_sha256}\n"
+        + f"Repository: {request.repository_slug}\n"
+    )
+    return request.commit.subject, body
 
 
 def _publication_root(
@@ -528,13 +557,11 @@ def _publication_root(
         policy={"schema_version": CHECK_POLICY_SCHEMA, "digest": command.policy_sha256},
     )
     subject = subject_digest(destination)
-    title = request.commit.subject
-    body = (
-        request.commit.body.rstrip()
-        + "\n\n"
-        + f"Verification-Certificate-SHA256: {file_digest(verify_root / VERIFY_CERTIFICATE)}\n"
-        + f"Publication-Subject-SHA256: {subject}\n"
-        + f"Repository: {request.repository_slug}\n"
+    title, body = _publication_text(
+        request,
+        certificate=_require_object(read_data(verify_root / VERIFY_CERTIFICATE), "verification certificate"),
+        certificate_sha256=file_digest(verify_root / VERIFY_CERTIFICATE),
+        subject_sha256=subject,
     )
     return destination, subject, title, body
 
@@ -636,18 +663,6 @@ class _SealedGit:
     body: str
 
 
-def _recovery_text(request: PublishDomainRequest, plan: dict[str, Any]) -> tuple[str, str]:
-    title = request.commit.subject
-    body = (
-        request.commit.body.rstrip()
-        + "\n\n"
-        + f"Verification-Certificate-SHA256: {plan['verification_certificate_sha256']}\n"
-        + f"Publication-Subject-SHA256: {plan['publication_subject_sha256']}\n"
-        + f"Repository: {request.repository_slug}\n"
-    )
-    return title, body
-
-
 def _read_sealed_git_outbound_root(
     *,
     repository: PublicationRepository,
@@ -726,16 +741,31 @@ def _read_sealed_git_outbound_root(
     if outbound_request != expected_outbound:
         raise PublicationError("publish.git_recovery_request")
 
-    title, body = _recovery_text(request, plan)
-    if plan["pr_title_sha256"] != digest({"title": title}) or plan["pr_body_sha256"] != digest({"body": body}):
-        raise PublicationError("publish.git_recovery_pr_text")
-
     repository.verify_candidate_bundle(
         outbound_root / "candidate.bundle",
         commit=commit,
         tree=tree,
         parents=tuple(parents),
     )
+    certificate_raw = repository.read_blob(commit=commit, path=f"reports/{VERIFY_CERTIFICATE}")
+    try:
+        certificate = json.loads(certificate_raw)
+    except ValueError as error:
+        raise PublicationError("publish.git_recovery_certificate") from error
+    if (
+        not isinstance(certificate, dict)
+        or certificate_raw != canonical(certificate)
+        or digest(certificate) != plan["verification_certificate_sha256"]
+    ):
+        raise PublicationError("publish.git_recovery_certificate")
+    title, body = _publication_text(
+        request,
+        certificate=certificate,
+        certificate_sha256=plan["verification_certificate_sha256"],
+        subject_sha256=subject,
+    )
+    if plan["pr_title_sha256"] != digest({"title": title}) or plan["pr_body_sha256"] != digest({"body": body}):
+        raise PublicationError("publish.git_recovery_pr_text")
     return _SealedGit(
         outbound_root=Path(outbound_root),
         candidate=_PublishedCandidate(
@@ -2216,7 +2246,6 @@ class PublishHandler:
             pr_body = sealed.body
             publisher_tool, actual_executor = _executor_identity(command, claim)
             git_effect_id = git_settlement.effect_id
-            git_reused = True
         elif git_settlement is None or git_settlement.state is EffectState.PREPARED:
             inputs = self._prepare(
                 command,
@@ -2269,7 +2298,7 @@ class PublishHandler:
                 if candidate is not None:
                     candidate.cleanup()
                 return git_result
-            git_effect_id, git_observation, git_reused = git_result
+            git_effect_id, git_observation, _ = git_result
         elif git_settlement.state is EffectState.CONFLICT:
             raise StageFailure("publish_git_effect_conflict", "The Git effect is conflicted")
         elif git_settlement.state is EffectState.DEFINITELY_FAILED:
@@ -2287,11 +2316,10 @@ class PublishHandler:
             )
             if isinstance(pr_result, StageDeferral):
                 return pr_result
-            pr_effect_id, pr_observation, pr_reused = pr_result
-            if not (git_reused and pr_reused):
-                if repository.observe(request.branch_ref) != candidate_facts.commit:
-                    raise StageFailure("publish_remote_drift", "Published branch changed before stage completion")
-                repository.fetch_expected(request.base_ref, request.expected_base_oid)
+            pr_effect_id, pr_observation, _ = pr_result
+            if repository.observe(request.branch_ref) != candidate_facts.commit:
+                raise StageFailure("publish_remote_drift", "Published branch changed before stage completion")
+            repository.fetch_expected(request.base_ref, request.expected_base_oid)
             receipt = {
                 "schema_version": PUBLISH_RECEIPT_SCHEMA,
                 "command_id": command.command_id,

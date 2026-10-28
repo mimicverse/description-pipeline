@@ -34,7 +34,7 @@ from description_pipeline.verification.native_discovery import (
 from . import support
 from .selection_support import sealed_selection
 
-RECORD_FILE = "evidence/discovery.json"
+RECORD_FILE = "input/discovery/native-discovery.json"
 
 IDENTITY = [
     1.0,
@@ -149,6 +149,7 @@ def native_record() -> dict:
             {
                 "name": "shoulder_pitch_joint__coaxial",
                 "type": "concentric",
+                "entity_count": 2,
                 "suppressed": False,
                 "error_code": 0,
                 "scope": "",
@@ -179,6 +180,7 @@ def native_record() -> dict:
             {
                 "name": "shoulder_pitch_joint__locate",
                 "type": "coincident",
+                "entity_count": 2,
                 "suppressed": False,
                 "error_code": 0,
                 "scope": "",
@@ -199,6 +201,7 @@ def native_record() -> dict:
             {
                 "name": "shoulder_pitch_joint__limit",
                 "type": "limitangle",
+                "entity_count": 2,
                 "suppressed": False,
                 "error_code": 0,
                 "scope": "",
@@ -270,6 +273,7 @@ def frame_ground_mates(component: str = "base-1") -> list[dict]:
         return {
             "name": name,
             "type": kind,
+            "entity_count": 2,
             "suppressed": False,
             "error_code": 0,
             "scope": "",
@@ -337,8 +341,8 @@ class OracleSemanticsTests(unittest.TestCase):
         record_path = package / RECORD_FILE
         payload = json.loads(record_path.read_text(encoding="utf-8"))
         mutate(payload["raw"], payload)
-        # allow_nan keeps adversarial Infinity/NaN literals in the record on purpose: the oracle
-        # must reject them semantically, not only because the bytes changed.
+        # Allow non-finite literals when callers inject them so the shared strict
+        # reader, rather than manifest resealing, is the rejection boundary.
         record_path.write_text(
             json.dumps(payload, sort_keys=True, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
@@ -358,8 +362,6 @@ class OracleSemanticsTests(unittest.TestCase):
     def check(self, package: Path) -> tuple[bool, list[dict], dict]:
         report = verify_discovery(package)
         checks = {entry["id"]: entry for entry in report["checks"]}
-        # The reseal itself must be sound: a failure may only come from the semantic rule.
-        self.assertTrue(checks["discovery.binding"]["passed"], checks["discovery.binding"])
         self.assertNotIn("discovery.internal", [error["code"] for error in report["errors"]])
         # Diagnostics must stay JSON-serializable even when the raw payload carried Infinity/NaN,
         # and computed sets must already be sorted lists.
@@ -371,6 +373,16 @@ class OracleSemanticsTests(unittest.TestCase):
         self._native(package, mutate)
         passed, errors, _checks = self.check(package)
         self.assertFalse(passed, errors)
+        binding = next(
+            (error for error in errors if error["code"] == "discovery.binding"),
+            None,
+        )
+        if binding is not None:
+            self.assertIn(
+                "the JSON document carries the non-finite constant",
+                binding["message"],
+            )
+            return
         graph = [error for error in errors if error["code"] == "discovery.graph"]
         self.assertTrue(any(expected in error["message"] for error in graph), errors)
 
@@ -760,6 +772,7 @@ class OracleSemanticsTests(unittest.TestCase):
                 {
                     "name": "base_to_sub_lock",
                     "type": "lock",
+                    "entity_count": 2,
                     "suppressed": False,
                     "error_code": 0,
                     "scope": "",
@@ -820,6 +833,7 @@ class OracleSemanticsTests(unittest.TestCase):
                 {
                     "name": "sub_to_arm_lock",
                     "type": "lock",
+                    "entity_count": 2,
                     "suppressed": False,
                     "error_code": 0,
                     "scope": "",
@@ -912,6 +926,7 @@ class OracleSemanticsTests(unittest.TestCase):
             {
                 "name": "base_arm_lock",
                 "type": "lock",
+                "entity_count": 2,
                 "suppressed": False,
                 "error_code": 0,
                 "scope": "",
@@ -1058,6 +1073,7 @@ class OracleSemanticsTests(unittest.TestCase):
                 {
                     "name": "nested_self__coaxial",
                     "type": "concentric",
+                    "entity_count": 2,
                     "suppressed": False,
                     "error_code": 0,
                     "scope": "sub-1",
@@ -1109,6 +1125,7 @@ class OracleSemanticsTests(unittest.TestCase):
         mate = {
             "name": "probe__coaxial",
             "type": "concentric",
+            "entity_count": 2,
             "suppressed": False,
             "error_code": 0,
             "scope": "",
@@ -1251,7 +1268,7 @@ class OracleSemanticsTests(unittest.TestCase):
         def publish_frame(package: Path, parent: str) -> None:
             # A planted legacy second-model carrier must never steer the rebuild.
             record = json.loads((package / RECORD_FILE).read_text(encoding="utf-8"))
-            record.setdefault("derived", {}).setdefault("frames", []).append(
+            record.setdefault("raw", {}).setdefault("derived", {}).setdefault("frames", []).append(
                 {"name": "tool", "parent": parent, "coordinate_system": "TCP_tool"}
             )
             OracleSemanticsTests._seal(package, record)
@@ -1323,6 +1340,7 @@ class OracleSemanticsTests(unittest.TestCase):
         mate = {
             "name": "circle_axis__coaxial",
             "type": "concentric",
+            "entity_count": 2,
             "suppressed": False,
             "error_code": 0,
             "scope": "",
@@ -1371,6 +1389,7 @@ class OracleSemanticsTests(unittest.TestCase):
             return {
                 "name": "mixed_axis__coaxial",
                 "type": "concentric",
+                "entity_count": 2,
                 "suppressed": False,
                 "error_code": 0,
                 "scope": "",
@@ -1442,6 +1461,7 @@ class OracleSemanticsTests(unittest.TestCase):
             return {
                 "name": "framed_axis__coaxial",
                 "type": "concentric",
+                "entity_count": 2,
                 "suppressed": False,
                 "error_code": 0,
                 "scope": "",
@@ -1472,6 +1492,7 @@ class OracleSemanticsTests(unittest.TestCase):
             return {
                 "name": "edge_in_plane__locate",
                 "type": "coincident",
+                "entity_count": 2,
                 "suppressed": False,
                 "error_code": 0,
                 "scope": "",
@@ -1521,6 +1542,7 @@ class OracleSemanticsTests(unittest.TestCase):
             return {
                 "name": "probe__coaxial",
                 "type": "concentric",
+                "entity_count": 2,
                 "suppressed": False,
                 "error_code": 0,
                 "scope": "",
@@ -1568,6 +1590,7 @@ class OracleSemanticsTests(unittest.TestCase):
             return {
                 "name": "plane_probe__locate",
                 "type": "coincident",
+                "entity_count": 2,
                 "suppressed": False,
                 "error_code": 0,
                 "scope": "",

@@ -53,7 +53,12 @@ class PublishRecoveryPostgresTests(unittest.TestCase):
         cls.server_root.cleanup()
 
     def setUp(self) -> None:
-        self.fixture = PublishFixture()
+        self.fixture = PublishFixture(diagnostics=[{
+            "code": "input.cad_revision_absent",
+            "blocking": False,
+            "message": "the CAD revision label is absent; the raw value stays missing",
+            "detail": {"hardware_id": "robot", "missing": ["revision"]},
+        }])
         self.addCleanup(self.fixture.close)
         self.schema = "publish_recovery_" + uuid.uuid4().hex
         schema_sql = PLATFORM_SCHEMA.read_text(encoding="utf-8").replace(
@@ -212,6 +217,10 @@ class PublishRecoveryPostgresTests(unittest.TestCase):
         rows = json.loads(self.pr_state.read_text(encoding="utf-8"))
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["head_oid"], pushed)
+        original_plan = json.loads((outbound / publish_stage.PUBLICATION_PLAN).read_bytes())
+        self.assertEqual(digest({"body": rows[0]["body"]}), original_plan["pr_body_sha256"])
+        self.assertIn("`input.cad_revision_absent`", rows[0]["body"])
+        self.assertEqual(rows[0]["body"].count("Verification warnings ("), 1)
 
     def test_two_process_absence_stays_unknown_and_never_creates_pr(self) -> None:
         command = self._command("absence")

@@ -41,6 +41,7 @@ from description_pipeline.orchestration.portal import (
     DEFAULT_DAG_ID,
     PortalApp,
     PortalConfig,
+    _findings,
     load_portal_config,
 )
 
@@ -817,7 +818,7 @@ class FakeRunControl:
                     )
                     generate_receipt_bytes = selected["reports/generate.json"]
             if stage == "verify" and preview:
-                quality_payload = current.get("reports/quality.json")
+                quality_payload = current.get("reports/diagnostic.json")
                 quality_record = {}
                 if isinstance(quality_payload, (bytes, bytearray)):
                     try:
@@ -1539,7 +1540,7 @@ class PortalTests(unittest.TestCase):
             raise FactStoreError("The platform admission is closed")
         if self.platform.admit_error is not None:
             raise self.platform.admit_error
-        dag_run_id = request.request_id.removeprefix("portal-")
+        dag_run_id = request.request_id
         dispatch = {
             "dag_id": DEFAULT_DAG_ID,
             "dag_run_id": dag_run_id,
@@ -1604,7 +1605,7 @@ class PortalTests(unittest.TestCase):
         )
         if existing is not None:
             return existing
-        dag_run_id = request.request_id.removeprefix("portal-")
+        dag_run_id = request.request_id
         command = SimpleNamespace(
             command_id="dispatch:" + digest(
                 {
@@ -2062,7 +2063,7 @@ class PortalTests(unittest.TestCase):
         report_files = {
             path: hashlib.sha256(data).hexdigest() for path, data in members.items() if path.startswith("reports/")
         }
-        quality_payload = members.get("reports/quality.json")
+        quality_payload = members.get("reports/diagnostic.json")
         quality = {}
         if isinstance(quality_payload, (bytes, bytearray)):
             try:
@@ -2198,7 +2199,7 @@ class PortalTests(unittest.TestCase):
         # A retryable attempt is interrupted, not delivered: its registration is
         # non-terminal (the terminal immutability gate owns everything else).
         entry = self.store.runs[native_run_id(DAG_RUN_ID)]
-        entry["request_id"] = f"portal-{DAG_RUN_ID}"
+        entry["request_id"] = DAG_RUN_ID
         merged = entry["merged"]
         merged["status"] = "running"
         merged.pop("result", None)
@@ -2498,11 +2499,32 @@ class PortalTests(unittest.TestCase):
         listed = json.loads(body)["runs"][0]
         self.assertEqual(listed["dag_run_id"], dag_run_id)
         self.assertIsNone(listed["handoff_path"])
-        self.assertEqual(listed["state"], "running")
+        self.assertEqual(listed["main_assembly"], "model.SLDASM")
+        status, _, detail = self.client.request("GET", f"/api/runs/{dag_run_id}")
+        self.assertEqual(status, 200, detail)
+        self.assertEqual(listed["state"], json.loads(detail)["state"])
         self.assertEqual(listed["user"], FEISHU_NAME)
         self.assertEqual(listed["principal"], FEISHU_PRINCIPAL)
         staging = self.upload_root / ".staging"
         self.assertTrue(not staging.exists() or not any(staging.iterdir()))
+
+    def test_upload_rechecks_the_live_principal_before_admission(self) -> None:
+        self.client.login()
+        admissions_before = len(self.production_application.admission_requests)
+        self.airflow.profiles[AIRFLOW_TOKEN]["principal"] = VIEWER_PRINCIPAL
+        status, _, body = self.client.request_raw(
+            "POST",
+            "/api/runs",
+            _upload_body(files=[("model.SLDASM", b"<assembly/>")]),
+            "multipart/form-data; boundary=portal-boundary",
+        )
+        self.assertEqual(status, 401, body)
+        self.assertIn("identity changed", json.loads(body)["error"])
+        self.assertEqual(
+            len(self.production_application.admission_requests),
+            admissions_before,
+        )
+        self.assertEqual(self.airflow.trigger_payloads, [])
 
     def test_a_closed_admission_gate_refuses_before_uploading_or_triggering(self) -> None:
         self.client.login()
@@ -2530,14 +2552,14 @@ class PortalTests(unittest.TestCase):
         dag_run_id = json.loads(body)["dag_run_id"]
         self.assertEqual(len(self.platform.admits), 1)
         admit = self.platform.admits[0]
-        self.assertEqual(admit["request_id"], f"portal-{dag_run_id}")
+        self.assertEqual(admit["request_id"], dag_run_id)
         self.assertEqual(admit["run_id"], native_run_id(dag_run_id))
         self.assertEqual(admit["principal"], FEISHU_PRINCIPAL)
         self.assertEqual(admit["main_assembly"], "model.SLDASM")
         self.assertEqual(admit["configuration"], {"purpose": "engineering"})
         dispatch = admit["dispatch"]
         self.assertEqual(dispatch["stage"], "freeze")
-        self.assertEqual(dispatch["operation_key"], f"portal-{dag_run_id}/freeze:0")
+        self.assertEqual(dispatch["operation_key"], f"{dag_run_id}/freeze:0")
         self.assertEqual(dispatch["dag_run_id"], dag_run_id)
         self.assertEqual(dispatch["dag_id"], DEFAULT_DAG_ID)
         self.assertRegex(dispatch["params_digest"], r"^[0-9a-f]{64}$")
@@ -2589,7 +2611,7 @@ class PortalTests(unittest.TestCase):
 
         def load(request):
             calls.append(request)
-            dag_run_id = request.request_id.removeprefix("portal-")
+            dag_run_id = request.request_id
             outcome = SimpleNamespace(
                 admission=SimpleNamespace(
                     run_id=request.run_id,
@@ -2632,7 +2654,7 @@ class PortalTests(unittest.TestCase):
             first["dag_run_id"],
             "portal-submission-20261025-stable-0001",
         )
-        self.assertEqual(first["request_id"], f"portal-{first['dag_run_id']}")
+        self.assertEqual(first["request_id"], first["dag_run_id"])
         self.assertFalse(first["idempotent"])
 
         status, _, response = client.request_raw(
@@ -2725,6 +2747,44 @@ class PortalTests(unittest.TestCase):
                 self.assertEqual(status, 400, body)
         self.assertEqual(self.airflow.trigger_payloads, [])
         self.assertEqual(self.airflow.dag_runs, {})
+
+    def test_rejected_received_fields_allow_the_same_key_to_retry(self) -> None:
+        self.client.login()
+        headers = {"Idempotency-Key": "invalid-then-valid"}
+        files = [("model.SLDASM", b"<assembly/>")]
+        rejected = _upload_body(
+            files=files,
+            fields=[
+                ("target_hardware", "ghost"),
+                ("change_summary", TEST_SUMMARY),
+                ("purpose", "engineering"),
+            ],
+        )
+        status, _, body = self.client.request_raw(
+            "POST",
+            "/api/runs",
+            rejected,
+            "multipart/form-data; boundary=portal-boundary",
+            headers,
+        )
+        self.assertEqual(status, 400, body)
+        dag_run_id = "portal-invalid-then-valid"
+        self.assertFalse((self.upload_root / dag_run_id).exists())
+
+        accepted = _upload_body(
+            files=files,
+            fields=list(UPLOAD_CHOICES),
+        )
+        status, _, body = self.client.request_raw(
+            "POST",
+            "/api/runs",
+            accepted,
+            "multipart/form-data; boundary=portal-boundary",
+            headers,
+        )
+        self.assertEqual(status, 201, body)
+        self.assertEqual(json.loads(body)["dag_run_id"], dag_run_id)
+        self.assertEqual(len(self.airflow.trigger_payloads), 1)
 
     def test_multiline_change_summary_normalizes_line_breaks_and_reaches_discovery(self) -> None:
         self.client.login()
@@ -3255,6 +3315,38 @@ class PortalTests(unittest.TestCase):
         )
         self.assertEqual(payload["job"]["status"], "passed")
 
+    def test_findings_preserve_state_only_failed_quality_checks(self) -> None:
+        findings = _findings(
+            {
+                "result": {
+                    "quality": {
+                        "checks": [
+                            {
+                                "id": "fixture.state_failed",
+                                "state": "failed",
+                                "details": {"reason": "recorded failure"},
+                            },
+                            {
+                                "id": "fixture.boolean_failed",
+                                "state": "passed",
+                                "passed": False,
+                                "details": {"reason": "contradictory failure"},
+                            },
+                            {
+                                "id": "fixture.passed",
+                                "state": "passed",
+                                "passed": True,
+                            },
+                        ]
+                    }
+                }
+            }
+        )
+        self.assertEqual(
+            [finding["id"] for finding in findings],
+            ["fixture.state_failed", "fixture.boolean_failed"],
+        )
+
     def test_coverage_external_scope_ignores_job_confirmation_claims(self) -> None:
         self.client.login()
         self._seed_passed_job()
@@ -3288,75 +3380,36 @@ class PortalTests(unittest.TestCase):
         # Previews and artifacts are store-owned; the endpoint is never consulted for them.
         self.assertFalse(any("preview" in path for path in self.endpoint_server.requests))
 
-    def test_failed_linux_run_serves_the_retained_structural_report(self) -> None:
+    def test_run_links_only_registered_verification_evidence(self) -> None:
         self.client.login()
         self._seed_airflow_run(DAG_RUN_ID, state="failed")
         self._seed_job(DAG_RUN_ID)
         self._fail_job(DAG_RUN_ID)
         run_id = native_run_id(DAG_RUN_ID)
-        document = "# 结构团队报告\n\n阻塞项与警告见结构化证据。\n".encode()
-        self._register_attempt(run_id, {"reports/structural-team.md": document}, verified=False)
-
-        status, headers, body = self.client.request(
-            "GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/structural-team.md"
-        )
-        self.assertEqual(status, 200, body)
-        self.assertEqual(body, document)
-        self.assertEqual(headers.get("Content-Type"), "text/markdown; charset=utf-8")
-        # The run page itself links the retained report; no URL hunting required.
-        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
-        self.assertEqual(status, 200, body)
-        links = json.loads(body)["structural_report"]
-        self.assertEqual([entry["path"] for entry in links], ["reports/structural-team.md"])
-        self.assertEqual(links[0]["url"], f"/api/runs/{DAG_RUN_ID}/artifacts/reports/structural-team.md")
-        self.assertTrue(links[0]["label"])
-
-    def test_failed_native_run_serves_the_fetched_report_and_refuses_absent(self) -> None:
-        self.client.login()
-        self._seed_airflow_run(DAG_RUN_ID, state="failed")
-        self._seed_job(DAG_RUN_ID)
-        self._fail_job(DAG_RUN_ID)
-        run_id = native_run_id(DAG_RUN_ID)
-        markdown = b"native capture blocked\n"
-        self._register_attempt(run_id, {"reports/structural-team.md": markdown}, verified=False)
-
-        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/structural-team.md")
-        self.assertEqual(status, 200, body)
-        self.assertEqual(body, markdown)
-
-        # A member the run never retained is a clear 404, never a substitute report.
-        status, _, _ = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/structural-team.json")
-        self.assertEqual(status, 404)
-        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
-        self.assertEqual(status, 200, body)
-        links = json.loads(body)["structural_report"]
-        self.assertEqual([entry["path"] for entry in links], ["reports/structural-team.md"])
-
-    def test_verified_but_unpublished_run_serves_the_report_from_the_bound_delivery(self) -> None:
-        self.client.login()
-        self._seed_airflow_run(DAG_RUN_ID, state="failed")
-        self._seed_job(DAG_RUN_ID)
-        self._fail_job(DAG_RUN_ID)
-        run_id = native_run_id(DAG_RUN_ID)
-        # Verify green, publish unroutable: the registered verify checkpoint still
-        # carries the report as a bound member.
-        document = b"verify checkpoint report\n"
-        self._register_attempt(
-            run_id,
-            {"urdf/robot.urdf": b"<robot name='fixture'/>", "reports/structural-team.md": document},
-            verified=True,
-        )
-
-        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/structural-team.md")
-        self.assertEqual(status, 200, body)
-        self.assertEqual(body, document)
-        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
-        self.assertEqual(status, 200, body)
-        links = json.loads(body)["structural_report"]
-        self.assertEqual([entry["path"] for entry in links], ["reports/structural-team.md"])
-        # Authorization is unchanged: without a session the route refuses outright.
+        for verified in (False, True):
+            with self.subTest(verified=verified):
+                self._register_attempt(
+                    run_id, {"urdf/robot.urdf": b"<robot name='fixture'/>"}, verified=verified,
+                )
+                status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
+                self.assertEqual(status, 200, body)
+                links = json.loads(body)["verification_reports"]
+                self.assertEqual(
+                    [entry["path"] for entry in links],
+                    ["verification-certificate.json", "verification-execution.json"],
+                )
+                for entry in links:
+                    status, headers, document = self.client.request("GET", entry["url"])
+                    self.assertEqual(status, 200, document)
+                    self.assertIn("application/json", headers["Content-Type"])
+                    self.assertIsInstance(json.loads(document), dict)
+                    self.assertTrue(entry["label"])
+                status, _, _ = self.client.request(
+                    "GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/quality.json",
+                )
+                self.assertEqual(status, 404)
         anonymous = PortalClient(self.client.base)
-        status, _, _ = anonymous.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/structural-team.md")
+        status, _, _ = anonymous.request("GET", links[0]["url"])
         self.assertEqual(status, 401)
 
     def test_failed_run_serves_the_bound_diagnostic_quality_document(self) -> None:
@@ -3381,20 +3434,20 @@ class PortalTests(unittest.TestCase):
                 "subject_sha256": "d" * 64,
                 "urdf": "urdf/robot.urdf",
                 "files": {"urdf/robot.urdf": hashlib.sha256(urdf).hexdigest()},
-                "report_files": {"reports/quality.json": digest},
+                "report_files": {"reports/diagnostic.json": digest},
                 "verified": False,
                 "state": "unverified",
                 "reason": "verification_failed",
             },
-            artifacts={"urdf/robot.urdf": urdf, "reports/quality.json": document},
+            artifacts={"urdf/robot.urdf": urdf, "reports/diagnostic.json": document},
         )
-        status, headers, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/quality.json")
+        status, headers, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/diagnostic.json")
         self.assertEqual(status, 200, body)
         self.assertEqual(body, document)
         self.assertEqual(headers.get("Content-Type"), "application/json")
         # The digest rule is unchanged: tampered bytes surface as a stream failure.
-        self.store.runs[run_id]["artifacts"]["reports/quality.json"] = b"tampered"
-        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/quality.json")
+        self.store.runs[run_id]["artifacts"]["reports/diagnostic.json"] = b"tampered"
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/diagnostic.json")
         self.assertEqual(status, 502)
         self.assertNotIn(b"tampered", body)
         # A member outside the bound member maps stays a clear 404.
@@ -3404,7 +3457,7 @@ class PortalTests(unittest.TestCase):
     def test_verified_preview_does_not_expose_report_members(self) -> None:
         self.client.login()
         self._seed_passed_job()
-        status, _, _ = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/quality.json")
+        status, _, _ = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/diagnostic.json")
         self.assertEqual(status, 404)
 
     def test_registered_member_defects_refuse_with_502(self) -> None:
@@ -3418,19 +3471,19 @@ class PortalTests(unittest.TestCase):
         document = json.dumps({"passed": False, "subject_sha256": "d" * 64, "checks": []}).encode()
         self._register_attempt(
             run_id,
-            {"urdf/robot.urdf": b"<robot name='fixture'/>", "reports/quality.json": document},
+            {"urdf/robot.urdf": b"<robot name='fixture'/>", "reports/diagnostic.json": document},
             verified=False,
         )
-        route = f"/api/runs/{DAG_RUN_ID}/artifacts/reports/quality.json"
+        route = f"/api/runs/{DAG_RUN_ID}/artifacts/reports/diagnostic.json"
         # Bytes edited before the first read never re-sign the registered digest.
-        self.store.runs[run_id]["artifacts"]["reports/quality.json"] = b"edited before first read\n"
+        self.store.runs[run_id]["artifacts"]["reports/diagnostic.json"] = b"edited before first read\n"
         status, _, body = self.client.request("GET", route)
         self.assertEqual(status, 502)
         self.assertNotIn(b"edited", body)
         # A malformed registration (no digest) refuses with the incomplete-registration 502.
-        self.store.runs[run_id]["artifacts"]["reports/quality.json"] = document
+        self.store.runs[run_id]["artifacts"]["reports/diagnostic.json"] = document
         preview = self.store.runs[run_id]["preview"]
-        preview["report_files"]["reports/quality.json"] = None
+        preview["report_files"]["reports/diagnostic.json"] = None
         status, _, body = self.client.request("GET", route)
         self.assertEqual(status, 502)
         self.assertNotIn(document, body)
@@ -3449,16 +3502,16 @@ class PortalTests(unittest.TestCase):
         quality = json.dumps({"passed": False, "checks": [{"id": "fixture.required", "state": "failed"}]}).encode()
         self._register_attempt(
             run_id,
-            {"urdf/robot.urdf": b"<robot name='fixture'/>", "reports/quality.json": quality},
+            {"urdf/robot.urdf": b"<robot name='fixture'/>", "reports/diagnostic.json": quality},
             verified=False,
         )
         # Replaced before the first read: the certificate-backed preview remains
         # available, while the mismatched report download is refused.
-        self.store.runs[run_id]["artifacts"]["reports/quality.json"] = b'{"checks":[]}'
+        self.store.runs[run_id]["artifacts"]["reports/diagnostic.json"] = b'{"checks":[]}'
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
         self.assertEqual(status, 200, body)
         self.assertEqual(json.loads(body)["failing_checks_total"], 1)
-        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/quality.json")
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/diagnostic.json")
         self.assertEqual(status, 502, body)
 
     def test_diagnostic_verify_pass_is_not_a_formal_preview_or_checkpoint(self) -> None:
@@ -3470,7 +3523,7 @@ class PortalTests(unittest.TestCase):
             run_id,
             {
                 "urdf/robot.urdf": b"<robot name='fixture'/>",
-                "reports/quality.json": b'{"passed":true,"checks":[]}\n',
+                "reports/diagnostic.json": b'{"passed":true,"checks":[]}\n',
             },
             verified=True,
         )
@@ -3500,7 +3553,7 @@ class PortalTests(unittest.TestCase):
             run_id,
             {
                 "urdf/robot.urdf": b"<robot name='fixture'/>",
-                "reports/quality.json": b'{"passed":true,"checks":[]}\n',
+                "reports/diagnostic.json": b'{"passed":true,"checks":[]}\n',
             },
             verified=True,
         )
@@ -3525,7 +3578,7 @@ class PortalTests(unittest.TestCase):
             run_id,
             {
                 "urdf/robot.urdf": b"<robot name='fixture'/>",
-                "reports/quality.json": b'{"passed":true,"checks":[]}\n',
+                "reports/diagnostic.json": b'{"passed":true,"checks":[]}\n',
             },
             verified=True,
         )
@@ -3554,10 +3607,13 @@ class PortalTests(unittest.TestCase):
             run_id,
             {
                 "urdf/robot.urdf": b"<robot name='fixture'/>",
-                "reports/quality.json": b'{"passed":true,"checks":[]}\n',
+                "reports/diagnostic.json": b'{"passed":true,"checks":[]}\n',
             },
             verified=True,
         )
+        status, _, first = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
+        self.assertEqual(status, 200, first)
+        self.assertTrue(json.loads(first)["verified"])
         self.store.runs[run_id]["effect_states"] = [
             {
                 "effect_id": "effect-after-verify",
@@ -3573,6 +3629,10 @@ class PortalTests(unittest.TestCase):
         run = json.loads(body)
         self.assertEqual(run["state"], "unresolved")
         self.assertFalse(run["formal_eligible"])
+        status, _, listed = self.client.request("GET", "/api/runs")
+        self.assertEqual(status, 200, listed)
+        row = next(row for row in json.loads(listed)["runs"] if row["dag_run_id"] == DAG_RUN_ID)
+        self.assertEqual(row["state"], run["state"])
         self.assertEqual(run["automatic"]["state"], "unverified")
 
         status, _, body = self.client.request(
@@ -3598,10 +3658,10 @@ class PortalTests(unittest.TestCase):
         quality = json.dumps({"passed": False, "checks": [{"id": "fixture.required", "state": "failed"}]}).encode()
         self._register_attempt(
             run_id,
-            {"urdf/robot.urdf": b"<robot name='fixture'/>", "reports/quality.json": quality},
+            {"urdf/robot.urdf": b"<robot name='fixture'/>", "reports/diagnostic.json": quality},
             verified=False,
         )
-        self.store.runs[run_id]["preview"]["report_files"]["reports/quality.json"] = None
+        self.store.runs[run_id]["preview"]["report_files"]["reports/diagnostic.json"] = None
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
         self.assertEqual(status, 502, body)
 
@@ -3616,7 +3676,7 @@ class PortalTests(unittest.TestCase):
         quality = json.dumps({"passed": False, "checks": [{"id": "fixture.required", "state": "failed"}]}).encode()
         self._register_attempt(
             run_id,
-            {"urdf/robot.urdf": b"<robot name='fixture'/>", "reports/quality.json": quality},
+            {"urdf/robot.urdf": b"<robot name='fixture'/>", "reports/diagnostic.json": quality},
             verified=False,
         )
         route = f"/api/runs/{DAG_RUN_ID}/artifacts/reports/native-stages.json"
@@ -3645,7 +3705,7 @@ class PortalTests(unittest.TestCase):
             run_id,
             {
                 "urdf/robot.urdf": b"<robot name='fixture'/>",
-                "reports/quality.json": quality,
+                "reports/diagnostic.json": quality,
                 "input/handoff.json": handoff,
             },
             verified=False,
@@ -3668,7 +3728,7 @@ class PortalTests(unittest.TestCase):
         quality = json.dumps({"passed": False, "checks": [{"id": "fixture.required", "state": "failed"}]}).encode()
         self._register_attempt(
             run_id,
-            {"urdf/robot.urdf": b"<robot name='fixture'/>", "reports/quality.json": quality},
+            {"urdf/robot.urdf": b"<robot name='fixture'/>", "reports/diagnostic.json": quality},
             verified=False,
         )
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
@@ -3706,14 +3766,14 @@ class PortalTests(unittest.TestCase):
         self._fail_job(DAG_RUN_ID)
         run_id = native_run_id(DAG_RUN_ID)
         newest = b"newest failed publish diagnostics\n"
-        self._register_attempt(run_id, {"reports/structural-team.md": newest}, verified=False)
+        self._register_attempt(run_id, {"reports/failure.json": newest}, verified=False)
         # An older copy on disk is never a substitute: without a registration it
         # establishes no member identity.
-        older = self.store.run_dir(run_id) / "output.failed/reports/structural-team.md"
+        older = self.store.run_dir(run_id) / "output.failed/reports/failure.json"
         older.parent.mkdir(parents=True, exist_ok=True)
         older.write_bytes(b"older delivered copy\n")
 
-        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/structural-team.md")
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/artifacts/reports/failure.json")
         self.assertEqual(status, 200, body)
         self.assertEqual(body, newest)
         self.assertNotEqual(body, older.read_bytes())
@@ -4422,7 +4482,7 @@ class PortalTests(unittest.TestCase):
         self.store.add(child_run, meta={})
         self.store.runs[child_run].update(
             parent_run_id=native_run_id(DAG_RUN_ID),
-            request_id=f"portal-{child}",
+            request_id=child,
             from_stage="verify",
             admission_request={
                 "change_summary": TEST_SUMMARY,

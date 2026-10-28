@@ -144,7 +144,6 @@ class UploadUiContractTests(unittest.TestCase):
         self.assertIn('$("upload-view").hidden = true', app)
         self.assertIn('$("detail-card").hidden = true', app)
         self.assertGreaterEqual(app.count("run-error-detail"), 3)
-        self.assertIn("terminalNow", app)
 
 
 class UploadRenderTests(unittest.TestCase):
@@ -288,7 +287,7 @@ class ReportUiContractTests(unittest.TestCase):
             "stage.counts.warnings",
             "Qualification blocker: ",
             "Publication blocker: ",
-            "Recorded values",
+            "Source values",
             "warningValueText",
             "rows.slice(0, WARNING_ROW_LIMIT)",
             "WARNING_VALUE_LIMIT",
@@ -395,6 +394,8 @@ class AssemblySelectorUiContractTests(unittest.TestCase):
             "applyAssemblies",
             "updateStartEnabled",
             "state.assemblyChoice",
+            "targetsRequest",
+            "loadTargets(state.folderPick)",
             'form.append("main_assembly", state.assemblyChoice)',
             "Main assembly",
             "Select the main assembly...",
@@ -406,7 +407,7 @@ class AssemblySelectorUiContractTests(unittest.TestCase):
 class RunHistoryUiContractTests(unittest.TestCase):
     """Readable run history with rename and explicit reversible delete/restore.
 
-    The list shows the engineering folder (or the custom display title), a human timestamp,
+    The list shows the main assembly (or the custom display title), a human timestamp,
     the state and the recorded initiator; rerun lineage stays a secondary chip. Delete moves a
     run into the explicit Deleted view (never a one-way hide), rename only changes the displayed
     name, and deleted runs stay readable while retry/rerun wait for a restore.
@@ -427,6 +428,8 @@ class RunHistoryUiContractTests(unittest.TestCase):
         app = self.app()
         for token in (
             "runDisplayTitle",
+            "assemblyLabel",
+            "run.main_assembly",
             "formatRunTime",
             "RUN_STATES[run.state]",
             "State unconfirmed",
@@ -437,6 +440,7 @@ class RunHistoryUiContractTests(unittest.TestCase):
             "formatTime(run.started_at)",
         ):
             self.assertIn(token, app)
+        self.assertNotIn("handoff_path", app)
         # The rerun-dominated list title is gone; the parent id only lives in secondary detail.
         self.assertNotIn("Rerun source: ${run.resume_from_name} rerun", app)
 

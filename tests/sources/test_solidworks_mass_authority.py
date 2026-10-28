@@ -9,10 +9,8 @@ from pathlib import Path
 
 from . import _paths  # noqa: F401
 from . import support
-from description_pipeline.sources.solidworks.appearance import AppearanceError
 from description_pipeline.sources.solidworks.errors import ConfigError
 from description_pipeline.sources.solidworks.freeze import validate_source_config as _validate_source_config
-from description_pipeline.sources.solidworks.scene import load_scene
 from description_pipeline.sources.snapshot import write_manifest
 
 
@@ -233,82 +231,6 @@ class CadMassAuthorityTests(unittest.TestCase):
                 validate_source_config(dict(self.config, **{key: value}))
         with self.assertRaises(ConfigError):
             validate_source_config(dict(self.config, material_source="documented_table"))
-
-    def test_freeze_preserves_unverified_cad_mass_and_records_warning(self) -> None:
-        self.backend.components[1]["mass"]["reference"].update(
-            part_document="C:/cad/arm.SLDPRT",
-            scope="part_document",
-            volume_m3=6.25e-5,
-            density_kg_m3=7900.0,
-            material_assignment={
-                "schema_version": "swbridge.material-assignment/v1",
-                "configuration": "默认",
-                "unverified_reason": "cad_material_provenance_missing",
-                "message": "Every solid requires an explicit physical material; default density is not evidence",
-                "missing_body_indices": [0],
-            },
-        )
-        snapshot = self._freeze("unverified")
-        _compose_scene_inputs(snapshot, self.tmp / "cad")
-        record = json.loads((snapshot / "raw/material_provenance.json").read_text(encoding="utf-8"))
-        self.assertEqual([entry["code"] for entry in record["warnings"]], ["cad_material_provenance_missing"])
-        self.assertFalse(record["warnings"][0]["blocking"])
-        raw_rows = json.loads((snapshot / "raw/mass_properties.json").read_text(encoding="utf-8"))
-        warning = record["warnings"][0]
-        self.assertEqual(warning["material_assignment"], raw_rows["arm-1"]["reference"]["material_assignment"])
-        self.assertEqual(warning["measured"]["mass_kg"], raw_rows["arm-1"]["mass"])
-        scene = load_scene(snapshot)
-        arm = next(link for link in scene["links"] if link["name"] == "arm_link")
-        self.assertAlmostEqual(arm["inertial"]["mass"], 0.5, places=12)
-        self.assertEqual(
-            [entry["code"] for entry in scene["provenance"]["warnings"]],
-            ["cad_material_provenance_missing"],
-        )
-
-    def test_verified_cad_material_has_no_warning_and_no_declared_mass_file(self) -> None:
-        snapshot = self._freeze("verified")
-        _compose_scene_inputs(snapshot, self.tmp / "cad")
-        record = json.loads((snapshot / "raw/material_provenance.json").read_text(encoding="utf-8"))
-        self.assertEqual(record["warnings"], [])
-        self.assertFalse((snapshot / "raw/declared_masses.json").exists())
-        scene = load_scene(snapshot)
-        self.assertNotIn("warnings", scene["provenance"])
-
-    def test_native_unrecorded_or_default_appearance_fails_generation(self) -> None:
-        for label, explicit in (("unrecorded", False), ("all_false_all_minus_one", True)):
-            with self.subTest(case=label):
-                if explicit:
-                    self._install_appearance(claimed=False)
-                snapshot = self._freeze("appearance-" + label)
-                _compose_scene_inputs(snapshot, self.tmp / "cad")
-                self._mark_as_native(snapshot)
-                with self.assertRaises(AppearanceError) as caught:
-                    load_scene(snapshot)
-                self.assertIn(
-                    (
-                        "cad_appearance_record_missing"
-                        if not explicit
-                        else "cad_appearance_display_state_invalid"
-                    ),
-                    {
-                        issue["code"]
-                        for issue in caught.exception.details["appearance"]["issues"]
-                    },
-                )
-
-    def test_generate_rejects_claimed_appearance_without_effective_scope(self) -> None:
-        self._install_appearance(claimed=True)
-        snapshot = self._freeze("appearance-claimed")
-        _compose_scene_inputs(snapshot, self.tmp / "cad")
-        self._mark_as_native(snapshot)
-        with self.assertRaises(AppearanceError) as caught:
-            load_scene(snapshot)
-        appearance = caught.exception.details["appearance"]
-        self.assertEqual(appearance["component"], "arm-1")
-        self.assertIn(
-            "cad_appearance_display_state_invalid",
-            {issue["code"] for issue in appearance["issues"]},
-        )
 
 
 if __name__ == "__main__":

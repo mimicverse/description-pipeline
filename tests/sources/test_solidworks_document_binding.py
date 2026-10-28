@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import Mock, patch
 from typing import ClassVar
 
-from description_pipeline.sources.solidworks import native
+from description_pipeline.sources.solidworks import capture_projection, native
 from description_pipeline.sources.solidworks.native import (
     ICONFIGURATION_IID,
     ICONFIGURATIONMANAGER_IID,
@@ -375,7 +375,7 @@ class ConfigurationPrimitiveTests(unittest.TestCase):
         )
         self.assertEqual(reading["reference"]["measurement_basis"], "cad_assembly_instance_measurement")
         self.assertFalse(any(reading["reference"]["overrides"].values()))
-        projected = native._project_effective_reading(reading)
+        projected = capture_projection._project_effective_reading(reading)
         self.assertEqual(projected["mass"], 1.5)
         self.assertEqual(projected["part_measurement"]["mass_kg"], 1.0)
         self.assertEqual(part["mass"], 1.0)
@@ -492,7 +492,9 @@ class ConfigurationPrimitiveTests(unittest.TestCase):
             "cad_material_read_failed",
         )
         with self.assertRaises(native.CadError) as raised:
-            native._project_mass_reading(native._raw_mass_fact(result))
+            capture_projection._project_mass_reading(
+                native._raw_mass_fact(result)
+            )
         self.assertEqual(raised.exception.code, "cad_material_read_failed")
 
     def test_unreadable_component_path_keeps_other_rows_and_records_the_error(self):

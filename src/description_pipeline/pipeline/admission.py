@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from ..interface_records import REQUEST_PURPOSES
+from ..stages import STAGE_IDS
 from ..io import PipelineError, artifact_path_parts, digest, parse_data
 from ..repository.publish import CommitSpec
 from ..schemas import (
@@ -53,14 +54,15 @@ from .publish_contract import (
     REPOSITORY_SNAPSHOT_SCHEMA,
 )
 from .verify_contract import (
+    CERTIFICATE_FIELDS,
     CERTIFICATE_FILENAME,
     CERTIFICATE_SCHEMA,
     EXECUTION_RECEIPT_FILENAME,
     OUTPUT_CONTRACT as VERIFY_OUTPUT_CONTRACT,
     REQUEST_SCHEMA as VERIFY_REQUEST_SCHEMA,
+    validate_certificate_diagnostics,
 )
 
-SUPPORTED_PROJECTION_STAGES = ("freeze", "discover", "capture", "generate", "verify", "publish")
 _SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")
 _OID40 = re.compile(r"\A[0-9a-f]{40}\Z")
 _ADMISSION_FIELDS = frozenset(
@@ -250,11 +252,11 @@ class StageExecutors:
     publish: str
 
     def __post_init__(self) -> None:
-        for name in ("freeze", "discover", "capture", "generate", "verify", "publish"):
+        for name in STAGE_IDS:
             _require_digest(getattr(self, name), "admission.invalid", f"executors.{name}")
 
     def for_stage(self, stage: StageId) -> str:
-        if stage not in {"freeze", "discover", "capture", "generate", "verify", "publish"}:
+        if stage not in STAGE_IDS:
             raise ProtocolError("admission.invalid", {"where": "executors.stage", "value": stage})
         return str(getattr(self, stage))
 
@@ -270,7 +272,7 @@ class StageExecutors:
 
     @classmethod
     def from_record(cls, record: Mapping[str, Any]) -> StageExecutors:
-        expected = {"freeze", "discover", "capture", "generate", "verify", "publish"}
+        expected = set(STAGE_IDS)
         if not isinstance(record, Mapping) or set(record) != expected:
             raise ProtocolError("admission.invalid", {"where": "executors"})
         return cls(**dict(record))
@@ -398,7 +400,7 @@ class AdmissionSpec:
             _require_text(self.parent_run_id, "admission.invalid", "parent_run_id")
             if self.parent_run_id == self.run_id:
                 raise ProtocolError("admission.invalid", {"where": "parent_run_id", "reason": "self-reference"})
-        if self.from_stage not in {None, "freeze", "discover", "capture", "generate", "verify", "publish"}:
+        if self.from_stage is not None and self.from_stage not in STAGE_IDS:
             raise ProtocolError("admission.invalid", {"where": "from_stage", "value": self.from_stage})
         if self.purpose not in REQUEST_PURPOSES:
             raise ProtocolError("admission.invalid", {"where": "purpose"})
@@ -700,14 +702,18 @@ class VerifiedDiscoverResult:
             "request_digest",
             "selection",
             "prepared_sha256",
+            "prepared_files",
+            "findings",
             "native_observation_sha256",
             "passed",
             "source_set_artifact",
             "ruleset_artifact",
             "configuration_artifact",
             "native_tool",
+            "discovery_file",
+            "findings_file",
         }
-        if not isinstance(record, Mapping) or not required <= set(record):
+        if not isinstance(record, Mapping) or set(record) != required:
             raise ProtocolError("admission.discover_result_invalid", {"where": "record"})
         if (
             record["schema_version"] != DISCOVER_RESULT_SCHEMA
@@ -830,24 +836,8 @@ class VerifiedVerifyResult:
             certificate = parse_data(certificate_bytes, Path(CERTIFICATE_FILENAME))
         except PipelineError as error:
             raise ProtocolError("admission.verify_result_invalid", {"where": "certificate"}) from error
-        required = {
-            "actual_verifier",
-            "actual_verifier_sha256",
-            "capture_artifact",
-            "config_snapshot_sha256",
-            "contract_sha256",
-            "decision",
-            "generate_artifact",
-            "passed",
-            "policy_sha256",
-            "purpose",
-            "request",
-            "request_sha256",
-            "schema_version",
-            "subject_sha256",
-            "verification_key",
-        }
-        if not isinstance(certificate, Mapping) or not required <= set(certificate):
+        required = CERTIFICATE_FIELDS
+        if not isinstance(certificate, Mapping) or set(certificate) != required:
             raise ProtocolError("admission.verify_result_invalid", {"where": "certificate"})
         proof = {key: certificate[key] for key in certificate if key != "verification_key"}
         if (
@@ -862,6 +852,13 @@ class VerifiedVerifyResult:
             or certificate.get("actual_verifier_sha256") != predecessor.decision.actual_executor_sha256
         ):
             raise ProtocolError("admission.verify_result_invalid", {"where": "certificate-identity"})
+        try:
+            validate_certificate_diagnostics(certificate)
+        except PipelineError as error:
+            raise ProtocolError(
+                "admission.verify_result_invalid",
+                {"where": "certificate-diagnostics"},
+            ) from error
         try:
             generate = ArtifactRef.from_record(certificate["generate_artifact"])
             capture = ArtifactRef.from_record(certificate["capture_artifact"])
@@ -1580,7 +1577,6 @@ __all__ = [
     "GENERATE_ARTIFACT_KIND",
     "GENERATE_OUTPUT_CONTRACT",
     "GENERATE_REQUEST_SCHEMA",
-    "SUPPORTED_PROJECTION_STAGES",
     "VERIFY_OUTPUT_CONTRACT",
     "VERIFY_REQUEST_SCHEMA",
     "AdmissionSpec",

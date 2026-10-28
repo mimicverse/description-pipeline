@@ -22,6 +22,7 @@ from .session_artifacts import (
     session_materialization_under_root,
     session_root_pid,
 )
+from .saved_state import validate_open_status
 
 SELECTION_SCHEMA = "solidworks-to-urdf.selection/v1"
 SELECTION_SCOPE = "native_staged_folder_closure"
@@ -229,12 +230,10 @@ def seal_closure_selection(
             or (item.get("instance") is not None and not isinstance(item.get("instance"), str))
             or not isinstance(item.get("resolved_path"), str)
             or not item.get("resolved_path").strip()
-            or item.get("justification") != "authored_suppression_clean_open"
         ):
             raise SelectionError(
                 "selection_closure_invalid",
-                "A suppressed placement record is incomplete; only placements justified by a clean "
-                "native open are omitted from the closure and recorded verbatim",
+                "A suppressed placement record is incomplete",
             )
     if evidence.get("upload_sha256") != digest(files):
         raise SelectionError("selection_closure_invalid", "Closure evidence carries another upload digest")
@@ -260,14 +259,46 @@ def seal_closure_selection(
             "Closure evidence must pin and restore the native search configuration",
         )
     open_status = evidence.get("open_status")
-    if (
-        not isinstance(open_status, Mapping)
-        or type(open_status.get("errors")) is not int
-        or type(open_status.get("warnings")) is not int
-        or open_status["errors"] < 0
-        or open_status["warnings"] < 0
+    try:
+        open_status = validate_open_status(open_status)
+    except ValueError as error:
+        raise SelectionError(
+            "selection_closure_invalid",
+            "Closure evidence carries no usable open status",
+            error=str(error),
+        ) from error
+    if not open_status["continuable"]:
+        raise SelectionError(
+            "selection_open_errors",
+            "Closure evidence carries unsupported SolidWorks error bits",
+            open_status=open_status,
+        )
+    evidence["open_status"] = open_status
+    saved_state_incomplete = (open_status["errors"] != 0 or open_status["warnings"] != 0)
+    expected_suppression = (
+        "suppression_with_incomplete_saved_state"
+        if saved_state_incomplete
+        else "authored_suppression_clean_open"
+    )
+    if any(item.get("justification") != expected_suppression for item in suppressed):
+        raise SelectionError(
+            "selection_closure_invalid",
+            "Suppressed placement justification differs from the native open status",
+        )
+    unresolved = evidence.get("unresolved", [])
+    if not isinstance(unresolved, list) or any(
+        not isinstance(item, Mapping)
+        or not isinstance(item.get("instance"), str)
+        or not item.get("instance")
+        or not isinstance(item.get("document"), str)
+        or not item.get("document")
+        or not isinstance(item.get("resolved_path"), str)
+        for item in unresolved
     ):
-        raise SelectionError("selection_closure_invalid", "Closure evidence carries no usable open status")
+        raise SelectionError(
+            "selection_closure_invalid",
+            "Unresolved occurrence evidence is malformed",
+        )
     session = evidence.get("session")
     if not isinstance(session, Mapping) or session.get("sealed") is not True or session.get("closed") is not True:
         raise SelectionError("selection_closure_invalid", "Closure evidence must come from a sealed, closed session")
@@ -735,6 +766,17 @@ def seal_closure_selection(
             paths=unreachable_virtual_owners,
         )
     selected = {name: files[name] for name in sorted(reachable)}
+    excluded = {name: value for name, value in files.items() if name not in selected}
+    if any(item.get("suppression_state") != 0 for item in unresolved):
+        raise SelectionError(
+            "selection_closure_invalid",
+            "An active unresolved occurrence has unreadable required engineering facts",
+        )
+    if not saved_state_incomplete and unresolved:
+        raise SelectionError(
+            "selection_closure_invalid",
+            "A clean native open cannot carry unresolved occurrence evidence",
+        )
     manifest = {
         "schema_version": SELECTION_SCHEMA,
         "scope": SELECTION_SCOPE,
@@ -744,6 +786,13 @@ def seal_closure_selection(
         "files": selected,
         "handoff_sha256": digest(selected),
         "closure": {**evidence, "main_assembly": main, "graph": checked},
-        "excluded_files": {name: value for name, value in files.items() if name not in selected},
+        "excluded_files": excluded,
     }
+    if saved_state_incomplete:
+        from .saved_state import warning_from_selection
+
+        try:
+            warning_from_selection(manifest)
+        except ValueError as error:
+            raise SelectionError("selection_closure_invalid", str(error)) from error
     return {**manifest, "selection_sha256": digest(manifest)}

@@ -6,7 +6,8 @@ import hashlib
 import json
 import unittest
 
-from description_pipeline.orchestration.portal import PortalApp, PortalError
+from description_pipeline.orchestration.portal import PortalApp, PortalError, _automatic_summary
+from description_pipeline.io import PipelineError
 from description_pipeline.orchestration.report_view import build_report
 from description_pipeline.stages import CONTRACT, stage_view
 from tests.v1.protocol_support import protocol_events
@@ -27,12 +28,44 @@ def registered_report(run_id: str = RUN_ID) -> dict:
 
 
 class RegisteredStageProjectionTests(unittest.TestCase):
+    def test_display_uses_only_certificate_and_publication_artifact(self) -> None:
+        certificate = {"decision": "FAIL", "passed": False, "subject_sha256": SUBJECT,
+                       "checks": [], "diagnostics": []}
+        publication = {"publication_subject_sha256": SUBJECT, "repository": "actual/repo",
+                       "base_ref": "main", "branch_ref": "work/current", "candidate_parents": ["parent"],
+                       "pr_effect": {"observation": {"url": "https://github.com/actual/repo/pull/1",
+                                                      "head_oid": "b" * 40, "number": 1}}}
+        projection = {
+            "state": "succeeded", "request": {},
+            "stages": {
+                "verify": {"formal_eligible": True, "qualification": {
+                    "formal_eligible": True, "scope_kind": "formal", "outcome": "completed"},
+                    "receipt": {"quality": {"passed": True, "checks": [{"id": "stale"}]}}},
+                "publish": {"receipt": {"submission": {
+                    "passed": True, "state": "published", "subject_sha256": SUBJECT,
+                    "url": "https://github.com/stale/repo/pull/2"}}},
+            },
+            "by_stage": {"verify": {"verification-certificate.json": {}},
+                         "publish": {"publication-receipt.json": {}}},
+        }
+        app = PortalApp.__new__(PortalApp)
+        app._registered_member_bytes = lambda path, member: json.dumps(
+            certificate if path.endswith("certificate.json") else publication).encode()
+        job = app._fact_display_job(projection)
+        self.assertFalse(job["formal_eligible"])
+        self.assertFalse(job["result"]["quality"]["passed"])
+        self.assertNotEqual(_automatic_summary(job)["state"], "passed")
+        self.assertEqual(job["pr"]["url"], publication["pr_effect"]["observation"]["url"])
+        certificate["diagnostics"] = [{"code": "unknown"}]
+        with self.assertRaisesRegex(PipelineError, "blocking"):
+            app._fact_display_job(projection)
+
     def setUp(self) -> None:
         self.artifacts = RegisteredProjectionArtifacts()
 
     def app(self, report: dict) -> PortalApp:
         app = PortalApp.__new__(PortalApp)
-        app._registered_stage_report = lambda projection, *, run_id, stage: report
+        app._registered_stage_report = lambda projection, *, stage: report
         return app
 
     def stage_members(
@@ -167,7 +200,6 @@ class RegisteredStageProjectionTests(unittest.TestCase):
 
         report = app._registered_stage_report(
             projection,
-            run_id=RUN_ID,
             stage="generate",
         )
 
@@ -179,7 +211,7 @@ class RegisteredStageProjectionTests(unittest.TestCase):
     ) -> None:
         app = PortalApp.__new__(PortalApp)
         app._registered_stage_report = (
-            lambda projection, *, run_id, stage: registered_report()
+            lambda projection, *, stage: registered_report()
         )
         projection = self.projection(
             {"generate": "completed"},

@@ -29,6 +29,8 @@ CAD 提供工程事实，版本化规则负责规范化、派生与有依据的�
 | `subject_digest` | 一份完整交付的不可变文件主体摘要；验证只针对该主体 |
 | 发布身份 | 仓库、硬件、base、候选分支、前置提交、交付主体及最终 commit/PR |
 
+接纳请求的 `request_id` 同时是固定 DAG `solidworks_to_urdf` 的 `dag_run_id`；Portal 首次提交、Freeze 后继、CLI 与接纳结果重读均使用这一身份，不允许额外覆盖或添加前缀。同一不可变请求可以重试；CLI 提交同一 `run_id` 下不同的完整 `AdmissionSpec` 必须拒绝。生产入口并发准备同一请求时，沿用先成功接纳的不可变事实，并经现有请求意图校验后重放；不同请求不能得到旧请求的成功结果。上传后、接纳前的字段校验失败须清理本次 intake，使用户能修正提交后使用同一幂等键重试；已接纳请求及外部结果仍按原身份对账。
+
 内容摘要对象的固定字段为 `kind="source-revision"`、`handoff_digest`、`main_assembly`、`configuration`、`hardware_id`、`records`。`records` 是实际引用的 `{reference, file_sha256}` 列表，按完整引用排序且唯一，无引用时为 `[]`；路径是包内相对路径，字符串保持封存值，不以临时绝对路径替代。按照本契约的规范 JSON 序列化求摘要，未引用规格的变化不影响结果。
 
 `source_revision_id` 不含运行 UUID、时间、显示名或工具版本。重复运行相同工程内容保持同一内容身份；新工具与新原生观察仍可产生不同交付主体。完整摘要用于机器判断，页面可展示短前缀；分支与文件名不得依赖拼接工程标签形成无界长度。
@@ -199,8 +201,8 @@ executor。各 role 只与自己的冻结 requirement 比较，禁止假设跨 r
 |---|---|---|---|
 | `freeze` 冻结输入 | Linux | originals、ruleset、platform configuration、认证主体、主装配、配置目标、用途及必填说明；artifact closure、路径、文件类型、大小和选择有效 | `stage-request.json`、`request.json`、`inputs.json`、`ruleset.json`、`configuration.json`、`checks.json`；清单闭合、字节及摘要一致；不启动 CAD |
 | `discover` 解析结构 | Windows 原生观察 + Linux 推导 | 已验证 Freeze 输出、SourceSet、ruleset/configuration identity 和准入的 native tool source/record identity；artifact 与工具身份一致 | `native-observation/`、`prepared/`、`request.json`、`checks.json`、`result.json`；原生观察、selection、ruleset 和 prepared bytes 一致 |
-| `capture` 采集证据 | Windows 原生读取 + Linux 传输核验 | 已验证 Freeze/Discover 输出和同版 native tool requirement；prepared bytes、source inventory、tool identity 与对象归属一致 | admitted tree 的 `input/`、`evidence/`、`reports/native-tool.json`、`reports/native-stages.json`、`transfer-manifest.json`；原生事实、对象和配置绑定、几何覆盖、失败保全和资源结算通过 |
-| `generate` 生成 URDF | Linux | 精确 committed Capture artifact；snapshot、schema、provenance、source warning、source binding 与 tool identity 有效 | `model/robot.json`、`urdf/robot.urdf`、`meshes/`、`tool.json`、`reports/generate.json`；确定性、完整并绑定 Capture |
+| `capture` 采集证据 | Windows 原生读取 + Linux 传输核验 | 已验证 Freeze/Discover 输出和同版 native tool requirement；prepared bytes、source inventory、tool identity 与对象归属一致 | admitted tree 的 `input/`、`evidence/`、`reports/native-tool.json`、`reports/native-stages.json`、`transfer-manifest.json`；原生字节、必需 schema、对象/配置/计划绑定、失败保全和资源结算通过 |
+| `generate` 生成 URDF | Linux | 精确 committed Capture artifact；snapshot、schema、provenance、source warning、source binding 与 tool identity 有效 | `model/robot.json`、`urdf/robot.urdf`、`meshes/`、`tool.json`、`reports/generate.json`；一次语义投影、惯量规范化与 STL 物化，结果确定且绑定 Capture |
 | `verify` 独立验证 | Linux | 精确 committed Generate/Capture pair；原始证据和实际生成字节未变 | `verification-certificate.json`、`verification-execution.json`；全部必需且适用的检查通过，并绑定 pair、verifier、contract、policy 与 subject |
 | `publish` 提交评审 PR | Linux | Generate/Capture/Verify artifacts 与 sealed RepositorySnapshot；重验、配置目标、前置基线和干净工作区有效 | `publication-receipt.json` 与 fenced Git/PR effects；copied bytes、committed tree、remote head/base、PR 和 verified subject 一致 |
 
@@ -210,7 +212,7 @@ Airflow 的任务标识依次为 `freeze / discover / capture / generate / verif
 `EffectPollTrigger`，`execute_complete()` 校验持久 wait 与 event digest 后调用
 `StageApplication.resume_stage()`。Airflow 固定为 3.3.2，并运行受管 triggerer。
 上传、原生操作派发、结果等待和传输核验均位于所属工程任务内，不作为另一套阶段。
-原生操作使用容量为一的资源池，任务重试保留操作身份；阶段重做只通过关联运行命令
+原生阶段按同一阶段契约绑定容量为一的 `windows_native` 池；等待原生结果的 deferred 任务保留池槽位并释放 Airflow worker，池容量与 deferred 占用均纳入健康核验。任务重试保留操作身份；阶段重做只通过关联运行命令
 发起，不用 backfill 或直接 clear 改写工程历史。DAG 当前设置
 `max_active_runs=8` 与 `max_active_tasks=8`，只约束调度并发；CAD 排他由 physical
 ownership、native pool 与 target/effect 冲突分别执行，不能把 scheduler 并发字段
@@ -587,7 +589,7 @@ body、face 和三角形；每个 face 的直接返回按原始次序保留，�
 这些标志不代替对象身份和归属证明，数组位置也不代表跨次稳定身份。这里的接收者是
 `IComponent2`；`IPartDoc.GetBodies2(BodyType, BVisibleOnly)` 仍用于 Part 文档查询，
 不是 occurrence 几何的备用或替代链。
-旧几何与准备收据按原 schema 保全，不能重标版本、填充新字段或自动晋升为当前输入。
+封存几何与准备收据不可改写，不得重标 schema、补造原始字段或替换来源身份。
 
 原始三角形每项为九个有限 `binary64` 数值，单位为米、坐标位于 component-local。
 封存字节保留原值与顺序，严格核验格式版本、数量和文件长度，拒绝截断、尾随字节、
@@ -601,14 +603,18 @@ persistent reference。scene 保留实际 placement，不能为简化转换替�
 
 `prepare_prepared_capture` 只绑定已封存 prepared 的 root/configuration，不打开
 COM；Freeze 保留初次准备职责。Capture 读取 scene 与内存几何事实后，按唯一会话
-所有权协议释放 CAD，再在 Windows 离线执行原值投影、惯量规范化、raw/STL 序列化
-和封包。这部分纯计算不再持有 CAD，会话释放不代表 Windows 作业已经结束。STL 从同一 raw
+所有权协议释放 CAD，再完成原值序列化与封包。Windows 不执行语义投影、惯量规范化
+或 STL 生成；Linux Capture 接纳只核字节、schema、身份、scope 与计划绑定。
+Generate 在 Linux 对同一 raw 执行一次语义投影、惯量规范化与 STL 物化。STL 从同一 raw
 三角形派生，保留 component-local 坐标，明确法向量和浮点编码的派生来源，不能重复
 应用 occurrence placement。原生错误及已取得的 partial facts 保全，不被离线异常替代。
 
+冻结原件只保留在 `input/cad/`；source scope 的逻辑引用绑定这份原件及其摘要，不另封存 `evidence/source/` 副本。virtual 文档保持独立会话、所属装配和原生对象依据，不用 owner 文件冒充。
+
 原生事实只在 `evidence/raw/native_capture_facts.json` 封存一份，由 source manifest 和
-Capture artifact 绑定其字节；`evidence/capture.json` 保留必要投影与其他证据块，不再
-内嵌完整原生事实。Generate 与独立 Verify 读取同一原始成员，各自执行匹配、派生与
+Capture artifact 绑定其字节；不保存 `evidence/capture.json` 或其他等价投影副本。
+原始三角形的 binary64 流是保真数值编码，不冒称 COM SAFEARRAY 的内存原字节。
+Generate 与独立 Verify 读取同一原始成员，各自执行匹配、派生与
 复算；原始事实缺失、被改写或与投影冲突时，按既有工程和完整性规则拒绝。
 
 独立 consumer 从 raw 字节、face spans、原始 placement、物性和基准读数复算实际
@@ -682,7 +688,7 @@ inventory，只将受约束的相对路径定位到已登记工程副本，不�
 只保存 selection、原生对象、规则、证据和 prepared bytes 身份，不另存完整机器人模型；
 不得在采集结束后从配置或结果倒造新的计划。
 
-原生记录保留直接读数、API 状态、原生引用、配置、保存状态、环境及原始几何。厂商矩阵布局、单位和原始数值先如实保全；释放 CAD 后从固定事实离线投影到 SI，变换使用行优先 4×4 齐次矩阵及列向量乘法，保留原值到结果的规则和来源 warning。工程模型生成、闭包比较、独立工程验证、诊断解释与报告渲染在 Linux 完成；格式校验和封存摘要计算属于传输职责。
+原生记录保留直接读数、API 状态、原生引用、配置、保存状态、环境及原始几何。厂商矩阵布局、单位和原始数值先如实保全；Generate 从固定事实投影到 SI，变换使用行优先 4×4 齐次矩阵及列向量乘法，保留原值到结果的规则和来源 warning。工程模型生成、闭包比较、独立工程验证、诊断解释与报告渲染在 Linux 完成；格式校验和封存摘要计算属于传输职责。
 
 当前方向处理不引入基于右手定则的新正向选择或符号推导规则，也不引入屈曲、外展等功能动作推导正向。输出遵循 URDF 既定格式和坐标约定，并按[《MimicVerse URDF 工程标准 v1》](https://hcnd2fgke1pv.feishu.cn/docx/N3iSdpYxGo151UxgBz6csCthnSb)检查表达一致性；这些约定不能用来绕过 CAD 已有有向轴及有效作者声明。斜轴保留真实机械轴，不吸附到主轴。名称、全局向量分量或镜像标记不能单独决定正向。
 
@@ -775,8 +781,10 @@ reports/verification-execution.json
 的全部文件。`manifest.json` 和阶段自有的 `reports/` 收据不进入主体；它们由各自
 schema、receipt 与 artifact identity 验证，不能把自身纳入摘要形成循环。Verify
 certificate 绑定 Generate/Capture pair、verifier、contract、policy 与 subject；
-execution receipt 绑定该 certificate。Publish receipt 再绑定 publication subject、
+execution receipt 绑定该 certificate，仅以 `execution_details` 保全 `check.details` 直接层的原始进程输出与退出信息，不重复保存检查和 warning 全表。该分离不递归改写 warning、diagnostic 或资格中的来源扩展；完整记录按规范字节去重，证书拒绝重复的顶层 diagnostics。检查、warning 与资格的唯一交付依据为 certificate；URDF、PR 和浏览器引用实际登记的证书路径，展示保留对象、字段、来源、规则及未建立资格的原值。PR 摘要达到长度上限时明确给出未展开数量与完整证书位置，不生成另一份 quality 或 structural-team 报告。Publish receipt 再绑定 publication subject、
 publication plan、候选 commit/tree 与 Git/PR effect。
+
+证书的顶层 `diagnostics` 是完整诊断清单：Verify 从顶层及每项检查的 `details.warnings`、`details.diagnostics` 汇总完整记录并按规范字节去重。每条须有非空 code 和明确布尔 blocking；PASS 不得携带阻断诊断。消费边界核对嵌套记录没有遗漏于顶层清单，报告、预览与 PR 只按显式非阻断语义展示 warning，不把未知状态改为 false。运行详情只使用登记证书及 publication receipt，不从旧阶段回执补回检查成功或 PR 身份。
 
 运行投影、活动、维护 reconciliation metadata 和 PR effect observation 保存在
 平台 facts/CAS 中，引用交付摘要，不进入模型主体。所有阶段的失败诊断由该阶段生产、
@@ -830,3 +838,11 @@ push、不重复 create/update。candidate bundle 与 publication plan 是原恢
 已合并 PR 的后续交付从确认包含该候选的当前 base 建立新基线，沿受管理分支 fast-forward 并创建下一评审 PR。已关闭且未合并的候选禁止自动重新开启，由目标负责人处理撤回原因。
 
 同一已登记 Publish command 的恢复可在重验原 effect 与证据后复用已确认结果。新运行按自身已验证有效载荷和固定基线发布；远端基线变化必须形成绑定新基线的新 Freeze 请求，最多复用父 originals，不能继承旧下游成功。原发布收据与已发生的远端结果完整保留。
+
+## 缺失引用与保存状态导出
+
+用户授权在原生模型可打开、必要工程事实可读时，对已知缺失引用发出详细 warning 并继续导出保存状态。可继续的非零打开错误仅为文件缺失位 `0x2`，且当次原生依赖枚举须提供具体缺失名称和非空路径。枚举失败、空缺失清单、非整数状态、未知或混合错误位以及空文档仍拒绝；普通整数 warning 原值保留，不要求一概归零。活动纳入对象的必需模型、文件或绑定不可读仍阻断，不能凭主装配的 `0x2` 跳过对象。Discover、Capture 与独立验证遵守相同语义。
+
+warning 绑定本次输入摘要与配置，保留原始错误／警告值、全部已枚举的缺失引用名称与路径、可获得的原生对象定位、实际读取范围和原件未改动证据。范围由唯一封存 closure 与选择清单派生，不在打开状态中重复保存文件清单或计数。明确未证明源完整性，隐藏或自动压制对象状态未知；干净打开也不自动证明完整性。无法取得的定位字段保持未知，不以名称猜测、默认值或历史参考补齐。
+
+已有来源 warning 通道承载这些事实；报告、模型来源、URDF、预览和交付 PR 从同一证据生成一致结论，不创建第二份质量状态。独立验证从封存原始观察复核 warning 与实际产物，仍验证纳入对象的几何、轴线、绑定、物性及适用检查。导出成功不建立总体机械或硬件资格；不修改、保存或重建 CAD，不自动搜索并采用包外同名文件。

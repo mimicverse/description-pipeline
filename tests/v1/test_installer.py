@@ -228,6 +228,7 @@ class ServicesRenderTest(unittest.TestCase):
 class InstallGuardsTest(unittest.TestCase):
     def _install(self, tmp: str, **env: str) -> subprocess.CompletedProcess:
         base = {
+            "PIP_FIND_LINKS": tmp,
             "AIRFLOW_VENV": f"{tmp}/venv",
             "AIRFLOW_HOME": f"{tmp}/home",
             "PIPELINE_WHEEL": f"{tmp}/wheels/mimicverse_description-0.3.25-py3-none-any.whl",
@@ -250,6 +251,9 @@ class InstallGuardsTest(unittest.TestCase):
             python.write_text(
                 '#!/bin/bash\n'
                 '[ "${1:-}" != "-c" ] || echo 3.12\n'
+                'if [ "${1:-}" = "-m" ] && [ "${2:-}" = "pip" ] && [ "${3:-}" = "install" ]; then\n'
+                '  case " $* " in *" --no-index "*) ;; *) exit 91 ;; esac\n'
+                'fi\n'
                 'if [ "${1:-}" = "-m" ] && [ "${2:-}" = "description_pipeline.orchestration.feishu_auth" ]; then\n'
                 '  echo "feishu_state_init" >> "$CALLS"\n'
                 'fi\n'

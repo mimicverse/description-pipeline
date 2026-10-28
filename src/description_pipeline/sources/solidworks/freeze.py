@@ -2,8 +2,8 @@
 
 Freeze and Discover own the first dependency closure and prepared package.
 Capture consumes those sealed bytes, opens one owned read-only session, records
-the native facts once, releases CAD, and then performs STL serialization,
-normalization, evidence projection, and snapshot publication offline.
+the native facts once, releases CAD, and writes only the raw observation,
+triangle streams, dependency closure, and runtime receipts.
 
 Nothing here derives values from a final URDF or from hand-written XML: every
 CAD value in ``raw/`` comes from the prepared native session.
@@ -18,17 +18,14 @@ import shutil
 import contextlib
 from pathlib import Path, PurePosixPath
 from typing import Any
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 
 from .errors import BridgeError, ConfigError
-from .inertia_convention import normalize_capture_inertia
-from .evidence import build_evidence, capture_environment
-from .jsonio import digest_json, read_json, sha256_file, write_json
-from .scene import material_unverified
+from .evidence import capture_environment
+from .jsonio import digest_json, sha256_file, write_json
 
 # The native adapter binds exported bytes; full mesh analysis runs on Linux.
 from ...io import confined, inventory
-from ...schemas import EFFECTIVE_INSTANCES_SCHEMA, LINK_GROUP_MASS_SCHEMA
 
 #: Freeze/capture records use the current solidworks-to-urdf contract.
 FREEZE_SCHEMA = "solidworks-to-urdf.freeze/v1"
@@ -767,327 +764,6 @@ def _exception_trace(error: BaseException) -> list[dict[str, Any]]:
     return chain
 
 
-def _component_context_record(
-    reading: dict[str, Any],
-    assembly_mass: float | None,
-) -> dict[str, Any]:
-    """Project one already-normalized component context into sealed evidence."""
-
-    instances = []
-    errors = list(reading.get("errors") or [])
-    for entry in reading.get("instances") or []:
-        name = str(entry.get("name") or "")
-        try:
-            if not name:
-                raise ValueError("component instance row has no name")
-            raw_depth = entry.get("depth")
-            if type(raw_depth) is not int:
-                raise ValueError(f"row for {name} has no integer depth")
-            parent = name.rsplit("/", 1)[0] if "/" in name else None
-            if raw_depth != name.count("/") or entry.get("parent") != parent:
-                raise ValueError(f"row for {name} has inconsistent hierarchy")
-            mass = float(entry["context_mass_kg"])
-            if not math.isfinite(mass) or mass <= 0.0:
-                raise ValueError("component mass is not finite and positive")
-            volume = entry.get("context_volume_m3")
-            volume = None if volume is None else float(volume)
-            if volume is not None and not math.isfinite(volume):
-                raise ValueError("component volume is not finite")
-            raw_overrides = entry.get("overrides")
-            if (
-                not isinstance(raw_overrides, dict)
-                or not {
-                    "OverrideMass",
-                    "OverrideCenterOfMass",
-                    "OverrideMomentsOfInertia",
-                }
-                <= set(raw_overrides)
-            ):
-                raise ValueError("component row has no complete override flags")
-            overrides = {
-                str(key): value
-                for key, value in raw_overrides.items()
-            }
-            if any(type(value) is not bool for value in overrides.values()):
-                raise ValueError("component override flags must be booleans")
-        except (KeyError, TypeError, ValueError) as error:
-            errors.append(
-                {
-                    "name": name,
-                    "error": "cad_component_context_invalid",
-                    "message": str(error)[:200],
-                }
-            )
-            continue
-        instances.append(
-            {
-                "name": name,
-                "parent": parent,
-                "depth": raw_depth,
-                "document": entry.get("document"),
-                "document_type": str(entry.get("document_type") or ""),
-                "context_mass_kg": mass,
-                "context_volume_m3": volume,
-                "overrides": overrides,
-                "effective": entry.get("effective"),
-                "effective_error": entry.get("effective_error"),
-            }
-        )
-    return {
-        "schema_version": "solidworks-to-urdf.component-mass-context/v1",
-        "status": "recorded" if not errors else "partial",
-        "assembly_mass_kg": None if assembly_mass is None else float(assembly_mass),
-        "instances": instances,
-        "errors": errors,
-        "reference": dict(reading.get("reference") or {}),
-    }
-
-
-def _mass_closure_from_projection(
-    assembly_mass: dict[str, Any] | None,
-    component_mass: dict[str, Any] | None,
-) -> dict[str, Any] | None:
-    """Project normalized assembly/component readings into one sealed closure."""
-
-    if assembly_mass is None and component_mass is None:
-        return None
-    top_mass = None
-    if isinstance(assembly_mass, dict):
-        try:
-            top_mass = float(assembly_mass["mass"])
-        except (KeyError, TypeError, ValueError):
-            assembly_mass = None
-    elif assembly_mass is not None:
-        assembly_mass = None
-    component_context = (
-        _component_context_record(component_mass, top_mass)
-        if isinstance(component_mass, dict)
-        else None
-    )
-    if assembly_mass is None or top_mass is None:
-        record: dict[str, Any] = {
-            "schema_version": "solidworks-to-urdf.mass-closure/v1",
-            "status": "unavailable",
-            "reason": "cad_mass_property_unavailable",
-            "message": "no usable assembly mass reading was projected",
-        }
-    else:
-        record = {
-            "schema_version": "solidworks-to-urdf.mass-closure/v1",
-            "status": "recorded",
-            "mode": "full",
-            "top_level": {
-                "mass": top_mass,
-                "com": [float(value) for value in assembly_mass["com"]],
-                "inertia": [
-                    [float(value) for value in row]
-                    for row in assembly_mass["inertia"]
-                ],
-                "reference": dict(assembly_mass.get("reference") or {}),
-            },
-        }
-    if component_context is not None:
-        record["component_context"] = component_context
-    return record
-
-
-def _raw_scene_payload(scene: Any, cfg: dict[str, Any], source_root: Path) -> dict[str, Any]:
-    """The raw/scene_raw.json projection of the captured scene.
-
-    Rebuilt after the component mass context runs, because the effective
-    instance readings are injected into ``scene.notes`` there and the earlier
-    file write cannot see them.
-    """
-
-    return {
-        "document": scene.document,
-        "source_document": cfg["assembly"],
-        "source_root": str(source_root),
-        "components": [
-            {
-                "name": component.name,
-                "path": component.path,
-                "transform": list(component.transform),
-                "is_fixed": component.is_fixed,
-                "document_type": component.document_type,
-            }
-            for component in scene.components
-        ],
-        "coordinate_systems": {name: list(matrix) for name, matrix in scene.coordinate_systems.items()},
-        "mass_properties": scene.mass_properties,
-        "notes": scene.notes,
-    }
-
-
-def _material_provenance_record(scene: Any, cfg: dict[str, Any]) -> dict[str, Any]:
-    """The stable warning record for CAD masses read from unverified materials.
-
-    A pure projection of ``raw/mass_properties.json``: each entry carries the verbatim
-    material assignment the reader produced next to the measured CAD values it came
-    with.  Missing explicit material is a warnable deficiency - capture, model and
-    delivery continue - but no consumer may mistake the document's default density for
-    evidence.  The record is written for every capture, with an empty ``warnings`` list
-    when every included solid carries a verified assignment.
-    """
-
-    warnings: list[dict[str, Any]] = []
-    for name, payload in sorted((scene.mass_properties or {}).items()):
-        if not material_unverified(payload):
-            continue
-        reference = payload["reference"]
-        assignment = reference["material_assignment"]
-        warnings.append(
-            {
-                "code": str(assignment["unverified_reason"]),
-                "message": str(assignment.get("message") or "material assignment is not verified"),
-                "blocking": False,
-                "component": str(name),
-                "document": reference.get("part_document"),
-                "configuration": reference.get("configuration") or assignment.get("configuration"),
-                "missing_body_indices": assignment.get("missing_body_indices"),
-                "material_assignment": assignment,
-                "measured": {
-                    "source": "cad_api",
-                    "scope": reference.get("scope"),
-                    "mass_kg": payload.get("mass"),
-                    "center_of_mass_m": payload.get("com"),
-                    "inertia_kg_m2": payload.get("inertia"),
-                    "volume_m3": reference.get("volume_m3"),
-                    "density_kg_m3": reference.get("density_kg_m3"),
-                },
-            }
-        )
-    return {
-        "schema_version": "solidworks-to-urdf.material-provenance/v1",
-        "assembly": str(cfg.get("assembly") or ""),
-        "configuration": str(cfg.get("configuration") or ""),
-        "measured_source": "cad_api",
-        "warnings": warnings,
-    }
-
-
-def _effective_instance_record(
-    scene: Any, cfg: dict[str, Any], readings: dict[str, Any], cache_error: dict[str, Any] | None = None
-) -> dict[str, Any]:
-    """The stable record for CAD-authored effective instance measurements.
-
-    A surface-only occurrence whose part document cannot answer mass questions,
-    and any overridden instance, are read through the assembly instance under
-    the ``assembly_component_group`` scope (including CAD-authored overrides).
-    The record is written for EVERY capture - with empty readings/warnings when
-    none was needed - and states plainly that these values are CAD-authored
-    effective data: not geometry-derived and not independently physically
-    qualified.  Nothing is rescaled, substituted or distributed here.
-    """
-
-    readings_payload = {
-        str(name): dict(reading) for name, reading in sorted((readings or {}).items()) if isinstance(reading, dict)
-    }
-    warnings: list[dict[str, Any]] = []
-    for name, reading in sorted(readings_payload.items()):
-        reference = dict(reading.get("reference") or {})
-        flags = dict(reference.get("overrides") or {})
-        instance_difference = reference.get("measurement_basis") == "cad_assembly_instance_measurement"
-        if not any(bool(value) for value in flags.values()) and not instance_difference:
-            continue
-        warnings.append(
-            {
-                "code": (
-                    "cad_instance_measurement_differs_from_part"
-                    if instance_difference
-                    else "cad_instance_override_effective"
-                ),
-                "blocking": False,
-                "message": (
-                    "the native assembly-instance measurement differs from the part-document measurement; "
-                    "the cause is unproven and both are retained"
-                    if instance_difference
-                    else "the instance carries CAD-authored mass-property overrides; these are effective CAD values, "
-                    "not geometry qualification"
-                ),
-                "component": name,
-                "role": reading.get("role"),
-                "document_type": reading.get("document_type"),
-                "configuration": reference.get("configuration"),
-                "part_document": reference.get("part_document"),
-                "assembly_document": reference.get("assembly_document"),
-                "assembly_configuration": reference.get("assembly_configuration"),
-                "selected_components": reference.get("selected_components"),
-                "overrides": flags,
-                "qualification": (
-                    "cad_assembly_instance_measurement; cause_of_part_difference_unproven; "
-                    "not geometry-derived, not independently physically qualified"
-                    if instance_difference
-                    else "cad_authored_effective_instance; not geometry-derived, not independently physically qualified"
-                ),
-                **({"part_measurement": reading.get("part_measurement")} if instance_difference else {}),
-                "measurement": {
-                    "scope": reference.get("scope"),
-                    "axes": reference.get("axes"),
-                    "used_api": reference.get("used_api"),
-                    "selection_api": reference.get("selection_api"),
-                    "override_api": reference.get("override_api"),
-                    "mass_kg": reading.get("mass"),
-                    "center_of_mass_m": reading.get("com"),
-                    "inertia_kg_m2": reading.get("inertia"),
-                    "volume_m3": reference.get("volume_m3"),
-                    "density_kg_m3": reference.get("density_kg_m3"),
-                },
-            }
-        )
-    for name, payload in sorted((getattr(scene, "mass_properties", None) or {}).items()):
-        if not isinstance(payload, dict) or payload.get("mode") != "effective_instance":
-            continue
-        reference = dict(payload.get("reference") or {})
-        warnings.append(
-            {
-                "code": "cad_surface_only_effective_instance",
-                "blocking": False,
-                "message": (
-                    "the part is surface-only (no solid bodies); its mass properties come from the assembly "
-                    "instance measurement, not from geometric qualification"
-                ),
-                "component": str(name),
-                "document": reference.get("part_document"),
-                "configuration": reference.get("configuration"),
-                "assembly_document": reference.get("assembly_document"),
-                "assembly_configuration": reference.get("assembly_configuration"),
-                "selected_components": reference.get("selected_components"),
-                "part_document_read": "unavailable",
-                "fallback_reason": reference.get("fallback_reason"),
-                "fallback_error_code": reference.get("fallback_error_code"),
-                "solid_bodies": reference.get("solid_bodies"),
-                "sheet_bodies": reference.get("sheet_bodies"),
-                "overrides": dict(reference.get("overrides") or {}),
-                "qualification": (
-                    "cad_authored_effective_instance; not geometry-derived, not independently physically qualified"
-                ),
-                "measurement": {
-                    "state": payload.get("state"),
-                    "measurement_basis": payload.get("measurement_basis"),
-                    "scope": reference.get("scope"),
-                    "axes": reference.get("axes"),
-                    "used_api": reference.get("used_api"),
-                    "selection_api": reference.get("selection_api"),
-                    "override_api": reference.get("override_api"),
-                    "mass_kg": payload.get("mass"),
-                    "center_of_mass_m": payload.get("com"),
-                    "inertia_kg_m2": payload.get("inertia"),
-                    "volume_m3": reference.get("volume_m3"),
-                    "density_kg_m3": reference.get("density_kg_m3"),
-                },
-            }
-        )
-    return {
-        "schema_version": EFFECTIVE_INSTANCES_SCHEMA,
-        "assembly": str(cfg.get("assembly") or ""),
-        "configuration": str(cfg.get("configuration") or ""),
-        "cache_error": cache_error,
-        "readings": readings_payload,
-        "warnings": warnings,
-    }
-
-
 def _capture_axis_references(backend: Any, cfg: dict[str, Any]) -> list[dict[str, Any]]:
     """Read raw facts for each structured joint axis reference.
 
@@ -1115,293 +791,6 @@ def _capture_axis_references(backend: Any, cfg: dict[str, Any]) -> list[dict[str
             error.partial_axis_facts = captured
             raise
     return captured
-
-
-def _geometry_destinations(geometry_dir: Path, components: list[str]) -> dict[str, str]:
-    """Return one stable binary-STL destination for every occurrence."""
-
-    geometry_dir.mkdir(parents=True, exist_ok=True)
-    destinations = {
-        component: str(geometry_dir / f"{index:04d}_{digest_json(component)[:24]}.stl")
-        for index, component in enumerate(sorted(components), start=1)
-    }
-    if len(destinations) != len(components):
-        raise BridgeError("cad_mesh_export_failed", "geometry contains duplicate occurrence identities", exit_code=3)
-    return destinations
-
-
-
-
-LINK_GROUP_SCHEMA = LINK_GROUP_MASS_SCHEMA
-LINK_GROUP_USED_API = "IMassProperty2 (SelectedItems = component set)"
-LINK_GROUP_SELECTION_RULE = "top_most_providers+uncovered_leaves"
-
-
-def _link_group_selections(cfg: dict[str, Any], scene: Any, effective: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """Compose each body's selection from the captured scene's per-instance evidence.
-
-    Provider names come from the recorded evidence exactly as the verifier
-    recomputes them (notes effective instances and effective-instance rows);
-    the shared core validates and collapses them.
-    """
-
-    leaves = [str(component.name) for component in (scene.components or [])]
-    provider_names = {str(name) for name in effective}
-    provider_names |= {
-        str(name)
-        for name, row in (getattr(scene, "mass_properties", None) or {}).items()
-        if isinstance(row, dict) and row.get("mode") == "effective_instance"
-    }
-    return _compose_link_selections(cfg, leaves, provider_names)
-
-
-def _compose_link_selections(
-    cfg: dict[str, Any], leaves: Sequence[str], provider_names: set[str]
-) -> dict[str, dict[str, Any]]:
-    """Compose each rigid body's direct-read selection (top-most providers + uncovered leaves).
-
-    Mirrors the verifier's independent recomputation: providers are effective
-    instances (any override flag or a flagless instance measurement) whose whole
-    leaf subtree lies inside one body; a nested provider collapses into the
-    top-most one; every remaining body leaf is selected individually.  Unknown
-    members, duplicated membership, providers that span or only partially cover
-    bodies, and empty selections fail the capture closed.
-    """
-
-    leaves = [str(name) for name in leaves]
-    if len(set(leaves)) != len(leaves):
-        raise BridgeError("link_group_occurrence_duplicate", "the captured scene repeats an occurrence", exit_code=3)
-    leaf_set = set(leaves)
-    bodies = list(cfg.get("groups") or [])
-    if not bodies:
-        raise BridgeError("link_group_body_missing", "native discovery defines no rigid bodies", exit_code=3)
-    body_of: dict[str, str] = {}
-    for body in bodies:
-        body_name = str(body.get("name") or body.get("id") or "")
-        if not body_name:
-            raise BridgeError("link_group_body_unnamed", "every body needs a name", exit_code=3)
-        for member in body.get("components") or []:
-            member = str(member)
-            if member not in leaf_set:
-                raise BridgeError(
-                    "link_group_member_unknown",
-                    "a body references an unknown occurrence",
-                    {"body": body_name, "component": member},
-                    exit_code=3,
-                )
-            if member in body_of:
-                raise BridgeError(
-                    "link_group_member_duplicate",
-                    "an occurrence belongs to two bodies",
-                    {"component": member, "bodies": [body_of[member], body_name]},
-                    exit_code=3,
-                )
-            body_of[member] = body_name
-    providers: dict[str, set[str]] = {}
-    for provider in sorted(provider_names):
-        subtree = {leaf for leaf in leaves if leaf == provider or leaf.startswith(provider + "/")}
-        if not subtree:
-            raise BridgeError(
-                "link_group_provider_unknown",
-                "an effective instance is not a captured occurrence",
-                {"provider": provider},
-                exit_code=3,
-            )
-        owners = {body_of.get(leaf) for leaf in subtree}
-        named = {owner for owner in owners if owner}
-        if len(named) > 1:
-            raise BridgeError(
-                "link_group_provider_spans_bodies",
-                "an effective instance spans several bodies",
-                {"provider": provider, "bodies": sorted(named), "descendants": sorted(subtree)[:50]},
-                exit_code=3,
-            )
-        if named and len(owners) != 1:
-            raise BridgeError(
-                "link_group_provider_partial",
-                "an effective instance is only partially assigned to a body",
-                {"provider": provider, "body": sorted(named)[0], "descendants": sorted(subtree)[:50]},
-                exit_code=3,
-            )
-        if not named:
-            # Entirely unassigned subtree: it cannot be a provider for any body;
-            # the closure record already accounts for the unassigned mass.
-            continue
-        providers[provider] = subtree
-    selections: dict[str, dict[str, Any]] = {}
-    for body in bodies:
-        body_name = str(body.get("name") or body.get("id") or "")
-        members = {str(item) for item in body.get("components") or []}
-        inner = [provider for provider, subtree in providers.items() if subtree <= members]
-        top_most = [
-            provider
-            for provider in inner
-            if not any(other != provider and provider.startswith(other + "/") for other in inner)
-        ]
-        covered: set[str] = set()
-        for provider in top_most:
-            covered |= providers[provider]
-        uncovered = sorted(members - covered)
-        # The native reader canonicalizes the complete selection before
-        # echoing it, so the producer must do the same. Sorting providers and
-        # uncovered leaves separately creates a second, incompatible order for
-        # mixed groups.
-        selection = sorted([*top_most, *uncovered])
-        if not selection:
-            raise BridgeError(
-                "link_group_empty_selection",
-                "a body has no selectable occurrence",
-                {"body": body_name, "members": sorted(members)},
-                exit_code=3,
-            )
-        selections[body_name] = {"selection": selection, "providers": sorted(top_most), "uncovered_leaves": uncovered}
-    return selections
-
-
-def _link_group_record_from_payload(
-    payload: Any,
-    selections: dict[str, dict[str, Any]],
-    document: str | None,
-    configuration: str,
-) -> dict[str, Any]:
-    """Validate one native link group payload against the composed selections."""
-
-    if (
-        not isinstance(payload, dict)
-        or payload.get("used_api") != LINK_GROUP_USED_API
-        or payload.get("selection_rule") != LINK_GROUP_SELECTION_RULE
-    ):
-        raise BridgeError(
-            "cad_link_group_payload_invalid",
-            "the backend returned an unexpected link group payload",
-            exit_code=3,
-        )
-    if payload.get("configuration") != configuration:
-        raise BridgeError(
-            "cad_link_group_payload_invalid",
-            "the link group payload names another configuration",
-            {
-                "expected": configuration,
-                "received": payload.get("configuration"),
-            },
-            exit_code=3,
-        )
-    links = payload.get("links")
-    if not isinstance(links, dict) or set(links) != set(selections):
-        raise BridgeError(
-            "cad_link_group_payload_invalid",
-            "the link group payload does not cover the composed bodies",
-            {"expected": sorted(selections), "received": sorted(links or [])},
-            exit_code=3,
-        )
-    for name, entry in selections.items():
-        row = links[name]
-        reads = row.get("reads") if isinstance(row, dict) else None
-        if not isinstance(row, dict) or row.get("selection") != entry["selection"]:
-            raise BridgeError(
-                "cad_link_group_payload_invalid",
-                "the link group payload echoes another selection",
-                {
-                    "body": name,
-                    "expected": entry["selection"],
-                    "received": row.get("selection") if isinstance(row, dict) else None,
-                },
-                exit_code=3,
-            )
-        if not isinstance(reads, list) or len(reads) != 2:
-            raise BridgeError(
-                "cad_link_group_payload_invalid",
-                "the link group payload must carry two reads",
-                {"body": name},
-                exit_code=3,
-            )
-        for index, read in enumerate(reads):
-            _link_group_read_valid(name, index, read)
-        reproducibility = row.get("reproducibility")
-        if not isinstance(reproducibility, dict) or set(reproducibility) != {
-            "mass_delta_kg",
-            "com_delta_norm_m",
-            "tensor_delta_max_abs",
-        }:
-            raise BridgeError(
-                "cad_link_group_payload_invalid",
-                "the link group payload carries no reproducibility record",
-                {"body": name},
-                exit_code=3,
-            )
-        for key, value in reproducibility.items():
-            if type(value) not in (int, float) or not math.isfinite(float(value)) or float(value) < 0.0:
-                raise BridgeError(
-                    "cad_link_group_payload_invalid",
-                    "the reproducibility record is malformed",
-                    {"body": name, "field": key},
-                    exit_code=3,
-                )
-    assembly = str(payload.get("assembly") or "")
-    if document and not _same_document(assembly, str(document)):
-        raise BridgeError(
-            "capture_source_mismatch",
-            "the link group read names another document",
-            {"requested": str(document), "reported": assembly},
-            exit_code=3,
-        )
-    return {
-        "schema_version": LINK_GROUP_SCHEMA,
-        "assembly": assembly,
-        "configuration": str(payload.get("configuration") or ""),
-        "used_api": LINK_GROUP_USED_API,
-        "selection_rule": LINK_GROUP_SELECTION_RULE,
-        "links": {
-            name: {
-                "selection": list(links[name]["selection"]),
-                "reads": links[name]["reads"],
-                "reproducibility": links[name]["reproducibility"],
-            }
-            for name in selections
-        },
-    }
-
-
-def _link_group_read_valid(body: str, index: int, read: Any) -> None:
-    def invalid(field: str) -> None:
-        raise BridgeError(
-            "cad_link_group_payload_invalid",
-            "a link group read is malformed",
-            {"body": body, "read": index, "field": field},
-            exit_code=3,
-        )
-
-    if not isinstance(read, dict):
-        invalid("read")
-    mass = read.get("mass_kg")
-    if type(mass) not in (int, float) or not math.isfinite(float(mass)) or float(mass) <= 0.0:
-        invalid("mass_kg")
-    com = read.get("com_m")
-    if (
-        not isinstance(com, list)
-        or len(com) != 3
-        or any(type(value) not in (int, float) or not math.isfinite(float(value)) for value in com)
-    ):
-        invalid("com_m")
-    tensor = read.get("inertia_tensor_about_com")
-    if (
-        not isinstance(tensor, list)
-        or len(tensor) != 3
-        or any(
-            not isinstance(row, list)
-            or len(row) != 3
-            or any(type(value) not in (int, float) or not math.isfinite(float(value)) for value in row)
-            for row in tensor
-        )
-    ):
-        invalid("inertia_tensor_about_com")
-    overrides = read.get("overrides")
-    if (
-        not isinstance(overrides, dict)
-        or set(overrides) != {"OverrideMass", "OverrideCenterOfMass", "OverrideMomentsOfInertia"}
-        or any(type(value) is not bool for value in overrides.values())
-    ):
-        invalid("overrides")
 
 
 def _prepared_document_state(backend: Any, document: str, configuration: str) -> dict[str, Any]:
@@ -1541,17 +930,13 @@ def _capture_prepared_local(
             document,
             str(cfg["configuration"]),
         )
-        write_json(staging / "raw" / "document_state.json", state_before)
 
         stage = "environment"
         environment = capture_environment(backend, worker_version)
         environment["prepared_capture"] = {
-            "mode": "single_read_only_prepared_capture",
             "policy": prepared_policy,
             "opened": opened,
-            "state_before": state_before,
         }
-        write_json(staging / "evidence" / "environment.json", environment)
 
         stage = "readings"
         _capture_note(activity, "readings")
@@ -1584,7 +969,6 @@ def _capture_prepared_local(
             document,
             str(cfg["configuration"]),
         )
-        write_json(staging / "raw" / "document_state_after_reads.json", state_after)
 
         stage = "release"
         _capture_note(activity, "release")
@@ -1598,107 +982,55 @@ def _capture_prepared_local(
         release()
         released = True
 
-        stage = "scene_projection"
-        _capture_note(activity, "scene_projection")
-        raw_scene = raw_facts.get("scene_raw") if isinstance(raw_facts, dict) else None
-        raw_occurrences = raw_scene.get("occurrences") if isinstance(raw_scene, dict) else None
-        for occurrence in raw_occurrences if isinstance(raw_occurrences, list) else ():
-            if not isinstance(occurrence, dict):
-                continue
-            geometry_row = raw_geometry.get(occurrence.get("name"))
-            if isinstance(geometry_row, dict) and "appearance_raw" in geometry_row:
-                occurrence["appearance_raw"] = geometry_row["appearance_raw"]
-        write_json(staging / "raw" / "native_capture_facts.json", raw_facts)
-        from .native import project_prepared_capture, project_axis_references
-
-        axis_references = project_axis_references(axis_references)
-        projected = project_prepared_capture(raw_facts)
-        scene = projected["scene"]
-        if not _same_document(str(getattr(scene, "document", "") or ""), document):
-            raise BridgeError(
-                "capture_source_mismatch",
-                "the offline scene projection named another document",
-                {"requested": document, "reported": getattr(scene, "document", None)},
-                exit_code=3,
-            )
-        backend_readings = projected["effective_instances"]
-        cache_error = projected["effective_instances_error"]
-        mass_closure = _mass_closure_from_projection(
-            projected["assembly_mass"],
-            projected["component_mass"],
-        )
-        projected_source_scopes = raw_facts["source_scopes"]
-        if not isinstance(projected_source_scopes, dict):
-            raise BridgeError(
-                "cad_prepared_capture_projection",
-                "the raw source-scope projection is not an object",
-                exit_code=3,
-            )
+        stage = "raw_observation"
+        _capture_note(activity, "raw_observation")
         source_scopes = _bind_source_scope_origins(
-            projected_source_scopes,
+            raw_facts["source_scopes"],
             closure,
             source_root,
         )
-        components = [component.name for component in scene.components]
-        for component in components if raw_geometry else ():
-            facts = raw_geometry.get(component)
-            if not isinstance(facts, dict) or facts.get("source_scope") != projected_source_scopes[component]:
-                raise BridgeError(
-                    "cad_source_scope_mismatch",
-                    "geometry facts do not bind their captured occurrence source",
-                    {"component": component},
-                    exit_code=3,
-                )
-        if cache_error is not None:
-            scene.notes["effective_instances_error"] = cache_error
-        scene.notes["effective_instances"] = backend_readings
-        raw_scene = _raw_scene_payload(scene, cfg, source_root)
-        write_json(staging / "raw" / "scene_raw.json", raw_scene)
-        write_json(staging / "raw" / "coordinate_systems.json", raw_scene["coordinate_systems"])
-        write_json(staging / "raw" / "mass_properties.json", raw_scene["mass_properties"])
-        write_json(staging / "raw" / "axis_references.json", axis_references)
-        write_json(staging / "raw" / "source_scopes.json", source_scopes)
-        write_json(
-            staging / "raw" / "material_provenance.json",
-            _material_provenance_record(scene, cfg),
-        )
-        write_json(
-            staging / "raw" / "effective_instances.json",
-            _effective_instance_record(scene, cfg, backend_readings, cache_error),
-        )
-        link_payload = projected["link_group_mass_properties"]
-        selections = _link_group_selections(cfg, scene, backend_readings)
-        link_groups = _link_group_record_from_payload(
-            link_payload,
-            selections,
-            document,
-            configuration=str(cfg["configuration"]),
-        )
-        link_groups["readout_window"] = "single-read-only-pass"
-        write_json(staging / "raw" / "link_group_mass_properties.json", link_groups)
-        if mass_closure is not None:
-            write_json(staging / "raw" / "mass_closure.json", mass_closure)
+        from .capture_geometry import seal_native_geometry
+        from .capture_projection import build_native_capture_observation
 
-        stage = "geometry"
-        _capture_note(activity, "geometry")
-        destinations = _geometry_destinations(
-            staging / "geometry",
-            components,
+        geometry_raw = seal_native_geometry(
+            raw_geometry,
+            source_scopes,
+            staging,
         )
-        from .native import materialize_native_triangles
-
-        serialized = materialize_native_triangles(raw_geometry, destinations)
-        geometry_entries = list(serialized.values())
-        write_json(staging / "raw" / "geometry.json", geometry_entries)
 
         for lock in _native_lock_files(source_root):
             lock.unlink()
         originals = _verify_sealed_capture_copy(closure)
+        source_inputs = _source_inputs(cfg, closure)
+        shutil.rmtree(source_root)
+        raw_facts = {
+            **raw_facts,
+            "source_scopes": source_scopes,
+        }
+        observation = build_native_capture_observation(
+            facts=raw_facts,
+            geometry_raw=geometry_raw,
+            axis_references_raw=axis_references,
+            document_state={
+                "before": state_before,
+                "after": state_after,
+            },
+            input_stability={
+                "originals_unchanged": originals,
+                "source_hashes": {
+                    name: {"sha256": checksum}
+                    for name, checksum in sorted(source_inputs.items())
+                },
+            },
+        )
+        write_json(
+            staging / "raw" / "native_capture_facts.json",
+            observation,
+        )
+        write_json(staging / "native-runtime.json", environment)
 
         stage = "seal"
         _capture_note(activity, "seal")
-        _seal_inertia_convention(staging)
-        source_inputs = _source_inputs(cfg, closure)
         identity = {
             "provider": SOURCE_KIND,
             "assembly": cfg["assembly"],
@@ -1714,31 +1046,6 @@ def _capture_prepared_local(
                 "mode": "sealed_prepared_single_read_only_pass",
             },
         }
-        evidence = build_evidence(
-            identity=identity,
-            environment=environment,
-            dependency_closure=closure,
-            capture={
-                "components": len(scene.components),
-                "mass_properties": len(scene.mass_properties),
-                "geometry_files": len(geometry_entries),
-                "source_hashes": {
-                    name: {"sha256": checksum}
-                    for name, checksum in sorted(source_inputs.items())
-                },
-                "collected_document": closure["top_level"],
-                "originals_unchanged": originals,
-            },
-            limits={
-                "native_cad": True,
-                "kinematics_defined_by": (
-                    "source.groups/source.axis_requests"
-                    if cfg.get("axis_requests")
-                    else "not_defined"
-                ),
-            },
-        )
-        write_json(staging / "evidence" / "collection.json", evidence)
 
         stage = "publish"
         write_manifest = _shared_manifest_writer()
@@ -1771,42 +1078,6 @@ def _capture_prepared_local(
         raise
     finally:
         activity.stop_keepalive()
-
-#: Every raw native document that records an inertia tensor, in write order.
-_CONVENTION_DOCUMENTS = (
-    "mass_properties.json",
-    "scene_raw.json",
-    "effective_instances.json",
-    "mass_closure.json",
-    "material_provenance.json",
-    "link_group_mass_properties.json",
-)
-
-
-def _seal_inertia_convention(staging: Path) -> None:
-    """The one throat: prove the product convention, normalize, seal the proof.
-
-    SolidWorks releases disagree on the sign of the products of inertia (see
-    ``inertia_convention``).  The family is proven from the capture's own sealed
-    dual reads; a positive-products capture has every recorded tensor's
-    products negated exactly once here, before the evidence block and the
-    manifest bind the raw bytes.  A capture that cannot prove exactly one
-    family refuses instead of sealing unqualified tensors.
-    """
-
-    raw = staging / "raw"
-    documents: dict[str, Any] = {}
-    for name in _CONVENTION_DOCUMENTS:
-        path = raw / name
-        if path.is_file():
-            documents[name] = read_json(path)
-    report = normalize_capture_inertia(documents)
-    if report["capture_transform"]["applied"]:
-        for name in _CONVENTION_DOCUMENTS:
-            if name in documents:
-                write_json(raw / name, documents[name])
-    write_json(raw / "inertia_convention.json", report)
-
 
 def capture_prepared(
     config: dict[str, Any],

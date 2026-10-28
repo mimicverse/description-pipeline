@@ -92,6 +92,7 @@ class NestedSelfFrameTests(unittest.TestCase):
             "suppressed": False,
             "lightweight": False,
             "suppression_state": 2,
+            "fixed": False,
             "transform": transform16(rotation_matrix, translation),
         }
 
@@ -100,6 +101,7 @@ class NestedSelfFrameTests(unittest.TestCase):
             {
                 "name": "coaxial__top-frame",
                 "type": "concentric",
+                "entity_count": 2,
                 "suppressed": False,
                 "error_code": 0,
                 "scope": "",
@@ -119,6 +121,7 @@ class NestedSelfFrameTests(unittest.TestCase):
             {
                 "name": "parallel__top-frame",
                 "type": "parallel",
+                "entity_count": 2,
                 "suppressed": False,
                 "error_code": 0,
                 "scope": "",
@@ -138,6 +141,7 @@ class NestedSelfFrameTests(unittest.TestCase):
             {
                 "name": "coincident__top-frame",
                 "type": "coincident",
+                "entity_count": 2,
                 "suppressed": False,
                 "error_code": 0,
                 "scope": "",
@@ -195,6 +199,7 @@ class NestedSelfFrameTests(unittest.TestCase):
         return {
             "name": "parallel__nested",
             "type": "parallel",
+            "entity_count": 2,
             "suppressed": False,
             "error_code": 0,
             "scope": "head-1",
@@ -306,6 +311,7 @@ class NestedSelfFrameTests(unittest.TestCase):
         shaft = {
             "name": "coaxial__pair",
             "type": "concentric",
+            "entity_count": 2,
             "suppressed": False,
             "error_code": 0,
             "scope": "head-1",
@@ -334,6 +340,7 @@ class NestedSelfFrameTests(unittest.TestCase):
         coincident_pair = {
             "name": "coincident__pair",
             "type": "coincident",
+            "entity_count": 2,
             "suppressed": False,
             "error_code": 0,
             "scope": "head-1",

@@ -48,7 +48,13 @@ def localized(kind: str, *, frame: str | None = "component-local", error=None, *
 
 
 def mate(kind: str, first: dict, second: dict) -> dict:
-    return {"name": "m1", "type": kind, "limits": None, "entities": [first, second]}
+    return {
+        "name": "m1",
+        "type": kind,
+        "entity_count": 2,
+        "limits": None,
+        "entities": [first, second],
+    }
 
 
 def rows(mate_item: dict, frames=None):
@@ -60,6 +66,20 @@ def rank(result: dict) -> int:
 
 
 class LocalizedFallbackScopeTests(unittest.TestCase):
+    def test_multi_entity_mate_never_expands_to_pairwise_constraints(self):
+        item = mate(
+            "concentric",
+            entity("A", **localized("cylinder", point=[0, 0, 0], direction=[0, 0, 1], radius=0.01)),
+            entity("B", **localized("cylinder", point=[0, 0, 0], direction=[0, 0, 1], radius=0.01)),
+        )
+        item["entity_count"] = 3
+        item["entities"].append(
+            entity("A", **localized("cylinder", point=[0, 0, 0], direction=[0, 0, 1], radius=0.01))
+        )
+
+        self.assertEqual(V._names(item), [])
+        self.assertIsNone(V._rows_for(item, FRAMES))
+
     def test_line_line_parallel_uses_localized_directions_through_the_occurrence(self) -> None:
         # B is rotated 90 degrees about Z: its local +Y is the assembly -X, parallel to A.
         item = mate(

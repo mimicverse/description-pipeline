@@ -36,7 +36,6 @@ SCHEMA_LITERAL_FIXTURES = {
     "tests/v1/test_effective_instance_integration.py",
     "tests/v1/test_quality.py",
     "tests/v1/test_stage_transfer.py",
-    "tests/v1/test_structural_report.py",
 }
 
 
@@ -66,7 +65,8 @@ class ContractConvergenceTests(unittest.TestCase):
         self.assertEqual(offenders, [])
 
     def test_portal_labels_cover_the_fixed_required_checks(self) -> None:
-        self.assertEqual(report_view._UNLABELLED_REQUIRED_CHECKS, ())
+        for identifier in FIXED_REQUIRED_CHECKS:
+            self.assertNotEqual(report_view.independent_label(identifier), identifier)
         self.assertLessEqual(FIXED_REQUIRED_CHECKS, set(report_view._INDEPENDENT_LABELS))
 
     def test_required_check_inventory_is_single_sourced(self) -> None:

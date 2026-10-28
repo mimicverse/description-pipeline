@@ -6,7 +6,9 @@ import unittest
 
 from . import _paths  # noqa: F401  (import side effect: sys.path)
 
-from description_pipeline.sources.solidworks.freeze import _component_context_record  # noqa: E402
+from description_pipeline.sources.solidworks.capture_projection import (  # noqa: E402
+    _component_context_record,
+)
 
 from . import support  # noqa: E402
 

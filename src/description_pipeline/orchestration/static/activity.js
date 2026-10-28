@@ -172,7 +172,16 @@ export function activityView(activity, { runState = "", nowMs = Date.now() } = {
     note: "",
     recent: [],
   };
-  const terminalRun = runState === "success" || runState === "failed";
+  if (runState === "unresolved") {
+    return {
+      ...empty, visible: true, final: true, state: "waiting",
+      stateText: "Awaiting reconciliation",
+      note: "External effects require reconciliation; prior activity does not prove current execution.",
+      recent: recentRows(record || {}),
+    };
+  }
+  const terminalRun =
+    runState === "success" || runState === "failed" || runState === "cancelled";
   if (terminalRun || rawState === "finished") {
     // Terminal runs keep at most a compact last-activity record for diagnosis.
     // (dot animation, elapsed ticking, staleness nagging) are gone. Legacy terminal runs

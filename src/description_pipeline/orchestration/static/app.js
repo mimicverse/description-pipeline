@@ -1,7 +1,13 @@
 // Operator page logic. All Airflow and Windows endpoint credentials stay on the server; this
 // module only talks to the portal's own JSON API and the digest-verified artifact routes.
 import { buildJointControls, createViewer, disposeRobot, loadRobot } from "/static/viewer.js";
-import { menuAction, overlayRun, resolveDeleted, resolveTitle } from "/static/run_history.js";
+import {
+  menuAction,
+  overlayRun,
+  resolveDeleted,
+  resolveTitle,
+  shouldRefreshRunList,
+} from "/static/run_history.js";
 import { activityPlacement, activityView } from "/static/activity.js";
 import {
   closureRows,
@@ -13,7 +19,7 @@ import {
   previewDiagnosticState,
   previewExpansion,
   purposeLabel,
-  registeredQualityArtifact,
+  registeredVerificationArtifact,
   stageEntersPreview,
   stageSummaryRows,
   summaryIdentity,
@@ -38,6 +44,7 @@ const state = {
   submissionKey: null,
   blockedPick: false,
   targetsRetryPick: null,
+  targetsRequest: 0,
   stages: [],
   selectedStage: null,
   viewer: null,
@@ -63,6 +70,7 @@ const RUN_STATES = {
   success: "Succeeded",
   failed: "Failed",
   unresolved: "Unresolved",
+  cancelled: "Cancelled",
 };
 const TASK_STATES = {
   success: "Succeeded",
@@ -139,6 +147,10 @@ function formatBytes(bytes) {
 function folderLabel(value) {
   const name = String(value || "").replace(/[\\/]+$/, "").split(/[\\/]/).pop();
   return name || "";
+}
+
+function assemblyLabel(value) {
+  return folderLabel(value).replace(/\.sldasm$/i, "");
 }
 
 function shortRunId(value) {
@@ -259,6 +271,8 @@ function applyAssemblies(pick) {
 }
 
 async function loadTargets(pick) {
+  const requestId = state.targetsRequest + 1;
+  state.targetsRequest = requestId;
   const row = $("target-row");
   const select = $("target-select");
   const summary = $("change-summary");
@@ -274,6 +288,7 @@ async function loadTargets(pick) {
       `/api/targets?folder=${encodeURIComponent(pick.top)}&main_assembly=${encodeURIComponent(main)}`
     );
   } catch (error) {
+    if (requestId !== state.targetsRequest || state.folderPick !== pick) return;
     // A failed fetch is not "no targets configured": keep the pick so the fetch retries once a
     // session is ready again, and say what happened instead of misreporting an empty platform.
     state.targetsRetryPick = pick;
@@ -294,6 +309,7 @@ async function loadTargets(pick) {
     updateStartEnabled();
     return;
   }
+  if (requestId !== state.targetsRequest || state.folderPick !== pick) return;
   state.targetsRetryPick = null;
   const targets = payload.targets || [];
   const placeholder = document.createElement("option");
@@ -543,7 +559,7 @@ function clearSession() {
 
 function runDisplayTitle(run) {
   const custom = String(run.title || "").trim();
-  return custom || folderLabel(run.handoff_path) || "Engineering delivery";
+  return custom || assemblyLabel(run.main_assembly) || "Engineering delivery";
 }
 
 function pad2(value) {
@@ -560,7 +576,8 @@ function formatRunTime(value) {
 }
 
 function deleteBlockedReason(run) {
-  if (run.state === "success" || run.state === "failed") return "";
+  if (run.state === "success" || run.state === "failed" || run.state === "cancelled") return "";
+  if (run.state === "unresolved") return "External effects require reconciliation before deletion.";
   if (run.state === "queued" || run.state === "running") return "This run cannot be deleted before it ends.";
   return "Run state is unknown, so deletion is unavailable.";
 }
@@ -680,7 +697,7 @@ function buildRunItem(run) {
   open.append(heading, meta);
   open.title = [
     runDisplayTitle(run),
-    folderLabel(run.handoff_path) || "Engineering folder",
+    assemblyLabel(run.main_assembly) || "Engineering delivery",
     formatTime(run.started_at),
     run.dag_run_id,
   ].join("\n");
@@ -758,8 +775,8 @@ function buildRunMenu(run) {
     input.type = "text";
     input.maxLength = 120;
     input.value = String(run.title || "");
-    input.placeholder = folderLabel(run.handoff_path) || "Engineering delivery";
-    input.title = "Leave empty and save to restore the engineering folder name; the title affects list display only.";
+    input.placeholder = assemblyLabel(run.main_assembly) || "Engineering delivery";
+    input.title = "Leave empty and save to restore the main assembly name; the title affects list display only.";
     input.setAttribute("aria-label", `Rename ${runDisplayTitle(run)}`);
     const buttons = document.createElement("div");
     buttons.className = "run-menu-buttons";
@@ -1058,30 +1075,6 @@ function checkRow(parent, row) {
 //: pass bookkeeping or per-item human confirmation.
 const WARNING_ROW_LIMIT = 8;
 const WARNING_VALUE_LIMIT = 8;
-const WARNING_VALUE_KEYS = [
-  "limits",
-  "components",
-  "links",
-  "joint",
-  "mate",
-  "mate_type",
-  "scope",
-  "mass_kg",
-  "masses",
-  "object_type",
-  "object",
-  "objects",
-  "fields",
-  "field",
-  "original",
-  "actual",
-  "source",
-  "rule_id",
-  "rule_version",
-  "reason",
-  "qualification_blocker",
-  "publication_blocker",
-];
 
 function warningValueText(value) {
   if (value === null) return "null";
@@ -1100,25 +1093,6 @@ function warningValueText(value) {
   return String(value);
 }
 
-const WARNING_SOURCE_KEYS = new Set([
-  "object_type",
-  "object",
-  "objects",
-  "fields",
-  "field",
-  "original",
-  "actual",
-  "source",
-  "rule_id",
-  "rule_version",
-  "reason",
-  "file",
-  "sha256",
-  "anchor",
-  "key",
-  "reference",
-  "native_observation_errors",
-]);
 
 function warningSourceText(value) {
   return value === undefined ? "not recorded" : warningValueText(value);
@@ -1150,6 +1124,9 @@ function appendWarningSourceRows(parent, warning) {
         ? `native_observation_errors=${warningSourceText(row.native_observation_errors)}`
         : "",
     ].filter(Boolean);
+    if (row.extra) {
+      parts.push(...Object.entries(row.extra).map(([key, value]) => `${key}=${warningValueText(value)}`));
+    }
     line.textContent = parts.join("; ");
     details.append(line);
   }
@@ -1191,30 +1168,7 @@ function stageWarningRow(row) {
     line.textContent = blockers.join("; ");
     item.append(line);
   }
-  const hasSourceRows = appendWarningSourceRows(item, row);
-  const keys = WARNING_VALUE_KEYS.filter(
-    (key) =>
-      row[key] !== undefined &&
-      row[key] !== null &&
-      !(hasSourceRows && WARNING_SOURCE_KEYS.has(key)),
-  );
-  const residual = row.residual && typeof row.residual === "object" ? Object.entries(row.residual) : [];
-  if (keys.length || residual.length) {
-    const details = expandable(item, "Recorded values");
-    const list = document.createElement("div");
-    list.className = "warning-values";
-    for (const key of keys) {
-      const line = document.createElement("p");
-      line.textContent = `${key}: ${warningValueText(row[key])}`;
-      list.append(line);
-    }
-    for (const [key, value] of residual) {
-      const line = document.createElement("p");
-      line.textContent = `residual.${key}: ${warningValueText(value)}`;
-      list.append(line);
-    }
-    details.append(list);
-  }
+  appendWarningSourceRows(item, row);
   return item;
 }
 
@@ -1433,7 +1387,7 @@ function renderStageDetail() {
   const quick = stageSummaryRows(stage.id, {
     files: state.previewFiles,
     stage,
-    quality: state.previewData ? state.previewData.quality : null,
+    certificate: state.previewData ? state.previewData.certificate : null,
     pr: run ? run.pr : null,
     subjectSha256: state.previewSubject,
   });
@@ -1595,11 +1549,11 @@ async function loadPreviewArtifactJson(artifactUrl, files, name, signal) {
   if (!files || !Object.prototype.hasOwnProperty.call(files, name)) return null;
   try {
     const response = await fetch(artifactUrl(name), { credentials: "same-origin", signal });
-    if (!response.ok) return null;
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
     return await response.json();
   } catch (error) {
     if (signal?.aborted) throw error;
-    return null;
+    throw new Error(`Cannot read registered preview artifact ${name}: ${error.message}`);
   }
 }
 
@@ -1627,11 +1581,21 @@ function fillPanelTable(host, headers, rows) {
 }
 
 async function renderPreviewPanels(preview, records, artifactUrl, signal) {
-  const data = {
-    robot: await loadPreviewArtifactJson(artifactUrl, preview.files, "model/robot.json", signal),
-    tool: await loadPreviewArtifactJson(artifactUrl, preview.files, "tool.json", signal),
-    quality: await loadPreviewArtifactJson(artifactUrl, preview.report_files, "reports/quality.json", signal),
-  };
+  const data = {};
+  const artifactErrors = [];
+  for (const [key, files, name] of [
+    ["robot", preview.files, "model/robot.json"],
+    ["tool", preview.files, "tool.json"],
+    ["certificate", preview.report_files, "verification-certificate.json"],
+  ]) {
+    try {
+      data[key] = await loadPreviewArtifactJson(artifactUrl, files, name, signal);
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      data[key] = null;
+      artifactErrors.push(error.message);
+    }
+  }
   state.previewData = data;
   const identity = summaryIdentity({ runId: state.dagRunId, subjectSha256: preview.subject_sha256 });
   const info = $("preview-info");
@@ -1641,13 +1605,21 @@ async function renderPreviewPanels(preview, records, artifactUrl, signal) {
     subjectSha256: identity.subject_sha256,
     purpose: preview.purpose,
     tool: data.tool,
-    qualitySchema: data.quality ? data.quality.schema_version : null,
-    qualificationStates: data.quality ? data.quality.qualifications : null,
+    certificateSchema: data.certificate ? data.certificate.schema_version : null,
+    qualificationStates: data.certificate ? data.certificate.qualifications : null,
   })) {
     const key = document.createElement("dt");
     key.textContent = row.key;
     const value = document.createElement("dd");
     value.textContent = row.value || "not recorded";
+    info.append(key, value);
+  }
+  for (const message of artifactErrors) {
+    const key = document.createElement("dt");
+    key.textContent = "Preview artifact";
+    const value = document.createElement("dd");
+    value.className = "error";
+    value.textContent = message;
     info.append(key, value);
   }
   const limits = jointRows(records ? records.joints : []);
@@ -1688,7 +1660,7 @@ async function renderPreviewPanels(preview, records, artifactUrl, signal) {
   );
   $("links-title").textContent = `Link/body mass and inertia (${links.length})`;
   const frames = frameRows(data.robot ? data.robot.frames : []);
-  const closure = closureRows(data.quality ? data.quality.checks : []);
+  const closure = closureRows(data.certificate ? data.certificate.checks : []);
   fillPanelTable(
     $("panel-frames"),
     ["Frame / interface", "Parent", "xyz (m)", "rpy (rad)"],
@@ -1719,7 +1691,7 @@ function startActivityTimer() {
   state.activityTimer = window.setInterval(() => {
     const run = state.lastRun;
     if (!run || run.dag_run_id !== state.dagRunId) return;
-    if (run.state === "success" || run.state === "failed") return;
+    if (run.state === "success" || run.state === "failed" || run.state === "cancelled") return;
     renderActivity(run);
   }, 1000);
 }
@@ -2108,7 +2080,7 @@ function renderRun(run) {
   const listEntry = (state.runsList || []).find((item) => item && item.dag_run_id === runId) || null;
   const deleted = resolveDeleted(run, listEntry);
   const customTitle = resolveTitle(run, listEntry);
-  $("run-heading").textContent = customTitle || folderLabel(run.handoff_path) || "Engineering folder";
+  $("run-heading").textContent = customTitle || assemblyLabel(run.main_assembly) || "Engineering delivery";
   $("run-state-label").textContent = RUN_STATES[run.state] || run.state || "State unconfirmed";
   $("run-dot").className = `dot ${runDotState(run.state)}`;
   $("run-initiator").textContent = `Initiator: ${run.operator || run.user || "not recorded"}`;
@@ -2155,13 +2127,12 @@ function renderRun(run) {
   const report = run.report && Array.isArray(run.report.stages) ? run.report : null;
   const coverage = run.coverage || {};
   const rows = [
-    ["Engineering folder", folderLabel(run.handoff_path) || "—"],
     ["State", RUN_STATES[run.state] || run.state || "—"],
     ["Started", formatTime(run.started_at)],
     ["Ended", formatTime(run.ended_at)],
   ];
   if (typeof run.main_assembly === "string" && run.main_assembly) {
-    rows.splice(1, 0, ["Main assembly", run.main_assembly]);
+    rows.unshift(["Main assembly", run.main_assembly]);
   }
   rows.splice(1, 0, ["Purpose", purposeLabel(run.purpose)]);
   const measured = report && report.measured ? report.measured : null;
@@ -2338,21 +2309,21 @@ function renderRun(run) {
 
   const findings = $("findings");
   findings.textContent = "";
-  // The automatically retained structural-team report stays directly downloadable on runs
+  // The registered verification evidence stays directly downloadable on runs
   // without a verified delivery (failed Windows or Linux runs); no URL hunting required.
-  const retainedReports = Array.isArray(run.structural_report) ? run.structural_report : [];
+  const retainedReports = Array.isArray(run.verification_reports) ? run.verification_reports : [];
   if (retainedReports.length) {
     const item = document.createElement("li");
     item.className = "report-download";
     const label = document.createElement("span");
-    label.textContent = "Structural-team report (generated):";
+    label.textContent = "Verification evidence:";
     item.append(label, " ");
     for (const entry of retainedReports) {
       const link = document.createElement("a");
       link.href = String(entry.url || "");
       link.target = "_blank";
       link.rel = "noopener";
-      link.textContent = entry.label || entry.path || "Structural-team report";
+      link.textContent = entry.label || entry.path || "Verification evidence";
       item.append(link, " ");
     }
     findings.append(item);
@@ -2509,14 +2480,14 @@ function renderPreviewDiagnostic(preview) {
       "Recorded source warnings are neither passes nor publication evidence. " +
       "Default ranges are not native mechanical limits or hardware qualifications.";
     warningDetails.append(statement);
-    const qualityArtifact = registeredQualityArtifact(preview, state.dagRunId);
-    if (qualityArtifact) {
+    const certificateArtifact = registeredVerificationArtifact(preview, state.dagRunId);
+    if (certificateArtifact) {
       const link = document.createElement("a");
-      link.href = qualityArtifact.href;
+      link.href = certificateArtifact.href;
       link.target = "_blank";
       link.rel = "noopener";
-      link.dataset.sha256 = qualityArtifact.sha256;
-      link.textContent = "Open registered quality report (reports/quality.json)";
+      link.dataset.sha256 = certificateArtifact.sha256;
+      link.textContent = "Open verification certificate";
       warningDetails.append(link);
     }
     for (const warning of diagnostic.warnings) {
@@ -2558,9 +2529,9 @@ async function loadPreview(dagRunId) {
   try {
     const preview = await api(`/api/runs/${encodeURIComponent(dagRunId)}/preview`, { signal: request.signal });
     if (request.signal.aborted || state.dagRunId !== dagRunId) return;
+    renderPreviewDiagnostic(preview);
     if (state.previewSubject === preview.subject_sha256) return;
     $("preview-meta").textContent = `Delivery subject ${String(preview.subject_sha256).slice(0, 12)}... · URDF ${preview.urdf}`;
-    renderPreviewDiagnostic(preview);
     note.hidden = true;
     setError($("preview-note"), "");
     state.viewer = ensureSingleViewer(state, () => createViewer($("viewer"))).viewer;
@@ -2630,7 +2601,7 @@ async function poll() {
     if (state.dagRunId !== dagRunId) return;
     setError($("run-error-detail"), "");
     const verified = run.automatic && run.automatic.state === "passed";
-    const diagnosable = !verified && run.state === "failed";
+    const diagnosable = !verified && ["failed", "unresolved"].includes(run.state);
     if (!verified && !diagnosable) clearPreview();
     const previous = state.lastRun;
     state.lastRun = run;
@@ -2639,16 +2610,10 @@ async function poll() {
       await loadPreview(dagRunId);
     }
     if (state.dagRunId !== dagRunId) return;
-    const jobDone = run.job && (run.job.status === "passed" || run.job.status === "failed");
-    if ((run.state === "success" || run.state === "failed") && jobDone && (!verified || state.previewSubject)) {
-      if (state.timer) window.clearInterval(state.timer);
-      state.timer = null;
-      stopActivityTimer();
-    }
-    const terminalNow = run.state === "success" || run.state === "failed";
-    if (terminalNow && !(previous && (previous.state === "success" || previous.state === "failed"))) {
-      await refreshRuns();
-    }
+    // A late effect conflict can revoke success, so canonical polling continues while
+    // this run is selected. Only live activity animation stops at a known terminal state.
+    if (["success", "failed", "cancelled", "unresolved"].includes(run.state)) stopActivityTimer();
+    if (shouldRefreshRunList(previous, run)) await refreshRuns();
   } catch (error) {
     if (state.dagRunId !== dagRunId) return;
     if (error.status === 401) {
@@ -2788,6 +2753,7 @@ function wire() {
   $("assembly-select").addEventListener("change", () => {
     state.assemblyChoice = $("assembly-select").value || null;
     updateStartEnabled();
+    if (state.folderPick) void loadTargets(state.folderPick);
   });
 
   $("cancel-button").addEventListener("click", () => {

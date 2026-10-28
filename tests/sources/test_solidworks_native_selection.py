@@ -18,7 +18,8 @@ from description_pipeline.sources.solidworks.native import (  # noqa: E402
 )
 from description_pipeline.sources.solidworks.native_selection import (  # noqa: E402
     IDENTITY_DECLARATIONS,
-    NativeSelectionReader,
+    _closure_payload,
+    project_native_closure,
 )
 from description_pipeline.sources.solidworks.selection import (  # noqa: E402
     SelectionError,
@@ -139,8 +140,7 @@ class ClosureAdmissionTests(unittest.TestCase):
     def observe(self, occurrences: list[dict], *, stored=None, files=None, **extra) -> dict:
         index = files if files is not None else self.files
         raw = readings(self.stage, occurrences, stored=stored, **extra)
-        reader = NativeSelectionReader(walker=lambda stage, main, files_: raw, reader_sha256=READER)
-        return reader.observe(self.stage, "robot.SLDASM", index)
+        return _closure_payload(self.stage, "robot.SLDASM", index, raw, READER)
 
     def resolved(self, name: str) -> str:
         return str(self.stage.joinpath(*name.split("/")))
@@ -911,17 +911,80 @@ class ClosureAdmissionTests(unittest.TestCase):
             self.observe([occurrence("cover-3", "", state=0)])
         self.assertEqual(caught.exception.code, "selection_suppressed_unresolved")
 
-    def test_open_errors_refuse_the_closure(self) -> None:
-        with self.assertRaises(SelectionError) as caught:
+    def test_known_missing_reference_error_continues_from_readable_saved_state(self) -> None:
+        payload = self.observe(
+            [occurrence("arm-1", self.resolved("arm.SLDPRT"))],
+            open={"errors": 2, "warnings": 0, "missing_references": {
+                "state": "observed",
+                "items": [{"name": "construction", "last_known_path": "C:/missing/construction.SLDPRT"}],
+            }},
+        )
+        status = payload["open_status"]
+        self.assertEqual(status["classification"], "continuable_missing_referenced_documents")
+        self.assertEqual(status["errors"], 2)
+        self.assertEqual(status["error_bits"], [{"bit": 2, "name": "swFileNotFoundError"}])
+        self.assertEqual(status["missing_references"]["items"][0]["name"], "construction")
+        self.assertNotIn("source_integrity_proven", status)
+        self.assertNotIn("actual_scope", status)
+        self.assertEqual(sorted(payload["graph"]), ["arm.SLDPRT", "robot.SLDASM"])
+        self.assertFalse(payload["preverify"]["closure_ok"] is False)
+        self.assertEqual(payload["preverify"]["verdict"], "attention")
+
+    def test_unlocated_missing_reference_error_is_not_continuable(self) -> None:
+        for missing in ({"state": "observed", "items": []}, {"state": "unavailable", "items": []}):
+            with self.subTest(missing=missing), self.assertRaises(SelectionError):
+                self.observe(
+                    [occurrence("arm-1", self.resolved("arm.SLDPRT"))],
+                    open={"errors": 2, "warnings": 0, "missing_references": missing},
+                )
+
+    def test_suppressed_unresolved_occurrence_is_recorded_in_continuable_scope(self) -> None:
+        payload = self.observe(
+            [occurrence("missing-1", "", state=0)],
+            open={"errors": 2, "warnings": 0, "missing_references": {
+                "state": "observed",
+                "items": [{"name": "construction", "last_known_path": "C:/missing/construction.SLDPRT"}],
+            }},
+        )
+        self.assertEqual(payload["unresolved"][0]["instance"], "missing-1")
+        self.assertEqual(
+            payload["observed_occurrences"][0]["instance"],
+            "missing-1",
+        )
+        self.assertEqual(payload["graph"]["robot.SLDASM"]["references"], [])
+
+    def test_missing_reference_open_cannot_exclude_active_unresolved_occurrence(self) -> None:
+        with self.assertRaises(SelectionError):
             self.observe(
-                [occurrence("arm-1", self.resolved("arm.SLDPRT"))],
-                open={"errors": 2, "warnings": 0},
-            )
-        error = caught.exception
-        self.assertEqual(error.code, "selection_open_errors")
-        item = error.detail["problems"][0]
-        self.assertEqual(item["open_errors"], 2)
-        self.assertEqual(item["document"], "robot.SLDASM")
+                [occurrence("missing-1", "", state=2)], open={"errors": 2, "warnings": 0, "missing_references": {
+                "state": "observed",
+                "items": [{"name": "construction", "last_known_path": "C:/missing/construction.SLDPRT"}],
+            }})
+
+    def test_unrelated_warning_does_not_turn_unknown_occurrences_into_missing_references(self) -> None:
+        with self.assertRaises(SelectionError):
+            self.observe([occurrence("missing-1", "", state=2)], open={"errors": 0, "warnings": 1})
+
+    def test_missing_open_does_not_hide_an_occurrence_getter_error(self) -> None:
+        for field in ("path_error", "import_error"):
+            with self.subTest(field=field), self.assertRaises(SelectionError):
+                row = occurrence("missing-1", "", state=2)
+                row[field] = "RPC unavailable"
+                self.observe([row], open={"errors": 2, "warnings": 0, "missing_references": {
+                    "state": "observed",
+                    "items": [{"name": "construction", "last_known_path": "C:/missing/construction.SLDPRT"}],
+                }})
+
+    def test_unsupported_or_mixed_open_errors_refuse_the_closure(self) -> None:
+        for errors in (1, 3, 6):
+            with self.subTest(errors=errors), self.assertRaises(SelectionError) as caught:
+                self.observe(
+                    [occurrence("arm-1", self.resolved("arm.SLDPRT"))],
+                    open={"errors": errors, "warnings": 0},
+                )
+            error = caught.exception
+            self.assertEqual(error.code, "selection_open_errors")
+            self.assertEqual(error.detail["problems"][0]["open_errors"], errors)
 
     def test_unreadable_open_status_refused(self) -> None:
         with self.assertRaises(SelectionError) as caught:
@@ -944,29 +1007,14 @@ class ClosureAdmissionTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "selection_source_changed")
 
     def test_main_must_be_an_indexed_assembly(self) -> None:
-        reader = NativeSelectionReader(walker=lambda *_: readings(self.stage, []), reader_sha256=READER)
         with self.assertRaises(SelectionError) as caught:
-            reader.observe(self.stage, "missing.SLDASM", self.files)
+            project_native_closure(self.stage, "missing.SLDASM", self.files, {}, reader_sha256=READER)
         self.assertEqual(caught.exception.code, "selection_main_invalid")
 
-    def test_reader_construction_refusals(self) -> None:
-        with self.assertRaises(SelectionError):
-            NativeSelectionReader(walker=lambda *_: {}, backend=object())
-        with self.assertRaises(SelectionError):
-            NativeSelectionReader(walker=lambda *_: {}, reader_sha256="short")
-        with self.assertRaises(SelectionError):
-            NativeSelectionReader(walker="not-callable")
-        with self.assertRaises(SelectionError):
-            NativeSelectionReader(walker=lambda *_: {}, cad_ownership_file=Path("ledger.json"))
-        with self.assertRaises(SelectionError):
-            NativeSelectionReader(backend=object(), cad_ownership_file=Path("ledger.json"))
-
-    def test_default_backend_can_be_bound_to_a_cad_ownership_file(self) -> None:
-        ledger = Path("/state/cad-ownership.json")
-        reader = NativeSelectionReader(cad_ownership_file=ledger)
-        backend = reader._walker.__self__
-        self.assertEqual(backend._cad_ownership_file, ledger)
-        self.assertIsNone(NativeSelectionReader()._walker.__self__._cad_ownership_file)
+    def test_projection_requires_the_unified_native_record_and_reader_identity(self) -> None:
+        for record, reader in (({}, READER), (None, READER), ({}, "short")):
+            with self.subTest(record=record, reader=reader), self.assertRaises(SelectionError):
+                project_native_closure(self.stage, "robot.SLDASM", self.files, record, reader_sha256=reader)
 
 
 class SearchFolderPinTests(unittest.TestCase):
@@ -1034,8 +1082,8 @@ class SearchFolderPinTests(unittest.TestCase):
 class BackendShapeIntegrationTests(unittest.TestCase):
     """The policy consumes what the real backend walk produces, not a payload."""
 
-    def test_backend_closure_readings_feed_policy_and_seal(self) -> None:
-        from .test_solidworks_native_reader import _Component, _Doc, _com_stubs
+    def test_unified_native_observation_feeds_policy_and_seal(self) -> None:
+        from .test_solidworks_native_reader import _App, _Component, _Doc, _Session, _com_stubs
         from description_pipeline.sources.solidworks.native import SolidWorksBackend
 
         tmp = tempfile.TemporaryDirectory()
@@ -1049,78 +1097,22 @@ class BackendShapeIntegrationTests(unittest.TestCase):
         get_save_calls: list = []
         robot.GetSaveFlag = lambda: (get_save_calls.append(1), False)[1]
 
-        class FakeApp:
-            @staticmethod
-            def RevisionNumber():
-                return "34.0.0"
-
-            def __init__(self):
-                self.folders = ""
-
-            def GetSearchFolders(self, folder_type):  # noqa: N802
-                return self.folders
-
-            def SetSearchFolders(self, folder_type, folders):  # noqa: N802
-                self.folders = folders
-                return True
-
-            def GetProcessID(self):  # noqa: N802
-                return 111
-
-            def GetDocumentCount(self):  # noqa: N802
-                return 0
-
-            def GetDocumentDependencies2(self, path, traverse, search, read_only):  # noqa: N802
-                assert (traverse, search, read_only) == (False, False, False)
-                return []
-
-        app = FakeApp()
-
-        class FakeSession:
-            def __init__(self):
-                self.closed = False
-
-            def connect(self, cancelled):
-                return app
-
-            def current_application(self):
-                return app
-
-            def identity(self):
-                return {
-                    "pid": 111,
-                    "executable": "fake",
-                    "ownership": "windows_job",
-                    "state": "closed" if self.closed else "active",
-                }
-
-            def close(self):
-                self.closed = True
-
-            def terminate(self):
-                self.closed = True
-
-        backend = SolidWorksBackend(session_factory=FakeSession)
-        backend._probe_document = lambda path: {
-            "doc": robot,
-            "errors": 0,
-            "warnings": 0,
-            "open_exception": None,
-            "already_open": False,
-        }
+        app = _App({str(stage / "robot.SLDASM"): robot})
+        app.GetProcessID = lambda: 111
+        backend = SolidWorksBackend(session_factory=lambda: _Session(app))
         with _com_stubs():
-            readings = backend.closure_readings(stage, "robot.SLDASM", files)
+            observation = backend.discover_native(stage, {"main_assembly": "robot.SLDASM"})
 
         for key in ("before", "pinned", "observed_after_pin", "restored", "restore_error", "apis"):
-            self.assertIn(key, readings["search"])
-        self.assertEqual(readings["search"]["observed_after_pin"], [str(stage)])
-        self.assertTrue(readings["search"]["restored"])
-        self.assertIsNone(readings["search"]["restore_error"])
-        self.assertTrue(readings["session"]["sealed"])
-        self.assertTrue(readings["session"]["closed"])
-        self.assertEqual(readings["stored_references_phase"], "preopen")
-        self.assertEqual(readings["saved_configuration"], "默认")
-        state = readings["document_state"]
+            self.assertIn(key, observation["search"])
+        self.assertEqual(observation["search"]["observed_after_pin"], [str(stage)])
+        self.assertTrue(observation["search"]["restored"])
+        self.assertIsNone(observation["search"]["restore_error"])
+        self.assertTrue(observation["session"]["sealed"])
+        self.assertTrue(observation["session"]["closed"])
+        self.assertEqual(observation["stored_references_phase"], "preopen")
+        self.assertEqual(observation["saved_configuration"], "默认")
+        state = observation["document_state"]
         self.assertEqual(state["before"]["save_flag"], False)
         self.assertEqual(state["after"]["save_flag"], False)
         self.assertEqual(state["after"]["configuration"], "默认")
@@ -1129,9 +1121,7 @@ class BackendShapeIntegrationTests(unittest.TestCase):
         # Two saved-state samples: one at open and one after the native walk.
         self.assertGreaterEqual(len(get_save_calls), 2)
 
-        payload = NativeSelectionReader(
-            walker=lambda stage_root, main, index: readings, reader_sha256=READER
-        ).observe(stage, "robot.SLDASM", files)
+        payload = project_native_closure(stage, "robot.SLDASM", files, observation, reader_sha256=READER)
         self.assertEqual(payload["graph"]["robot.SLDASM"]["references"], ["arm.SLDPRT"])
         self.assertEqual(payload["saved_configuration"], "默认")
         self.assertIn("document_state", payload)
@@ -1140,7 +1130,7 @@ class BackendShapeIntegrationTests(unittest.TestCase):
         self.assertEqual(sorted(manifest["files"]), ["arm.SLDPRT", "robot.SLDASM"])
 
     def test_real_walk_nested_materialization_and_virtual_component_seal_with_owner(self) -> None:
-        from .test_solidworks_native_reader import _Component, _Doc, _com_stubs
+        from .test_solidworks_native_reader import _App, _Component, _Doc, _Session, _com_stubs
         from description_pipeline.sources.solidworks.native import SolidWorksBackend
 
         tmp = tempfile.TemporaryDirectory()
@@ -1151,7 +1141,7 @@ class BackendShapeIntegrationTests(unittest.TestCase):
         child_doc = session_temp("swx111", "IC~~", "3915_ASM_2_ASM.stp.SLDASM")
         child = _Component("3915_ASM_2_ASM.stp-1", child_doc, doc=_Doc(child_doc))
         parent = _Component(
-            "bracket_a.stp-2", parent_doc, doc=_Doc(parent_doc), children=(child,)
+            "bracket_a.stp-2", parent_doc, doc=_Doc(parent_doc, doc_type=2, children=(child,)), children=(child,)
         )
         virtual_doc = session_temp(
             "swx111",
@@ -1162,7 +1152,7 @@ class BackendShapeIntegrationTests(unittest.TestCase):
         virtual = _Component(
             "Copy of 复件 (2) 零件10^waist-1",
             virtual_doc,
-            doc=_Doc(virtual_doc),
+            doc=_Doc(virtual_doc, configuration="默认"),
             configuration="默认",
         )
         virtual.IsVirtual = True
@@ -1175,70 +1165,12 @@ class BackendShapeIntegrationTests(unittest.TestCase):
             properties=dict(DECLARED),
         )
 
-        class FakeApp:
-            @staticmethod
-            def RevisionNumber():
-                return "34.0.0"
-
-            def __init__(self):
-                self.folders = ""
-
-            def GetSearchFolders(self, folder_type):  # noqa: N802
-                return self.folders
-
-            def SetSearchFolders(self, folder_type, folders):  # noqa: N802
-                self.folders = folders
-                return True
-
-            def GetProcessID(self):  # noqa: N802
-                return 111
-
-            def GetDocumentCount(self):  # noqa: N802
-                return 0
-
-            def GetDocumentDependencies2(self, path, traverse, search, read_only):  # noqa: N802
-                assert (traverse, search, read_only) == (False, False, False)
-                return []
-
-        app = FakeApp()
-
-        class FakeSession:
-            def __init__(self):
-                self.closed = False
-
-            def connect(self, cancelled):
-                return app
-
-            def current_application(self):
-                return app
-
-            def identity(self):
-                return {
-                    "pid": 111,
-                    "executable": "fake",
-                    "ownership": "windows_job",
-                    "state": "closed" if self.closed else "active",
-                }
-
-            def close(self):
-                self.closed = True
-
-            def terminate(self):
-                self.closed = True
-
-        backend = SolidWorksBackend(session_factory=FakeSession)
-        backend._probe_document = lambda path: {
-            "doc": robot,
-            "errors": 0,
-            "warnings": 0,
-            "open_exception": None,
-            "already_open": False,
-        }
+        app = _App({str(stage / "robot.SLDASM"): robot})
+        app.GetProcessID = lambda: 111
+        backend = SolidWorksBackend(session_factory=lambda: _Session(app))
         with _com_stubs():
-            readings = backend.closure_readings(stage, "robot.SLDASM", files)
-        payload = NativeSelectionReader(
-            walker=lambda stage_root, main, index: readings, reader_sha256=READER
-        ).observe(stage, "robot.SLDASM", files)
+            observation = backend.discover_native(stage, {"main_assembly": "robot.SLDASM"})
+        payload = project_native_closure(stage, "robot.SLDASM", files, observation, reader_sha256=READER)
         self.assertEqual(sorted(payload["graph"]), ["arm.SLDPRT", "robot.SLDASM"])
         entries = payload["imports"]
         self.assertEqual(len(entries), 2)
@@ -1289,8 +1221,7 @@ class CuPreverifyTests(unittest.TestCase):
     def observe(self, **extra) -> dict:
         occurrence_rows = [occurrence("arm-1", str(self.stage / "arm.SLDPRT"))]
         raw = readings(self.stage, occurrence_rows, **extra)
-        reader = NativeSelectionReader(walker=lambda stage, main, files_: raw, reader_sha256=READER)
-        return reader.observe(self.stage, "robot.SLDASM", self.files)
+        return _closure_payload(self.stage, "robot.SLDASM", self.files, raw, READER)
 
     def test_complete_declarations_seal_a_preverify_pass_receipt(self) -> None:
         payload = self.observe()

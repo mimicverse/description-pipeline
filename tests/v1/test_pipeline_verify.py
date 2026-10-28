@@ -62,6 +62,7 @@ from description_pipeline.schemas import DIAGNOSTIC_ADMISSION_SCHEMA, STAGE_RESU
 from description_pipeline.sources.snapshot import write_manifest
 from description_pipeline.stages import CONTRACT_SHA256
 from description_pipeline.platform.facts import FactStore
+from description_pipeline.verification.consumer import ConsumerError
 from tests.v1 import verification_fixture as hermetic
 
 PG_AVAILABLE = pgserver is not None and psycopg2 is not None
@@ -1938,10 +1939,7 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
         evidence = source / "evidence"
         facts_path = evidence / "raw/native_capture_facts.json"
         facts = read_data(facts_path)
-        geometry = {
-            row["component"]: row
-            for row in read_data(evidence / "raw/geometry.json")
-        }
+        geometry = facts["geometry_raw"]
         for occurrence in facts["scene_raw"]["occurrences"]:
             component = str(occurrence["name"])
             scope = facts["source_scopes"][component]
@@ -1982,8 +1980,7 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                 }
 
             body_rows = []
-            spans = geometry[component]["tessellation"]["face_spans"]
-            for body in geometry[component]["tessellation"]["bodies"]:
+            for body in geometry[component]["body_inventory"]:
                 body_rows.append(
                     {
                         "component": component,
@@ -1997,21 +1994,20 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                         ),
                         "faces": [
                             {
-                                "face_index": span["face_index"],
+                                "face_index": face["face_index"],
                                 "appearance": owner(
                                     "IFace2.MaterialPropertyValues"
                                 ),
                             }
-                            for span in spans
-                            if span["body_type"] == body["body_type"]
-                            and span["body_index"] == body["body_index"]
+                            for face in geometry[component][
+                                "face_inventory"
+                            ]
+                            if face["body_type"] == body["body_type"]
+                            and face["body_index"] == body["body_index"]
                         ],
                     }
                 )
-            occurrence["appearance_raw"] = {
-                "component": component,
-                "source_document_path": scope["source_document_path"],
-                "referenced_configuration": configuration,
+            geometry[component]["appearance_raw"] = {
                 "native_active_configuration": configuration,
                 "native_active_configuration_error": None,
                 "native_referenced_display_state": "Display State 1",
@@ -2176,6 +2172,42 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
         self.assertFalse((self.generate_root / "input").exists())
         self.assertFalse((self.generate_root / "evidence").exists())
 
+    def test_consumer_process_failure_is_kept_as_receipt_execution_detail(self) -> None:
+        stderr = "native consumer failure evidence"
+        failure = ConsumerError(
+            "Consumer loading failed",
+            returncode=17,
+            stderr=stderr,
+        )
+        with patch(
+            "description_pipeline.verification.solidworks_urdf.load_consumer",
+            side_effect=failure,
+        ):
+            result = self._run_verify()
+
+        execution = result[1]
+        certificate = result[2]
+        receipt = result[3]
+        self.assertEqual(execution.outcome, "failed")
+        self.assertEqual(certificate["decision"], "FAIL")
+        consumer = next(
+            row
+            for row in certificate["checks"]
+            if row["id"] == "consumer.urdf"
+        )
+        self.assertFalse(consumer["passed"])
+        self.assertNotIn("returncode", consumer["details"])
+        self.assertNotIn("stderr", consumer["details"])
+        self.assertNotIn("raw_checks", receipt)
+        self.assertNotIn("raw_diagnostics", receipt)
+        self.assertEqual(
+            receipt["execution_details"]["consumer.urdf"],
+            {
+                "returncode": 17,
+                "stderr": stderr,
+            },
+        )
+
     def test_real_verify_handler_runs_as_one_diagnostic_stage(self) -> None:
         command, claim, workspace = self._verify_request()
         scope = DiagnosticReplayScope.from_inputs(
@@ -2268,6 +2300,53 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                         effects=NoExternalEffects(),
                     )
                 self.assertFalse((workspace.root / "output").exists())
+
+    def test_nested_check_observation_reaches_certificate_preview_and_publication(self) -> None:
+        from description_pipeline.orchestration.portal import _quality_warnings
+        from description_pipeline.pipeline.stages.publish import _publication_warning_text
+        from description_pipeline.pipeline.verify_contract import validate_certificate_diagnostics
+
+        observation = {
+            "code": "cad.instance_observation", "blocking": False, "component": "arm-1",
+            "qualification": {"hardware_qualified": False}, "measured": {"mass_kg": 1.0},
+        }
+        extensions = [
+            {**observation, "detail": {"stderr": text, "stdout": "native observation"}}
+            for text in ("first recorded value", "second recorded value")
+        ]
+        evaluate = pipeline_verify.evaluate_bundle
+
+        def with_observation(*args, **kwargs):
+            report = evaluate(*args, **kwargs)
+            report["checks"][0]["details"]["warnings"] = [observation, *extensions, extensions[0]]
+            return report
+
+        with patch.object(pipeline_verify, "evaluate_bundle", side_effect=with_observation):
+            certificate = self._run_verify()[2]
+        validate_certificate_diagnostics(certificate)
+        self.assertIn(observation, certificate["diagnostics"])
+        recorded = [row for row in certificate["diagnostics"] if row["code"] == observation["code"]]
+        self.assertEqual(recorded, [observation, *extensions])
+        displayed = [row for row in _quality_warnings(certificate) if row["code"] == observation["code"]]
+        self.assertEqual(len(displayed), len(recorded))
+        for extension in extensions:
+            self.assertIn(extension, certificate["checks"][0]["details"]["warnings"])
+        body = _publication_warning_text(certificate)
+        self.assertIn(f"Verification warnings ({len(certificate['diagnostics'])} recorded)", body)
+        if observation["code"] not in body:
+            self.assertIn("additional warning records", body)
+            self.assertIn("reports/verification-certificate.json", body)
+        duplicate = copy.deepcopy(certificate)
+        duplicate["diagnostics"].append(copy.deepcopy(observation))
+        with self.assertRaisesRegex(PipelineError, "duplicate"):
+            validate_certificate_diagnostics(duplicate)
+        certificate["diagnostics"].remove(observation)
+        with self.assertRaisesRegex(PipelineError, "omit"):
+            validate_certificate_diagnostics(certificate)
+        for flag in (True, None, "false"):
+            certificate["checks"][0]["details"]["warnings"][0]["blocking"] = flag
+            with self.assertRaisesRegex(PipelineError, "diagnostic"):
+                validate_certificate_diagnostics(certificate)
 
     def test_validate_candidate_only_checks_runtime_identity(self) -> None:
         command, execution, certificate, _receipt, _bytes, _generate_ref, claim = self._run_verify()

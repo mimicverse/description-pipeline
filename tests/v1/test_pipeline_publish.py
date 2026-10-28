@@ -50,6 +50,7 @@ from description_pipeline.pipeline.stages.publish import (
     validate_publication_receipt,
 )
 from description_pipeline.repository.publish import (
+    GitHubCliPullRequestClient,
     PublicationRepository,
     PullRequestObservation,
     seal_repository_snapshot,
@@ -416,7 +417,7 @@ class _HttpPullRequests:
 
 
 class PublishFixture:
-    def __init__(self) -> None:
+    def __init__(self, *, diagnostics: list[dict] | None = None) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="publish-fixture-")
         self.root = Path(self.temporary.name)
         self.store = ArtifactStore(self.root / "cas")
@@ -455,7 +456,7 @@ class PublishFixture:
             producer_stage="generate",
             producer_tool_sha256=self.executor,
         )
-        verify_root, self.certificate = self._make_verify(capture_root, generate_root)
+        verify_root, self.certificate = self._make_verify(capture_root, generate_root, diagnostics=diagnostics)
         self.verify_ref = self.store.seal_tree(
             verify_root,
             kind=VERIFY_ARTIFACT_KIND,
@@ -549,7 +550,8 @@ class PublishFixture:
         self.handler = PublishHandler(self.store, pull_requests=self.pr)
 
     def _make_repository(self) -> None:
-        self.remote = self.root / "remote.git"
+        self.remote = self.root / "example" / "robot.git"
+        self.remote.parent.mkdir()
         git(None, "init", "--bare", "-b", "main", str(self.remote))
         seed = self.root / "seed"
         seed.mkdir()
@@ -567,7 +569,9 @@ class PublishFixture:
         git(self.repo, "config", "user.name", "Seed")
         git(self.repo, "config", "user.email", "seed@example.test")
 
-    def _make_verify(self, capture_root: Path, generate_root: Path) -> tuple[Path, dict]:
+    def _make_verify(
+        self, capture_root: Path, generate_root: Path, *, diagnostics: list[dict] | None = None
+    ) -> tuple[Path, dict]:
         pair_subject = tree_digest(
             {
                 **{"input/" + path: checksum for path, checksum in inventory(capture_root / "input").items()},
@@ -603,7 +607,7 @@ class PublishFixture:
             "config_snapshot_sha256": CONFIG_SHA,
             "contract_sha256": CONTRACT_SHA,
             "decision": "PASS",
-            "diagnostics": [],
+            "diagnostics": diagnostics or [],
             "evaluation_subject_sha256": pair_subject,
             "generate_artifact": self.generate_ref.to_record(),
             "generate_receipt_sha256": file_digest(generate_root / "reports/generate.json"),
@@ -632,9 +636,8 @@ class PublishFixture:
                 "closure_sha256": proof["closure_sha256"],
                 "command_id": "verify-command",
                 "fence": 1,
+                "execution_details": {},
                 "finished_at": "2026-10-25T00:00:01+00:00",
-                "raw_checks": [],
-                "raw_diagnostics": [],
                 "request": verify_request,
                 "request_sha256": digest(verify_request),
                 "run_id": "verify-run",
@@ -872,6 +875,159 @@ class PublishHandlerTests(unittest.TestCase):
                 )
         self.assertEqual(prepared.exception.code, "publish.target_forbidden")
         self.assertEqual(pushed.exception.code, "publish.target_forbidden")
+
+    def test_repository_validation_rejects_split_fetch_and_push_targets(self) -> None:
+        second_remote = self.fixture.root / "example" / "other.git"
+        second_remote.parent.mkdir(exist_ok=True)
+        git(None, "init", "--bare", "-b", "main", str(second_remote))
+        git(
+            self.fixture.repo,
+            "remote",
+            "set-url",
+            "--push",
+            "origin",
+            str(second_remote),
+        )
+        repository = PublicationRepository(
+            self.fixture.repo,
+            expected_origin=str(self.fixture.remote),
+        )
+        with self.assertRaises(PipelineError) as raised:
+            repository.validate()
+        self.assertEqual(
+            raised.exception.code,
+            "publish.remote_target_mismatch",
+        )
+
+    def test_push_revalidates_the_remote_target_before_git(self) -> None:
+        repository = PublicationRepository(
+            self.fixture.repo,
+            expected_origin=str(self.fixture.remote),
+        )
+        worktree = self.fixture.root / "linked-push-worktree"
+        git(
+            self.fixture.repo,
+            "config",
+            "extensions.worktreeConfig",
+            "true",
+        )
+        git(
+            self.fixture.repo,
+            "worktree",
+            "add",
+            "--detach",
+            str(worktree),
+            "HEAD",
+        )
+        second_remote = self.fixture.root / "example" / "changed.git"
+        second_remote.parent.mkdir(exist_ok=True)
+        git(None, "init", "--bare", "-b", "main", str(second_remote))
+        git(
+            worktree,
+            "config",
+            "--worktree",
+            "remote.origin.pushurl",
+            str(second_remote),
+        )
+        repository.validate()
+        with self.assertRaises(PipelineError) as raised:
+            repository.push(
+                SimpleNamespace(worktree=worktree),
+                base_ref="main",
+                branch_ref=REVIEW_BRANCH,
+                expected_head_oid=None,
+            )
+        self.assertEqual(raised.exception.code, "publish.remote_target_mismatch")
+        self.assertEqual(
+            git(
+                None,
+                "--git-dir",
+                str(second_remote),
+                "for-each-ref",
+                "--format=%(refname)",
+            ).stdout,
+            "",
+        )
+
+    def test_repository_validation_rejects_multiple_push_targets(self) -> None:
+        for name in ("other-one", "other-two"):
+            remote = self.fixture.root / "example" / f"{name}.git"
+            remote.parent.mkdir(exist_ok=True)
+            git(None, "init", "--bare", "-b", "main", str(remote))
+            git(
+                self.fixture.repo,
+                "remote",
+                "set-url",
+                "--add",
+                "--push",
+                "origin",
+                str(remote),
+            )
+        repository = PublicationRepository(
+            self.fixture.repo,
+            expected_origin=str(self.fixture.remote),
+        )
+        with self.assertRaises(PipelineError) as raised:
+            repository.validate()
+        self.assertEqual(
+            raised.exception.code,
+            "publish.remote_target_mismatch",
+        )
+
+    def test_repository_validation_rejects_insteadof_rewrites(self) -> None:
+        replacement = self.fixture.root / "rewritten.git"
+        git(None, "init", "--bare", "-b", "main", str(replacement))
+        git(
+            self.fixture.repo,
+            "config",
+            f"url.{replacement}.insteadOf",
+            str(self.fixture.remote),
+        )
+        repository = PublicationRepository(
+            self.fixture.repo,
+            expected_origin=str(self.fixture.remote),
+        )
+        with self.assertRaises(PipelineError) as raised:
+            repository.validate()
+        self.assertEqual(raised.exception.code, "publish.remote_rewrite")
+
+    def test_symlinked_repository_root_is_refused_before_resolve(self) -> None:
+        linked = self.fixture.root / "linked-repository"
+        try:
+            linked.symlink_to(self.fixture.repo, target_is_directory=True)
+        except OSError as error:
+            self.skipTest(f"The host cannot create a symbolic link: {error}")
+        with self.assertRaises(PipelineError) as raised:
+            PublicationRepository(
+                linked,
+                expected_origin=str(self.fixture.remote),
+            )
+        self.assertEqual(raised.exception.code, "publish.repository_missing")
+
+    def test_github_cli_client_always_targets_github_com(self) -> None:
+        client = GitHubCliPullRequestClient(self.fixture.repo)
+        completed = SimpleNamespace(stdout=b"[]", returncode=0)
+        with (
+            patch.dict(os.environ, {"GH_HOST": "enterprise.invalid"}),
+            patch(
+                "description_pipeline.repository.publish.subprocess.run",
+                return_value=completed,
+            ) as run,
+        ):
+            self.assertEqual(
+                client.observe(
+                    repository="mimicverse/robot",
+                    base_ref="main",
+                    head_ref="description/run-1",
+                    candidate_commit="a" * 40,
+                ),
+                (),
+            )
+        self.assertEqual(
+            run.call_args.args[0][:5],
+            ["gh", "pr", "list", "--repo", "mimicverse/robot"],
+        )
+        self.assertEqual(run.call_args.kwargs["env"]["GH_HOST"], "github.com")
 
     def test_default_pull_request_client_is_scoped_to_each_claim_workspace(self) -> None:
         bin_root = self.fixture.root / "fake-bin"
@@ -1262,6 +1418,32 @@ else:
         after = (self.fixture.pr.observe_calls, self.fixture.pr.create_calls, self.fixture.pr.update_calls)
         self.assertEqual(first.checks_sha256, second.checks_sha256)
         self.assertEqual(before, after)
+
+    def test_completed_effect_replay_rechecks_the_live_base(self) -> None:
+        self._run()
+        seed = self.fixture.root / "seed"
+        (seed / "README.md").write_text("moved after effects completed\n", encoding="utf-8")
+        git(seed, "add", "README.md")
+        git(seed, "commit", "-m", "move base after publication")
+        git(seed, "push", "origin", "main")
+        second_workspace = StageWorkspace(
+            root=self.fixture.root / "replay-workspace",
+            inputs=self.fixture.workspace.inputs,
+        )
+        second_claim = replace(
+            self.fixture.claim,
+            claim_id="publish-claim-replay",
+            fence=2,
+            owner_sha256=digest({"process": "publish-replay"}),
+        )
+        with (
+            patch.object(PublishHandler, "_prepare", side_effect=AssertionError("must not rebuild publication")),
+            patch.object(PublicationRepository, "push", side_effect=AssertionError("must not resend")),
+            patch.object(self.fixture.pr, "create", side_effect=AssertionError("must not recreate PR")),
+            patch.object(self.fixture.pr, "update", side_effect=AssertionError("must not update PR")),
+            self.assertRaisesRegex(PipelineError, "publish.base_moved"),
+        ):
+            self._run(workspace=second_workspace, claim=second_claim)
 
     def test_pull_request_reconciliation_reuses_original_outbound_without_writes(self) -> None:
         first, effect_id, intent, outbound = self._pr_recovery_inputs()
@@ -1759,6 +1941,39 @@ else:
         self.assertEqual(self.fixture.pr.create_calls, 1)
         self.assertEqual(self.fixture.pr.update_calls, 0)
 
+    def test_git_reconciliation_binds_warning_source_to_the_sealed_candidate(self) -> None:
+        self._run()
+        wait, _artifact, outbound = self._probe_source(publish_stage.GIT_EFFECT_KEY, "git-certificate-binding")
+        plan_path = outbound / publish_stage.PUBLICATION_PLAN
+        original = read_data(plan_path)
+        request_path = outbound / "request.json"
+        original_request = read_data(request_path)
+        for field, changed, code in (
+            ("verification_certificate_sha256", "f" * 64, "publish.git_recovery_certificate"),
+            ("candidate_tree", "f" * 40, "publish.candidate_bundle_facts"),
+            ("pr_body_sha256", "f" * 64, "publish.git_recovery_pr_text"),
+        ):
+            with self.subTest(field=field):
+                write_json(plan_path, {**original, field: changed})
+                write_json(
+                    request_path,
+                    {**original_request, field: changed} if field == "candidate_tree" else original_request,
+                )
+                workspace = self.fixture.root / f"git-certificate-binding-{field}"
+                with (
+                    patch.object(
+                        PublicationRepository, "observe", side_effect=AssertionError("invalid source was queried")
+                    ),
+                    self.assertRaisesRegex(PipelineError, code),
+                ):
+                    publish_stage.PublishGitReconciliationAdapter().observe(
+                        command=self.fixture.command,
+                        intent=self.fixture.effects.intents[wait.effect_id],
+                        outbound_root=outbound,
+                        workspace_root=workspace,
+                    )
+                self.assertFalse((workspace / "publish-evidence").exists())
+
     def test_resume_reuses_settled_effects_without_external_writes(self) -> None:
         first = self._run()
         self.assertEqual(first.outcome, "completed")
@@ -2112,6 +2327,103 @@ class PublishReceiptTests(unittest.TestCase):
         receipt["pr_effect"].pop("effect_id")
         with self.assertRaisesRegex(PipelineError, "incomplete"):
             validate_publication_receipt(receipt, command=fixture.command, claim=fixture.claim, artifact=artifact)
+
+
+class PublicationWarningProjectionTests(unittest.TestCase):
+    def test_saved_state_warning_is_projected_into_the_pull_request(self) -> None:
+        detail = {
+            "classification": "continuable_missing_referenced_documents",
+            "open_errors": 2,
+            "open_warnings": 1048576,
+            "configuration": "Default",
+            "missing_references": {
+                "state": "observed",
+                "items": [{"name": "missing", "last_known_path": r"C:\missing.SLDPRT"}],
+            },
+            "actual_scope": {
+                "graph_nodes": 3,
+                "occurrence_count": 7,
+                "selected_files": ["a", "b", "c"],
+                "excluded_files": ["d"],
+                "unresolved_occurrences": [{"instance": "missing-1"}],
+            },
+            "source_integrity_proven": False,
+            "rebuilt": False,
+            "mechanical_qualification_complete": False,
+            "hardware_qualified": False,
+        }
+        text = publish_stage._publication_warning_text(
+            {
+                "diagnostics": [
+                    {
+                        "code": "source.saved_state_incomplete",
+                        "blocking": False,
+                        "message": "The assembly was exported from its saved state.",
+                        "detail": detail,
+                    }
+                ]
+            }
+        )
+
+        self.assertIn("source.saved_state_incomplete", text)
+        recorded = json.loads(text.split("```json\n", 1)[1].split("\n```", 1)[0])
+        self.assertEqual(recorded["detail"], detail)
+        self.assertIn("reports/verification-certificate.json", text)
+        self.assertNotIn("reports/quality.json", text)
+
+    def test_malformed_certificate_diagnostics_cannot_be_published(self) -> None:
+        for diagnostic in (
+            {"blocking": False, "message": "Missing code"},
+            "not an object", {"code": "unknown"},
+            {"code": "unknown", "blocking": "false"},
+            {"code": "blocking", "blocking": True},
+        ):
+            with self.subTest(diagnostic=diagnostic):
+                fixture = PublishFixture(diagnostics=[diagnostic])
+                self.addCleanup(fixture.close)
+                with self.assertRaisesRegex(PipelineError, "diagnostic"):
+                    fixture.handler.execute(
+                        fixture.command, fixture.claim, fixture.workspace, effects=fixture.effects,
+                    )
+                self.assertEqual(fixture.pr.rows, [])
+
+    def test_published_warning_links_resolve_to_the_bound_certificate(self) -> None:
+        warning = {
+            "code": "limits.default_policy", "blocking": False,
+            "object": "joint:left", "detail": {"field": "limits", "hardware_qualified": False},
+        }
+        fixture = PublishFixture(diagnostics=[warning])
+        self.addCleanup(fixture.close)
+        result = fixture.handler.execute(
+            fixture.command, fixture.claim, fixture.workspace, effects=fixture.effects,
+        )
+        self.assertEqual(result.outcome, "completed")
+        body = fixture.pr.rows[0].body
+        self.assertIn("reports/verification-certificate.json", body)
+        self.assertNotIn("reports/quality.json", body)
+        raw = git(
+            None, "--git-dir", str(fixture.remote), "show",
+            f"refs/heads/{fixture.command.request['branch_ref']}:reports/verification-certificate.json",
+        ).stdout
+        certificate = json.loads(raw)
+        self.assertIn(warning, certificate["diagnostics"])
+        self.assertIn('"hardware_qualified": false', body)
+
+    def test_all_warning_kinds_keep_context_and_long_summaries_are_explicit(self) -> None:
+        warning = {
+            "code": "limits.default_policy", "blocking": False,
+            "object": "joint:left", "field": "limits",
+            "detail": {"native_cad_ranges": False, "hardware_qualified": False, "original": [0, 0]},
+        }
+        text = publish_stage._publication_warning_text({"diagnostics": [warning]})
+        recorded = json.loads(text.split("```json\n", 1)[1].split("\n```", 1)[0])
+        self.assertEqual(recorded, {k: v for k, v in warning.items() if k != "code"})
+        large = {**warning, "detail": {"objects": ["component-" + "x" * 100] * 1000}}
+        text = publish_stage._publication_warning_text({"diagnostics": [warning, large]})
+        self.assertLess(len(text), 50000)
+        self.assertIn("1 additional warning records", text)
+        self.assertIn("verification-certificate.json", text)
+
 
 
 if __name__ == "__main__":

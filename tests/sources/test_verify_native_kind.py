@@ -41,31 +41,20 @@ class NativeEvidenceKindTests(unittest.TestCase):
         (root / "input").mkdir(parents=True, exist_ok=True)
         (root / "evidence/raw").mkdir(parents=True, exist_ok=True)
         write_json(root / "input/source.json", source)
-        write_json(
-            root / "evidence/capture.json",
-            {
-                "schema_version": "solidworks-to-urdf.capture/v1",
-                # The real capture block carries no kind/evidence_class; wrong values here
-                # are ignored because the gate reads the frozen snapshot manifest.
-                "collection": {
-                    "kind": collection_kind,
-                    "evidence_class": collection_class,
-                    "identity": identity,
-                    "environment": environment,
-                    "limits": {"native_cad": True},
-                },
-            },
-        )
+        del collection_kind, collection_class
         write_json(root / "evidence/native-runtime.json", environment)
-        (root / "evidence/raw/scene_raw.json").write_text('{"scene": "raw"}', encoding="utf-8")
+        (root / "evidence/raw/native_capture_facts.json").write_text(
+            "{}\n",
+            encoding="utf-8",
+        )
         write_json(
             root / "evidence/manifest.json",
             {
-                "schema_version": "solidworks-to-urdf.source/v1",
+                "schema_version": "solidworks-to-urdf.source/v2",
                 "kind": manifest_kind,
                 "evidence_class": manifest_class,
                 "identity": identity,
-                "scene": "raw/scene_raw.json",
+                "scene": "raw/native_capture_facts.json",
                 "files": inventory(root / "evidence", exclude=("manifest.json",)),
             },
         )

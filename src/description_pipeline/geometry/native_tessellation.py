@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 import struct
 from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from ..io import PipelineError
@@ -156,6 +158,56 @@ def read_native_triangle_count(path: Path) -> int:
     return count
 
 
+@dataclass(frozen=True)
+class VerifiedNativeTriangleStream:
+    path: Path
+    sha256: str
+    triangle_count: int
+
+
+def inspect_native_triangle_stream(
+    path: Path,
+    *,
+    expected_sha256: str,
+    expected_count: int,
+) -> VerifiedNativeTriangleStream:
+    """Hash and validate one stream in a single buffered pass."""
+
+    target = Path(path)
+    _require(target.is_file(), f"native triangle stream is missing: {target.name}")
+    _require(
+        isinstance(expected_sha256, str)
+        and HEX64.fullmatch(expected_sha256) is not None,
+        "native triangle stream expected digest is malformed",
+    )
+    _require(
+        _integer(expected_count) and expected_count > 0,
+        "native triangle stream expected count is malformed",
+    )
+    digest = hashlib.sha256()
+    byte_count = 0
+    with target.open("rb") as stream:
+        header = stream.read(_RAW_HEADER.size)
+        _require(len(header) == _RAW_HEADER.size, "native triangle stream header is truncated")
+        magic, version, count = _RAW_HEADER.unpack(header)
+        _require(magic == NATIVE_TRIANGLE_STREAM_MAGIC, "native triangle stream magic is unsupported")
+        _require(version == NATIVE_TRIANGLE_STREAM_VERSION, "native triangle stream version is unsupported")
+        _require(count == expected_count, "native triangle stream count differs from its record")
+        digest.update(header)
+        byte_count += len(header)
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+            byte_count += len(block)
+    _require(digest.hexdigest() == expected_sha256, "native triangle stream digest differs")
+    expected_size = _RAW_HEADER.size + count * _RAW_TRIANGLE.size
+    _require(byte_count == expected_size, "native triangle stream size is inconsistent")
+    return VerifiedNativeTriangleStream(
+        path=target,
+        sha256=expected_sha256,
+        triangle_count=count,
+    )
+
+
 def iter_native_triangles(
     path: Path,
     *,
@@ -164,12 +216,15 @@ def iter_native_triangles(
     """Yield exact raw-order triangles without applying an occurrence transform."""
 
     target = Path(path)
-    count = read_native_triangle_count(target)
-    if expected_count is not None:
-        _require(count == expected_count, "native triangle stream count differs from its record")
+    count = read_native_triangle_count(target) if expected_count is None else expected_count
+    _require(_integer(count) and count > 0, "native triangle stream count is invalid")
     with target.open("rb") as stream:
         header = stream.read(_RAW_HEADER.size)
-        _magic, _version, _count = _RAW_HEADER.unpack(header)
+        _magic, _version, recorded_count = _RAW_HEADER.unpack(header)
+        _require(
+            recorded_count == count,
+            "native triangle stream count differs from its record",
+        )
         for triangle_index in range(count):
             payload = stream.read(_RAW_TRIANGLE.size)
             _require(
@@ -260,12 +315,18 @@ def materialize_native_stl(
     raw_path: Path,
     stl_path: Path,
     spans: Sequence[dict],
+    *,
+    triangle_count: int | None = None,
 ) -> int:
     """Convert one raw triangle stream to binary STL after the CAD session closes."""
 
     ordered = sorted(spans, key=lambda span: span["triangle_start"])
     _require(bool(ordered), "native triangle materialization has no face spans")
-    triangle_count = read_native_triangle_count(Path(raw_path))
+    triangle_count = (
+        read_native_triangle_count(Path(raw_path))
+        if triangle_count is None
+        else triangle_count
+    )
     next_start = 0
     for span in ordered:
         _require(

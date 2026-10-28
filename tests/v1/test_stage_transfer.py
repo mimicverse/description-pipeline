@@ -20,11 +20,23 @@ from packaging.utils import canonicalize_name
 from description_pipeline import __version__ as PIPELINE_VERSION
 from description_pipeline.build.archive import write_zip
 from description_pipeline.delivery import PIPELINE_ID
+from description_pipeline.geometry.native_scope import (
+    native_scope_identity_sha256,
+)
+from description_pipeline.geometry.native_tessellation import (
+    native_triangle_relative_path,
+    write_native_triangle_stream,
+)
 from description_pipeline.io import PipelineError, canonical, digest, file_digest, inventory, read_data, write_json
 from description_pipeline.orchestration import stage_transfer as transfer
 from description_pipeline.pipeline.contracts import ArtifactRef
+from description_pipeline.request_evidence import build_request_evidence
 from description_pipeline.runtime import RUNTIME_VERSIONS, required_packages
-from description_pipeline.schemas import SOURCE_RECORD_SCHEMA
+from description_pipeline.schemas import (
+    CAPTURE_EVIDENCE_REQUESTS,
+    NATIVE_CAPTURE_OBSERVATION_SCHEMA,
+    SOURCE_RECORD_SCHEMA,
+)
 from description_pipeline import native_transfer
 from description_pipeline.interface_records import record_archive_path
 from description_pipeline.sources.solidworks.capture_transaction import (
@@ -151,7 +163,9 @@ def _capture_events(
         f"input/{name.removeprefix('cad/')}": checksum
         for name, checksum in input_inventory.items()
     }
-    prepared_inputs["input/capture-plan.json"] = file_digest(root / "evidence/capture-plan.json")
+    prepared_inputs["input/capture-plan.json"] = file_digest(
+        root / "input/capture-plan.json"
+    )
     return [
         event(
             0,
@@ -161,7 +175,6 @@ def _capture_events(
                 "input",
                 "input.valid",
                 {
-                    "cad_revision": handoff_record["cad_revision"],
                     "files": {
                         f"input/{name}": checksum
                         for name, checksum in input_inventory.items()
@@ -235,13 +248,6 @@ def capture_root(
     if digest(upload_files) != upload:
         raise AssertionError("upload fixture digest differs from its inventory")
     package_files = {f"cad/{name}": checksum for name, checksum in native_files.items()}
-    cad_revision = {
-        "change_summary": "fixture",
-        "control": None,
-        "hardware_id": "fixture",
-        "owner": None,
-        "revision": "r1",
-    }
     source_identity = {
         "configuration": "Default",
         "handoff_digest": upload,
@@ -275,29 +281,23 @@ def capture_root(
     discovery = {
         "schema_version": "solidworks-to-urdf.native-discovery/v1",
         "run_id": run_id,
+        "derivation": {
+            "main_assembly": main,
+            "configuration": "Default",
+            "record_roots": [],
+        },
         "identity": {
             "delivery_configuration": "Default",
             "hardware_id": "fixture",
             "main_assembly": main,
             "revision": "r1",
+            "robot_name": "robot",
         },
         "handoff_sha256": handoff,
         "native_files": native_files,
-        "files": [
-            {"path": name, "sha256": checksum}
-            for name, checksum in sorted(native_files.items())
-        ],
-        "native_inventory_sha256": digest(
-            [
-                {"path": name, "sha256": checksum}
-                for name, checksum in sorted(native_files.items())
-            ]
-        ),
         "records": [],
         "findings": [],
-        "robot_name": "robot",
     }
-    write_json(root / "evidence/discovery.json", discovery)
     write_json(root / "input/discovery/native-discovery.json", discovery)
     write_json(
         root / "input/discovery/findings.json",
@@ -321,7 +321,6 @@ def capture_root(
                 },
             },
             "input_receipt": {"inventory": dict(sorted(native_files.items()))},
-            "cad_revision": cad_revision,
             "package_files": dict(sorted(package_files.items())),
             "main_assembly": main,
             "configuration": "Default",
@@ -329,8 +328,6 @@ def capture_root(
     )
     evidence = root / "evidence"
     (evidence / "raw").mkdir(parents=True)
-    (evidence / "evidence").mkdir()
-    write_json(evidence / "raw/scene_raw.json", {"components": [], "mates": []})
     main_root = ntpath.dirname(main.replace("/", "\\"))
     source_inputs = {}
     for name, checksum in native_files.items():
@@ -359,14 +356,6 @@ def capture_root(
         "top_level": str(root / "input/cad" / main),
     }
     write_json(evidence / "raw/dependency_closure.json", dependency_closure)
-    material = {
-        "assembly": str(root / "input/cad" / main),
-        "configuration": "Default",
-        "measured_source": "cad_api",
-        "schema_version": "solidworks-to-urdf.material-provenance/v1",
-        "warnings": [],
-    }
-    write_json(evidence / "raw/material_provenance.json", material)
     tool = native_tool()
     environment = {
         "captured_at": "2026-10-10T00:00:00Z",
@@ -389,11 +378,191 @@ def capture_root(
         "solidworks_revision": "34.4.1",
         "dependency_digest": digest(dependency_inputs),
     }
-    collection = {
-        "identity": identity,
-        "environment": environment,
-        "capture": {
-            "collected_document": str(root / "input/cad" / main),
+    write_json(evidence / "native-runtime.json", environment)
+    source_scope = {
+        "source_document_path": str(root / "input/cad" / main),
+        "source_document_identity_kind": "file_sha256",
+        "source_document_sha256": native_files[main],
+        "source_copy_path": "source/" + main,
+        "source_copy_sha256": native_files[main],
+        "referenced_configuration": "Default",
+        "virtual_owner": None,
+        "virtual_owner_sha256": None,
+        "virtual_session_temp_root": None,
+        "virtual_native_api_pid": None,
+    }
+    triangle_values = [
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+    ]
+    stream_name = "raw/triangles/fixture.triangles"
+    stream = evidence / stream_name
+    triangle_count = write_native_triangle_stream(
+        stream,
+        triangle_values,
+    )
+    stream_sha256 = file_digest(stream)
+    stream_relative = native_triangle_relative_path(stream_sha256)
+    canonical_stream = evidence / stream_relative
+    canonical_stream.parent.mkdir(parents=True, exist_ok=True)
+    stream.replace(canonical_stream)
+    transform_raw = [
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+    ]
+    native_raw_mass = {
+        "mass_kg": 1.0,
+        "center_of_mass_m": [0.0, 0.0, 0.0],
+        "inertia_values": [
+            0.001,
+            0.0,
+            0.0,
+            0.0,
+            0.001,
+            0.0,
+            0.0,
+            0.0,
+            0.001,
+        ],
+        "overrides": {
+            "OverrideMass": False,
+            "OverrideCenterOfMass": False,
+            "OverrideMomentsOfInertia": False,
+        },
+    }
+    mass_read = {
+        "native_raw": copy.deepcopy(native_raw_mass),
+        "reference": {"scope": "part_document"},
+        "read_errors": {},
+    }
+    link_read = {
+        "mass_kg": 1.0,
+        "com_m": [0.0, 0.0, 0.0],
+        "inertia_values_raw": copy.deepcopy(
+            native_raw_mass["inertia_values"]
+        ),
+        "inertia_values_about_origin_api": None,
+        "overrides": copy.deepcopy(native_raw_mass["overrides"]),
+        "read_errors": {},
+    }
+    native_facts = {
+        "schema_version": NATIVE_CAPTURE_OBSERVATION_SCHEMA,
+        "scene_raw": {
+            "document": str(root / "input/cad" / main),
+            "configuration": "Default",
+            "occurrences": [
+                {
+                    "name": main,
+                    "path": str(root / "input/cad" / main),
+                    "transform_raw": transform_raw,
+                    "referenced_configuration": "Default",
+                    "suppression_state": 2,
+                    "is_fixed": True,
+                    "document_type": "assembly",
+                }
+            ],
+            "components": [
+                {
+                    "name": main,
+                    "path": str(root / "input/cad" / main),
+                    "suppression_state": 2,
+                    "is_fixed": True,
+                    "document_type": "assembly",
+                }
+            ],
+            "coordinate_systems": {},
+        },
+        "part_mass_raw": {main: copy.deepcopy(mass_read)},
+        "assembly_mass_raw": copy.deepcopy(mass_read),
+        "component_mass_raw": {
+            "assembly": str(root / "input/cad" / main),
+            "configuration": "Default",
+            "instances": [
+                {
+                    "name": main,
+                    "parent": None,
+                    "depth": 0,
+                    "document": str(root / "input/cad" / main),
+                    "document_type": "assembly",
+                    "context_mass_kg": 1.0,
+                    "context_volume_m3": None,
+                    "overrides": copy.deepcopy(
+                        native_raw_mass["overrides"]
+                    ),
+                    "read_errors": {},
+                }
+            ],
+            "errors": [],
+            "reference": {},
+        },
+        "link_group_mass_raw": {
+            "assembly": str(root / "input/cad" / main),
+            "configuration": "Default",
+            "used_api": "IMassProperty2 (SelectedItems = component set)",
+            "selection_rule": "top_most_providers+uncovered_leaves",
+            "links": {
+                "body": {
+                    "selection": [main],
+                    "reads": [
+                        copy.deepcopy(link_read),
+                        copy.deepcopy(link_read),
+                    ],
+                }
+            },
+        },
+        "source_scopes": {main: source_scope},
+        "geometry_raw": {
+            main: {
+                "stream_path": stream_relative,
+                "stream_sha256": stream_sha256,
+                "triangle_count": triangle_count,
+                "body_inventory": [],
+                "face_inventory": [],
+                "body_counts": {"solid": 0, "sheet": 0},
+                "used_api": "fixture",
+                "source_scope_sha256": native_scope_identity_sha256(
+                    source_scope
+                ),
+                "appearance_raw": None,
+            }
+        },
+        "axis_references_raw": [],
+        "document_state": {
+            "before": {
+                "path": str(root / "input/cad" / main),
+                "active_configuration": "Default",
+                "read_only": True,
+                "save_flag": False,
+            },
+            "after": {
+                "path": str(root / "input/cad" / main),
+                "active_configuration": "Default",
+                "read_only": True,
+                "save_flag": False,
+            },
+        },
+        "input_stability": {
             "originals_unchanged": {
                 "files_checked": len(native_files),
             },
@@ -402,30 +571,42 @@ def capture_root(
                 for name, checksum in sorted(source_inputs.items())
             },
         },
+        "notes": {},
     }
-    write_json(evidence / "evidence/collection.json", collection)
-    write_json(evidence / "evidence/environment.json", environment)
-    # The capture stage declares evidence/capture.json, evidence/geometry/ and
-    # evidence/native-runtime.json as native outputs; the synthetic tree carries
-    # them so a sealed capture delivery covers its stage contract.
+    write_json(evidence / "raw/native_capture_facts.json", native_facts)
     write_json(
-        evidence / "capture.json",
-        {
-            "collection": collection,
-            "dependency_closure": dependency_closure,
-            "material_provenance": material,
-        },
-    )
-    write_json(evidence / "native-runtime.json", environment)
-    write_json(
-        evidence / "capture-plan.json",
+        root / "input/capture-plan.json",
         {
             "schema_version": "solidworks-to-urdf.capture-plan/v1",
-            "objects": [],
+            "run_id": run_id,
+            "handoff_sha256": handoff,
+            "discovery_sha256": file_digest(
+                root / "input/discovery/native-discovery.json"
+            ),
+            "main_assembly": main,
+            "configuration": "Default",
+            "identity": {"hardware_id": "fixture", "revision": "r1"},
+            "selection": {"files": native_files},
+            "objects": [
+                {
+                    "name": main,
+                    "document": main,
+                    "state": 2,
+                }
+            ],
+            "groups": [
+                {"name": "body", "components": [main]}
+            ],
+            "axis_requests": [],
+            "datums": [],
+            "evidence_requests": list(CAPTURE_EVIDENCE_REQUESTS),
         },
     )
-    (evidence / "geometry").mkdir()
-    (evidence / "geometry/base.stl").write_bytes(b"STL-BYTES")
+    handoff_record = read_data(root / "input/handoff.json")
+    handoff_record["package_files"]["capture-plan.json"] = file_digest(
+        root / "input/capture-plan.json"
+    )
+    write_json(root / "input/handoff.json", handoff_record)
     write_manifest(
         evidence,
         kind="solidworks",
@@ -438,20 +619,6 @@ def capture_root(
         root / "reports/native-stages.json",
         stage_view(run_id=run_id, handoff=handoff, events=events),
     )
-    # The native capture stamps the structural-team reports beside the sealed payload; they
-    # must travel with the archive so the Linux side can always hand them to the team.
-    write_json(
-        root / "reports/structural-team.json",
-        {
-            "schema_version": "solidworks-to-urdf.structural-report/v1",
-            "run_id": run_id,
-            "state": "native_complete",
-            "main_assembly": main,
-            "summary": {"warnings": 0, "blockers": 0},
-            "findings": [],
-        },
-    )
-    (root / "reports/structural-team.md").write_text("# Structural team report\n\nNo findings.\n", encoding="utf-8")
     return root
 
 
@@ -572,9 +739,13 @@ class StageTransferTests(unittest.TestCase):
                 "cad/right/part.SLDPRT": b"RIGHT-PART",
             },
         )
-        native_files = read_data(root / "evidence/discovery.json")["native_files"]
+        native_files = read_data(
+            root / "input/discovery/native-discovery.json"
+        )["native_files"]
         handoff = digest(native_files)
-        source_hashes = read_data(root / "evidence/evidence/collection.json")["capture"]["source_hashes"]
+        source_hashes = read_data(
+            root / "evidence/raw/native_capture_facts.json"
+        )["input_stability"]["source_hashes"]
         self.assertEqual(
             set(source_hashes),
             {"robot.sldasm", "left/part.sldprt", "right/part.sldprt"},
@@ -598,21 +769,32 @@ class StageTransferTests(unittest.TestCase):
                 "input/source.json",
             },
         )
-        self.assertEqual(
-            set(producer_checks["capture.integrity"]["files"]),
+        integrity_files = set(
+            producer_checks["capture.integrity"]["files"]
+        )
+        self.assertTrue(
             {
-                "evidence/capture-plan.json",
-                "evidence/capture.json",
-                "evidence/discovery.json",
-                "evidence/evidence/collection.json",
-                "evidence/evidence/environment.json",
-                "evidence/geometry/base.stl",
                 "evidence/manifest.json",
                 "evidence/native-runtime.json",
                 "evidence/raw/dependency_closure.json",
-                "evidence/raw/material_provenance.json",
-                "evidence/raw/scene_raw.json",
-            },
+                "evidence/raw/native_capture_facts.json",
+            }
+            <= integrity_files
+        )
+        self.assertTrue(
+            any(
+                name.startswith("evidence/raw/triangles/")
+                for name in integrity_files
+            )
+        )
+        self.assertFalse(
+            integrity_files
+            & {
+                "evidence/capture-plan.json",
+                "evidence/capture.json",
+                "evidence/discovery.json",
+                "evidence/geometry/base.stl",
+            }
         )
 
         archive = self.base / "nested-duplicate-basenames.zip"
@@ -634,25 +816,11 @@ class StageTransferTests(unittest.TestCase):
         admitted_events = read_data(destination / "reports/native-stages.json")["events"]
         self.assertEqual(admitted_events, producer_events)
 
-    def test_input_stability_rejects_a_missing_or_ambiguous_capture_plan(self) -> None:
+    def test_input_stability_rejects_a_missing_capture_plan(self) -> None:
         missing = capture_root(self.base / "missing-capture-plan")
-        (missing / "evidence/capture-plan.json").unlink()
-        manifest_path = missing / "evidence/manifest.json"
-        manifest = read_data(manifest_path)
-        manifest["files"].pop("capture-plan.json")
-        write_json(manifest_path, manifest)
+        (missing / "input/capture-plan.json").unlink()
         with self.assertRaisesRegex(PipelineError, "capture-plan.json"):
             seal(missing, self.base / "missing-capture-plan.zip")
-
-        ambiguous = capture_root(self.base / "ambiguous-capture-plan")
-        plan = ambiguous / "input/capture-plan.json"
-        plan.write_bytes((ambiguous / "evidence/capture-plan.json").read_bytes())
-        handoff_path = ambiguous / "input/handoff.json"
-        handoff = read_data(handoff_path)
-        handoff["package_files"]["capture-plan.json"] = file_digest(plan)
-        write_json(handoff_path, handoff)
-        with self.assertRaisesRegex(PipelineError, "Capture-plan archive path is ambiguous"):
-            seal(ambiguous, self.base / "ambiguous-capture-plan.zip")
 
     def test_transfer_requires_exact_upstream_and_execution_bindings(self) -> None:
         seal(self.root, self.archive)
@@ -729,8 +897,7 @@ class StageTransferTests(unittest.TestCase):
         installed = {path.relative_to(destination).as_posix() for path in destination.rglob("*") if path.is_file()}
         self.assertEqual(installed, set(manifest["files"]) | {transfer.CAPTURE_MANIFEST})
         for name in ("reports/structural-team.md", "reports/structural-team.json"):
-            self.assertIn(name, manifest["files"])
-            self.assertEqual(file_digest(destination / name), file_digest(self.root / name))
+            self.assertNotIn(name, manifest["files"])
         self.assertEqual(
             file_digest(destination / "reports/native-tool.json"),
             manifest["files"]["reports/native-tool.json"],
@@ -761,34 +928,85 @@ class StageTransferTests(unittest.TestCase):
         self.assertEqual(summary["upload_sha256"], upload_sha256)
         self.assertEqual(summary["handoff_sha256"], HANDOFF)
 
-    def test_regenerated_team_reports_are_tolerated_only_in_deliveries(self) -> None:
-        manifest = seal(self.root, self.archive)
-        destination = self.base / "admitted"
-        admit(self.archive, destination)
-        summary = _verify_transfer(destination)
-        self.assertEqual(summary["files"], manifest["file_count"])
+    def test_structural_team_reports_are_not_capture_payload(self) -> None:
+        (self.root / "reports/structural-team.md").write_text(
+            "# generated\n",
+            encoding="utf-8",
+        )
+        (self.root / "reports/structural-team.json").write_text(
+            '{"findings": []}\n',
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(
+            PipelineError,
+            "outside the transfer payload",
+        ):
+            seal(self.root, self.archive)
 
-        # The admitted capture stays strict when the sealed report bytes change ...
-        (destination / "reports/structural-team.md").write_text("# regenerated\n", encoding="utf-8")
-        (destination / "reports/structural-team.json").write_text('{"findings": []}\n', encoding="utf-8")
-        with self.assertRaisesRegex(PipelineError, "differs from the transfer manifest"):
-            _verify_transfer(destination)
-        # ... while a delivery may carry its own regenerated copy ...
-        summary = _verify_transfer(
-            destination,
-            regenerated=native_transfer.TEAM_REPORTS,
+    def test_unknown_success_evidence_members_are_not_capture_payload(
+        self,
+    ) -> None:
+        evidence = self.root / "evidence"
+        write_json(evidence / "discovery.json", {"legacy": True})
+        manifest = read_data(evidence / "manifest.json")
+        write_manifest(
+            evidence,
+            kind=manifest["kind"],
+            identity=manifest["identity"],
+            evidence_class=manifest["evidence_class"],
         )
-        self.assertEqual(summary["files"], manifest["file_count"])
-        # ... or none at all before the report is stamped.
-        (destination / "reports/structural-team.md").unlink()
-        (destination / "reports/structural-team.json").unlink()
-        summary = _verify_transfer(
-            destination,
-            regenerated=native_transfer.TEAM_REPORTS,
+        with self.assertRaisesRegex(
+            PipelineError,
+            "outside the transfer payload",
+        ):
+            seal(self.root, self.archive)
+
+    def test_noncanonical_triangle_evidence_name_is_not_capture_payload(
+        self,
+    ) -> None:
+        evidence = self.root / "evidence"
+        triangle = evidence / "raw/triangles/not-a-content-hash.triangles"
+        triangle.parent.mkdir(parents=True, exist_ok=True)
+        triangle.write_bytes(b"not canonical")
+        manifest = read_data(evidence / "manifest.json")
+        write_manifest(
+            evidence,
+            kind=manifest["kind"],
+            identity=manifest["identity"],
+            evidence_class=manifest["evidence_class"],
         )
-        self.assertEqual(summary["files"], manifest["file_count"])
-        with self.assertRaises(PipelineError):
-            _verify_transfer(destination)
+        with self.assertRaisesRegex(
+            PipelineError,
+            "outside the transfer payload",
+        ):
+            seal(self.root, self.archive)
+
+    def test_unreferenced_canonical_triangle_is_not_capture_payload(
+        self,
+    ) -> None:
+        seal(self.root, self.archive)
+        content = b"unreferenced triangle stream"
+        checksum = hashlib.sha256(content).hexdigest()
+        relative = f"raw/triangles/{checksum}.triangles"
+        with zipfile.ZipFile(self.archive) as source:
+            evidence_manifest = json.loads(
+                source.read("evidence/manifest.json")
+            )
+        evidence_manifest["files"][relative] = checksum
+        broken = self.base / "unreferenced-triangle.zip"
+        repack(
+            self.archive,
+            broken,
+            {
+                "evidence/" + relative: content,
+                "evidence/manifest.json": canonical(evidence_manifest),
+            },
+        )
+        with self.assertRaisesRegex(
+            PipelineError,
+            "triangle inventory differs",
+        ):
+            admit(broken, self.base / "out-unreferenced-triangle")
 
     def test_sealing_is_deterministic(self) -> None:
         first = self.base / "first.zip"
@@ -868,19 +1086,26 @@ class StageTransferTests(unittest.TestCase):
     def test_self_consistent_evidence_tamper_is_refused(self) -> None:
         seal(self.root, self.archive)
         with zipfile.ZipFile(self.archive) as source:
-            collection = json.loads(source.read("evidence/evidence/collection.json"))
-        collection["capture"]["originals_unchanged"] = False
-        payload = canonical(collection)
+            facts = json.loads(
+                source.read("evidence/raw/native_capture_facts.json")
+            )
+        facts["input_stability"]["originals_unchanged"] = False
+        payload = canonical(facts)
         with zipfile.ZipFile(self.archive) as source:
             evidence_manifest = json.loads(source.read("evidence/manifest.json"))
-        evidence_manifest["files"]["evidence/collection.json"] = hashlib.sha256(payload).hexdigest()
+        evidence_manifest["files"]["raw/native_capture_facts.json"] = hashlib.sha256(
+            payload
+        ).hexdigest()
         broken = self.base / "evidence.zip"
         repack(
             self.archive,
             broken,
-            {"evidence/evidence/collection.json": payload, "evidence/manifest.json": canonical(evidence_manifest)},
+            {
+                "evidence/raw/native_capture_facts.json": payload,
+                "evidence/manifest.json": canonical(evidence_manifest),
+            },
         )
-        with self.assertRaisesRegex(PipelineError, "Standalone capture collection"):
+        with self.assertRaisesRegex(PipelineError, "CAD bytes were unchanged"):
             admit(broken, self.base / "out-evidence")
 
     def test_self_consistent_input_report_tamper_is_refused(self) -> None:
@@ -916,7 +1141,10 @@ class StageTransferTests(unittest.TestCase):
     def test_native_discovery_binding_is_enforced(self) -> None:
         seal(self.root, self.archive)
         with zipfile.ZipFile(self.archive) as source:
-            record = json.loads(source.read("evidence/discovery.json"))
+            record = json.loads(
+                source.read("input/discovery/native-discovery.json")
+            )
+            plan = json.loads(source.read("input/capture-plan.json"))
 
         renamed = {**record, "identity": {**record["identity"], "main_assembly": "other.SLDASM"}}
         broken = self.base / "discovery-name.zip"
@@ -924,7 +1152,7 @@ class StageTransferTests(unittest.TestCase):
             self.archive,
             broken,
             {
-                "evidence/discovery.json": canonical(renamed),
+                "input/discovery/native-discovery.json": canonical(renamed),
             },
         )
         with self.assertRaisesRegex(PipelineError, "opened another main assembly"):
@@ -936,11 +1164,24 @@ class StageTransferTests(unittest.TestCase):
             self.archive,
             broken,
             {
-                "evidence/discovery.json": canonical(rebased),
+                "input/discovery/native-discovery.json": canonical(rebased),
             },
         )
         with self.assertRaisesRegex(PipelineError, "bound to another handoff"):
             admit(broken, self.base / "out-discovery-handoff")
+
+        foreign_plan = copy.deepcopy(plan)
+        foreign_plan["identity"]["hardware_id"] = "foreign-hardware"
+        broken = self.base / "plan-identity.zip"
+        repack(
+            self.archive,
+            broken,
+            {
+                "input/capture-plan.json": canonical(foreign_plan),
+            },
+        )
+        with self.assertRaisesRegex(PipelineError, "plan identity differs"):
+            admit(broken, self.base / "out-plan-identity")
 
     def test_structural_zip_tamper_is_refused(self) -> None:
         seal(self.root, self.archive)
@@ -1297,128 +1538,95 @@ class StageTransferTests(unittest.TestCase):
                     worker_version=native_identity["version"],
                 )
 
-            capture = self.base / "real-capture"
-            (capture / "input" / "cad").mkdir(parents=True)
-            shutil.copyfile(assembly, capture / "input" / "cad" / assembly.name)
+            capture = capture_root(
+                self.base / "real-capture",
+                main=assembly.name,
+            )
+            shutil.copyfile(
+                assembly,
+                capture / "input/cad" / assembly.name,
+            )
             for name in ("base.SLDPRT", "arm.SLDPRT"):
-                shutil.copyfile(work / "cad" / name, capture / "input" / "cad" / name)
-            shutil.copytree(snapshot, capture / "evidence")
-            collection = read_data(capture / "evidence/evidence/collection.json")
-            write_json(
-                capture / "evidence/capture.json",
-                {
-                    "collection": collection,
-                    "dependency_closure": read_data(
-                        capture / "evidence/raw/dependency_closure.json"
-                    ),
-                    "material_provenance": read_data(
-                        capture / "evidence/raw/material_provenance.json"
-                    ),
-                },
-            )
-            write_json(capture / "evidence/native-runtime.json", collection["environment"])
-            write_json(
-                capture / "evidence/capture-plan.json",
-                {
-                    "schema_version": "solidworks-to-urdf.capture-plan/v1",
-                    "objects": [],
-                },
-            )
+                shutil.copyfile(
+                    work / "cad" / name,
+                    capture / "input/cad" / name,
+                )
+            evidence = capture / "evidence"
+            shutil.rmtree(evidence)
+            shutil.copytree(snapshot, evidence)
             native_files = {
-                name: file_digest(work / "cad" / name) for name in ("robot.SLDASM", "base.SLDPRT", "arm.SLDPRT")
+                name: file_digest(work / "cad" / name)
+                for name in (
+                    assembly.name,
+                    "base.SLDPRT",
+                    "arm.SLDPRT",
+                )
             }
             handoff_sha256 = digest(native_files)
-            native_discovery = {
-                "schema_version": "solidworks-to-urdf.native-discovery/v1",
-                "run_id": RUN_ID,
-                "identity": {
-                    "delivery_configuration": "Default",
-                    "hardware_id": "fixture",
-                    "main_assembly": assembly.name,
-                    "revision": "r1",
-                },
-                "handoff_sha256": handoff_sha256,
-                "native_files": native_files,
-                "files": [
-                    {"path": name, "sha256": checksum}
-                    for name, checksum in sorted(native_files.items())
-                ],
-                "native_inventory_sha256": digest(
-                    [
-                        {"path": name, "sha256": checksum}
-                        for name, checksum in sorted(native_files.items())
-                    ]
-                ),
-                "records": [],
-                "findings": [],
-                "robot_name": "robot",
-            }
-            write_json(capture / "evidence/discovery.json", native_discovery)
-            (capture / "input" / "discovery").mkdir()
+            facts = read_data(
+                evidence / "raw/native_capture_facts.json"
+            )
+            discovery_path = (
+                capture / "input/discovery/native-discovery.json"
+            )
+            discovery = read_data(discovery_path)
+            discovery["native_files"] = native_files
+            discovery["handoff_sha256"] = handoff_sha256
+            discovery["identity"].update(
+                main_assembly=assembly.name,
+                delivery_configuration="Default",
+            )
+            write_json(discovery_path, discovery)
+            source_path = capture / "input/source.json"
+            source = read_data(source_path)
+            source["identity"].update(
+                handoff_digest=handoff_sha256,
+                main_assembly=assembly.name,
+                configuration="Default",
+            )
+            source["selection"].update(
+                main_assembly=assembly.name,
+                configuration="Default",
+            )
+            source["source_revision_id"] = digest(source["identity"])
+            write_json(source_path, source)
+            link_groups = facts["link_group_mass_raw"]["links"]
             write_json(
-                capture / "input/discovery/native-discovery.json",
-                native_discovery,
-            )
-            manifest = read_data(capture / "evidence" / "manifest.json")
-            manifest["files"]["capture.json"] = file_digest(capture / "evidence/capture.json")
-            manifest["files"]["discovery.json"] = file_digest(capture / "evidence" / "discovery.json")
-            manifest["files"]["native-runtime.json"] = file_digest(
-                capture / "evidence/native-runtime.json"
-            )
-            manifest["files"]["capture-plan.json"] = file_digest(
-                capture / "evidence/capture-plan.json"
-            )
-            manifest["files"] = dict(sorted(manifest["files"].items()))
-            write_json(capture / "evidence" / "manifest.json", manifest)
-            package_files = {
-                "cad/" + name: checksum
-                for name, checksum in native_files.items()
-            }
-            write_json(
-                capture / "input/handoff.json",
+                capture / "input/capture-plan.json",
                 {
-                    "passed": True,
-                    "input": {
-                        "hardware_id": "fixture",
-                        "source": {
-                            "assembly": assembly.name,
-                            "configuration": "Default",
-                        },
-                    },
-                    "input_receipt": {"inventory": dict(sorted(native_files.items()))},
-                    "cad_revision": {"hardware_id": "fixture", "revision": "r1"},
-                    "package_files": dict(sorted(package_files.items())),
+                    "schema_version": "solidworks-to-urdf.capture-plan/v1",
+                    "run_id": RUN_ID,
+                    "handoff_sha256": handoff_sha256,
+                    "discovery_sha256": file_digest(discovery_path),
                     "main_assembly": assembly.name,
                     "configuration": "Default",
-                },
-            )
-            source_identity = {
-                "configuration": "Default",
-                "handoff_digest": handoff_sha256,
-                "hardware_id": "fixture",
-                "kind": "source-revision",
-                "main_assembly": assembly.name,
-                "records": [],
-            }
-            write_json(
-                capture / "input/source.json",
-                {
-                    "schema_version": SOURCE_RECORD_SCHEMA,
-                    "source_revision_id": digest(source_identity),
-                    "identity": source_identity,
-                    "selection": {
-                        "configuration": "Default",
+                    "identity": {
                         "hardware_id": "fixture",
-                        "hardware_source": "cad",
-                        "main_assembly": assembly.name,
-                    },
-                    "metadata": {
-                        "change_summary": "fixture",
-                        "change_summary_source": "cad",
-                        "control": None,
-                        "owner": None,
                         "revision": "r1",
                     },
+                    "selection": {"files": native_files},
+                    "objects": [
+                        {
+                            "name": row["name"],
+                            "document": Path(row["path"]).name,
+                            "state": row["suppression_state"],
+                        }
+                        for row in facts["scene_raw"]["occurrences"]
+                    ],
+                    "groups": [
+                        {
+                            "name": name,
+                            "components": list(entry["selection"]),
+                        }
+                        for name, entry in sorted(link_groups.items())
+                    ],
+                    "axis_requests": [],
+                    "datums": sorted(
+                        facts["scene_raw"]["coordinate_systems"]
+                    ),
+                    "evidence_requests": list(
+                        CAPTURE_EVIDENCE_REQUESTS
+                    ),
                 },
             )
             package_files = {
@@ -1427,6 +1635,9 @@ class StageTransferTests(unittest.TestCase):
                 if name not in {"handoff.json", "request.json"}
             }
             handoff_record = read_data(capture / "input/handoff.json")
+            handoff_record["input_receipt"]["inventory"] = dict(
+                sorted(native_files.items())
+            )
             handoff_record["package_files"] = dict(sorted(package_files.items()))
             write_json(capture / "input/handoff.json", handoff_record)
             write_json(capture / "reports/native-tool.json", native_identity)
@@ -1444,7 +1655,14 @@ class StageTransferTests(unittest.TestCase):
                 upload_sha256=handoff_sha256,
                 main_assembly=assembly.name,
             )
-            self.assertIn("evidence/evidence/collection.json", manifest["files"])
+            self.assertIn(
+                "evidence/raw/native_capture_facts.json",
+                manifest["files"],
+            )
+            self.assertNotIn(
+                "evidence/evidence/collection.json",
+                manifest["files"],
+            )
             destination = self.base / "real-admitted"
             admit(
                 archive,
@@ -1554,12 +1772,6 @@ class StageTransferTests(unittest.TestCase):
             "native_tool_bytes": (destination / "reports/native-tool.json").read_bytes(),
             "native_stages_bytes": (destination / "reports/native-stages.json").read_bytes(),
             "transfer_manifest_bytes": (destination / transfer.CAPTURE_MANIFEST).read_bytes(),
-            "structural_team_md_bytes": (
-                destination / "reports/structural-team.md"
-            ).read_bytes(),
-            "structural_team_json_bytes": (
-                destination / "reports/structural-team.json"
-            ).read_bytes(),
         }
         self.assertEqual(
             _verify_transfer(
@@ -1572,6 +1784,35 @@ class StageTransferTests(unittest.TestCase):
         with self.assertRaisesRegex(PipelineError, "disk receipt differs"):
             _verify_transfer(destination, native_receipts=receipts)
 
+    def test_carried_request_is_consistent_with_or_without_a_native_member(self) -> None:
+        request = build_request_evidence(
+            purpose="engineering",
+            request_id="portal-20261016T000000-abcdef01",
+            target_hardware="fixture",
+            change_summary="carried request consistency",
+            main_assembly=MAIN_ASSEMBLY,
+            handoff_digest=HANDOFF,
+            platform_config_digest="e" * 64,
+        )
+        for label, native_member in (("native-member", True), ("carried-only", False)):
+            with self.subTest(case=label):
+                root = capture_root(self.base / label)
+                if native_member:
+                    write_json(root / "input/request.json", request)
+                archive = self.base / f"{label}.zip"
+                seal(root, archive)
+                destination = self.base / f"{label}-admitted"
+                admit(archive, destination)
+                if not native_member:
+                    write_json(destination / "input/request.json", request)
+                receipts = {
+                    "native_tool_bytes": (destination / "reports/native-tool.json").read_bytes(),
+                    "native_stages_bytes": (destination / "reports/native-stages.json").read_bytes(),
+                    "transfer_manifest_bytes": (destination / transfer.CAPTURE_MANIFEST).read_bytes(),
+                }
+                evidence = native_transfer.validate_native_receipts(destination, receipts)
+                self.assertEqual(evidence["main_assembly"], MAIN_ASSEMBLY)
+
     def test_immutable_receipts_always_verify_the_complete_total_bytes(self) -> None:
         seal(self.root, self.archive)
         destination = self.base / "receipt-total"
@@ -1579,22 +1820,13 @@ class StageTransferTests(unittest.TestCase):
         receipts = {
             "native_tool_bytes": (destination / "reports/native-tool.json").read_bytes(),
             "native_stages_bytes": (destination / "reports/native-stages.json").read_bytes(),
-            "structural_team_md_bytes": (
-                destination / "reports/structural-team.md"
-            ).read_bytes(),
-            "structural_team_json_bytes": (
-                destination / "reports/structural-team.json"
-            ).read_bytes(),
         }
         manifest = read_data(destination / transfer.CAPTURE_MANIFEST)
         manifest["total_bytes"] += 1
         receipts["transfer_manifest_bytes"] = canonical(manifest)
-        for name in native_transfer.TEAM_REPORTS:
-            (destination / name).unlink()
         with self.assertRaisesRegex(PipelineError, "size differs"):
             _verify_transfer(
                 destination,
-                regenerated=native_transfer.TEAM_REPORTS,
                 native_receipts=receipts,
             )
 
@@ -1625,7 +1857,9 @@ class StageTransferTests(unittest.TestCase):
         ]
         source["source_revision_id"] = digest(source["identity"])
         write_json(source_path, source)
-        discovery_path = record_bound / "evidence/discovery.json"
+        discovery_path = (
+            record_bound / "input/discovery/native-discovery.json"
+        )
         discovery = read_data(discovery_path)
         discovery["records"] = [
             {
@@ -1635,9 +1869,11 @@ class StageTransferTests(unittest.TestCase):
             }
         ]
         write_json(discovery_path, discovery)
-        evidence_manifest = read_data(record_bound / "evidence/manifest.json")
-        evidence_manifest["files"]["discovery.json"] = file_digest(discovery_path)
-        write_json(record_bound / "evidence/manifest.json", evidence_manifest)
+        handoff = read_data(record_bound / "input/handoff.json")
+        handoff["package_files"][
+            "discovery/native-discovery.json"
+        ] = file_digest(discovery_path)
+        write_json(record_bound / "input/handoff.json", handoff)
         events = _capture_events(record_bound, handoff=HANDOFF)
         write_json(
             record_bound / "reports/native-stages.json",
@@ -1671,7 +1907,7 @@ class StageTransferTests(unittest.TestCase):
             handoff = read_data(root / "input/handoff.json")
             handoff["package_files"]["source.json"] = file_digest(source_path)
             write_json(root / "input/handoff.json", handoff)
-            discovery_path = root / "evidence/discovery.json"
+            discovery_path = root / "input/discovery/native-discovery.json"
             discovery = read_data(discovery_path)
             discovery["records"] = [
                 {
@@ -1685,9 +1921,11 @@ class StageTransferTests(unittest.TestCase):
                 }
             ]
             write_json(discovery_path, discovery)
-            evidence_manifest = read_data(root / "evidence/manifest.json")
-            evidence_manifest["files"]["discovery.json"] = file_digest(discovery_path)
-            write_json(root / "evidence/manifest.json", evidence_manifest)
+            handoff = read_data(root / "input/handoff.json")
+            handoff["package_files"][
+                "discovery/native-discovery.json"
+            ] = file_digest(discovery_path)
+            write_json(root / "input/handoff.json", handoff)
             events = _capture_events(root, handoff=HANDOFF)
             write_json(
                 root / "reports/native-stages.json",
@@ -1704,13 +1942,15 @@ class StageTransferTests(unittest.TestCase):
             ("anchor", lambda row: row.update(anchor='"missing"'), "anchor is not present"),
         ):
             root = record_root(label)
-            discovery_path = root / "evidence/discovery.json"
+            discovery_path = root / "input/discovery/native-discovery.json"
             discovery = read_data(discovery_path)
             mutate(discovery["records"][0])
             write_json(discovery_path, discovery)
-            evidence_manifest = read_data(root / "evidence/manifest.json")
-            evidence_manifest["files"]["discovery.json"] = file_digest(discovery_path)
-            write_json(root / "evidence/manifest.json", evidence_manifest)
+            handoff = read_data(root / "input/handoff.json")
+            handoff["package_files"][
+                "discovery/native-discovery.json"
+            ] = file_digest(discovery_path)
+            write_json(root / "input/handoff.json", handoff)
             events = _capture_events(root, handoff=HANDOFF)
             write_json(
                 root / "reports/native-stages.json",
@@ -1900,33 +2140,31 @@ class StageTransferTests(unittest.TestCase):
                 report["input_receipt"]["inventory"]["extra.SLDPRT"] = file_digest(extra)
                 report["package_files"]["cad/extra.SLDPRT"] = file_digest(extra)
                 write_json(report_path, report)
-                discovery_path = root / "evidence/discovery.json"
+                discovery_path = (
+                    root / "input/discovery/native-discovery.json"
+                )
                 discovery = read_data(discovery_path)
                 if added:
                     discovery["native_files"]["extra.SLDPRT"] = "0" * 64
                 write_json(discovery_path, discovery)
+                report["package_files"][
+                    "discovery/native-discovery.json"
+                ] = file_digest(discovery_path)
+                write_json(report_path, report)
                 with self.assertRaisesRegex(PipelineError, "Native discovery inventory"):
                     seal(root, self.base / f"inventory-{label}.zip")
 
     def test_capture_identity_is_cross_bound_to_tool_runtime_and_sources(self) -> None:
         root = capture_root(self.base / "identity")
-        collection_path = root / "evidence/evidence/collection.json"
-        collection = read_data(collection_path)
-        collection["identity"].update(
+        manifest_path = root / "evidence/manifest.json"
+        manifest = read_data(manifest_path)
+        manifest["identity"].update(
             document_id=r"C:\foreign\Other.SLDASM",
             worker_version="999.0.0",
             solidworks_revision="99.9.9",
             dependency_digest="f" * 64,
         )
-        write_json(collection_path, collection)
-        capture_record = read_data(root / "evidence/capture.json")
-        capture_record["collection"] = collection
-        write_json(root / "evidence/capture.json", capture_record)
-        evidence_manifest = read_data(root / "evidence/manifest.json")
-        evidence_manifest["identity"] = collection["identity"]
-        evidence_manifest["files"]["evidence/collection.json"] = file_digest(collection_path)
-        evidence_manifest["files"]["capture.json"] = file_digest(root / "evidence/capture.json")
-        write_json(root / "evidence/manifest.json", evidence_manifest)
+        write_json(manifest_path, manifest)
         events = _capture_events(root, handoff=HANDOFF)
         write_json(
             root / "reports/native-stages.json",
@@ -1937,20 +2175,15 @@ class StageTransferTests(unittest.TestCase):
 
     def test_capture_identity_paths_bind_the_full_main_assembly_path(self) -> None:
         root = capture_root(self.base / "identity-paths")
-        collection_path = root / "evidence/evidence/collection.json"
-        collection = read_data(collection_path)
+        manifest_path = root / "evidence/manifest.json"
+        manifest = read_data(manifest_path)
         foreign = r"C:\foreign\robot.SLDASM"
-        collection["identity"].update(assembly=foreign, document_id=foreign)
-        write_json(collection_path, collection)
-        capture_record = read_data(root / "evidence/capture.json")
-        capture_record["collection"] = collection
-        write_json(root / "evidence/capture.json", capture_record)
-        evidence_manifest = read_data(root / "evidence/manifest.json")
-        evidence_manifest["identity"] = collection["identity"]
-        evidence_manifest["files"]["evidence/collection.json"] = file_digest(collection_path)
-        evidence_manifest["files"]["capture.json"] = file_digest(root / "evidence/capture.json")
-        write_json(root / "evidence/manifest.json", evidence_manifest)
-        with self.assertRaisesRegex(PipelineError, "source paths disagree"):
+        manifest["identity"].update(assembly=foreign, document_id=foreign)
+        write_json(manifest_path, manifest)
+        with self.assertRaisesRegex(
+            PipelineError,
+            "does not bind the selected source assembly",
+        ):
             seal(root, self.base / "identity-paths.zip")
 
     def test_native_receipts_must_carry_events_that_rebuild_their_rows(self) -> None:
@@ -2005,10 +2238,6 @@ class StageTransferTests(unittest.TestCase):
         root = capture_root(self.base / "winpath")
         windows = r"C:\native-discovery-20261007\gap-config-runs\prepared\cad\robot.SLDASM"
         evidence = root / "evidence"
-        collection_path = evidence / "evidence/collection.json"
-        collection = json.loads(collection_path.read_text(encoding="utf-8"))
-        collection["identity"].update(assembly=windows, document_id=windows)
-        collection["capture"]["collected_document"] = windows
         closure_path = evidence / "raw/dependency_closure.json"
         closure = read_data(closure_path)
         old_source = closure["top_level"]
@@ -2020,24 +2249,19 @@ class StageTransferTests(unittest.TestCase):
             if row.get("source") == old_source:
                 row["source"] = windows
         write_json(closure_path, closure)
-        material_path = evidence / "raw/material_provenance.json"
-        material = read_data(material_path)
-        material["assembly"] = windows
-        write_json(material_path, material)
-        payload = canonical(collection)
-        collection_path.write_bytes(payload)
-        capture_record = json.loads((evidence / "capture.json").read_text(encoding="utf-8"))
-        capture_record["collection"] = collection
-        capture_record["dependency_closure"] = closure
-        capture_record["material_provenance"] = material
-        write_json(evidence / "capture.json", capture_record)
+        facts_path = evidence / "raw/native_capture_facts.json"
+        facts = read_data(facts_path)
+        facts["scene_raw"]["document"] = windows
+        for phase in ("before", "after"):
+            facts["document_state"][phase]["path"] = windows
+        write_json(facts_path, facts)
         manifest_path = evidence / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest["identity"].update(assembly=windows, document_id=windows)
-        manifest["files"]["evidence/collection.json"] = hashlib.sha256(payload).hexdigest()
         manifest["files"]["raw/dependency_closure.json"] = file_digest(closure_path)
-        manifest["files"]["raw/material_provenance.json"] = file_digest(material_path)
-        manifest["files"]["capture.json"] = file_digest(evidence / "capture.json")
+        manifest["files"]["raw/native_capture_facts.json"] = file_digest(
+            facts_path
+        )
         manifest_path.write_bytes(canonical(manifest))
         events = _capture_events(root, handoff=HANDOFF)
         write_json(

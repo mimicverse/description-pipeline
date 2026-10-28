@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any
 
 from ..io import digest
+from ..stages import STAGE_IDS
 from ..schemas import DIAGNOSTIC_ADMISSION_SCHEMA
 from .contracts import (
     ArtifactRef,
@@ -56,7 +57,7 @@ class DiagnosticAdmissionSpec:
             value = getattr(self, field)
             if not isinstance(value, str) or not value:
                 raise ProtocolError("diagnostic.invalid", {"where": field})
-        if self.target_stage not in {"freeze", "discover", "capture", "generate", "verify", "publish"}:
+        if self.target_stage not in STAGE_IDS:
             raise ProtocolError("diagnostic.invalid", {"where": "target_stage"})
         object.__setattr__(
             self,

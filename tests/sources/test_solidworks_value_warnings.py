@@ -12,10 +12,13 @@ from xml.etree import ElementTree as ET
 
 import numpy as np
 
-from description_pipeline.io import PipelineError
+from description_pipeline.io import PipelineError, write_json
 from description_pipeline.sources.solidworks.naming import (
     mesh_path,
     visual_name,
+)
+from description_pipeline.sources.solidworks.saved_state import (
+    warning_from_selection,
 )
 from description_pipeline.sources.solidworks.scene import _value_warnings
 from description_pipeline.verification.solidworks_urdf import (
@@ -300,6 +303,68 @@ class ValueWarningTests(unittest.TestCase):
                 model,
                 metadata_warnings=[forged],
             )
+
+    def test_saved_state_warning_is_required_and_recomputed_from_capture_evidence(self):
+        upload = {
+            "cad/robot.SLDASM": "a" * 64,
+            "cad/base.SLDPRT": "b" * 64,
+        }
+        open_status = {
+            "errors": 2,
+            "warnings": 0,
+            "missing_references": {
+                "state": "observed",
+                "items": [{"name": "construction", "last_known_path": "C:/missing/construction.SLDPRT"}],
+            },
+        }
+        occurrences = [{
+            "instance": "base-1",
+            "defining": "cad/robot.SLDASM",
+            "configuration": "Default",
+            "suppression_state": 2,
+            "resolved_path": "C:/stage/cad/base.SLDPRT",
+        }]
+        from tests.sources.selection_support import closure_evidence
+        from description_pipeline.sources.solidworks.selection import seal_closure_selection
+
+        closure = closure_evidence(upload, "cad/robot.SLDASM", open_status=open_status)
+        closure["saved_configuration"] = "Default"
+        closure["observed_occurrences"] = occurrences
+        selection = seal_closure_selection(
+            upload, "cad/robot.SLDASM", closure, reader_sha256=closure["reader_sha256"]
+        )
+        source = copy.deepcopy(self.source)
+        source["configuration"] = "Default"
+        source["saved_state_selection"] = selection
+        warning = warning_from_selection(selection)
+        model = copy.deepcopy(self.model)
+        model["provenance"]["value_warnings"].append(copy.deepcopy(warning))
+        write_json(
+            self.root / "evidence/native-runtime.json",
+            {"prepared_capture": {"opened": selection["closure"]["open_status"]}},
+        )
+
+        result = _value_warning_gate(self.root, source, model)
+        self.assertIn("source.saved_state_incomplete", result["codes"])
+
+        missing = copy.deepcopy(model)
+        missing["provenance"]["value_warnings"] = [
+            item
+            for item in missing["provenance"]["value_warnings"]
+            if item["code"] != "source.saved_state_incomplete"
+        ]
+        with self.assertRaisesRegex(PipelineError, "Saved-state source warning"):
+            _value_warning_gate(self.root, source, missing)
+
+        forged = copy.deepcopy(model)
+        forged_warning = next(
+            item
+            for item in forged["provenance"]["value_warnings"]
+            if item["code"] == "source.saved_state_incomplete"
+        )
+        forged_warning["detail"]["open_errors"] = 0
+        with self.assertRaisesRegex(PipelineError, "Saved-state source warning"):
+            _value_warning_gate(self.root, source, forged)
 
     def test_missing_spoofed_or_wrong_field_warnings_are_rejected(self):
         mutations = (
