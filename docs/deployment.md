@@ -123,7 +123,9 @@ drain/stop 使用当前作业和 CAD 所有权事实；未决状态或外部占�
 
 ## 安装 Linux 平台
 
-配置服务账户的 Git 身份及 GitHub 认证，确认目标仓库与 base 可读写。配置专用 SSH key 和已核验 Windows host key；传输使用 SSH 隧道和端点令牌，内侧均为 loopback。拒绝跨主机重定向和未认证端点。
+配置服务账户的 GitHub 认证，确认目标仓库与 base 可读写。开放接纳前，按已核平台 snapshot 的 `derived.repositories` 为每个目标准备完整 Git 工作区；不得使用浅克隆，因为仓库封存必须能独立还原全部所需对象。核对实际 fetch/push remote、存在的 base ref/commit、干净工作树，并在该仓库的 local config 设置服务账户的 `user.name` 和 `user.email`。使用当前发行的仓库封存与还原入口完成隔离往返，核对还原的 base commit/tree；同时核算工作区、封存临时文件及上传所需空间。服务健康不代表这些业务资源已就绪。
+
+配置专用 SSH key 和已核验 Windows host key；传输使用 SSH 隧道和端点令牌，内侧均为 loopback。拒绝跨主机重定向和未认证端点。
 
 校验同版 Linux 离线运行档案、部署档案与全部摘要。首次安装须先用受支持的 CPython 3.12 和该发行的 Linux 角色档案建立独立引导环境；后续控制命令也须使用已核验的同版环境，不能假定系统 `python3` 已装有规范验证器。以下路径均为待替换的示例：
 

@@ -179,6 +179,33 @@ class RegisteredStageProjectionTests(unittest.TestCase):
             },
         )
 
+    def test_registered_rows_preserve_canonical_stage_states(self) -> None:
+        expected = {
+            "active": "running",
+            "cancelled": "cancelled",
+            "unresolved": "unresolved",
+        }
+        for canonical, displayed in expected.items():
+            with self.subTest(state=canonical):
+                states = {stage["id"]: "completed" for stage in CONTRACT["stages"]}
+                states["capture"] = canonical
+                for stage in ("generate", "verify", "publish"):
+                    states[stage] = "blocked"
+                projection = self.projection(states)
+                display = self.app(registered_report())._registered_stage_job(
+                    {
+                        "run_id": RUN_ID,
+                        "request": {},
+                        "result": {"subject_sha256": SUBJECT},
+                    },
+                    projection,
+                )
+                view = stage_view(display)
+                capture = next(stage for stage in view["stages"] if stage["id"] == "capture")
+                generate = next(stage for stage in view["stages"] if stage["id"] == "generate")
+                self.assertEqual(capture["state"], displayed)
+                self.assertEqual(generate["state"], "blocked")
+
     def test_reuse_report_binds_the_artifact_producer_run(self) -> None:
         app = PortalApp.__new__(PortalApp)
         source_run = "origin-run"

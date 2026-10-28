@@ -15,11 +15,13 @@ from description_pipeline.stages import (
     checked,
     canonical_freeze_timestamp,
     record_check,
+    stage_display_state,
     stage_view,
     validate_freeze_events,
 )
 from description_pipeline.verification.solidworks_urdf import evaluate_bundle, require_qualified_report
 from tests.v1.freeze_event_support import freeze_events
+from tests.v1.protocol_support import protocol_events
 
 
 class StageTests(unittest.TestCase):
@@ -75,6 +77,43 @@ class StageTests(unittest.TestCase):
             )
         self.assertEqual(self.stage(stage_view(job), "capture")["state"], "failed")
         self.assertEqual(self.stage(stage_view(job), "generate")["state"], "blocked")
+
+    def test_canonical_stage_states_are_preserved_with_active_as_running(self):
+        expected = {
+            "waiting": "waiting",
+            "active": "running",
+            "blocked": "blocked",
+            "completed": "completed",
+            "failed": "failed",
+            "cancelled": "cancelled",
+            "unresolved": "unresolved",
+        }
+        self.assertEqual(
+            {state: stage_display_state(state) for state in expected},
+            expected,
+        )
+        self.assertEqual(stage_display_state("queued"), "not_run")
+        self.assertEqual(stage_display_state("ready"), "not_run")
+        self.assertEqual(stage_display_state("invented"), "not_run")
+
+        for canonical, displayed in expected.items():
+            with self.subTest(state=canonical):
+                events = protocol_events(subject="a" * 64)
+                for event in reversed(events):
+                    if event["stage"] != "capture":
+                        continue
+                    if "check" in event:
+                        continue
+                    event["state"] = canonical
+                    break
+                for event in reversed(events):
+                    if event["stage"] in {"generate", "verify", "publish"} and "check" not in event:
+                        event["state"] = "blocked"
+                view = stage_view({"events": events, "subject_sha256": "a" * 64})
+                self.assertEqual(self.stage(view, "capture")["state"], displayed)
+                if displayed in {"failed", "cancelled", "unresolved"}:
+                    self.assertEqual(self.stage(view, "generate")["state"], "blocked")
+                    self.assertEqual(self.stage(view, "publish")["state"], "blocked")
 
     def test_failed_boundary_action_executes_once_and_retains_diagnostics(self):
         calls, events = [], []

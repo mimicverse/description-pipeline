@@ -4102,10 +4102,10 @@ class PortalTests(unittest.TestCase):
             {
                 "freeze": "completed",
                 "discover": "completed",
-                "capture": "not_run",
-                "generate": "not_run",
-                "verify": "not_run",
-                "publish": "not_run",
+                "capture": "waiting",
+                "generate": "waiting",
+                "verify": "waiting",
+                "publish": "waiting",
             },
         )
 

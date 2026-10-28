@@ -95,9 +95,25 @@ const TASK_LABELS = {
   publish: "Publish review PR",
 };
 const CHECK_STATES = { passed: "Passed", failed: "Failed", not_run: "Not run", unsupported: "Unsupported" };
-const STAGE_STATES = { not_run: "Not run", running: "Running", completed: "Completed", failed: "Failed", blocked: "Upstream blocked" };
 // Compact state words for the stepper; the full reason stays in the tooltip.
-const STEP_STATE_SHORT = { completed: "Completed", running: "Running", failed: "Failed", blocked: "Blocked", not_run: "Not run" };
+const STEP_STATE_SHORT = {
+  not_run: "Not run",
+  waiting: "Waiting",
+  running: "Running",
+  completed: "Completed",
+  failed: "Failed",
+  blocked: "Blocked",
+  cancelled: "Cancelled",
+  unresolved: "Unresolved",
+};
+const STAGE_SELECTION_PRIORITY = [
+  "failed",
+  "unresolved",
+  "cancelled",
+  "running",
+  "waiting",
+  "blocked",
+];
 const PREREQ_STATE = { ok: "ready", invalid: "unavailable", absent: "missing", changed: "changed", unknown: "unknown" };
 const AUTOMATIC_STATES = {
   passed: "Automatic checks passed",
@@ -862,9 +878,8 @@ async function mutateRun(run, method, title) {
 
 function stageDotState(state) {
   if (state === "completed") return "ok";
-  if (state === "failed") return "bad";
-  if (state === "unresolved") return "bad";
-  if (state === "running") return "run";
+  if (state === "failed" || state === "unresolved") return "bad";
+  if (["waiting", "running"].includes(state)) return "run";
   // Upstream-blocked and not-run stages stay neutral: nothing failed here.
   return "idle";
 }
@@ -938,8 +953,8 @@ function inlineValue(value) {
 
 function stateKind(state) {
   if (state === "completed" || state === "passed" || state === "success") return "ok";
-  if (state === "failed") return "bad";
-  if (state === "running") return "run";
+  if (state === "failed" || state === "unresolved") return "bad";
+  if (["waiting", "running"].includes(state)) return "run";
   return "";
 }
 
@@ -959,10 +974,11 @@ function chooseStageIndex(stages, runId) {
     const index = stages.findIndex((stage) => stage.id === remembered);
     if (index !== -1) return index;
   }
-  const failed = stages.findIndex((stage) => stage.state === "failed");
-  if (failed !== -1) return failed;
-  const running = stages.findIndex((stage) => stage.state === "running");
-  return running !== -1 ? running : 0;
+  for (const state of STAGE_SELECTION_PRIORITY) {
+    const index = stages.findIndex((stage) => stage.state === state);
+    if (index !== -1) return index;
+  }
+  return 0;
 }
 
 function countChecks(rows) {

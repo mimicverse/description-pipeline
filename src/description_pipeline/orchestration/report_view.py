@@ -44,9 +44,12 @@ REPORT_SCHEMA = "solidworks-to-urdf.report/v1"
 
 _STAGE_STATE_LABELS = {
     "completed": "Completed",
+    "waiting": "Waiting",
     "running": "In progress",
     "failed": "Failed",
-    "blocked": "Blocked by upstream failure",
+    "blocked": "Blocked by incomplete predecessor",
+    "cancelled": "Cancelled",
+    "unresolved": "Unresolved",
     "not_run": "Not run",
 }
 _CHECK_STATE_LABELS = {
@@ -56,8 +59,12 @@ _CHECK_STATE_LABELS = {
 }
 _OVERALL_STATE_LABELS = {
     "passed": "Passed",
+    "waiting": "Waiting",
     "running": "In progress",
     "failed": "Failed",
+    "blocked": "Blocked",
+    "cancelled": "Cancelled",
+    "unresolved": "Unresolved",
     "not_run": "Not started",
 }
 
@@ -1288,10 +1295,14 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
                 "The following fact scopes require external review. The platform does not read "
                 "review approvals; a rerun only requires re-confirmation where relevant facts changed."
             )
-        else:
+        elif stage.get("state") == "failed":
             stage_out["manual_scope_note"] = (
                 "Automatic checks failed or did not run. Fix the issues and complete automatic "
                 "verification first; manual confirmations are not applicable yet."
+            )
+        else:
+            stage_out["manual_scope_note"] = (
+                "Automatic checks are not complete. Manual confirmations are not applicable yet."
             )
         if independent_rows:
             stage_out["independent"] = independent_rows
@@ -1303,12 +1314,25 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
         any(stage["id"] == "verify" and stage["state"] == "completed" for stage in stages_out)
         and quality.get("passed") is True
     )
-    if "failed" in states:
+    if "unresolved" in states:
+        first = next(stage for stage in stages_out if stage["state"] == "unresolved")
+        overall_state, headline = (
+            "unresolved",
+            f"{first['name']} stage is unresolved; reconcile its external effects",
+        )
+    elif "failed" in states:
         overall_state, headline = "failed", f"{first_failed['name']} stage failed; downstream stages did not run"
+    elif "cancelled" in states:
+        first = next(stage for stage in stages_out if stage["state"] == "cancelled")
+        overall_state, headline = "cancelled", f"{first['name']} stage was cancelled"
     elif job.get("status") == "failed":
         overall_state, headline = "failed", "Job failed; see the raw diagnostic"
     elif "running" in states:
         overall_state, headline = "running", "Run is in progress; not all stages have completed"
+    elif "waiting" in states:
+        overall_state, headline = "waiting", "Waiting for the next eligible stage"
+    elif "blocked" in states:
+        overall_state, headline = "blocked", "Stages are blocked by an incomplete predecessor"
     elif stages_out and states == {"completed"} and verification_completed:
         overall_state, headline = "passed", "All six stages completed and independent verification passed"
     elif stages_out and states == {"completed"}:
