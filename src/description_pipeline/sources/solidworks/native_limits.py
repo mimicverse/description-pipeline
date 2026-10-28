@@ -153,10 +153,6 @@ def finite_number(value) -> float:
     return number
 
 
-def _finite(value) -> float:
-    return finite_number(value)
-
-
 def _value_record(record, key: str, expected_api: str, unit: str) -> float:
     if not isinstance(record, Mapping) or not set(record) >= _VALUE_KEYS:
         raise NativeLimitReadError(f"{key} has no complete readable native value record")
@@ -166,7 +162,7 @@ def _value_record(record, key: str, expected_api: str, unit: str) -> float:
         raise NativeLimitInvalidError(f"{key} came from another API")
     if record.get("unit") != unit:
         raise NativeLimitInvalidError(f"{key} uses the wrong unit")
-    return _finite(record.get("value"))
+    return finite_number(record.get("value"))
 
 
 def _binding(entity, index: int) -> tuple[str, str | None, int | None]:
@@ -349,8 +345,8 @@ def validate_native_limit(
     if (
         set(limits) != expected_limit_keys
         or limits.get("unit") != unit
-        or _finite(limits.get("lower")) != minimum
-        or _finite(limits.get("upper")) != maximum
+        or finite_number(limits.get("lower")) != minimum
+        or finite_number(limits.get("upper")) != maximum
     ):
         raise NativeLimitInvalidError("legacy limits do not equal the validated native limit")
     entities = mate.get("entities")
