@@ -1847,6 +1847,7 @@ class NativeDeclarationsTests(unittest.TestCase):
             budget_bytes = json.dumps(budget).encode()
             (package / "input/records/budget.json").write_bytes(budget_bytes)
             payload["budget"] = {
+                "reference": "budget.json#",
                 "package_file": "records/budget.json",
                 "key": "",
                 "sha256": hashlib.sha256(budget_bytes).hexdigest(),

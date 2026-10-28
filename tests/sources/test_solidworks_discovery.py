@@ -34,6 +34,7 @@ from description_pipeline.sources.solidworks.discovery import (  # noqa: E402
     _identity,
     _interface_frames,
     _mate_rows,
+    _resolve_record,
     _unit,
     SubmissionIdentity,
     derive_native_package,
@@ -46,6 +47,8 @@ from description_pipeline.sources.solidworks.scene import _value_warnings  # noq
 from description_pipeline.verification.solidworks_urdf import _carrier_snapshot  # noqa: E402
 from description_pipeline.schemas import SOURCE_RECORD_SCHEMA  # noqa: E402
 from description_pipeline.verification.native_discovery import (  # noqa: E402
+    _Failure,
+    _record_value,
     rebuild_interface_frames,
     rebuild_joint_facts,
     rebuild_rigid_bodies,
@@ -600,6 +603,143 @@ class DiscoveryTests(unittest.TestCase):
             settings=DiscoverySettings(record_roots=(records,)),
         )
         self.assertIn("discovery.record_unreadable", self._codes(result))
+
+    def test_production_and_independent_readers_reject_same_invalid_bytes(self):
+        cases = {
+            "invalid_utf8": b'{"limits":{"lower":0.0,"upper":0.0},"note":"\xff"}',
+            "duplicate_key": b'{"limits":{"lower":0.0,"lower":-1.0,"upper":0.0}}',
+        }
+        for label, payload in cases.items():
+            with self.subTest(case=label):
+                root = self.tmp / label
+                records = root / "source-records"
+                original = records / "joints/arm.json"
+                original.parent.mkdir(parents=True)
+                original.write_bytes(payload)
+                findings = []
+                self.assertIsNone(
+                    _resolve_record(
+                        DiscoverySettings(record_roots=(records,)),
+                        "joints/arm.json#limits",
+                        findings,
+                        "joint:test",
+                    )
+                )
+                self.assertIn(
+                    "discovery.record_unreadable",
+                    {item["code"] for item in findings},
+                )
+
+                target = root / "records/record.txt"
+                target.parent.mkdir(parents=True)
+                target.write_bytes(payload)
+                entry = {
+                    "file": "joints/arm.json",
+                    "package_file": "records/record.txt",
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                }
+                with self.assertRaises(PipelineError):
+                    parse_data(payload, Path("joints/arm.json"))
+                with self.assertRaises(_Failure) as raised:
+                    _record_value(root, entry, "limits")
+                self.assertEqual(raised.exception.code, "discovery.record")
+
+    def test_discovery_binding_rejects_duplicate_json_keys(self):
+        result, _source, output = self._prepare()
+        self.assertTrue(result.passed, result.findings)
+        delivery = self._deliver(output)
+        discovery_path = delivery / "evidence/discovery.json"
+        text = discovery_path.read_text(encoding="utf-8")
+        marker = '"schema_version":' + json.dumps(DISCOVERY_SCHEMA)
+        self.assertIn(marker, text)
+        discovery_path.write_text(
+            text.replace(marker, marker + "," + marker, 1),
+            encoding="utf-8",
+        )
+        support.seal_delivery(delivery)
+
+        report = verify_discovery(delivery)
+
+        self.assertFalse(report["passed"])
+        failure = next(
+            item for item in report["errors"] if item["code"] == "discovery.binding"
+        )
+        self.assertIn("Duplicate input key", failure["message"])
+
+    def test_independent_verify_rejects_ambiguous_embedded_record(self):
+        record_value = {
+            "limits": {"lower": 0.0, "upper": 0.0},
+            "drive": {"effort": 6.0, "velocity": 2.0},
+        }
+
+        def baseline_mutation(payload):
+            payload["mates"][0]["limits"] = None
+            payload["properties"]["mates"][
+                "shoulder_pitch_joint__coaxial"
+            ]["dp.joint.limits_record"] = "joints/arm.json#limits"
+
+        result, _source, output = self._prepare(
+            mutate=baseline_mutation,
+            joint_record=record_value,
+        )
+        self.assertTrue(result.passed, result.findings)
+        delivery = self._deliver(output)
+        discovery_path = delivery / "evidence/discovery.json"
+        discovery = json.loads(discovery_path.read_text(encoding="utf-8"))
+        entry = next(
+            item
+            for item in discovery["records"]
+            if item.get("file") == "joints/arm.json"
+        )
+        record_path = delivery / "input" / entry["package_file"]
+        original = record_path.read_text(encoding="utf-8")
+        changed = original.replace(
+            '"lower": 0.0',
+            '"lower": 0.0, "lower": -1.0',
+            1,
+        )
+        if changed == original:
+            changed = original.replace(
+                '"lower":0.0',
+                '"lower":0.0,"lower":-1.0',
+                1,
+            )
+        self.assertNotEqual(changed, original)
+        payload = changed.encode("utf-8")
+        with self.assertRaises(PipelineError):
+            parse_data(payload, Path(entry["file"]))
+        record_path.write_bytes(payload)
+        checksum = hashlib.sha256(payload).hexdigest()
+        for item in discovery["records"]:
+            if item.get("file") == entry["file"]:
+                item["sha256"] = checksum
+                item["source_sha256"] = checksum
+        discovery_path.write_text(
+            json.dumps(discovery, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        source_path = delivery / "input/source.json"
+        source = json.loads(source_path.read_text(encoding="utf-8"))
+        for item in source["identity"]["records"]:
+            if item.get("reference", "").startswith(entry["file"] + "#"):
+                item["file_sha256"] = checksum
+        source["source_revision_id"] = digest(source["identity"])
+        source_path.write_text(
+            json.dumps(source, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        support.seal_delivery(delivery)
+
+        report = verify_discovery(delivery)
+
+        self.assertFalse(report["passed"])
+        self.assertTrue(
+            any(
+                item["code"] == "discovery.record"
+                and "Duplicate input key" in item["message"]
+                for item in report["errors"]
+            )
+        )
 
     def test_missing_file_in_one_root_does_not_hide_a_unique_record(self):
         _source, records = self._native()

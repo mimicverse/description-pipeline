@@ -31,13 +31,10 @@ exporter state is a proven ``absent`` runs the mate-inference suite.  Gate owner
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 import ntpath
 import re
 from pathlib import Path, PurePosixPath
-
-import yaml
 
 from ..delivery import read_delivery_manifest, read_source_record
 from ..interface_records import validate_request_record
@@ -107,10 +104,6 @@ class _Failure(Exception):
 def _require(condition: bool, code: str, message: str, detail=None) -> None:
     if not condition:
         raise _Failure(code, message, detail)
-
-
-def _read_json(path: Path) -> dict:
-    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _authored_identity(raw: dict, namespace: str) -> dict:
@@ -2784,6 +2777,15 @@ def _close(left, right, tolerance: float = 1e-9) -> bool:
 def _record_value(package: Path, entry: dict, key: str):
     from ..interface_records import record_archive_path
 
+    original_file = entry.get("file")
+    if not isinstance(original_file, str) and isinstance(entry.get("reference"), str):
+        original_file = str(entry["reference"]).partition("#")[0]
+    _require(
+        isinstance(original_file, str) and bool(original_file),
+        "discovery.record",
+        "embedded record has no original filename",
+        {"file": entry.get("package_file")},
+    )
     relative = record_archive_path(str(entry.get("package_file") or ""))
     candidates = [package / relative, package / "input" / relative]
     target = next((candidate for candidate in candidates if candidate.is_file()), candidates[0])
@@ -2797,11 +2799,14 @@ def _record_value(package: Path, entry: dict, key: str):
         "embedded record bytes changed",
         {"file": entry.get("package_file")},
     )
-    text = payload.decode("utf-8", errors="replace")
     try:
-        data = json.loads(text)
-    except ValueError:
-        data = yaml.safe_load(text)
+        data = parse_data(payload, Path(original_file))
+    except PipelineError as error:
+        raise _Failure(
+            "discovery.record",
+            f"embedded record is not valid UTF-8 JSON/YAML: {error}",
+            {"file": entry.get("package_file")},
+        ) from error
     node = data
     for part in [piece for piece in str(key or "").split(".") if piece]:
         _require(
@@ -2923,7 +2928,13 @@ def verify_discovery(package: Path) -> dict:
     def binding():
         _require(record_path.is_file(), "discovery.file", "the discovery record is missing")
         payload_bytes = record_path.read_bytes()
-        payload = json.loads(payload_bytes.decode("utf-8"))
+        try:
+            payload = parse_data(payload_bytes, record_path)
+        except PipelineError as error:
+            raise _Failure(
+                "discovery.binding",
+                f"discovery record is not valid UTF-8 JSON: {error}",
+            ) from error
         _require(payload.get("schema_version") == DISCOVERY_SCHEMA, "discovery.binding", "unexpected discovery schema")
         files = payload.get("files")
         _require(
@@ -3517,11 +3528,7 @@ def verify_discovery(package: Path) -> dict:
         payload = state["payload"]
         entry = payload.get("budget")
         _require(isinstance(entry, dict), "discovery.budgets", "the package carries no design budget record binding")
-        value = _record_value(
-            package,
-            {"package_file": entry.get("package_file"), "sha256": entry.get("sha256")},
-            str(entry.get("key") or ""),
-        )
+        value = _record_value(package, entry, str(entry.get("key") or ""))
         _require(isinstance(value, dict), "discovery.budgets", "the design budget record entry is not an object")
         for key in ("expected_mass_kg", "expected_extent_m"):
             item = value.get(key)

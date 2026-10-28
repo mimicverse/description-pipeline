@@ -401,7 +401,7 @@ def _input(root, diagnostics=None):
 
         value = _record_value(
             Path(root),
-            {"package_file": budget_entry.get("package_file"), "sha256": budget_entry.get("sha256")},
+            budget_entry,
             str(budget_entry.get("key") or ""),
         )
         _require(isinstance(value, dict), "Discovery record budget entry is not an object")
