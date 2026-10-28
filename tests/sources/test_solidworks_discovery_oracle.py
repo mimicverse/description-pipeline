@@ -320,13 +320,9 @@ class OracleSemanticsTests(unittest.TestCase):
     def baseline(self, record: dict | None = None) -> Path:
         """One delivery produced by the generator from the analytic fixture (or a variant)."""
         self.serial += 1
+        record = native_record() if record is None else record
         source = self.tmp / f"native{self.serial}"
-        for name in (
-            "cad/robot.SLDASM",
-            "cad/base.SLDPRT",
-            "cad/sub.SLDASM",
-            "cad/arm.SLDPRT",
-        ):
+        for name in record["files"]:
             path = source / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(f"placeholder {name}\n".encode())
@@ -345,7 +341,7 @@ class OracleSemanticsTests(unittest.TestCase):
             source,
             output,
             run_id="oracle-run",
-            backend=_ReplayBackend(record if record is not None else native_record()),
+            backend=_ReplayBackend(record),
             settings=DiscoverySettings(record_roots=(records,)),
         )
         self.assertTrue(result.passed, result.findings)

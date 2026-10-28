@@ -34,7 +34,7 @@ class RebuildCarrierTests(unittest.TestCase):
     def _prepared(self, record: dict) -> tuple[dict, dict, Path]:
         self.serial += 1
         source = self.tmp / f"native{self.serial}"
-        for name in ("cad/robot.SLDASM", "cad/base.SLDPRT", "cad/arm.SLDPRT"):
+        for name in record["files"]:
             path = source / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(f"placeholder {name}\n".encode())
