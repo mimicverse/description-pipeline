@@ -530,6 +530,8 @@ class DiagnosticPreviewTests(unittest.TestCase):
         self.assertIn("previewDiagnosticState(preview)", app)
         self.assertIn("Source warnings", app)
         self.assertIn("appendWarningSourceRows", app)
+        self.assertIn("Cannot read registered preview artifact", app)
+        self.assertIn('key.textContent = "Preview artifact"', app)
         self.assertIn("replaceChildren()", app)
         self.assertIn("must not be published", app)
         self.assertNotIn("innerHTML", app)

@@ -91,7 +91,25 @@ assert.deepEqual(previewDiagnosticState({ verified: false, warnings: [] }), {
   unverified: true,
   warnings: [],
   warnings_total: 0,
+  reason: "",
+  mechanical_passed: false,
 });
+assert.deepEqual(
+  previewDiagnosticState({
+    verified: false,
+    reason: "run_unresolved",
+    mechanical_passed: true,
+    warnings: [],
+  }),
+  {
+    visible: true,
+    unverified: true,
+    warnings: [],
+    warnings_total: 0,
+    reason: "run_unresolved",
+    mechanical_passed: true,
+  },
+);
 
 const renderer = app.slice(
   app.indexOf("function renderPreviewDiagnostic"),

@@ -121,6 +121,8 @@ export function previewDiagnosticState(preview) {
     unverified: preview?.verified === false,
     warnings,
     warnings_total: Number.isInteger(preview?.warnings_total) ? preview.warnings_total : warnings.length,
+    reason: typeof preview?.reason === "string" ? preview.reason : "",
+    mechanical_passed: preview?.mechanical_passed === true,
   };
 }
 

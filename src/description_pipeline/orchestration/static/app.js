@@ -38,6 +38,7 @@ const state = {
   submissionKey: null,
   blockedPick: false,
   targetsRetryPick: null,
+  targetsRequest: 0,
   stages: [],
   selectedStage: null,
   viewer: null,
@@ -139,6 +140,10 @@ function formatBytes(bytes) {
 function folderLabel(value) {
   const name = String(value || "").replace(/[\\/]+$/, "").split(/[\\/]/).pop();
   return name || "";
+}
+
+function assemblyLabel(value) {
+  return folderLabel(value).replace(/\.sldasm$/i, "");
 }
 
 function shortRunId(value) {
@@ -259,6 +264,8 @@ function applyAssemblies(pick) {
 }
 
 async function loadTargets(pick) {
+  const requestId = state.targetsRequest + 1;
+  state.targetsRequest = requestId;
   const row = $("target-row");
   const select = $("target-select");
   const summary = $("change-summary");
@@ -274,6 +281,7 @@ async function loadTargets(pick) {
       `/api/targets?folder=${encodeURIComponent(pick.top)}&main_assembly=${encodeURIComponent(main)}`
     );
   } catch (error) {
+    if (requestId !== state.targetsRequest || state.folderPick !== pick) return;
     // A failed fetch is not "no targets configured": keep the pick so the fetch retries once a
     // session is ready again, and say what happened instead of misreporting an empty platform.
     state.targetsRetryPick = pick;
@@ -294,6 +302,7 @@ async function loadTargets(pick) {
     updateStartEnabled();
     return;
   }
+  if (requestId !== state.targetsRequest || state.folderPick !== pick) return;
   state.targetsRetryPick = null;
   const targets = payload.targets || [];
   const placeholder = document.createElement("option");
@@ -543,7 +552,7 @@ function clearSession() {
 
 function runDisplayTitle(run) {
   const custom = String(run.title || "").trim();
-  return custom || folderLabel(run.handoff_path) || "Engineering delivery";
+  return custom || assemblyLabel(run.main_assembly) || "Engineering delivery";
 }
 
 function pad2(value) {
@@ -680,7 +689,7 @@ function buildRunItem(run) {
   open.append(heading, meta);
   open.title = [
     runDisplayTitle(run),
-    folderLabel(run.handoff_path) || "Engineering folder",
+    assemblyLabel(run.main_assembly) || "Engineering delivery",
     formatTime(run.started_at),
     run.dag_run_id,
   ].join("\n");
@@ -758,8 +767,8 @@ function buildRunMenu(run) {
     input.type = "text";
     input.maxLength = 120;
     input.value = String(run.title || "");
-    input.placeholder = folderLabel(run.handoff_path) || "Engineering delivery";
-    input.title = "Leave empty and save to restore the engineering folder name; the title affects list display only.";
+    input.placeholder = assemblyLabel(run.main_assembly) || "Engineering delivery";
+    input.title = "Leave empty and save to restore the main assembly name; the title affects list display only.";
     input.setAttribute("aria-label", `Rename ${runDisplayTitle(run)}`);
     const buttons = document.createElement("div");
     buttons.className = "run-menu-buttons";
@@ -1595,11 +1604,11 @@ async function loadPreviewArtifactJson(artifactUrl, files, name, signal) {
   if (!files || !Object.prototype.hasOwnProperty.call(files, name)) return null;
   try {
     const response = await fetch(artifactUrl(name), { credentials: "same-origin", signal });
-    if (!response.ok) return null;
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
     return await response.json();
   } catch (error) {
     if (signal?.aborted) throw error;
-    return null;
+    throw new Error(`Cannot read registered preview artifact ${name}: ${error.message}`);
   }
 }
 
@@ -1627,11 +1636,21 @@ function fillPanelTable(host, headers, rows) {
 }
 
 async function renderPreviewPanels(preview, records, artifactUrl, signal) {
-  const data = {
-    robot: await loadPreviewArtifactJson(artifactUrl, preview.files, "model/robot.json", signal),
-    tool: await loadPreviewArtifactJson(artifactUrl, preview.files, "tool.json", signal),
-    quality: await loadPreviewArtifactJson(artifactUrl, preview.report_files, "reports/quality.json", signal),
-  };
+  const data = {};
+  const artifactErrors = [];
+  for (const [key, files, name] of [
+    ["robot", preview.files, "model/robot.json"],
+    ["tool", preview.files, "tool.json"],
+    ["quality", preview.report_files, "reports/quality.json"],
+  ]) {
+    try {
+      data[key] = await loadPreviewArtifactJson(artifactUrl, files, name, signal);
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      data[key] = null;
+      artifactErrors.push(error.message);
+    }
+  }
   state.previewData = data;
   const identity = summaryIdentity({ runId: state.dagRunId, subjectSha256: preview.subject_sha256 });
   const info = $("preview-info");
@@ -1648,6 +1667,14 @@ async function renderPreviewPanels(preview, records, artifactUrl, signal) {
     key.textContent = row.key;
     const value = document.createElement("dd");
     value.textContent = row.value || "not recorded";
+    info.append(key, value);
+  }
+  for (const message of artifactErrors) {
+    const key = document.createElement("dt");
+    key.textContent = "Preview artifact";
+    const value = document.createElement("dd");
+    value.className = "error";
+    value.textContent = message;
     info.append(key, value);
   }
   const limits = jointRows(records ? records.joints : []);
@@ -2108,7 +2135,7 @@ function renderRun(run) {
   const listEntry = (state.runsList || []).find((item) => item && item.dag_run_id === runId) || null;
   const deleted = resolveDeleted(run, listEntry);
   const customTitle = resolveTitle(run, listEntry);
-  $("run-heading").textContent = customTitle || folderLabel(run.handoff_path) || "Engineering folder";
+  $("run-heading").textContent = customTitle || assemblyLabel(run.main_assembly) || "Engineering delivery";
   $("run-state-label").textContent = RUN_STATES[run.state] || run.state || "State unconfirmed";
   $("run-dot").className = `dot ${runDotState(run.state)}`;
   $("run-initiator").textContent = `Initiator: ${run.operator || run.user || "not recorded"}`;
@@ -2155,13 +2182,12 @@ function renderRun(run) {
   const report = run.report && Array.isArray(run.report.stages) ? run.report : null;
   const coverage = run.coverage || {};
   const rows = [
-    ["Engineering folder", folderLabel(run.handoff_path) || "—"],
     ["State", RUN_STATES[run.state] || run.state || "—"],
     ["Started", formatTime(run.started_at)],
     ["Ended", formatTime(run.ended_at)],
   ];
   if (typeof run.main_assembly === "string" && run.main_assembly) {
-    rows.splice(1, 0, ["Main assembly", run.main_assembly]);
+    rows.unshift(["Main assembly", run.main_assembly]);
   }
   rows.splice(1, 0, ["Purpose", purposeLabel(run.purpose)]);
   const measured = report && report.measured ? report.measured : null;
@@ -2788,6 +2814,7 @@ function wire() {
   $("assembly-select").addEventListener("change", () => {
     state.assemblyChoice = $("assembly-select").value || null;
     updateStartEnabled();
+    if (state.folderPick) void loadTargets(state.folderPick);
   });
 
   $("cancel-button").addEventListener("click", () => {

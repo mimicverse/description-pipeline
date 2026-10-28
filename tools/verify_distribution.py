@@ -37,8 +37,12 @@ from description_pipeline.runtime import LINUX_PLATFORMS, TARGET_ABI, TARGET_PYT
 def safe_members(names):
     keys = []
     for name in names:
-        artifact_path_parts(name.rstrip("/"))
-        keys.append(name.rstrip("/").casefold())
+        clean = name.rstrip("/")
+        parts = artifact_path_parts(clean)
+        canonical = "/".join(parts)
+        if canonical != clean:
+            raise PipelineError(f"Archive member is not in canonical form: {name}")
+        keys.append(canonical.casefold())
     if len(keys) != len(set(keys)):
         raise PipelineError("Duplicate or case-colliding archive member")
 
@@ -214,12 +218,27 @@ def verify_release(directory, identity):
                 if any(stat.S_ISLNK(info.external_attr >> 16) for info in archive.infolist()):
                     raise PipelineError("Release ZIP contains a symlink")
                 if name in roles:
+                    if "files.json" not in archive.namelist():
+                        raise PipelineError(f"Role archive {name} lacks its complete file manifest")
                     expected = {**_locked_pins(source_locks[roles[name]]), product: version}
                     wheel_members = [
                         member
                         for member in archive.namelist()
-                        if member.startswith("wheels/") and member.endswith(".whl")
+                        if member.startswith("wheels/")
+                        and member.endswith(".whl")
+                        and len(artifact_path_parts(member)) == 2
                     ]
+                    expected_members = {
+                        *wheel_members,
+                        "requirements.lock",
+                        "README.md",
+                        "files.json",
+                    }
+                    unexpected_members = sorted(set(archive.namelist()) - expected_members)
+                    if unexpected_members:
+                        raise PipelineError(
+                            f"Role archive {name} carries unexpected members: {unexpected_members}"
+                        )
                     wheels = {}
                     for wheel_member in wheel_members:
                         parsed, wheel_version, _, tags = parse_wheel_filename(Path(wheel_member).name)

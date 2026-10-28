@@ -92,6 +92,30 @@ def die(message: str) -> None:
     raise SystemExit(f"render_operator: {message}")
 
 
+def require_distinct_local_ports(ports: dict[str, int | None]) -> None:
+    """Validate the actual local listener set with one shared collision rule."""
+
+    invalid = sorted(
+        name
+        for name, value in ports.items()
+        if value is not None and (type(value) is not int or not 1 <= value < 65536)
+    )
+    if invalid:
+        raise ValueError(f"local ports are invalid: {', '.join(invalid)}")
+    seen: dict[int, str] = {}
+    collisions = []
+    for name, value in ports.items():
+        if value is None:
+            continue
+        previous = seen.get(value)
+        if previous is not None:
+            collisions.append(f"{previous}/{name}={value}")
+        else:
+            seen[value] = name
+    if collisions:
+        raise ValueError(f"local ports must not collide: {', '.join(collisions)}")
+
+
 #: The one env-file encoding: a value stays bare only when every byte is in this shell-safe
 #: set; anything else (the libpq DSNs' ``&``/``?``, lists' ``,``, quoted paths) is single-quoted
 #: by shlex so that BOTH readers of this file - a shell ``source`` and the KEY=VALUE parser
@@ -360,8 +384,22 @@ def main() -> int:
     if not portal_port_raw.isdigit():
         die("OPERATOR_UPSTREAM must be host:port")
     portal_port = int(portal_port_raw)
-    if portal_port == https_port:
-        die("OPERATOR_UPSTREAM must not collide with the proxy ports")
+    try:
+        portal_is_loopback = ipaddress.ip_address(portal_host).is_loopback
+    except ValueError:
+        portal_is_loopback = portal_host == "localhost"
+    try:
+        require_distinct_local_ports(
+            {
+                "operator_https": https_port,
+                "portal": portal_port if portal_is_loopback else None,
+                "airflow_api": airflow_api_port,
+                "tunnel_loopback": tunnel_port,
+                "postgres": postgres_port,
+            }
+        )
+    except ValueError as error:
+        die(str(error))
     venv = private_dir(require_no_space(values["AIRFLOW_VENV"], "AIRFLOW_VENV"), "AIRFLOW_VENV")
     home = private_dir(require_no_space(values["AIRFLOW_HOME"], "AIRFLOW_HOME"), "AIRFLOW_HOME")
     if venv == home:

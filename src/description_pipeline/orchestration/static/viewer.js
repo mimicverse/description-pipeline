@@ -168,11 +168,17 @@ function originOf(node) {
   return { position: new THREE.Vector3(xyz[0], xyz[1], xyz[2]), quaternion };
 }
 
-function colorOf(materialNode) {
+function materialStyle(materialNode) {
   const color = materialNode ? materialNode.querySelector("color") : null;
   const values = color ? String(color.getAttribute("rgba") || "").trim().split(/\s+/).map(Number) : [];
-  if (values.length < 3 || values.slice(0, 3).some((value) => !Number.isFinite(value))) return 0x8fa8bf;
-  return new THREE.Color(values[0], values[1], values[2]).getHex();
+  if (values.length < 3 || values.slice(0, 3).some((value) => !Number.isFinite(value))) {
+    return { color: 0x8fa8bf, opacity: 1 };
+  }
+  const rawOpacity = Number.isFinite(values[3]) ? values[3] : 1;
+  return {
+    color: new THREE.Color(values[0], values[1], values[2]).getHex(),
+    opacity: Math.min(1, Math.max(0, rawOpacity)),
+  };
 }
 
 export function parseStl(buffer) {
@@ -363,8 +369,12 @@ export async function loadRobot(viewer, { urdfUrl, files, artifactUrl, onWarning
       const geometryNode = visual.querySelector("geometry");
       if (!geometryNode) continue;
       const { position, quaternion } = originOf(visual);
+      const style = materialStyle(visual.querySelector("material"));
       const material = new THREE.MeshStandardMaterial({
-        color: colorOf(visual.querySelector("material")),
+        color: style.color,
+        opacity: style.opacity,
+        transparent: style.opacity < 1,
+        depthWrite: style.opacity >= 1,
         metalness: 0.12,
         roughness: 0.68,
       });

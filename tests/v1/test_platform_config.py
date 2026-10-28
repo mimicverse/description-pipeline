@@ -120,6 +120,17 @@ class ValidationTests(unittest.TestCase):
                 "state_root": "C:/description-e2e/state",
             },
         )
+        remote_port_collision = platform_document(VALID_ROOT)
+        remote_port_collision["windows"]["endpoint_port"] = 18765
+        self.assertEqual(
+            platform_config.validate_platform(remote_port_collision)["windows"]["endpoint_port"],
+            18765,
+        )
+        remote_port_collision["windows"]["endpoint_port"] = 9443
+        self.assertEqual(
+            platform_config.validate_platform(remote_port_collision)["windows"]["endpoint_port"],
+            9443,
+        )
         self.assertEqual(resolved["windows"]["tunnel_loopback_port"], platform_config.DEFAULT_TUNNEL_LOOPBACK_PORT)
         self.assertEqual(resolved["retention"], {"unreferenced_evidence_days": None})
         self.assertNotIn("store_root", resolved["derived"])
@@ -203,7 +214,27 @@ class ValidationTests(unittest.TestCase):
             (
                 "origin collides with tunnel port",
                 lambda d: d["operator"].__setitem__("origin", "https://10.0.0.235:18765"),
-                "must not collide",
+                "local ports must not collide",
+            ),
+            (
+                "origin collides with portal port",
+                lambda d: d["operator"].__setitem__("origin", "https://10.0.0.235:8788"),
+                "local ports must not collide",
+            ),
+            (
+                "origin collides with airflow api port",
+                lambda d: d["operator"].__setitem__("origin", "https://10.0.0.235:8791"),
+                "local ports must not collide",
+            ),
+            (
+                "origin collides with postgres port",
+                lambda d: d["operator"].__setitem__("origin", "https://10.0.0.235:5433"),
+                "local ports must not collide",
+            ),
+            (
+                "tunnel collides with airflow api port",
+                lambda d: d["windows"].__setitem__("tunnel_loopback_port", 8791),
+                "local ports must not collide",
             ),
             (
                 "origin port zero",

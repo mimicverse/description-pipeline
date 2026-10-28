@@ -40,7 +40,10 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from render_operator import PORT_DEFAULTS  # noqa: E402  (single deploy-layer port source, DEP-01)
+from render_operator import (  # noqa: E402  (single deploy-layer port source, DEP-01)
+    PORT_DEFAULTS,
+    require_distinct_local_ports,
+)
 
 PLATFORM_SCHEMA = "solidworks-to-urdf.platform/v1"
 SNAPSHOT_SCHEMA = "solidworks-to-urdf.config-snapshot/v1"
@@ -198,10 +201,18 @@ def validate_platform(document) -> dict:
         field: windows_path(instance[field], f"windows.instance.{field}")
         for field in ("package_root", "output_root", "state_root")
     }
-    require(
-        len({origin_port, endpoint_port, tunnel_port}) == 3,
-        "configured ports must not collide (origin / endpoint / tunnel_loopback)",
-    )
+    try:
+        require_distinct_local_ports(
+            {
+                "operator_https": origin_port,
+                "portal": PORT_DEFAULTS["OPERATOR_UPSTREAM_PORT"],
+                "airflow_api": PORT_DEFAULTS["AIRFLOW_API_PORT"],
+                "tunnel_loopback": tunnel_port,
+                "postgres": PORT_DEFAULTS["POSTGRES_PORT"],
+            }
+        )
+    except ValueError as error:
+        die(str(error))
 
     auth = document["auth"]
     require_keys(auth, allowed=_AUTH_KEYS, required=_AUTH_KEYS, where="auth")

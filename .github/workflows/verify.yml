@@ -20,6 +20,8 @@ jobs:
     steps:
       - name: Check out the repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Install the pinned CPython
         uses: actions/setup-python@v5
         with:
@@ -143,6 +145,8 @@ jobs:
     steps:
       - name: Check out the repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: The baseline is Desktop PowerShell 5.1 with a bound CPython 3.12
         run: |
           if ($PSVersionTable.PSEdition -ne 'Desktop') { throw "expected Desktop PowerShell, got $($PSVersionTable.PSEdition)" }
@@ -175,6 +179,8 @@ jobs:
     steps:
       - name: Check out the repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Install the pinned CPython
         uses: actions/setup-python@v5
         with:
@@ -332,6 +338,8 @@ jobs:
     steps:
       - name: Check out the repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Install the pinned CPython
         uses: actions/setup-python@v5
         with:
