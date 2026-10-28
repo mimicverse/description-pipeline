@@ -25,9 +25,7 @@ WITH bound_claims AS (
      AND task.task_id = claim.task_id
      AND task.run_id = claim.dag_run_id
      AND task.map_index = claim.map_index
-    WHERE claim.dag_id IS NOT NULL
-       OR claim.dag_run_id IS NOT NULL
-       OR claim.task_id IS NOT NULL
+    WHERE claim.task_id IS NOT NULL
        OR claim.map_index IS NOT NULL
 ),
 scheduling_projection AS (
@@ -52,7 +50,7 @@ scheduling_projection AS (
 ),
 dag_run_projection AS (
     SELECT
-        dag.dag_id || '/' || dag.run_id AS object_id,
+        COALESCE(claim.dag_id, '') || '/' || COALESCE(claim.dag_run_id, '') AS object_id,
         command.run_id,
         dag.state,
         CASE
@@ -65,15 +63,17 @@ dag_run_projection AS (
             ELSE 'unknown'
         END AS bucket,
         COALESCE(dag.end_date, dag.start_date) AS updated_at
-    FROM :"airflow_schema".dag_run AS dag
-    JOIN :"platform_schema".execution_claim AS claim
-      ON claim.dag_id = dag.dag_id
-     AND claim.dag_run_id = dag.run_id
+    FROM :"platform_schema".execution_claim AS claim
     JOIN :"platform_schema".command AS command
       ON command.command_id = claim.command_id
+    LEFT JOIN :"airflow_schema".dag_run AS dag
+      ON claim.dag_id = dag.dag_id
+     AND claim.dag_run_id = dag.run_id
+    WHERE claim.dag_id IS NOT NULL
+       OR claim.dag_run_id IS NOT NULL
     GROUP BY
-        dag.dag_id,
-        dag.run_id,
+        claim.dag_id,
+        claim.dag_run_id,
         dag.state,
         dag.start_date,
         dag.end_date,

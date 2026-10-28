@@ -22,7 +22,7 @@ except ImportError:
     psycopg2 = None
 
 from description_pipeline.io import digest
-from description_pipeline.orchestration.lifecycle_state import collect_projection
+from description_pipeline.orchestration.lifecycle_state import collect_projection, main as lifecycle_main
 from description_pipeline.pipeline.contracts import ArtifactRef
 from description_pipeline.pipeline.diagnostic import (
     DiagnosticAdmissionSpec,
@@ -1204,6 +1204,176 @@ class PlatformSchemaPostgresTests(unittest.TestCase):
             ("request", "request-run-gate", None),
             [(row["object_kind"], row["object_id"], row["run_id"]) for row in projection["rows"]],
         )
+
+    def _insert_scheduling_claim(
+        self,
+        run_id: str,
+        *,
+        dag_id: str | None,
+        dag_run_id: str | None,
+        task_id: str | None = None,
+        map_index: int | None = None,
+    ) -> str:
+        command_id = f"{run_id}:scheduling"
+        claim_id = f"claim-{command_id}"
+        task_bound = task_id is not None or map_index is not None
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO command (
+                    command_id, run_id, kind, stage, idempotency_key, request,
+                    request_digest, config_snapshot_sha256, contract_sha256,
+                    policy_sha256, expected_executor_sha256
+                ) VALUES (%s, %s, %s, %s, %s, '{}'::jsonb, %s, %s, %s, %s, %s)
+                """,
+                (
+                    command_id,
+                    run_id,
+                    "stage" if task_bound else "dispatch",
+                    "discover" if task_bound else None,
+                    command_id,
+                    *[digest({"scheduling": command_id})] * 5,
+                ),
+            )
+            cursor.execute(
+                """
+                INSERT INTO execution_claim (
+                    claim_id, command_id, fence, owner_sha256, executor_sha256,
+                    dag_id, dag_run_id, task_id, map_index,
+                    issued_at, last_seen_at, expires_at, closed_at, closure_code
+                ) VALUES (
+                    %s, %s, 1, %s, %s, %s, %s, %s, %s,
+                    now(), now(), now(), now(), 'completed'
+                )
+                """,
+                (
+                    claim_id,
+                    command_id,
+                    digest({"owner": claim_id}),
+                    digest({"scheduling": command_id}),
+                    dag_id,
+                    dag_run_id,
+                    task_id,
+                    map_index,
+                ),
+            )
+        return claim_id
+
+    def test_terminal_dispatch_claim_allows_real_operator_stop_gate(self) -> None:
+        self._install_canonical_schema()
+        run_id = "run-dispatch-failed"
+        self._insert_run(run_id)
+        command_id = self._insert_stage_command(run_id, "freeze")
+        self._insert_decision(run_id, "freeze", command_id, outcome="failed")
+        self._insert_scheduling_claim(run_id, dag_id="pipeline", dag_run_id=run_id)
+        self._query(
+            f'INSERT INTO "{self.airflow_schema}".dag_run (dag_id, run_id, state) '
+            "VALUES ('pipeline', %s, 'failed') RETURNING run_id",
+            (run_id,),
+        )
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "PLATFORM_OPERATOR_DSN": psycopg2.extensions.make_dsn(
+                        self.server.get_uri(),
+                        user="operator_ro",
+                    )
+                },
+            ),
+            mock.patch("sys.stdout"),
+        ):
+            projection = collect_projection()
+            self.assertEqual(
+                lifecycle_main(
+                    [
+                        "report",
+                        "--require-settled",
+                        "--require-no-unresolved",
+                        "--require-admission-closed",
+                    ]
+                ),
+                0,
+            )
+        scheduler_rows = [row for row in projection["rows"] if row["object_kind"] in {"dag_run", "scheduling"}]
+        self.assertEqual(
+            [(row["object_kind"], row["state"], row["bucket"]) for row in scheduler_rows],
+            [("dag_run", "failed", "terminal")],
+        )
+
+    def test_dispatch_projection_preserves_missing_unknown_and_active_dags(self) -> None:
+        self._install_canonical_schema()
+        for state, bucket in (
+            ("success", "terminal"),
+            ("failed", "terminal"),
+            ("queued", "in_flight"),
+            ("running", "in_flight"),
+            (None, "unknown"),
+            ("unexpected", "unknown"),
+            ("missing", "unknown"),
+        ):
+            with self.subTest(state=state):
+                run_id = "run-dag-" + str(state)
+                self._insert_run(run_id)
+                self._insert_scheduling_claim(run_id, dag_id="pipeline", dag_run_id=run_id)
+                if state != "missing":
+                    self._query(
+                        f'INSERT INTO "{self.airflow_schema}".dag_run (dag_id, run_id, state) '
+                        "VALUES ('pipeline', %s, %s) RETURNING run_id",
+                        (run_id, state),
+                    )
+                self.assertEqual(
+                    self._query(
+                        "SELECT object_kind, bucket FROM lifecycle_projection WHERE run_id = %s",
+                        (run_id,),
+                    ),
+                    [("dag_run", bucket)],
+                )
+
+    def test_task_projection_preserves_missing_unknown_active_and_partial_bindings(self) -> None:
+        self._install_canonical_schema()
+        cases = [
+            ("success", "terminal", "task", -1, "pipeline", "bound"),
+            ("failed", "terminal", "task", -1, "pipeline", "bound"),
+            ("running", "in_flight", "task", -1, "pipeline", "bound"),
+            ("deferred", "in_flight", "task", -1, "pipeline", "bound"),
+            (None, "unknown", "task", -1, "pipeline", "bound"),
+            ("unexpected", "unknown", "task", -1, "pipeline", "bound"),
+            ("missing", "unknown", "task", -1, "pipeline", "bound"),
+            ("partial-map", "unknown", None, -1, "pipeline", "bound"),
+            ("partial-task", "unknown", "task", None, "pipeline", "bound"),
+            ("partial-dag", "unknown", None, None, "pipeline", None),
+            ("partial-run", "unknown", None, None, None, "bound"),
+        ]
+        for index, (state, bucket, task_id, map_index, dag_id, dag_run_id) in enumerate(cases):
+            with self.subTest(state=state):
+                run_id = f"run-task-{index}"
+                dag_run_id = f"bound-{index}" if dag_run_id is not None else None
+                self._insert_run(run_id)
+                claim_id = self._insert_scheduling_claim(
+                    run_id,
+                    dag_id=dag_id,
+                    dag_run_id=dag_run_id,
+                    task_id=task_id,
+                    map_index=map_index,
+                )
+                if state in {"success", "failed", "running", "deferred", None, "unexpected"}:
+                    self._query(
+                        f'INSERT INTO "{self.airflow_schema}".task_instance '
+                        "(dag_id, task_id, run_id, map_index, state) "
+                        "VALUES (%s, %s, %s, %s, %s) RETURNING task_id",
+                        (dag_id, task_id, dag_run_id, map_index, state),
+                    )
+                rows = self._query(
+                    "SELECT object_kind, object_id, bucket FROM lifecycle_projection WHERE run_id = %s",
+                    (run_id,),
+                )
+                expected_kind = "scheduling" if task_id is not None or map_index is not None else "dag_run"
+                selected = [row for row in rows if row[0] == expected_kind]
+                self.assertEqual(len(selected), 1)
+                self.assertEqual(selected[0][2], bucket)
+                if expected_kind == "scheduling":
+                    self.assertEqual(selected[0][1], claim_id)
 
 
 if __name__ == "__main__":
