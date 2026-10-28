@@ -140,7 +140,7 @@ def joint_name(native_name: str) -> str:
 def _role_token(native_name: str) -> tuple[str, str] | None:
     """Return ``(side_prefix, role)`` for a recognised native joint role."""
 
-    source = re.sub(r"^(?:c_|cs_)", "", str(native_name), flags=re.IGNORECASE)
+    source = re.sub(r"^(?:c_|cs_|a_|axis_)", "", str(native_name), flags=re.IGNORECASE)
     try:
         name = token(source)
     except ValueError:

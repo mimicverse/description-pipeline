@@ -98,6 +98,9 @@ from .native_limits import (
     validate_native_limit,
 )
 from .session_artifacts import (
+    sealed_session_source,
+    session_materialization_under_root,
+    session_root_pid,
     session_source_identity,
     session_source_identity_sha256,
 )
@@ -118,6 +121,7 @@ from ...schemas import (
     NATIVE_IDENTITY_RESOLUTION_SCHEMA,
     SOURCE_RECORD_SCHEMA,
     exporter_declaration_present,
+    saved_native_reference_present,
 )
 
 DISCOVERY_SCHEMA = NATIVE_DISCOVERY_SCHEMA
@@ -448,19 +452,29 @@ _PROJECTED_IDENTITY = (
     (0.0, 0.0, 1.0, 0.0),
     (0.0, 0.0, 0.0, 1.0),
 )
+# IMateEntity2.ReferenceType uses swMateEntityTypes_e, not the similar
+# swMateEntity2ReferenceType_e enumeration.
 _MATE_ENTITY_TYPES = {
-    0: "Point",
-    1: "Line",
+    0: "Unsupported",
+    1: "Point",
+    2: "Line",
     3: "Plane",
     4: "Cylinder",
-    7: "Cone",
+    5: "Cone",
+    6: "Sphere",
+    7: "Circle",
 }
 _MATE_ENTITY_MINIMUMS = {
-    0: 3,
-    1: 6,
+    1: 3,
+    2: 6,
     3: 6,
     4: 7,
-    7: 8,
+    5: 8,
+}
+_MATE_ENTITY_UNSUPPORTED = {
+    0: "swMateUnsupported carries no mate entity geometry",
+    6: "swMateSphere local geometry and rank layout are not verified",
+    7: "swMateCircle local geometry and rank layout are not verified",
 }
 
 
@@ -526,12 +540,64 @@ def _projected_document_key(value: object) -> str:
     )
 
 
+def _projected_cached_author_binding(component: dict, slot: dict, carrier: dict, native_files: dict) -> bool:
+    provenance = component["source_provenance"]
+    relatives = []
+    for envelope, flag, root in (
+        (provenance, "author_imported_in_source_root", provenance.get("source_root")),
+        (slot, "author_metadata_in_stage", carrier["closure"].get("stage_root")),
+    ):
+        if not {"author_imported_path", "author_imported_error", "author_imported_exists",
+                "author_imported_relative"} <= envelope.keys():
+            return False
+        path, error = envelope["author_imported_path"], envelope["author_imported_error"]
+        exists, relative = envelope["author_imported_exists"], envelope["author_imported_relative"]
+        if error is not None and (not isinstance(error, str) or not error.strip()):
+            return False
+        if path is None:
+            if exists is not None or relative is not None:
+                return False
+            relatives.append(None)
+            continue
+        if not isinstance(path, str) or not path.strip() or not ntpath.isabs(path) or error is not None:
+            return False
+        if envelope.get(flag) is True:
+            relative = envelope.get("bound_source") if envelope is slot else relative
+            if (
+                not isinstance(relative, str) or not isinstance(root, str)
+                or not ntpath.isabs(root) or exists is not True
+            ):
+                return False
+            try:
+                artifact_path_parts(relative.replace("\\", "/"))
+            except PipelineError:
+                return False
+            canonical = relative.replace("\\", "/")
+            if (
+                _projected_document_key(path) != _projected_document_key(ntpath.join(root, relative))
+                or not isinstance(native_files.get(canonical), str)
+                or carrier["files"].get(canonical) != native_files[canonical]
+            ):
+                return False
+            relatives.append(canonical)
+        else:
+            if exists is not False or relative is not None:
+                return False
+            relatives.append(None)
+    return (
+        relatives[0] == relatives[1]
+        and type(slot.get("suppression_state")) is int
+        and slot["suppression_state"] == component.get("suppression_state")
+    )
+
+
 def _projected_component_document_is_bound(
     component: dict,
     name: str,
     reference_document: str,
-    native_files: object,
+    record: dict,
 ) -> bool:
+    native_files = record.get("files")
     document = component.get("document")
     if (
         not isinstance(document, str)
@@ -540,6 +606,64 @@ def _projected_component_document_is_bound(
         != _projected_document_key(reference_document)
     ):
         return False
+    provenance = component.get("source_provenance")
+    if provenance is not None and not isinstance(provenance, dict):
+        return False
+    provenance = provenance or {}
+    if provenance.get("state") == "cached_materialization" or provenance.get("kind") == "native_import_materialization":
+        reference = component.get("native_reference")
+        if not isinstance(reference, dict) or not isinstance(record.get("session"), dict):
+            return False
+        anchor = provenance.get("defining_anchor")
+        owner = provenance.get("owner")
+        expected_defining = owner if anchor is None else next(
+            (row.get("document") for row in record.get("components", []) if row.get("name2") == anchor), None
+        )
+        session_pid = (record.get("session") or {}).get("native_api_pid")
+        if (
+            not isinstance(native_files, dict)
+            or provenance.get("document") is not None
+            or provenance.get("configuration") != component.get("configuration")
+            or provenance.get("occurrence") != name
+            or reference.get("is_virtual") is not False
+            or _projected_document_key(reference.get("native_owner")) != _projected_document_key(owner)
+            or reference.get("defining_anchor") != anchor
+            or not expected_defining
+            or _projected_document_key(reference.get("defining")) != _projected_document_key(expected_defining)
+            or (anchor is not None and anchor != component.get("parent_occurrence"))
+            or type(session_pid) is not int or session_pid <= 0
+            or type(provenance.get("native_api_pid")) is not int
+            or provenance.get("native_api_pid") != session_pid
+            or session_root_pid(provenance.get("session_temp_root")) != session_pid
+            or not session_materialization_under_root(document, provenance.get("session_temp_root"))
+            or any(
+                _projected_document_key(provenance.get(key)) != _projected_document_key(document)
+                for key in ("native_document_path", "materialization_path", "session_document_path")
+            )
+        ):
+            return False
+        carrier = record.get("source_selection")
+        if not isinstance(carrier, dict) or not isinstance(carrier.get("closure"), dict):
+            return False
+        slots = carrier["closure"].get("imports")
+        if not isinstance(slots, list) or not isinstance(carrier.get("files"), dict):
+            return False
+        matches = [row for row in slots if isinstance(row, dict) and row.get("instance") == name]
+        if len(matches) != 1 or (carrier.get("files") or {}).get(owner) != provenance.get("owner_sha256"):
+            return False
+        slot = matches[0]
+        try:
+            sealed_session_source(component, slot, native_files=native_files)
+        except (ValueError, PipelineError):
+            return False
+        return (
+            _projected_cached_author_binding(component, slot, carrier, native_files)
+            and
+            type(slot.get("native_api_pid")) is int
+            and slot["native_api_pid"] > 0
+            and session_root_pid(slot.get("session_temp_root")) == slot["native_api_pid"]
+            and session_materialization_under_root(slot.get("materialization"), slot.get("session_temp_root"))
+        )
     try:
         artifact_path_parts(document.replace("\\", "/"))
     except PipelineError:
@@ -587,23 +711,31 @@ def _projected_entity_geometry(reference_type, params):
             "ReferenceType must be an exact native integer",
             {"value_type": type(reference_type).__name__},
         )
+    type_name = _MATE_ENTITY_TYPES.get(reference_type)
+    if type_name is None:
+        return None, f"ReferenceType {reference_type} is outside swMateEntityTypes_e"
+    unsupported = _MATE_ENTITY_UNSUPPORTED.get(reference_type)
+    if unsupported is not None:
+        return {
+            "kind": "unsupported",
+            "type": type_name,
+            "reason": unsupported,
+        }, None
     minimum = _MATE_ENTITY_MINIMUMS.get(reference_type)
-    if minimum is None:
-        return None, None
     if len(params) < minimum:
         return None, (
             f"EntityParams has {len(params)} values; the documented layout for "
-            f"{_MATE_ENTITY_TYPES[reference_type]} needs at least {minimum}"
+            f"{type_name} needs at least {minimum}"
         )
     point = list(params[0:3])
-    if reference_type == 0:
+    if reference_type == 1:
         return {"kind": "point", "point": point}, None
     vector = list(params[3:6])
     norm = math.hypot(*vector)
     if norm <= 0:
         return None, "EntityParams vector is zero-length"
     unit = [value / norm for value in vector]
-    if reference_type == 1:
+    if reference_type == 2:
         return {"kind": "line", "point": point, "direction": unit}, None
     if reference_type == 3:
         return {"kind": "plane", "point": point, "normal": unit}, None
@@ -904,7 +1036,6 @@ def _project_native_record(record: dict) -> dict:
         name: str(component.get("document") or "")
         for name, component in by_component.items()
     }
-    native_files = record.get("files")
     mates = projected.get("mates")
     if not isinstance(mates, list):
         raise CadError(
@@ -1045,7 +1176,7 @@ def _project_native_record(record: dict) -> dict:
                             by_component[scope],
                             scope,
                             reference_document,
-                            native_files,
+                            record,
                         )
                     )
                 else:
@@ -1083,7 +1214,7 @@ def _project_native_record(record: dict) -> dict:
                         by_component[component],
                         component,
                         reference_document,
-                        native_files,
+                        record,
                     )
                 ):
                     raise CadError(
@@ -1533,12 +1664,20 @@ def _entity_geometry_view(entity: dict, findings: list[dict], obj: str) -> dict 
     if kind not in _LOCALIZED_GEOMETRY_FIELDS:
         if usable_flat:
             return view
+        detail = {"kind": kind}
+        if kind == "unsupported":
+            detail.update(
+                {
+                    "type": geometry.get("type"),
+                    "reason": geometry.get("reason"),
+                }
+            )
         findings.append(
             _finding(
                 "discovery.mate_entities_unsupported",
                 obj,
                 "localized mate entity geometry carries an unsupported kind",
-                {"kind": kind},
+                detail,
             )
         )
         return None
@@ -1671,10 +1810,24 @@ def _mate_rows(mate: dict, frames: dict, findings: list[dict], obj: str) -> dict
             )
         )
         return None
-    first = _entity_geometry_view(entities[0], findings, obj)
-    second = _entity_geometry_view(entities[1], findings, obj)
-    if first is None or second is None:
-        return None
+    geometry_relevant = kind not in {"lock", "limitangle", "limitdistance"}
+    if not geometry_relevant and any(
+        any(
+            entity.get(shape) is not None
+            for shape in ("point", "plane", "cylinder", "circle", "line")
+        )
+        for entity in entities
+    ):
+        geometry_relevant = True
+    if not geometry_relevant:
+        # These branches do not need mate-entity geometry. Solver state is read
+        # separately, and an unsupported entity type is retained as provenance.
+        first, second = dict(entities[0]), dict(entities[1])
+    else:
+        first = _entity_geometry_view(entities[0], findings, obj)
+        second = _entity_geometry_view(entities[1], findings, obj)
+        if first is None or second is None:
+            return None
     # A limits reading is an observation, not a default.  Only an intact reading
     # (an explicit null, or a mapping) may claim anything; a missing key or a
     # non-mapping value refuses before either purpose may treat it as absence.
@@ -2588,6 +2741,8 @@ def _merged_joint_properties(
     namespace: str,
     findings: list[dict],
     obj: str,
+    *,
+    consumed: set[tuple[str, str, str]] | None = None,
 ) -> dict:
     """Merge mate-level and document-level scalars; conflicts block.
 
@@ -2600,6 +2755,8 @@ def _merged_joint_properties(
     for name in names:
         for key, value in (mate_properties.get(name) or {}).items():
             candidates.setdefault(key, []).append((f"mate:{name}", value))
+            if consumed is not None and key.startswith(f"{namespace}.joint."):
+                consumed.add(("mate", name, key))
     heads = {name.split("__", 1)[0] for name in names if "__" in name}
     prefixes = [f"{namespace}.joint.{head}." for head in sorted(heads)]
     prefixes += [f"{namespace}.joint.{name}." for name in names if name]
@@ -2609,6 +2766,8 @@ def _merged_joint_properties(
         for prefix in prefixes:
             if key.startswith(prefix):
                 candidates.setdefault(f"{namespace}.joint.{key[len(prefix) :]}", []).append((f"document:{key}", value))
+                if consumed is not None:
+                    consumed.add(("document", "", key))
     merged: dict = {}
     for key, values in candidates.items():
         texts = {str(value) for _, value in values}
@@ -3845,7 +4004,16 @@ def _exporter_native_pairs(record: dict, findings: list[dict]) -> dict[tuple[str
             continue
         diagnostics: list[dict] = []
         kind = str(mate.get("type") or "").strip().lower()
-        if kind in SUPPORTED_MATES and kind not in {"lock", "limitangle"}:
+        geometry_relevant = kind in SUPPORTED_MATES and kind not in {"lock", "limitangle", "limitdistance"}
+        if geometry_relevant is False and any(
+            any(
+                entity.get(shape) is not None
+                for shape in ("point", "plane", "cylinder", "circle", "line")
+            )
+            for entity in entities
+        ):
+            geometry_relevant = True
+        if geometry_relevant:
             geometry = [_entity_geometry_view(entity, diagnostics, obj) for entity in entities]
             if all(entity is not None for entity in geometry) and any(
                 not any(entity.get(shape) is not None for shape in ("point", "plane", "cylinder", "circle", "line"))
@@ -3956,7 +4124,7 @@ def _exporter_constraint_checks(
                     )
 
 
-def _exporter_axis(
+def _declared_axis(
     record: dict, declared: dict, body: dict, parent_body: dict | None, findings: list[dict]
 ) -> tuple[dict, dict | None]:
     obj = f"joint:{declared['name']}"
@@ -4173,14 +4341,18 @@ def _exporter_origin(declared: dict, child: dict, parent: dict, record: dict, fi
         )
 
 
-def _exporter_joint_facts(
+def _declared_joint_facts(
     record: dict,
     declaration: dict,
     bodies: list[dict],
     findings: list[dict],
     *,
     purpose: str = PURPOSE_ENGINEERING,
+    declaration_source: str = "exporter",
 ) -> list[dict]:
+    if declaration_source not in {"exporter", "saved_native_reference"}:
+        raise PipelineError("unknown native joint declaration source")
+    saved_preview = declaration_source == "saved_native_reference"
     by_name = {body["name"]: body for body in bodies}
     component_records = {
         str(item.get("name2")): item
@@ -4253,10 +4425,17 @@ def _exporter_joint_facts(
             )
         child, parent = by_name[link["name"]], by_name[link["parent"]]
         subtree = child_tree(str(child["name"]))
-        _exporter_origin(declared, child, parent, record, findings)
+        if not saved_preview:
+            _exporter_origin(declared, child, parent, record, findings)
         axis, selector = ({"point": None, "direction": None, "source": "exporter"}, None)
         if kind != "fixed":
-            axis, selector = _exporter_axis(record, declared, child, parent, findings)
+            axis, selector = _declared_axis(record, declared, child, parent, findings)
+            axis["source"] = declaration_source
+            if saved_preview:
+                # The native reference already supplies the assembly line. Do
+                # not round-trip it through a local frame merely to recover it.
+                axis["direction"] = list(declared["assembly_direction"])
+                axis["assembly_direction"] = list(declared["assembly_direction"])
         limits = declared["limits"]
         limit_source = "declared_author" if isinstance(limits, dict) else None
         preview_policy = None
@@ -4272,10 +4451,14 @@ def _exporter_joint_facts(
                 and all(valid(limits.get(key)) for key in ("lower", "upper"))
             )
             bounds_present = [limits.get(key) for key in ("lower", "upper")] if isinstance(limits, dict) else []
+            position_absent = saved_preview and (
+                limits is None or (isinstance(limits, dict) and not {"lower", "upper"}.intersection(limits))
+            )
             invalid_bounds = any(value is not None and not valid(value) for value in bounds_present)
             ordered_conflict = bounds_usable and limits["lower"] > limits["upper"]
             if kind != "continuous" and (
-                invalid_bounds or ordered_conflict or (purpose != PURPOSE_ENGINEERING and not bounds_usable)
+                invalid_bounds or ordered_conflict
+                or (purpose != PURPOSE_ENGINEERING and not bounds_usable and not position_absent)
             ):
                 findings.append(
                     _finding(
@@ -4471,7 +4654,10 @@ def _exporter_joint_facts(
                 limit_source = "native"
             else:
                 author_limits = dict(limits) if isinstance(limits, dict) else None
-                author_nonzero = bounds_usable and (float(limits["lower"]) != 0.0 or float(limits["upper"]) != 0.0)
+                author_nonzero = bounds_usable and (
+                    declared.get("position_range_source") == "controlled_record"
+                    or float(limits["lower"]) != 0.0 or float(limits["upper"]) != 0.0
+                )
                 author_zero = bounds_usable and float(limits["lower"]) == 0.0 and float(limits["upper"]) == 0.0
                 native_inventory_complete = native_limit_inventory_complete(record.get("mates"))
                 if author_nonzero:
@@ -4509,7 +4695,10 @@ def _exporter_joint_facts(
                             blocking=False,
                         )
                     )
-                elif kind == "revolute" and preview_allowed and author_zero and not native_read_errors:
+                elif (
+                    kind == "revolute" and preview_allowed
+                    and (author_zero or position_absent) and not native_read_errors
+                ):
                     preview_policy = rotation_window_policy(
                         PREVIEW_POLICY_ID,
                         author_limits=author_limits,
@@ -6112,6 +6301,15 @@ def _validate_component_states(record: dict, findings: list[dict]) -> None:
                     {"component": name, "suppression_state": state},
                 )
             )
+        provenance = item.get("source_provenance")
+        if not suppressed and isinstance(provenance, dict) and (
+            provenance.get("state") == "cached_materialization"
+            or provenance.get("kind") == "native_import_materialization"
+        ) and not _projected_component_document_is_bound(item, name, item.get("document"), record):
+            findings.append(_finding(
+                "discovery.imported_source_unbound", f"component:{name}",
+                "Cached native materialization lacks a coherent sealed source and session binding",
+            ))
 
 
 def _validate_source_definition_record(payload: object) -> dict:
@@ -6267,9 +6465,9 @@ def derive_native_package(
     try:
         record = _project_native_record(raw_record)
     except CadError as error:
-        raise PipelineError(
-            f"native discovery local projection failed: {error}"
-        ) from error
+        failure = PipelineError(f"native discovery local projection failed: {error}")
+        failure.details = {"code": error.code, "detail": error.detail}
+        raise failure from error
     _validate_property_objects(record)
     identity_block = record.get("identity") if isinstance(record.get("identity"), dict) else {}
     recorded_main = identity_block.get("main_assembly")
@@ -6522,6 +6720,199 @@ def derive_native_package(
     )
 
 
+def _saved_native_carriers(
+    record: dict, settings: DiscoverySettings, findings: list[dict]
+) -> tuple[list, list, list, dict]:
+    from .saved_native_references import RULE_ID, SavedNativeReferenceError, bind_saved_native_references
+
+    try:
+        proof = bind_saved_native_references(record, purpose=settings.purpose)
+    except SavedNativeReferenceError as error:
+        findings.append(_finding("discovery.saved_native_reference_invalid", "assembly", str(error), error.details))
+        return [], [], [], {}
+    features = proof["features"]
+    bodies, links = [], []
+    controlled = {}
+    consumed: set[tuple[str, str, str]] = set()
+    for index, mate in enumerate(record.get("mates") or []):
+        if mate.get("suppressed") is False and (
+            mate.get("native_limit") is not None or mate.get("limits") is not None
+        ):
+            findings.append(_finding(
+                "discovery.saved_native_limit_direction_unbound", f"mate:{mate.get('name')}",
+                "Native position values are preserved, but their scalar coordinate is not bound "
+                "to the saved inspection axis; no replacement window is permitted",
+                {"raw_reference": f"raw.mates[{index}]", "native_limits": mate.get("limits")},
+            ))
+    for occurrence, feature in sorted(features.items()):
+        coordinate = proof["coordinates"][feature]
+        members = sorted(proof["members"][occurrence])
+        for member in members:
+            component_properties = ((record.get("properties") or {}).get("components") or {}).get(member) or {}
+            if "dp.body_datum" in component_properties and component_properties["dp.body_datum"] != coordinate["name"]:
+                findings.append(_finding("discovery.body_datum_conflict", f"component:{member}",
+                                         "The native body datum declaration contradicts the saved inspection frame"))
+            if any(key.startswith("dp.joint.") for key in component_properties):
+                findings.append(_finding("discovery.joint_property_unbound", f"component:{member}",
+                                         "Component-level joint properties lack an exact interface binding"))
+        material = [name for name in members if not proof["components"][name]["document"].lower().endswith(".sldasm")]
+        if not material:
+            findings.append(_finding("discovery.saved_native_reference_empty", f"body:{occurrence}",
+                                     "A declared native carrier has no material members"))
+        bodies.append({"root": feature, "name": feature, "source": "saved_native_reference",
+                       "identity": f"native:{occurrence}", "components": material, "owners": members,
+                       "datum": coordinate["name"], "datum_owner": coordinate["owner"]})
+        parent_occurrence = proof["parent"][occurrence]
+        joint = None
+        witnesses = []
+        if parent_occurrence is not None:
+            axis_record = proof["axes"][feature]
+            selector = axis_record["record"]["selector"]
+            matrix = coordinate["array"]
+            direction = axis_record["direction"]
+            local = [sum(matrix[row * 4 + col] * direction[row] for row in range(3)) for col in range(3)]
+            signed_direction = list(direction)
+            witnesses = proof["edges"][tuple(sorted((occurrence, parent_occurrence)))]
+            properties = _merged_joint_properties(
+                (record.get("properties") or {}).get("mates") or {},
+                (record.get("properties") or {}).get("document") or {},
+                [*[witness["mate"] for witness in witnesses], {"name": feature}, {"name": selector["feature_name"]}],
+                NAMESPACE, findings, f"joint:{selector['feature_name']}",
+                consumed=consumed,
+            )
+            unknown = set(properties) - {
+                "dp.joint.type", "dp.joint.axis_sign", "dp.joint.limits_record", "dp.joint.drive_record",
+            }
+            if any(key.startswith("dp.joint.") for key in unknown):
+                findings.append(_finding("discovery.joint_property_unsupported", f"joint:{selector['feature_name']}",
+                                         "A native joint declaration cannot be interpreted by the inspection rule",
+                                         {"keys": sorted(unknown)}))
+            signs = [properties["dp.joint.axis_sign"]] if "dp.joint.axis_sign" in properties else []
+            if signs:
+                valid_signs = [
+                    value if type(value) is int and value in {-1, 1}
+                    else int(value) if type(value) is str and value in {"1", "+1", "-1"} else None
+                    for value in signs
+                ]
+                if None in valid_signs or len(set(valid_signs)) != 1:
+                    findings.append(_finding("discovery.joint_axis_sign_invalid", f"joint:{selector['feature_name']}",
+                                             "Native axis-sign declarations are invalid or contradictory"))
+                else:
+                    local = [value * valid_signs[0] for value in local]
+                    signed_direction = [value * valid_signs[0] for value in direction]
+            findings.append(_finding(
+                "direction.native_axis_sign" if signs else "direction.preview_endpoint_order",
+                f"joint:{selector['feature_name']}",
+                "The native axis-sign declaration selects the inspection direction; "
+                "native positive motion and hardware direction remain unqualified" if signs else
+                "The saved undirected axis uses an explicit inspection direction convention; "
+                "native positive motion and hardware direction remain unqualified",
+                {"rule_id": "native_axis_sign/v1" if signs else "stored_endpoint_order/v1", "native_selector": selector,
+                 "raw_endpoints_m": axis_record["record"]["raw_endpoints_m"], "signed_local_axis": local,
+                 "native_axis_sign_present": bool(signs), "native_positive_motion": False,
+                 "hardware_direction_qualified": False}, blocking=False,
+            ))
+            kind = properties.get("dp.joint.type", "revolute")
+            if kind not in {"revolute", "continuous"}:
+                findings.append(_finding("discovery.joint_type_conflict", f"joint:{selector['feature_name']}",
+                                         "A saved concentric inspection reference requires a rotational joint", kind))
+            limits = None
+            control = {}
+            for property_name, record_field, fields in (
+                ("dp.joint.limits_record", "limit_evidence", ("lower", "upper")),
+                ("dp.joint.drive_record", "drive", ("effort", "velocity")),
+            ):
+                if property_name not in properties:
+                    continue
+                if record_field == "limit_evidence" and kind == "continuous":
+                    findings.append(_finding("discovery.joint_limits_unexpected", f"joint:{selector['feature_name']}",
+                                             "A continuous joint cannot bind a controlled position record"))
+                    continue
+                reference = properties[property_name]
+                if not _text(reference):
+                    findings.append(_finding("discovery.record_reference_invalid", f"joint:{selector['feature_name']}",
+                                             "Controlled joint record reference must be nonempty text"))
+                    continue
+                entry = _resolve_record(settings, reference, findings, f"joint:{selector['feature_name']}")
+                if entry is None:
+                    continue
+                values = {field: _controlled_number(entry["value"].get(field)) for field in fields
+                          if record_field == "limit_evidence" or field in entry["value"]}
+                if record_field == "limit_evidence":
+                    values.update({field: _controlled_number(entry["value"][field]) for field in
+                                   ("effort", "velocity") if field in entry["value"]})
+                if not values or any(value is None for value in values.values()):
+                    findings.append(_finding("discovery.joint_control_invalid", f"joint:{selector['feature_name']}",
+                                             "Controlled joint values must be finite", {"reference": reference}))
+                    continue
+                if any(field in (limits or {}) and limits[field] != value for field, value in values.items()):
+                    findings.append(_finding("discovery.joint_control_conflict", f"joint:{selector['feature_name']}",
+                                             "Controlled joint records disagree", {"reference": reference}))
+                    continue
+                limits = {**(limits or {}), **values}
+                control[record_field] = entry
+            if "drive" not in control and "limit_evidence" in control and any(
+                field in (limits or {}) for field in ("effort", "velocity")
+            ):
+                control["drive"] = control["limit_evidence"]
+            controlled[feature] = control
+            joint = {"name": selector["feature_name"], "type": kind, "axis_name": selector["feature_name"],
+                     "axis": local, "limits": limits, "optional": {}, "origin": None,
+                     "assembly_direction": signed_direction,
+                     "position_range_source": "controlled_record" if "limit_evidence" in control else None}
+        links.append({"name": feature, "parent": features[parent_occurrence] if parent_occurrence else None,
+                      "joint": joint})
+        findings.append(_finding(
+            "discovery.saved_native_carrier", f"body:{occurrence}",
+            "Saved native references declare an inspection carrier; body attachment, mechanical freedom "
+            "and hardware qualification are not established",
+            {"rule_id": RULE_ID, "native_occurrence": occurrence, "native_coordinate": coordinate["name"],
+             "native_axis": proof["axes"][feature]["record"]["selector"], "components": members,
+             "parent_occurrence": parent_occurrence,
+             "rigid_observation": proof["roots"][occurrence].get("solver_observation"),
+             "native_coordinate_references": coordinate.get("references"),
+             "geometric_witnesses": [row["mate"]["name"] for row in witnesses],
+             "mechanical_qualified": False, "hardware_qualified": False}, blocking=False,
+        ))
+    property_buckets = [("document", "", (record.get("properties") or {}).get("document") or {})]
+    property_buckets.extend(("mate", name, values) for name, values in
+                            ((record.get("properties") or {}).get("mates") or {}).items())
+    for scope, name, values in property_buckets:
+        for key in values:
+            if key.startswith("dp.joint.") and (scope, name, key) not in consumed:
+                findings.append(_finding("discovery.joint_property_unbound", f"{scope}:{name or 'assembly'}",
+                                         "A native joint declaration has no exact saved interface binding",
+                                         {"key": key}))
+    clusters = _Clusters(
+        members={body["name"]: body["owners"] for body in bodies},
+        of={member: body["name"] for body in bodies for member in body["owners"]}, pairs={},
+    )
+    root = features[proof["root"]]
+    joints = _declared_joint_facts(record, {"root": root, "links": links}, bodies, findings,
+                                   purpose=settings.purpose, declaration_source="saved_native_reference")
+    for joint in joints:
+        joint.update(controlled.get(joint["child"], {}))
+    for item in proof["pose_mates"]:
+        mate = item["mate"]
+        findings.append(_finding(
+            "discovery.saved_pose_constraint", f"mate:{mate['name']}",
+            "The saved native constraint is retained as pose evidence; it does not prove joint freedom",
+            {"rule_id": RULE_ID, "scope": mate.get("scope"), "type": mate.get("type"),
+             "entities": [{key: entity.get(key) for key in
+                           ("component", "reference_document", "reference_configuration", "entity_index")}
+                          for entity in mate.get("entities") or []], "error_code": mate.get("error_code"),
+             "native_owners": item["owners"], "constraint_rows_used": False,
+             "mechanical_qualified": False}, blocking=False,
+        ))
+    _apply_cad_names(bodies, joints, clusters, findings, root=root)
+    base = next(body for body in bodies if body["name"] == "base_link")
+    frames = _interface_frames(record, clusters, bodies, base, findings)
+    names = {str(body.get("source_name") or body["name"]): body["name"] for body in bodies} | {
+        str(joint.get("source_name") or joint["name"]): joint["name"] for joint in joints
+    }
+    return bodies, joints, frames, names
+
+
 def _derive_carriers(
     record: dict, identity: dict, settings: DiscoverySettings, findings: list[dict]
 ) -> tuple[list, list, list, dict]:
@@ -6553,7 +6944,7 @@ def _derive_carriers(
         frames: list = []
         if declaration is not None:
             bodies, clusters = _exporter_memberships(record, declaration, findings)
-            joints = _exporter_joint_facts(record, declaration, bodies, findings, purpose=settings.purpose)
+            joints = _declared_joint_facts(record, declaration, bodies, findings, purpose=settings.purpose)
             root = next(
                 body
                 for body in bodies
@@ -6581,6 +6972,8 @@ def _derive_carriers(
             }
             frames = _interface_frames(record, clusters, bodies, root, findings)
         return bodies, joints, frames, derived_names
+    if saved_native_reference_present(record, settings.purpose):
+        return _saved_native_carriers(record, settings, findings)
     clusters = _clusters(record, findings)
     bodies, by_root = _body_records(record, clusters, settings, findings)
     joints = _joint_facts(record, clusters, settings, findings)
@@ -6802,21 +7195,17 @@ def source_definition(
                 }
                 entry["drive_source"] = "controlled"
         elif joint["type"] == "continuous":
-            if joint.get("drive") is not None:
-                entry["limits"] = {
-                    key: float(joint["drive"]["value"][key]) for key in ("effort", "velocity")
-                    if joint["drive"]["value"].get(key) is not None
-                }
+            entry["limits"] = {key: float(joint["limits"][key]) for key in ("effort", "velocity")
+                               if joint["limits"].get(key) is not None}
         else:
-            entry["limits"] = {
-                "lower": float(joint["limits"]["lower"]),
-                "upper": float(joint["limits"]["upper"]),
-            }
-            if joint.get("drive") is not None:
-                entry["limits"].update({
-                    key: float(joint["drive"]["value"][key]) for key in ("effort", "velocity")
-                    if joint["drive"]["value"].get(key) is not None
-                })
+            entry["limits"] = {key: float(joint["limits"][key])
+                               for key in ("lower", "upper", "effort", "velocity")
+                               if joint["limits"].get(key) is not None}
+        if isinstance(joint.get("drive"), dict):
+            entry.setdefault("limits", {}).update({
+                key: float(joint["drive"]["value"][key]) for key in ("effort", "velocity")
+                if joint["drive"]["value"].get(key) is not None
+            })
         limit_evidence = joint.get("limit_evidence")
         if isinstance(limit_evidence, dict):
             embedded = next(

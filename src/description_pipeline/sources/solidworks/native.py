@@ -2075,8 +2075,9 @@ def _mate_entity_reference(entity):
     radius2]`` array in the owning assembly's model space; the layout is
     preserved without semantic decoding.  Linux Discover performs the class
     decode and component localization after the native session has ended.
-    ``ReferenceType`` and ``ReferenceType2`` remain raw provenance.  A missing
-    or malformed reading is recorded explicitly and never silently dropped.
+    ``ReferenceType`` uses ``swMateEntityTypes_e``; ``ReferenceType2`` remains
+    separate raw provenance.  A missing or malformed reading is recorded
+    explicitly and never silently dropped.
     """
 
     record = {
@@ -7356,8 +7357,11 @@ class SolidWorksBackend(CadBackend):
         ``ReferenceType2`` as provenance plus ``EntityParams``
         (``[point xyz, vector ijk, radius1, radius2]`` in the owning
         assembly's model space). Linux independently performs documented
-        point/line/plane/cylinder/cone decoding and component localization
-        after the session closes. A missing or malformed reading is recorded
+        documented point/line/plane/cylinder/cone decoding and component
+        localization after the session closes. ``ReferenceType`` follows
+        ``swMateEntityTypes_e``; circle and sphere local geometry/rank layouts
+        are not inferred until their exact fields are independently
+        established. A missing or malformed reading is recorded
         explicitly without fabricating geometry.
         The block is additive evidence: the existing plane/cylinder/circle/point
         keys and every derivation consumer are unchanged by it, so recorded

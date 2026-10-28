@@ -20,6 +20,14 @@ from description_pipeline.verification.native_declarations import (
 )
 
 from tests.sources import support
+from tests.sources.test_verify_imported_sources import (
+    CACHED_CAPTURE_DOCUMENT,
+    CACHED_OCCURRENCE,
+    cached_carrier,
+    cached_component,
+    cached_slot,
+)
+from tests.sources.selection_support import sealed_selection
 
 
 def _translated(x: float, y: float, z: float) -> list[float]:
@@ -108,7 +116,7 @@ def _record() -> dict:
                         "assembly_frame": False,
                         "mate_entity_reference": {
                             "source": "mate-entity-params",
-                            "reference_type": 0,
+                            "reference_type": 1,
                             "reference_type2": 3,
                             "space": "mate-assembly",
                             "params": [2.0, 0.0, 4.0],
@@ -156,6 +164,133 @@ def _record() -> dict:
 
 
 class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
+    @staticmethod
+    def _cached_record(*, nested: bool = False) -> dict:
+        raw = _record()
+        anchor = "sub-1" if nested else None
+        occurrence = f"sub-1/{CACHED_OCCURRENCE}" if nested else CACHED_OCCURRENCE
+        component = cached_component(raw["files"]["robot.SLDASM"])
+        component.update(
+            name2=occurrence,
+            instance_id=occurrence,
+            parent_occurrence=anchor or "",
+            transform_raw=support.solidworks_transform(_translated(0.0, 0.0, 0.0)),
+            native_reference={
+                "is_virtual": False,
+                "native_owner": "robot.SLDASM",
+                "defining": "sub.SLDASM" if nested else "robot.SLDASM",
+                "defining_anchor": anchor,
+            },
+        )
+        component["source_provenance"].update(occurrence=occurrence, defining_anchor=anchor)
+        raw["components"].append(component)
+        slot = cached_slot(
+            raw["files"]["robot.SLDASM"], instance=occurrence, occurrence=occurrence,
+            owner_anchor=anchor, defining_anchor=anchor,
+        )
+        if nested:
+            parent = cached_component(raw["files"]["robot.SLDASM"])
+            parent_document = parent["document"].replace("imported_part.step.SLDPRT", "sub.SLDASM")
+            parent.update(
+                name2=anchor, instance_id=anchor, parent_occurrence="", configuration="Sub",
+                document=parent_document, transform_raw=raw["components"][0]["transform_raw"],
+                native_reference={"is_virtual": False, "native_owner": "robot.SLDASM",
+                                  "defining": "robot.SLDASM", "defining_anchor": None},
+            )
+            parent["source_provenance"].update(
+                occurrence=anchor, configuration="Sub", native_document_path=parent_document,
+                materialization_path=parent_document, session_document_path=parent_document,
+            )
+            raw["components"][0] = parent
+            component["native_reference"]["defining"] = parent_document
+            parent_slot = cached_slot(
+                raw["files"]["robot.SLDASM"], instance=anchor, occurrence=anchor, configuration="Sub",
+            )
+            parent_slot["materialization"] = parent_slot["materialization"].replace(
+                "imported_part.step.SLDPRT", "sub.SLDASM",
+            )
+            slot["document"] = parent_slot["materialization"]
+            raw["source_selection"] = sealed_selection(
+                {"robot.SLDASM": raw["files"]["robot.SLDASM"]}, "robot.SLDASM",
+                edges={"robot.SLDASM": []}, imports=[slot, parent_slot],
+            )
+        else:
+            raw["source_selection"] = cached_carrier(raw["files"]["robot.SLDASM"], slot)
+        raw["session"] = {"native_api_pid": 1001}
+        raw["mates"][0].update(scope="", configuration="Default")
+        raw["mates"][0]["entities"] = [{
+            "reference_name": occurrence,
+            "reference_document": CACHED_CAPTURE_DOCUMENT,
+            "reference_configuration": "Default",
+            "assembly_frame": False,
+            "mate_entity_reference": {
+                "source": "mate-entity-params", "reference_type": 0,
+                "space": "mate-assembly", "params": [1.0, 2.0, 3.0], "error": None,
+            },
+        }]
+        return raw
+
+    def test_cached_mate_endpoint_binds_separate_owned_sessions_and_nested_defining_document(self):
+        for nested in (False, True):
+            with self.subTest(nested=nested):
+                raw = self._cached_record(nested=nested)
+                original = copy.deepcopy(raw)
+                producer = _project_native_record(raw)
+                verifier = project_native_verification_record(raw)
+                self.assertEqual(producer["mates"][0]["entities"], verifier["mates"][0]["entities"])
+                self.assertEqual(raw, original)
+
+    def test_cached_mate_endpoint_refuses_unsealed_foreign_and_contradictory_bindings(self):
+        mutations = {
+            "session_pid": lambda r: r["session"].update(native_api_pid=1002),
+            "boolean_pid": lambda r: r["components"][-1]["source_provenance"].update(native_api_pid=True),
+            "owner_bytes": lambda r: r["components"][-1]["source_provenance"].update(owner_sha256="f" * 64),
+            "defining_document": lambda r: r["components"][-1]["native_reference"].update(defining="foreign.SLDASM"),
+            "virtual_conflict": lambda r: r["components"][-1]["native_reference"].update(is_virtual=True),
+            "current_path": lambda r: r["components"][-1]["source_provenance"].update(
+                session_document_path=r"C:\foreign\part.SLDPRT",
+            ),
+            "selection_root": lambda r: r["source_selection"]["closure"]["imports"][0].update(
+                session_temp_root=r"C:\Temp\swx1001",
+            ),
+            "selection_digest": lambda r: r["source_selection"]["closure"]["imports"][0].update(
+                session_source_sha256="0" * 64,
+            ),
+            "current_author_presence": lambda r: r["components"][-1]["source_provenance"].update(
+                author_imported_exists=True,
+            ),
+            "current_author_conflict": lambda r: r["components"][-1]["source_provenance"].update(
+                author_imported_path=r"D:\missing.step", author_imported_error="unreadable",
+                author_imported_exists=False,
+            ),
+            "slot_author_presence": lambda r: r["source_selection"]["closure"]["imports"][0].update(
+                author_imported_exists=True,
+            ),
+            "slot_author_conflict": lambda r: r["source_selection"]["closure"]["imports"][0].update(
+                author_imported_path=r"D:\missing.step", author_imported_error="unreadable",
+                author_imported_exists=False,
+            ),
+            "slot_suppression": lambda r: r["source_selection"]["closure"]["imports"][0].update(
+                suppression_state=0,
+            ),
+            "duplicate_slot": lambda r: r["source_selection"]["closure"]["imports"].append(
+                copy.deepcopy(r["source_selection"]["closure"]["imports"][0]),
+            ),
+            "malformed_carrier": lambda r: r.update(source_selection=[]),
+            "malformed_closure": lambda r: r["source_selection"].update(closure=[]),
+            "malformed_imports": lambda r: r["source_selection"]["closure"].update(imports={}),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(case=label):
+                raw = self._cached_record(nested=True)
+                mutate(raw)
+                original = copy.deepcopy(raw)
+                with self.assertRaises(CadError):
+                    _project_native_record(raw)
+                with self.assertRaises(_Failure):
+                    project_native_verification_record(raw)
+                self.assertEqual(raw, original)
+
     def test_mate_reference_preserves_an_explicit_native_read_state(self) -> None:
         for field, value in (
             ("reference_type", None), ("params", None), ("error", None), ("error", False), ("error", ""),
@@ -388,12 +523,12 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
                 "error": None,
             },
             "non-array": {
-                "reference_type": 1,
+                "reference_type": 2,
                 "params": "not-an-array",
                 "error": None,
             },
             "boolean-element": {
-                "reference_type": 1,
+                "reference_type": 2,
                 "params": [0.0, 0.0, 0.0, 0.0, True, 0.0, 0.0, 0.0],
                 "error": None,
             },
@@ -859,7 +994,7 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
                     "assembly_frame": False,
                     "mate_entity_reference": {
                         "source": "mate-entity-params",
-                        "reference_type": 0,
+                        "reference_type": 1,
                         "reference_type2": 3,
                         "space": "mate-assembly",
                         "params": [0.0, 0.0, 0.0],

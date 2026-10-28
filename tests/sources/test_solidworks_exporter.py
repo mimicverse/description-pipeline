@@ -19,7 +19,7 @@ from description_pipeline.sources.solidworks.discovery import (
     DISCOVERY_SCHEMA,
     _exporter_constraint_checks,
     _exporter_declaration,
-    _exporter_joint_facts,
+    _declared_joint_facts,
     _exporter_memberships,
     _exporter_native_pairs,
     prepare_native_package,
@@ -310,7 +310,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
         declaration = decode_exporter_v14(record["exporter"]["raw_xml"], 1.4)
         findings = []
         bodies, clusters = _exporter_memberships(record, declaration, findings)
-        joints = _exporter_joint_facts(record, declaration, bodies, findings, purpose=purpose)
+        joints = _declared_joint_facts(record, declaration, bodies, findings, purpose=purpose)
         _exporter_constraint_checks(declaration, clusters, joints, findings)
         return bodies, joints, findings
 
@@ -359,7 +359,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
         declaration = decode_exporter_v14(record["exporter"]["raw_xml"], 1.4)
         bodies, _clusters = _exporter_memberships(record, declaration, [])
         findings = []
-        joints = _exporter_joint_facts(
+        joints = _declared_joint_facts(
             record,
             declaration,
             bodies,
@@ -375,7 +375,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
             joints[0]["preview_policy"]["rule_id"], "inspection_rotation_full_turn/v1"
         )
         engineering_findings = []
-        engineering = _exporter_joint_facts(
+        engineering = _declared_joint_facts(
             record,
             declaration,
             bodies,
@@ -470,7 +470,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
                 for key in missing:
                     declaration["links"][1]["joint"]["limits"][key] = None
                 findings = []
-                joints = _exporter_joint_facts(raw, declaration, bodies, findings)
+                joints = _declared_joint_facts(raw, declaration, bodies, findings)
                 self.assertEqual(joints[0]["limit_source"], "native")
                 self.assertEqual(joints[0]["limits"]["lower"], -1.0)
                 self.assertEqual(joints[0]["limits"]["upper"], 1.0)
@@ -599,7 +599,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
             "velocity": 3,
         }
         missing_findings = []
-        missing = _exporter_joint_facts(raw, declaration, bodies, missing_findings)
+        missing = _declared_joint_facts(raw, declaration, bodies, missing_findings)
         self.assertEqual(missing[0]["limit_source"], "default_policy")
         self.assertNotIn("discovery.joint_limits_invalid", {item["code"] for item in missing_findings})
 
@@ -622,7 +622,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
                 **changes,
             }
             findings = []
-            _exporter_joint_facts(raw, declaration, bodies, findings)
+            _declared_joint_facts(raw, declaration, bodies, findings)
             self.assertIn(code, {item["code"] for item in findings if item["blocking"]})
         with self.assertRaises(ExporterDeclarationError):
             decode_exporter_v14(wire_xml({"velocity": float("nan")}), 1.4)

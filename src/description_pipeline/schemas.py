@@ -56,6 +56,9 @@ CAPTURE_EVIDENCE_REQUESTS = (
     "evidence/raw/triangles/",
 )
 NATIVE_DISCOVERY_SCHEMA = "solidworks-to-urdf.native-discovery/v1"
+SAVED_NATIVE_REFERENCE_RULE = "inspection_saved_native_carrier/v1"
+SAVED_NATIVE_REFERENCE_POSITION_TOL_M = 1e-7
+SAVED_NATIVE_REFERENCE_DOT_TOL = 1e-8
 NATIVE_DISCOVERY_ENVELOPE_KEYS = frozenset(
     {
         "schema_version",
@@ -201,3 +204,19 @@ def exporter_declaration_present(record: object) -> bool:
         return False
     block = record.get("exporter")
     return "exporter" in record and not (isinstance(block, dict) and block.get("state") == "absent")
+
+
+def saved_native_reference_present(record: object, purpose: str) -> bool:
+    """Route native inspection features; their independent proof still must pass."""
+    if purpose != "inspection_preview" or not isinstance(record, dict) or exporter_declaration_present(record):
+        return False
+    datums = record.get("datums")
+    axes = record.get("reference_axes")
+    return any(
+        isinstance(row, dict) and str(row.get("name") or "").startswith("c_")
+        for row in (datums if isinstance(datums, list) else [])
+    ) or any(
+        isinstance(row, dict) and isinstance(row.get("selector"), dict)
+        and str(row["selector"].get("feature_name") or "").startswith("a_")
+        for row in (axes if isinstance(axes, list) else [])
+    )

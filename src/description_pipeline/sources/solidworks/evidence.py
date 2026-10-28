@@ -50,6 +50,71 @@ CACHED_MATERIALIZATION_WARNING_MESSAGE = (
     "Geometry comes from a verified native cached materialization; "
     "the author import path is metadata and source completeness is not qualified."
 )
+SAVED_NATIVE_WARNING_CODE = "source.saved_native_inspection"
+SAVED_NATIVE_WARNING_MESSAGE = (
+    "Saved native carriers, named coordinate systems and undirected reference axes define an inspection model. "
+    "Body attachment, mechanical freedom, positive motion and hardware qualification are not established."
+)
+
+
+def saved_native_reference_warnings(raw: dict, *, purpose: str) -> list[dict]:
+    """Format raw field locators; admission and independent interpretation remain separate."""
+
+    from ...schemas import SAVED_NATIVE_REFERENCE_RULE, saved_native_reference_present
+
+    if not saved_native_reference_present(raw, purpose):
+        return []
+    objects = []
+    for index, component in enumerate(raw.get("components") or []):
+        if component.get("parent_occurrence") == "" and component.get("suppressed") is False:
+            objects.append({
+                "object_type": "component", "object": component["name2"], "field": "carrier_membership",
+                "source": f"input/discovery/native-discovery.json#raw.components[{index}]",
+                "configuration": component["configuration"], "rule_id": SAVED_NATIVE_REFERENCE_RULE,
+                "original": {"fixed": component.get("fixed"),
+                             "solver_observation": component.get("solver_observation")},
+                "mechanical_qualified": False, "hardware_qualified": False,
+            })
+    for index, datum in enumerate(raw.get("datums") or []):
+        if str(datum.get("name") or "").startswith("c_"):
+            objects.append({
+                "object_type": "coordinate_system", "object": datum["name"], "field": "body_frame",
+                "source": f"input/discovery/native-discovery.json#raw.datums[{index}]",
+                "rule_id": SAVED_NATIVE_REFERENCE_RULE, "attachment_qualified": False,
+            })
+    for index, axis in enumerate(raw.get("reference_axes") or []):
+        feature = (axis.get("selector") or {}).get("feature_name")
+        if isinstance(feature, str) and feature.startswith("a_"):
+            objects.append({
+                "object_type": "reference_axis", "object": feature, "fields": ["direction", "joint_type"],
+                "source": f"input/discovery/native-discovery.json#raw.reference_axes[{index}]",
+                "rule_id": SAVED_NATIVE_REFERENCE_RULE, "direction_semantics": axis.get("direction_semantics"),
+                "native_positive_motion": False, "hardware_direction_qualified": False,
+            })
+    for index, mate in enumerate(raw.get("mates") or []):
+        if mate.get("suppressed") is False:
+            objects.append({
+                "object_type": "mate", "object": mate["name"], "field": "saved_pose_constraint",
+                "scope": mate.get("scope"), "native_type": mate.get("type"),
+                "source": f"input/discovery/native-discovery.json#raw.mates[{index}]",
+                "rule_id": SAVED_NATIVE_REFERENCE_RULE, "constraint_rows_used": False,
+                "mechanical_qualified": False,
+            })
+    properties = raw.get("properties") or {}
+    buckets = [("document", "", properties.get("document") or {})]
+    buckets.extend((scope, name, values) for scope in ("mates", "components")
+                   for name, values in (properties.get(scope) or {}).items())
+    for scope, name, values in buckets:
+        for key, value in values.items():
+            if key.startswith("dp.joint.") and key.endswith("axis_sign"):
+                objects.append({
+                    "object_type": "native_property", "object": name or "assembly", "field": key,
+                    "source": "input/discovery/native-discovery.json#raw.properties."
+                    + scope + ("." + name if name else "") + "." + key,
+                    "original": copy.deepcopy(value), "rule_id": "native_axis_sign/v1",
+                    "native_positive_motion": False, "hardware_direction_qualified": False,
+                })
+    return [{"code": SAVED_NATIVE_WARNING_CODE, "message": SAVED_NATIVE_WARNING_MESSAGE, "objects": objects}]
 
 
 def cached_materialization_warnings(source_scopes: object) -> list[dict[str, Any]]:

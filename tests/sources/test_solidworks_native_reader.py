@@ -150,7 +150,7 @@ class _MateEntity:
         *,
         curve=None,
         point=None,
-        reference_type=0,
+        reference_type=1,
         reference_type2=0,
         entity_params=(0.0, 0.0, 0.0),
     ):
@@ -6797,7 +6797,7 @@ class MateEntityReferenceTests(unittest.TestCase):
             entity = _MateEntity(
                 component,
                 "Edge1",
-                reference_type=1,
+                reference_type=2,
                 reference_type2=1,
                 entity_params=[0.1, 0.2, 0.3, 0.0, 2.0, 0.0, 0.0, 0.0],
             )
@@ -6806,7 +6806,7 @@ class MateEntityReferenceTests(unittest.TestCase):
                 "mate_entity_reference"
             ]
             self.assertEqual(raw_reference["source"], "mate-entity-params")
-            self.assertEqual(raw_reference["reference_type"], 1)
+            self.assertEqual(raw_reference["reference_type"], 2)
             self.assertEqual(raw_reference["reference_type2"], 1)
             self.assertEqual(raw_reference["space"], "mate-assembly")
             self.assertEqual(raw_reference["params"], [0.1, 0.2, 0.3, 0.0, 2.0, 0.0, 0.0, 0.0])
@@ -6863,7 +6863,7 @@ class MateEntityReferenceTests(unittest.TestCase):
             entity = _MateEntity(
                 component,
                 "Vertex1",
-                reference_type=0,
+                reference_type=1,
                 reference_type2=3,
                 entity_params=[1.5, 2.5, 3.0],
             )
@@ -6879,6 +6879,55 @@ class MateEntityReferenceTests(unittest.TestCase):
             self.assertEqual(reference["geometry"]["frame"], "component-local")
             self.assertIsNone(reference["error"])
 
+    def test_circle_reference_type_keeps_circle_semantics_without_cone_decode(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            component = _Component("base-1", base)
+            entity = _MateEntity(
+                component,
+                "Edge1",
+                curve=_Circle(
+                    center=(1.0, 2.0, 3.0),
+                    normal=(0.0, 0.0, 1.0),
+                    radius=0.02,
+                ),
+                reference_type=7,
+                reference_type2=1,
+                entity_params=[1.0, 2.0, 3.0, 0.0, 0.0, 1.0, 0.02, 0.0],
+            )
+            raw_record = self._read_single_record(root, component, entity)
+            raw_reference = raw_record["mates"][0]["entities"][0][
+                "mate_entity_reference"
+            ]
+            self.assertEqual(raw_reference["reference_type"], 7)
+            self.assertEqual(
+                raw_reference["params"],
+                [1.0, 2.0, 3.0, 0.0, 0.0, 1.0, 0.02, 0.0],
+            )
+
+            projected = _project_native_record(raw_record)
+            projected_entity = projected["mates"][0]["entities"][0]
+            reference = projected_entity["mate_entity_reference"]
+            self.assertIsNone(reference["error"])
+            self.assertEqual(
+                reference["geometry"],
+                {
+                    "kind": "unsupported",
+                    "type": "Circle",
+                    "reason": "swMateCircle local geometry and rank layout are not verified",
+                    "frame": "component-local",
+                },
+            )
+            self.assertEqual(
+                projected_entity["circle"],
+                {
+                    "center": [1.0, 2.0, 3.0],
+                    "normal": [0.0, 0.0, 1.0],
+                    "radius": 0.02,
+                },
+            )
+
     def test_entity_params_direction_rotates_into_component_local_frame(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -6889,7 +6938,7 @@ class MateEntityReferenceTests(unittest.TestCase):
             entity = _MateEntity(
                 component,
                 "Edge1",
-                reference_type=1,
+                reference_type=2,
                 reference_type2=1,
                 entity_params=[1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
             )
@@ -6915,7 +6964,7 @@ class MateEntityReferenceTests(unittest.TestCase):
             root = Path(tmp)
             base = _write(root, "base.SLDPRT")
             component = _Component("base-1", base)
-            entity = _MateEntity(component, "Face1", reference_type=1, reference_type2=1, entity_params=raiser)
+            entity = _MateEntity(component, "Face1", reference_type=2, reference_type2=1, entity_params=raiser)
             raw_record = self._read_single_record(root, component, entity)
             raw_entity = raw_record["mates"][0]["entities"][0]
             reference = raw_entity["mate_entity_reference"]
@@ -6940,7 +6989,7 @@ class MateEntityReferenceTests(unittest.TestCase):
             entity = _MateEntity(
                 component,
                 "Edge1",
-                reference_type=1,
+                reference_type=2,
                 reference_type2=raiser,
                 entity_params=[0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
             )
@@ -7043,7 +7092,7 @@ class MateEntityReferenceTests(unittest.TestCase):
             ),
             (
                 "zero-vector",
-                {"reference_type": 1, "entity_params": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]},
+                {"reference_type": 2, "entity_params": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]},
                 "zero-length",
                 [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             ),
@@ -7087,7 +7136,7 @@ class MateEntityReferenceTests(unittest.TestCase):
             root = Path(tmp)
             base = _write(root, "base.SLDPRT")
             component = _Component("base-1", base, transform=())
-            entity = _MateEntity(component, "Face1", reference_type=0, entity_params=[1.0, 2.0, 3.0])
+            entity = _MateEntity(component, "Face1", reference_type=1, entity_params=[1.0, 2.0, 3.0])
             raw_record = self._read_single_record(root, component, entity)
             projected = _project_native_record(raw_record)
             reference = projected["mates"][0]["entities"][0][
@@ -7115,7 +7164,7 @@ class MateEntityReferenceTests(unittest.TestCase):
                         arm_component,
                         "Face1",
                         _Plane((0.0, 0.0, 1.0), (0.0, 0.0, 0.0)),
-                        reference_type=0,
+                        reference_type=1,
                         reference_type2=3,
                         entity_params=[2.0, 0.0, 4.0],
                     ),
