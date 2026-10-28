@@ -886,7 +886,7 @@ function stageDotState(state) {
 
 function runDotState(state) {
   if (state === "success") return "ok";
-  if (state === "failed") return "bad";
+  if (state === "failed" || state === "unresolved") return "bad";
   if (state === "running") return "run";
   return "idle";
 }

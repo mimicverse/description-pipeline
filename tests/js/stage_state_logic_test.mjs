@@ -24,6 +24,7 @@ const functionSource = (name) => {
   throw new Error(`unterminated function ${name}`);
 };
 const stageDotState = new Function(`return (${functionSource("stageDotState")});`)();
+const runDotState = new Function(`return (${functionSource("runDotState")});`)();
 const stateKind = new Function(`return (${functionSource("stateKind")});`)();
 const prioritySource = source.match(/const STAGE_SELECTION_PRIORITY = \[[\s\S]*?\n\];/)[0];
 assert.doesNotMatch(prioritySource, /"(?:queued|ready)"/);
@@ -36,6 +37,10 @@ const stages = (...states) =>
   states.map((state, index) => ({ id: `stage-${index}`, state }));
 
 assert.equal(stageDotState("completed"), "ok");
+assert.equal(runDotState("failed"), "bad");
+assert.equal(runDotState("unresolved"), "bad");
+assert.equal(runDotState("cancelled"), "idle");
+assert.equal(runDotState("running"), "run");
 assert.equal(stageDotState("failed"), "bad");
 assert.equal(stageDotState("unresolved"), "bad");
 assert.equal(stageDotState("cancelled"), "idle");
