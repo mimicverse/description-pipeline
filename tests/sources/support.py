@@ -562,6 +562,8 @@ def local_native_record_payload(
     """Encode fixture scenario values as the local facts the Windows reader emits."""
 
     result = copy.deepcopy(payload)
+    result.setdefault("mates", [])
+    result.setdefault("datums", [])
     components = [
         item
         for item in result.get("components") or []
@@ -670,6 +672,11 @@ def local_native_record_payload(
         if default_mate_scope:
             mate.setdefault("scope", "")
         scope = str(mate.get("scope") or "")
+        mate["configuration"] = (
+            str(by_name.get(scope, {}).get("configuration") or "")
+            if scope
+            else str(result.get("saved_configuration") or "")
+        )
         owner_world = world.get(scope, _identity()) if scope else _identity()
         for entity in mate.get("entities") or []:
             if not isinstance(entity, dict):
@@ -688,12 +695,18 @@ def local_native_record_payload(
             )
             if full and full in by_name:
                 reference_document = str(by_name[full].get("document") or "")
+                reference_configuration = str(
+                    by_name[full].get("configuration") or ""
+                )
                 component_world = world.get(full, _identity())
             else:
                 reference_document = (
                     str(by_name.get(scope, {}).get("document") or "")
                     if scope
                     else str((result.get("identity") or {}).get("main_assembly") or "")
+                )
+                reference_configuration = str(
+                    by_name.get(scope, {}).get("configuration") or ""
                 )
                 component_world = _identity()
             reference_name = (
@@ -782,6 +795,9 @@ def local_native_record_payload(
             reference["space"] = "mate-assembly"
             entity["reference_name"] = reference_name
             entity["reference_document"] = reference_document
+            entity["reference_configuration"] = (
+                reference_configuration
+            )
             entity["assembly_frame"] = bool(assembly_frame)
             entity["mate_entity_reference"] = reference
             entity.pop("component", None)

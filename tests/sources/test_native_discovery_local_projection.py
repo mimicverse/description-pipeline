@@ -6,11 +6,13 @@ import copy
 import unittest
 
 from description_pipeline.sources.solidworks.discovery import (
+    _entity_geometry_view,
     _project_native_record,
 )
 from description_pipeline.sources.solidworks.errors import CadError
 from description_pipeline.verification.native_discovery import (
     _Failure,
+    _geometry,
     project_native_verification_record,
 )
 from description_pipeline.verification.native_declarations import (
@@ -66,12 +68,18 @@ def _record() -> dict:
     local_arm = _rotated_z_90_with_translation()
     return {
         "identity": {"main_assembly": "robot.SLDASM"},
+        "files": {
+            "robot.SLDASM": "a" * 64,
+            "sub.SLDASM": "b" * 64,
+            "arm.SLDPRT": "c" * 64,
+        },
+        "saved_configuration": "Default",
         "components": [
             {
                 "name2": "sub-1",
                 "parent_occurrence": "",
                 "document": "sub.SLDASM",
-                "configuration": "Default",
+                "configuration": "Sub",
                 "suppressed": False,
                 "transform_raw": support.solidworks_transform(
                     _translated(10.0, 0.0, 0.0)
@@ -90,6 +98,7 @@ def _record() -> dict:
             {
                 "name": "nested_seat",
                 "scope": "sub-1",
+                "configuration": "Sub",
                 "suppressed": False,
                 "entities": [
                     {
@@ -393,6 +402,26 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
                 "params": [0.0, 0.0, 0.0, 0.0, 0.0, float("nan")],
                 "error": None,
             },
+            "non-array-with-native-error": {
+                "reference_type": None,
+                "params": "not-an-array",
+                "error": "RuntimeError: ReferenceType getter failed",
+            },
+            "non-numeric-with-native-error": {
+                "reference_type": None,
+                "params": ["bad"] * 7,
+                "error": "RuntimeError: ReferenceType getter failed",
+            },
+            "boolean-element-with-native-error": {
+                "reference_type": None,
+                "params": [0.0, 0.0, 0.0, 0.0, True, 0.0, 0.0, 0.0],
+                "error": "RuntimeError: ReferenceType getter failed",
+            },
+            "non-finite-with-native-error": {
+                "reference_type": None,
+                "params": [0.0, 0.0, 0.0, 0.0, 0.0, float("inf")],
+                "error": "RuntimeError: ReferenceType getter failed",
+            },
             "null-without-error": {
                 "reference_type": 3,
                 "params": None,
@@ -442,6 +471,132 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
             self.assertIsNone(reference["geometry"])
             self.assertEqual(reference["error"], "EntityParams is unavailable")
 
+    def test_reference_type_error_preserves_params_and_primary_evidence(self) -> None:
+        primary_cases = {
+            "plane": {
+                "plane": {
+                    "point": [0.0, 0.0, 0.0],
+                    "normal": [0.0, 0.0, 1.0],
+                }
+            },
+            "cylinder": {
+                "cylinder": {
+                    "point": [0.0, 0.0, 0.0],
+                    "direction": [0.0, 0.0, 1.0],
+                    "radius": 0.1,
+                }
+            },
+            "point": {"point": [0.0, 0.0, 0.0]},
+        }
+        for name, primary in primary_cases.items():
+            with self.subTest(name=name):
+                raw = _record()
+                entity = raw["mates"][0]["entities"][0]
+                entity.update(primary)
+                reference = entity["mate_entity_reference"]
+                reference.update(
+                    reference_type=None,
+                    params=[0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.1, 0.0],
+                    error="RuntimeError: ReferenceType getter failed",
+                )
+                original = copy.deepcopy(raw)
+
+                projected_rows = (
+                    _project_native_record(raw),
+                    project_native_verification_record(raw),
+                )
+                self.assertEqual(raw, original)
+                for projected in projected_rows:
+                    projected_entity = projected["mates"][0]["entities"][0]
+                    projected_reference = projected_entity[
+                        "mate_entity_reference"
+                    ]
+                    self.assertEqual(
+                        projected_reference["params"],
+                        [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.1, 0.0],
+                    )
+                    self.assertEqual(
+                        projected_reference["error"],
+                        "RuntimeError: ReferenceType getter failed",
+                    )
+                    self.assertIsNone(projected_reference["geometry"])
+
+                source_findings: list[dict] = []
+                source_entity = projected_rows[0]["mates"][0]["entities"][0]
+                verify_entity = projected_rows[1]["mates"][0]["entities"][0]
+                self.assertIsNotNone(
+                    _entity_geometry_view(
+                        source_entity,
+                        source_findings,
+                        "mate:nested_seat",
+                    )
+                )
+                self.assertEqual(source_findings, [])
+                point, direction = _geometry(
+                    verify_entity,
+                    {
+                        "sub-1": [
+                            [1.0, 0.0, 0.0, 0.0],
+                            [0.0, 1.0, 0.0, 0.0],
+                            [0.0, 0.0, 1.0, 0.0],
+                            [0.0, 0.0, 0.0, 1.0],
+                        ],
+                        "sub-1/arm-1": [
+                            [1.0, 0.0, 0.0, 0.0],
+                            [0.0, 1.0, 0.0, 0.0],
+                            [0.0, 0.0, 1.0, 0.0],
+                            [0.0, 0.0, 0.0, 1.0],
+                        ],
+                    },
+                )
+                self.assertIsNotNone(point)
+                if name != "point":
+                    self.assertIsNotNone(direction)
+
+    def test_reference_type_error_without_primary_is_still_rejected_downstream(self) -> None:
+        raw = _record()
+        raw["mates"][0]["entities"][0]["mate_entity_reference"].update(
+            reference_type=None,
+            params=[0.0, 0.0, 0.0],
+            error="RuntimeError: ReferenceType getter failed",
+        )
+        source = _project_native_record(raw)
+        verifier = project_native_verification_record(raw)
+        source_entity = source["mates"][0]["entities"][0]
+        verify_entity = verifier["mates"][0]["entities"][0]
+        findings: list[dict] = []
+        self.assertIsNone(
+            _entity_geometry_view(
+                source_entity,
+                findings,
+                "mate:nested_seat",
+            )
+        )
+        self.assertEqual(
+            [finding["code"] for finding in findings],
+            ["discovery.mate_entities_unsupported"],
+        )
+        self.assertEqual(
+            _geometry(
+                verify_entity,
+                {
+                    "sub-1": [
+                        [1.0, 0.0, 0.0, 0.0],
+                        [0.0, 1.0, 0.0, 0.0],
+                        [0.0, 0.0, 1.0, 0.0],
+                        [0.0, 0.0, 0.0, 1.0],
+                    ],
+                    "sub-1/arm-1": [
+                        [1.0, 0.0, 0.0, 0.0],
+                        [0.0, 1.0, 0.0, 0.0],
+                        [0.0, 0.0, 1.0, 0.0],
+                        [0.0, 0.0, 0.0, 1.0],
+                    ],
+                },
+            ),
+            (None, None),
+        )
+
     def test_mate_document_mismatch_is_refused(self) -> None:
         raw = copy.deepcopy(_record())
         raw["mates"][0]["entities"][0]["reference_document"] = "other.SLDPRT"
@@ -449,6 +604,294 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
             _project_native_record(raw)
         with self.assertRaises(_Failure):
             project_native_verification_record(raw)
+
+    def test_component_document_must_belong_to_the_sealed_file_inventory(
+        self,
+    ) -> None:
+        raw = copy.deepcopy(_record())
+        raw["components"][0]["document"] = "forged.SLDPRT"
+        raw["mates"][0]["entities"][0]["reference_document"] = (
+            "forged.SLDPRT"
+        )
+        with self.assertRaises(CadError):
+            _project_native_record(raw)
+        with self.assertRaises(_Failure):
+            project_native_verification_record(raw)
+
+    def test_mate_reference_requires_an_explicit_document_identity(self) -> None:
+        for label, mutate in (
+            (
+                "missing",
+                lambda entity: entity.pop(
+                    "reference_document",
+                    None,
+                ),
+            ),
+            (
+                "null",
+                lambda entity: entity.__setitem__(
+                    "reference_document",
+                    None,
+                ),
+            ),
+            (
+                "empty",
+                lambda entity: entity.__setitem__(
+                    "reference_document",
+                    "",
+                ),
+            ),
+        ):
+            with self.subTest(label=label):
+                raw = copy.deepcopy(_record())
+                mutate(raw["mates"][0]["entities"][0])
+                with self.assertRaises(CadError):
+                    _project_native_record(raw)
+                with self.assertRaises(_Failure):
+                    project_native_verification_record(raw)
+
+    def test_component_mate_reference_requires_its_exact_configuration(self) -> None:
+        for label, mutate in (
+            (
+                "missing",
+                lambda entity: entity.pop(
+                    "reference_configuration",
+                    None,
+                ),
+            ),
+            (
+                "null",
+                lambda entity: entity.__setitem__(
+                    "reference_configuration",
+                    None,
+                ),
+            ),
+            (
+                "empty",
+                lambda entity: entity.__setitem__(
+                    "reference_configuration",
+                    "",
+                ),
+            ),
+            (
+                "wrong",
+                lambda entity: entity.__setitem__(
+                    "reference_configuration",
+                    "Other",
+                ),
+            ),
+        ):
+            with self.subTest(label=label):
+                raw = copy.deepcopy(_record())
+                mutate(raw["mates"][0]["entities"][0])
+                with self.assertRaises(CadError):
+                    _project_native_record(raw)
+                with self.assertRaises(_Failure):
+                    project_native_verification_record(raw)
+
+    def test_mate_configuration_must_match_its_owner_assembly(self) -> None:
+        for label, mutate in (
+            (
+                "missing",
+                lambda mate: mate.pop("configuration", None),
+            ),
+            (
+                "null",
+                lambda mate: mate.__setitem__("configuration", None),
+            ),
+            (
+                "empty",
+                lambda mate: mate.__setitem__("configuration", ""),
+            ),
+            (
+                "wrong",
+                lambda mate: mate.__setitem__("configuration", "Other"),
+            ),
+        ):
+            with self.subTest(label=label):
+                raw = copy.deepcopy(_record())
+                mutate(raw["mates"][0])
+                with self.assertRaises(CadError):
+                    _project_native_record(raw)
+                with self.assertRaises(_Failure):
+                    project_native_verification_record(raw)
+
+    def test_assembly_frame_document_must_equal_its_owner_assembly(self) -> None:
+        def frame_record() -> dict:
+            raw = copy.deepcopy(_record())
+            mate = raw["mates"][0]
+            mate["scope"] = ""
+            mate["configuration"] = "Default"
+            entity = mate["entities"][1]
+            entity.update(
+                reference_name="assembly_root",
+                reference_document="robot.SLDASM",
+                assembly_frame=True,
+            )
+            mate["entities"] = [entity]
+            return raw
+
+        baseline = frame_record()
+        self.assertIsNotNone(_project_native_record(baseline))
+        self.assertIsNotNone(
+            project_native_verification_record(baseline)
+        )
+        for value in (None, "", "NotTheOwnerConfig"):
+            raw = frame_record()
+            raw["mates"][0]["entities"][0][
+                "reference_configuration"
+            ] = value
+            with self.subTest(reference_configuration=value):
+                self.assertIsNotNone(_project_native_record(raw))
+                self.assertIsNotNone(
+                    project_native_verification_record(raw)
+                )
+        for label, mutate in (
+            (
+                "missing",
+                lambda entity: entity.pop(
+                    "reference_configuration",
+                    None,
+                ),
+            ),
+            (
+                "wrong-type",
+                lambda entity: entity.__setitem__(
+                    "reference_configuration",
+                    1,
+                ),
+            ),
+        ):
+            raw = frame_record()
+            mutate(raw["mates"][0]["entities"][0])
+            with self.subTest(configuration_state=label):
+                with self.assertRaises(CadError):
+                    _project_native_record(raw)
+                with self.assertRaises(_Failure):
+                    project_native_verification_record(raw)
+        for label, mutate in (
+            (
+                "missing",
+                lambda entity: entity.pop(
+                    "reference_document",
+                    None,
+                ),
+            ),
+            (
+                "null",
+                lambda entity: entity.__setitem__(
+                    "reference_document",
+                    None,
+                ),
+            ),
+            (
+                "wrong",
+                lambda entity: entity.__setitem__(
+                    "reference_document",
+                    "other.SLDASM",
+                ),
+            ),
+        ):
+            with self.subTest(label=label):
+                raw = frame_record()
+                mutate(raw["mates"][0]["entities"][0])
+                with self.assertRaises(CadError):
+                    _project_native_record(raw)
+                with self.assertRaises(_Failure):
+                    project_native_verification_record(raw)
+
+    def test_only_a_sealed_embedded_virtual_outside_document_is_accepted(self) -> None:
+        owner_sha256 = "a" * 64
+        virtual_document = (
+            r"C:\Users\operator\AppData\Local\Temp\swx21040"
+            r"\VC~~\waist\virtual_part.SLDPRT"
+        )
+        provenance = {
+            "state": "embedded_virtual_component",
+            "kind": "native_embedded_virtual_component",
+            "owner": "robot.SLDASM",
+            "owner_sha256": owner_sha256,
+            "occurrence": "virtual-1",
+            "defining_anchor": None,
+            "native_document_path": virtual_document,
+            "session_document_path": virtual_document,
+            "materialization_path": virtual_document,
+            "session_temp_root": (
+                r"C:\Users\operator\AppData\Local\Temp\swx21040"
+            ),
+            "native_api_pid": 21040,
+            "author_imported_path": None,
+            "author_imported_error": None,
+            "is_virtual": True,
+            "used_api": (
+                "IComponent2.GetPathName/"
+                "IComponent2.GetImportedPath/"
+                "IComponent2.IsVirtual"
+            ),
+            "document": None,
+            "error": None,
+        }
+
+        def virtual_record() -> dict:
+            raw = copy.deepcopy(_record())
+            raw["files"] = {"robot.SLDASM": owner_sha256}
+            raw["components"].append(
+                {
+                    "name2": "virtual-1",
+                    "parent_occurrence": "",
+                    "document": virtual_document,
+                    "configuration": "Default",
+                    "suppressed": False,
+                    "transform_raw": support.solidworks_transform(
+                        _translated(0.0, 0.0, 0.0)
+                    ),
+                    "source_provenance": copy.deepcopy(provenance),
+                }
+            )
+            mate = raw["mates"][0]
+            mate["scope"] = ""
+            mate["configuration"] = "Default"
+            mate["entities"] = [
+                {
+                    "reference_name": "virtual-1",
+                    "reference_document": virtual_document,
+                    "reference_configuration": "Default",
+                    "assembly_frame": False,
+                    "mate_entity_reference": {
+                        "source": "mate-entity-params",
+                        "reference_type": 0,
+                        "reference_type2": 3,
+                        "space": "mate-assembly",
+                        "params": [0.0, 0.0, 0.0],
+                        "error": None,
+                    },
+                }
+            ]
+            return raw
+
+        qualified = virtual_record()
+        self.assertIsNotNone(_project_native_record(qualified))
+        self.assertIsNotNone(
+            project_native_verification_record(qualified)
+        )
+
+        invalid_provenance = virtual_record()
+        invalid_provenance["components"][-1]["source_provenance"][
+            "native_api_pid"
+        ] = 99999
+        with self.assertRaises(CadError):
+            _project_native_record(invalid_provenance)
+        with self.assertRaises(_Failure):
+            project_native_verification_record(invalid_provenance)
+
+        wrong_document = virtual_record()
+        wrong_document["mates"][0]["entities"][0][
+            "reference_document"
+        ] = r"C:\elsewhere\virtual_part.SLDPRT"
+        with self.assertRaises(CadError):
+            _project_native_record(wrong_document)
+        with self.assertRaises(_Failure):
+            project_native_verification_record(wrong_document)
 
     def test_prelocalized_mate_geometry_is_not_trusted_as_raw(self) -> None:
         raw = copy.deepcopy(_record())
@@ -479,6 +922,32 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
         self.assertEqual(repeated, projected)
         with self.assertRaises(_Failure):
             project_native_verification_record(dict(projected))
+
+    def test_malformed_mate_and_datum_containers_fail_precisely(self) -> None:
+        for label, mutate in (
+            (
+                "mates",
+                lambda raw: raw.__setitem__("mates", "bad"),
+            ),
+            (
+                "entities",
+                lambda raw: raw["mates"][0].__setitem__(
+                    "entities",
+                    1,
+                ),
+            ),
+            (
+                "datums",
+                lambda raw: raw.__setitem__("datums", 1),
+            ),
+        ):
+            with self.subTest(label=label):
+                raw = copy.deepcopy(_record())
+                mutate(raw)
+                with self.assertRaises(CadError):
+                    _project_native_record(raw)
+                with self.assertRaises(_Failure):
+                    project_native_verification_record(raw)
 
 
 if __name__ == "__main__":

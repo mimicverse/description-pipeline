@@ -575,6 +575,23 @@ scope 和 `EntityParams`。Windows 只验证读取形状与可读性，不组合
 派生结果写回封存 raw。父链、owner、引用冲突或缺失字段必须拒绝，不能当作根节点或
 空帧补齐；原生明确记录的空读数与字段缺失、null 分别处理。
 
+Mate component endpoint 的 `reference_document` 必须是可移植包内路径，或由同一 occurrence
+的 sealed embedded-virtual provenance 证明的包外 session 路径；
+`reference_configuration` 必须等于该 occurrence 的 referenced configuration。
+普通 component 的 document 还必须是既有 sealed raw `files` inventory 的成员；该检查
+在 Source 与独立 Verify 各自执行，virtual session path 继续走精确 GetterPath 例外，
+不建立第二 inventory 或额外 registry。
+Assembly-frame endpoint 的 owner 由 `scope` 与 owner assembly document 证明，
+`reference_name` 和 `reference_configuration` 只保留为 provenance，不充当 component
+selector。`reference_configuration` 在 raw 中必须存在，且只允许 string 或显式 null；
+缺失与 getter 明确返回 null、空字符串之间不得合并。mate 自身的 configuration 仍须与
+root/scope owner configuration 精确一致。Native-limit 消费仍须独立要求并比较 component
+endpoint configuration。
+`ReferenceType` 读取失败但 `params` 可读时，保留原始数值和读取错误，派生
+`geometry` 为空，不拿未知类型解码；既有有效 face/point primary evidence 仍可使用。
+`params` 的类型、元素类型和有限数校验不因读取错误而放宽，无 primary evidence 时仍由
+既有消费者拒绝。
+
 Discover 与 Capture 可以各自传输并 materialize 自己的封存输入 closure。前者使用
 SourceSet archive，后者使用由同一 SourceSet 原件血缘派生的 prepared archive；
 SourceSet 与 prepared 分别保存不同摘要。每个 operation 必须绑定原请求、上游

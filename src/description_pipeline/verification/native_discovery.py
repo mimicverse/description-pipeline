@@ -43,7 +43,7 @@ from ..geometry.native_transform import (
     transform_from_solidworks,
 )
 from ..interface_records import validate_request_record
-from ..io import PipelineError, confined, digest, parse_data
+from ..io import PipelineError, artifact_path_parts, confined, digest, parse_data
 from ..schemas import (
     NATIVE_DISCOVERY_BUDGET_KEYS,
     NATIVE_DISCOVERY_CONTROL_KEYS,
@@ -1157,13 +1157,97 @@ def _verification_document_key(value: object) -> str:
     )
 
 
-def _verification_entity_geometry(reference_type, params):
-    if type(reference_type) is not int:
-        raise _Failure(
-            "discovery.mate_entity_reference",
-            "ReferenceType must be an exact native integer",
-            {"value_type": type(reference_type).__name__},
+def _verification_sealed_embedded_virtual_document(
+    component: dict,
+    name: str,
+    native_files: object,
+) -> bool:
+    provenance = component.get("source_provenance")
+    if not isinstance(provenance, dict):
+        return False
+    if (
+        provenance.get("kind") != "native_embedded_virtual_component"
+        or provenance.get("state") != "embedded_virtual_component"
+        or provenance.get("is_virtual") is not True
+        or provenance.get("occurrence") != name
+        or not isinstance(provenance.get("owner"), str)
+        or not provenance["owner"]
+        or not isinstance(provenance.get("owner_sha256"), str)
+        or _HEX.fullmatch(provenance["owner_sha256"]) is None
+        or not isinstance(native_files, dict)
+        or native_files.get(provenance["owner"]) != provenance["owner_sha256"]
+        or provenance.get("used_api") != SESSION_DOCUMENT_API
+        or provenance.get("author_imported_path") is not None
+        or provenance.get("author_imported_error") is not None
+        or provenance.get("document") is not None
+    ):
+        return False
+    session_document = provenance.get("session_document_path")
+    native_document = provenance.get("native_document_path")
+    materialization = provenance.get("materialization_path")
+    session_root = provenance.get("session_temp_root")
+    native_api_pid = provenance.get("native_api_pid")
+    if not (
+        isinstance(session_document, str)
+        and isinstance(native_document, str)
+        and isinstance(materialization, str)
+        and ntpath.normcase(session_document)
+        == ntpath.normcase(native_document)
+        == ntpath.normcase(materialization)
+    ):
+        return False
+    if (
+        not embedded_virtual_component_under_root(
+            session_document,
+            session_root,
         )
+        or type(native_api_pid) is not int
+        or native_api_pid <= 0
+        or session_root_pid(session_root) != native_api_pid
+    ):
+        return False
+    document = component.get("document")
+    return (
+        isinstance(document, str)
+        and bool(document.strip())
+        and ntpath.normcase(document) == ntpath.normcase(session_document)
+        and isinstance(component.get("configuration"), str)
+        and bool(component["configuration"].strip())
+    )
+
+
+def _verification_component_document_is_bound(
+    component: dict,
+    name: str,
+    reference_document: str,
+    native_files: object,
+) -> bool:
+    document = component.get("document")
+    if (
+        not isinstance(document, str)
+        or not document.strip()
+        or _verification_document_key(document)
+        != _verification_document_key(reference_document)
+    ):
+        return False
+    try:
+        artifact_path_parts(document.replace("\\", "/"))
+    except PipelineError:
+        return _verification_sealed_embedded_virtual_document(
+            component,
+            name,
+            native_files,
+        )
+    return (
+        isinstance(native_files, dict)
+        and isinstance(
+            native_files.get(document.replace("\\", "/")),
+            str,
+        )
+    )
+
+
+def _verification_entity_params(params):
     if not isinstance(params, list):
         raise _Failure(
             "discovery.mate_entity_reference",
@@ -1178,6 +1262,17 @@ def _verification_entity_geometry(reference_type, params):
         raise _Failure(
             "discovery.mate_entity_reference",
             "EntityParams must contain only finite non-boolean numbers",
+        )
+    return [float(value) for value in params]
+
+
+def _verification_entity_geometry(reference_type, params):
+    params = _verification_entity_params(params)
+    if type(reference_type) is not int:
+        raise _Failure(
+            "discovery.mate_entity_reference",
+            "ReferenceType must be an exact native integer",
+            {"value_type": type(reference_type).__name__},
         )
     minimum = _ENTITY_MINIMUMS.get(reference_type)
     if minimum is None:
@@ -1247,17 +1342,19 @@ def _verification_mate_reference(block, component, owner, frames):
             "null EntityParams requires an explicit native read error",
         )
     if params is not None:
-        projected["geometry"], error = _verification_entity_geometry(
-            projected.get("reference_type"),
-            params,
-        )
-        projected["params"] = [
-            float(value) for value in params
-        ]
         if native_error is not None:
+            projected["params"] = _verification_entity_params(params)
             projected["geometry"] = None
-        if native_error is None and error is not None:
-            projected["error"] = error
+        else:
+            projected["geometry"], error = _verification_entity_geometry(
+                projected.get("reference_type"),
+                params,
+            )
+            projected["params"] = [
+                float(value) for value in params
+            ]
+            if error is not None:
+                projected["error"] = error
     else:
         projected["geometry"] = None
     if projected.get("error") is not None or projected.get("geometry") is None:
@@ -1401,7 +1498,14 @@ def project_native_verification_record(record: dict) -> dict:
         name: str(component.get("document") or "")
         for name, component in by_component.items()
     }
-    for mate in projected.get("mates") or []:
+    native_files = projected.get("files")
+    mates = projected.get("mates")
+    if not isinstance(mates, list):
+        raise _Failure(
+            "discovery.raw",
+            "native mate inventory is unavailable",
+        )
+    for mate in mates:
         if not isinstance(mate, dict):
             raise _Failure("discovery.raw", "a native mate is malformed")
         scope = mate.get("scope")
@@ -1417,7 +1521,37 @@ def project_native_verification_record(record: dict) -> dict:
                 "native mate owner scope is not a known occurrence",
                 {"mate": mate.get("name"), "scope": scope},
             )
-        for entity in mate.get("entities") or []:
+        owner_configuration = (
+            by_component[scope].get("configuration")
+            if scope
+            else projected.get("saved_configuration")
+        )
+        mate_configuration = mate.get("configuration")
+        if (
+            not isinstance(owner_configuration, str)
+            or not owner_configuration.strip()
+            or not isinstance(mate_configuration, str)
+            or not mate_configuration.strip()
+            or mate_configuration != owner_configuration
+        ):
+            raise _Failure(
+                "discovery.mate_configuration",
+                "native mate configuration does not match its owner assembly",
+                {
+                    "mate": mate.get("name"),
+                    "scope": scope,
+                    "configuration": mate_configuration,
+                    "expected": owner_configuration,
+                },
+            )
+        entities = mate.get("entities")
+        if not isinstance(entities, list):
+            raise _Failure(
+                "discovery.mate_scope",
+                "native mate has no entity list",
+                {"mate": mate.get("name")},
+            )
+        for entity in entities:
             if not isinstance(entity, dict) or "component" in entity:
                 raise _Failure(
                     "discovery.mate_scope",
@@ -1426,26 +1560,65 @@ def project_native_verification_record(record: dict) -> dict:
                 )
             reference_name = entity.get("reference_name")
             reference_document = entity.get("reference_document")
+            reference_configuration = entity.get(
+                "reference_configuration"
+            )
             assembly_frame = entity.get("assembly_frame")
             if (
                 not isinstance(reference_name, str)
                 or not reference_name
-                or (reference_document is not None and not isinstance(reference_document, str))
+                or not isinstance(reference_document, str)
+                or not reference_document.strip()
                 or type(assembly_frame) is not bool
             ):
                 raise _Failure(
                     "discovery.mate_scope",
-                    "native mate entity lacks raw reference identity",
-                    {"mate": mate.get("name")},
+                    "native mate entity lacks raw reference identity or document",
+                    {
+                        "mate": mate.get("name"),
+                        "component": reference_name,
+                    },
+                )
+            if (
+                "reference_configuration" not in entity
+                or (
+                    reference_configuration is not None
+                    and not isinstance(reference_configuration, str)
+                )
+            ):
+                raise _Failure(
+                    "discovery.mate_configuration",
+                    "native mate entity has no explicit configuration reading",
+                    {
+                        "mate": mate.get("name"),
+                        "component": reference_name,
+                    },
                 )
             if assembly_frame:
-                if scope and (
-                    scope not in by_component
-                    or (
-                        reference_document is not None
-                        and by_document[scope] != reference_document
+                if scope:
+                    exact_owner = (
+                        scope in by_component
+                        and _verification_component_document_is_bound(
+                            by_component[scope],
+                            scope,
+                            reference_document,
+                            native_files,
+                        )
                     )
-                ):
+                else:
+                    identity = projected.get("identity")
+                    main_assembly = (
+                        identity.get("main_assembly")
+                        if isinstance(identity, dict)
+                        else None
+                    )
+                    exact_owner = (
+                        isinstance(main_assembly, str)
+                        and bool(main_assembly)
+                        and _verification_document_key(reference_document)
+                        == _verification_document_key(main_assembly)
+                    )
+                if not exact_owner:
                     raise _Failure(
                         "discovery.mate_scope",
                         "mate entity does not resolve to its exact scoped occurrence",
@@ -1463,8 +1636,12 @@ def project_native_verification_record(record: dict) -> dict:
                     else reference_name
                 )
                 if component not in by_component or (
-                    reference_document is not None
-                    and by_document[component] != reference_document
+                    not _verification_component_document_is_bound(
+                        by_component[component],
+                        component,
+                        reference_document,
+                        native_files,
+                    )
                 ):
                     raise _Failure(
                         "discovery.mate_scope",
@@ -1473,6 +1650,21 @@ def project_native_verification_record(record: dict) -> dict:
                             "mate": mate.get("name"),
                             "component": reference_name,
                             "scope": scope,
+                        },
+                    )
+                if (
+                    not isinstance(reference_configuration, str)
+                    or not reference_configuration.strip()
+                    or by_component[component].get("configuration")
+                    != reference_configuration
+                ):
+                    raise _Failure(
+                        "discovery.mate_configuration",
+                        "mate entity configuration does not match its recorded component",
+                        {
+                            "mate": mate.get("name"),
+                            "component": component,
+                            "reference_configuration": reference_configuration,
                         },
                     )
                 owner_document = (
@@ -1500,7 +1692,13 @@ def project_native_verification_record(record: dict) -> dict:
                 frames,
             )
 
-    for datum in projected.get("datums") or []:
+    datums = projected.get("datums")
+    if not isinstance(datums, list):
+        raise _Failure(
+            "discovery.raw",
+            "native datum inventory is unavailable",
+        )
+    for datum in datums:
         if not isinstance(datum, dict) or "array" in datum:
             raise _Failure(
                 "discovery.local_datum",

@@ -7568,8 +7568,25 @@ class SolidWorksBackend(CadBackend):
                             reference = _component(_property(entity, "ReferenceComponent"))
                             reference_full = str(_method(reference, "GetPathName") or "")
                             reference_name = str(_property(reference, "Name2") or "")
-                            reference_configuration = str(_property(reference, "ReferencedConfiguration") or "")
-                            reference_path = _relative_document(reference_full, source_root)
+                            reference_configuration = _json_raw_value(
+                                _property(
+                                    reference,
+                                    "ReferencedConfiguration",
+                                )
+                            )
+                            reference_path = _relative_document(
+                                reference_full,
+                                source_root,
+                            )
+                            if (
+                                reference_path is None
+                                and _is_text_name(reference_full)
+                            ):
+                                reference_path = (
+                                    str(reference_full)
+                                    .replace("/", "\\")
+                                    .strip()
+                                )
                             # An entity may lie on the owning assembly's own reference
                             # geometry (assembly planes/axes): it has no component
                             # occurrence identity and belongs to that assembly's frame.

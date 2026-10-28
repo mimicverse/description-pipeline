@@ -6323,6 +6323,7 @@ class AssemblyFrameMateTests(unittest.TestCase):
             component = _Component("base-1", base)
             assembly = _write(root, "robot.SLDASM")
             root_reference = _Component("robot", assembly, is_root=True)
+            root_reference.ReferencedConfiguration = None
             mate = _mate(
                 "ground_pin",
                 0,
@@ -6345,6 +6346,11 @@ class AssemblyFrameMateTests(unittest.TestCase):
                 record["mates"][0]["entities"][1]["reference_document"],
                 "robot.SLDASM",
             )
+            self.assertIsNone(
+                record["mates"][0]["entities"][1][
+                    "reference_configuration"
+                ]
+            )
 
     def test_nested_mate_to_the_sub_assembly_frame_binds_to_its_occurrence(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -6354,6 +6360,7 @@ class AssemblyFrameMateTests(unittest.TestCase):
             arm_doc = _Doc(arm_path)
             arm_component = _Component("arm-1", arm_path, doc=arm_doc)
             sub_reference = _Component("sub", sub_path, is_root=True)
+            sub_reference.ReferencedConfiguration = None
             nested = _mate(
                 "nested_ground_pin",
                 0,
@@ -6383,6 +6390,11 @@ class AssemblyFrameMateTests(unittest.TestCase):
             self.assertEqual(entities[0]["component"], "sub-1/arm-1")
             self.assertEqual(entities[1]["component"], "sub-1")
             self.assertIs(entities[1]["assembly_frame"], True)
+            self.assertIsNone(
+                record["mates"][0]["entities"][1][
+                    "reference_configuration"
+                ]
+            )
 
     def test_unrecorded_reference_still_fails_closed(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -6786,6 +6798,42 @@ class MateEntityReferenceTests(unittest.TestCase):
                 "line",
             )
 
+    def test_unreadable_reference_type_preserves_numeric_params(self) -> None:
+        def raiser():
+            raise RuntimeError("no type")
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = _write(root, "base.SLDPRT")
+            component = _Component("base-1", base)
+            entity = _MateEntity(
+                component,
+                "Face1",
+                reference_type=raiser,
+                reference_type2=4,
+                entity_params=[0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.1, 0.0],
+            )
+            raw_record = self._read_single_record(root, component, entity)
+            raw_reference = raw_record["mates"][0]["entities"][0][
+                "mate_entity_reference"
+            ]
+            self.assertIsNone(raw_reference["reference_type"])
+            self.assertEqual(
+                raw_reference["params"],
+                [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.1, 0.0],
+            )
+            self.assertIn("RuntimeError: no type", raw_reference["error"])
+
+            projected_reference = _project_native_record(raw_record)["mates"][
+                0
+            ]["entities"][0]["mate_entity_reference"]
+            self.assertEqual(
+                projected_reference["params"],
+                [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.1, 0.0],
+            )
+            self.assertIn("RuntimeError: no type", projected_reference["error"])
+            self.assertIsNone(projected_reference["geometry"])
+
     def test_linux_projection_requires_proper_rigid_local_transform(self) -> None:
         identity = SW_IDENTITY
         scaled = (*SW_IDENTITY[:12], 2.0, 0.0, 0.0, 0.0)
@@ -6855,8 +6903,12 @@ class MateEntityReferenceTests(unittest.TestCase):
                 self.assertEqual(raw_reference["params"], expected_params)
                 self.assertNotIn("geometry", raw_reference)
                 if name == "bad-type":
-                    with self.assertRaises(CadError):
-                        _project_native_record(raw_record)
+                    projected = _project_native_record(raw_record)
+                    reference = projected["mates"][0]["entities"][0][
+                        "mate_entity_reference"
+                    ]
+                    self.assertIn(expected_error, reference["error"])
+                    self.assertIsNone(reference["geometry"])
                     continue
                 projected = _project_native_record(raw_record)
                 reference = projected["mates"][0]["entities"][0][
@@ -6953,6 +7005,75 @@ class MateEntityReferenceTests(unittest.TestCase):
             self.assertEqual(
                 frame_reference["geometry"],
                 {"kind": "plane", "point": [0.0, 0.0, 0.0], "normal": [0.0, 0.0, 1.0], "frame": "component-local"},
+            )
+
+    def test_virtual_mate_reference_preserves_outside_get_path_name(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "stage"
+            root.mkdir()
+            assembly = _write(root, "robot.SLDASM")
+            virtual_root = (
+                Path(tmp) / "swx21040" / "VC~~" / "waist"
+            )
+            virtual_root.mkdir(parents=True)
+            virtual_document = virtual_root / "virtual_part.SLDPRT"
+            virtual_document.write_bytes(b"virtual")
+            virtual_component = _Component(
+                "virtual-1",
+                virtual_document,
+                configuration="Default",
+            )
+            virtual_component.IsVirtual = True
+            virtual_component.GetImportedPath = lambda: None
+            mate = _mate(
+                "virtual_seat",
+                0,
+                [
+                    _MateEntity(
+                        virtual_component,
+                        "Vertex1",
+                        point=(0.0, 0.0, 0.0),
+                    )
+                ],
+            )
+            group = _Feature(
+                "MateGroup",
+                "MateGroup",
+                first_sub=mate,
+            )
+            main = _Doc(
+                assembly,
+                first_feature=group,
+                children=[virtual_component],
+            )
+            record = _read(
+                root,
+                _App(
+                    {
+                        assembly: main,
+                        virtual_document: virtual_component.GetModelDoc2(),
+                    }
+                ),
+            )
+
+            raw_entity = record["mates"][0]["entities"][0]
+            self.assertEqual(
+                raw_entity["reference_document"],
+                str(virtual_document).replace("/", "\\"),
+            )
+            component = next(
+                item
+                for item in record["components"]
+                if item["name2"] == "virtual-1"
+            )
+            self.assertEqual(
+                component["source_provenance"]["state"],
+                "embedded_virtual_component",
+            )
+            projected = _project_native_record(record)
+            self.assertEqual(
+                projected["mates"][0]["entities"][0]["component"],
+                "virtual-1",
             )
 
 

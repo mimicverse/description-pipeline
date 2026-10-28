@@ -3798,6 +3798,7 @@ class DiscoveryTests(unittest.TestCase):
                         "discovery.binding",
                         "discovery.configuration",
                         "discovery.identity",
+                        "discovery.mate_configuration",
                     }
                     & {item["code"] for item in report["errors"]}
                 )
@@ -4390,7 +4391,10 @@ class DerivationSplitTests(unittest.TestCase):
         payload = record()
         payload["identity"]["delivery_configuration"] = None
         payload.pop("saved_configuration", None)
-        with self.assertRaisesRegex(PipelineError, "carries no usable configuration"):
+        with self.assertRaisesRegex(
+            PipelineError,
+            "mate configuration",
+        ):
             derive_native_package(
                 source,
                 self.tmp / "derived-unbound-config",

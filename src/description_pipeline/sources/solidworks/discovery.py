@@ -35,7 +35,8 @@ the backend and re-read by the independent verifier:
     {1, 4})``).
 ``mates``
     ``{name, type, entities: [{reference_name, reference_document,
-    assembly_frame, feature, face_index, cylinder, mate_entity_reference}],
+    reference_configuration, assembly_frame, feature, face_index, cylinder,
+    mate_entity_reference}],
     alignment, limits: {lower, upper, unit}, suppressed}`` with each cylinder
     given in its component frame (``point``/``direction``/``radius``) and raw
     ``EntityParams`` retained in the owning assembly frame.
@@ -45,6 +46,9 @@ the backend and re-read by the independent verifier:
     ``{component: "", assembly_frame: true, ...}`` with geometry recorded in the
     assembly frame.  Such mates only ground exactly one rigid cluster when they
     reach full rank, and only that cluster may become ``CS_base_link``.
+    Component endpoints bind their exact referenced document and configuration;
+    assembly-frame endpoints bind their owner assembly document, while their
+    reference name and configuration remain provenance rather than selectors.
 ``datums``
     ``{name, owner, array_raw: [16 floats]}`` coordinate systems with the
     original local transform (owner ``""`` is assembly scope). Linux composes
@@ -518,13 +522,41 @@ def _projected_document_key(value: object) -> str:
     )
 
 
-def _projected_entity_geometry(reference_type, params):
-    if type(reference_type) is not int:
-        raise CadError(
-            "cad_mate_entity_reference_invalid",
-            "ReferenceType must be an exact native integer",
-            {"value_type": type(reference_type).__name__},
+def _projected_component_document_is_bound(
+    component: dict,
+    name: str,
+    reference_document: str,
+    native_files: object,
+) -> bool:
+    document = component.get("document")
+    if (
+        not isinstance(document, str)
+        or not document.strip()
+        or _projected_document_key(document)
+        != _projected_document_key(reference_document)
+    ):
+        return False
+    try:
+        artifact_path_parts(document.replace("\\", "/"))
+    except PipelineError:
+        return (
+            isinstance(native_files, dict)
+            and sealed_embedded_virtual_document(
+                component,
+                name,
+                native_files,
+            )
         )
+    return (
+        isinstance(native_files, dict)
+        and isinstance(
+            native_files.get(document.replace("\\", "/")),
+            str,
+        )
+    )
+
+
+def _projected_entity_params(params):
     if not isinstance(params, list):
         raise CadError(
             "cad_mate_entity_reference_invalid",
@@ -539,6 +571,17 @@ def _projected_entity_geometry(reference_type, params):
         raise CadError(
             "cad_mate_entity_reference_invalid",
             "EntityParams must contain only finite non-boolean numbers",
+        )
+    return [float(value) for value in params]
+
+
+def _projected_entity_geometry(reference_type, params):
+    params = _projected_entity_params(params)
+    if type(reference_type) is not int:
+        raise CadError(
+            "cad_mate_entity_reference_invalid",
+            "ReferenceType must be an exact native integer",
+            {"value_type": type(reference_type).__name__},
         )
     minimum = _MATE_ENTITY_MINIMUMS.get(reference_type)
     if minimum is None:
@@ -612,19 +655,20 @@ def _projected_mate_reference(block, component, owner, frames):
             "null EntityParams requires an explicit native read error",
         )
     if params is not None:
-        geometry, error = _projected_entity_geometry(
-            projected.get("reference_type"),
-            params,
-        )
-        projected["params"] = [
-            float(value) for value in params
-        ]
-        if native_error is None:
-            projected["geometry"] = geometry
-        else:
+        if native_error is not None:
+            projected["params"] = _projected_entity_params(params)
             projected["geometry"] = None
-        if native_error is None and error is not None:
-            projected["error"] = error
+        else:
+            geometry, error = _projected_entity_geometry(
+                projected.get("reference_type"),
+                params,
+            )
+            projected["params"] = [
+                float(value) for value in params
+            ]
+            projected["geometry"] = geometry
+            if error is not None:
+                projected["error"] = error
     else:
         projected["geometry"] = None
     if projected.get("error") is not None or projected.get("geometry") is None:
@@ -797,6 +841,7 @@ def _project_native_record(record: dict) -> dict:
         name: str(component.get("document") or "")
         for name, component in by_component.items()
     }
+    native_files = record.get("files")
     mates = projected.get("mates")
     if not isinstance(mates, list):
         raise CadError(
@@ -822,7 +867,37 @@ def _project_native_record(record: dict) -> dict:
                 "a native mate owner scope is not a known occurrence",
                 {"mate": mate.get("name"), "scope": scope},
             )
-        for entity in mate.get("entities") or []:
+        owner_configuration = (
+            by_component[scope].get("configuration")
+            if scope
+            else record.get("saved_configuration")
+        )
+        mate_configuration = mate.get("configuration")
+        if (
+            not isinstance(owner_configuration, str)
+            or not owner_configuration.strip()
+            or not isinstance(mate_configuration, str)
+            or not mate_configuration.strip()
+            or mate_configuration != owner_configuration
+        ):
+            raise CadError(
+                "cad_mate_configuration_invalid",
+                "a native mate configuration does not match its owner assembly",
+                {
+                    "mate": mate.get("name"),
+                    "scope": scope,
+                    "configuration": mate_configuration,
+                    "expected": owner_configuration,
+                },
+            )
+        entities = mate.get("entities")
+        if not isinstance(entities, list):
+            raise CadError(
+                "cad_mate_unreadable",
+                "a native mate has no entity list",
+                {"mate": mate.get("name")},
+            )
+        for entity in entities:
             if not isinstance(entity, dict):
                 raise CadError(
                     "cad_mate_unreadable",
@@ -836,26 +911,65 @@ def _project_native_record(record: dict) -> dict:
                 )
             reference_name = entity.get("reference_name")
             reference_document = entity.get("reference_document")
+            reference_configuration = entity.get(
+                "reference_configuration"
+            )
             assembly_frame = entity.get("assembly_frame")
             if (
                 not isinstance(reference_name, str)
                 or not reference_name
-                or (reference_document is not None and not isinstance(reference_document, str))
+                or not isinstance(reference_document, str)
+                or not reference_document.strip()
                 or type(assembly_frame) is not bool
             ):
                 raise CadError(
                     "cad_mate_scope_ambiguous",
-                    "a native mate entity lacks its raw reference identity",
-                    {"mate": mate.get("name")},
+                    "a native mate entity lacks its raw reference identity or document",
+                    {
+                        "mate": mate.get("name"),
+                        "component": reference_name,
+                    },
+                )
+            if (
+                "reference_configuration" not in entity
+                or (
+                    reference_configuration is not None
+                    and not isinstance(reference_configuration, str)
+                )
+            ):
+                raise CadError(
+                    "cad_mate_configuration_invalid",
+                    "a native mate entity has no explicit configuration reading",
+                    {
+                        "mate": mate.get("name"),
+                        "component": reference_name,
+                    },
                 )
             if assembly_frame:
-                if scope and (
-                    scope not in by_component
-                    or (
-                        reference_document is not None
-                        and by_document[scope] != reference_document
+                if scope:
+                    exact_owner = (
+                        scope in by_component
+                        and _projected_component_document_is_bound(
+                            by_component[scope],
+                            scope,
+                            reference_document,
+                            native_files,
+                        )
                     )
-                ):
+                else:
+                    identity = record.get("identity")
+                    main_assembly = (
+                        identity.get("main_assembly")
+                        if isinstance(identity, dict)
+                        else None
+                    )
+                    exact_owner = (
+                        isinstance(main_assembly, str)
+                        and bool(main_assembly)
+                        and _projected_document_key(reference_document)
+                        == _projected_document_key(main_assembly)
+                    )
+                if not exact_owner:
                     raise CadError(
                         "cad_mate_scope_ambiguous",
                         "a mate entity does not resolve to its exact scoped occurrence",
@@ -873,8 +987,12 @@ def _project_native_record(record: dict) -> dict:
                     else reference_name
                 )
                 if component not in by_component or (
-                    reference_document is not None
-                    and by_document[component] != reference_document
+                    not _projected_component_document_is_bound(
+                        by_component[component],
+                        component,
+                        reference_document,
+                        native_files,
+                    )
                 ):
                     raise CadError(
                         "cad_mate_scope_ambiguous",
@@ -883,6 +1001,21 @@ def _project_native_record(record: dict) -> dict:
                             "mate": mate.get("name"),
                             "component": reference_name,
                             "scope": scope,
+                        },
+                    )
+                if (
+                    not isinstance(reference_configuration, str)
+                    or not reference_configuration.strip()
+                    or by_component[component].get("configuration")
+                    != reference_configuration
+                ):
+                    raise CadError(
+                        "cad_mate_configuration_invalid",
+                        "a mate entity configuration does not match its recorded component",
+                        {
+                            "mate": mate.get("name"),
+                            "component": component,
+                            "reference_configuration": reference_configuration,
                         },
                     )
                 owner_document = (
@@ -5982,19 +6115,12 @@ def derive_native_package(
         raise PipelineError("native discovery record has an unexpected schema")
     raw_record = record
     _validate_native_record(raw_record)
-    try:
-        record = _project_native_record(raw_record)
-    except CadError as error:
-        raise PipelineError(
-            f"native discovery local projection failed: {error}"
-        ) from error
     frozen_source = Path(frozen_source)
     output = Path(output)
     native_files = package_inventory(frozen_source)
     handoff_sha256 = digest(native_files)
     _check_authored_files(native_files)
-    _validate_property_objects(record)
-    record_files = record.get("files")
+    record_files = raw_record.get("files")
     if not isinstance(record_files, dict) or not record_files:
         raise PipelineError(
             "native discovery record carries no bound file inventory; the frozen bytes cannot be tied to the record"
@@ -6002,6 +6128,13 @@ def derive_native_package(
     for name, recorded_sha in record_files.items():
         if not isinstance(recorded_sha, str) or native_files.get(str(name)) != recorded_sha:
             raise PipelineError(f"native discovery record file binding does not match the frozen directory: {name!r}")
+    try:
+        record = _project_native_record(raw_record)
+    except CadError as error:
+        raise PipelineError(
+            f"native discovery local projection failed: {error}"
+        ) from error
+    _validate_property_objects(record)
     identity_block = record.get("identity") if isinstance(record.get("identity"), dict) else {}
     recorded_main = identity_block.get("main_assembly")
     if not _text(recorded_main):
