@@ -212,7 +212,7 @@ Airflow 的任务标识依次为 `freeze / discover / capture / generate / verif
 `EffectPollTrigger`，`execute_complete()` 校验持久 wait 与 event digest 后调用
 `StageApplication.resume_stage()`。Airflow 固定为 3.3.2，并运行受管 triggerer。
 上传、原生操作派发、结果等待和传输核验均位于所属工程任务内，不作为另一套阶段。
-原生操作使用容量为一的资源池，任务重试保留操作身份；阶段重做只通过关联运行命令
+原生阶段按同一阶段契约绑定容量为一的 `windows_native` 池；等待原生结果的 deferred 任务保留池槽位并释放 Airflow worker，池容量与 deferred 占用均纳入健康核验。任务重试保留操作身份；阶段重做只通过关联运行命令
 发起，不用 backfill 或直接 clear 改写工程历史。DAG 当前设置
 `max_active_runs=8` 与 `max_active_tasks=8`，只约束调度并发；CAD 排他由 physical
 ownership、native pool 与 target/effect 冲突分别执行，不能把 scheduler 并发字段

@@ -164,6 +164,7 @@ class RealAirflowConfigIdentityTests(unittest.TestCase):
         for task in dag.tasks:
             self.assertIsInstance(task, StageTaskOperator)
             self.assertEqual(task.stage, task.task_id)
+            self.assertEqual(task.pool, "windows_native" if task.stage in {"discover", "capture"} else "default_pool")
         chain = ("freeze", "discover", "capture", "generate", "verify", "publish")
         for upstream, downstream in pairwise(chain):
             self.assertEqual(dag.get_task(downstream).upstream_task_ids, {upstream})

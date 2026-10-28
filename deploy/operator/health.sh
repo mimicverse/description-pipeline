@@ -208,12 +208,12 @@ from airflow.settings import Session
 
 with Session() as session:
     pool = session.query(Pool).filter(Pool.pool == "windows_native").one_or_none()
-    sys.exit(0 if pool is not None and int(pool.slots) == 1 else 1)
+    sys.exit(0 if pool is not None and int(pool.slots) == 1 and pool.include_deferred else 1)
 PY
   then
-    report PASS "native pool windows_native capacity=1"
+    report PASS "native pool windows_native capacity=1 including deferred tasks"
   else
-    report FAIL "native pool windows_native is missing or its capacity is not 1"
+    report FAIL "native pool windows_native must have capacity 1 including deferred tasks"
   fi
 else
   report FAIL "native pool cannot be verified: AIRFLOW_VENV is not executable"

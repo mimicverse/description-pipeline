@@ -3,6 +3,12 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
+import os
+import subprocess
+import sys
+import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -48,11 +54,63 @@ class AirflowApplicationAdapterTests(unittest.TestCase):
 
     def test_dag_uses_the_class_operator_with_bounded_cross_run_concurrency(self):
         source = DAG.read_text(encoding="utf-8")
-        self.assertIn("StageTaskOperator(task_id=stage, stage=stage", source)
+        self.assertIn("StageTaskOperator(", source)
         self.assertIn("max_active_runs=8", source)
         self.assertIn("max_active_tasks=8", source)
         self.assertNotIn("from airflow.sdk import Param, dag, task", source)
         self.assertNotIn("max_active_runs=1", source)
+
+    @unittest.skipUnless(importlib.util.find_spec("airflow"), "Airflow is not installed")
+    def test_real_dag_and_pool_preserve_deferred_native_capacity(self):
+        script = textwrap.dedent("""
+            import importlib.util
+            from contextlib import contextmanager
+            from pathlib import Path
+            from sqlalchemy import create_engine
+            from sqlalchemy.orm import Session
+            from airflow.models.pool import Pool
+            from description_pipeline.stages import STAGE_IDS, WINDOWS_STAGES
+
+            def load(name, path):
+                spec = importlib.util.spec_from_file_location(name, path)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                return module
+
+            dag = load("pool_test_dag", Path("deploy/airflow/dags/solidworks_to_urdf.py")).solidworks_to_urdf_dag
+            assert tuple(dag.task_ids) == STAGE_IDS
+            for stage in STAGE_IDS:
+                task = dag.get_task(stage)
+                assert task.pool == ("windows_native" if stage in WINDOWS_STAGES else "default_pool")
+                assert task.pool_slots == 1
+            for previous, following in zip(STAGE_IDS, STAGE_IDS[1:]):
+                assert dag.get_task(following).upstream_task_ids == {previous}
+
+            engine = create_engine("sqlite://")
+            Pool.__table__.create(engine)
+            @contextmanager
+            def session_factory():
+                with Session(engine) as session:
+                    yield session
+            module = load("pool_test_installer", Path("deploy/airflow/scripts/ensure_pool.py"))
+            for existing in (False, True):
+                if existing:
+                    with Session(engine) as session:
+                        pool = session.query(Pool).filter(Pool.pool == "windows_native").one()
+                        pool.slots = 7
+                        pool.include_deferred = False
+                        session.commit()
+                module.ensure_pool("windows_native", 1, "native", session_factory=session_factory, pool_class=Pool)
+                with Session(engine) as session:
+                    pool = session.query(Pool).filter(Pool.pool == "windows_native").one()
+                    assert pool.slots == 1 and pool.include_deferred is True
+        """)
+        with tempfile.TemporaryDirectory() as home:
+            env = {key: value for key, value in os.environ.items() if not key.startswith("AIRFLOW")}
+            env.update(AIRFLOW_HOME=home, PYTHONPATH=str(ROOT / "src"), PYTHONDONTWRITEBYTECODE="1")
+            result = subprocess.run([sys.executable, "-c", script], cwd=ROOT, env=env,
+                                    capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 if __name__ == "__main__":
     unittest.main()

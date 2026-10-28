@@ -10,6 +10,7 @@ from airflow.sdk import Param, dag
 from description_pipeline.orchestration.airflow_stage_operator import (
     StageTaskOperator,
 )
+from description_pipeline.stages import STAGE_IDS, WINDOWS_STAGES
 
 DAG_ID = "solidworks_to_urdf"
 
@@ -26,15 +27,11 @@ DAG_ID = "solidworks_to_urdf"
 )
 def solidworks_to_urdf():
     stages = [
-        StageTaskOperator(task_id=stage, stage=stage, retries=0)
-        for stage in (
-            "freeze",
-            "discover",
-            "capture",
-            "generate",
-            "verify",
-            "publish",
+        StageTaskOperator(
+            task_id=stage, stage=stage, retries=0,
+            pool="windows_native" if stage in WINDOWS_STAGES else "default_pool",
         )
+        for stage in STAGE_IDS
     ]
     for upstream, downstream in pairwise(stages):
         upstream >> downstream
