@@ -29,7 +29,7 @@ CAD 提供工程事实，版本化规则负责规范化、派生与有依据的�
 | `subject_digest` | 一份完整交付的不可变文件主体摘要；验证只针对该主体 |
 | 发布身份 | 仓库、硬件、base、候选分支、前置提交、交付主体及最终 commit/PR |
 
-接纳请求的 `request_id` 同时是固定 DAG `solidworks_to_urdf` 的 `dag_run_id`；Portal 首次提交、Freeze 后继、CLI 与接纳结果重读均使用这一身份，不允许额外覆盖或添加前缀。同一不可变请求可以重试；同一 `run_id` 下不同的接纳事实必须拒绝，不能返回旧请求的成功结果。上传后、接纳前的字段校验失败须清理本次 intake，使用户能修正提交后使用同一幂等键重试；已接纳请求及外部结果仍按原身份对账。
+接纳请求的 `request_id` 同时是固定 DAG `solidworks_to_urdf` 的 `dag_run_id`；Portal 首次提交、Freeze 后继、CLI 与接纳结果重读均使用这一身份，不允许额外覆盖或添加前缀。同一不可变请求可以重试；CLI 提交同一 `run_id` 下不同的完整 `AdmissionSpec` 必须拒绝。生产入口并发准备同一请求时，沿用先成功接纳的不可变事实，并经现有请求意图校验后重放；不同请求不能得到旧请求的成功结果。上传后、接纳前的字段校验失败须清理本次 intake，使用户能修正提交后使用同一幂等键重试；已接纳请求及外部结果仍按原身份对账。
 
 内容摘要对象的固定字段为 `kind="source-revision"`、`handoff_digest`、`main_assembly`、`configuration`、`hardware_id`、`records`。`records` 是实际引用的 `{reference, file_sha256}` 列表，按完整引用排序且唯一，无引用时为 `[]`；路径是包内相对路径，字符串保持封存值，不以临时绝对路径替代。按照本契约的规范 JSON 序列化求摘要，未引用规格的变化不影响结果。
 
