@@ -175,6 +175,38 @@ class SavedNativeReferencesTests(unittest.TestCase):
             bind_saved_native_references(raw, purpose="inspection_preview")
         self.assertIn("native_name", caught.exception.details)
 
+    def test_numbered_auto_names_cannot_disambiguate_coincident_geometry(self):
+        raw = inspection_record()
+        root, leaf = raw["components"][2:]
+        root.update(name2="auto_link_001-1", document="auto_link_001.SLDASM")
+        leaf.update(name2="auto_link_001-1/part-1", parent_occurrence=root["name2"])
+        leaf["solver_observation"]["context"].update(document=root["document"], scope=root["name2"])
+        raw["mates"][0]["entities"][1]["component"] = leaf["name2"]
+        other_root, other_leaf = copy.deepcopy((root, leaf))
+        other_root.update(name2="auto_link_002-1", document="auto_link_002.SLDASM")
+        other_leaf.update(name2="auto_link_002-1/part-1", parent_occurrence=other_root["name2"])
+        other_leaf["solver_observation"]["context"].update(document=other_root["document"], scope=other_root["name2"])
+        raw["components"].extend((other_root, other_leaf))
+        raw["datums"][-1]["name"] = "c_auto_link_001"
+        raw["reference_axes"][-1]["selector"]["feature_name"] = "a_auto_link_001"
+        datum, axis, mate = copy.deepcopy((raw["datums"][-1], raw["reference_axes"][-1], raw["mates"][0]))
+        datum["name"] = "c_auto_link_002"
+        axis["selector"]["feature_name"] = "a_auto_link_002"
+        mate["name"] = "second_native_bearing"
+        mate["entities"][1]["component"] = other_leaf["name2"]
+        raw["datums"].append(datum)
+        raw["reference_axes"].append(axis)
+        raw["mates"].append(mate)
+        with self.assertRaises(SavedNativeReferenceError):
+            bind_saved_native_references(raw, purpose="inspection_preview")
+        datum["array"][3] = 1.0
+        axis["axis_point_m"][0] = 1.0
+        axis["raw_endpoints_m"][0] = axis["raw_endpoints_m"][3] = 1.0
+        for entity in mate["entities"]:
+            entity["mate_entity_reference"]["params"][0] = 1.0
+        proof = bind_saved_native_references(raw, purpose="inspection_preview")
+        self.assertEqual(proof["features"][other_root["name2"]], "auto_link_002")
+
     def test_native_sign_warning_preserves_its_property_without_positive_motion_claim(self):
         from description_pipeline.sources.solidworks.evidence import saved_native_reference_warnings
 

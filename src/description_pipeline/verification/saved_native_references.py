@@ -101,7 +101,7 @@ def _context(component, document, configuration, scope):
 
 def _semantic(datum, component):
     """Use exact native semantic tokens only inside geometric candidates."""
-    if datum[2:].lower().startswith("auto_"):
+    if _token(datum[2:]).startswith("auto_"):
         return False
     occurrence = component["name2"].rsplit("/", 1)[-1]
     occurrence = re.sub(r"-\d+$", "", occurrence)

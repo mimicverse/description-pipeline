@@ -351,7 +351,7 @@ def bind_saved_native_references(record: dict, *, purpose: str) -> dict:
                    and _line_distance(point, axis["point"], axis["direction"]) <= LINE_TOLERANCE_M
                    for witness in witnesses for point, direction in witness["lines"]):
                 matches.add(key)
-        named_candidates = _component_tokens(roots[child]) & matches
+        named_candidates = {key for key in _component_tokens(roots[child]) & matches if not key.startswith("auto_")}
         candidates[child] = named_candidates or matches
     assignments = {root: "base_link", **_unique_assignment(candidates, set(coordinates) - {"base_link"})}
     return {"root": root, "roots": roots, "components": components, "members": members, "owner": owner,
