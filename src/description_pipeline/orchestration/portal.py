@@ -5,8 +5,9 @@ The portal is a dependency-free WSGI application:
 * the operator signs in once with Feishu SSO at ``/auth/feishu/login``; the Airflow ``_token``
   cookie that Airflow issues is validated server-side through ``/auth/feishu/profile`` and its
   value is kept in a portal session, never echoed to the browser;
-* the portal triggers the ``solidworks_to_urdf`` DAG with ``handoff_path`` and ``main_assembly``,
-  and reports the Airflow stage progress, native findings and the published pull request;
+* the portal triggers the ``solidworks_to_urdf`` DAG with the canonical
+  ``DispatchConf(run_id, freeze_command_id)`` and reports the Airflow stage progress, native
+  findings and the published pull request;
 * every submission is admitted in the platform store first (request, run and the initial
   dispatch intent in one short transaction) and is refused while the admission window is
   closed or the platform store is unreachable;
@@ -1696,6 +1697,9 @@ class PortalApp:
                     {
                         "dag_run_id": dag_run_id,
                         "handoff_path": None,
+                        "main_assembly": _optional_str(
+                            request.get("main_assembly")
+                        ),
                         # The recorded initiator, never the current viewer; missing names stay null.
                         "user": name,
                         # Airflow's own record outlives any portal restart.
@@ -1861,21 +1865,27 @@ class PortalApp:
                     [("Retry-After", "5")],
                 )
             raise PortalError(error.status, error.message) from error
-        target_hardware = receipt.target_hardware.strip() if isinstance(receipt.target_hardware, str) else ""
-        if not target_hardware:
-            raise PortalError(HTTPStatus.BAD_REQUEST, "Publication target is required; select one and retry")
-        if target_hardware not in (self.config.pipeline_targets or {}):
-            raise PortalError(HTTPStatus.BAD_REQUEST, "Publication target is not configured; select another target")
-        change_summary = (
-            normalize_change_summary(receipt.change_summary).strip() if isinstance(receipt.change_summary, str) else ""
-        )
-        if not change_summary:
-            raise PortalError(HTTPStatus.BAD_REQUEST, "Change summary is required")
-        purpose = receipt.purpose.strip() if isinstance(receipt.purpose, str) else ""
-        if not purpose:
-            raise PortalError(HTTPStatus.BAD_REQUEST, "Purpose is required; select one on the page")
-        if purpose not in REQUEST_PURPOSES:
-            raise PortalError(HTTPStatus.BAD_REQUEST, "Purpose is not configured; select another purpose")
+        try:
+            target_hardware = receipt.target_hardware.strip() if isinstance(receipt.target_hardware, str) else ""
+            if not target_hardware:
+                raise PortalError(HTTPStatus.BAD_REQUEST, "Publication target is required; select one and retry")
+            if target_hardware not in (self.config.pipeline_targets or {}):
+                raise PortalError(HTTPStatus.BAD_REQUEST, "Publication target is not configured; select another target")
+            change_summary = (
+                normalize_change_summary(receipt.change_summary).strip()
+                if isinstance(receipt.change_summary, str)
+                else ""
+            )
+            if not change_summary:
+                raise PortalError(HTTPStatus.BAD_REQUEST, "Change summary is required")
+            purpose = receipt.purpose.strip() if isinstance(receipt.purpose, str) else ""
+            if not purpose:
+                raise PortalError(HTTPStatus.BAD_REQUEST, "Purpose is required; select one on the page")
+            if purpose not in REQUEST_PURPOSES:
+                raise PortalError(HTTPStatus.BAD_REQUEST, "Purpose is not configured; select another purpose")
+        except PortalError:
+            drop_received_folder(self.config.upload_root / intake_run_id)
+            raise
         try:
             from ..pipeline.ingestion import (
                 ProductionAdmissionRequest,
@@ -1885,7 +1895,7 @@ class PortalApp:
             production_outcome = self.config.production_admission_loader(
                 ProductionAdmissionRequest(
                     run_id=run_id,
-                    request_id=f"portal-{dag_run_id}",
+                    request_id=dag_run_id,
                     upload_dir=self.config.upload_root / intake_run_id,
                     receipt=ReceivedUploadReceipt(
                         folder=receipt.folder,
@@ -1997,7 +2007,7 @@ class PortalApp:
             "change_summary": change_summary,
         }
         if production_outcome is not None:
-            payload["request_id"] = f"portal-{dag_run_id}"
+            payload["request_id"] = dag_run_id
             payload["idempotent"] = existing_outcome is not None
         if receipt.main_assembly is not None:
             payload["main_assembly"] = receipt.main_assembly
@@ -2043,10 +2053,9 @@ class PortalApp:
 
     @staticmethod
     def _dag_run_id_from_request_id(request_id: object) -> str | None:
-        if not isinstance(request_id, str) or not request_id.startswith("portal-"):
+        if not isinstance(request_id, str):
             return None
-        candidate = request_id.removeprefix("portal-")
-        return candidate if _RUN_ID.fullmatch(candidate) is not None else None
+        return request_id if _RUN_ID.fullmatch(request_id) is not None else None
 
     def _rename_run(self, environ: dict, start_response: Callable, dag_run_id: str) -> Iterable[bytes]:
         """Display-only rename; works for deleted runs and never touches native state."""
@@ -2694,7 +2703,7 @@ class PortalApp:
                 outcome = loader(
                     ProductionFreezeSuccessorRequest(
                         run_id=new_run_id,
-                        request_id=f"portal-{new_dag_run_id}",
+                        request_id=new_dag_run_id,
                         parent_run_id=parent_run_id,
                         main_assembly=main_assembly,
                         target_hardware=target_hardware,

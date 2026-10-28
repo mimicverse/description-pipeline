@@ -29,8 +29,6 @@ def parser() -> argparse.ArgumentParser:
 
     admit = operations.add_parser("admit", help="admit one immutable AdmissionSpec")
     admit.add_argument("spec", type=Path)
-    admit.add_argument("--dispatch-dag-id", default="solidworks_to_urdf")
-    admit.add_argument("--dispatch-dag-run-id")
 
     stage = operations.add_parser("stage", help="execute one already-registered stage command")
     stage.add_argument("command_id")
@@ -75,11 +73,7 @@ def main(
             application = (application_factory or _default_application)()
             if arguments.operation == "admit":
                 spec = AdmissionSpec.from_record(read_data(arguments.spec))
-                admitted = application.admit(
-                    spec,
-                    dispatch_dag_id=arguments.dispatch_dag_id,
-                    dispatch_dag_run_id=arguments.dispatch_dag_run_id,
-                )
+                admitted = application.admit(spec)
                 result = {
                     "passed": True,
                     "outcome": "admitted",

@@ -1539,7 +1539,7 @@ class PortalTests(unittest.TestCase):
             raise FactStoreError("The platform admission is closed")
         if self.platform.admit_error is not None:
             raise self.platform.admit_error
-        dag_run_id = request.request_id.removeprefix("portal-")
+        dag_run_id = request.request_id
         dispatch = {
             "dag_id": DEFAULT_DAG_ID,
             "dag_run_id": dag_run_id,
@@ -1604,7 +1604,7 @@ class PortalTests(unittest.TestCase):
         )
         if existing is not None:
             return existing
-        dag_run_id = request.request_id.removeprefix("portal-")
+        dag_run_id = request.request_id
         command = SimpleNamespace(
             command_id="dispatch:" + digest(
                 {
@@ -2198,7 +2198,7 @@ class PortalTests(unittest.TestCase):
         # A retryable attempt is interrupted, not delivered: its registration is
         # non-terminal (the terminal immutability gate owns everything else).
         entry = self.store.runs[native_run_id(DAG_RUN_ID)]
-        entry["request_id"] = f"portal-{DAG_RUN_ID}"
+        entry["request_id"] = DAG_RUN_ID
         merged = entry["merged"]
         merged["status"] = "running"
         merged.pop("result", None)
@@ -2498,6 +2498,7 @@ class PortalTests(unittest.TestCase):
         listed = json.loads(body)["runs"][0]
         self.assertEqual(listed["dag_run_id"], dag_run_id)
         self.assertIsNone(listed["handoff_path"])
+        self.assertEqual(listed["main_assembly"], "model.SLDASM")
         self.assertEqual(listed["state"], "running")
         self.assertEqual(listed["user"], FEISHU_NAME)
         self.assertEqual(listed["principal"], FEISHU_PRINCIPAL)
@@ -2530,14 +2531,14 @@ class PortalTests(unittest.TestCase):
         dag_run_id = json.loads(body)["dag_run_id"]
         self.assertEqual(len(self.platform.admits), 1)
         admit = self.platform.admits[0]
-        self.assertEqual(admit["request_id"], f"portal-{dag_run_id}")
+        self.assertEqual(admit["request_id"], dag_run_id)
         self.assertEqual(admit["run_id"], native_run_id(dag_run_id))
         self.assertEqual(admit["principal"], FEISHU_PRINCIPAL)
         self.assertEqual(admit["main_assembly"], "model.SLDASM")
         self.assertEqual(admit["configuration"], {"purpose": "engineering"})
         dispatch = admit["dispatch"]
         self.assertEqual(dispatch["stage"], "freeze")
-        self.assertEqual(dispatch["operation_key"], f"portal-{dag_run_id}/freeze:0")
+        self.assertEqual(dispatch["operation_key"], f"{dag_run_id}/freeze:0")
         self.assertEqual(dispatch["dag_run_id"], dag_run_id)
         self.assertEqual(dispatch["dag_id"], DEFAULT_DAG_ID)
         self.assertRegex(dispatch["params_digest"], r"^[0-9a-f]{64}$")
@@ -2589,7 +2590,7 @@ class PortalTests(unittest.TestCase):
 
         def load(request):
             calls.append(request)
-            dag_run_id = request.request_id.removeprefix("portal-")
+            dag_run_id = request.request_id
             outcome = SimpleNamespace(
                 admission=SimpleNamespace(
                     run_id=request.run_id,
@@ -2632,7 +2633,7 @@ class PortalTests(unittest.TestCase):
             first["dag_run_id"],
             "portal-submission-20261025-stable-0001",
         )
-        self.assertEqual(first["request_id"], f"portal-{first['dag_run_id']}")
+        self.assertEqual(first["request_id"], first["dag_run_id"])
         self.assertFalse(first["idempotent"])
 
         status, _, response = client.request_raw(
@@ -2725,6 +2726,44 @@ class PortalTests(unittest.TestCase):
                 self.assertEqual(status, 400, body)
         self.assertEqual(self.airflow.trigger_payloads, [])
         self.assertEqual(self.airflow.dag_runs, {})
+
+    def test_rejected_received_fields_allow_the_same_key_to_retry(self) -> None:
+        self.client.login()
+        headers = {"Idempotency-Key": "invalid-then-valid"}
+        files = [("model.SLDASM", b"<assembly/>")]
+        rejected = _upload_body(
+            files=files,
+            fields=[
+                ("target_hardware", "ghost"),
+                ("change_summary", TEST_SUMMARY),
+                ("purpose", "engineering"),
+            ],
+        )
+        status, _, body = self.client.request_raw(
+            "POST",
+            "/api/runs",
+            rejected,
+            "multipart/form-data; boundary=portal-boundary",
+            headers,
+        )
+        self.assertEqual(status, 400, body)
+        dag_run_id = "portal-invalid-then-valid"
+        self.assertFalse((self.upload_root / dag_run_id).exists())
+
+        accepted = _upload_body(
+            files=files,
+            fields=list(UPLOAD_CHOICES),
+        )
+        status, _, body = self.client.request_raw(
+            "POST",
+            "/api/runs",
+            accepted,
+            "multipart/form-data; boundary=portal-boundary",
+            headers,
+        )
+        self.assertEqual(status, 201, body)
+        self.assertEqual(json.loads(body)["dag_run_id"], dag_run_id)
+        self.assertEqual(len(self.airflow.trigger_payloads), 1)
 
     def test_multiline_change_summary_normalizes_line_breaks_and_reaches_discovery(self) -> None:
         self.client.login()
@@ -4422,7 +4461,7 @@ class PortalTests(unittest.TestCase):
         self.store.add(child_run, meta={})
         self.store.runs[child_run].update(
             parent_run_id=native_run_id(DAG_RUN_ID),
-            request_id=f"portal-{child}",
+            request_id=child,
             from_stage="verify",
             admission_request={
                 "change_summary": TEST_SUMMARY,

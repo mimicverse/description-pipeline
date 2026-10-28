@@ -61,6 +61,7 @@ from description_pipeline.pipeline.ingestion import (
     ProductionAdmissionFactory,
     ProductionAdmissionRequest,
     ProductionFreezeSuccessorRequest,
+    PreparedAdmission,
     ReceivedUploadReceipt,
     _formal_release,
     load_production_admission,
@@ -81,7 +82,7 @@ from description_pipeline.schemas import (
     PLATFORM_CONFIG_SCHEMA,
     TOOL_SCHEMA,
 )
-from description_pipeline.platform.facts import FactStore
+from description_pipeline.platform.facts import FactConflict, FactStore
 from description_pipeline.sources.solidworks.handoff import describe_handoff
 from description_pipeline.sources.solidworks.discovery import (
     DiscoverySettings,
@@ -614,6 +615,67 @@ class ProductionAdmissionTests(unittest.TestCase):
             concurrent_a = first_future.result(timeout=30)
             concurrent_b = second_future.result(timeout=30)
         self.assertEqual(concurrent_a, concurrent_b)
+        stored_spec = AdmissionSpec.from_record(concurrent_a.admission.request)
+        variants = {
+            "ruleset": replace(
+                stored_spec,
+                ruleset=replace(
+                    stored_spec.ruleset,
+                    artifact=replace(
+                        stored_spec.ruleset.artifact,
+                        ref=replace(
+                            stored_spec.ruleset.artifact.ref,
+                            producer_tool_sha256="e" * 64,
+                        ),
+                    ),
+                ),
+            ),
+            "configuration": replace(
+                stored_spec,
+                configuration=replace(
+                    stored_spec.configuration,
+                    ref=replace(
+                        stored_spec.configuration.ref,
+                        producer_tool_sha256="e" * 64,
+                    ),
+                ),
+            ),
+            "executors": replace(
+                stored_spec,
+                executors=replace(
+                    stored_spec.executors,
+                    generate="e" * 64,
+                ),
+            ),
+            "publish-intent": replace(
+                stored_spec,
+                publish_intent=replace(
+                    stored_spec.publish_intent,
+                    commit=replace(
+                        stored_spec.publish_intent.commit,
+                        subject="feat: different publication intent",
+                    ),
+                ),
+            ),
+            "native-target": replace(
+                stored_spec,
+                native_target_identity=NativeTargetIdentity.create(
+                    install_id="win-" + "e" * 32,
+                    pipeline_id=PIPELINE_ID,
+                ),
+            ),
+        }
+        for label, variant in variants.items():
+            with self.subTest(identity=label):
+                with self.assertRaises(ProtocolError) as identity_conflict:
+                    PreparedAdmission(
+                        spec=variant,
+                        run_admission=build_run_admission(variant),
+                    ).validate_outcome(concurrent_a)
+                self.assertEqual(
+                    identity_conflict.exception.code,
+                    "admission_ingestion.identity_conflict",
+                )
         self.assertEqual(
             query(
                 "SELECT count(*) FROM run_admission WHERE run_id = %s",
@@ -648,6 +710,23 @@ class ProductionAdmissionTests(unittest.TestCase):
             work_root=first_work,
             clock=lambda: datetime(2026, 10, 25, 12, tzinfo=UTC),
         )
+        first_spec = AdmissionSpec.from_record(first.admission.request)
+        self.assertEqual(application.admit(first_spec), first)
+        with self.assertRaises(FactConflict):
+            application.admit(
+                replace(
+                    first_spec,
+                    created_at=datetime(
+                        2026,
+                        10,
+                        25,
+                        12,
+                        0,
+                        1,
+                        tzinfo=UTC,
+                    ),
+                )
+            )
         shutil.rmtree(self.upload)
         shutil.rmtree(self.records)
         shutil.rmtree(self.checkout)

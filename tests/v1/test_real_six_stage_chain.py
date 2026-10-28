@@ -621,6 +621,10 @@ class RealSixStageChainTests(unittest.TestCase):
                 admitted,
             )
             self.assertEqual(
+                admitted.dispatch_command.dag_run_id,
+                request.request_id,
+            )
+            self.assertEqual(
                 spec.originals.inventory_sha256,
                 request.receipt.handoff_sha256,
             )

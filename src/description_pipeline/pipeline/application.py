@@ -18,7 +18,7 @@ from typing import Any, Protocol, get_args
 from ..artifacts import ArtifactStore
 from ..interface_records import validate_config_snapshot
 from ..io import PipelineError, digest, read_data
-from ..platform.facts import FactConflict, FactStore
+from ..platform.facts import FactStore
 from ..orchestration.native_operation_client import (
     NativeOperationClient,
     NativeOperationDiscoverPort,
@@ -747,13 +747,7 @@ class StageApplication:
                 "Repository snapshot metadata differs from AdmissionSpec",
             )
 
-    def admit(
-        self,
-        spec: AdmissionSpec,
-        *,
-        dispatch_dag_id: str = "solidworks_to_urdf",
-        dispatch_dag_run_id: str | None = None,
-    ) -> AdmissionOutcome:
+    def admit(self, spec: AdmissionSpec) -> AdmissionOutcome:
         """Atomically register admission, Freeze and technical Airflow dispatch."""
 
         if not isinstance(spec, AdmissionSpec):
@@ -793,21 +787,13 @@ class StageApplication:
             spec,
             command,
             conf_artifact,
-            dispatch_dag_id=dispatch_dag_id,
-            dispatch_dag_run_id=dispatch_dag_run_id,
         )
-        try:
-            stored_command, stored_dispatch, _intent = self.facts.admit_run(
-                admission,
-                command,
-                dispatch_command,
-                conf_artifact,
-            )
-        except FactConflict:
-            existing = self.load_admission_outcome(spec.run_id)
-            if existing is None:
-                raise
-            return existing
+        stored_command, stored_dispatch, _intent = self.facts.admit_run(
+            admission,
+            command,
+            dispatch_command,
+            conf_artifact,
+        )
         if stored_command != command or stored_dispatch != dispatch_command:
             raise ApplicationError(
                 "application.admission_conflict",
@@ -823,14 +809,11 @@ class StageApplication:
     def _dispatch_identity(
         spec: AdmissionSpec,
         command: StageCommand,
-        *,
-        dispatch_dag_id: str = "solidworks_to_urdf",
-        dispatch_dag_run_id: str | None = None,
     ) -> dict[str, str]:
         return {
             "admission_sha256": spec.admission_sha256,
-            "dag_id": dispatch_dag_id,
-            "dag_run_id": dispatch_dag_run_id or spec.request_id,
+            "dag_id": "solidworks_to_urdf",
+            "dag_run_id": spec.request_id,
             "freeze_command_id": command.command_id,
             "run_id": spec.run_id,
         }
@@ -840,24 +823,15 @@ class StageApplication:
         spec: AdmissionSpec,
         command: StageCommand,
         conf_artifact: ArtifactRef,
-        *,
-        dispatch_dag_id: str = "solidworks_to_urdf",
-        dispatch_dag_run_id: str | None = None,
     ) -> DispatchCommand:
-        dag_run_id = dispatch_dag_run_id or spec.request_id
-        dispatch_identity = self._dispatch_identity(
-            spec,
-            command,
-            dispatch_dag_id=dispatch_dag_id,
-            dispatch_dag_run_id=dag_run_id,
-        )
+        dispatch_identity = self._dispatch_identity(spec, command)
         return DispatchCommand.create(
             command_id="dispatch:" + digest(dispatch_identity),
             run_id=spec.run_id,
             freeze_command_id=command.command_id,
             idempotency_key=f"{spec.run_id}/dispatch",
-            dag_id=dispatch_dag_id,
-            dag_run_id=dag_run_id,
+            dag_id="solidworks_to_urdf",
+            dag_run_id=spec.request_id,
             conf_artifact=conf_artifact,
             expected_executor_sha256=spec.dispatch_executor_sha256,
         )

@@ -175,7 +175,7 @@ class RunMetadataTests(unittest.TestCase):
         ]
         return {
             "run_id": run_id,
-            "request_id": f"portal-{dag_run_id}",
+            "request_id": dag_run_id,
             "parent_run_id": metadata.get("parent_run_id"),
             "from_stage": metadata.get("from_stage"),
             "request": metadata.get("request", {}),

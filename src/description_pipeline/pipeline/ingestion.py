@@ -54,6 +54,7 @@ from .freeze import RulesetCatalog, RulesetRoot
 from .native_target import load_registered_native_target
 from .publish_contract import REPOSITORY_SNAPSHOT_KIND, REPOSITORY_SNAPSHOT_METADATA
 from ..orchestration.feishu_oauth import valid_actor_principal
+from ..platform.facts import FactConflict
 
 _SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")
 _GIT_OBJECT = re.compile(r"\A[0-9a-f]{40}\Z")
@@ -598,6 +599,18 @@ def _spec_administrative_intent(spec: AdmissionSpec) -> dict[str, Any]:
     }
 
 
+def _durable_admission_identity(spec: AdmissionSpec) -> dict[str, Any]:
+    """Compare every prepared fact while ignoring only clock-derived timestamps."""
+
+    identity = copy.deepcopy(spec.identity_record())
+    identity.pop("created_at", None)
+    commit = identity.get("publish_intent", {}).get("commit")
+    if isinstance(commit, dict):
+        commit.pop("authored_at", None)
+        commit.pop("committed_at", None)
+    return identity
+
+
 def _freeze_successor_request_intent(
     request: ProductionFreezeSuccessorRequest,
     originals: VerifiedArtifact,
@@ -705,6 +718,18 @@ class PreparedAdmission:
                     "fields": differences,
                 },
             )
+        identity_differences = _intent_differences(
+            _durable_admission_identity(self.spec),
+            _durable_admission_identity(outcome_spec),
+        )
+        if identity_differences:
+            raise ProtocolError(
+                "admission_ingestion.identity_conflict",
+                {
+                    "run_id": self.spec.run_id,
+                    "fields": identity_differences,
+                },
+            )
         if outcome.admission != build_run_admission(outcome_spec):
             raise ProtocolError(
                 "admission_ingestion.outcome_invalid",
@@ -766,7 +791,12 @@ class PreparedAdmission:
                     "admission": expected_target.to_record(),
                 },
             )
-        outcome = application.admit(self.spec)
+        try:
+            outcome = application.admit(self.spec)
+        except FactConflict:
+            outcome = application.load_admission_outcome(self.spec.run_id)
+            if outcome is None:
+                raise
         self.validate_outcome(outcome)
         return outcome
 
