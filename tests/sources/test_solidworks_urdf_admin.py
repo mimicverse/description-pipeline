@@ -185,7 +185,7 @@ class UrdfRobotLabelTests(unittest.TestCase):
             "<!--WARNING units.si_conversion: "
             '{"message": "Delivered values use SI units.", '
             '"provenance": {"field": "units", "object": "robot", "source": "native_derived"}} '
-            "See reports/quality.json.-->"
+            "See reports/verification-certificate.json.-->"
             '<link name="base"/></robot>'
         )
         with tempfile.TemporaryDirectory() as directory:
@@ -246,7 +246,7 @@ class UrdfRobotLabelTests(unittest.TestCase):
         exact = (
             '<robot name="robot">'
             f"<!--WARNING source.saved_state_incomplete: {payload} "
-            "See reports/quality.json.-->"
+            "See reports/verification-certificate.json.-->"
             '<link name="base"/></robot>'
         )
         with tempfile.TemporaryDirectory() as directory:

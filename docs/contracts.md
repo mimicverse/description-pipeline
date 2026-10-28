@@ -609,6 +609,8 @@ Generate 在 Linux 对同一 raw 执行一次语义投影、惯量规范化与 S
 三角形派生，保留 component-local 坐标，明确法向量和浮点编码的派生来源，不能重复
 应用 occurrence placement。原生错误及已取得的 partial facts 保全，不被离线异常替代。
 
+冻结原件只保留在 `input/cad/`；source scope 的逻辑引用绑定这份原件及其摘要，不另封存 `evidence/source/` 副本。virtual 文档保持独立会话、所属装配和原生对象依据，不用 owner 文件冒充。
+
 原生事实只在 `evidence/raw/native_capture_facts.json` 封存一份，由 source manifest 和
 Capture artifact 绑定其字节；不保存 `evidence/capture.json` 或其他等价投影副本。
 原始三角形的 binary64 流是保真数值编码，不冒称 COM SAFEARRAY 的内存原字节。
@@ -779,8 +781,10 @@ reports/verification-execution.json
 的全部文件。`manifest.json` 和阶段自有的 `reports/` 收据不进入主体；它们由各自
 schema、receipt 与 artifact identity 验证，不能把自身纳入摘要形成循环。Verify
 certificate 绑定 Generate/Capture pair、verifier、contract、policy 与 subject；
-execution receipt 绑定该 certificate。Publish receipt 再绑定 publication subject、
+execution receipt 绑定该 certificate，仅以 `execution_details` 保全 `check.details` 直接层的原始进程输出与退出信息，不重复保存检查和 warning 全表。该分离不递归改写 warning、diagnostic 或资格中的来源扩展；完整记录按规范字节去重，证书拒绝重复的顶层 diagnostics。检查、warning 与资格的唯一交付依据为 certificate；URDF、PR 和浏览器引用实际登记的证书路径，展示保留对象、字段、来源、规则及未建立资格的原值。PR 摘要达到长度上限时明确给出未展开数量与完整证书位置，不生成另一份 quality 或 structural-team 报告。Publish receipt 再绑定 publication subject、
 publication plan、候选 commit/tree 与 Git/PR effect。
+
+证书的顶层 `diagnostics` 是完整诊断清单：Verify 从顶层及每项检查的 `details.warnings`、`details.diagnostics` 汇总完整记录并按规范字节去重。每条须有非空 code 和明确布尔 blocking；PASS 不得携带阻断诊断。消费边界核对嵌套记录没有遗漏于顶层清单，报告、预览与 PR 只按显式非阻断语义展示 warning，不把未知状态改为 false。运行详情只使用登记证书及 publication receipt，不从旧阶段回执补回检查成功或 PR 身份。
 
 运行投影、活动、维护 reconciliation metadata 和 PR effect observation 保存在
 平台 facts/CAS 中，引用交付摘要，不进入模型主体。所有阶段的失败诊断由该阶段生产、

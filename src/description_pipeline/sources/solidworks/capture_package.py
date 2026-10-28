@@ -34,6 +34,214 @@ _PLAN_KEYS = frozenset(
         "evidence_requests",
     }
 )
+_PLAN_IDENTITY_KEYS = frozenset({"hardware_id", "revision"})
+_PLAN_OBJECT_KEYS = frozenset({"name", "document", "state"})
+_PLAN_GROUP_KEYS = frozenset({"name", "components"})
+_PLAN_AXIS_KEYS = frozenset({"name", "axis_reference"})
+_PLAN_REFERENCE_AXIS_KEYS = frozenset(
+    {"kind", "component", "feature_name"}
+)
+_PLAN_CYLINDER_KEYS = frozenset(
+    {"kind", "component", "body_type", "feature_name", "face_index"}
+)
+
+
+def _is_digest(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _validate_axis_selector(reference: object) -> None:
+    if not isinstance(reference, dict):
+        raise PipelineError("The sealed capture plan axis reference is not an object")
+    if reference.get("kind") == "reference_axis":
+        if (
+            set(reference) != _PLAN_REFERENCE_AXIS_KEYS
+            or not isinstance(reference.get("component"), str)
+            or not isinstance(reference.get("feature_name"), str)
+            or not reference["feature_name"]
+        ):
+            raise PipelineError(
+                "The sealed capture plan reference-axis selector is malformed"
+            )
+        return
+    if (
+        set(reference) - _PLAN_CYLINDER_KEYS
+        or not {"component", "body_type"} <= set(reference)
+        or not isinstance(reference.get("component"), str)
+        or not reference["component"]
+        or reference.get("body_type") != "solid"
+        or reference.get("kind") not in {None, "cylinder"}
+    ):
+        raise PipelineError(
+            "The sealed capture plan cylinder selector is malformed"
+        )
+    feature_name = reference.get("feature_name")
+    face_index = reference.get("face_index")
+    if (
+        (feature_name is not None and (
+            not isinstance(feature_name, str) or not feature_name
+        ))
+        or (face_index is not None and (
+            type(face_index) is not int or face_index < 0
+        ))
+        or (feature_name is None and face_index is None)
+    ):
+        raise PipelineError(
+            "The sealed capture plan cylinder selector has no usable identity"
+        )
+
+
+def validate_capture_plan_shape(plan: object) -> dict:
+    """Validate the one Capture plan schema and selector shapes."""
+
+    if not isinstance(plan, dict):
+        raise PipelineError("The sealed capture plan is not an object")
+    if plan.get("schema_version") != PLAN_SCHEMA:
+        raise PipelineError("The sealed capture plan has an unexpected schema")
+    if set(plan) != _PLAN_KEYS:
+        raise PipelineError("The sealed capture plan carries an unknown field")
+    if (
+        not isinstance(plan.get("run_id"), str)
+        or not plan["run_id"]
+        or not isinstance(plan.get("main_assembly"), str)
+        or not plan["main_assembly"]
+        or not isinstance(plan.get("configuration"), str)
+        or not plan["configuration"]
+        or not _is_digest(plan.get("handoff_sha256"))
+        or not _is_digest(plan.get("discovery_sha256"))
+    ):
+        raise PipelineError("The sealed capture plan identity is incomplete")
+    identity = plan.get("identity")
+    if (
+        not isinstance(identity, dict)
+        or set(identity) != _PLAN_IDENTITY_KEYS
+        or any(
+            value is not None and not isinstance(value, str)
+            for value in identity.values()
+        )
+    ):
+        raise PipelineError("The sealed capture plan identity is malformed")
+    selection = plan.get("selection")
+    files = selection.get("files") if isinstance(selection, dict) else None
+    if (
+        not isinstance(selection, dict)
+        or set(selection) != {"files"}
+        or not isinstance(files, dict)
+        or not files
+        or any(
+            not isinstance(name, str)
+            or not name
+            or not _is_digest(checksum)
+            for name, checksum in files.items()
+        )
+    ):
+        raise PipelineError("The sealed capture plan selection is malformed")
+    objects = plan.get("objects")
+    if not isinstance(objects, list) or not objects:
+        raise PipelineError(
+            "The sealed capture plan carries no native object selectors"
+        )
+    object_names = []
+    for item in objects:
+        if not isinstance(item, dict) or set(item) - _PLAN_OBJECT_KEYS:
+            raise PipelineError(
+                "The sealed capture plan carries an unknown native selector field"
+            )
+        if (
+            not {"name", "state"} <= set(item)
+            or not isinstance(item.get("name"), str)
+            or not item["name"]
+            or type(item.get("state")) is not int
+            or item["state"] not in {0, 1, 2, 3, 4}
+        ):
+            raise PipelineError(
+                "The sealed capture plan does not bind the native suppression state"
+            )
+        document = item.get("document")
+        if document is not None:
+            if not isinstance(document, str) or not document:
+                raise PipelineError(
+                    "The sealed capture plan carries an unusable selector document"
+                )
+            try:
+                artifact_path_parts(document)
+            except PipelineError as error:
+                raise PipelineError(
+                    "The sealed capture plan carries an unsafe selector document"
+                ) from error
+            if not document.lower().endswith((".sldprt", ".sldasm")):
+                raise PipelineError(
+                    "The sealed capture plan carries a non-CAD selector document"
+                )
+        object_names.append(item["name"])
+    if len(set(object_names)) != len(object_names):
+        raise PipelineError(
+            "The sealed capture plan repeats a native object selector"
+        )
+    groups = plan.get("groups")
+    if not isinstance(groups, list) or not groups:
+        raise PipelineError(
+            "The sealed capture plan carries no native link-group selections"
+        )
+    group_names = []
+    for item in groups:
+        if (
+            not isinstance(item, dict)
+            or set(item) != _PLAN_GROUP_KEYS
+            or not isinstance(item["name"], str)
+            or not item["name"]
+            or not isinstance(item["components"], list)
+            or not item["components"]
+            or any(
+                not isinstance(member, str) or not member
+                for member in item["components"]
+            )
+            or len(set(item["components"])) != len(item["components"])
+        ):
+            raise PipelineError(
+                "The sealed capture plan carries unusable native link-group selections"
+            )
+        group_names.append(item["name"])
+    if len(set(group_names)) != len(group_names):
+        raise PipelineError("The sealed capture plan repeats a link-group identity")
+    axes = plan.get("axis_requests")
+    if not isinstance(axes, list):
+        raise PipelineError(
+            "The sealed capture plan carries no native axis requests"
+        )
+    axis_names = []
+    for item in axes:
+        if (
+            not isinstance(item, dict)
+            or set(item) != _PLAN_AXIS_KEYS
+            or not isinstance(item["name"], str)
+            or not item["name"]
+        ):
+            raise PipelineError(
+                "The sealed capture plan carries unusable native axis requests"
+            )
+        _validate_axis_selector(item["axis_reference"])
+        axis_names.append(item["name"])
+    if len(set(axis_names)) != len(axis_names):
+        raise PipelineError("The sealed capture plan repeats an axis request")
+    datums = plan.get("datums")
+    if (
+        not isinstance(datums, list)
+        or any(not isinstance(item, str) or not item for item in datums)
+        or len(set(datums)) != len(datums)
+    ):
+        raise PipelineError(
+            "The sealed capture plan carries unusable datums"
+        )
+    if plan.get("evidence_requests") != list(CAPTURE_EVIDENCE_REQUESTS):
+        raise PipelineError(
+            "The sealed capture plan requests unknown evidence items"
+        )
+    return plan
 
 
 def _require_selector_state(item: dict, component: object) -> None:
@@ -102,10 +310,7 @@ def consume_sealed_definition(package: Path) -> tuple[dict, dict]:
     if not isinstance(source, dict) or not source:
         raise PipelineError("The sealed source identity is not a usable record")
     plan = read_data(plan_path)
-    if not isinstance(plan, dict) or plan.get("schema_version") != PLAN_SCHEMA:
-        raise PipelineError("The sealed capture plan has an unexpected schema")
-    if set(plan) != _PLAN_KEYS:
-        raise PipelineError("The sealed capture plan carries an unknown field")
+    plan = validate_capture_plan_shape(plan)
     payload = read_data(discovery_path)
     if not isinstance(payload, dict):
         raise PipelineError("The sealed discovery record is not a usable record")
@@ -166,6 +371,23 @@ def consume_sealed_definition(package: Path) -> tuple[dict, dict]:
     if plan.get("run_id") != payload.get("run_id"):
         raise PipelineError(
             "The sealed capture plan names another run than the sealed discovery"
+        )
+    discovery_identity = payload.get("identity")
+    expected_plan_identity = {
+        "hardware_id": (
+            discovery_identity.get("hardware_id")
+            if isinstance(discovery_identity, dict)
+            else None
+        ),
+        "revision": (
+            discovery_identity.get("revision")
+            if isinstance(discovery_identity, dict)
+            else None
+        ),
+    }
+    if plan.get("identity") != expected_plan_identity:
+        raise PipelineError(
+            "The sealed capture plan identity differs from the sealed discovery"
         )
     component_rows = [
         item

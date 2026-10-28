@@ -38,6 +38,7 @@ def build_package(root: Path) -> Path:
         "schema_version": NATIVE_DISCOVERY_SCHEMA,
         "run_id": "r-1",
         "derivation": {"main_assembly": MAIN, "configuration": None},
+        "identity": {"hardware_id": "m3.0", "revision": "r1"},
         "native_files": {
             MAIN: "a" * 64,
             "cad/base.SLDPRT": "b" * 64,
@@ -85,7 +86,16 @@ def build_package(root: Path) -> Path:
             {"name": "base_link", "components": ["base-1"]},
             {"name": "arm_link", "components": ["arm-1"]},
         ],
-        "axis_requests": [{"name": "shoulder_pitch_joint", "axis_reference": {"point": [0, 0, 0]}}],
+        "axis_requests": [
+            {
+                "name": "shoulder_pitch_joint",
+                "axis_reference": {
+                    "kind": "reference_axis",
+                    "component": "",
+                    "feature_name": "Axis1",
+                },
+            }
+        ],
         "datums": ["CS_base_link"],
         "evidence_requests": list(CAPTURE_EVIDENCE_REQUESTS),
     }
@@ -666,6 +676,13 @@ class CapturePlanTests(unittest.TestCase):
     def test_a_plan_naming_another_run_is_refused(self) -> None:
         self._rewrite_plan(lambda plan: plan.update(run_id="r-2"))
         with self.assertRaisesRegex(PipelineError, "another run"):
+            steps._consume_sealed_definition(self.root)
+
+    def test_a_plan_with_foreign_identity_is_refused(self) -> None:
+        self._rewrite_plan(
+            lambda plan: plan["identity"].update(hardware_id="foreign")
+        )
+        with self.assertRaisesRegex(PipelineError, "plan identity differs"):
             steps._consume_sealed_definition(self.root)
 
     def test_a_plan_requesting_unknown_evidence_is_refused(self) -> None:

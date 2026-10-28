@@ -36,7 +36,7 @@ class EngineeringModelTests(unittest.TestCase):
             mesh_root = Path(directory)
             for snapshot in (first, second):
                 evidence = snapshot / "evidence"
-                for name in ("raw", "source", "manifest.json"):
+                for name in ("raw", "manifest.json"):
                     shutil.move(
                         snapshot / name,
                         evidence / name,

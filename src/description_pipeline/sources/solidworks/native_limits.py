@@ -185,7 +185,15 @@ def _binding(entity, index: int) -> tuple[str, str | None, int | None]:
         raise NativeLimitReadError("limit mate entity reference could not be read")
     feature = entity.get("feature")
     face_index = entity.get("face_index")
-    if not ((isinstance(feature, str) and feature) or type(face_index) is int):
+    if (
+        (feature is not None and (
+            not isinstance(feature, str) or not feature
+        ))
+        or (face_index is not None and (
+            type(face_index) is not int or face_index < 0
+        ))
+        or (feature is None and face_index is None)
+    ):
         raise NativeLimitReadError("limit mate entity has no readable feature or face selector")
     return (
         component,

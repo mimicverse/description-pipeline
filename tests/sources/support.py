@@ -188,7 +188,6 @@ def fixture_link_group_mass_fact(reading: dict[str, Any]) -> dict[str, Any]:
 def fixture_native_geometry(
     component: str,
     source_scope: dict[str, Any],
-    transform_raw: Sequence[float],
     *,
     half: float = 0.199999,
 ) -> dict[str, Any]:
@@ -228,7 +227,6 @@ def fixture_native_geometry(
         "state": "observed",
         "representation": "cad_face_display_triangles_raw",
         "source_scope": copy.deepcopy(source_scope),
-        "transform_raw": [float(value) for value in transform_raw],
         "bodies": {"solid": 1, "sheet": 0},
         "appearance_raw": None,
     }
@@ -684,15 +682,6 @@ class FixtureCadBackend(CadBackend):
         if not root.is_dir() or not document.is_file():
             raise ValueError("prepared capture root or assembly is missing")
         self._prepared_capture_root = str(root)
-        self._prepared_capture_document = str(document)
-        self._prepared_capture_configuration = configuration
-        self._capture_component_transforms = {
-            str(entry["name"]): tuple(
-                float(value)
-                for value in (entry.get("transform") or _identity())
-            )
-            for entry in self.components
-        }
         return {
             "mode": "prepared_read_only_copy",
             "source_root": str(root),
@@ -805,6 +794,7 @@ class FixtureCadBackend(CadBackend):
         components = []
         for component in scene.components:
             entry = component_entries.get(component.name, {})
+            suppression_state = entry.get("suppression_state", 2)
             occurrences.append(
                 {
                     "name": component.name,
@@ -813,6 +803,7 @@ class FixtureCadBackend(CadBackend):
                     "referenced_configuration": str(
                         entry.get("configuration") or self.configurations[0]
                     ),
+                    "suppression_state": suppression_state,
                     "is_fixed": component.is_fixed,
                     "document_type": component.document_type,
                 }
@@ -821,6 +812,7 @@ class FixtureCadBackend(CadBackend):
                 {
                     "name": component.name,
                     "path": component.path,
+                    "suppression_state": suppression_state,
                     "is_fixed": component.is_fixed,
                     "document_type": component.document_type,
                 }
@@ -828,8 +820,6 @@ class FixtureCadBackend(CadBackend):
         raw_scene = {
             "document": scene.document,
             "configuration": self.configurations[0],
-            "source_sha256": file_digest(Path(doc_path)),
-            "document_state": self.document_state(doc_path),
             "occurrences": occurrences,
             "components": components,
             "coordinate_systems": {
@@ -927,11 +917,9 @@ class FixtureCadBackend(CadBackend):
             raise ValueError("prepared geometry source scopes differ from its occurrences")
         entries = {}
         for index, name in enumerate(names, start=1):
-            entry = next(item for item in self.components if str(item["name"]) == name)
             entries[name] = fixture_native_geometry(
                 name,
                 source_scopes[name],
-                solidworks_transform(entry.get("transform") or _identity()),
             )
             if on_activity is not None:
                 on_activity(
@@ -1197,14 +1185,12 @@ def saved_document_state(configuration: str = "Default") -> dict:
     observed = {
         "save_flag": False,
         "configuration": configuration,
+        "active_configuration": configuration,
         "read_only": True,
     }
     return {
         "before": copy.deepcopy(observed),
         "after": copy.deepcopy(observed),
-        "used_api": (
-            "IModelDoc2.GetSaveFlag/IConfiguration.Name"
-        ),
     }
 
 
@@ -1443,13 +1429,72 @@ def frozen_discovery_payload(
     """
 
     from description_pipeline.io import digest
+    from description_pipeline.schemas import (
+        NATIVE_DISCOVERY_ENVELOPE_KEYS,
+        NATIVE_DISCOVERY_IDENTITY_KEYS,
+        NATIVE_DISCOVERY_DERIVATION_KEYS,
+        NATIVE_DISCOVERY_RECORD_KEYS,
+    )
 
     payload = copy.deepcopy(record)
-    payload["native_files"] = dict(sorted(files.items()))
-    payload["handoff_sha256"] = digest(files)
-    identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else {}
     raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
     raw_identity = raw.get("identity") if isinstance(raw.get("identity"), dict) else {}
+    envelope_defaults = {
+        "schema_version": "solidworks-to-urdf.native-discovery/v1",
+        "contract": "native-discovery/v1",
+        "namespace": "dp",
+        "run_id": "fixture-run",
+        "generator": "native-discovery",
+        "generator_version": "1",
+        "derived_interface_names": {},
+        "findings": [],
+        "records": [],
+    }
+    for key in NATIVE_DISCOVERY_ENVELOPE_KEYS:
+        if key in {"identity", "derivation", "raw", "native_files", "handoff_sha256"}:
+            continue
+        payload.setdefault(key, copy.deepcopy(envelope_defaults.get(key)))
+    identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else {}
+    identity_defaults = {
+        "hardware_id": raw_identity.get("hardware_id"),
+        "revision": raw_identity.get("revision"),
+        "parent_revision": raw_identity.get("parent_revision"),
+        "owner": raw_identity.get("owner"),
+        "change_summary": raw_identity.get("change_summary"),
+        "control": copy.deepcopy(raw_identity.get("control")),
+        "delivery_configuration": (
+            raw_identity.get("delivery_configuration")
+            or raw.get("saved_configuration")
+            or "Default"
+        ),
+        "main_assembly": (
+            raw_identity.get("main_assembly")
+            or identity.get("main_assembly")
+            or "robot.SLDASM"
+        ),
+        "robot_name": raw_identity.get("robot_name"),
+        "robot_name_technical": "robot",
+    }
+    for key in NATIVE_DISCOVERY_IDENTITY_KEYS:
+        identity.setdefault(key, identity_defaults.get(key))
+    payload["identity"] = identity
+    derivation = (
+        payload.get("derivation")
+        if isinstance(payload.get("derivation"), dict)
+        else {}
+    )
+    for key in NATIVE_DISCOVERY_DERIVATION_KEYS:
+        derivation.setdefault(
+            key,
+            {
+                "record_roots": [],
+                "main_assembly": identity_defaults["main_assembly"],
+                "configuration": identity_defaults["delivery_configuration"],
+            }[key],
+        )
+    payload["derivation"] = derivation
+    payload["native_files"] = dict(sorted(files.items()))
+    payload["handoff_sha256"] = digest(files)
     authored = raw_identity.get("robot_name")
     if isinstance(authored, str) and authored:
         identity["robot_name"] = authored
@@ -1462,6 +1507,16 @@ def frozen_discovery_payload(
             or "robot"
         )
     payload["identity"] = identity
+    payload["records"] = [
+        {
+            **item,
+            **{
+                key: item.get(key)
+                for key in NATIVE_DISCOVERY_RECORD_KEYS
+            },
+        }
+        for item in payload.get("records") or []
+    ]
     return payload
 
 
@@ -1622,8 +1677,6 @@ def compose_delivery_inputs(
     import shutil
 
     from description_pipeline.io import file_digest, write_json
-    from description_pipeline.sources.solidworks.discovery import DISCOVERY_SCHEMA
-
     write_fixture_request(Path(delivery), main_assembly=main_assembly)
     delivery = Path(delivery)
     evidence = delivery / "evidence"
@@ -1648,6 +1701,9 @@ def compose_delivery_inputs(
             "file": str(name),
             "package_file": archive_name,
             "sha256": _hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "source_sha256": _hashlib.sha256(
+                text.encode("utf-8")
+            ).hexdigest(),
         }
         keys = _record_keys_for(record, record_keys, str(name))
         if keys:
@@ -1662,28 +1718,28 @@ def compose_delivery_inputs(
             )
         else:
             payload_records.append(common)
-    from description_pipeline.io import digest as canonical_digest
-
-    handoff_sha256 = canonical_digest(native_files)
-    discovery = {
-        "schema_version": DISCOVERY_SCHEMA,
-        "run_id": str(record.get("run_id") or "fixture-run"),
-        "derivation": {
-            "main_assembly": main_assembly,
-            "configuration": configuration,
-            "record_roots": [],
-        },
-        "identity": {
-            "main_assembly": main_assembly,
-            "delivery_configuration": configuration,
-            "robot_name": str(identity.get("robot_name") or "robot"),
-            "robot_name_technical": None,
-        },
-        "records": payload_records,
-        "raw": record,
-        "native_files": dict(sorted(native_files.items())),
-        "handoff_sha256": handoff_sha256,
+    discovery_source = (
+        record
+        if isinstance(record.get("raw"), dict)
+        else {"raw": copy.deepcopy(record)}
+    )
+    discovery = frozen_discovery_payload(
+        discovery_source,
+        files=native_files,
+    )
+    discovery["run_id"] = str(record.get("run_id") or "fixture-run")
+    discovery["derivation"] = {
+        "main_assembly": main_assembly,
+        "configuration": configuration,
+        "record_roots": [],
     }
+    discovery["identity"].update(
+        main_assembly=main_assembly,
+        delivery_configuration=configuration,
+        robot_name=str(identity.get("robot_name") or "robot"),
+        robot_name_technical=None,
+    )
+    discovery["records"] = payload_records
     write_json(
         delivery / "input/discovery/native-discovery.json",
         discovery,

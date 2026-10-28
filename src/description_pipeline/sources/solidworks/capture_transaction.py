@@ -206,6 +206,7 @@ def capture_native_package(
     backend: Any,
     on_event=None,
     on_activity=None,
+    resource_boundary: dict[str, bool] | None = None,
 ):
     """Inspect, archive and capture one complete prepared package."""
 
@@ -332,6 +333,8 @@ def capture_native_package(
         package_inventory(package) == original_files,
         "Prepared inputs changed before native capture",
     )
+    if resource_boundary is not None:
+        resource_boundary["entered"] = True
     capture_prepared(
         definition["source"],
         staging / "evidence",

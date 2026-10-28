@@ -3,7 +3,8 @@
 The packaged Airflow plugin installs one pure-ASGI root middleware that binds the actual request
 scope for the duration of a single HTTP request and always resets it in ``finally``. The Feishu
 auth manager reads the resolved endpoint and path parameters during authorization. A bounded
-request body selects a parent run; ownership comes exclusively from that run's stored actor.
+request body carries the current DispatchConf; ownership comes exclusively from the persisted
+admission and dispatch facts, plus the recorded parent actor for a linked run.
 """
 
 from __future__ import annotations
@@ -25,62 +26,24 @@ CREATE_BODY_SCOPE_KEY = "description_pipeline_create_body"
 #: authorization still runs on the resolved endpoint and router-populated path parameters.
 _CLEAR_BODY_LIMIT = 4096
 _CLEAR_BODY_FIELDS = frozenset({"dry_run", "only_failed", "only_new", "run_on_latest_version"})
-#: The create body carries exactly the submission frame the DAG understands: the
-#: frozen intake path, the frozen request identity the DAG intake requires, the
-#: optional linked-attempt linkage, the selected main assembly and the publish
-#: target with its multi-line change summary.  The recorded submitter identity is
-#: never a create-body field: ownership comes from the run's stored actor and
-#: the Airflow-authenticated actor, never from a client-provided identity claim.
-_CREATE_FIELDS = frozenset(
-    {
-        "handoff_path",
-        "parent_dag_run_id",
-        "resume_from",
-        "target_hardware",
-        "change_summary",
-        "main_assembly",
-        # The user's declared purpose (engineering / inspection_preview); the
-        # frozen request/v2 carries it and the DAG refuses a run without it.
-        "purpose",
-        # The portal-issued frozen request identity of one submission
-        # (``portal-<dag_run_id>``); the DAG intake refuses a run without it.
-        "request_id",
-    }
-)
-_CREATE_SINGLE_LINE_FIELDS = ("handoff_path", "target_hardware", "main_assembly", "request_id")
-_CREATE_SINGLE_LINE_LIMIT = 1024
-_CREATE_SUMMARY_LIMIT = 2048
+#: Airflow's current create body. The conf is parsed by the one DispatchConf
+#: owner; the outer run id is bound to the persisted dispatch command later.
+_CREATE_BODY_FIELDS = frozenset({"conf", "dag_run_id", "logical_date"})
+_DAG_RUN_ID_LIMIT = 250
 
 
-def _safe_single_line(value: object) -> bool:
-    """One bounded, control-character-free line of submission frame text.
-
-    The text must carry a non-whitespace character and rejects C0 controls and DEL, exactly
-    like the frozen frame contract: an all-whitespace or C0/DEL-carrying field is not a
-    nameable path, identity or target.
-    """
+def valid_dag_run_id(value: object) -> bool:
+    """One bounded Airflow run id without controls or path separators."""
 
     return (
         isinstance(value, str)
-        and 0 < len(value) <= _CREATE_SINGLE_LINE_LIMIT
+        and 0 < len(value) <= _DAG_RUN_ID_LIMIT
         and bool(value.strip())
+        and value == value.strip()
         and all(ord(char) >= 32 and ord(char) != 127 for char in value)
+        and "/" not in value
+        and "\\" not in value
     )
-
-
-def _safe_change_summary(value: object) -> bool:
-    """The frozen identity contract: LF stays inside a summary, every other control character refuses.
-
-    Line endings are folded to LF first, exactly like the portal and the DAG
-    intake fold them, so a CRLF submission keeps its multi-line shape.
-    """
-
-    if not isinstance(value, str):
-        return False
-    folded = value.replace("\r\n", "\n").replace("\r", "\n").strip()
-    if not folded or len(folded) > _CREATE_SUMMARY_LIMIT:
-        return False
-    return all(ord(char) >= 32 or char == "\n" for char in folded)
 
 
 def bound_request() -> Any | None:
@@ -157,9 +120,9 @@ def _selects_create_candidate(scope: dict) -> bool:
 
 
 def evaluate_create_candidate(raw: bytes, *, oversize: bool) -> dict:
-    """Parse a requested lineage selector, never a client-provided owner identity."""
-    from ..interface_records import REQUEST_PURPOSES
-    from ..stages import STAGE_IDS
+    """Parse the exact current DispatchConf create body."""
+
+    from ..pipeline.contracts import DispatchConf, ProtocolError
 
     if oversize:
         return {"safe": False}
@@ -167,34 +130,24 @@ def evaluate_create_candidate(raw: bytes, *, oversize: bool) -> dict:
         data = json.loads(raw.decode("utf-8"), object_pairs_hook=_strict_object)
     except (UnicodeDecodeError, ValueError):
         return {"safe": False}
-    if not isinstance(data, dict):
+    if not isinstance(data, dict) or set(data) != _CREATE_BODY_FIELDS:
         return {"safe": False}
-    conf = data.get("conf")
-    if conf is None:
-        conf = {}
-    if not isinstance(conf, dict) or set(conf) - _CREATE_FIELDS:
-        return {"safe": False}
-    for name in _CREATE_SINGLE_LINE_FIELDS:
-        if name in conf and not _safe_single_line(conf[name]):
-            return {"safe": False}
-    if "change_summary" in conf and not _safe_change_summary(conf["change_summary"]):
-        return {"safe": False}
-    if conf.get("purpose") not in REQUEST_PURPOSES:
-        return {"safe": False}
-    if "parent_dag_run_id" not in conf and "resume_from" not in conf:
-        return {"safe": True, "parent_dag_run_id": None}
-    parent, stage = conf.get("parent_dag_run_id"), conf.get("resume_from")
+    dag_run_id = data.get("dag_run_id")
     if (
-        not isinstance(parent, str)
-        or not parent
-        or len(parent) > 250
-        or any(ord(char) < 32 for char in parent)
-        or parent == "~"
-        or not isinstance(stage, str)
-        or stage not in STAGE_IDS
+        data.get("logical_date") is not None
+        or not valid_dag_run_id(dag_run_id)
+        or not isinstance(data.get("conf"), dict)
     ):
         return {"safe": False}
-    return {"safe": True, "parent_dag_run_id": parent}
+    try:
+        conf = DispatchConf.from_record(data["conf"])
+    except ProtocolError:
+        return {"safe": False}
+    return {
+        "safe": True,
+        "dag_run_id": dag_run_id,
+        "conf": conf.to_record(),
+    }
 
 
 def _strict_object(pairs: list[tuple[str, Any]]) -> dict:

@@ -10,15 +10,16 @@ from pathlib import Path
 
 from ...geometry.native_scope import native_scope_identity_sha256
 from ...geometry.native_tessellation import (
+    VerifiedNativeTriangleStream,
     build_native_tessellation,
+    inspect_native_triangle_stream,
     materialize_native_stl,
     native_stl_relative_path,
     native_triangle_relative_path,
     parse_native_tessellation,
-    read_native_triangle_count,
     write_native_triangle_stream,
 )
-from ...io import file_digest
+from ...io import PipelineError, file_digest
 from .errors import CadError
 
 
@@ -32,7 +33,6 @@ RAW_GEOMETRY_KEYS = frozenset(
         "stream_path",
         "stream_sha256",
         "triangle_count",
-        "transform_raw",
         "body_inventory",
         "face_inventory",
         "body_counts",
@@ -111,18 +111,6 @@ def _geometry_facts(component: str, facts: object) -> dict:
         "prepared geometry body counts are malformed",
         {"component": component},
     )
-    transform_raw = facts.get("transform_raw")
-    _require(
-        isinstance(transform_raw, list)
-        and len(transform_raw) == 16
-        and all(
-            type(value) in (int, float)
-            and math.isfinite(float(value))
-            for value in transform_raw
-        ),
-        "prepared geometry transform is malformed",
-        {"component": component},
-    )
     _require(
         facts.get("used_api") == USED_API,
         "prepared geometry uses an unsupported primary triangle API",
@@ -145,7 +133,6 @@ def _geometry_facts(component: str, facts: object) -> dict:
         "body_inventory": copy.deepcopy(body_inventory),
         "face_inventory": copy.deepcopy(face_inventory),
         "body_counts": dict(body_counts),
-        "transform_raw": [float(value) for value in transform_raw],
         "used_api": USED_API,
     }
 
@@ -360,7 +347,6 @@ def seal_native_geometry(
             "stream_path": stream_path,
             "stream_sha256": stream_sha256,
             "triangle_count": triangle_count,
-            "transform_raw": facts["transform_raw"],
             "body_inventory": facts["body_inventory"],
             "face_inventory": facts["face_inventory"],
             "body_counts": facts["body_counts"],
@@ -381,6 +367,11 @@ def materialize_native_geometry(
     *,
     evidence_root: Path,
     destination_root: Path,
+    verified_streams: Mapping[
+        str,
+        VerifiedNativeTriangleStream,
+    ]
+    | None = None,
 ) -> dict[str, dict]:
     """Materialize STL bytes after Capture admission from the sealed raw streams."""
 
@@ -416,17 +407,32 @@ def materialize_native_geometry(
             "raw triangle stream is missing or not canonical",
             {"component": component},
         )
+        verified = (
+            verified_streams.get(component)
+            if isinstance(verified_streams, Mapping)
+            else None
+        )
+        if verified is None:
+            try:
+                verified = inspect_native_triangle_stream(
+                    raw_path,
+                    expected_sha256=str(raw["stream_sha256"]),
+                    expected_count=raw["triangle_count"],
+                )
+            except PipelineError as error:
+                raise CadError(
+                    "cad_mesh_export_failed",
+                    str(error),
+                    {"component": component},
+                ) from error
         _require(
-            file_digest(raw_path) == raw["stream_sha256"],
-            "raw triangle stream digest differs",
+            verified.path.resolve() == raw_path.resolve()
+            and verified.sha256 == raw["stream_sha256"]
+            and verified.triangle_count == raw["triangle_count"],
+            "verified raw triangle stream differs from its record",
             {"component": component},
         )
-        triangle_count = read_native_triangle_count(raw_path)
-        _require(
-            triangle_count == raw["triangle_count"],
-            "raw triangle stream count differs",
-            {"component": component},
-        )
+        triangle_count = verified.triangle_count
         component_warnings: list[dict] = []
         tessellation = build_native_tessellation(
             component,
@@ -446,7 +452,12 @@ def materialize_native_geometry(
         stl_directory.mkdir(parents=True, exist_ok=True)
         temporary = stl_directory / f".{component.casefold()}.partial.stl"
         temporary.unlink(missing_ok=True)
-        materialize_native_stl(raw_path, temporary, spans)
+        materialize_native_stl(
+            raw_path,
+            temporary,
+            spans,
+            triangle_count=triangle_count,
+        )
         stl_sha256 = file_digest(temporary)
         stl_path = native_stl_relative_path(stl_sha256)
         _publish_if_absent(
@@ -464,7 +475,6 @@ def materialize_native_geometry(
             "bodies": copy.deepcopy(raw["body_counts"]),
             "used_api": raw["used_api"],
             "tessellation": tessellation,
-            "transform_raw": copy.deepcopy(raw["transform_raw"]),
         }
     return records
 

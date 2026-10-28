@@ -962,48 +962,6 @@ def _state_owner_display_state(
     return owner_state
 
 
-def _target_faces(
-    target: object,
-    all_faces: set[tuple[int, int, int]],
-) -> set[tuple[int, int, int]]:
-    _require(isinstance(target, Mapping), "A display-state appearance target is malformed")
-    scope = target.get("scope")
-    if scope == "occurrence":
-        return set(all_faces)
-    if scope == "body":
-        key = _face_key(target.get("body_type"), target.get("body_index"), 0)
-        return {face for face in all_faces if face[:2] == key[:2]}
-    if scope == "face":
-        key = _face_key(
-            target.get("body_type"),
-            target.get("body_index"),
-            target.get("face_index"),
-        )
-        _require(key in all_faces, "A face appearance target is not a delivered face")
-        return {key}
-    if scope == "feature":
-        source_owner = target.get("source_owner")
-        face_keys = target.get("face_keys")
-        _require(
-            isinstance(source_owner, Mapping)
-            and isinstance(face_keys, list)
-            and bool(face_keys),
-            "A feature appearance target has no native owner or face binding",
-        )
-        result = set()
-        for face in face_keys:
-            _require(isinstance(face, Mapping), "A feature face key is malformed")
-            key = _face_key(
-                face.get("body_type"),
-                face.get("body_index"),
-                face.get("face_index"),
-            )
-            _require(key in all_faces, "A feature face key is not a delivered face")
-            result.add(key)
-        return result
-    raise PipelineError("A display-state appearance target has an unknown scope")
-
-
 def _colorref(value: object, transparency: object):
     _require(
         type(value) is int

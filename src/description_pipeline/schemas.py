@@ -27,6 +27,15 @@ NATIVE_CAPTURE_FACTS_KEYS = frozenset(
         "notes",
     }
 )
+NATIVE_SCENE_RAW_KEYS = frozenset(
+    {
+        "document",
+        "configuration",
+        "occurrences",
+        "components",
+        "coordinate_systems",
+    }
+)
 NATIVE_CAPTURE_OBSERVATION_SCHEMA = (
     "solidworks-to-urdf.native-capture-facts/v2"
 )
@@ -47,6 +56,57 @@ CAPTURE_EVIDENCE_REQUESTS = (
     "evidence/raw/triangles/",
 )
 NATIVE_DISCOVERY_SCHEMA = "solidworks-to-urdf.native-discovery/v1"
+NATIVE_DISCOVERY_ENVELOPE_KEYS = frozenset(
+    {
+        "schema_version",
+        "contract",
+        "namespace",
+        "run_id",
+        "generator",
+        "generator_version",
+        "handoff_sha256",
+        "native_files",
+        "derivation",
+        "identity",
+        "records",
+        "derived_interface_names",
+        "raw",
+        "findings",
+    }
+)
+NATIVE_DISCOVERY_OPTIONAL_ENVELOPE_KEYS = frozenset({"budget"})
+NATIVE_DISCOVERY_IDENTITY_KEYS = frozenset(
+    {
+        "hardware_id",
+        "revision",
+        "parent_revision",
+        "owner",
+        "change_summary",
+        "control",
+        "delivery_configuration",
+        "main_assembly",
+        "robot_name",
+        "robot_name_technical",
+    }
+)
+NATIVE_DISCOVERY_CONTROL_KEYS = frozenset({"system", "reference"})
+NATIVE_DISCOVERY_DERIVATION_KEYS = frozenset(
+    {"record_roots", "main_assembly", "configuration"}
+)
+NATIVE_DISCOVERY_RECORD_KEYS = frozenset(
+    {
+        "reference",
+        "file",
+        "key",
+        "package_file",
+        "sha256",
+        "source_sha256",
+        "anchor",
+    }
+)
+NATIVE_DISCOVERY_BUDGET_KEYS = frozenset(
+    {"reference", "key", "package_file", "sha256"}
+)
 NATIVE_DISCOVERY_FINDING_SCHEMA = "solidworks-to-urdf.discovery-finding/v1"
 NATIVE_IDENTITY_RESOLUTION_SCHEMA = "solidworks-to-urdf.identity-resolution/v1"
 
@@ -85,8 +145,6 @@ UNHANDLED_STAGE_FAILURE_SCHEMA = "solidworks-to-urdf.unhandled-stage-failure/v1"
 VERIFICATION_CERTIFICATE_SCHEMA = "solidworks-to-urdf.verification-certificate/v1"
 VERIFICATION_EXECUTION_SCHEMA = "solidworks-to-urdf.verification-execution/v1"
 VERIFY_REQUEST_SCHEMA = "solidworks-to-urdf.verify-request/v1"
-DISPATCH_CONF_SCHEMA = AIRFLOW_DISPATCH_CONF_SCHEMA
-DISPATCH_EFFECT_SCHEMA = AIRFLOW_DISPATCH_EFFECT_SCHEMA
 DIAGNOSTIC_ADMISSION_SCHEMA = "solidworks-to-urdf.diagnostic-admission-spec/v1"
 DIAGNOSTIC_SCOPE_SCHEMA = "solidworks-to-urdf.diagnostic-replay-scope/v1"
 DIAGNOSTIC_COMMAND_REQUEST_SCHEMA = "solidworks-to-urdf.diagnostic-command-request/v1"

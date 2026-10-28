@@ -56,6 +56,8 @@ from .verify_contract import (
     OUTPUT_CONTRACT,
     RECEIPT_SCHEMA,
     REQUEST_SCHEMA,
+    validate_certificate_diagnostics,
+    verification_diagnostics,
 )
 _PURPOSES = frozenset({PURPOSE_ENGINEERING, PURPOSE_INSPECTION_PREVIEW})
 _VOLATILE_DETAIL_KEYS = frozenset({"stderr", "stdout", "returncode", "traceback"})
@@ -94,12 +96,17 @@ def _json_object(value: Mapping[str, Any], label: str) -> dict[str, Any]:
         raise PipelineError(f"{label} is not canonical JSON") from error
 
 
-def _stable_record(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return {str(key): _stable_record(item) for key, item in value.items() if key not in _VOLATILE_DETAIL_KEYS}
-    if isinstance(value, (list, tuple)):
-        return [_stable_record(item) for item in value]
-    return value
+def _certificate_checks(checks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            **check,
+            "details": {
+                key: value for key, value in (check.get("details") or {}).items()
+                if key not in _VOLATILE_DETAIL_KEYS
+            },
+        }
+        for check in checks
+    ]
 
 
 @dataclass(frozen=True, slots=True)
@@ -450,12 +457,12 @@ def _certificate(prepared: _PreparedInput, report: Mapping[str, Any]) -> dict[st
         "actual_verifier": prepared.verifier,
         "actual_verifier_sha256": prepared.verifier_sha256,
         "capture_artifact": prepared.capture.artifact.to_record(),
-        "checks": _stable_record(report.get("checks") or []),
+        "checks": _certificate_checks(report.get("checks") or []),
         "closure_sha256": prepared.closure_sha256,
         "config_snapshot_sha256": request.config_snapshot_sha256,
         "contract_sha256": request.contract_sha256,
         "decision": "PASS" if report.get("passed") is True else "FAIL",
-        "diagnostics": _stable_record(report.get("diagnostics") or []),
+        "diagnostics": verification_diagnostics(report),
         "evaluation_subject_sha256": evaluation_subject,
         "generate_artifact": prepared.generate.artifact.to_record(),
         "generate_receipt_sha256": file_digest(prepared.generate.root / GENERATE_RECEIPT),
@@ -463,7 +470,7 @@ def _certificate(prepared: _PreparedInput, report: Mapping[str, Any]) -> dict[st
         "pipeline_id": report.get("pipeline_id"),
         "policy_sha256": request.policy_sha256,
         "purpose": request.purpose,
-        "qualifications": _stable_record(report.get("qualifications") or []),
+        "qualifications": report.get("qualifications") or [],
         "request": request.to_record(),
         "request_sha256": request.sha256,
         "required_checks": list(report.get("required_checks") or []),
@@ -612,8 +619,14 @@ class VerifyHandler:
             "finished_at": finished.astimezone(UTC).isoformat(),
             "actual_verifier": prepared.verifier,
             "actual_verifier_sha256": prepared.verifier_sha256,
-            "raw_checks": report.get("checks") or [],
-            "raw_diagnostics": report.get("diagnostics") or [],
+            "execution_details": {
+                check["id"]: {
+                    key: value for key, value in (check.get("details") or {}).items()
+                    if key in _VOLATILE_DETAIL_KEYS
+                }
+                for check in report.get("checks") or []
+                if any(key in (check.get("details") or {}) for key in _VOLATILE_DETAIL_KEYS)
+            },
         }
         if candidate_root.exists():
             raise PipelineError("Verify candidate output must not already exist")
@@ -715,6 +728,7 @@ def _validate_certificate_structure(certificate: Mapping[str, Any]) -> None:
         raise PipelineError("Verification certificate has an invalid decision")
     if (certificate.get("decision") == "PASS") != (certificate.get("passed") is True):
         raise PipelineError("Verification certificate decision conflicts with passed")
+    validate_certificate_diagnostics(certificate)
     request = certificate.get("request")
     if not isinstance(request, dict):
         raise PipelineError("Verification certificate request must be an object")

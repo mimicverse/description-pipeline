@@ -1268,7 +1268,7 @@ class OracleSemanticsTests(unittest.TestCase):
         def publish_frame(package: Path, parent: str) -> None:
             # A planted legacy second-model carrier must never steer the rebuild.
             record = json.loads((package / RECORD_FILE).read_text(encoding="utf-8"))
-            record.setdefault("derived", {}).setdefault("frames", []).append(
+            record.setdefault("raw", {}).setdefault("derived", {}).setdefault("frames", []).append(
                 {"name": "tool", "parent": parent, "coordinate_system": "TCP_tool"}
             )
             OracleSemanticsTests._seal(package, record)

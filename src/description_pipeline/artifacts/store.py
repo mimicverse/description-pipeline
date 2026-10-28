@@ -22,6 +22,20 @@ class ArtifactStoreError(PipelineError):
     """An immutable artifact cannot be read, sealed or materialized safely."""
 
 
+def path_has_link_ancestor(value: str | Path) -> bool:
+    """Whether the lexical path or an existing ancestor is a link or junction."""
+
+    current = Path(value)
+    if not current.is_absolute():
+        current = Path.cwd() / current
+    while True:
+        if current.is_symlink() or current.is_junction():
+            return True
+        if current.parent == current:
+            return False
+        current = current.parent
+
+
 def _fsync_path(path: Path) -> None:
     descriptor = os.open(path, os.O_RDONLY)
     try:
@@ -43,15 +57,14 @@ class ArtifactStore:
 
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
-        if self.root.exists() and self.root.is_symlink():
-            raise ArtifactStoreError("The artifact store root may not be a symbolic link")
-        self.root.mkdir(parents=True, exist_ok=True)
-        if any(item.is_symlink() for item in self.root.parents):
+        if path_has_link_ancestor(self.root):
             raise ArtifactStoreError("The artifact store root may not traverse a symbolic link")
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.root = self.root.resolve()
         self.objects = self.root / "objects"
+        if path_has_link_ancestor(self.objects):
+            raise ArtifactStoreError("The artifact object directory may not traverse a symbolic link")
         self.objects.mkdir(exist_ok=True)
-        if self.objects.is_symlink():
-            raise ArtifactStoreError("The artifact store object directory may not be a symbolic link")
 
     @classmethod
     def from_environment(cls, environ) -> ArtifactStore:
@@ -310,11 +323,11 @@ class ArtifactStore:
         producer_tool_sha256: str,
     ) -> ArtifactRef:
         supplied = Path(source)
-        if supplied.is_symlink() or supplied.is_junction():
-            raise ArtifactStoreError("An artifact source root may not be a symbolic link")
-        origin = supplied.resolve()
-        if any(parent.is_symlink() for parent in origin.parents):
+        if path_has_link_ancestor(supplied):
             raise ArtifactStoreError("An artifact source may not traverse a symbolic link")
+        if not supplied.is_dir():
+            raise ArtifactStoreError("An artifact source must be a real directory")
+        origin = supplied.resolve()
         first = self._members(origin)
         record = self._descriptor(
             kind=kind,
@@ -379,6 +392,8 @@ class ArtifactStore:
     def materialize(self, artifact: ArtifactRef, destination: str | Path) -> Path:
         self.verify(artifact)
         target = Path(destination)
+        if path_has_link_ancestor(target):
+            raise ArtifactStoreError("An artifact destination may not traverse a symbolic link")
         if target.exists():
             raise ArtifactStoreError("An artifact destination must not already exist")
         target.parent.mkdir(parents=True, exist_ok=True)

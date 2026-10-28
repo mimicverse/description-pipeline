@@ -356,10 +356,6 @@ def capture_root(
         "top_level": str(root / "input/cad" / main),
     }
     write_json(evidence / "raw/dependency_closure.json", dependency_closure)
-    for name in native_files:
-        target = evidence / "source" / name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(root / "input/cad" / name, target)
     tool = native_tool()
     environment = {
         "captured_at": "2026-10-10T00:00:00Z",
@@ -435,6 +431,41 @@ def capture_root(
         0.0,
         0.0,
     ]
+    native_raw_mass = {
+        "mass_kg": 1.0,
+        "center_of_mass_m": [0.0, 0.0, 0.0],
+        "inertia_values": [
+            0.001,
+            0.0,
+            0.0,
+            0.0,
+            0.001,
+            0.0,
+            0.0,
+            0.0,
+            0.001,
+        ],
+        "overrides": {
+            "OverrideMass": False,
+            "OverrideCenterOfMass": False,
+            "OverrideMomentsOfInertia": False,
+        },
+    }
+    mass_read = {
+        "native_raw": copy.deepcopy(native_raw_mass),
+        "reference": {"scope": "part_document"},
+        "read_errors": {},
+    }
+    link_read = {
+        "mass_kg": 1.0,
+        "com_m": [0.0, 0.0, 0.0],
+        "inertia_values_raw": copy.deepcopy(
+            native_raw_mass["inertia_values"]
+        ),
+        "inertia_values_about_origin_api": None,
+        "overrides": copy.deepcopy(native_raw_mass["overrides"]),
+        "read_errors": {},
+    }
     native_facts = {
         "schema_version": NATIVE_CAPTURE_OBSERVATION_SCHEMA,
         "scene_raw": {
@@ -446,22 +477,59 @@ def capture_root(
                     "path": str(root / "input/cad" / main),
                     "transform_raw": transform_raw,
                     "referenced_configuration": "Default",
+                    "suppression_state": 2,
                     "is_fixed": True,
                     "document_type": "assembly",
                 }
             ],
-            "components": [],
+            "components": [
+                {
+                    "name": main,
+                    "path": str(root / "input/cad" / main),
+                    "suppression_state": 2,
+                    "is_fixed": True,
+                    "document_type": "assembly",
+                }
+            ],
             "coordinate_systems": {},
         },
-        "part_mass_raw": {},
-        "assembly_mass_raw": None,
-        "component_mass_raw": None,
+        "part_mass_raw": {main: copy.deepcopy(mass_read)},
+        "assembly_mass_raw": copy.deepcopy(mass_read),
+        "component_mass_raw": {
+            "assembly": str(root / "input/cad" / main),
+            "configuration": "Default",
+            "instances": [
+                {
+                    "name": main,
+                    "parent": None,
+                    "depth": 0,
+                    "document": str(root / "input/cad" / main),
+                    "document_type": "assembly",
+                    "context_mass_kg": 1.0,
+                    "context_volume_m3": None,
+                    "overrides": copy.deepcopy(
+                        native_raw_mass["overrides"]
+                    ),
+                    "read_errors": {},
+                }
+            ],
+            "errors": [],
+            "reference": {},
+        },
         "link_group_mass_raw": {
             "assembly": str(root / "input/cad" / main),
             "configuration": "Default",
             "used_api": "IMassProperty2 (SelectedItems = component set)",
             "selection_rule": "top_most_providers+uncovered_leaves",
-            "links": {},
+            "links": {
+                "body": {
+                    "selection": [main],
+                    "reads": [
+                        copy.deepcopy(link_read),
+                        copy.deepcopy(link_read),
+                    ],
+                }
+            },
         },
         "source_scopes": {main: source_scope},
         "geometry_raw": {
@@ -469,7 +537,6 @@ def capture_root(
                 "stream_path": stream_relative,
                 "stream_sha256": stream_sha256,
                 "triangle_count": triangle_count,
-                "transform_raw": transform_raw,
                 "body_inventory": [],
                 "face_inventory": [],
                 "body_counts": {"solid": 0, "sheet": 0},
@@ -483,16 +550,17 @@ def capture_root(
         "axis_references_raw": [],
         "document_state": {
             "before": {
-                "configuration": "Default",
+                "path": str(root / "input/cad" / main),
+                "active_configuration": "Default",
                 "read_only": True,
                 "save_flag": False,
             },
             "after": {
-                "configuration": "Default",
+                "path": str(root / "input/cad" / main),
+                "active_configuration": "Default",
                 "read_only": True,
                 "save_flag": False,
             },
-            "used_api": "fixture",
         },
         "input_stability": {
             "originals_unchanged": {
@@ -510,7 +578,22 @@ def capture_root(
         root / "input/capture-plan.json",
         {
             "schema_version": "solidworks-to-urdf.capture-plan/v1",
-            "objects": [{"name": main}],
+            "run_id": run_id,
+            "handoff_sha256": handoff,
+            "discovery_sha256": file_digest(
+                root / "input/discovery/native-discovery.json"
+            ),
+            "main_assembly": main,
+            "configuration": "Default",
+            "identity": {"hardware_id": "fixture", "revision": "r1"},
+            "selection": {"files": native_files},
+            "objects": [
+                {
+                    "name": main,
+                    "document": main,
+                    "state": 2,
+                }
+            ],
             "groups": [
                 {"name": "body", "components": [main]}
             ],
@@ -536,20 +619,6 @@ def capture_root(
         root / "reports/native-stages.json",
         stage_view(run_id=run_id, handoff=handoff, events=events),
     )
-    # The native capture stamps the structural-team reports beside the sealed payload; they
-    # must travel with the archive so the Linux side can always hand them to the team.
-    write_json(
-        root / "reports/structural-team.json",
-        {
-            "schema_version": "solidworks-to-urdf.structural-report/v1",
-            "run_id": run_id,
-            "state": "native_complete",
-            "main_assembly": main,
-            "summary": {"warnings": 0, "blockers": 0},
-            "findings": [],
-        },
-    )
-    (root / "reports/structural-team.md").write_text("# Structural team report\n\nNo findings.\n", encoding="utf-8")
     return root
 
 
@@ -828,8 +897,7 @@ class StageTransferTests(unittest.TestCase):
         installed = {path.relative_to(destination).as_posix() for path in destination.rglob("*") if path.is_file()}
         self.assertEqual(installed, set(manifest["files"]) | {transfer.CAPTURE_MANIFEST})
         for name in ("reports/structural-team.md", "reports/structural-team.json"):
-            self.assertIn(name, manifest["files"])
-            self.assertEqual(file_digest(destination / name), file_digest(self.root / name))
+            self.assertNotIn(name, manifest["files"])
         self.assertEqual(
             file_digest(destination / "reports/native-tool.json"),
             manifest["files"]["reports/native-tool.json"],
@@ -860,34 +928,85 @@ class StageTransferTests(unittest.TestCase):
         self.assertEqual(summary["upload_sha256"], upload_sha256)
         self.assertEqual(summary["handoff_sha256"], HANDOFF)
 
-    def test_regenerated_team_reports_are_tolerated_only_in_deliveries(self) -> None:
-        manifest = seal(self.root, self.archive)
-        destination = self.base / "admitted"
-        admit(self.archive, destination)
-        summary = _verify_transfer(destination)
-        self.assertEqual(summary["files"], manifest["file_count"])
+    def test_structural_team_reports_are_not_capture_payload(self) -> None:
+        (self.root / "reports/structural-team.md").write_text(
+            "# generated\n",
+            encoding="utf-8",
+        )
+        (self.root / "reports/structural-team.json").write_text(
+            '{"findings": []}\n',
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(
+            PipelineError,
+            "outside the transfer payload",
+        ):
+            seal(self.root, self.archive)
 
-        # The admitted capture stays strict when the sealed report bytes change ...
-        (destination / "reports/structural-team.md").write_text("# regenerated\n", encoding="utf-8")
-        (destination / "reports/structural-team.json").write_text('{"findings": []}\n', encoding="utf-8")
-        with self.assertRaisesRegex(PipelineError, "differs from the transfer manifest"):
-            _verify_transfer(destination)
-        # ... while a delivery may carry its own regenerated copy ...
-        summary = _verify_transfer(
-            destination,
-            regenerated=native_transfer.TEAM_REPORTS,
+    def test_unknown_success_evidence_members_are_not_capture_payload(
+        self,
+    ) -> None:
+        evidence = self.root / "evidence"
+        write_json(evidence / "discovery.json", {"legacy": True})
+        manifest = read_data(evidence / "manifest.json")
+        write_manifest(
+            evidence,
+            kind=manifest["kind"],
+            identity=manifest["identity"],
+            evidence_class=manifest["evidence_class"],
         )
-        self.assertEqual(summary["files"], manifest["file_count"])
-        # ... or none at all before the report is stamped.
-        (destination / "reports/structural-team.md").unlink()
-        (destination / "reports/structural-team.json").unlink()
-        summary = _verify_transfer(
-            destination,
-            regenerated=native_transfer.TEAM_REPORTS,
+        with self.assertRaisesRegex(
+            PipelineError,
+            "outside the transfer payload",
+        ):
+            seal(self.root, self.archive)
+
+    def test_noncanonical_triangle_evidence_name_is_not_capture_payload(
+        self,
+    ) -> None:
+        evidence = self.root / "evidence"
+        triangle = evidence / "raw/triangles/not-a-content-hash.triangles"
+        triangle.parent.mkdir(parents=True, exist_ok=True)
+        triangle.write_bytes(b"not canonical")
+        manifest = read_data(evidence / "manifest.json")
+        write_manifest(
+            evidence,
+            kind=manifest["kind"],
+            identity=manifest["identity"],
+            evidence_class=manifest["evidence_class"],
         )
-        self.assertEqual(summary["files"], manifest["file_count"])
-        with self.assertRaises(PipelineError):
-            _verify_transfer(destination)
+        with self.assertRaisesRegex(
+            PipelineError,
+            "outside the transfer payload",
+        ):
+            seal(self.root, self.archive)
+
+    def test_unreferenced_canonical_triangle_is_not_capture_payload(
+        self,
+    ) -> None:
+        seal(self.root, self.archive)
+        content = b"unreferenced triangle stream"
+        checksum = hashlib.sha256(content).hexdigest()
+        relative = f"raw/triangles/{checksum}.triangles"
+        with zipfile.ZipFile(self.archive) as source:
+            evidence_manifest = json.loads(
+                source.read("evidence/manifest.json")
+            )
+        evidence_manifest["files"][relative] = checksum
+        broken = self.base / "unreferenced-triangle.zip"
+        repack(
+            self.archive,
+            broken,
+            {
+                "evidence/" + relative: content,
+                "evidence/manifest.json": canonical(evidence_manifest),
+            },
+        )
+        with self.assertRaisesRegex(
+            PipelineError,
+            "triangle inventory differs",
+        ):
+            admit(broken, self.base / "out-unreferenced-triangle")
 
     def test_sealing_is_deterministic(self) -> None:
         first = self.base / "first.zip"
@@ -1025,6 +1144,7 @@ class StageTransferTests(unittest.TestCase):
             record = json.loads(
                 source.read("input/discovery/native-discovery.json")
             )
+            plan = json.loads(source.read("input/capture-plan.json"))
 
         renamed = {**record, "identity": {**record["identity"], "main_assembly": "other.SLDASM"}}
         broken = self.base / "discovery-name.zip"
@@ -1049,6 +1169,19 @@ class StageTransferTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(PipelineError, "bound to another handoff"):
             admit(broken, self.base / "out-discovery-handoff")
+
+        foreign_plan = copy.deepcopy(plan)
+        foreign_plan["identity"]["hardware_id"] = "foreign-hardware"
+        broken = self.base / "plan-identity.zip"
+        repack(
+            self.archive,
+            broken,
+            {
+                "input/capture-plan.json": canonical(foreign_plan),
+            },
+        )
+        with self.assertRaisesRegex(PipelineError, "plan identity differs"):
+            admit(broken, self.base / "out-plan-identity")
 
     def test_structural_zip_tamper_is_refused(self) -> None:
         seal(self.root, self.archive)
@@ -1433,25 +1566,6 @@ class StageTransferTests(unittest.TestCase):
             facts = read_data(
                 evidence / "raw/native_capture_facts.json"
             )
-            components = sorted(facts["source_scopes"])
-            write_json(
-                capture / "input/capture-plan.json",
-                {
-                    "schema_version": "solidworks-to-urdf.capture-plan/v1",
-                    "objects": [
-                        {"name": component}
-                        for component in components
-                    ],
-                    "groups": [
-                        {"name": "body", "components": components}
-                    ],
-                    "axis_requests": [],
-                    "datums": [],
-                    "evidence_requests": list(
-                        CAPTURE_EVIDENCE_REQUESTS
-                    ),
-                },
-            )
             discovery_path = (
                 capture / "input/discovery/native-discovery.json"
             )
@@ -1476,6 +1590,45 @@ class StageTransferTests(unittest.TestCase):
             )
             source["source_revision_id"] = digest(source["identity"])
             write_json(source_path, source)
+            link_groups = facts["link_group_mass_raw"]["links"]
+            write_json(
+                capture / "input/capture-plan.json",
+                {
+                    "schema_version": "solidworks-to-urdf.capture-plan/v1",
+                    "run_id": RUN_ID,
+                    "handoff_sha256": handoff_sha256,
+                    "discovery_sha256": file_digest(discovery_path),
+                    "main_assembly": assembly.name,
+                    "configuration": "Default",
+                    "identity": {
+                        "hardware_id": "fixture",
+                        "revision": "r1",
+                    },
+                    "selection": {"files": native_files},
+                    "objects": [
+                        {
+                            "name": row["name"],
+                            "document": Path(row["path"]).name,
+                            "state": row["suppression_state"],
+                        }
+                        for row in facts["scene_raw"]["occurrences"]
+                    ],
+                    "groups": [
+                        {
+                            "name": name,
+                            "components": list(entry["selection"]),
+                        }
+                        for name, entry in sorted(link_groups.items())
+                    ],
+                    "axis_requests": [],
+                    "datums": sorted(
+                        facts["scene_raw"]["coordinate_systems"]
+                    ),
+                    "evidence_requests": list(
+                        CAPTURE_EVIDENCE_REQUESTS
+                    ),
+                },
+            )
             package_files = {
                 name: checksum
                 for name, checksum in inventory(capture / "input").items()
@@ -1619,12 +1772,6 @@ class StageTransferTests(unittest.TestCase):
             "native_tool_bytes": (destination / "reports/native-tool.json").read_bytes(),
             "native_stages_bytes": (destination / "reports/native-stages.json").read_bytes(),
             "transfer_manifest_bytes": (destination / transfer.CAPTURE_MANIFEST).read_bytes(),
-            "structural_team_md_bytes": (
-                destination / "reports/structural-team.md"
-            ).read_bytes(),
-            "structural_team_json_bytes": (
-                destination / "reports/structural-team.json"
-            ).read_bytes(),
         }
         self.assertEqual(
             _verify_transfer(
@@ -1662,12 +1809,6 @@ class StageTransferTests(unittest.TestCase):
                     "native_tool_bytes": (destination / "reports/native-tool.json").read_bytes(),
                     "native_stages_bytes": (destination / "reports/native-stages.json").read_bytes(),
                     "transfer_manifest_bytes": (destination / transfer.CAPTURE_MANIFEST).read_bytes(),
-                    "structural_team_md_bytes": (
-                        destination / "reports/structural-team.md"
-                    ).read_bytes(),
-                    "structural_team_json_bytes": (
-                        destination / "reports/structural-team.json"
-                    ).read_bytes(),
                 }
                 evidence = native_transfer.validate_native_receipts(destination, receipts)
                 self.assertEqual(evidence["main_assembly"], MAIN_ASSEMBLY)
@@ -1679,22 +1820,13 @@ class StageTransferTests(unittest.TestCase):
         receipts = {
             "native_tool_bytes": (destination / "reports/native-tool.json").read_bytes(),
             "native_stages_bytes": (destination / "reports/native-stages.json").read_bytes(),
-            "structural_team_md_bytes": (
-                destination / "reports/structural-team.md"
-            ).read_bytes(),
-            "structural_team_json_bytes": (
-                destination / "reports/structural-team.json"
-            ).read_bytes(),
         }
         manifest = read_data(destination / transfer.CAPTURE_MANIFEST)
         manifest["total_bytes"] += 1
         receipts["transfer_manifest_bytes"] = canonical(manifest)
-        for name in native_transfer.TEAM_REPORTS:
-            (destination / name).unlink()
         with self.assertRaisesRegex(PipelineError, "size differs"):
             _verify_transfer(
                 destination,
-                regenerated=native_transfer.TEAM_REPORTS,
                 native_receipts=receipts,
             )
 
@@ -2120,6 +2252,8 @@ class StageTransferTests(unittest.TestCase):
         facts_path = evidence / "raw/native_capture_facts.json"
         facts = read_data(facts_path)
         facts["scene_raw"]["document"] = windows
+        for phase in ("before", "after"):
+            facts["document_state"][phase]["path"] = windows
         write_json(facts_path, facts)
         manifest_path = evidence / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))

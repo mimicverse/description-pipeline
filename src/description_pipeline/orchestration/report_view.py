@@ -18,10 +18,10 @@ from ..geometry.native_scope import (
     NATIVE_SCOPE_IDENTITY_WARNING_CODES,
     native_gate_warning_details_match,
 )
-from ..io import PipelineError
+from ..io import PipelineError, canonical_json_value
 from ..sources.solidworks.evidence import METADATA_WARNING_CODE
 from ..sources.solidworks.saved_state import SAVED_STATE_WARNING_CODE
-from ..stages import FIXED_REQUIRED_CHECKS, stage_view
+from ..stages import stage_view
 
 REPORT_SCHEMA = "solidworks-to-urdf.report/v1"
 
@@ -140,10 +140,8 @@ _FILE_PATH_LABELS = {
     "urdf/ + meshes/": "URDF and local meshes",
     "reports/tool.json": "Tool identity and file subject",
     "input/ + evidence/ + model/ + urdf/ + meshes/": "Raw evidence and generated artifacts",
-    "reports/quality.json": "Deterministic per-object quality report",
-    "urdf/ + meshes/ + reports/quality.json": "Verified delivery and configured model repository",
-    "reports/structural-team.md": "Structural-team report (readable Markdown)",
-    "reports/structural-team.json": "Structural-team report (structured findings and parameters)",
+    "verification-certificate.json": "Independent verification certificate",
+    "verification-execution.json": "Verification execution receipt",
 }
 
 _INDEPENDENT_LABELS = {
@@ -183,10 +181,6 @@ _INDEPENDENT_LABELS = {
     "physics.raw_inputs": "Physical raw inputs",
     "physics.reading": "Physical reading",
 }
-
-#: VER-02 guard: the label table must cover the verifier's fixed inventory; the
-#: regression suite asserts this stays empty.
-_UNLABELLED_REQUIRED_CHECKS = tuple(sorted(FIXED_REQUIRED_CHECKS - set(_INDEPENDENT_LABELS)))
 
 _INDEPENDENT_FAMILIES = (
     ("inertia.", "Inertia: {name}"),
@@ -835,52 +829,31 @@ def _failed_summary(label: str, summary: dict | None, details: dict) -> dict:
     return row
 
 
-_WARNING_DETAIL_KEYS = (
-    "limits",
-    "components",
-    "links",
-    "joint",
-    "mate",
-    "scope",
-    "mate_type",
-    "qualification_blocker",
-    "publication_blocker",
-    "missing",
-    "technical_label",
-    "label_source",
-    "mass_kg",
-    "objects",
-    "component",
-    "entity_kind",
-    "body_type",
-    "body_index",
-    "owner_scope_key",
-    "object_indices",
-    "object_type",
-    "field",
-    "fields",
-    "original",
-    "actual",
-    "source",
-    "file",
-    "sha256",
-    "anchor",
-    "key",
-    "reference",
-    "rule_id",
-    "rule_version",
-    "reason",
-)
-_WARNING_RESIDUAL_KEYS = ("max_abs_residual", "max_normalized_residual", "threshold")
+def merge_warnings(*groups: list[dict]) -> list[dict]:
+    """Deduplicate complete warning content, preserving recorded source identities."""
+
+    unique = {}
+    for row in (item for group in groups for item in group):
+        identity = dict(row)
+        # These values identify the display surface, not an engineering source.
+        if identity.get("source") in ("input", "discovery", "verification"):
+            identity.pop("source")
+        identity.setdefault("blocking", False)
+        unique.setdefault(canonical_json_value(identity), row)
+    return [unique[key] for key in sorted(unique)]
 
 
 def _warning_row(stage: dict, item: dict) -> dict:
     """One recorded non-blocking observation as a warning row (never a pass, never a gate)."""
 
+    if item.get("blocking") is not False:
+        raise PipelineError("A warning requires an explicit non-blocking diagnostic")
     code = str(item.get("code") or "")
     detail = item.get("detail") if isinstance(item.get("detail"), dict) else {}
     context = {**item, **detail}
     row: dict = {
+        **detail,
+        **item,
         "stage": stage.get("id"),
         "stage_name": stage.get("name"),
         "code": code,
@@ -912,22 +885,6 @@ def _warning_row(stage: dict, item: dict) -> dict:
         row["message"] = str(item["message"])
     elif code in NATIVE_SCOPE_IDENTITY_WARNING_CODES:
         row["message"] = str(row["label"])
-    if code in NATIVE_SCOPE_IDENTITY_WARNING_CODES:
-        row.update(detail)
-    for key in _WARNING_DETAIL_KEYS:
-        value = context.get(key)
-        if value is not None:
-            # Authored zeros (for example an equal zero joint range) stay exact values.
-            row[key] = value
-    if detail:
-        row["detail"] = detail
-    residual = {
-        key: detail[key]
-        for key in _WARNING_RESIDUAL_KEYS
-        if isinstance(detail.get(key), (int, float)) and not isinstance(detail.get(key), bool)
-    }
-    if residual:
-        row["residual"] = residual
     return row
 
 
@@ -991,7 +948,8 @@ def _recorded_warnings(
                 projection_compared = True
                 recorded = native_diagnostics
             warnings.extend(
-                _warning_row(stage, item) for item in recorded if isinstance(item, dict) and item.get("code")
+                _warning_row(stage, item) for item in recorded
+                if isinstance(item, dict) and item.get("code") and item.get("blocking") is False
             )
         elif row.get("id") == "geometry.native_tessellation" and row_passed:
             raise PipelineError(
@@ -1000,7 +958,8 @@ def _recorded_warnings(
         diagnostics = details.get("diagnostics") if isinstance(details, dict) else None
         if isinstance(diagnostics, list):
             warnings.extend(
-                _warning_row(stage, item) for item in diagnostics if isinstance(item, dict) and item.get("code")
+                _warning_row(stage, item) for item in diagnostics
+                if isinstance(item, dict) and item.get("code") and item.get("blocking") is False
             )
     if native_diagnostics and (
         not projection_compared or not native_gate_seen
@@ -1013,18 +972,18 @@ def _recorded_warnings(
             item
             for item in quality_diagnostics or []
             if isinstance(item, dict)
-            and item.get("code") in {METADATA_WARNING_CODE, SAVED_STATE_WARNING_CODE}
+            and item.get("code")
             and item.get("blocking") is False
         ]
         for code in {METADATA_WARNING_CODE, SAVED_STATE_WARNING_CODE}:
             matching = [item for item in standalone_diagnostics if item.get("code") == code]
             if len(matching) > 1:
                 raise PipelineError(f"{code} diagnostics are duplicated")
-            if matching and not any(
-                item.get("code") == code for item in warnings if isinstance(item, dict)
-            ):
-                warnings.extend(_warning_row(stage, item) for item in matching)
-    return warnings
+        for item in standalone_diagnostics:
+            warning = _warning_row(stage, item)
+            if warning not in warnings:
+                warnings.append(warning)
+    return merge_warnings(warnings)
 
 
 def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:

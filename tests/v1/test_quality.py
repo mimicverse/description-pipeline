@@ -5,7 +5,6 @@ from __future__ import annotations
 import copy
 import hashlib
 import struct
-import json
 import tempfile
 import unittest
 from unittest import mock
@@ -15,7 +14,7 @@ from xml.etree import ElementTree as ET
 import numpy as np
 
 from description_pipeline.interface_records import CHECK_POLICY_V1, validate_qualification
-from description_pipeline.io import PipelineError, canonical, write_json
+from description_pipeline.io import PipelineError, write_json
 from description_pipeline.verification import solidworks_urdf as quality
 from tests.sources import support
 
@@ -150,38 +149,12 @@ class StructuralQualityTests(unittest.TestCase):
         with self.assertRaises(PipelineError):
             quality._joint(node_negative, negative, canonical_negative, {}, frames, [])
 
-    def test_incomplete_delivery_and_forged_green_report_fail_without_crashing(self):
+    def test_incomplete_delivery_fails_without_crashing(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            write_json(root / "reports/quality.json", {"passed": True})
-            report = quality.check_bundle(root)
+            report = quality.evaluate_bundle(root)
             self.assertFalse(report["passed"])
-            self.assertIn("report.binding", [check["id"] for check in report["checks"]])
-            canonical(report)
             self.assertEqual(report["subject_status"], "unavailable")
-            self.assertNotIn(str(root).encode(), canonical(report))
-
-    def test_recomputed_tuple_values_bind_through_the_json_model(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            report = {"schema_version": "probe", "checks": [], "passed": True, "value": ("a", 1)}
-            write_json(root / "reports/quality.json", json.loads(json.dumps(report)))
-            with mock.patch.object(quality, "evaluate_bundle", return_value=report):
-                result = quality.check_bundle(root)
-            self.assertNotIn("report.binding", [check["id"] for check in result["checks"]])
-
-    def test_altered_saved_report_still_fails_with_the_same_message(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            report = {"schema_version": "probe", "checks": [], "passed": True, "value": ("a", 1)}
-            write_json(root / "reports/quality.json", {"schema_version": "probe", "checks": [], "passed": True,
-                                                       "value": ["a", 2]})
-            with mock.patch.object(quality, "evaluate_bundle", return_value=report):
-                result = quality.check_bundle(root)
-            binding = [check for check in result["checks"] if check["id"] == "report.binding"]
-            self.assertEqual(len(binding), 1)
-            self.assertIn("Saved quality report differs from recomputation", binding[0]["details"]["error"])
-            self.assertFalse(result["passed"])
 
 
 class DerivedSelectionAccountingTests(unittest.TestCase):
@@ -706,19 +679,23 @@ class QualificationItemTests(unittest.TestCase):
         write_json(root / "input/handoff.json", {"probe": "sealed input"})
         write_json(root / "model/robot.json", {"probe": "model"})
         (root / "urdf/robot.urdf").write_text("<robot/>", encoding="utf-8")
-        from description_pipeline.request_evidence import build_request_evidence, write_request_evidence
+        from description_pipeline.request_evidence import (
+            build_request_evidence,
+            request_evidence_bytes,
+        )
 
-        write_request_evidence(
-            root / "input" / "request.json",
-            build_request_evidence(
-                purpose="engineering",
-                request_id="fixture-quality",
-                target_hardware="nd_fixture",
-                change_summary="fixture",
-                main_assembly="cad/robot.SLDASM",
-                handoff_digest="a" * 64,
-                platform_config_digest="c" * 64,
-            ),
+        (root / "input" / "request.json").write_bytes(
+            request_evidence_bytes(
+                build_request_evidence(
+                    purpose="engineering",
+                    request_id="fixture-quality",
+                    target_hardware="nd_fixture",
+                    change_summary="fixture",
+                    main_assembly="cad/robot.SLDASM",
+                    handoff_digest="a" * 64,
+                    platform_config_digest="c" * 64,
+                )
+            )
         )
         return root
 

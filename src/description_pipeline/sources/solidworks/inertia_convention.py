@@ -65,8 +65,6 @@ MIN_DECISIVE_SAMPLES = 2
 MIN_DECISIVE_LINKS = 1
 
 _OFF_DIAGONAL = ((0, 1), (0, 2), (1, 2))
-#: Row-major flat positions of the off-diagonal entries in a 9-value tensor.
-_FLAT_OFF_DIAGONAL = (1, 2, 3, 5, 6, 7)
 
 
 def _finite(value: Any) -> bool:

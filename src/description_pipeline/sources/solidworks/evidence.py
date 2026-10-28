@@ -55,10 +55,6 @@ _RULE_TEXT = {
         "frozen source configuration echo",
         "the value echoes the selected source configuration even when it matches the native read",
     ),
-    "metadata.save_flag_inversion": (
-        "GetSaveFlag boolean inversion",
-        "saved is derived from the same validated capture_state.save_flag observation",
-    ),
 }
 _RULE_ORDER = tuple(_RULE_TEXT)
 
@@ -206,11 +202,18 @@ def metadata_value_warnings(
     prepared = runtime["prepared_capture"]
     if not isinstance(prepared, dict):
         fail("native runtime prepared_capture metadata must be an object")
+    if set(prepared) != {"policy", "opened"}:
+        fail(
+            "prepared_capture metadata must contain only policy and opened",
+            {
+                "missing": sorted({"policy", "opened"} - set(prepared)),
+                "unknown": sorted(set(prepared) - {"policy", "opened"}),
+            },
+        )
     policy = prepared.get("policy")
     opened = prepared.get("opened")
-    state = prepared.get("state_before")
-    if not isinstance(policy, dict) or not isinstance(opened, dict) or not isinstance(state, dict):
-        fail("prepared_capture policy/opened/state_before metadata is missing")
+    if not isinstance(policy, dict) or not isinstance(opened, dict):
+        fail("prepared_capture policy/opened metadata is missing")
     for key in ("source_root", "assembly", "requested_configuration"):
         text(policy.get(key), f"prepared_capture.policy.{key}")
     assembly = policy["assembly"]
@@ -235,36 +238,6 @@ def metadata_value_warnings(
         fail("prepared_capture.opened path differs from its policy assembly")
     for key in set(opened) - {"path", "read_only"}:
         add("metadata.platform_diagnostic", f"/prepared_capture/opened/{_pointer_token(key)}")
-
-    for key in ("path", "read_only", "active_configuration"):
-        if key not in state:
-            fail(f"prepared_capture.state_before.{key} is missing")
-    text(state["path"], "prepared_capture.state_before.path")
-    if state["read_only"] is not True:
-        fail("prepared_capture.state_before is not read-only")
-    if not same_path(state["path"], assembly):
-        fail("prepared_capture.state_before path differs from its policy assembly")
-    if state["active_configuration"] != expected_configuration:
-        fail("prepared_capture.state_before configuration differs from source")
-    if "configuration" in state and state["configuration"] != expected_configuration:
-        fail("prepared_capture.state_before native configuration differs from source")
-    save_flag = state.get("save_flag")
-    saved = state.get("saved")
-    if type(save_flag) is bool:
-        if type(saved) is not bool or saved is save_flag:
-            fail("prepared_capture.state_before saved differs from the native save-flag inversion")
-        add("metadata.save_flag_inversion", "/prepared_capture/state_before/saved")
-    else:
-        if saved is not None:
-            fail("prepared_capture.state_before invents saved state from an unknown save flag")
-        add(
-            "metadata.platform_diagnostic",
-            "/prepared_capture/state_before/save_flag",
-            "/prepared_capture/state_before/saved",
-        )
-    for key in set(state) - {"path", "read_only", "active_configuration", "configuration", "save_flag", "saved"}:
-        add("metadata.platform_diagnostic", f"/prepared_capture/state_before/{_pointer_token(key)}")
-    add("metadata.source_configuration_echo", "/prepared_capture/state_before/active_configuration")
 
     digest(runtime_sha256, RUNTIME_EVIDENCE)
     text(expected_configuration, "expected configuration")

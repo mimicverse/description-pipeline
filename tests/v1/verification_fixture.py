@@ -677,10 +677,15 @@ class HermeticNativeFixture:
         self.assertIs(verified["passed"], True)
         self.assertEqual(verified["subject_sha256"], generated_subject)
         self.assertEqual(read_delivery_manifest(self.root / "verify")["subject"]["digest"], generated_subject)
-        quality = json.loads((self.root / "verify/reports/quality.json").read_text(encoding="utf-8"))
+        certificate = json.loads(
+            (
+                self.root
+                / "verify/reports/verification-certificate.json"
+            ).read_text(encoding="utf-8")
+        )
         metadata_diagnostics = [
             diagnostic
-            for diagnostic in quality["diagnostics"]
+            for diagnostic in certificate["diagnostics"]
             if diagnostic.get("code") == "metadata.non_native"
         ]
         self.assertEqual(len(metadata_diagnostics), 1)
@@ -698,7 +703,7 @@ class HermeticNativeFixture:
         return original_handoff, native, verified
 
     def test_published_subject_supports_self_contained_cli_check(self) -> None:
-        from description_pipeline.verification.solidworks_urdf import check_bundle
+        from description_pipeline.verification.solidworks_urdf import evaluate_bundle
 
         _original_handoff, _native, verified = self._generate_and_verify()
         published = self.root / "self-contained"
@@ -708,35 +713,31 @@ class HermeticNativeFixture:
         shutil.copy2(self.root / "verify/manifest.json", published / "manifest.json")
         (published / "reports").mkdir()
         shutil.copy2(
-            self.root / "verify/reports/quality.json",
-            published / "reports/quality.json",
+            self.root / "verify/reports/verification-certificate.json",
+            published / "reports/verification-certificate.json",
+        )
+        shutil.copy2(
+            self.root / "verify/reports/verification-execution.json",
+            published / "reports/verification-execution.json",
         )
 
-        report = check_bundle(published)
+        report = evaluate_bundle(published)
         self.assertIs(report["passed"], True, report.get("checks"))
         self.assertEqual(report["subject_sha256"], verified["subject_sha256"])
 
-        shutil.copy2(
-            self.root / "verify/reports/native-stages.json",
-            published / "reports/native-stages.json",
-        )
-        partial_receipts = check_bundle(published)
-        self.assertIs(partial_receipts["passed"], False)
-        (published / "reports/native-stages.json").unlink()
-
-        with_required_receipts = check_bundle(
+        with_required_receipts = evaluate_bundle(
             published,
             require_native_receipts=True,
         )
         self.assertIs(with_required_receipts["passed"], False)
 
     def test_verify_rereads_the_subject_and_native_receipts_before_success(self) -> None:
-        from description_pipeline.verification import solidworks_urdf as quality
+        from description_pipeline.pipeline import verify as pipeline_verify
 
         _original_handoff, native, _verified = self._generate_and_verify()
         seed = self.root / "generate"
         expected_subject = read_delivery_manifest(seed)["subject"]["digest"]
-        original_check = quality.check_bundle
+        original_check = pipeline_verify.evaluate_bundle
 
         def check_then_append_to_tool(*args, **kwargs):
             report = original_check(*args, **kwargs)
@@ -744,7 +745,11 @@ class HermeticNativeFixture:
             tool.write_bytes(tool.read_bytes() + b"\n")
             return report
 
-        with patch.object(quality, "check_bundle", side_effect=check_then_append_to_tool):
+        with patch.object(
+            pipeline_verify,
+            "evaluate_bundle",
+            side_effect=check_then_append_to_tool,
+        ):
             receipt = solidworks.verify(
                 seed,
                 self.root / "verify-race",

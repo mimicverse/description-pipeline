@@ -57,6 +57,7 @@ from description_pipeline.pipeline.reconciliation import (
 )
 from description_pipeline.pipeline.services import CanonicalStageServices, ClaimPolicy
 from description_pipeline.platform.facts import FactConflict, FactStore, RunControlStore
+from description_pipeline.platform.queries import read_run_projection
 from description_pipeline.schemas import (
     AIRFLOW_DISPATCH_CONF_SCHEMA,
     DIAGNOSTIC_ADMISSION_SCHEMA,
@@ -957,6 +958,17 @@ class PlatformServicePostgresTests(unittest.TestCase):
         recovered = FactStore(self._service_connect, self.artifacts)
         restored = recovered.effect_settlement_for_key(command.command_id, "native")
         self.assertEqual(restored.state, EffectState.SATISFIED)
+        projection = read_run_projection(
+            self._service_connect(),
+            spec.run_id,
+            artifacts=self.artifacts,
+        )
+        projected_effect = next(
+            effect
+            for effect in projection["technical"]["effects"]
+            if effect["effect_id"] == intent.effect_id
+        )
+        self.assertEqual(projected_effect["state"], "satisfied")
 
     def test_concurrent_diagnostics_share_artifact_order_without_deadlock(self) -> None:
         first_root = Path(self.directory.name) / "shared-artifact-a"

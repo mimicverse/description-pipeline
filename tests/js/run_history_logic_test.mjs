@@ -11,7 +11,7 @@ const source = readFileSync(
   "utf8",
 );
 // Load the browser module as real ESM without a package.json in the way.
-const { menuAction, overlayRun, resolveDeleted, resolveTitle } = await import(
+const { menuAction, overlayRun, resolveDeleted, resolveTitle, shouldRefreshRunList } = await import(
   `data:text/javascript;base64,${Buffer.from(source, "utf8").toString("base64")}`
 );
 
@@ -51,3 +51,48 @@ assert.deepEqual(detailOnly, {
 assert.equal(runs.length, 1);
 overlayRun(runs, null, { title: "x" });
 console.log("run_history_logic_test OK");
+
+// Exercise the actual polling consumer across a late conflict without a manual list refresh.
+const appSource = readFileSync(path.join(here, "..", "..", "src", "description_pipeline", "orchestration", "static", "app.js"), "utf8");
+const pollSource = appSource.match(/async function poll\(\) \{[\s\S]*?\n\}/)[0];
+const browserState = { dagRunId: "run-3", lastRun: { state: "success" }, timer: 17 };
+const displayedList = [{ dag_run_id: "run-3", state: "success" }];
+let nextRun = { dag_run_id: "run-3", state: "success", automatic: { state: "passed" } };
+let refreshes = 0;
+let previewLoads = 0;
+const poll = new Function("state", "api", "$", "setError", "clearPreview", "renderRun", "loadPreview", "stopActivityTimer", "shouldRefreshRunList", "refreshRuns", "window", `return (${pollSource});`)(
+  browserState, async () => nextRun, () => ({}), () => {}, () => {}, () => {}, async () => { previewLoads++; }, () => {},
+  shouldRefreshRunList, async () => { refreshes++; displayedList[0].state = nextRun.state; },
+  { clearInterval: () => { throw new Error("Canonical polling stopped after success"); } },
+);
+await poll();
+assert.equal(browserState.timer, 17);
+assert.equal(refreshes, 0);
+nextRun = { dag_run_id: "run-3", state: "unresolved", automatic: { state: "unresolved" } };
+await poll();
+assert.equal(displayedList[0].state, "unresolved");
+assert.equal(refreshes, 1);
+assert.equal(previewLoads, 2);
+nextRun = { dag_run_id: "run-3", state: "cancelled" };
+await poll();
+assert.equal(displayedList[0].state, "cancelled");
+assert.equal(refreshes, 2);
+const deleteSource = appSource.match(/function deleteBlockedReason\(run\) \{[\s\S]*?\n\}/)[0];
+const blockedReason = new Function(`return (${deleteSource});`)();
+assert.equal(blockedReason(nextRun), "");
+assert.notEqual(blockedReason({state: "unresolved"}), "");
+console.log("canonical polling consumer OK");
+
+// Immutable geometry can stay loaded while current qualification changes.
+const loadPreviewSource = appSource.match(/async function loadPreview\(dagRunId\) \{[\s\S]*?\n\}/)[0];
+const sameGeometry = { dagRunId: "run-3", previewSubject: "same-subject", previewRequest: null };
+let diagnosticShown;
+const loadPreview = new Function("state", "api", "$", "renderPreviewDiagnostic", `return (${loadPreviewSource});`)(
+  sameGeometry, async () => ({ subject_sha256: "same-subject", verified: false, reason: "run_unresolved" }),
+  () => ({}), (preview) => { diagnosticShown = preview; },
+);
+await loadPreview("run-3");
+assert.equal(diagnosticShown.verified, false);
+assert.equal(diagnosticShown.reason, "run_unresolved");
+assert.equal(sameGeometry.previewRequest, null);
+console.log("same-subject qualification refresh OK");

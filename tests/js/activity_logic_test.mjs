@@ -241,3 +241,10 @@ const literal = activityView(
 assert.equal(literal.objectText, "<img src=x onerror=alert(1)>");
 
 console.log("activity_logic_test OK");
+
+assert.equal(activityView({ available: true, state: "busy", stage: "capture", recent: [] }, { runState: "cancelled", nowMs }).visible, false);
+
+const unresolved = activityView({ available: true, state: "busy", stage: "capture", recent: [] }, { runState: "unresolved", nowMs });
+assert.equal(unresolved.state, "waiting");
+assert.equal(unresolved.elapsedText, "");
+assert.match(unresolved.note, /reconciliation/);

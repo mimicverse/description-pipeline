@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
+from ..artifacts.store import path_has_link_ancestor
 from ..io import canonical, write_json
 from .contracts import DispatchCommand, DispatchConf, ProtocolError
 from .effects import EffectSettlement, EffectState
@@ -73,7 +74,7 @@ class TechnicalDispatchService:
         self.facts = facts
         self.artifacts = artifacts
         root = Path(work_root)
-        if root.exists() and (root.is_symlink() or root.is_junction()):
+        if path_has_link_ancestor(root):
             raise ProtocolError("dispatch.workspace_invalid", {"root": str(root)})
         root.mkdir(parents=True, exist_ok=True)
         self.work_root = root.resolve()
@@ -156,7 +157,6 @@ class TechnicalDispatchService:
                     settlement.effect_id,
                     expected_command_id=command.command_id,
                 ),
-                claim=claim,
             )
 
         return self._observe_existing(command, conf, settlement)
@@ -190,14 +190,19 @@ class TechnicalDispatchService:
         command: DispatchCommand,
         conf: DispatchConf,
         settlement: EffectSettlement,
-        *,
-        claim=None,
     ) -> DispatchResult:
-        if settlement.state in {
-            EffectState.SATISFIED,
-            EffectState.DEFINITELY_FAILED,
-            EffectState.CONFLICT,
-        }:
+        if settlement.state in {EffectState.SATISFIED, EffectState.DEFINITELY_FAILED}:
+            self.facts.close_open_claim_for_command(
+                command.command_id,
+                closure_code=(
+                    "completed"
+                    if settlement.state is EffectState.SATISFIED
+                    else "definite_failure"
+                ),
+                closed_at=self._now(),
+            )
+            return DispatchResult(command.command_id, settlement.effect_id, settlement.state, None)
+        if settlement.state is EffectState.CONFLICT:
             return DispatchResult(command.command_id, settlement.effect_id, settlement.state, None)
         try:
             observation = self.adapter.observe(command, conf)
@@ -247,16 +252,14 @@ class TechnicalDispatchService:
             settlement.effect_id,
             expected_command_id=command.command_id,
         )
-        if claim is not None and final.state is EffectState.SATISFIED:
-            self.facts.close_open_claim(
-                claim,
-                closure_code="completed",
-                closed_at=self._now(),
-            )
-        elif claim is not None and final.state is EffectState.DEFINITELY_FAILED:
-            self.facts.close_open_claim(
-                claim,
-                closure_code="definite_failure",
+        if final.state in {EffectState.SATISFIED, EffectState.DEFINITELY_FAILED}:
+            self.facts.close_open_claim_for_command(
+                command.command_id,
+                closure_code=(
+                    "completed"
+                    if final.state is EffectState.SATISFIED
+                    else "definite_failure"
+                ),
                 closed_at=self._now(),
             )
         return DispatchResult(command.command_id, settlement.effect_id, final.state, observation)

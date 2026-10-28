@@ -21,7 +21,6 @@ from ..geometry.native_tessellation import (
 from ..geometry.native_transform import transform_from_solidworks
 from ..io import PipelineError, confined, file_digest, read_data
 from ..schemas import EFFECTIVE_INSTANCES_SCHEMA, LINK_GROUP_MASS_SCHEMA
-from ..sources.snapshot import verify_snapshot
 from ..sources.solidworks.capture_projection import load_native_capture_observation
 from ..sources.solidworks.inertia_convention import POSITIVE, detect_family
 from ..sources.solidworks.session_artifacts import (
@@ -268,7 +267,6 @@ def _raw_geometry(root: Path, observation: dict) -> dict[str, dict]:
                 "bodies": copy.deepcopy(raw["body_counts"]),
                 "used_api": raw["used_api"],
                 "tessellation": tessellation,
-                "transform_raw": copy.deepcopy(raw["transform_raw"]),
                 "source_scope": copy.deepcopy(source_scope),
                 "source_bytes": source_bytes,
                 "appearance_raw": appearance,
@@ -781,12 +779,6 @@ def link_group_mass_properties(root) -> dict:
     }
 
 
-def collection(root) -> dict:
-    """The source manifest identity, the one surviving collection authority."""
-
-    return verify_snapshot(_delivery_root(root) / "evidence")
-
-
 def effective_instances(root) -> dict:
     """Independently reconstruct effective-instance readings from raw facts."""
 
@@ -1114,7 +1106,7 @@ def source_scopes(root) -> dict:
         else {}
     )
     delivery_root = _delivery_root(root)
-    frozen_source_digests = {}
+    archived_source_digests = {}
     for name, scope in record.items():
         if not native_source_scope_is_valid(scope, name):
             raise PipelineError(
@@ -1247,25 +1239,28 @@ def source_scopes(root) -> dict:
                 raise PipelineError(
                     f"File source identity differs from discovery: {name}"
                 )
-            frozen_source = confined(
-                delivery_root,
-                f"evidence/{scope['source_copy_path']}",
+            archived_relative = scope["source_copy_path"].removeprefix(
+                "source/"
             )
-            frozen_source_key = str(frozen_source.resolve())
-            if not frozen_source.is_file():
+            archived_source = confined(
+                delivery_root / "input/cad",
+                archived_relative,
+            )
+            archived_source_key = str(archived_source.resolve())
+            if not archived_source.is_file():
                 raise PipelineError(
-                    f"Frozen source bytes differ from the source scope: {name}"
+                    f"Archived source bytes differ from the source scope: {name}"
                 )
-            if frozen_source_key not in frozen_source_digests:
-                frozen_source_digests[frozen_source_key] = file_digest(
-                    frozen_source
+            if archived_source_key not in archived_source_digests:
+                archived_source_digests[archived_source_key] = file_digest(
+                    archived_source
                 )
             if (
-                frozen_source_digests[frozen_source_key]
+                archived_source_digests[archived_source_key]
                 != scope["source_copy_sha256"]
             ):
                 raise PipelineError(
-                    f"Frozen source bytes differ from the source scope: {name}"
+                    f"Archived source bytes differ from the source scope: {name}"
                 )
         else:
             provenance = discovery_row.get("source_provenance")

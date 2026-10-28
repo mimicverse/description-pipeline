@@ -6,7 +6,6 @@ import hashlib
 import zipfile
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 from ..build.archive import ZIP_EPOCH
 from ..io import PipelineError, artifact_path_parts, confined, digest, file_digest, read_data
@@ -22,12 +21,8 @@ from ..sources.solidworks.discover_stage import (
 )
 from ..sources.solidworks.handoff import MAX_HANDOFF_BYTES
 from ..sources.solidworks.discovery import DiscoverySettings, read_native_record
-from ..sources.solidworks.native_selection import project_native_closure
 from ..sources.solidworks.revision import package_inventory
 from .selection_transport import StagedSelection
-
-if TYPE_CHECKING:
-    from ..artifacts import ArtifactStore
 
 SOURCE_ARCHIVE = "source-set.zip"
 OBSERVATION_ARCHIVE = "native-observation.zip"
@@ -248,6 +243,8 @@ def run_windows_discover(
             staged.stage, DiscoverySettings(main_assembly=request.main_assembly),
             backend=backend, on_activity=on_activity,
         )
+        from ..sources.solidworks.native_selection import project_native_closure
+
         evidence = project_native_closure(
             staged.stage, request.main_assembly, request.source_files, record,
             reader_sha256=request.expected_native_tool_sha256,
@@ -272,84 +269,10 @@ def run_windows_discover(
         ) from error
 
 
-class ArchiveDiscoverAdapter:
-    """In-process native adapter; authorization is owned by ``StageEffectPort``.
-
-    The production HTTP adapter must accept the same sealed source archive once
-    and invoke :func:`run_windows_discover`; it must not add a definition
-    callback, selection round or Capture continuation.
-    """
-
-    def __init__(
-        self,
-        *,
-        artifacts: ArtifactStore,
-        native_tool: Mapping[str, object],
-        backend_factory: Callable | None = None,
-        cad_ownership_file: Path | None = None,
-        on_activity=None,
-    ) -> None:
-        self.artifacts = artifacts
-        self.native_tool = dict(native_tool)
-        self.backend_factory = backend_factory
-        self.cad_ownership_file = cad_ownership_file
-        self.on_activity = on_activity
-        self.invocations: list[dict] = []
-
-    def submit(
-        self,
-        source_archive: Path,
-        request: NativeDiscoverRequest,
-        target,
-        workspace: Path,
-    ) -> NativeObservation:
-        del target
-        self.invocations.append(
-            {
-                "operation_id": request.operation_id,
-                "archive_sha256": file_digest(Path(source_archive)),
-                "source_inventory_sha256": request.source_inventory_sha256,
-            }
-        )
-        return run_windows_discover(
-            source_archive,
-            request,
-            Path(workspace),
-            native_tool=self.native_tool,
-            backend_factory=self.backend_factory,
-            cad_ownership_file=self.cad_ownership_file,
-            on_activity=self.on_activity,
-        )
-
-    def resume_transfer(
-        self,
-        source_archive: Path,
-        request: NativeDiscoverRequest,
-        target,
-        workspace: Path,
-    ) -> NativeObservation | None:
-        return self.submit(source_archive, request, target, workspace)
-
-    def materialize(
-        self,
-        artifact,
-        request: NativeDiscoverRequest,
-        destination: Path,
-    ) -> NativeObservation:
-        root = self.artifacts.materialize(artifact, destination)
-        return admit_native_observation(
-            root,
-            request=request,
-            artifact_ref=artifact,
-            resources_settled=True,
-        )
-
-
 __all__ = [
     "MAX_OBSERVATION_BYTES",
     "OBSERVATION_ARCHIVE",
     "SOURCE_ARCHIVE",
-    "ArchiveDiscoverAdapter",
     "admit_observation_bundle",
     "run_windows_discover",
     "seal_observation_bundle",

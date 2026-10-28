@@ -21,7 +21,7 @@ from description_pipeline.interface_records import (
 from description_pipeline.pipeline.contracts import ArtifactRef
 from description_pipeline.request_evidence import (
     build_request_evidence,
-    write_request_evidence,
+    request_evidence_bytes,
 )
 from description_pipeline.runtime import tool_record
 from description_pipeline.schemas import (
@@ -124,7 +124,6 @@ def build_sealed_delivery(
     (root / "urdf" / "robot.urdf").write_text("<robot/>\n", encoding="utf-8")
     (root / "meshes" / "part.stl").write_bytes(b"mesh-stl")
     write_json(root / "tool.json", tool_record())
-    write_json(root / "reports" / "quality.json", {"quality": "fixture"})
     write_json(
         root / "reports" / "generate.json",
         {"fixture": "generate-receipt"},
@@ -177,17 +176,18 @@ def build_sealed_delivery(
         {"fixture": "publication-observation"},
     )
     (root / "candidate.bundle").write_bytes(b"fixture-candidate\n")
-    write_request_evidence(
-        root / "input" / "request.json",
-        build_request_evidence(
-            purpose="engineering",
-            request_id="fixture-sealed-delivery",
-            target_hardware=hardware_id,
-            change_summary="fixture",
-            main_assembly="cad/robot.SLDASM",
-            handoff_digest=digest(package_files),
-            platform_config_digest="c" * 64,
-        ),
+    (root / "input" / "request.json").write_bytes(
+        request_evidence_bytes(
+            build_request_evidence(
+                purpose="engineering",
+                request_id="fixture-sealed-delivery",
+                target_hardware=hardware_id,
+                change_summary="fixture",
+                main_assembly="cad/robot.SLDASM",
+                handoff_digest=digest(package_files),
+                platform_config_digest="c" * 64,
+            )
+        )
     )
     write_delivery_manifest(
         root,
@@ -772,7 +772,7 @@ class RegisteredPlatform:
         )
         quality = {}
         try:
-            parsed = json.loads(files.get("reports/quality.json", b"{}"))
+            parsed = json.loads(files.get("verification-certificate.json", b"{}"))
             quality = parsed if isinstance(parsed, dict) else {}
         except ValueError:
             quality = {}

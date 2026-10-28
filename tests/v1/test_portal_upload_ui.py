@@ -144,7 +144,6 @@ class UploadUiContractTests(unittest.TestCase):
         self.assertIn('$("upload-view").hidden = true', app)
         self.assertIn('$("detail-card").hidden = true', app)
         self.assertGreaterEqual(app.count("run-error-detail"), 3)
-        self.assertIn("terminalNow", app)
 
 
 class UploadRenderTests(unittest.TestCase):
@@ -288,7 +287,7 @@ class ReportUiContractTests(unittest.TestCase):
             "stage.counts.warnings",
             "Qualification blocker: ",
             "Publication blocker: ",
-            "Recorded values",
+            "Source values",
             "warningValueText",
             "rows.slice(0, WARNING_ROW_LIMIT)",
             "WARNING_VALUE_LIMIT",

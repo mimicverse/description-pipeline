@@ -934,10 +934,8 @@ def _capture_prepared_local(
         stage = "environment"
         environment = capture_environment(backend, worker_version)
         environment["prepared_capture"] = {
-            "mode": "single_read_only_prepared_capture",
             "policy": prepared_policy,
             "opened": opened,
-            "state_before": state_before,
         }
 
         stage = "readings"
@@ -1004,6 +1002,7 @@ def _capture_prepared_local(
             lock.unlink()
         originals = _verify_sealed_capture_copy(closure)
         source_inputs = _source_inputs(cfg, closure)
+        shutil.rmtree(source_root)
         raw_facts = {
             **raw_facts,
             "source_scopes": source_scopes,
@@ -1079,17 +1078,6 @@ def _capture_prepared_local(
         raise
     finally:
         activity.stop_keepalive()
-
-#: Every raw native document that records an inertia tensor, in write order.
-_CONVENTION_DOCUMENTS = (
-    "mass_properties.json",
-    "scene_raw.json",
-    "effective_instances.json",
-    "mass_closure.json",
-    "material_provenance.json",
-    "link_group_mass_properties.json",
-)
-
 
 def capture_prepared(
     config: dict[str, Any],

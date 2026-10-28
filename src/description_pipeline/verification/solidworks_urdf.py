@@ -233,7 +233,9 @@ def require_qualified_report(report, definition, root=None):
             and len(executed) == len(expected)
             and set(executed) == set(expected)
             and required_rows_complete(expected, rows),
-            "URDF verification failed or required checks were not executed; see reports/quality.json",
+            "URDF verification failed or required checks were not executed; "
+            "see reports/verification-certificate.json and "
+            "reports/verification-execution.json",
         )
         qualifications = report.get("qualifications")
         facts = qualification_facts(definition)
@@ -598,14 +600,6 @@ def _native(root, manifest):
 
 
 
-def _same_native_path(left, right) -> bool:
-    return bool(
-        isinstance(left, str)
-        and isinstance(right, str)
-        and ntpath.normcase(ntpath.abspath(left)) == ntpath.normcase(ntpath.abspath(right))
-    )
-
-
 def _native_discovery(package, diagnostics=None):
     """Mandatory native-discovery gate: an authored or stripped package fails.
 
@@ -671,15 +665,17 @@ def _dependencies(root, definition):
     _require(closure["configuration"] == definition["source"]["configuration"], "Captured another configuration")
     original = closure["original_files"]
     _require(bool(original) and bool(closure["mapping"]), "Missing dependency mapping")
-    actual = {"source/" + name: checksum for name, checksum in inventory(root / "evidence/source").items()}
-    _require(actual == closure["copy_files"], "Collected CAD changed")
-    # The frozen tree carries the dependency-closure copies under
-    # ``evidence/source``; the discovery inventory binds the frozen originals
-    # under ``input/cad``.
+    actual = {
+        "source/" + name: checksum
+        for name, checksum in inventory(root / "input/cad").items()
+    }
+    _require(actual == closure["copy_files"], "Archived CAD changed")
+    # The retained package originals under ``input/cad`` are the sole CAD byte
+    # authority. The dependency-closure ``source/`` prefix records the
+    # prepared-copy namespace used during Capture; it is not a second tree.
     _handoff_native_hashes(root)
-    # Every retained source is copied byte-for-byte from the sealed prepared
-    # inventory.  Original identity and copy identity are both checked against
-    # the same upload index below.
+    # Original identity and prepared-copy identity are both checked against the
+    # same upload index below.
     handoff = evidence.handoff(root)
     package_files = handoff.get("package_files")
     _require(isinstance(package_files, dict) and bool(package_files), "The frozen upload index is missing")
@@ -3362,28 +3358,3 @@ def _expectation_bounds(bounds):
     )
     _require(0 <= bounds[0] < bounds[1], "Design bounds must be nonnegative and strictly ordered")
     return list(bounds)
-
-
-def check_bundle(
-    root: Path,
-    *,
-    native_receipts=None,
-    require_native_receipts: bool = False,
-) -> dict:
-    """Recompute all gates and require an exact binding to the saved report."""
-    report = evaluate_bundle(
-        root,
-        native_receipts=native_receipts,
-        require_native_receipts=require_native_receipts,
-    )
-    try:
-        saved = read_data(confined(Path(root), "reports/quality.json"))
-        # The quality report is a JSON document: bind in the JSON data model so a
-        # recomputed tuple cannot make every saved report differ from itself.
-        _require(saved == json.loads(json.dumps(report)), "Saved quality report differs from recomputation")
-    except (OSError, ValueError) as error:
-        report["checks"].append(
-            {"id": "report.binding", "state": "failed", "passed": False, "details": {"error": str(error)}}
-        )
-        report["passed"] = False
-    return report

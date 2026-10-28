@@ -10,17 +10,13 @@ that produced them.
 from __future__ import annotations
 
 import math
-from pathlib import Path
 from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
 
 from ...geometry.native_transform import rigid_matrix_from_row_major
-from .jsonio import read_json
 from .native_limits import NativeLimitInvalidError, finite_number
-from ...io import PipelineError
-from ...schemas import EFFECTIVE_INSTANCES_SCHEMA as EFFECTIVE_SCHEMA
 
 INERTIA_ORDER = ("ixx", "ixy", "ixz", "iyy", "iyz", "izz")
 # Same API, selection scopes measured on the analytic native fixture
@@ -40,21 +36,6 @@ COM_ATOL = 1e-9
 COM_RTOL = 1e-7
 INERTIA_ATOL = 1e-12
 INERTIA_RTOL = 1e-6
-
-
-def _result(code: str, passed: bool, *, expected=(), checked=(), details=None, status=None) -> dict:
-    """The shared verification result shape, built without importing it."""
-
-    missing = sorted(set(expected) - set(checked))
-    return {
-        "id": code,
-        "version": 1,
-        "status": status or ("passed" if passed and not missing else "failed"),
-        "expected": sorted(expected),
-        "checked": sorted(checked),
-        "missing": missing,
-        "details": {} if details is None else details,
-    }
 
 
 def _rpy_matrix(rpy: Sequence[float] | np.ndarray) -> np.ndarray:
@@ -477,45 +458,6 @@ def _component_mass(component: str, payload: dict) -> tuple[float, np.ndarray, n
     inertia = _raw_tensor(component, payload)
     note = {"component": component, "raw_mass_kg": mass, "used_mass_kg": mass, "scale": 1.0}
     return mass, com, inertia, note
-
-
-def load_effective_instances(evidence_root) -> dict[str, dict]:
-    """The sealed effective-instance warnings, keyed by occurrence name.
-
-    Both the sheet-only leaf fallback and non-leaf (group) native overrides are
-    recorded here; the raw math stays in ``mass_properties.json`` rows and
-    ``scene_raw.notes.effective_instances``, and this record binds them with
-    verbatim measured values.  The record lives in the delivery capture block
-    ``effective_instances``; the caller may pass the delivery root or its
-    ``evidence/`` directory.
-    """
-
-    root = Path(evidence_root)
-    base = root.parent if root.name == "evidence" else root
-    capture_path = base / "evidence" / "capture.json"
-    if not capture_path.is_file():
-        raise PipelineError("the CAD capture has no capture record")
-    capture = read_json(capture_path)
-    payload = capture.get("effective_instances") if isinstance(capture, dict) else None
-    if not isinstance(payload, dict):
-        raise PipelineError("the CAD capture has no effective instance record")
-    if payload.get("schema_version") != EFFECTIVE_SCHEMA:
-        raise PipelineError("effective instance record schema changed")
-    warnings = payload.get("warnings")
-    if not isinstance(warnings, list):
-        raise PipelineError("effective instance record has no warnings list")
-    entries: dict[tuple[str, str], dict] = {}
-    for entry in warnings:
-        if not isinstance(entry, dict):
-            raise PipelineError("effective instance record carries a malformed warning")
-        component = entry.get("component")
-        code = entry.get("code")
-        if not isinstance(component, str) or not component or not isinstance(code, str) or not code:
-            raise PipelineError("effective instance record names an unknown or repeated occurrence")
-        if (component, code) in entries:
-            raise PipelineError("effective instance record names an unknown or repeated occurrence")
-        entries[(component, code)] = entry
-    return entries
 
 
 def _notes_effective(raw_scene: dict) -> dict[str, dict]:

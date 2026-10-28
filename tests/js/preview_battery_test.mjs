@@ -70,7 +70,7 @@ const {
     runId: "portal-20261015T000000-aa11bb22",
     subjectSha256: "a".repeat(64),
     tool,
-    qualitySchema: "solidworks-to-urdf.quality/v1",
+    certificateSchema: "solidworks-to-urdf.quality/v1",
     qualificationStates: [
       { fact_id: "drive_sizing", status: "unqualified" },
       { fact_id: "machine_qualification", status: "out_of_scope" },
@@ -136,7 +136,7 @@ const {
   const quick = stageSummaryRows("generate", {
     files: {},
     stage: null,
-    quality: null,
+    certificate: null,
     pr: null,
     subjectSha256: record.subject_sha256,
   });

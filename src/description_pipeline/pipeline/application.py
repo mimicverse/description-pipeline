@@ -349,8 +349,6 @@ def _registered_native_target_from_environment(
 class AdmissionFactPort(Protocol):
     def load_admission(self, run_id: str) -> RunAdmission | None: ...
 
-    def load_admission_by_request_id(self, request_id: str) -> RunAdmission | None: ...
-
     def admit_run(
         self,
         admission: RunAdmission,
@@ -991,22 +989,6 @@ class StageApplication:
             target_effect_id=target_effect_id,
         )
 
-    def admission_by_request_id(self, request_id: str) -> RunAdmission | None:
-        """Read one existing admission by its stable request key."""
-
-        if not isinstance(request_id, str) or not request_id:
-            raise ApplicationError(
-                "application.request_id_invalid",
-                "A non-empty request id is required",
-            )
-        loader = getattr(self.facts, "load_admission_by_request_id", None)
-        if not callable(loader):
-            raise ApplicationError(
-                "application.request_lookup_missing",
-                "The fact store cannot resolve request-id admission identity",
-            )
-        return loader(request_id)
-
     def _load_spec(self, run_id: str) -> tuple[AdmissionSpec, RunAdmission]:
         admission = self.facts.load_admission(run_id)
         if admission is None:
@@ -1383,35 +1365,6 @@ class StageApplication:
         )
 
 
-def build_stage_application(
-    *,
-    services: StageServices,
-    facts: AdmissionFactPort,
-    artifacts: ArtifactStore,
-    handlers: Mapping[StageId, StageHandler],
-    builders: Mapping[StageId, CommandBuilder] | None = None,
-    clock: Callable[[], datetime] = _utc_now,
-    reconciler: EffectReconciliationService | None = None,
-    reconciliation_adapters: Mapping[str, EffectReconciliationAdapter] | None = None,
-    cancellation_controllers: Mapping[str, CancellationControlPort] | None = None,
-    native_target_identity: NativeTargetIdentity | None = None,
-) -> StageApplication:
-    """Construct one immutable application from explicit ports; no hidden fallback exists."""
-
-    return StageApplication(
-        services=services,
-        facts=facts,
-        artifacts=artifacts,
-        handlers=handlers,
-        builders=builders or {},
-        clock=clock,
-        reconciler=reconciler,
-        reconciliation_adapters=reconciliation_adapters,
-        cancellation_controllers=cancellation_controllers,
-        native_target_identity=native_target_identity,
-    )
-
-
 def application_from_environment(
     environ: Mapping[str, str] | None = None,
     *,
@@ -1634,5 +1587,4 @@ __all__ = [
     "EffectWakeupHint",
     "StageApplication",
     "application_from_environment",
-    "build_stage_application",
 ]

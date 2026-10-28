@@ -220,7 +220,7 @@ class PublishRecoveryPostgresTests(unittest.TestCase):
         original_plan = json.loads((outbound / publish_stage.PUBLICATION_PLAN).read_bytes())
         self.assertEqual(digest({"body": rows[0]["body"]}), original_plan["pr_body_sha256"])
         self.assertIn("`input.cad_revision_absent`", rows[0]["body"])
-        self.assertEqual(rows[0]["body"].count("Verification warnings:"), 1)
+        self.assertEqual(rows[0]["body"].count("Verification warnings ("), 1)
 
     def test_two_process_absence_stays_unknown_and_never_creates_pr(self) -> None:
         command = self._command("absence")

@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
-import tempfile
 import unittest
-from pathlib import Path
 
 from description_pipeline.geometry.native_scope import (
     NATIVE_GATE_WARNING_CODES,
@@ -16,10 +14,9 @@ from description_pipeline.geometry.native_scope import (
     native_gate_warning_details_match,
     native_scope_identity_sha256,
 )
-from description_pipeline.io import PipelineError, write_json
+from description_pipeline.io import PipelineError
 from description_pipeline.orchestration.portal import PortalError, _quality_warnings
 from description_pipeline.orchestration.report_view import _recorded_warnings
-from description_pipeline.structural_report import build_structural_report
 from description_pipeline.verification.solidworks_urdf import native_gate_warning_diagnostics
 
 
@@ -71,13 +68,6 @@ def quality_report(raw: list[dict], rows: list[dict] | None = None) -> dict:
     return json.loads(json.dumps(report))
 
 
-def structural_report(quality: dict) -> dict:
-    with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary)
-        write_json(root / "reports/quality.json", quality)
-        return build_structural_report({}, evidence_root=root)
-
-
 def recorded_warnings(quality: dict) -> list[dict]:
     check = quality["checks"][0]
     return _recorded_warnings(
@@ -99,12 +89,7 @@ class NativeScopeWarningProjectionTests(unittest.TestCase):
                 raw = raw_warnings(kind)
                 quality = quality_report(raw)
                 expected = raw[0]["detail"]
-                findings = [
-                    row for row in structural_report(quality)["findings"]
-                    if row["code"] == NATIVE_SCOPE_LOCAL_IDENTITY_DERIVED
-                ]
                 for surface, projected in (
-                    ("structural", findings),
                     ("portal", _quality_warnings(quality)),
                     ("view", recorded_warnings(quality)),
                 ):
@@ -154,10 +139,6 @@ class NativeScopeWarningProjectionTests(unittest.TestCase):
                     native_gate_warning_diagnostics({"warnings": [row]})
 
     def assert_rejected_by_reports(self, quality):
-        self.assertIn(
-            "report.native_identity_warning_invalid",
-            {row["code"] for row in structural_report(quality)["findings"]},
-        )
         with self.assertRaises(PortalError):
             _quality_warnings(quality)
         with self.assertRaises(PipelineError):
@@ -223,10 +204,6 @@ class NativeScopeWarningProjectionTests(unittest.TestCase):
         quality["checks"][0].update(state="failed", passed=False)
         self.assertEqual(_quality_warnings(quality), [])
         self.assertEqual(recorded_warnings(quality), [])
-        self.assertNotIn(
-            "report.native_identity_warning_invalid",
-            {row["code"] for row in structural_report(quality)["findings"]},
-        )
 
     def test_a_passed_native_gate_requires_its_explicit_warning_list(self):
         for details in ({}, {"warnings": "not-a-list"}):

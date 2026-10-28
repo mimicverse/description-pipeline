@@ -89,6 +89,45 @@ def passed_job() -> dict:
 
 
 class ReportViewTests(unittest.TestCase):
+    def test_nested_blocking_and_unknown_diagnostics_are_not_downgraded(self) -> None:
+        from description_pipeline.orchestration.report_view import _recorded_warnings, _warning_row
+        from description_pipeline.io import PipelineError
+
+        for field in ("warnings", "diagnostics"):
+            for value in (True, None, "false"):
+                diagnostic = {"code": "recorded.failure", "blocking": value}
+                rows = [{"id": "check", "state": "failed", "raw_details": {field: [diagnostic]}}]
+                self.assertEqual(_recorded_warnings({"id": "verify"}, [], rows, []), [])
+                with self.assertRaises(PipelineError):
+                    _warning_row({"id": "verify"}, diagnostic)
+
+    def test_warning_consumers_preserve_complete_distinct_instance_records(self) -> None:
+        from description_pipeline.orchestration.portal import _delivery_warnings, _preview_warnings
+        from description_pipeline.orchestration.report_view import _recorded_warnings
+        import json
+
+        rows = [
+            {
+                "code": "cad_instance_override_effective", "blocking": False,
+                "component": component, "field": "mass",
+                "qualification": {"hardware_qualified": False},
+                "measured": {"mass_kg": 1.0}, "overrides": {"mass": True},
+                "objects": [{"object": component}], "source": "cad_api",
+            }
+            for component in ("left_wheel", "right_wheel")
+        ]
+        delivered = _delivery_warnings({"input/handoff.json": json.dumps({"warnings": rows}).encode()})
+        preview = _preview_warnings(rows, delivered)
+        report = _recorded_warnings({"id": "verify", "name": "Verify"}, [], [], rows)
+        self.assertEqual(len(preview), 2)
+        self.assertEqual(len(report), 2)
+        for expected in rows:
+            for projected in (delivered, preview, report):
+                actual = next(row for row in projected if row["component"] == expected["component"])
+                self.assertEqual({key: actual[key] for key in expected}, expected)
+        other_source = {**rows[0], "source": "independent_native_observation"}
+        self.assertEqual(len(_preview_warnings(rows, [other_source])), 3)
+
     def test_activity_view_keeps_native_read_release_and_offline_phases(self) -> None:
         view = activity_view(
             {
@@ -807,11 +846,23 @@ class ReportViewTests(unittest.TestCase):
         self.assertEqual(warning["mate"], "平行24")
         self.assertEqual(warning["components"], ["hip-1", "thigh_link-1"])
         self.assertEqual(warning["links"], ["r_thigh_yaw", "r_thigh_roll"])
-        self.assertEqual(
-            warning["residual"], {"max_abs_residual": 1.0, "max_normalized_residual": 1.0, "threshold": 1e-6}
-        )
+        for key, value in {"max_abs_residual": 1.0, "max_normalized_residual": 1.0, "threshold": 1e-6}.items():
+            self.assertEqual(warning["detail"][key], value)
         check = next(row for row in verify["independent"] if row["id"] == "discovery.declarations")
         self.assertEqual(check["state"], "passed")
+
+    def test_all_nonblocking_diagnostics_survive_without_duplicate_rows(self) -> None:
+        job = passed_job()
+        diagnostics = [
+            {"code": code, "blocking": False, "object": "joint:left", "detail": {"hardware_qualified": False}}
+            for code in ("limits.default_policy", "input.cad_revision_absent", "urdf.motion_unqualified")
+        ]
+        job["result"]["quality"]["diagnostics"] = [*diagnostics, diagnostics[0]]
+        report = build_report(job)
+        verify = next(stage for stage in report["stages"] if stage["id"] == "verify")
+        warnings = [row for row in verify["warnings"] if row["code"] in {d["code"] for d in diagnostics}]
+        self.assertEqual(len(warnings), 3)
+        self.assertTrue(all(row["detail"]["hardware_qualified"] is False for row in warnings))
 
     def test_metadata_quality_diagnostic_survives_the_verify_report_projection(self) -> None:
         job = passed_job()

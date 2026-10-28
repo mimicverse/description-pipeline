@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 from description_pipeline.geometry.native_scope import (
+    NATIVE_SOURCE_SCOPE_RULE,
     native_scope_identity_sha256,
 )
 from description_pipeline.geometry.native_tessellation import (
@@ -45,7 +46,7 @@ class SourceScopeTests(unittest.TestCase):
             source_copy_path="source/Part.SLDPRT",
             source_document_sha256=self.source_sha256,
         )
-        frozen = self.root / "evidence/source/Part.SLDPRT"
+        frozen = self.root / "input/cad/Part.SLDPRT"
         frozen.parent.mkdir(parents=True)
         frozen.write_bytes(self.source_bytes)
         self._write_stream()
@@ -110,6 +111,7 @@ class SourceScopeTests(unittest.TestCase):
                         "name": "part-1",
                         "path": source_path,
                         "transform_raw": transform,
+                        "suppression_state": 2,
                         "is_fixed": True,
                         "document_type": "part",
                     }
@@ -118,6 +120,7 @@ class SourceScopeTests(unittest.TestCase):
                     {
                         "name": "part-1",
                         "path": source_path,
+                        "suppression_state": 2,
                         "is_fixed": True,
                         "document_type": "part",
                     }
@@ -138,7 +141,6 @@ class SourceScopeTests(unittest.TestCase):
             "geometry_raw": {
                 "part-1": {
                     **self.stream,
-                    "transform_raw": transform,
                     "body_inventory": [],
                     "face_inventory": [],
                     "body_counts": {"solid": 0, "sheet": 0},
@@ -150,7 +152,18 @@ class SourceScopeTests(unittest.TestCase):
                 }
             },
             "axis_references_raw": [],
-            "document_state": {},
+            "document_state": {
+                "before": {
+                    "path": r"C:\source\Part.SLDASM",
+                    "read_only": True,
+                    "active_configuration": "Default",
+                },
+                "after": {
+                    "path": r"C:\source\Part.SLDASM",
+                    "read_only": True,
+                    "active_configuration": "Default",
+                },
+            },
             "input_stability": {},
             "notes": {},
         }
@@ -239,14 +252,80 @@ class SourceScopeTests(unittest.TestCase):
             },
         )
 
+    def _use_virtual_source(self) -> str:
+        source_path = (
+            r"C:\Users\operator\AppData\Local\Temp"
+            r"\swx21040\VC~~\owner\Copy of part.SLDPRT"
+        )
+        source_root = r"C:\Users\operator\AppData\Local\Temp\swx21040"
+        owner = "owner.SLDPRT"
+        owner_sha256 = self.source_sha256
+        scope = {
+            "rule_version": NATIVE_SOURCE_SCOPE_RULE,
+            "component": "part-1",
+            "source_document_path": source_path,
+            "source_copy_path": None,
+            "source_document_sha256": None,
+            "source_copy_sha256": None,
+            "source_document_identity_sha256": hashlib.sha256(
+                source_path.encode("utf-8")
+            ).hexdigest(),
+            "source_document_identity_kind": "virtual_path_sha256",
+            "referenced_configuration": "Default",
+            "occurrence_scope": "part-1",
+            "virtual_owner": owner,
+            "virtual_owner_sha256": owner_sha256,
+            "virtual_session_document_path": source_path,
+            "virtual_session_temp_root": source_root,
+            "virtual_native_api_pid": 21040,
+        }
+        facts_path = (
+            self.root / "evidence/raw/native_capture_facts.json"
+        )
+        observation = read_data(facts_path)
+        observation["source_scopes"]["part-1"] = scope
+        observation["geometry_raw"]["part-1"][
+            "source_scope_sha256"
+        ] = native_scope_identity_sha256(scope)
+        for row in (
+            observation["scene_raw"]["occurrences"][0],
+            observation["scene_raw"]["components"][0],
+        ):
+            row["path"] = source_path
+        write_json(facts_path, observation)
+
+        discovery_path = (
+            self.root / "input/discovery/native-discovery.json"
+        )
+        discovery = read_data(discovery_path)
+        discovery["raw"]["components"][0].update(
+            document="Copy of part.SLDPRT",
+            source_provenance={
+                "state": "embedded_virtual_component",
+                "kind": "native_embedded_virtual_component",
+                "owner": owner,
+                "owner_sha256": owner_sha256,
+                "occurrence": "part-1",
+                "session_document_path": source_path,
+                "session_temp_root": source_root,
+                "native_api_pid": 21040,
+                "is_virtual": True,
+            },
+        )
+        discovery["raw"]["files"] = {owner: owner_sha256}
+        discovery["native_files"] = {owner: owner_sha256}
+        discovery["handoff_sha256"] = digest({owner: owner_sha256})
+        write_json(discovery_path, discovery)
+        return source_path
+
     def test_file_scope_returns_the_exact_sealed_mapping(self) -> None:
         self.assertEqual(source_scopes(self.root), {"part-1": self.scope})
 
     def test_changed_frozen_copy_is_refused(self) -> None:
-        (self.root / "evidence/source/Part.SLDPRT").write_bytes(
+        (self.root / "input/cad/Part.SLDPRT").write_bytes(
             b"changed"
         )
-        with self.assertRaisesRegex(PipelineError, "Frozen source bytes differ"):
+        with self.assertRaisesRegex(PipelineError, "Archived source bytes differ"):
             source_scopes(self.root)
 
     def test_missing_discovery_component_is_refused(self) -> None:
@@ -266,6 +345,35 @@ class SourceScopeTests(unittest.TestCase):
         observation["source_scopes"]["part-1"]["component"] = "other"
         write_json(path, observation)
         with self.assertRaisesRegex(PipelineError, "scope differs"):
+            source_scopes(self.root)
+
+    def test_virtual_scope_keeps_its_session_identity_without_a_file_copy(
+        self,
+    ) -> None:
+        source_path = self._use_virtual_source()
+        scope = source_scopes(self.root)["part-1"]
+        self.assertEqual(scope["source_document_identity_kind"], "virtual_path_sha256")
+        self.assertIsNone(scope["source_copy_path"])
+        self.assertIsNone(scope["source_document_sha256"])
+        self.assertEqual(scope["source_document_path"], source_path)
+        self.assertEqual(scope["virtual_session_document_path"], source_path)
+
+    def test_virtual_scope_rejects_an_owner_file_as_the_session_document(
+        self,
+    ) -> None:
+        self._use_virtual_source()
+        discovery_path = (
+            self.root / "input/discovery/native-discovery.json"
+        )
+        discovery = read_data(discovery_path)
+        discovery["raw"]["components"][0]["source_provenance"][
+            "session_document_path"
+        ] = r"C:\Users\operator\AppData\Local\Temp\swx21040\owner.SLDPRT"
+        write_json(discovery_path, discovery)
+        with self.assertRaisesRegex(
+            PipelineError,
+            "Virtual source owner/path/root differs",
+        ):
             source_scopes(self.root)
 
 

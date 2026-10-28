@@ -172,7 +172,7 @@ class ArtifactStoreTests(unittest.TestCase):
             os.symlink(source, linked, target_is_directory=True)
         except OSError as error:
             self.skipTest(f"The host cannot create a symbolic link: {error}")
-        with self.assertRaisesRegex(ArtifactStoreError, "source root"):
+        with self.assertRaisesRegex(ArtifactStoreError, "traverse a symbolic link"):
             self.store.seal_tree(
                 linked,
                 kind="generated",
@@ -180,6 +180,25 @@ class ArtifactStoreTests(unittest.TestCase):
                 producer_stage="generate",
                 producer_tool_sha256=self.tool,
             )
+
+    def test_linked_parent_is_rejected_before_resolve(self) -> None:
+        real = self.root / "real"
+        real.mkdir()
+        linked = self.root / "linked-parent"
+        try:
+            os.symlink(real, linked, target_is_directory=True)
+        except OSError as error:
+            self.skipTest(f"The host cannot create a symbolic link: {error}")
+        with self.assertRaisesRegex(ArtifactStoreError, "traverse"):
+            ArtifactStore(linked / "cas")
+        with self.assertRaisesRegex(ArtifactStoreError, "traverse"):
+            ArtifactStore(linked / ".." / "cas")
+
+        source = real / "source"
+        (source / "nested").mkdir(parents=True)
+        (source / "nested" / "a.txt").write_text("alpha\n", encoding="utf-8")
+        with self.assertRaisesRegex(ArtifactStoreError, "traverse"):
+            self.seal(linked / "source")
 
     def test_stage_result_record_roundtrip_is_byte_verified(self) -> None:
         output = self.seal(self.source("output"))

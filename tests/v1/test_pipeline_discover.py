@@ -30,12 +30,12 @@ from description_pipeline.orchestration.native_operation_runtime import (
     DISCOVER_KIND,
 )
 from description_pipeline.orchestration.discover_protocol import (
-    ArchiveDiscoverAdapter,
     admit_observation_bundle,
     seal_observation_bundle,
     seal_source_archive,
     run_windows_discover,
 )
+from tests.v1.archive_discover_adapter import ArchiveDiscoverAdapter
 from description_pipeline.orchestration.native_operation_client import (
     native_discover_operation_id,
 )

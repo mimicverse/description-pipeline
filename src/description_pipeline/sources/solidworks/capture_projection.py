@@ -9,24 +9,28 @@ from __future__ import annotations
 
 import copy
 import math
+import ntpath
 from collections.abc import Mapping
 from pathlib import Path
 
 from ...geometry.native_scope import native_scope_identity_sha256
 from ...geometry.native_tessellation import (
+    VerifiedNativeTriangleStream,
+    inspect_native_triangle_stream,
     native_triangle_relative_path,
-    read_native_triangle_count,
 )
 from ...geometry.native_transform import transform_from_solidworks
-from ...io import PipelineError, confined, file_digest, read_data
+from ...io import PipelineError, confined, read_data
 from ...schemas import (
     EFFECTIVE_INSTANCES_SCHEMA,
     LINK_GROUP_MASS_SCHEMA,
     NATIVE_CAPTURE_FACTS_KEYS,
     NATIVE_CAPTURE_OBSERVATION_KEYS,
     NATIVE_CAPTURE_OBSERVATION_SCHEMA,
+    NATIVE_SCENE_RAW_KEYS,
 )
 from .capture_geometry import RAW_GEOMETRY_KEYS
+from .capture_package import validate_capture_plan_shape
 from .errors import CadError
 from .inertia_convention import POSITIVE, STANDARD, detect_family
 from .protocol import Matrix, RawComponent, RawScene
@@ -47,9 +51,12 @@ def build_native_capture_observation(
 ) -> dict:
     """Assemble the one raw-only observation without projecting it."""
 
+    scene_raw = facts.get("scene_raw") if isinstance(facts, Mapping) else None
     if (
         not isinstance(facts, Mapping)
         or set(facts) != NATIVE_CAPTURE_FACTS_KEYS
+        or not isinstance(scene_raw, Mapping)
+        or set(scene_raw) != NATIVE_SCENE_RAW_KEYS
         or not isinstance(geometry_raw, Mapping)
         or not isinstance(axis_references_raw, list)
         or not isinstance(document_state, Mapping)
@@ -66,7 +73,11 @@ def build_native_capture_observation(
     }
 
 
-def load_native_capture_observation(evidence_root: Path) -> dict:
+def load_native_capture_observation(
+    evidence_root: Path,
+    *,
+    verified_streams: dict[str, VerifiedNativeTriangleStream] | None = None,
+) -> dict:
     """Load and byte-bind the raw-only Capture observation.
 
     The returned mapping is the existing raw-record contract extended with
@@ -94,6 +105,45 @@ def load_native_capture_observation(evidence_root: Path) -> dict:
         or not isinstance(axes_raw, list)
     ):
         raise PipelineError("Native Capture observation inventories differ")
+    scene_raw = record.get("scene_raw")
+    document_state = record.get("document_state")
+    scene_document = (
+        scene_raw.get("document") if isinstance(scene_raw, Mapping) else None
+    )
+    scene_configuration = (
+        scene_raw.get("configuration")
+        if isinstance(scene_raw, Mapping)
+        else None
+    )
+    if (
+        not isinstance(scene_document, str)
+        or not scene_document
+        or not isinstance(scene_configuration, str)
+        or not scene_configuration
+        or not isinstance(document_state, dict)
+        or set(document_state) != {"before", "after"}
+        or not isinstance(scene_raw, Mapping)
+        or set(scene_raw) != NATIVE_SCENE_RAW_KEYS
+    ):
+        raise PipelineError("Native Capture document identity is incomplete")
+    normalized_document = ntpath.normcase(
+        ntpath.normpath(scene_document.replace("/", "\\"))
+    )
+    for phase in ("before", "after"):
+        state = document_state.get(phase)
+        state_path = state.get("path") if isinstance(state, dict) else None
+        if (
+            not isinstance(state_path, str)
+            or ntpath.normcase(
+                ntpath.normpath(state_path.replace("/", "\\"))
+            )
+            != normalized_document
+            or state.get("read_only") is not True
+            or state.get("active_configuration") != scene_configuration
+        ):
+            raise PipelineError(
+                f"Native Capture document {phase} state is not the requested read-only configuration"
+            )
     for component, raw in geometry_raw.items():
         if (
             not isinstance(component, str)
@@ -121,14 +171,13 @@ def load_native_capture_observation(evidence_root: Path) -> dict:
                 f"Native Capture triangle path is not canonical: {component}"
             )
         stream = confined(root, str(stream_path))
-        if file_digest(stream) != stream_sha256:
-            raise PipelineError(
-                f"Native Capture triangle stream differs: {component}"
-            )
-        if read_native_triangle_count(stream) != raw.get("triangle_count"):
-            raise PipelineError(
-                f"Native Capture triangle count differs: {component}"
-            )
+        verified = inspect_native_triangle_stream(
+            stream,
+            expected_sha256=str(stream_sha256),
+            expected_count=raw.get("triangle_count"),
+        )
+        if verified_streams is not None:
+            verified_streams[component] = verified
     return record
 
 
@@ -139,51 +188,136 @@ def validate_native_capture_plan(observation: Mapping, plan: Mapping) -> None:
         not isinstance(observation, Mapping)
         or set(observation) != NATIVE_CAPTURE_OBSERVATION_KEYS
         or observation.get("schema_version") != NATIVE_CAPTURE_OBSERVATION_SCHEMA
-        or not isinstance(plan, Mapping)
     ):
         raise PipelineError("Native Capture observation or plan is incomplete")
+    plan = validate_capture_plan_shape(plan)
     source_scopes = observation.get("source_scopes")
-    objects = plan.get("objects")
-    groups = plan.get("groups")
-    axes = plan.get("axis_requests")
-    datums = plan.get("datums")
+    geometry_raw = observation.get("geometry_raw")
+    part_mass = observation.get("part_mass_raw")
+    assembly_mass = observation.get("assembly_mass_raw")
+    component_mass = observation.get("component_mass_raw")
+    link_group = observation.get("link_group_mass_raw")
+    scene_raw = observation.get("scene_raw")
     if (
         not isinstance(source_scopes, dict)
-        or not isinstance(objects, list)
-        or not isinstance(groups, list)
-        or not isinstance(axes, list)
-        or not isinstance(datums, list)
+        or not source_scopes
+        or not isinstance(geometry_raw, dict)
+        or set(geometry_raw) != set(source_scopes)
+        or not isinstance(part_mass, dict)
+        or not part_mass
+        or not isinstance(assembly_mass, dict)
+        or not isinstance(component_mass, dict)
+        or not isinstance(link_group, dict)
+        or not isinstance(link_group.get("links"), dict)
+        or not link_group["links"]
+        or not isinstance(scene_raw, Mapping)
+        or set(scene_raw) != NATIVE_SCENE_RAW_KEYS
     ):
-        raise PipelineError("Native Capture plan inventories are malformed")
-    object_names = [
-        item.get("name")
-        for item in objects
-        if isinstance(item, dict)
-    ]
+        raise PipelineError("Native Capture raw required inventories are incomplete")
+    scene_document = str(scene_raw.get("document") or "").replace("\\", "/")
+    scene_configuration = scene_raw.get("configuration")
+    planned_main = str(plan["main_assembly"]).replace("\\", "/").casefold()
     if (
-        len(object_names) != len(objects)
-        or any(not isinstance(name, str) or not name for name in object_names)
-        or len(set(object_names)) != len(object_names)
-        or set(object_names) != set(source_scopes)
+        not scene_document
+        or not (
+            scene_document.casefold() == planned_main
+            or scene_document.casefold().endswith("/" + planned_main)
+        )
+        or scene_configuration != plan["configuration"]
     ):
         raise PipelineError(
-            "Native Capture plan object identities differ from source scopes"
+            "Native Capture plan main assembly or configuration differs from raw facts"
+        )
+    scene_occurrences = scene_raw.get("occurrences")
+    scene_components = scene_raw.get("components")
+    if (
+        not isinstance(scene_occurrences, list)
+        or not scene_occurrences
+        or not isinstance(scene_components, list)
+        or not scene_components
+    ):
+        raise PipelineError("Native Capture scene inventory is incomplete")
+    occurrence_by_name = {}
+    for row in scene_occurrences:
+        if not isinstance(row, dict):
+            raise PipelineError("Native Capture scene occurrence is malformed")
+        name = row.get("name")
+        if not isinstance(name, str) or not name or name in occurrence_by_name:
+            raise PipelineError("Native Capture scene occurrence identity is malformed")
+        occurrence_by_name[name] = row
+    component_names = {
+        str(row.get("name"))
+        for row in scene_components
+        if isinstance(row, dict) and isinstance(row.get("name"), str)
+    }
+    if (
+        len(component_names) != len(scene_components)
+        or component_names != set(source_scopes)
+        or set(part_mass) != component_names
+    ):
+        raise PipelineError("Native Capture leaf mass inventory differs from source scopes")
+    objects = plan["objects"]
+    object_names = {item["name"] for item in objects}
+    if object_names != set(occurrence_by_name):
+        raise PipelineError(
+            "Native Capture plan object identities differ from raw occurrences"
+        )
+    for item in objects:
+        raw = occurrence_by_name[item["name"]]
+        if (
+            type(raw.get("suppression_state")) is not int
+            or raw["suppression_state"] != item["state"]
+        ):
+            raise PipelineError(
+                f"Native Capture plan state differs from raw occurrence: {item['name']}"
+            )
+        document = item.get("document")
+        if document is not None:
+            raw_document = str(raw.get("path") or "").replace("\\", "/").casefold()
+            planned_document = document.replace("\\", "/").casefold()
+            if not (
+                raw_document == planned_document
+                or raw_document.endswith("/" + planned_document)
+            ):
+                raise PipelineError(
+                    f"Native Capture plan document differs from raw occurrence: {item['name']}"
+                )
+    groups = plan["groups"]
+    if {item["name"] for item in groups} != set(link_group["links"]):
+        raise PipelineError(
+            "Native Capture plan group identities differ from raw link groups"
         )
     seen_members = set()
     for group in groups:
-        members = group.get("components") if isinstance(group, dict) else None
+        raw_group = link_group["links"].get(group["name"])
+        selection = (
+            raw_group.get("selection")
+            if isinstance(raw_group, Mapping)
+            else None
+        )
         if (
-            not isinstance(members, list)
-            or not members
-            or any(not isinstance(name, str) or not name for name in members)
+            not isinstance(selection, list)
+            or any(
+                not isinstance(name, str) or not name
+                for name in selection
+            )
+            or len(set(selection)) != len(selection)
+            or set(selection) != set(group["components"])
         ):
-            raise PipelineError("Native Capture plan groups are malformed")
-        for name in members:
+            raise PipelineError(
+                "Native Capture plan group differs from raw selection: "
+                f"{group['name']}"
+            )
+        for name in group["components"]:
             if name not in source_scopes or name in seen_members:
                 raise PipelineError(
                     "Native Capture plan groups are unbound or overlap"
                 )
             seen_members.add(name)
+    if seen_members != set(source_scopes):
+        raise PipelineError(
+            "Native Capture plan groups do not cover the raw source scopes"
+        )
     axis_rows = observation.get("axis_references_raw")
     if not isinstance(axis_rows, list):
         raise PipelineError("Native Capture raw axis inventory is malformed")
@@ -197,37 +331,27 @@ def validate_native_capture_plan(observation: Mapping, plan: Mapping) -> None:
         ):
             raise PipelineError("Native Capture raw axis identity is malformed")
         raw_axes[item["joint"]] = item
-    planned_axes = {}
-    for item in axes:
-        name = item.get("name") if isinstance(item, dict) else None
-        reference = (
-            item.get("axis_reference")
-            if isinstance(item, dict)
-            else None
-        )
-        if (
-            not isinstance(name, str)
-            or not name
-            or name in planned_axes
-            or not isinstance(reference, Mapping)
-            or not reference
-        ):
-            raise PipelineError("Native Capture plan axis requests are malformed")
-        component = reference.get("component")
-        if component is not None and (
-            not isinstance(component, str)
-            or not component
-            or component not in source_scopes
-        ):
-            raise PipelineError(
-                f"Native Capture plan axis component is unbound: {name}"
-            )
-        planned_axes[name] = True
-    if set(planned_axes) != set(raw_axes):
+    axes = {item["name"]: item["axis_reference"] for item in plan["axis_requests"]}
+    if set(axes) != set(raw_axes):
         raise PipelineError(
             "Native Capture raw axis inventory differs from the plan"
         )
-    scene_raw = observation.get("scene_raw")
+    for name, reference in axes.items():
+        raw = raw_axes[name]
+        if raw.get("selector") != reference:
+            raise PipelineError(
+                f"Native Capture plan axis selector differs from raw facts: {name}"
+            )
+        kind = "reference_axis" if reference.get("kind") == "reference_axis" else "cylinder"
+        if raw.get("kind") != kind:
+            raise PipelineError(
+                f"Native Capture plan axis kind differs from raw facts: {name}"
+            )
+        component = reference["component"]
+        if component and component not in object_names:
+            raise PipelineError(
+                f"Native Capture plan axis component is unbound: {name}"
+            )
     coordinate_systems = (
         scene_raw.get("coordinate_systems")
         if isinstance(scene_raw, Mapping)
@@ -235,12 +359,7 @@ def validate_native_capture_plan(observation: Mapping, plan: Mapping) -> None:
     )
     if (
         not isinstance(coordinate_systems, dict)
-        or any(
-            not isinstance(name, str)
-            or not name
-            or name not in coordinate_systems
-            for name in datums
-        )
+        or set(plan["datums"]) != set(coordinate_systems)
     ):
         raise PipelineError(
             "Native Capture raw datum inventory differs from the plan"

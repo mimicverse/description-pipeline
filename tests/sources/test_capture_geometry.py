@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import copy
 import tempfile
 import unittest
 from pathlib import Path
 
 from description_pipeline.io import PipelineError, write_json
-from description_pipeline.schemas import NATIVE_CAPTURE_OBSERVATION_SCHEMA
+from description_pipeline.schemas import (
+    CAPTURE_EVIDENCE_REQUESTS,
+    NATIVE_CAPTURE_OBSERVATION_SCHEMA,
+)
 from description_pipeline.sources.solidworks.errors import CadError
 from description_pipeline.sources.solidworks.capture_geometry import (
     materialize_native_geometry,
@@ -142,7 +146,7 @@ class CaptureGeometryTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             CadError,
-            "raw triangle stream digest differs",
+            "triangle stream digest differs",
         ):
             materialize_native_geometry(
                 geometry_raw,
@@ -163,8 +167,20 @@ class CaptureGeometryTests(unittest.TestCase):
             geometry_raw=geometry_raw,
             axis_references_raw=[{"joint": "hinge", **self.raw_axis}],
             document_state={
-                "before": {"read_only": True},
-                "after": {"read_only": True},
+                "before": {
+                    "path": self.raw_facts["scene_raw"]["document"],
+                    "read_only": True,
+                    "active_configuration": self.raw_facts[
+                        "scene_raw"
+                    ]["configuration"],
+                },
+                "after": {
+                    "path": self.raw_facts["scene_raw"]["document"],
+                    "read_only": True,
+                    "active_configuration": self.raw_facts[
+                        "scene_raw"
+                    ]["configuration"],
+                },
             },
             input_stability={
                 "unchanged": True,
@@ -197,10 +213,27 @@ class CaptureGeometryTests(unittest.TestCase):
                 ],
             },
         )
+        scene = loaded["scene_raw"]
+        occurrences = {
+            row["name"]: row
+            for row in scene["occurrences"]
+        }
         plan = {
+            "schema_version": "solidworks-to-urdf.capture-plan/v1",
+            "run_id": "fixture-run",
+            "handoff_sha256": "a" * 64,
+            "discovery_sha256": "b" * 64,
+            "main_assembly": Path(scene["document"]).name,
+            "configuration": scene["configuration"],
+            "identity": {"hardware_id": "fixture", "revision": "r1"},
+            "selection": {"files": {"robot.SLDASM": "a" * 64}},
             "objects": [
-                {"name": "base-1"},
-                {"name": "arm-1"},
+                {
+                    "name": name,
+                    "document": Path(row["path"]).name,
+                    "state": row["suppression_state"],
+                }
+                for name, row in sorted(occurrences.items())
             ],
             "groups": [
                 {"name": "base_link", "components": ["base-1"]},
@@ -210,13 +243,12 @@ class CaptureGeometryTests(unittest.TestCase):
                 {
                     "name": "hinge",
                     "axis_reference": {
-                        "component": "arm-1",
-                        "body_type": "solid",
-                        "face_index": 0,
+                        **loaded["axis_references_raw"][0]["selector"]
                     },
                 }
             ],
-            "datums": [],
+            "datums": sorted(scene["coordinate_systems"]),
+            "evidence_requests": list(CAPTURE_EVIDENCE_REQUESTS),
         }
         validate_native_capture_plan(loaded, plan)
         with self.assertRaisesRegex(
@@ -227,6 +259,173 @@ class CaptureGeometryTests(unittest.TestCase):
                 loaded,
                 {**plan, "axis_requests": []},
             )
+
+        container_observation = copy.deepcopy(loaded)
+        container_observation["scene_raw"]["occurrences"].append(
+            {
+                "name": "sub-1",
+                "path": str(Path(scene["document"]).with_name("sub.SLDASM")),
+                "transform_raw": self.raw_facts["scene_raw"]["occurrences"][0][
+                    "transform_raw"
+                ],
+                "suppression_state": 2,
+                "is_fixed": False,
+                "document_type": "assembly",
+            }
+        )
+        container_plan = copy.deepcopy(plan)
+        container_plan["objects"].append(
+            {
+                "name": "sub-1",
+                "document": "sub.SLDASM",
+                "state": 2,
+            }
+        )
+        validate_native_capture_plan(container_observation, container_plan)
+
+        reference_observation = copy.deepcopy(loaded)
+        reference_selector = {
+            "kind": "reference_axis",
+            "component": "",
+            "feature_name": "Axis1",
+        }
+        reference_observation["axis_references_raw"][0].update(
+            kind="reference_axis",
+            selector=reference_selector,
+        )
+        reference_plan = copy.deepcopy(plan)
+        reference_plan["axis_requests"][0][
+            "axis_reference"
+        ] = reference_selector
+        validate_native_capture_plan(reference_observation, reference_plan)
+
+        swapped_groups = copy.deepcopy(plan)
+        swapped_groups["groups"][0]["components"], swapped_groups[
+            "groups"
+        ][1]["components"] = (
+            swapped_groups["groups"][1]["components"],
+            swapped_groups["groups"][0]["components"],
+        )
+        invalid = (
+            (
+                "schema",
+                loaded,
+                {**copy.deepcopy(plan), "schema_version": "forged"},
+            ),
+            (
+                "main",
+                loaded,
+                {**copy.deepcopy(plan), "main_assembly": "foreign.SLDASM"},
+            ),
+            (
+                "configuration",
+                loaded,
+                {**copy.deepcopy(plan), "configuration": "Other"},
+            ),
+            (
+                "axis",
+                loaded,
+                copy.deepcopy(plan)
+                | {
+                    "axis_requests": [
+                        {
+                            "name": "hinge",
+                            "axis_reference": {
+                                **plan["axis_requests"][0]["axis_reference"],
+                                "component": "base-1",
+                            },
+                        }
+                    ]
+                },
+            ),
+            (
+                "group",
+                loaded,
+                copy.deepcopy(plan)
+                | {
+                    "groups": [
+                        {"name": "foreign", "components": ["base-1"]},
+                        {"name": "arm_link", "components": ["arm-1"]},
+                    ]
+                },
+            ),
+            (
+                "group-membership",
+                loaded,
+                swapped_groups,
+            ),
+            (
+                "document",
+                loaded,
+                copy.deepcopy(plan)
+                | {
+                    "objects": [
+                        {**plan["objects"][0], "document": "foreign.SLDPRT"},
+                        plan["objects"][1],
+                    ]
+                },
+            ),
+            (
+                "unknown-plan-field",
+                loaded,
+                copy.deepcopy(plan) | {"second_authority": True},
+            ),
+            (
+                "datum-omission",
+                copy.deepcopy(loaded)
+                | {
+                    "scene_raw": {
+                        **scene,
+                        "coordinate_systems": {"CS_base_link": {}},
+                    }
+                },
+                plan,
+            ),
+            (
+                "datum-duplicate",
+                copy.deepcopy(loaded)
+                | {
+                    "scene_raw": {
+                        **scene,
+                        "coordinate_systems": {"CS_base_link": {}},
+                    }
+                },
+                copy.deepcopy(plan)
+                | {"datums": ["CS_base_link", "CS_base_link"]},
+            ),
+            (
+                "scene-document-state",
+                copy.deepcopy(loaded)
+                | {
+                    "scene_raw": {
+                        **scene,
+                        "document_state": {},
+                    }
+                },
+                plan,
+            ),
+            (
+                "scene-source-sha256",
+                copy.deepcopy(loaded)
+                | {
+                    "scene_raw": {
+                        **scene,
+                        "source_sha256": "f" * 64,
+                    }
+                },
+                plan,
+            ),
+        )
+        for label, candidate_observation, malformed in invalid:
+            with self.subTest(label=label), self.assertRaises(PipelineError):
+                validate_native_capture_plan(
+                    candidate_observation,
+                    malformed,
+                )
+        incomplete = copy.deepcopy(loaded)
+        incomplete["part_mass_raw"] = {}
+        with self.assertRaises(PipelineError):
+            validate_native_capture_plan(incomplete, plan)
 
         self.assertEqual(loaded, observation)
         self.assertEqual(
@@ -239,9 +438,24 @@ class CaptureGeometryTests(unittest.TestCase):
         stream.write_bytes(stream.read_bytes() + b"tamper")
         with self.assertRaisesRegex(
             PipelineError,
-            "triangle stream differs",
+            "triangle stream digest differs",
         ):
             load_native_capture_observation(evidence_root)
+
+        for field in ("document_state", "source_sha256"):
+            with self.subTest(field=field):
+                stream.write_bytes(stream.read_bytes()[:-6])
+                malformed = copy.deepcopy(observation)
+                malformed["scene_raw"][field] = {}
+                write_json(
+                    evidence_root / "raw/native_capture_facts.json",
+                    malformed,
+                )
+                with self.assertRaisesRegex(
+                    PipelineError,
+                    "document identity is incomplete",
+                ):
+                    load_native_capture_observation(evidence_root)
 
 if __name__ == "__main__":
     unittest.main()

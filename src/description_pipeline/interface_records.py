@@ -22,7 +22,6 @@ import stat
 from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 
-from . import schemas as _schemas
 from .delivery import PIPELINE_ID
 from .io import PipelineError, artifact_path_parts, confined, digest, file_digest, parse_data
 from .runtime import LINUX_GLIBC_BASELINE, RUNTIME_HOSTS, RUNTIME_VERSIONS, SUPPORTED_PYTHON, required_packages
@@ -38,17 +37,6 @@ from .schemas import (
     SOURCE_RECORD_SCHEMA,
 )
 from .stages import CONTRACT, CONTRACT_SHA256, FIXED_REQUIRED_CHECKS, HOST_BY_STAGE, HOST_IDS, STAGE_IDS
-
-#: Every single-owner boundary schema id of this release (one enumeration, the
-#: schema module stays the owner of the ids themselves).
-SCHEMA_VERSIONS = frozenset(
-    value for name, value in vars(_schemas).items() if name.endswith("_SCHEMA") and isinstance(value, str)
-)
-
-#: Every machine schema version this release knows: the single-owner schema ids
-#: plus the stage contract.  Unknown versions are refused wherever a record
-#: quotes one (call bindings, manifests, ...).
-KNOWN_SCHEMA_VERSIONS = SCHEMA_VERSIONS | {CONTRACT["schema_version"]}
 
 #: The shipped schema definition sources the schema digest covers: the model
 #: document schema (structure and field rules of produced documents) and the two
@@ -119,15 +107,6 @@ HEALTH_KEYS = (
     "capacity",
     "readiness",
 )
-
-CONFIG_IDENTITY_ERRORS = (
-    "config_identity_invalid",
-    "config_identity_unreadable",
-    "config_identity_mismatch",
-    "config_identity_not_active",
-    "config_identity_legacy",
-)
-
 
 def _require(condition, code: str, detail: dict | None = None) -> None:
     if not condition:
@@ -246,26 +225,6 @@ def require_same_release_identity(left, right, *, code: str = "release_identity_
             "right": {field: right.get(field) for field in fields},
         },
     )
-
-
-def validate_call_binding(binding) -> dict:
-    """Side-effecting calls bind operation id, parameter digest, release and contract."""
-
-    code = "call_binding_invalid"
-    _exact_keys(binding, {"operation_id", "params_sha256", "release", "contract"}, code, "binding")
-    _text(binding["operation_id"], code, "binding.operation_id")
-    _hex64(binding["params_sha256"], code, "binding.params_sha256")
-    validate_release_identity(binding["release"], code=code)
-    _exact_keys(binding["contract"], {"schema_version", "digest"}, code, "binding.contract")
-    # Family-bound: the call contract must be the stage-contract family of this
-    # release; other known schema ids (health, source, ...) are wrong families.
-    _require(
-        binding["contract"]["schema_version"] == CONTRACT["schema_version"],
-        code,
-        {"where": "binding.contract.schema_version", "expected": CONTRACT["schema_version"]},
-    )
-    _hex64(binding["contract"]["digest"], code, "binding.contract.digest")
-    return binding
 
 
 def validate_resource_policy(policy) -> dict:
@@ -748,9 +707,13 @@ def _string_list(value, code: str, where: str, *, allow_empty: bool) -> list:
 def _auth_string_list(value, code: str, where: str, *, allow_empty: bool) -> list:
     items = _string_list(value, code, where, allow_empty=allow_empty)
     _require(
-        all(not any(character == "," or character.isspace() for character in item) for item in items),
+        all(
+            not _CONTROL.search(item)
+            and not any(character == "," or character.isspace() for character in item)
+            for item in items
+        ),
         code,
-        {"where": where, "rule": "entries carry no comma or whitespace"},
+        {"where": where, "rule": "entries carry no control, comma or whitespace"},
     )
     return items
 

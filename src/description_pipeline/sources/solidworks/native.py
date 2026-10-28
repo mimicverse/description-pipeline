@@ -18,7 +18,7 @@ import re
 import sys
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -29,10 +29,7 @@ from ...geometry.native_transform import (
 )
 from ...schemas import NATIVE_DISCOVERY_SCHEMA
 from .errors import CadError, EnvironmentError_
-from .protocol import (
-    CadBackend,
-    Matrix,
-)
+from .protocol import CadBackend
 from .saved_state import normalize_open_status
 from .session_artifacts import (
     SESSION_DOCUMENT_API,
@@ -3194,7 +3191,6 @@ class SolidWorksBackend(CadBackend):
         self._staged_search_applied: set = set()
         self._staged_search_evidence: list[dict] = []
         self._components = set()
-        self._component_transforms = {}
         self._source_components = {}
         self._source_provenance = {}
         self._source_scope_overrides = {}
@@ -3586,7 +3582,6 @@ class SolidWorksBackend(CadBackend):
         if self._owner_thread is not None and self._owner_thread is not threading.current_thread():
             raise EnvironmentError_("cad_thread_mismatch", "Release CAD references on their owning STA thread")
         self._components.clear()
-        self._component_transforms.clear()
         self._source_components.clear()
         self._source_documents.clear()
         self._session_document_paths.clear()
@@ -4767,14 +4762,12 @@ class SolidWorksBackend(CadBackend):
                     "the native source document is not read-only",
                     {"path": document, "state": raw_state},
                 )
-            source_sha256 = _hash(document)
             try:
                 native_api_pid = int(_method(self._app_obj(), "GetProcessID"))
             except Exception:  # noqa: BLE001 - unresolved PID keeps source scope incomplete
                 native_api_pid = None
             self._record_save_flag(doc, doc_path)
             self._components = set()
-            self._component_transforms = {}
             self._source_components = {}
             self._source_provenance = {}
             self._source_scope_overrides = {}
@@ -4788,8 +4781,6 @@ class SolidWorksBackend(CadBackend):
                 "scene_raw": {
                     "document": str(document),
                     "configuration": configuration,
-                    "source_sha256": source_sha256,
-                    "document_state": raw_state,
                     "occurrences": None,
                     "components": None,
                     "coordinate_systems": None,
@@ -4880,7 +4871,8 @@ class SolidWorksBackend(CadBackend):
             while stack:
                 raw_component, owner_path = stack.pop()
                 comp = _component(raw_component)
-                if _measured_component_state(comp) == COMPONENT_SUPPRESSED:
+                suppression_state = _measured_component_state(comp)
+                if suppression_state == COMPONENT_SUPPRESSED:
                     continue
                 borrowed_components.append(comp)
                 raw_name = _property(comp, "Name2")
@@ -4994,13 +4986,13 @@ class SolidWorksBackend(CadBackend):
                     session_document=session_document,
                 )
                 self._source_components[name] = (document_key, str(referenced))
-                self._component_transforms[name] = copy.deepcopy(placement)
                 occurrences.append(
                     {
                         "name": name,
                         "path": path,
                         "transform_raw": copy.deepcopy(placement),
                         "referenced_configuration": str(referenced),
+                        "suppression_state": suppression_state,
                         "is_fixed": fixed,
                         "is_fixed_error": fixed_error,
                         "document_type": document_type,
@@ -6142,7 +6134,6 @@ class SolidWorksBackend(CadBackend):
                         "errors": [],
                         "bodies": {"solid": 0, "sheet": 0},
                         "source_scope": source_scopes[component],
-                        "transform_raw": _json_raw_value(self._component_transforms.get(component)),
                         "appearance_raw": None,
                     }
                 note(
@@ -6181,7 +6172,6 @@ class SolidWorksBackend(CadBackend):
         errors: list[dict[str, object]] = []
         body_counts = {"solid": 0, "sheet": 0}
         face_count = 0
-        occurrence_transform = self._component_transforms.get(component)
         used_api = (
             "IComponent2.GetBodies3/IBody2.GetFaces/"
             "IFace2.GetTessTriangles(True)"
@@ -6789,7 +6779,6 @@ class SolidWorksBackend(CadBackend):
             "state": state,
             "representation": "cad_face_display_triangles_raw",
             "source_scope": source_scope,
-            "transform_raw": _json_raw_value(occurrence_transform),
             "bodies": body_counts,
             "appearance_raw": appearance_raw,
         }
@@ -8208,20 +8197,6 @@ class SolidWorksBackend(CadBackend):
             }
         record.update(observation)
         return record
-
-
-
-
-def _frame_from_raw(values: Sequence[float], *, field: str) -> Matrix:
-    try:
-        return tuple(transform_from_solidworks(values))  # type: ignore[return-value]
-    except CadError as error:
-        detail = error.detail if isinstance(error.detail, dict) else {"detail": error.detail}
-        raise CadError(error.code, error.message, {**detail, "field": field}) from error
-
-
-
-
 def _native_error_record(error):
     detail = getattr(error, "detail", None)
     return {

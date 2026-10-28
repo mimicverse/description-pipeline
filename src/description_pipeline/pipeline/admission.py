@@ -60,6 +60,7 @@ from .verify_contract import (
     EXECUTION_RECEIPT_FILENAME,
     OUTPUT_CONTRACT as VERIFY_OUTPUT_CONTRACT,
     REQUEST_SCHEMA as VERIFY_REQUEST_SCHEMA,
+    validate_certificate_diagnostics,
 )
 
 _SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")
@@ -851,6 +852,13 @@ class VerifiedVerifyResult:
             or certificate.get("actual_verifier_sha256") != predecessor.decision.actual_executor_sha256
         ):
             raise ProtocolError("admission.verify_result_invalid", {"where": "certificate-identity"})
+        try:
+            validate_certificate_diagnostics(certificate)
+        except PipelineError as error:
+            raise ProtocolError(
+                "admission.verify_result_invalid",
+                {"where": "certificate-diagnostics"},
+            ) from error
         try:
             generate = ArtifactRef.from_record(certificate["generate_artifact"])
             capture = ArtifactRef.from_record(certificate["capture_artifact"])

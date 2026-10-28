@@ -106,10 +106,8 @@ class CopyCoverageTests(unittest.TestCase):
             handoff=handoff,
             originals={name: data.decode("utf-8") for name, data in originals.items()},
         )
-        source_tree = root / "evidence/source"
-        source_tree.mkdir(parents=True, exist_ok=True)
         for name, data in copies.items():
-            path = source_tree / name
+            path = root / "input/cad" / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data)
         support.seal_delivery(root)

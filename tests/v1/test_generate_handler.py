@@ -58,7 +58,6 @@ class GenerateHandlerTests(unittest.TestCase):
         evidence.mkdir(parents=True)
         shutil.copytree(self.capture / "input", artifact_source / "input")
         shutil.copytree(self.capture / "raw", evidence / "raw")
-        shutil.copytree(self.capture / "source", evidence / "source")
         shutil.copytree(self.capture / "reports", artifact_source / "reports")
         shutil.copyfile(
             self.capture / "evidence/native-runtime.json",

@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from ..artifacts import ArtifactStore
+from ..artifacts.store import path_has_link_ancestor
 from ..io import digest
 from ..platform.facts import FactStore
 from ..schemas import FAILURE_ENVELOPE_SCHEMA, STAGE_RESULT_SCHEMA
@@ -96,12 +97,10 @@ class CanonicalStageServices:
         self.facts = facts
         self.artifacts = artifacts
         supplied_root = Path(work_root)
-        if supplied_root.exists() and (supplied_root.is_symlink() or supplied_root.is_junction()):
+        if path_has_link_ancestor(supplied_root):
             raise ProtocolError("workspace.invalid", {"root": str(supplied_root)})
         supplied_root.mkdir(parents=True, exist_ok=True)
         self.work_root = supplied_root.resolve()
-        if any(parent.is_symlink() for parent in self.work_root.parents):
-            raise ProtocolError("workspace.invalid", {"root": str(self.work_root), "reason": "symlink-parent"})
         self.claim_policy = claim_policy
         self.clock = clock
         if transfer_resume_gate is not None and not callable(transfer_resume_gate):
@@ -198,7 +197,7 @@ class CanonicalStageServices:
         candidate: StageCandidate | None,
     ) -> StageWorkspace:
         command_root = self.work_root / command.command_id
-        if command_root.exists() and (command_root.is_symlink() or command_root.is_junction()):
+        if path_has_link_ancestor(command_root):
             raise ProtocolError("workspace.escape", {"root": str(command_root)})
         command_root.mkdir(parents=True, exist_ok=True)
         root = Path(tempfile.mkdtemp(prefix=f"{claim.fence}-", dir=command_root))
@@ -239,7 +238,7 @@ class CanonicalStageServices:
         if command.stage is None:
             raise ProtocolError("candidate.stage_required", {"command_id": command.command_id})
         supplied = Path(execution.candidate_root)
-        if supplied.is_symlink() or supplied.is_junction():
+        if path_has_link_ancestor(supplied):
             raise ProtocolError("candidate.path_invalid", {"reason": "symlink"})
         candidate_root = supplied.resolve()
         with self._workspace_lock:

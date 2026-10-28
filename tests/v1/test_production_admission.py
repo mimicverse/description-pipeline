@@ -74,7 +74,12 @@ from description_pipeline.pipeline.services import CanonicalStageServices, Claim
 from description_pipeline.pipeline.publish_contract import REPOSITORY_SNAPSHOT_FILE
 from description_pipeline.pipeline.stages.generate import GenerateHandler
 from description_pipeline.pipeline.stages.publish import PublishHandler
-from description_pipeline.repository.publish import materialize_repository_snapshot
+from description_pipeline.repository.publish import (
+    PublicationError,
+    materialize_repository_snapshot,
+    validate_git_remote,
+    validate_repository_remote,
+)
 from description_pipeline.schemas import (
     AIRFLOW_DISPATCH_CONF_SCHEMA,
     CONFIG_SNAPSHOT_SCHEMA,
@@ -181,6 +186,12 @@ class ProductionAdmissionTests(unittest.TestCase):
             encoding="utf-8",
         )
         self.checkout = self._repository()
+        self._repository_validation = mock.patch(
+            "description_pipeline.pipeline.ingestion.validate_git_remote",
+            side_effect=self._allow_hermetic_local_remote,
+        )
+        self._repository_validation.start()
+        self.addCleanup(self._repository_validation.stop)
         self.snapshot_path = self.root / "config-snapshot.json"
         self.snapshot_bytes = (
             json.dumps(self._config_snapshot(), indent=2).encode("utf-8") + b"\n"
@@ -371,7 +382,8 @@ class ProductionAdmissionTests(unittest.TestCase):
         (source / "README.md").write_text("fixture\n", encoding="utf-8")
         _git(source, "add", "README.md")
         _git(source, "commit", "-m", "fixture")
-        remote = self.root / "repository.git"
+        remote = self.root / "mimicverse" / "robot.git"
+        remote.parent.mkdir()
         subprocess.run(
             ["git", "init", "--bare", str(remote)],
             check=True,
@@ -393,6 +405,29 @@ class ProductionAdmissionTests(unittest.TestCase):
         _git(checkout, "config", "user.name", "Release Service")
         _git(checkout, "config", "user.email", "release@example.test")
         return checkout
+
+    def _allow_hermetic_local_remote(self, repository: Path, slug: str) -> str:
+        fetch = _git(repository, "remote", "get-url", "--all", "origin").splitlines()
+        push = _git(
+            repository,
+            "remote",
+            "get-url",
+            "--push",
+            "--all",
+            "origin",
+        ).splitlines()
+        actual_slug = (
+            "/".join(Path(fetch[0]).parts[-2:]).removesuffix(".git")
+            if len(fetch) == 1
+            else ""
+        )
+        if (
+            len(fetch) == 1
+            and fetch == push
+            and actual_slug == slug
+        ):
+            return fetch[0]
+        raise PublicationError("publish.remote_target_mismatch")
 
     def _config_snapshot(self) -> dict:
         resolved = {
@@ -1226,7 +1261,7 @@ class ProductionAdmissionTests(unittest.TestCase):
             )
         self.assertEqual(
             spec.publish_intent.repository.origin_url,
-            str(self.root / "repository.git"),
+            str(self.root / "mimicverse" / "robot.git"),
         )
         self.assertEqual(spec.publish_intent.repository.base_ref, "main")
         self.assertEqual(
@@ -1521,6 +1556,7 @@ class ProductionAdmissionTests(unittest.TestCase):
         self.assertEqual(spec.originals, parent.spec.originals)
         self.assertEqual(spec.originals.ref.producer_tool_sha256, parent_portable)
         self.assertNotEqual(spec.originals.ref.producer_tool_sha256, self.portable_tool["source_sha256"])
+
         for artifact in (
             spec.ruleset.artifact.ref,
             spec.configuration.ref,
@@ -1543,6 +1579,17 @@ class ProductionAdmissionTests(unittest.TestCase):
         )
         self.assertEqual(parent.spec.from_stage, "freeze")
         self.assertEqual(len(admitted), 1)
+
+    def test_admission_work_root_rejects_a_linked_lexical_parent(self) -> None:
+        real = self.root / "real-admission-work"
+        real.mkdir()
+        linked = self.root / "linked-admission-work"
+        try:
+            linked.symlink_to(real, target_is_directory=True)
+        except OSError as error:
+            self.skipTest(f"The host cannot create a symbolic link: {error}")
+        with self.assertRaisesRegex(ProtocolError, "admission_ingestion.invalid"):
+            self._factory(work_root=linked / "child")
 
     def test_freeze_successor_rejects_old_upload_and_unverified_origins(self) -> None:
         with self.assertRaises(ProtocolError) as linked_upload:
@@ -2191,6 +2238,107 @@ class ProductionAdmissionTests(unittest.TestCase):
         work.mkdir()
         with self.assertRaisesRegex(ProtocolError, "publication_actor_missing"):
             self._factory(work_root=work).prepare(self.request)
+
+    def test_repository_remote_is_exactly_bound_to_fetch_push_and_slug(self) -> None:
+        self.assertEqual(
+            validate_repository_remote(
+                "mimicverse/robot",
+                "https://github.com/mimicverse/robot.git",
+                "https://github.com/mimicverse/robot.git",
+            ),
+            "https://github.com/mimicverse/robot.git",
+        )
+        self.assertEqual(
+            validate_repository_remote(
+                "mimicverse/robot",
+                "git@github.com:mimicverse/robot.git",
+                "git@github.com:mimicverse/robot.git",
+            ),
+            "git@github.com:mimicverse/robot.git",
+        )
+        self.assertEqual(
+            validate_repository_remote(
+                "mimicverse/robot",
+                "ssh://git@github.com/mimicverse/robot.git",
+                "ssh://git@github.com/mimicverse/robot.git",
+            ),
+            "ssh://git@github.com/mimicverse/robot.git",
+        )
+        for fetch, push in (
+            (
+                "https://operator:supersecret@github.com/mimicverse/robot.git",
+                "https://operator:supersecret@github.com/mimicverse/robot.git",
+            ),
+            (
+                "https://github.com/other/robot.git",
+                "https://github.com/other/robot.git",
+            ),
+            (
+                "https://gitlab.com/mimicverse/robot.git",
+                "https://gitlab.com/mimicverse/robot.git",
+            ),
+            (
+                "https://github.com/mimicverse/robot.git",
+                "https://github.com/mimicverse/other.git",
+            ),
+        ):
+            with self.subTest(fetch=fetch, push=push), self.assertRaises(PublicationError):
+                validate_repository_remote("mimicverse/robot", fetch, push)
+
+        with mock.patch(
+            "description_pipeline.pipeline.ingestion.validate_git_remote",
+            side_effect=validate_git_remote,
+        ):
+            canonical = "https://github.com/mimicverse/robot.git"
+            _git(self.checkout, "remote", "set-url", "origin", canonical)
+            _git(
+                self.checkout,
+                "remote",
+                "set-url",
+                "--push",
+                "origin",
+                canonical,
+            )
+            positive_work = self.root / "repository-target-work-positive"
+            positive_work.mkdir()
+            prepared = self._factory(work_root=positive_work).prepare(self.request)
+            self.assertEqual(
+                prepared.spec.publish_intent.repository.origin_url,
+                canonical,
+            )
+        for label, fetch, push in (
+            (
+                "wrong-slug",
+                "https://github.com/other/robot.git",
+                "https://github.com/other/robot.git",
+            ),
+            (
+                "https-userinfo",
+                "https://operator:secret@github.com/mimicverse/robot.git",
+                "https://operator:secret@github.com/mimicverse/robot.git",
+            ),
+            (
+                "split-push",
+                "https://github.com/mimicverse/robot.git",
+                "https://github.com/other/robot.git",
+            ),
+        ):
+            work = self.root / f"repository-target-work-{label}"
+            work.mkdir()
+            _git(self.checkout, "remote", "set-url", "origin", fetch)
+            _git(self.checkout, "remote", "set-url", "--push", "origin", push)
+            with (
+                self.subTest(case=label),
+                mock.patch(
+                    "description_pipeline.pipeline.ingestion.validate_git_remote",
+                    side_effect=validate_git_remote,
+                ),
+                self.assertRaisesRegex(
+                    ProtocolError,
+                    "repository_target_invalid",
+                ),
+            ):
+                self._factory(work_root=work).prepare(self.request)
 
     def _config_digest(self) -> str:
         return config_snapshot_digest(self._config_snapshot())

@@ -103,7 +103,7 @@ Windows 的既有 `native_operation_event` 经同一 operation view 与 poll 形
 
 successor 创建、claim 取得、外发授权和 decision 提交各自重验当前命令及完整有界祖先链。锁顺序由数据库实现统一维护；claim 事务核对 effect、执行者和现有执行权，不在该事务内检查 cancellation。engine 在取得 claim 前检查取消请求；外发授权和 decision 提交再在各自事务中核对当前 cancellation、effect、owner 和 fence，取得 claim 本身不能绕过后来发生的取消。外部 HTTP、CAD、Git 和 PR 调用在发送授权事务提交后执行，不跨外部调用持有数据库事务。旧 fence 不得提交或关闭新的执行权。
 
-Airflow 只拥有实际调度状态。`project_stage_status`、`project_run_status` 从 canonical facts 生成业务投影；Portal、SQL view 和维护脚本不另建 reducer。`RunControlStore` 只控制显示名、隐藏与恢复显示。维护查询在同一只读 repeatable-read 快照中核对业务投影和真实 Airflow 关联；显示隐藏不删除证据或改变运行资格。
+Airflow 只拥有实际调度状态。`project_stage_status`、`project_run_status` 从 canonical facts 生成业务投影；Portal、SQL view 和维护脚本不另建 reducer。Portal 列表、详情与预览从同一 canonical 投影读取状态；预览每次请求重读当前资格，不缓存可变的 verified/formal_eligible 结论。`RunControlStore` 只控制显示名、隐藏与恢复显示。维护查询在同一只读 repeatable-read 快照中核对业务投影和真实 Airflow 关联；显示隐藏不删除证据或改变运行资格。
 
 只有六个正式阶段按序完成且全部相关 effect 已满足，运行才成功。诊断阶段通过、文件完整、服务健康或 task 成功都不能替代这一条件。`DiagnosticReplayScope` 保留历史生产者与本次工具身份，只产生隔离诊断资格，不能晋升为正式下游输入。
 

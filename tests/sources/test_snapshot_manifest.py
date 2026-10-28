@@ -109,6 +109,14 @@ class VerifySnapshotTests(unittest.TestCase):
                 "missing identity": ({**complete, "identity": {}}, "source identity is missing"),
                 "no declared files": ({**complete, "files": {}}, "no declared files"),
                 "changed file": ({**complete, "files": {"scene.json": "0" * 64}}, "incomplete or changed"),
+                "unknown envelope": (
+                    {**complete, "unknown_claim": {"second_authority": True}},
+                    "fields are incomplete or unknown",
+                ),
+                "unhashable scene": (
+                    {**complete, "scene": []},
+                    "scene is not bound by manifest",
+                ),
             }
             for label, (manifest, fragment) in cases.items():
                 with self.subTest(case=label):

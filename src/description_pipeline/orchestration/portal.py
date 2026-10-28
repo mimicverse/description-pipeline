@@ -49,7 +49,6 @@ from ..stages import (
     CONTRACT_SHA256,
     VIEW_SCHEMA,
     activity_view,
-    publication_succeeded,
     stage_view,
 )
 from ..geometry.native_scope import (
@@ -78,9 +77,9 @@ from ..pipeline.contracts import ArtifactRef, StageStatus
 from ..pipeline.dispatch import DispatchObservation
 from ..pipeline.effects import EffectState
 from ..pipeline.verify import CERTIFICATE_FILENAME, EXECUTION_RECEIPT_FILENAME
+from ..pipeline.verify_contract import validate_certificate_diagnostics
 from ..platform.facts import FactStoreError, RunNotAdmittedError
 from ..ports import PORTAL_HTTP_PORT
-from ..native_transfer import TEAM_REPORTS
 from .feishu_oauth import (
     TRIGGERING_USER_NAME_DELIMITER,
     TRIGGERING_USER_NAME_LIMIT,
@@ -98,7 +97,7 @@ from .run_ownership import (
     classify_recovery,
     recorded_actor_principal,
 )
-from .report_view import build_report
+from .report_view import build_report, merge_warnings
 from .uploads import (
     MAX_FILE_BYTES,
     MAX_FILES,
@@ -179,13 +178,6 @@ _ARTIFACT_TYPES = {
 #: Bounded preview payloads: totals always report the untruncated count.
 _PREVIEW_LIMIT = 50
 _SHA256_TEXT = re.compile(r"\A[0-9a-f]{64}\Z")
-_OBSERVATION_ONLY_JOB_FIELDS = (
-    "activity",
-    "activity_final",
-    "activity_history",
-    "discovery",
-    "error",
-)
 
 
 def _member_class(path: str) -> str:
@@ -268,30 +260,18 @@ def _delivery_warnings(members: dict) -> list[dict]:
     handoff = members.get("input/handoff.json")
     if handoff is not None:
         for item in _registered_source_rows(_parse_registered_json(handoff), "warnings", code_required=True):
-            warnings.append(
-                {
-                    "source": "input",
-                    "code": str(item["code"]),
-                    "object": "",
-                    "message": str(item.get("message") or ""),
-                    "detail": item.get("detail"),
-                }
-            )
+            warning = dict(item)
+            warning.setdefault("source", "input")
+            warnings.append(warning)
     discovery = members.get("input/discovery/native-discovery.json")
     if discovery is not None:
         findings = _registered_source_rows(_parse_registered_json(discovery), "findings", code_required=True)
         for item in findings:
             if item.get("blocking") is True:
                 continue
-            warnings.append(
-                {
-                    "source": "discovery",
-                    "code": str(item["code"]),
-                    "object": str(item.get("object") or ""),
-                    "message": str(item.get("message") or ""),
-                    "detail": item.get("detail"),
-                }
-            )
+            warning = dict(item)
+            warning.setdefault("source", "discovery")
+            warnings.append(warning)
     return warnings
 
 
@@ -356,57 +336,39 @@ def _quality_warnings(report: dict | None) -> list[dict]:
             "Registered native identity warning projection is incomplete or forged",
         )
     for item in diagnostics:
-        code = str(item["code"])
         if item.get("blocking") is not False:
             # Only an explicit non-blocking diagnostic is a warning.  A
             # missing or unknown flag must never be downgraded silently.
             continue
-        warning = {
-            "source": "quality",
-            "code": code,
-            "object": str(item.get("object") or ""),
-            "message": str(item.get("message") or ""),
-            "detail": item.get("detail"),
-        }
-        for key in ("blocking", "severity", "objects"):
-            if key in item:
-                warning[key] = item[key]
+        warning = dict(item)
+        warning.setdefault("source", "verification")
         warnings.append(warning)
     return warnings
 
 
 def _preview_warnings(*groups: list[dict]) -> list[dict]:
-    """Merge warning rows by display identity, then order them deterministically."""
+    """Merge recorded warnings with the shared semantic identity."""
 
-    unique: dict[tuple[str, str, str, str, str], dict] = {}
-    for row in (item for group in groups for item in group):
-        key = (
-            str(row.get("code") or ""),
-            str(row.get("object") or ""),
-            str(row.get("message") or ""),
-            canonical_json_value(row.get("detail")),
-            canonical_json_value(row.get("objects")),
-        )
-        unique.setdefault(key, row)
-
-    def order(row: dict) -> tuple[str, str, str, str, str, str]:
-        return (
-            str(row.get("code") or ""),
-            str(row.get("object") or ""),
-            str(row.get("message") or ""),
-            canonical_json_value(row.get("detail")),
-            canonical_json_value(row.get("objects")),
-            str(row.get("source") or ""),
-        )
-
-    return sorted(unique.values(), key=order)
+    return merge_warnings(*groups)
 
 
-#: Readable labels for the automatically retained structural-team reports.
-_STRUCTURAL_REPORT_LABELS = {
-    "reports/structural-team.md": "Structural-team report (readable Markdown)",
-    "reports/structural-team.json": "Structural-team report (structured findings and parameters)",
+_VERIFICATION_REPORT_LABELS = {
+    CERTIFICATE_FILENAME: "Verification certificate",
+    EXECUTION_RECEIPT_FILENAME: "Verification execution receipt",
 }
+
+
+def _run_state(projection: dict | None) -> str:
+    """Expose only the canonical business state, including missing evidence."""
+    if not isinstance(projection, dict):
+        return "unresolved"
+    return {
+        "succeeded": "success",
+        "failed": "failed",
+        "cancelled": "cancelled",
+        "unresolved": "unresolved",
+        "running": "running",
+    }.get(str(projection.get("state")), "unresolved")
 _STATIC_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".css": "text/css; charset=utf-8",
@@ -728,7 +690,6 @@ class PortalConfig:
     port: int = PORTAL_HTTP_PORT
     session_ttl: float = 12 * 3600.0
     artifact_limit: int = 64 * 1024 * 1024
-    preview_ttl: float = 60.0
     max_body_bytes: int = 64 * 1024
     upload_root: Path | None = None
     upload_concurrency: int = 2
@@ -1353,8 +1314,6 @@ class PortalApp:
     def __init__(self, config: PortalConfig) -> None:
         self.config = config
         self.sessions = SessionStore(config.session_ttl)
-        self._lock = threading.Lock()
-        self._previews: dict[str, tuple[float, dict]] = {}
         self._upload_gate = UploadGate(config.upload_concurrency)
         self._rerun_lock = threading.Lock()
         self._run_control_store = config.run_control_store
@@ -1706,7 +1665,7 @@ class PortalApp:
                         "user": name,
                         # Airflow's own record outlives any portal restart.
                         "principal": owner,
-                        "state": item.get("state"),
+                        "state": _run_state(projection),
                         "started_at": item.get("start_date"),
                         "parent_dag_run_id": parent_dag_run_id,
                         "resume_from": (
@@ -2267,18 +2226,7 @@ class PortalApp:
         )
         payload = {
             "dag_run_id": dag_run_id,
-            "state": (
-                {
-                    "succeeded": "success",
-                    "failed": "failed",
-                    "cancelled": "failed",
-                    "unresolved": "unresolved",
-                    "running": "running",
-                }.get(str(projection.get("state")), "running")
-                if isinstance(projection, dict)
-                else airflow_run.get("state")
-            ),
-            "technical_state": airflow_run.get("state"),
+            "state": _run_state(projection),
             "scope": projection.get("scope") if isinstance(projection, dict) else None,
             "formal_eligible": bool(
                 isinstance(projection, dict)
@@ -2337,7 +2285,7 @@ class PortalApp:
             },
             "stage_view": stage_view_payload,
             "report": report,
-            "structural_report": self._retained_report_links(dag_run_id),
+            "verification_reports": self._verification_report_links(dag_run_id, projection),
             "findings": _findings(job),
             "activity": activity_view(job),
             "automatic": _automatic_summary(job),
@@ -2832,7 +2780,7 @@ class PortalApp:
         """Every preview and every artifact re-authorizes against Airflow first.
 
         An expired or revoked session, a deleted tenant or a run the operator
-        may not read can never be served from the preview cache or the endpoint.
+        may not read can never be served artifact or preview bytes.
         """
 
         if _RUN_ID.fullmatch(dag_run_id) is None:
@@ -2948,7 +2896,12 @@ class PortalApp:
             except PortalError:
                 certificate = None
         certificate = certificate if isinstance(certificate, dict) else {}
-        formal_eligible = formal_eligible and bool(certificate)
+        if certificate:
+            validate_certificate_diagnostics(certificate)
+        formal_eligible = (
+            formal_eligible and certificate.get("decision") == "PASS"
+            and certificate.get("passed") is True
+        )
         publish_member = (by_stage.get("publish") or {}).get("publication-receipt.json")
         publication = None
         if isinstance(publish_member, dict):
@@ -2959,54 +2912,22 @@ class PortalApp:
             except PortalError:
                 publication = None
         publication = publication if isinstance(publication, dict) else {}
-        publish_row = stages.get("publish")
-        publish_receipt = (
-            publish_row.get("receipt")
-            if isinstance(publish_row, dict)
-            and isinstance(publish_row.get("receipt"), dict)
-            else {}
-        )
         pr_observation = (
             (publication.get("pr_effect") or {}).get("observation")
             if isinstance(publication.get("pr_effect"), dict)
             else None
         )
         pr_observation = pr_observation if isinstance(pr_observation, dict) else {}
-        verify_receipt = (
-            verify_row.get("receipt")
-            if isinstance(verify_row.get("receipt"), dict)
-            else {}
-        )
-        subject = certificate.get("subject_sha256") or verify_receipt.get(
-            "subject_sha256"
-        )
-        receipt_quality = verify_receipt.get("quality")
-        receipt_quality = (
-            receipt_quality if isinstance(receipt_quality, dict) else {}
-        )
+        subject = certificate.get("subject_sha256")
         quality = {
             "schema_version": certificate.get("schema_version"),
             "subject_sha256": subject,
-            "passed": certificate.get("passed") is True
-            or receipt_quality.get("passed") is True,
-            "checks": certificate.get("checks")
-            or receipt_quality.get("checks")
-            or [],
-            "diagnostics": certificate.get("diagnostics")
-            or receipt_quality.get("diagnostics")
-            or [],
+            "passed": certificate.get("passed") is True,
+            "checks": certificate.get("checks") or [],
+            "diagnostics": certificate.get("diagnostics") or [],
         }
         submission = None
-        registered_submission = publish_receipt.get("submission")
-        if publication_succeeded(registered_submission, subject):
-            submission = {
-                **registered_submission,
-                "repository_slug": registered_submission.get(
-                    "repository_slug",
-                    request.get("repository_slug"),
-                ),
-            }
-        elif (
+        if (
             publication
             and isinstance(pr_observation.get("url"), str)
             and isinstance(pr_observation.get("head_oid"), str)
@@ -3095,17 +3016,9 @@ class PortalApp:
         self,
         projection: dict,
         *,
-        run_id: str,
         stage: str,
     ) -> dict | None:
-        """One stage's immutable report, bound by its platform receipt.
-
-        Native stage reports are registered members when the receipt carries them.
-        Portable receipts bind the report through ``stage_report`` instead. Both
-        paths verify the registered bytes before parsing; a missing report leaves
-        the display observation unchanged, while a present but conflicting report
-        refuses rather than manufacturing check results.
-        """
+        """Read a registered native-stage report and verify its sealed artifact binding."""
 
         stages = projection.get("stages")
         row = stages.get(stage) if isinstance(stages, dict) else None
@@ -3212,7 +3125,7 @@ class PortalApp:
                         "source_run": artifact.producer_run_id,
                     }
             report = (
-                self._registered_stage_report(projection, run_id=run_id, stage=stage_id)
+                self._registered_stage_report(projection, stage=stage_id)
                 if row.get("state") != "waiting"
                 else None
             )
@@ -3581,6 +3494,7 @@ class PortalApp:
         )
         if not isinstance(certificate, dict):
             raise PipelineError("Verification certificate must be an object")
+        validate_certificate_diagnostics(certificate)
         generate_artifact, capture_artifact, evaluation_subject = self._bind_verification_certificate(
             projection,
             verify,
@@ -3731,11 +3645,6 @@ class PortalApp:
 
     def _preview_payload(self, session: PortalSession, dag_run_id: str, *, missing_ok: bool = False) -> dict | None:
         run_id = self._authorize_run(session, dag_run_id)
-        now = time.time()
-        with self._lock:
-            cached = self._previews.get(run_id)
-        if cached is not None and now - cached[0] <= self.config.preview_ttl:
-            return cached[1]
         projection = self._read_projection(run_id)
         preview = None
         failure: PipelineError | None = None
@@ -3751,8 +3660,6 @@ class PortalApp:
                 detail = f": {failure}" if failure is not None else ""
                 raise PortalError(HTTPStatus.CONFLICT, f"The model has not passed independent verification{detail}")
             raise PortalError(HTTPStatus.NOT_FOUND, "This run has no verified delivery to display")
-        with self._lock:
-            self._previews[run_id] = (now, preview)
         return preview
 
     def _preview(self, environ: dict, start_response: Callable, dag_run_id: str) -> Iterable[bytes]:
@@ -3780,8 +3687,8 @@ class PortalApp:
         start_response("200 OK", _common_headers(headers, self.config))
         return [data]
 
-    def _retained_report_links(self, dag_run_id: str) -> list[dict]:
-        """Downloadable entries of the automatically retained structural-team report.
+    def _verification_report_links(self, dag_run_id: str, projection: dict | None) -> list[dict]:
+        """Downloadable entries of the registered verification evidence.
 
         The run page links these directly through the authorized artifact route; the
         same resolver backs the download so a link can never point at a missing member.
@@ -3789,15 +3696,14 @@ class PortalApp:
 
         if _RUN_ID.fullmatch(dag_run_id) is None:
             return []
-        projection = self._read_projection(native_run_id(dag_run_id))
         resolved = projection["members"] if projection is not None else {}
         return [
             {
                 "path": artifact,
-                "label": _STRUCTURAL_REPORT_LABELS.get(artifact, artifact),
+                "label": _VERIFICATION_REPORT_LABELS[artifact],
                 "url": f"/api/runs/{dag_run_id}/artifacts/{artifact}",
             }
-            for artifact in TEAM_REPORTS
+            for artifact in _VERIFICATION_REPORT_LABELS
             if artifact in resolved
         ]
 

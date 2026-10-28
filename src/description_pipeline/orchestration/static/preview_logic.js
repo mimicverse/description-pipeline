@@ -49,10 +49,14 @@ function warningSortKey(row) {
     .join("\u0000");
 }
 
-// Project only documented object-level provenance fields across the display boundary.
+// Preserve recorded provenance and qualification fields in the display projection.
 export function warningSourceRows(warning) {
   if (!warning || typeof warning !== "object") return [];
-  const detail = warning.detail && typeof warning.detail === "object" ? warning.detail : {};
+  const detail = {
+    ...warning,
+    ...(warning.detail && typeof warning.detail === "object" ? warning.detail : {}),
+  };
+  for (const key of ["detail", "code", "message", "blocking", "stage", "stage_name", "label", "state_label"]) delete detail[key];
   const candidates = Array.isArray(detail.objects)
     ? detail.objects
     : Array.isArray(warning.objects)
@@ -60,7 +64,7 @@ export function warningSourceRows(warning) {
       : [];
   const rows = candidates.filter((item) => item && typeof item === "object");
   if (!rows.length) {
-    if (!warning.object && !detail.object && !warning.field && !detail.field && !warning.fields && !detail.fields) {
+    if (!warning.object && !detail.object && !warning.field && !detail.field && !warning.fields && !detail.fields && !Object.keys(detail).length) {
       return [];
     }
     rows.push({});
@@ -68,7 +72,7 @@ export function warningSourceRows(warning) {
   const seen = new Set();
   return rows
     .map((row) => {
-      const fields = warningFields(row, detail);
+      const fields = warningFields(row, { ...warning, ...detail });
       const normalized = {
         code: warningString(warning.code),
         object_type: warningString(row.object_type) || warningString(detail.object_type),
@@ -92,7 +96,13 @@ export function warningSourceRows(warning) {
           ? copyWarningValue(row, detail, "native_observation_errors")
           : [],
       };
-      const key = warningSortKey(normalized);
+      const extra = Object.fromEntries(
+        Object.entries({ ...detail, ...row }).filter(
+          ([key]) => !Object.hasOwn(normalized, key) && !["objects", "field"].includes(key),
+        ),
+      );
+      if (Object.keys(extra).length) normalized.extra = extra;
+      const key = warningSortKey(normalized) + JSON.stringify(extra);
       if (seen.has(key)) return null;
       seen.add(key);
       return normalized;
@@ -101,13 +111,13 @@ export function warningSourceRows(warning) {
     .sort((left, right) => warningSortKey(left).localeCompare(warningSortKey(right), "en"));
 }
 
-export function registeredQualityArtifact(preview, runId) {
-  const digest = preview?.report_files?.["reports/quality.json"];
+export function registeredVerificationArtifact(preview, runId) {
+  const digest = preview?.report_files?.["verification-certificate.json"];
   if (!runId || typeof digest !== "string" || !/^[0-9a-f]{64}$/.test(digest)) return null;
   return {
-    name: "reports/quality.json",
+    name: "verification-certificate.json",
     sha256: digest,
-    href: `/api/runs/${encodeURIComponent(runId)}/artifacts/reports/quality.json`,
+    href: `/api/runs/${encodeURIComponent(runId)}/artifacts/verification-certificate.json`,
   };
 }
 
@@ -247,7 +257,7 @@ export function summaryIdentity({ runId, subjectSha256 }) {
   };
 }
 
-export function infoPanelRows({ runId, subjectSha256, purpose, tool, qualitySchema, qualificationStates }) {
+export function infoPanelRows({ runId, subjectSha256, purpose, tool, certificateSchema, qualificationStates }) {
   const toolIdentity = tool
     ? [tool.version, tool.source_sha256].filter((value) => typeof value === "string" && value).join(" / ")
     : "";
@@ -259,7 +269,7 @@ export function infoPanelRows({ runId, subjectSha256, purpose, tool, qualitySche
     { key: "subject_sha256", value: typeof subjectSha256 === "string" ? subjectSha256 : "" },
     { key: "purpose", value: purposeLabel(purpose) },
     { key: "tool_identity", value: toolIdentity },
-    { key: "quality_schema", value: typeof qualitySchema === "string" ? qualitySchema : "" },
+    { key: "certificate_schema", value: typeof certificateSchema === "string" ? certificateSchema : "" },
     { key: "qualification_states", value: states },
   ];
 }
@@ -347,7 +357,7 @@ function segmentCounts(files) {
   return counts;
 }
 
-export function stageSummaryRows(stageId, { files, stage, quality, pr, subjectSha256 }) {
+export function stageSummaryRows(stageId, { files, stage, certificate, pr, subjectSha256 }) {
   const rows = [];
   const counts = segmentCounts(files);
   if (stageId === "freeze") {
@@ -361,8 +371,8 @@ export function stageSummaryRows(stageId, { files, stage, quality, pr, subjectSh
     const passed = Number.isFinite(stage?.passed) ? stage.passed : null;
     const total = Number.isFinite(stage?.total) ? stage.total : null;
     rows.push({ label: "Passed checks", value: passed !== null && total !== null ? `${passed}/${total}` : "not recorded" });
-    if (quality && typeof quality.schema_version === "string") {
-      rows.push({ label: "Quality report", value: quality.schema_version });
+    if (certificate && typeof certificate.schema_version === "string") {
+      rows.push({ label: "Verification certificate", value: certificate.schema_version });
     }
   } else if (stageId === "publish") {
     rows.push({ label: "PR state", value: pr && typeof pr.state === "string" ? pr.state : "not created" });

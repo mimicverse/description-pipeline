@@ -26,9 +26,7 @@ except ImportError:
 from description_pipeline.artifacts import ArtifactStore
 from description_pipeline.interface_records import config_snapshot_digest
 from description_pipeline.io import digest, read_data, write_json
-from description_pipeline.orchestration.discover_protocol import (
-    ArchiveDiscoverAdapter,
-)
+from tests.v1.archive_discover_adapter import ArchiveDiscoverAdapter
 from description_pipeline.orchestration.native_operation_client import (
     NativeOperationClient,
     NativeOperationEndpoint,
@@ -222,6 +220,12 @@ class RealSixStageChainTests(unittest.TestCase):
 
         self.publish = PublishFixture()
         self.addCleanup(self.publish.temporary.cleanup)
+        git_target = patch(
+            "description_pipeline.pipeline.ingestion.validate_git_remote",
+            return_value=str(self.publish.remote),
+        )
+        git_target.start()
+        self.addCleanup(git_target.stop)
         self.root = self.publish.root
         self.store = self.publish.store
         self.portable = _portable_tool()
@@ -403,7 +407,7 @@ class RealSixStageChainTests(unittest.TestCase):
                 },
                 "targets": {
                     "nd_fixture": {
-                        "repository_slug": "mimicverse/robot",
+                        "repository_slug": "example/robot",
                         "base": "main",
                     }
                 },
@@ -413,7 +417,7 @@ class RealSixStageChainTests(unittest.TestCase):
                 "retention": {"unreferenced_evidence_days": None},
                 "derived": {
                     "repositories": {
-                        "mimicverse/robot": str(repository),
+                        "example/robot": str(repository),
                     },
                     "discovery": {
                         "record_roots": [str(self.rules_root / "root-000")]

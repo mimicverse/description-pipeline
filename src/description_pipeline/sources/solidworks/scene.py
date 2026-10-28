@@ -27,12 +27,6 @@ from .native_limits import ENGINEERING_DEFAULT_POLICY_ID, PREVIEW_POLICY_ID
 from ...schemas import ENGINEERING_MODEL_SCHEMA, LINK_GROUP_MASS_SCHEMA as LINK_GROUP_SCHEMA
 
 
-def engineering_model_schema_supported(value: object) -> bool:
-    """Whether a payload declares the one current engineering model id."""
-
-    return value == ENGINEERING_MODEL_SCHEMA
-
-
 Matrix3 = tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]
 Vector3 = tuple[float, float, float]
 
@@ -255,51 +249,6 @@ class _PartReading:
 
     def mass_entry(self) -> dict[str, Any]:
         return {"mass": self.mass, "com": self.link_com, "inertia": self.link_inertia}
-
-
-def assembly_leaf_total(components: Sequence[Any], readings: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    """Combine the raw per-component readings about the assembly COM (parallel axis).
-
-    This is what the assembly *should* weigh if the leaf files on disk are the ones SolidWorks
-    measured.  The capture records it next to the assembly document's own reading so a repaired or
-    re-materialed leaf (a file that no longer matches the tree the assembly was built from) shows up
-    as a difference instead of an invisible undercount.
-    """
-
-    entries = []
-    for component in components:
-        payload = readings.get(str(component.name))
-        if payload is None:
-            raise ConfigError("a component has no mass property reading", {"component": str(component.name)})
-        # The identity link frame keeps the reading in assembly coordinates.
-        part = _PartReading(str(component.name), component.transform, payload, identity_matrix(), (0.0, 0.0, 0.0))
-        entries.append(part.mass_entry())
-    combined = combine_mass_properties(entries)
-    return {
-        "mass": float(combined["mass"]),
-        "com": [float(value) for value in combined["com"]],
-        "inertia": [[float(value) for value in row] for row in combined["inertia"]],
-    }
-
-
-def closure_delta(top_level: dict[str, Any], leaf_total: dict[str, Any]) -> dict[str, float]:
-    """Difference between the assembly's own reading and the recombined leaf readings."""
-
-    top_mass = float(top_level["mass"])
-    leaf_mass = float(leaf_total["mass"])
-    com_top = [float(value) for value in top_level["com"]]
-    com_leaf = [float(value) for value in leaf_total["com"]]
-    inertia_top = [[float(value) for value in row] for row in top_level["inertia"]]
-    inertia_leaf = [[float(value) for value in row] for row in leaf_total["inertia"]]
-    scale = max(max(abs(value) for row in inertia_top for value in row), 1e-12)
-    worst = max(abs(inertia_top[i][j] - inertia_leaf[i][j]) for i in range(3) for j in range(3))
-    return {
-        "mass_abs": abs(top_mass - leaf_mass),
-        "mass_rel": abs(top_mass - leaf_mass) / max(abs(top_mass), abs(leaf_mass), 1e-12),
-        "com_abs_max": max(abs(com_top[i] - com_leaf[i]) for i in range(3)),
-        "inertia_abs_max": worst,
-        "inertia_rel": worst / scale,
-    }
 
 
 def map_from_row_major(values: Sequence[float]) -> tuple[Matrix3, Vector3]:

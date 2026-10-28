@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+import os
 import tempfile
 import threading
 import time
@@ -20,6 +21,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from urllib import error as urlerror
 from urllib import request as urlrequest
 from unittest import mock
@@ -87,7 +89,12 @@ from description_pipeline.orchestration.windows import handler as windows_handle
 from description_pipeline.platform.queries import read_run_projection
 from description_pipeline.sources.solidworks.revision import package_inventory
 from description_pipeline.orchestration.discover_protocol import seal_source_archive
+from description_pipeline.orchestration import request_context
 from description_pipeline.orchestration.portal import PortalApp
+from description_pipeline.orchestration.run_ownership import (
+    owner_create_allowed,
+    recorded_create_binding,
+)
 from description_pipeline.stages import activity_view
 from tests.v1.test_native_operations import (
     NATIVE_TOOL,
@@ -1018,6 +1025,106 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         )
         self.assertEqual(rows[0], (1, 1, 1, 1, 0))
 
+    def test_operator_create_reads_the_real_persisted_dispatch_binding(self) -> None:
+        body = json.dumps(
+            {
+                "dag_run_id": self.dispatch_command.dag_run_id,
+                "logical_date": None,
+                "conf": self.dispatch_conf.to_record(),
+            }
+        ).encode()
+        candidate = request_context.evaluate_create_candidate(body, oversize=False)
+        self.assertIs(candidate["safe"], True)
+        request = SimpleNamespace(
+            scope={request_context.CREATE_BODY_SCOPE_KEY: candidate}
+        )
+        principal = self.admission_harness.spec.principal
+        owner = SimpleNamespace(get_id=lambda: principal)
+        other = SimpleNamespace(get_id=lambda: "cli_fixture:tenant:ou_other")
+        original_connect = psycopg2.connect
+
+        def connect(dsn, *, connect_timeout):
+            return original_connect(
+                dsn,
+                connect_timeout=connect_timeout,
+                options=f"-c search_path={self.schema},public",
+            )
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"PLATFORM_OPERATOR_DSN": self.server.get_uri()},
+            ),
+            mock.patch.object(psycopg2, "connect", side_effect=connect),
+            request_context.use_request(request),
+        ):
+            binding = recorded_create_binding(
+                self.dispatch_command.dag_run_id,
+                self.dispatch_conf,
+            )
+            self.assertIsNotNone(binding)
+            self.assertEqual(binding.principal, principal)
+            self.assertEqual(binding.run_id, self.admission.run_id)
+            self.assertEqual(binding.dag_run_id, self.dispatch_command.dag_run_id)
+            self.assertEqual(
+                binding.freeze_command_id,
+                self.command.command_id,
+            )
+            self.assertTrue(owner_create_allowed(owner, "solidworks_to_urdf"))
+            self.assertFalse(owner_create_allowed(other, "solidworks_to_urdf"))
+
+    def test_operator_successor_binding_uses_the_parent_airflow_run_id(self) -> None:
+        child_spec = replace(
+            self.admission_harness.spec,
+            run_id="run-successor",
+            request_id="portal-successor",
+            parent_run_id=self.admission.run_id,
+            from_stage="freeze",
+        )
+        child_admission = build_run_admission(child_spec)
+        child_command = build_freeze_command(child_spec)
+        child_dispatch, artifact = self._dispatch_for(
+            child_admission,
+            child_command,
+        )
+        child_conf = DispatchConf(
+            schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
+            run_id=child_admission.run_id,
+            freeze_command_id=child_command.command_id,
+        )
+        self.facts.admit_run(
+            child_admission,
+            child_command,
+            child_dispatch,
+            artifact,
+        )
+        original_connect = psycopg2.connect
+
+        def connect(dsn, *, connect_timeout):
+            return original_connect(
+                dsn,
+                connect_timeout=connect_timeout,
+                options=f"-c search_path={self.schema},public",
+            )
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"PLATFORM_OPERATOR_DSN": self.server.get_uri()},
+            ),
+            mock.patch.object(psycopg2, "connect", side_effect=connect),
+        ):
+            binding = recorded_create_binding(
+                child_dispatch.dag_run_id,
+                child_conf,
+            )
+        self.assertIsNotNone(binding)
+        self.assertEqual(binding.parent_run_id, self.admission.run_id)
+        self.assertEqual(
+            binding.parent_dag_run_id,
+            self.dispatch_command.dag_run_id,
+        )
+
     def test_fact_store_loads_the_unique_stage_command_for_a_run(self) -> None:
         self.assertEqual(
             self.facts.load_stage_command(self.admission.run_id, "freeze"),
@@ -1797,6 +1904,64 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         )
         self.assertNotEqual(claim_rows[0][0], claim_rows[0][1])
         self.assertTrue(claim_rows[0][2])
+
+    def test_terminal_dispatch_retry_closes_a_claim_left_by_close_failure(self) -> None:
+        original_close = self.facts.close_open_claim_for_command
+
+        def fail_once(*args, **kwargs):
+            raise RuntimeError("simulated post-terminal close failure")
+
+        with mock.patch.object(
+            self.facts,
+            "close_open_claim_for_command",
+            side_effect=fail_once,
+        ), self.assertRaisesRegex(RuntimeError, "post-terminal"):
+            self.dispatch_service.dispatch(self.dispatch_command.command_id)
+        self.assertEqual(
+            self.facts.effect_state(
+                self.facts.effect_settlement_for_key(
+                    self.dispatch_command.command_id,
+                    self.dispatch_command.effect_key,
+                ).effect_id
+            ),
+            EffectState.SATISFIED,
+        )
+        self.assertEqual(
+            self._query(
+                "SELECT count(*) FROM execution_claim "
+                "WHERE command_id = %s AND closed_at IS NULL",
+                (self.dispatch_command.command_id,),
+            ),
+            [(1,)],
+        )
+        barrier = threading.Barrier(2)
+
+        def retry(_index):
+            barrier.wait()
+            return self.dispatch_service.dispatch(self.dispatch_command.command_id)
+
+        with (
+            mock.patch.object(
+                self.facts,
+                "close_open_claim_for_command",
+                wraps=original_close,
+            ) as close,
+            ThreadPoolExecutor(max_workers=2) as executor,
+        ):
+            results = list(executor.map(retry, range(2)))
+        self.assertEqual(
+            [result.state for result in results],
+            [EffectState.SATISFIED, EffectState.SATISFIED],
+        )
+        self.assertEqual(close.call_count, 2)
+        self.assertEqual(
+            self._query(
+                "SELECT count(*) FROM execution_claim "
+                "WHERE command_id = %s AND closed_at IS NULL",
+                (self.dispatch_command.command_id,),
+            ),
+            [(0,)],
+        )
 
     def test_fact_store_owns_the_single_admission_control_row(self) -> None:
         initial = self.facts.admission()

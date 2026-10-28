@@ -39,6 +39,7 @@ import zipfile
 from base64 import urlsafe_b64encode
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest import mock
 
 from description_pipeline.schemas import TOOL_SCHEMA
 
@@ -236,6 +237,17 @@ class SupervisedFreezeIdentityTests(unittest.TestCase):
         cls.native_tool = tool_record("native", "Windows")
 
         _initialize_repository(cls.root)
+        cls._git_target = mock.patch(
+            "description_pipeline.pipeline.ingestion.validate_git_remote",
+            side_effect=lambda repository, _slug: _git(
+                repository,
+                "remote",
+                "get-url",
+                "origin",
+            ),
+        )
+        cls._git_target.start()
+        cls.addClassCleanup(cls._git_target.stop)
         record = cls.root / "specifications" / "joints.json"
         record.parent.mkdir(parents=True, exist_ok=True)
         record.write_text(

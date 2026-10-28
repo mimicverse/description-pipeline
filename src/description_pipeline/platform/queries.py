@@ -20,7 +20,13 @@ from ..pipeline.contracts import (
     project_stage_status,
     qualify_stage,
 )
-from ..pipeline.effects import EffectFact, EffectIntent, EffectState, project_effect_state
+from ..pipeline.effects import (
+    EffectFact,
+    EffectIntent,
+    EffectResumePhase,
+    EffectState,
+    project_effect_state,
+)
 from ..pipeline.diagnostic import DIAGNOSTIC_ADMISSION_SCHEMA, DiagnosticAdmissionSpec
 from ..schemas import (
     DIAGNOSTIC_COMMAND_REQUEST_SCHEMA,
@@ -193,6 +199,10 @@ def _effect_fact(row: tuple) -> EffectFact:
         payload_artifact_id=row[8],
         payload_digest=row[9],
         observed_at=row[10],
+        metadata_artifact_id=row[11],
+        resume_phase=(
+            EffectResumePhase(row[12]) if row[12] is not None else None
+        ),
     )
 
 
@@ -462,7 +472,8 @@ def read_run_projection(
             """
             SELECT fact.fact_id, fact.effect_id, fact.seq, fact.claim_id,
                    fact.fence, fact.fact_type, fact.source, fact.state_class,
-                   fact.payload_artifact_id, fact.payload_digest, fact.observed_at
+                   fact.payload_artifact_id, fact.payload_digest, fact.observed_at,
+                   fact.metadata_artifact_id, fact.resume_phase
             FROM effect_fact AS fact
             JOIN effect_intent AS effect
               ON effect.effect_id = fact.effect_id

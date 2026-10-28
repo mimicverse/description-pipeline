@@ -7,7 +7,6 @@ import math
 import os
 import re
 import stat
-import unicodedata
 import uuid
 from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path, PurePosixPath
@@ -64,30 +63,6 @@ def _validate_relative_path(value: str, field: str) -> str:
     if path.is_absolute() or any(segment in {"", ".", ".."} for segment in value.split("/")):
         raise EndpointProtocolError(f"{field} must stay inside the delivery: {value!r}")
     return path.as_posix()
-
-
-#: One explicit delivered-assembly selection shares the member-path bound.
-MAX_MAIN_ASSEMBLY = 1024
-
-
-def validate_main_assembly(value: object) -> str:
-    """One explicit delivered assembly: canonical POSIX path inside the handoff root.
-
-    The value is the operator's authoritative entry selection (the top engineering
-    folder is excluded). It names a saved SolidWorks assembly and must match a
-    frozen file exactly; the endpoint re-verifies that before any CAD runs.
-    """
-
-    if not isinstance(value, str) or not value or len(value) > MAX_MAIN_ASSEMBLY:
-        raise EndpointProtocolError("main_assembly must be a non-empty relative path")
-    if value != value.strip():
-        raise EndpointProtocolError("main_assembly must not carry leading or trailing whitespace")
-    if unicodedata.normalize("NFC", value) != value:
-        raise EndpointProtocolError("main_assembly must be NFC-normalized")
-    _validate_relative_path(value, "main_assembly")
-    if not value.casefold().endswith(".sldasm"):
-        raise EndpointProtocolError("main_assembly must name a saved SolidWorks assembly (.SLDASM)")
-    return value
 
 
 def normalize_change_summary(value: str) -> str:

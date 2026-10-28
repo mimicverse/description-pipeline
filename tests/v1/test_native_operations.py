@@ -61,6 +61,7 @@ from description_pipeline.orchestration.native_operation_runtime import (
     NativeOperationUnresolved,
     build_operation_record,
 )
+import description_pipeline.pipeline.capture as capture_module
 from description_pipeline.pipeline.capture import CaptureEffectDispatch
 from description_pipeline.pipeline.contracts import (
     ArtifactRef,
@@ -1273,6 +1274,115 @@ class NativeOperationRuntimeTests(unittest.TestCase):
             captured["kwargs"]["native_tool_factory"](),
             NATIVE_TOOL,
         )
+
+    def test_pre_cad_capture_failure_settles_lease_for_the_next_operation(self) -> None:
+        first_id = "operation-pre-cad-invalid"
+        second_id = "operation-after-pre-cad-invalid"
+        first_package = self.root / "pre-cad-invalid"
+        (first_package / "cad").mkdir(parents=True)
+        (first_package / "cad/robot.SLDASM").write_bytes(
+            b"not a prepared discovery package"
+        )
+        first_files = package_inventory(first_package)
+        first_archive = seal_source_archive(
+            first_package,
+            first_files,
+            self.root / "pre-cad-invalid.zip",
+        )
+
+        second_package = self.root / "capture-after-failure"
+        (second_package / "cad").mkdir(parents=True)
+        (second_package / "cad/robot.SLDASM").write_bytes(
+            b"second complete operation"
+        )
+        second_files = package_inventory(second_package)
+        second_archive = seal_source_archive(
+            second_package,
+            second_files,
+            self.root / "capture-after-failure.zip",
+        )
+        transaction_run_ids = []
+
+        def transaction(package, output, **kwargs):
+            transaction_run_ids.append(kwargs["run_id"])
+            if kwargs["run_id"] == first_id:
+                return capture_module._capture_native_transaction(
+                    package,
+                    output,
+                    **kwargs,
+                )
+            output.mkdir(parents=True)
+            (output / CAPTURE_ARCHIVE).write_bytes(
+                b"sealed capture after rejected input"
+            )
+            return {
+                "native_complete": True,
+                "capture_archive": {"name": CAPTURE_ARCHIVE},
+                "resource_settlement": {"settled": True},
+                "output": str(output),
+            }
+
+        runtime = NativeOperationRuntime(
+            state_root=self.root / "state",
+            native_tool_factory=lambda: NATIVE_TOOL,
+            executors={
+                CAPTURE_KIND: CaptureOperationExecutor(
+                    transaction=transaction,
+                    backend_factory=lambda _package: object(),
+                )
+            },
+        )
+        self.addCleanup(runtime.close)
+
+        runtime.create(
+            _operation(
+                first_id,
+                first_archive,
+                package_files=first_files,
+            )
+        )
+        runtime.admit_input(first_id, first_archive)
+        first = _wait_for(
+            lambda: (
+                view
+                if (view := runtime.view(first_id))["state"]
+                in {"failed", "unknown"}
+                else None
+            )
+        )
+        self.assertEqual(first["state"], "failed")
+        self.assertTrue(first["resource_terminated"])
+        self.assertEqual(
+            first["failure"]["code"],
+            "capture.native_failed",
+        )
+
+        with runtime._connect() as connection:
+            lease = connection.execute(
+                "SELECT operation_id FROM native_resource_lease "
+                "WHERE singleton=1"
+            ).fetchone()
+        self.assertIsNone(lease)
+
+        runtime.create(
+            _operation(
+                second_id,
+                second_archive,
+                package_files=second_files,
+            )
+        )
+        runtime.admit_input(second_id, second_archive)
+        second = _wait_for(
+            lambda: (
+                view
+                if (view := runtime.view(second_id))["state"]
+                in {"satisfied", "failed", "unknown"}
+                else None
+            )
+        )
+        self.assertEqual(second["state"], "satisfied")
+        self.assertTrue(second["resource_terminated"])
+        self.assertEqual(transaction_run_ids, [first_id, second_id])
 
     def test_linux_capture_adapter_observes_exact_identity_and_calls_windows_once(self) -> None:
         package = self.root / "prepared-adapter"

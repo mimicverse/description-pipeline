@@ -118,7 +118,7 @@ def generate_urdf(model: EngineeringModel, source: Path, destination: Path) -> P
                 # XML comment terminator from an authored name or message.
                 payload = json.dumps(detail, ensure_ascii=True, sort_keys=True).replace("--", r"\u002d\u002d")
                 code = str(warning["code"]).replace("--", "- -")
-                document.append(ET.Comment(f"WARNING {code}: {payload} See reports/quality.json."))
+                document.append(ET.Comment(f"WARNING {code}: {payload} See reports/verification-certificate.json."))
     for link in data["links"]:
         node = ET.SubElement(document, "link", name=link["name"])
         inertia = link["inertial"]

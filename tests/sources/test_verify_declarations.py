@@ -1761,7 +1761,7 @@ class NativeDeclarationsTests(unittest.TestCase):
             )
 
             def sync_robot() -> None:
-                derived = payload.setdefault("derived", {})
+                derived = payload.setdefault("raw", {}).setdefault("derived", {})
                 block = robot.get("source") or {}
                 derived["bodies"] = copy.deepcopy(block.get("bodies") or [])
                 derived["joints"] = copy.deepcopy(block.get("joints") or [])
@@ -1796,6 +1796,7 @@ class NativeDeclarationsTests(unittest.TestCase):
             self.assertNotIn("discovery.budgets", {check["id"] for check in report["checks"]})
 
             authored = copy.deepcopy(raw["identity"])
+            identity_keys = list(payload["identity"])
             source["metadata"]["revision"] = None
             reseal()
             mismatched = verify_discovery(package)
@@ -1805,7 +1806,7 @@ class NativeDeclarationsTests(unittest.TestCase):
             )
 
             raw["identity"] = dict.fromkeys(authored)
-            payload["identity"] = copy.deepcopy(raw["identity"])
+            payload["identity"] = dict.fromkeys(payload["identity"])
             robot["hardware_id"] = None
             robot["source"]["robot_name"] = "robot"
             payload["identity"]["robot_name_technical"] = "robot"
@@ -1844,12 +1845,15 @@ class NativeDeclarationsTests(unittest.TestCase):
                 reseal()
                 self.assertIn("discovery.identity", {item["code"] for item in verify_discovery(package)["errors"]})
                 raw["identity"] = dict.fromkeys(authored)
-                payload["identity"] = copy.deepcopy(raw["identity"])
+                payload["identity"] = dict.fromkeys(identity_keys)
                 robot["hardware_id"] = None
                 robot["source"]["robot_name"] = "robot"
                 payload["identity"]["robot_name_technical"] = "robot"
             raw["identity"] = authored
-            payload["identity"] = copy.deepcopy(authored)
+            payload["identity"] = {
+                key: copy.deepcopy(authored.get(key))
+                for key in identity_keys
+            }
             robot["hardware_id"] = "fixture"
             robot["source"]["robot_name"] = "fixture"
             source["metadata"]["owner"] = authored["owner"]

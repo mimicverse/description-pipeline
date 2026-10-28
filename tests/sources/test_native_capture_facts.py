@@ -124,6 +124,7 @@ class NativeCaptureFactsTests(unittest.TestCase):
                         "name": "base",
                         "path": "/source/base.SLDPRT",
                         "transform_raw": self.identity,
+                        "suppression_state": 2,
                         "is_fixed": True,
                         "document_type": "part",
                     }
@@ -133,6 +134,7 @@ class NativeCaptureFactsTests(unittest.TestCase):
                         "name": "base",
                         "path": "/source/base.SLDPRT",
                         "transform_raw": self.identity,
+                        "suppression_state": 2,
                         "is_fixed": True,
                         "document_type": "part",
                     }
@@ -186,7 +188,6 @@ class NativeCaptureFactsTests(unittest.TestCase):
                     "stream_path": "",
                     "stream_sha256": "",
                     "triangle_count": 1,
-                    "transform_raw": self.identity,
                     "body_inventory": [
                         {
                             "body_type": 0,
@@ -215,16 +216,17 @@ class NativeCaptureFactsTests(unittest.TestCase):
             "axis_references_raw": [],
             "document_state": {
                 "before": {
-                    "configuration": "Default",
+                    "path": "/source/root.SLDASM",
+                    "active_configuration": "Default",
                     "read_only": True,
                     "save_flag": False,
                 },
                 "after": {
-                    "configuration": "Default",
+                    "path": "/source/root.SLDASM",
+                    "active_configuration": "Default",
                     "read_only": True,
                     "save_flag": False,
                 },
-                "used_api": "fixture",
             },
             "input_stability": {
                 "originals_unchanged": {"files_checked": 1},
@@ -868,6 +870,61 @@ class NativeCaptureFactsTests(unittest.TestCase):
         (self.root / "evidence/raw/native_capture_facts.json").unlink()
         with self.assertRaises(PipelineError):
             verify_native_capture_facts(self.root)
+
+    def test_raw_document_state_is_independently_bound_without_save_flag_gate(
+        self,
+    ) -> None:
+        baseline = copy.deepcopy(self.raw_facts)
+        for label, mutate in (
+            (
+                "foreign-path",
+                lambda facts: facts["document_state"]["before"].__setitem__(
+                    "path",
+                    "/foreign/foreign.SLDASM",
+                ),
+            ),
+            (
+                "other-configuration",
+                lambda facts: facts["document_state"]["after"].__setitem__(
+                    "active_configuration",
+                    "Other",
+                ),
+            ),
+            (
+                "writable",
+                lambda facts: facts["document_state"]["before"].__setitem__(
+                    "read_only",
+                    False,
+                ),
+            ),
+        ):
+            with self.subTest(label=label):
+                facts = copy.deepcopy(baseline)
+                mutate(facts)
+                self.raw_facts = facts
+                self.write_capture()
+                with self.assertRaises(PipelineError):
+                    verify_native_capture_facts(self.root)
+
+        facts = copy.deepcopy(baseline)
+        facts["document_state"]["before"]["save_flag"] = True
+        facts["document_state"]["after"]["save_flag"] = True
+        self.raw_facts = facts
+        self.write_capture()
+        self.assertTrue(
+            verify_native_capture_facts(self.root)["native_capture_facts"]
+        )
+
+    def test_raw_scene_rejects_retired_duplicate_state_fields(self) -> None:
+        baseline = copy.deepcopy(self.raw_facts)
+        for field in ("document_state", "source_sha256"):
+            with self.subTest(field=field):
+                facts = copy.deepcopy(baseline)
+                facts["scene_raw"][field] = {}
+                self.raw_facts = facts
+                self.write_capture()
+                with self.assertRaises(PipelineError):
+                    verify_native_capture_facts(self.root)
 
     def test_raw_member_tamper_breaks_the_source_manifest(self):
         path = self.root / "evidence/raw/native_capture_facts.json"

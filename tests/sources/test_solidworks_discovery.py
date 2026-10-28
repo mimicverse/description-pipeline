@@ -44,6 +44,7 @@ from description_pipeline.sources.solidworks.discovery import (  # noqa: E402
 )
 from description_pipeline.sources.solidworks.errors import CadError  # noqa: E402
 from description_pipeline.sources.solidworks.native import _merge_property_scopes  # noqa: E402
+from description_pipeline.sources.solidworks.native_limits import validate_native_limit  # noqa: E402
 from description_pipeline.sources.solidworks.scene import _value_warnings  # noqa: E402
 from description_pipeline.verification.solidworks_urdf import _carrier_snapshot  # noqa: E402
 from description_pipeline.schemas import SOURCE_RECORD_SCHEMA  # noqa: E402
@@ -2229,6 +2230,45 @@ class DiscoveryTests(unittest.TestCase):
         self.assertFalse(report["passed"])
         self.assertIn("discovery.graph", {item["code"] for item in report["errors"]})
 
+    def test_negative_native_limit_face_selector_is_unreadable(self):
+        mate = support.native_limit_mate("base-1", "arm-1")
+        for index, entity in enumerate(mate["entities"]):
+            entity.update(
+                feature=None,
+                face_index=-(index + 1),
+            )
+        with self.assertRaisesRegex(ValueError, "face selector"):
+            validate_native_limit(mate)
+
+        def mutate(payload):
+            payload["mates"][0]["limits"] = None
+            observed = support.native_limit_mate(
+                "base-1",
+                "arm-1",
+                name="shoulder_pitch_joint",
+            )
+            for index, entity in enumerate(observed["entities"]):
+                entity.update(
+                    feature=None,
+                    face_index=-(index + 1),
+                )
+            payload["mates"].append(observed)
+
+        result, _source, _output = self._prepare(mutate=mutate)
+        self.assertIn("discovery.joint_limits_unreadable", self._codes(result))
+
+        baseline, _source, baseline_output = self._prepare()
+        self.assertTrue(baseline.passed, baseline.findings)
+        report = self._verify_mutated_record(
+            baseline_output,
+            lambda payload: mutate(payload["raw"]),
+        )
+        self.assertFalse(report["passed"])
+        self.assertIn(
+            "discovery.joint_limits_unreadable",
+            {item["code"] for item in report["errors"]},
+        )
+
     def test_incomplete_limited_mate_payload_is_unreadable(self):
         payload = record()
         cluster_findings: list[dict] = []
@@ -3662,19 +3702,82 @@ class DiscoveryTests(unittest.TestCase):
 
             return apply
 
-        for label, claim, observation, expected in (
-            ("omitted_claim_with_observations", "omitted", "kept", True),
-            ("omitted_claim_no_observation", "omitted", "absent", False),
-            ("null_claim_no_observation", "null", "absent", False),
-            ("omitted_claim_contradictory_observation", "omitted", "contradicting", False),
+        for label, claim, observation in (
+            ("omitted_claim_with_observations", "omitted", "kept"),
+            ("omitted_claim_no_observation", "omitted", "absent"),
+            ("null_claim_no_observation", "null", "absent"),
+            ("omitted_claim_contradictory_observation", "omitted", "contradicting"),
         ):
             with self.subTest(case=label):
                 delivery = self._deliver(output)
                 self._tamper_delivered(delivery, "input/discovery/native-discovery.json", mutation(claim, observation))
                 report = verify_discovery(delivery)
-                self.assertEqual(report["passed"], expected)
-                if not expected:
-                    self.assertIn("discovery.configuration", [item["code"] for item in report["errors"]])
+                self.assertFalse(report["passed"])
+                self.assertTrue(
+                    {
+                        "discovery.binding",
+                        "discovery.configuration",
+                        "discovery.identity",
+                    }
+                    & {item["code"] for item in report["errors"]}
+                )
+
+    def test_discovery_exact_keys_are_shared_by_rebuild_and_verifier(self) -> None:
+        result, _source, output = self._prepare()
+        self.assertTrue(result.passed, result.findings)
+        mutations = (
+            (
+                "envelope",
+                lambda payload: payload.__setitem__(
+                    "unknown_envelope_field",
+                    True,
+                ),
+            ),
+            (
+                "identity",
+                lambda payload: payload["identity"].__setitem__(
+                    "unknown_identity_field",
+                    True,
+                ),
+            ),
+            (
+                "derivation",
+                lambda payload: payload["derivation"].__setitem__(
+                    "unknown_derivation_field",
+                    True,
+                ),
+            ),
+            (
+                "record",
+                lambda payload: payload["records"][0].__setitem__(
+                    "unknown_record_field",
+                    True,
+                ),
+            ),
+        )
+        for label, mutate in mutations:
+            with self.subTest(label=label):
+                delivery = self._deliver(output)
+                self._tamper_delivered(
+                    delivery,
+                    "input/discovery/native-discovery.json",
+                    mutate,
+                )
+                report = verify_discovery(delivery)
+                self.assertFalse(report["passed"])
+                self.assertIn(
+                    "discovery.binding",
+                    {item["code"] for item in report["errors"]},
+                )
+                with self.assertRaises(PipelineError):
+                    source_definition(
+                        delivery,
+                        discovery_name=(
+                            "input/discovery/native-discovery.json"
+                        ),
+                        cad_prefix="input/cad/",
+                        records_prefix="input/",
+                    )
 
     def test_verifier_separates_full_upload_and_selected_closure_handoff(self) -> None:
         raw = record()

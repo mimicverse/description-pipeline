@@ -1,7 +1,13 @@
 // Operator page logic. All Airflow and Windows endpoint credentials stay on the server; this
 // module only talks to the portal's own JSON API and the digest-verified artifact routes.
 import { buildJointControls, createViewer, disposeRobot, loadRobot } from "/static/viewer.js";
-import { menuAction, overlayRun, resolveDeleted, resolveTitle } from "/static/run_history.js";
+import {
+  menuAction,
+  overlayRun,
+  resolveDeleted,
+  resolveTitle,
+  shouldRefreshRunList,
+} from "/static/run_history.js";
 import { activityPlacement, activityView } from "/static/activity.js";
 import {
   closureRows,
@@ -13,7 +19,7 @@ import {
   previewDiagnosticState,
   previewExpansion,
   purposeLabel,
-  registeredQualityArtifact,
+  registeredVerificationArtifact,
   stageEntersPreview,
   stageSummaryRows,
   summaryIdentity,
@@ -64,6 +70,7 @@ const RUN_STATES = {
   success: "Succeeded",
   failed: "Failed",
   unresolved: "Unresolved",
+  cancelled: "Cancelled",
 };
 const TASK_STATES = {
   success: "Succeeded",
@@ -569,7 +576,8 @@ function formatRunTime(value) {
 }
 
 function deleteBlockedReason(run) {
-  if (run.state === "success" || run.state === "failed") return "";
+  if (run.state === "success" || run.state === "failed" || run.state === "cancelled") return "";
+  if (run.state === "unresolved") return "External effects require reconciliation before deletion.";
   if (run.state === "queued" || run.state === "running") return "This run cannot be deleted before it ends.";
   return "Run state is unknown, so deletion is unavailable.";
 }
@@ -1067,30 +1075,6 @@ function checkRow(parent, row) {
 //: pass bookkeeping or per-item human confirmation.
 const WARNING_ROW_LIMIT = 8;
 const WARNING_VALUE_LIMIT = 8;
-const WARNING_VALUE_KEYS = [
-  "limits",
-  "components",
-  "links",
-  "joint",
-  "mate",
-  "mate_type",
-  "scope",
-  "mass_kg",
-  "masses",
-  "object_type",
-  "object",
-  "objects",
-  "fields",
-  "field",
-  "original",
-  "actual",
-  "source",
-  "rule_id",
-  "rule_version",
-  "reason",
-  "qualification_blocker",
-  "publication_blocker",
-];
 
 function warningValueText(value) {
   if (value === null) return "null";
@@ -1109,25 +1093,6 @@ function warningValueText(value) {
   return String(value);
 }
 
-const WARNING_SOURCE_KEYS = new Set([
-  "object_type",
-  "object",
-  "objects",
-  "fields",
-  "field",
-  "original",
-  "actual",
-  "source",
-  "rule_id",
-  "rule_version",
-  "reason",
-  "file",
-  "sha256",
-  "anchor",
-  "key",
-  "reference",
-  "native_observation_errors",
-]);
 
 function warningSourceText(value) {
   return value === undefined ? "not recorded" : warningValueText(value);
@@ -1159,6 +1124,9 @@ function appendWarningSourceRows(parent, warning) {
         ? `native_observation_errors=${warningSourceText(row.native_observation_errors)}`
         : "",
     ].filter(Boolean);
+    if (row.extra) {
+      parts.push(...Object.entries(row.extra).map(([key, value]) => `${key}=${warningValueText(value)}`));
+    }
     line.textContent = parts.join("; ");
     details.append(line);
   }
@@ -1200,30 +1168,7 @@ function stageWarningRow(row) {
     line.textContent = blockers.join("; ");
     item.append(line);
   }
-  const hasSourceRows = appendWarningSourceRows(item, row);
-  const keys = WARNING_VALUE_KEYS.filter(
-    (key) =>
-      row[key] !== undefined &&
-      row[key] !== null &&
-      !(hasSourceRows && WARNING_SOURCE_KEYS.has(key)),
-  );
-  const residual = row.residual && typeof row.residual === "object" ? Object.entries(row.residual) : [];
-  if (keys.length || residual.length) {
-    const details = expandable(item, "Recorded values");
-    const list = document.createElement("div");
-    list.className = "warning-values";
-    for (const key of keys) {
-      const line = document.createElement("p");
-      line.textContent = `${key}: ${warningValueText(row[key])}`;
-      list.append(line);
-    }
-    for (const [key, value] of residual) {
-      const line = document.createElement("p");
-      line.textContent = `residual.${key}: ${warningValueText(value)}`;
-      list.append(line);
-    }
-    details.append(list);
-  }
+  appendWarningSourceRows(item, row);
   return item;
 }
 
@@ -1442,7 +1387,7 @@ function renderStageDetail() {
   const quick = stageSummaryRows(stage.id, {
     files: state.previewFiles,
     stage,
-    quality: state.previewData ? state.previewData.quality : null,
+    certificate: state.previewData ? state.previewData.certificate : null,
     pr: run ? run.pr : null,
     subjectSha256: state.previewSubject,
   });
@@ -1641,7 +1586,7 @@ async function renderPreviewPanels(preview, records, artifactUrl, signal) {
   for (const [key, files, name] of [
     ["robot", preview.files, "model/robot.json"],
     ["tool", preview.files, "tool.json"],
-    ["quality", preview.report_files, "reports/quality.json"],
+    ["certificate", preview.report_files, "verification-certificate.json"],
   ]) {
     try {
       data[key] = await loadPreviewArtifactJson(artifactUrl, files, name, signal);
@@ -1660,8 +1605,8 @@ async function renderPreviewPanels(preview, records, artifactUrl, signal) {
     subjectSha256: identity.subject_sha256,
     purpose: preview.purpose,
     tool: data.tool,
-    qualitySchema: data.quality ? data.quality.schema_version : null,
-    qualificationStates: data.quality ? data.quality.qualifications : null,
+    certificateSchema: data.certificate ? data.certificate.schema_version : null,
+    qualificationStates: data.certificate ? data.certificate.qualifications : null,
   })) {
     const key = document.createElement("dt");
     key.textContent = row.key;
@@ -1715,7 +1660,7 @@ async function renderPreviewPanels(preview, records, artifactUrl, signal) {
   );
   $("links-title").textContent = `Link/body mass and inertia (${links.length})`;
   const frames = frameRows(data.robot ? data.robot.frames : []);
-  const closure = closureRows(data.quality ? data.quality.checks : []);
+  const closure = closureRows(data.certificate ? data.certificate.checks : []);
   fillPanelTable(
     $("panel-frames"),
     ["Frame / interface", "Parent", "xyz (m)", "rpy (rad)"],
@@ -1746,7 +1691,7 @@ function startActivityTimer() {
   state.activityTimer = window.setInterval(() => {
     const run = state.lastRun;
     if (!run || run.dag_run_id !== state.dagRunId) return;
-    if (run.state === "success" || run.state === "failed") return;
+    if (run.state === "success" || run.state === "failed" || run.state === "cancelled") return;
     renderActivity(run);
   }, 1000);
 }
@@ -2364,21 +2309,21 @@ function renderRun(run) {
 
   const findings = $("findings");
   findings.textContent = "";
-  // The automatically retained structural-team report stays directly downloadable on runs
+  // The registered verification evidence stays directly downloadable on runs
   // without a verified delivery (failed Windows or Linux runs); no URL hunting required.
-  const retainedReports = Array.isArray(run.structural_report) ? run.structural_report : [];
+  const retainedReports = Array.isArray(run.verification_reports) ? run.verification_reports : [];
   if (retainedReports.length) {
     const item = document.createElement("li");
     item.className = "report-download";
     const label = document.createElement("span");
-    label.textContent = "Structural-team report (generated):";
+    label.textContent = "Verification evidence:";
     item.append(label, " ");
     for (const entry of retainedReports) {
       const link = document.createElement("a");
       link.href = String(entry.url || "");
       link.target = "_blank";
       link.rel = "noopener";
-      link.textContent = entry.label || entry.path || "Structural-team report";
+      link.textContent = entry.label || entry.path || "Verification evidence";
       item.append(link, " ");
     }
     findings.append(item);
@@ -2535,14 +2480,14 @@ function renderPreviewDiagnostic(preview) {
       "Recorded source warnings are neither passes nor publication evidence. " +
       "Default ranges are not native mechanical limits or hardware qualifications.";
     warningDetails.append(statement);
-    const qualityArtifact = registeredQualityArtifact(preview, state.dagRunId);
-    if (qualityArtifact) {
+    const certificateArtifact = registeredVerificationArtifact(preview, state.dagRunId);
+    if (certificateArtifact) {
       const link = document.createElement("a");
-      link.href = qualityArtifact.href;
+      link.href = certificateArtifact.href;
       link.target = "_blank";
       link.rel = "noopener";
-      link.dataset.sha256 = qualityArtifact.sha256;
-      link.textContent = "Open registered quality report (reports/quality.json)";
+      link.dataset.sha256 = certificateArtifact.sha256;
+      link.textContent = "Open verification certificate";
       warningDetails.append(link);
     }
     for (const warning of diagnostic.warnings) {
@@ -2584,9 +2529,9 @@ async function loadPreview(dagRunId) {
   try {
     const preview = await api(`/api/runs/${encodeURIComponent(dagRunId)}/preview`, { signal: request.signal });
     if (request.signal.aborted || state.dagRunId !== dagRunId) return;
+    renderPreviewDiagnostic(preview);
     if (state.previewSubject === preview.subject_sha256) return;
     $("preview-meta").textContent = `Delivery subject ${String(preview.subject_sha256).slice(0, 12)}... · URDF ${preview.urdf}`;
-    renderPreviewDiagnostic(preview);
     note.hidden = true;
     setError($("preview-note"), "");
     state.viewer = ensureSingleViewer(state, () => createViewer($("viewer"))).viewer;
@@ -2656,7 +2601,7 @@ async function poll() {
     if (state.dagRunId !== dagRunId) return;
     setError($("run-error-detail"), "");
     const verified = run.automatic && run.automatic.state === "passed";
-    const diagnosable = !verified && run.state === "failed";
+    const diagnosable = !verified && ["failed", "unresolved"].includes(run.state);
     if (!verified && !diagnosable) clearPreview();
     const previous = state.lastRun;
     state.lastRun = run;
@@ -2665,16 +2610,10 @@ async function poll() {
       await loadPreview(dagRunId);
     }
     if (state.dagRunId !== dagRunId) return;
-    const jobDone = run.job && (run.job.status === "passed" || run.job.status === "failed");
-    if ((run.state === "success" || run.state === "failed") && jobDone && (!verified || state.previewSubject)) {
-      if (state.timer) window.clearInterval(state.timer);
-      state.timer = null;
-      stopActivityTimer();
-    }
-    const terminalNow = run.state === "success" || run.state === "failed";
-    if (terminalNow && !(previous && (previous.state === "success" || previous.state === "failed"))) {
-      await refreshRuns();
-    }
+    // A late effect conflict can revoke success, so canonical polling continues while
+    // this run is selected. Only live activity animation stops at a known terminal state.
+    if (["success", "failed", "cancelled", "unresolved"].includes(run.state)) stopActivityTimer();
+    if (shouldRefreshRunList(previous, run)) await refreshRuns();
   } catch (error) {
     if (state.dagRunId !== dagRunId) return;
     if (error.status === 401) {

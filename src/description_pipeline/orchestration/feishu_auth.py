@@ -433,7 +433,7 @@ class FeishuAuthManager(BaseAuthManager[FeishuUser]):
             and route.http_method == "POST"
             and route.dag_run_id is None
         ):
-            # Parent selection is untrusted; persisted parent ownership must match the caller.
+            # The body is untrusted; persisted admission, dispatch and parent ownership must match.
             return owner_create_allowed(user, route.dag_id)
         if (
             method == "PUT"

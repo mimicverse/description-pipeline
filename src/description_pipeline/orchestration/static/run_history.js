@@ -29,3 +29,10 @@ export function overlayRun(runs, run, patch) {
   }
   if (run) Object.assign(run, patch);
 }
+
+// Canonical state is authoritative in both the detail and the visible cached list. Refresh the
+// list whenever it changes, including a terminal result that later becomes unresolved.
+export function shouldRefreshRunList(previous, current) {
+  if (!current) return false;
+  return !previous || previous.state !== current.state;
+}

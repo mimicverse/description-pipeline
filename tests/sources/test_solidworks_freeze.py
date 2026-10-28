@@ -93,9 +93,6 @@ class RawCaptureFreezeTests(unittest.TestCase):
                 "raw/dependency_closure.json",
                 "raw/native_capture_facts.json",
                 "raw/triangles/f56f6426f638a44dc1da3320e7d1c79c149af69c01ae6e0f147733f8a5dbeff5.triangles",
-                "source/arm.SLDPRT",
-                "source/base.SLDPRT",
-                "source/robot.SLDASM",
             },
         )
         for retired in (

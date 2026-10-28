@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import copy
 import math
+import ntpath
 from pathlib import Path
 
 from ..geometry.native_scope import native_source_scope_is_valid
 from ..geometry.native_transform import transform_from_solidworks
 from ..io import PipelineError
-from ..schemas import NATIVE_CAPTURE_OBSERVATION_KEYS
+from ..schemas import (
+    NATIVE_CAPTURE_OBSERVATION_KEYS,
+    NATIVE_SCENE_RAW_KEYS,
+)
 from ..sources.solidworks.inertia_convention import POSITIVE, detect_family
 from . import capture_evidence as evidence
 
@@ -159,8 +163,41 @@ def _raw_link_detector_record(raw: object) -> dict:
 
 def _verify_raw_scene(root: Path, raw_facts: dict) -> None:
     raw_scene = raw_facts.get("scene_raw")
-    if not isinstance(raw_scene, dict):
+    if (
+        not isinstance(raw_scene, dict)
+        or set(raw_scene) != NATIVE_SCENE_RAW_KEYS
+    ):
         raise PipelineError("native capture facts carry no scene_raw object")
+    document_state = raw_facts.get("document_state")
+    scene_document = raw_scene.get("document")
+    scene_configuration = raw_scene.get("configuration")
+    if (
+        not isinstance(document_state, dict)
+        or set(document_state) != {"before", "after"}
+        or not isinstance(scene_document, str)
+        or not scene_document
+        or not isinstance(scene_configuration, str)
+        or not scene_configuration
+    ):
+        raise PipelineError("raw Capture document identity is incomplete")
+    normalized_document = ntpath.normcase(
+        ntpath.normpath(scene_document.replace("/", "\\"))
+    )
+    for phase in ("before", "after"):
+        state = document_state.get(phase)
+        state_path = state.get("path") if isinstance(state, dict) else None
+        if (
+            not isinstance(state_path, str)
+            or ntpath.normcase(
+                ntpath.normpath(state_path.replace("/", "\\"))
+            )
+            != normalized_document
+            or state.get("read_only") is not True
+            or state.get("active_configuration") != scene_configuration
+        ):
+            raise PipelineError(
+                f"raw Capture document {phase} state is not the requested read-only configuration"
+            )
     projected = evidence.scene(root)
     if not isinstance(projected, dict):
         raise PipelineError("projected scene is not an object")

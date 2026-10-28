@@ -55,7 +55,11 @@ def derive_engineering_input(
 
     from .discovery import source_definition
 
-    observation = load_native_capture_observation(root)
+    verified_streams = {}
+    observation = load_native_capture_observation(
+        root,
+        verified_streams=verified_streams,
+    )
     delivery = Path(root)
     delivery = delivery.parent if delivery.name == "evidence" else delivery
     payload = read_data(
@@ -104,6 +108,7 @@ def derive_engineering_input(
             observation["source_scopes"],
             evidence_root=root,
             destination_root=mesh_root,
+            verified_streams=verified_streams,
         ).values()
     )
     from .appearance import bind_capture_appearance

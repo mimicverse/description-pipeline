@@ -63,15 +63,6 @@ _REQUIRED_REPORTS = (
 )
 
 
-TEAM_REPORTS = ("reports/structural-team.md", "reports/structural-team.json")
-
-
-_TEAM_RECEIPT_KEYS = {
-    "reports/structural-team.md": "structural_team_md_bytes",
-    "reports/structural-team.json": "structural_team_json_bytes",
-}
-
-
 _LIVE_REPORTS = ("reports/stages.json",)
 
 
@@ -88,10 +79,52 @@ def _require(condition, message: str) -> None:
         raise PipelineError(message)
 
 
-def _allowed_payload(name: str) -> bool:
-    """Only the archived input, the evidence snapshot and the sealed reports are payload."""
+_CANONICAL_EVIDENCE = frozenset(
+    {
+        "evidence/manifest.json",
+        "evidence/native-runtime.json",
+        "evidence/raw/dependency_closure.json",
+        "evidence/raw/native_capture_facts.json",
+    }
+)
 
-    return name.startswith(("input/", "evidence/")) or name in _REQUIRED_REPORTS or name in TEAM_REPORTS
+
+def _is_canonical_evidence(name: str) -> bool:
+    if name in _CANONICAL_EVIDENCE:
+        return True
+    if not name.startswith("evidence/raw/triangles/"):
+        return False
+    relative = name.removeprefix("evidence/")
+    try:
+        parts = artifact_path_parts(relative)
+    except PipelineError:
+        return False
+    return (
+        len(parts) == 3
+        and parts[:2] == ("raw", "triangles")
+        and parts[2].endswith(".triangles")
+        and _is_sha256(parts[2][: -len(".triangles")])
+    )
+
+
+def _allowed_payload(name: str) -> bool:
+    """Only archived input, canonical evidence and sealed reports are payload."""
+
+    return (
+        name.startswith("input/")
+        or _is_canonical_evidence(name)
+        or name in _REQUIRED_REPORTS
+    )
+
+
+def _payload_candidate(name: str) -> bool:
+    """Names that can belong to the native transfer contract."""
+
+    return (
+        name.startswith(("input/", "evidence/"))
+        or name in _REQUIRED_REPORTS
+        or name in _LIVE_REPORTS
+    )
 
 
 def _is_sha256(value) -> bool:
@@ -530,7 +563,8 @@ def _validate_evidence(
     native_files: dict[str, str],
     native_tool: dict,
     native_prepared_dir: str | None = None,
-) -> dict:
+    discovery_record: dict | None = None,
+) -> tuple[dict, dict]:
     evidence = Path(root) / "evidence"
     manifest = verify_snapshot(evidence)
     _require(
@@ -550,6 +584,19 @@ def _validate_evidence(
     observation = load_native_capture_observation(root)
     plan = read_data(confined(root, "input/capture-plan.json"))
     validate_native_capture_plan(observation, plan)
+    triangle_files = {
+        name
+        for name in manifest["files"]
+        if name.startswith("raw/triangles/")
+    }
+    referenced_triangles = {
+        str(row["stream_path"])
+        for row in observation["geometry_raw"].values()
+    }
+    _require(
+        triangle_files == referenced_triangles,
+        "Evidence triangle inventory differs from raw geometry references",
+    )
     raw_closure = read_data(confined(evidence, "raw/dependency_closure.json"))
     _require(isinstance(raw_closure, dict), "Dependency closure must be an object")
     _require(identity.get("provider") == "solidworks", "Evidence identity has the wrong provider")
@@ -614,10 +661,24 @@ def _validate_evidence(
     collected_source = _normalize_document_path(collected_document)
     closure_source = _normalize_document_path(raw_closure.get("top_level"))
     expected_source_suffix = "\\" + _normalize_document_path(main_assembly)
-    discovery_record = read_data(
-        confined(root, "input/discovery/native-discovery.json")
+    if discovery_record is None:
+        discovery_record = read_data(
+            confined(root, "input/discovery/native-discovery.json")
+        )
+    discovery_identity = (
+        discovery_record.get("identity")
+        if isinstance(discovery_record, dict)
+        else None
     )
-    discovery_identity = discovery_record.get("identity") if isinstance(discovery_record, dict) else None
+    _require(
+        isinstance(discovery_identity, dict)
+        and plan.get("identity")
+        == {
+            "hardware_id": discovery_identity.get("hardware_id"),
+            "revision": discovery_identity.get("revision"),
+        },
+        "Capture plan identity differs from sealed discovery",
+    )
     discovery_main = discovery_identity.get("main_assembly") if isinstance(discovery_identity, dict) else None
     _require(
         isinstance(discovery_main, str) and bool(discovery_main),
@@ -678,7 +739,7 @@ def _validate_evidence(
         and _document_basename(collected_document).casefold() == _document_basename(main_assembly).casefold(),
         "Evidence capture names another collected main assembly",
     )
-    return identity
+    return identity, manifest
 
 
 def _stage_checks(view: dict) -> dict[str, dict]:
@@ -742,6 +803,8 @@ def expected_native_check_details(
     handoff_sha256: str,
     main_assembly: str,
     native_files: dict[str, str],
+    discovery_record: dict | None = None,
+    evidence_manifest: dict | None = None,
 ) -> dict[str, dict]:
     """Recompute every stage detail that is derivable from the final capture tree."""
 
@@ -755,9 +818,10 @@ def expected_native_check_details(
     package_files = handoff_record.get("package_files")
     prepared_inputs = _prepared_input_inventory(root, native_files, input_inventory, package_files)
     expected_input = {f"input/{name}": checksum for name, checksum in input_inventory.items()}
-    discovery_record = read_data(
-        confined(root, "input/discovery/native-discovery.json")
-    )
+    if discovery_record is None:
+        discovery_record = read_data(
+            confined(root, "input/discovery/native-discovery.json")
+        )
     derivation = discovery_record.get("derivation") if isinstance(discovery_record, dict) else None
     record_roots = derivation.get("record_roots") if isinstance(derivation, dict) else []
     _require(
@@ -765,7 +829,8 @@ def expected_native_check_details(
         "Native discovery derivation carries invalid controlled-record roots",
     )
     evidence_root = Path(root) / "evidence"
-    evidence_manifest = verify_snapshot(evidence_root)
+    if evidence_manifest is None:
+        evidence_manifest = verify_snapshot(evidence_root)
     expected_evidence = {
         "evidence/manifest.json": file_digest(evidence_root / "manifest.json"),
         **{
@@ -804,6 +869,8 @@ def _validate_stage_details(
     handoff_sha256: str,
     main_assembly: str,
     native_files: dict[str, str],
+    discovery_record: dict | None = None,
+    evidence_manifest: dict | None = None,
 ) -> None:
     checks = _stage_checks(view)
     expected = expected_native_check_details(
@@ -811,6 +878,8 @@ def _validate_stage_details(
         handoff_sha256=handoff_sha256,
         main_assembly=main_assembly,
         native_files=native_files,
+        discovery_record=discovery_record,
+        evidence_manifest=evidence_manifest,
     )
     required_identifiers = {
         "input.valid",
@@ -835,6 +904,7 @@ def _validate_source_identity(
     upload_sha256: str,
     main_assembly: str,
     configuration: str,
+    discovery_record: dict | None = None,
 ) -> dict:
     source = validate_source_record(read_data(confined(root, "input/source.json")))
     identity = source["identity"]
@@ -862,8 +932,12 @@ def _validate_source_identity(
         and selection.get("hardware_id") == hardware,
         "Source record identity differs from the frozen handoff or transfer",
     )
-    discovery = read_data(
-        confined(root, "input/discovery/native-discovery.json")
+    discovery = (
+        discovery_record
+        if discovery_record is not None
+        else read_data(
+            confined(root, "input/discovery/native-discovery.json")
+        )
     )
     discovery_identity = discovery.get("identity") if isinstance(discovery, dict) else {}
     _require(
@@ -975,7 +1049,7 @@ def _validate_native_discovery(
     main_assembly: str,
     handoff_sha256: str,
     actual_inputs: dict[str, str],
-) -> tuple[dict[str, str], str]:
+) -> tuple[dict[str, str], str, dict]:
     """Bind the main assembly through the real input source and the native discovery record.
 
     The packaged discovery record names the entry the reader opened, the handoff it was bound to,
@@ -1022,25 +1096,13 @@ def _validate_native_discovery(
         digest(native_files) == handoff_sha256,
         "The native discovery file inventory does not digest to its handoff",
     )
-    discovery_files = [
-        {"path": name, "sha256": checksum}
-        for name, checksum in sorted(
-            (native_files or {}).items()
-        )
-    ]
-    _require(bool(discovery_files), "Native discovery carries no file inventory")
-    listed = {str(item["path"]).casefold(): item["sha256"] for item in discovery_files}
-    _require(
-        len(listed) == len(discovery_files) and listed == {key: value[1] for key, value in native_casefold.items()},
-        "Native discovery file list differs from its inventory",
-    )
     main = native_casefold.get(main_assembly.casefold())
     _require(main is not None, f"The native discovery record does not inventory the main assembly: {main_assembly!r}")
     _require(
         main[1] == file_digest(confined(root, "input/cad/" + main[0])),
         "The archived main assembly differs from the native file inventory",
     )
-    return native_files, main[1]
+    return native_files, main[1], record
 
 
 def _validate_capture(
@@ -1071,7 +1133,7 @@ def _validate_capture(
     )
     handoff = read_data(confined(root, "input/handoff.json"))
     actual_inputs, input_main, main_assembly_sha256 = _validate_input(root, handoff, main_assembly)
-    native_files, native_sha256 = _validate_native_discovery(
+    native_files, native_sha256, discovery_record = _validate_native_discovery(
         root,
         producer_run_id=discovery_producer_run_id or run_id,
         main_assembly=main_assembly,
@@ -1093,8 +1155,9 @@ def _validate_capture(
         upload_sha256=upload_sha256,
         main_assembly=main_assembly,
         configuration=configuration,
+        discovery_record=discovery_record,
     )
-    _validate_evidence(
+    _identity, evidence_manifest = _validate_evidence(
         root,
         handoff_sha256=handoff_sha256,
         main_assembly=main_assembly,
@@ -1102,6 +1165,7 @@ def _validate_capture(
         native_files=native_files,
         native_tool=native_tool,
         native_prepared_dir=native_prepared_dir,
+        discovery_record=discovery_record,
     )
     _validate_stage_details(
         root,
@@ -1109,6 +1173,8 @@ def _validate_capture(
         handoff_sha256=handoff_sha256,
         main_assembly=main_assembly,
         native_files=native_files,
+        discovery_record=discovery_record,
+        evidence_manifest=evidence_manifest,
     )
     return {
         "main_assembly_sha256": main_assembly_sha256,
@@ -1185,7 +1251,6 @@ def capture_manifest(
 def verify_transfer(
     bundle: Path,
     *,
-    regenerated: tuple[str, ...] = (),
     carried: dict[str, str] | None = None,
     native_receipts: dict | None = None,
     transfer_manifest: dict | None = None,
@@ -1205,11 +1270,6 @@ def verify_transfer(
     stage receipts, evidence/discovery main-assembly binding and evidence snapshot, so a resealed
     but semantically invalid manifest cannot reach publication.
 
-    ``regenerated`` names payload members whose delivery copy the receiving pipeline
-    re-creates from its own receipt (the structural-team reports).  Admission still binds
-    them against the sealed manifest; a delivery is checked for everything else and may
-    carry its own regenerated copy or none at all.
-
     ``carried`` names the Linux-side originals the freeze stage registered from their own
     bytes (``input/request.json``), mapped to the frozen binding of this attempt.  A carried
     original may also be listed by the native manifest; either classification must bind the
@@ -1218,7 +1278,6 @@ def verify_transfer(
 
     bundle = Path(bundle)
     supplied = {}
-    team_receipts = {}
     _require(
         native_receipts is None or transfer_manifest is None,
         "Transfer manifest cannot have two receipt sources",
@@ -1232,14 +1291,6 @@ def verify_transfer(
                 f"Native receipt {name} is missing",
             )
             supplied[name] = bytes(blob)
-        for report, key in _TEAM_RECEIPT_KEYS.items():
-            blob = native_receipts.get(key)
-            if blob is not None:
-                _require(
-                    isinstance(blob, (bytes, bytearray)) and bool(blob),
-                    f"Native receipt {key} is malformed",
-                )
-                team_receipts[report] = bytes(blob)
         try:
             receipt_manifest = parse_data(
                 supplied["transfer_manifest_bytes"],
@@ -1265,7 +1316,6 @@ def verify_transfer(
         missing = sorted(set(TRANSFER_FILES) - set(present))
         _require(not missing, f"Transferred capture provenance is incomplete; missing: {missing}")
         receipt_manifest = receipt_native_tool = receipt_stages = None
-    derived = set(regenerated)
     carried_bindings = dict(carried or {})
     manifest = receipt_manifest if receipt_manifest is not None else read_data(confined(bundle, CAPTURE_MANIFEST))
     _require(isinstance(manifest, dict), "Transfer manifest must be an object")
@@ -1327,17 +1377,17 @@ def verify_transfer(
         f"{sorted(set(_REQUIRED_REPORTS) - set(files))}",
     )
     carried_not_native = set(carried_bindings) - set(files)
-    skip = derived | carried_not_native
+    skip = carried_not_native
     ignored = {CAPTURE_MANIFEST}
     if transfer_manifest is not None:
         ignored.update(_LIVE_REPORTS)
     actual_members = set(inventory(bundle))
     if receipt_manifest is not None:
         actual_members = {
-            name for name in actual_members if _allowed_payload(name)
+            name for name in actual_members if _payload_candidate(name)
         }
     actual = actual_members - ignored - skip
-    expected_members = set(files) - derived
+    expected_members = set(files)
     _require(
         actual == expected_members,
         "Transfer archive inventory differs from its manifest: "
@@ -1361,29 +1411,6 @@ def verify_transfer(
             f"Transfer manifest lists a member outside the capture payload: {name!r}",
         )
         _require(_is_sha256(checksum), f"Transfer manifest hash is not a sha256: {name}")
-        if name in derived:
-            team_blob = team_receipts.get(name)
-            if receipt_manifest is None:
-                continue
-            _require(
-                team_blob is not None or confined(bundle, name, exists=False).is_file(),
-                f"Derived transfer member has no receipt or delivery bytes: {name}",
-            )
-            actual = (
-                hashlib.sha256(team_blob).hexdigest() if team_blob is not None else file_digest(confined(bundle, name))
-            )
-            disk_path = confined(bundle, name, exists=False)
-            if team_blob is not None and disk_path.is_file():
-                _require(
-                    file_digest(disk_path) == checksum,
-                    f"Native disk receipt differs from the transfer manifest: {name}",
-                )
-            sized_members[name] = len(team_blob) if team_blob is not None else disk_path.stat().st_size
-            _require(
-                actual == checksum,
-                f"Delivered member differs from the transfer manifest: {name}",
-            )
-            continue
         if name == "reports/native-tool.json" and receipt_native_tool is not None:
             actual = hashlib.sha256(supplied["native_tool_bytes"]).hexdigest()
             disk_path = confined(bundle, name, exists=False)
@@ -1416,13 +1443,14 @@ def verify_transfer(
         path.relative_to(bundle).as_posix()
         for path in bundle.rglob("*")
         if path.is_file()
-        and _allowed_payload(path.relative_to(bundle).as_posix())
+        and _payload_candidate(path.relative_to(bundle).as_posix())
+        and path.relative_to(bundle).as_posix() not in ignored
         and path.relative_to(bundle).as_posix() not in skip
     }
     receipt_members = set()
     if receipt_native_tool is not None:
         receipt_members = {"reports/native-tool.json", "reports/native-stages.json"}
-    absent = sorted(set(files) - derived - receipt_members - actual_payload)
+    absent = sorted(set(files) - receipt_members - actual_payload)
     extra = sorted(actual_payload - set(files))
     _require(
         not absent and not extra,
@@ -1440,11 +1468,10 @@ def verify_transfer(
             file_digest(confined(bundle, name)) == checksum,
             f"Delivered carried original differs from its frozen bytes: {name}",
         )
-    if receipt_manifest is not None or not derived & set(files):
-        _require(
-            manifest.get("total_bytes") == sum(sized_members.values()),
-            "Transfer manifest size differs from its members",
-        )
+    _require(
+        manifest.get("total_bytes") == sum(sized_members.values()),
+        "Transfer manifest size differs from its members",
+    )
     _require(
         manifest.get("native_tool_sha256") == digest(manifest.get("native_tool")),
         "Transfer manifest native tool digest differs from its record",
@@ -1541,11 +1568,8 @@ def validate_native_receipts(
         "native_tool_bytes",
         "native_stages_bytes",
         "transfer_manifest_bytes",
-        *_TEAM_RECEIPT_KEYS.values(),
     )
     for name in receipt_names:
-        if name not in receipts and name in _TEAM_RECEIPT_KEYS.values():
-            continue
         blob = receipts.get(name)
         _require(isinstance(blob, (bytes, bytearray)) and bool(blob), f"Native receipt {name} is missing")
         blobs[name] = bytes(blob)
@@ -1559,9 +1583,6 @@ def validate_native_receipts(
     carried = {"input/request.json": file_digest(request_path)} if request_path.is_file() else {}
     summary = verify_transfer(
         root,
-        # These reports are presentation projections of the receiving stage.
-        # Their presence or absence cannot change the native evidence class.
-        regenerated=TEAM_REPORTS,
         carried=carried,
         native_receipts=blobs,
         expected_upstream_artifacts=transfer.get("upstream_artifacts"),
@@ -1587,8 +1608,6 @@ def load_native_receipts(root: Path) -> dict[str, bytes] | None:
         "native_tool_bytes": "reports/native-tool.json",
         "native_stages_bytes": "reports/native-stages.json",
         "transfer_manifest_bytes": "transfer-manifest.json",
-        "structural_team_md_bytes": "reports/structural-team.md",
-        "structural_team_json_bytes": "reports/structural-team.json",
     }
     paths = {
         name: confined(root, relative, exists=False)

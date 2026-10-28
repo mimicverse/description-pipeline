@@ -50,6 +50,7 @@ from description_pipeline.pipeline.stages.publish import (
     validate_publication_receipt,
 )
 from description_pipeline.repository.publish import (
+    GitHubCliPullRequestClient,
     PublicationRepository,
     PullRequestObservation,
     seal_repository_snapshot,
@@ -549,7 +550,8 @@ class PublishFixture:
         self.handler = PublishHandler(self.store, pull_requests=self.pr)
 
     def _make_repository(self) -> None:
-        self.remote = self.root / "remote.git"
+        self.remote = self.root / "example" / "robot.git"
+        self.remote.parent.mkdir()
         git(None, "init", "--bare", "-b", "main", str(self.remote))
         seed = self.root / "seed"
         seed.mkdir()
@@ -634,9 +636,8 @@ class PublishFixture:
                 "closure_sha256": proof["closure_sha256"],
                 "command_id": "verify-command",
                 "fence": 1,
+                "execution_details": {},
                 "finished_at": "2026-10-25T00:00:01+00:00",
-                "raw_checks": [],
-                "raw_diagnostics": [],
                 "request": verify_request,
                 "request_sha256": digest(verify_request),
                 "run_id": "verify-run",
@@ -874,6 +875,159 @@ class PublishHandlerTests(unittest.TestCase):
                 )
         self.assertEqual(prepared.exception.code, "publish.target_forbidden")
         self.assertEqual(pushed.exception.code, "publish.target_forbidden")
+
+    def test_repository_validation_rejects_split_fetch_and_push_targets(self) -> None:
+        second_remote = self.fixture.root / "example" / "other.git"
+        second_remote.parent.mkdir(exist_ok=True)
+        git(None, "init", "--bare", "-b", "main", str(second_remote))
+        git(
+            self.fixture.repo,
+            "remote",
+            "set-url",
+            "--push",
+            "origin",
+            str(second_remote),
+        )
+        repository = PublicationRepository(
+            self.fixture.repo,
+            expected_origin=str(self.fixture.remote),
+        )
+        with self.assertRaises(PipelineError) as raised:
+            repository.validate()
+        self.assertEqual(
+            raised.exception.code,
+            "publish.remote_target_mismatch",
+        )
+
+    def test_push_revalidates_the_remote_target_before_git(self) -> None:
+        repository = PublicationRepository(
+            self.fixture.repo,
+            expected_origin=str(self.fixture.remote),
+        )
+        worktree = self.fixture.root / "linked-push-worktree"
+        git(
+            self.fixture.repo,
+            "config",
+            "extensions.worktreeConfig",
+            "true",
+        )
+        git(
+            self.fixture.repo,
+            "worktree",
+            "add",
+            "--detach",
+            str(worktree),
+            "HEAD",
+        )
+        second_remote = self.fixture.root / "example" / "changed.git"
+        second_remote.parent.mkdir(exist_ok=True)
+        git(None, "init", "--bare", "-b", "main", str(second_remote))
+        git(
+            worktree,
+            "config",
+            "--worktree",
+            "remote.origin.pushurl",
+            str(second_remote),
+        )
+        repository.validate()
+        with self.assertRaises(PipelineError) as raised:
+            repository.push(
+                SimpleNamespace(worktree=worktree),
+                base_ref="main",
+                branch_ref=REVIEW_BRANCH,
+                expected_head_oid=None,
+            )
+        self.assertEqual(raised.exception.code, "publish.remote_target_mismatch")
+        self.assertEqual(
+            git(
+                None,
+                "--git-dir",
+                str(second_remote),
+                "for-each-ref",
+                "--format=%(refname)",
+            ).stdout,
+            "",
+        )
+
+    def test_repository_validation_rejects_multiple_push_targets(self) -> None:
+        for name in ("other-one", "other-two"):
+            remote = self.fixture.root / "example" / f"{name}.git"
+            remote.parent.mkdir(exist_ok=True)
+            git(None, "init", "--bare", "-b", "main", str(remote))
+            git(
+                self.fixture.repo,
+                "remote",
+                "set-url",
+                "--add",
+                "--push",
+                "origin",
+                str(remote),
+            )
+        repository = PublicationRepository(
+            self.fixture.repo,
+            expected_origin=str(self.fixture.remote),
+        )
+        with self.assertRaises(PipelineError) as raised:
+            repository.validate()
+        self.assertEqual(
+            raised.exception.code,
+            "publish.remote_target_mismatch",
+        )
+
+    def test_repository_validation_rejects_insteadof_rewrites(self) -> None:
+        replacement = self.fixture.root / "rewritten.git"
+        git(None, "init", "--bare", "-b", "main", str(replacement))
+        git(
+            self.fixture.repo,
+            "config",
+            f"url.{replacement}.insteadOf",
+            str(self.fixture.remote),
+        )
+        repository = PublicationRepository(
+            self.fixture.repo,
+            expected_origin=str(self.fixture.remote),
+        )
+        with self.assertRaises(PipelineError) as raised:
+            repository.validate()
+        self.assertEqual(raised.exception.code, "publish.remote_rewrite")
+
+    def test_symlinked_repository_root_is_refused_before_resolve(self) -> None:
+        linked = self.fixture.root / "linked-repository"
+        try:
+            linked.symlink_to(self.fixture.repo, target_is_directory=True)
+        except OSError as error:
+            self.skipTest(f"The host cannot create a symbolic link: {error}")
+        with self.assertRaises(PipelineError) as raised:
+            PublicationRepository(
+                linked,
+                expected_origin=str(self.fixture.remote),
+            )
+        self.assertEqual(raised.exception.code, "publish.repository_missing")
+
+    def test_github_cli_client_always_targets_github_com(self) -> None:
+        client = GitHubCliPullRequestClient(self.fixture.repo)
+        completed = SimpleNamespace(stdout=b"[]", returncode=0)
+        with (
+            patch.dict(os.environ, {"GH_HOST": "enterprise.invalid"}),
+            patch(
+                "description_pipeline.repository.publish.subprocess.run",
+                return_value=completed,
+            ) as run,
+        ):
+            self.assertEqual(
+                client.observe(
+                    repository="mimicverse/robot",
+                    base_ref="main",
+                    head_ref="description/run-1",
+                    candidate_commit="a" * 40,
+                ),
+                (),
+            )
+        self.assertEqual(
+            run.call_args.args[0][:5],
+            ["gh", "pr", "list", "--repo", "mimicverse/robot"],
+        )
+        self.assertEqual(run.call_args.kwargs["env"]["GH_HOST"], "github.com")
 
     def test_default_pull_request_client_is_scoped_to_each_claim_workspace(self) -> None:
         bin_root = self.fixture.root / "fake-bin"
@@ -2212,11 +2366,64 @@ class PublicationWarningProjectionTests(unittest.TestCase):
         )
 
         self.assertIn("source.saved_state_incomplete", text)
-        self.assertIn("errors=2, warnings=1048576", text)
-        self.assertIn("missing.SLDPRT", text)
-        self.assertIn("graph_nodes=3, occurrences=7, selected=3, excluded=1, unresolved=1", text)
-        self.assertIn("source_integrity_proven=false", text)
-        self.assertIn("not a source or hardware qualification", text)
+        recorded = json.loads(text.split("```json\n", 1)[1].split("\n```", 1)[0])
+        self.assertEqual(recorded["detail"], detail)
+        self.assertIn("reports/verification-certificate.json", text)
+        self.assertNotIn("reports/quality.json", text)
+
+    def test_malformed_certificate_diagnostics_cannot_be_published(self) -> None:
+        for diagnostic in (
+            {"blocking": False, "message": "Missing code"},
+            "not an object", {"code": "unknown"},
+            {"code": "unknown", "blocking": "false"},
+            {"code": "blocking", "blocking": True},
+        ):
+            with self.subTest(diagnostic=diagnostic):
+                fixture = PublishFixture(diagnostics=[diagnostic])
+                self.addCleanup(fixture.close)
+                with self.assertRaisesRegex(PipelineError, "diagnostic"):
+                    fixture.handler.execute(
+                        fixture.command, fixture.claim, fixture.workspace, effects=fixture.effects,
+                    )
+                self.assertEqual(fixture.pr.rows, [])
+
+    def test_published_warning_links_resolve_to_the_bound_certificate(self) -> None:
+        warning = {
+            "code": "limits.default_policy", "blocking": False,
+            "object": "joint:left", "detail": {"field": "limits", "hardware_qualified": False},
+        }
+        fixture = PublishFixture(diagnostics=[warning])
+        self.addCleanup(fixture.close)
+        result = fixture.handler.execute(
+            fixture.command, fixture.claim, fixture.workspace, effects=fixture.effects,
+        )
+        self.assertEqual(result.outcome, "completed")
+        body = fixture.pr.rows[0].body
+        self.assertIn("reports/verification-certificate.json", body)
+        self.assertNotIn("reports/quality.json", body)
+        raw = git(
+            None, "--git-dir", str(fixture.remote), "show",
+            f"refs/heads/{fixture.command.request['branch_ref']}:reports/verification-certificate.json",
+        ).stdout
+        certificate = json.loads(raw)
+        self.assertIn(warning, certificate["diagnostics"])
+        self.assertIn('"hardware_qualified": false', body)
+
+    def test_all_warning_kinds_keep_context_and_long_summaries_are_explicit(self) -> None:
+        warning = {
+            "code": "limits.default_policy", "blocking": False,
+            "object": "joint:left", "field": "limits",
+            "detail": {"native_cad_ranges": False, "hardware_qualified": False, "original": [0, 0]},
+        }
+        text = publish_stage._publication_warning_text({"diagnostics": [warning]})
+        recorded = json.loads(text.split("```json\n", 1)[1].split("\n```", 1)[0])
+        self.assertEqual(recorded, {k: v for k, v in warning.items() if k != "code"})
+        large = {**warning, "detail": {"objects": ["component-" + "x" * 100] * 1000}}
+        text = publish_stage._publication_warning_text({"diagnostics": [warning, large]})
+        self.assertLess(len(text), 50000)
+        self.assertIn("1 additional warning records", text)
+        self.assertIn("verification-certificate.json", text)
+
 
 
 if __name__ == "__main__":

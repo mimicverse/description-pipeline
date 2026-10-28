@@ -59,7 +59,6 @@ import json
 import math
 import re
 import shutil
-import unicodedata
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -89,7 +88,14 @@ from .naming import robot_name as format_robot_name
 from .revision import package_inventory
 from ...schemas import (
     CAPTURE_EVIDENCE_REQUESTS,
+    NATIVE_DISCOVERY_BUDGET_KEYS,
+    NATIVE_DISCOVERY_CONTROL_KEYS,
+    NATIVE_DISCOVERY_DERIVATION_KEYS,
+    NATIVE_DISCOVERY_ENVELOPE_KEYS,
     NATIVE_DISCOVERY_FINDING_SCHEMA,
+    NATIVE_DISCOVERY_IDENTITY_KEYS,
+    NATIVE_DISCOVERY_OPTIONAL_ENVELOPE_KEYS,
+    NATIVE_DISCOVERY_RECORD_KEYS,
     NATIVE_DISCOVERY_SCHEMA,
     NATIVE_IDENTITY_RESOLUTION_SCHEMA,
     SOURCE_RECORD_SCHEMA,
@@ -115,29 +121,6 @@ GENERATOR_VERSION = "1"
 NATIVE_READER_GENERATOR = "solidworks-native-reader"
 _DATE_ID = re.compile(r"[0-9]{8}\Z")
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}\Z")
-_FINDING_KEYS = frozenset({"schema_version", "code", "object", "message", "detail", "blocking"})
-_IDENTITY_RESOLUTION_KEYS = frozenset(
-    {
-        "schema_version",
-        "run_id",
-        "handoff_sha256",
-        "sources",
-        "hardware_id",
-        "revision",
-        "parent_revision",
-    }
-)
-_IDENTITY_RESOLUTION_SOURCES = frozenset(
-    {"hardware_id", "revision", "parent_revision", "owner", "change_summary", "control"}
-)
-_IDENTITY_SOURCE_ORIGINS = {
-    "hardware_id": frozenset({"cad", "platform_configuration", "absent"}),
-    "revision": frozenset({"cad", "absent"}),
-    "parent_revision": frozenset({"cad", "absent"}),
-    "owner": frozenset({"cad", "absent"}),
-    "change_summary": frozenset({"cad", "submission", "absent"}),
-    "control": frozenset({"cad", "absent"}),
-}
 
 #: The prepared package must satisfy the same joint geometry gate as an
 #: authored package: a movable joint frame has to sit on the native shaft.
@@ -290,22 +273,6 @@ def _saved_configuration_observed(record: dict, name: str) -> bool:
     return all(proven(reading) for reading in readings)
 
 
-def _snake(value: Any) -> str | None:
-    """Return a stable snake_case identifier, or ``None`` when nothing remains."""
-
-    if not _text(value):
-        return None
-    folded = unicodedata.normalize("NFKD", str(value))
-    folded = "".join(ch for ch in folded if not unicodedata.combining(ch))
-    folded = re.sub(r"[^0-9A-Za-z]+", "_", folded).strip("_").lower()
-    folded = re.sub(r"_{2,}", "_", folded)
-    if not folded:
-        return None
-    if folded[0].isdigit():
-        folded = "n_" + folded
-    return folded
-
-
 def _validate_property_objects(record: dict) -> None:
     def object_or_absent(value, field):
         if value is None:
@@ -455,36 +422,6 @@ def _validate_native_record(value: Any, path: str = "raw") -> None:
         "native evidence contains a nonfinite or non-JSON value",
         {"field": path, "value": repr(value)},
     )
-
-
-def _require_exact_keys(value: object, keys: frozenset[str], what: str) -> dict:
-    if not isinstance(value, dict):
-        raise PipelineError(f"{what} must be an object")
-    missing = sorted(keys - set(value))
-    unknown = sorted(set(value) - keys)
-    if missing or unknown:
-        raise PipelineError(f"{what} must carry exact keys; missing={missing}, unknown={unknown}")
-    return value
-
-
-def _require_optional_text(value: object, what: str, *, multiline: bool = False) -> str | None:
-    if value is None:
-        return None
-    valid = _authored_multiline_text(value) if multiline else _authored_text(value)
-    if not valid:
-        raise PipelineError(f"{what} must be non-empty text without invalid control characters")
-    return value
-
-
-def _require_text_map(value: object, what: str) -> dict[str, str]:
-    if not isinstance(value, dict):
-        raise PipelineError(f"{what} must be an object")
-    result: dict[str, str] = {}
-    for key, item in value.items():
-        if not _authored_text(key) or not _authored_text(item):
-            raise PipelineError(f"{what} must map non-empty text to non-empty text")
-        result[key] = item
-    return result
 
 
 def _cross(left: Sequence[float], right: Sequence[float]) -> list[float]:
@@ -5386,20 +5323,52 @@ def _validate_source_definition_record(payload: object) -> dict:
 
     if not isinstance(payload, dict) or payload.get("schema_version") != DISCOVERY_SCHEMA:
         raise PipelineError("native discovery record has an unexpected schema")
-    for field in ("identity", "derivation"):
-        value = payload.get(field)
-        if value is not None and not isinstance(value, dict):
-            raise PipelineError(
-                f"native discovery {field} must be an object"
-            )
+    if set(payload) - NATIVE_DISCOVERY_OPTIONAL_ENVELOPE_KEYS != NATIVE_DISCOVERY_ENVELOPE_KEYS:
+        raise PipelineError(
+            "native discovery envelope must carry exact keys"
+        )
+    identity_payload = payload.get("identity")
+    if (
+        not isinstance(identity_payload, dict)
+        or set(identity_payload) != NATIVE_DISCOVERY_IDENTITY_KEYS
+    ):
+        raise PipelineError(
+            "native discovery identity must carry exact keys"
+        )
+    control_payload = identity_payload.get("control")
+    if control_payload is not None and (
+        not isinstance(control_payload, dict)
+        or set(control_payload) != NATIVE_DISCOVERY_CONTROL_KEYS
+    ):
+        raise PipelineError(
+            "native discovery control identity must carry exact keys"
+        )
+    derivation_payload = payload.get("derivation")
+    if (
+        not isinstance(derivation_payload, dict)
+        or set(derivation_payload) != NATIVE_DISCOVERY_DERIVATION_KEYS
+    ):
+        raise PipelineError(
+            "native discovery derivation must carry exact keys"
+        )
     records = payload.get("records")
-    if records is not None and (
+    if (
         not isinstance(records, list)
-        or any(not isinstance(item, dict) for item in records)
+        or any(
+            not isinstance(item, dict)
+            or set(item) != NATIVE_DISCOVERY_RECORD_KEYS
+            for item in records
+        )
     ):
         raise PipelineError(
             "native discovery records must be an object list"
         )
+    budget = payload.get("budget")
+    if budget is not None and (
+        not isinstance(budget, dict)
+        or set(budget) != NATIVE_DISCOVERY_BUDGET_KEYS
+    ):
+        raise PipelineError("native discovery budget index is malformed")
     raw = payload.get("raw")
     if not isinstance(raw, dict):
         raise PipelineError("native discovery raw record must be an object")

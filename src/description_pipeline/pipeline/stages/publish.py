@@ -39,7 +39,6 @@ from ...schemas import (
     PUBLISH_REQUEST_SCHEMA,
     VERIFICATION_CERTIFICATE_SCHEMA,
 )
-from ...sources.solidworks.saved_state import SAVED_STATE_WARNING_CODE
 from ...stages import CONTRACT
 from ..contracts import (
     ArtifactRef,
@@ -67,6 +66,7 @@ from ..verify_contract import (
     CERTIFICATE_FILENAME as VERIFY_CERTIFICATE,
     EXECUTION_RECEIPT_FILENAME as VERIFY_EXECUTION,
     VERIFY_ARTIFACT_KIND,
+    validate_certificate_diagnostics,
 )
 
 PUBLISH_RECEIPT_SCHEMA = PUBLICATION_RECEIPT_SCHEMA
@@ -405,6 +405,7 @@ def _certificate(
         raise PipelineError("Verification certificate verifier identity differs")
     if certificate["decision"] != "PASS" or certificate["passed"] is not True:
         raise PipelineError("Publish requires a passing verification certificate")
+    validate_certificate_diagnostics(certificate)
     checks = certificate["checks"]
     required_checks = certificate["required_checks"]
     if (
@@ -456,8 +457,6 @@ def _certificate(
         "command_id",
         "fence",
         "finished_at",
-        "raw_checks",
-        "raw_diagnostics",
         "request",
         "request_sha256",
         "run_id",
@@ -465,6 +464,7 @@ def _certificate(
         "stage",
         "started_at",
         "execution_id",
+        "execution_details",
     }
     if (
         set(execution) != required_execution
@@ -481,52 +481,36 @@ def _certificate(
 
 
 def _publication_warning_text(certificate: Mapping[str, Any]) -> str:
-    """Project verifier diagnostics into the PR without creating a second state."""
+    """Render every recorded warning without dropping its source or qualification."""
 
+    validate_certificate_diagnostics(certificate)
     warnings = [
-        item
-        for item in certificate.get("diagnostics") or []
-        if isinstance(item, Mapping) and item.get("blocking") is False and item.get("code")
+        item for item in certificate.get("diagnostics") or []
+        if item.get("blocking") is False
     ]
     if not warnings:
         return ""
-    lines = ["", "Verification warnings:"]
+    lines = ["", f"Verification warnings ({len(warnings)} recorded):"]
+    shown = 0
+    remaining = 48000
     for item in warnings:
-        code = str(item["code"])
-        message = str(item.get("message") or "")
-        lines.append(f"- `{code}`: {message}")
-        detail = item.get("detail")
-        if code != SAVED_STATE_WARNING_CODE or not isinstance(detail, Mapping):
-            continue
-        missing = detail.get("missing_references")
-        missing = missing if isinstance(missing, Mapping) else {}
-        scope = detail.get("actual_scope")
-        scope = scope if isinstance(scope, Mapping) else {}
-        lines.append(
-            "  - Open status: "
-            f"errors={detail.get('open_errors')}, warnings={detail.get('open_warnings')}, "
-            f"classification={detail.get('classification')}, "
-            f"configuration={detail.get('configuration')}"
+        evidence = {key: value for key, value in item.items() if key not in {"code", "message"}}
+        block = (
+            f"- `{item['code']}`: {item.get('message') or ''}\n\n```json\n"
+            + json.dumps(evidence, ensure_ascii=True, sort_keys=True, indent=2)
+            + "\n```"
         )
+        if len(block) > remaining:
+            break
+        lines.append(block)
+        remaining -= len(block) + 1
+        shown += 1
+    if shown < len(warnings):
         lines.append(
-            "  - Missing references: "
-            f"state={missing.get('state')}, "
-            f"items={json.dumps(missing.get('items') or [], ensure_ascii=True, sort_keys=True)}"
+            f"{len(warnings) - shown} additional warning records are preserved in the certificate; "
+            "this PR summary is abbreviated."
         )
-        lines.append(
-            "  - Actual scope: "
-            f"graph_nodes={scope.get('graph_nodes')}, "
-            f"occurrences={scope.get('occurrence_count')}, "
-            f"selected={len(scope.get('selected_files') or [])}, "
-            f"excluded={len(scope.get('excluded_files') or [])}, "
-            f"unresolved={len(scope.get('unresolved_occurrences') or [])}"
-        )
-        lines.append(
-            "  - Qualification state: source_integrity_proven=false, rebuilt=false, "
-            "mechanical_qualification_complete=false, hardware_qualified=false. "
-            "This warning is not a source or hardware qualification."
-        )
-    lines.append("See `reports/quality.json` and the verification certificate for evidence bindings.")
+    lines.append("See `reports/verification-certificate.json` for the complete verified evidence.")
     return "\n".join(lines)
 
 

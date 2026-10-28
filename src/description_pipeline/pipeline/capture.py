@@ -1018,24 +1018,32 @@ def _keep_capture_diagnostic(staging: Path, output: Path, receipt: dict[str, Any
     return failed
 
 
-def _failed_capture(staging, output, receipt, event, error):
+def _failed_capture(
+    staging,
+    output,
+    receipt,
+    event,
+    error,
+    *,
+    native_session_entered: bool,
+):
     phase = receipt.get("stage") or "capture"
     if not receipt.get("events") or receipt["events"][-1]["state"] != "failed":
         with contextlib.suppress(Exception):
             event({"stage": phase, "state": "failed"})
     receipt.update(passed=False, state="failed", stage=phase, error=str(error))
     receipt["native_complete"] = False
+    if not native_session_entered:
+        receipt["resource_settlement"] = {
+            "settled": True,
+            "reason": "rejected_before_native_session",
+        }
     if hasattr(error, "code"):
         receipt["error_code"] = error.code
     detail = getattr(error, "detail", None) or getattr(error, "details", None)
     if detail is not None:
         receipt["detail"] = detail
     has_staging = staging is not None and staging.exists()
-    root = staging if has_staging else output
-    quality_path = root / "reports/quality.json"
-    if quality_path.is_file():
-        receipt["quality"] = read_data(quality_path)
-        receipt["subject_sha256"] = receipt["quality"].get("subject_sha256")
     if has_staging:
         receipt["diagnostic_path"] = str(_keep_capture_diagnostic(staging, output, receipt))
     else:
@@ -1141,6 +1149,7 @@ def _capture_native_transaction(
             handoff_sha256=handoff_sha256,
         )
         event = _capture_event_sink(receipt, on_event)
+        resource_boundary = {"entered": False}
         try:
             validate_request_record(request_evidence)
             request_path = staging / "input/request.json"
@@ -1156,6 +1165,7 @@ def _capture_native_transaction(
                 on_activity=on_activity,
                 expected_inputs=dict(expected_inputs),
                 handoff_sha256=handoff_sha256,
+                resource_boundary=resource_boundary,
             )
             tool = native_tool_factory()
             return _seal_native_capture_artifact(
@@ -1171,7 +1181,14 @@ def _capture_native_transaction(
                 native_tool=tool,
             )
         except Exception as error:
-            return _failed_capture(staging, output, receipt, event, error)
+            return _failed_capture(
+                staging,
+                output,
+                receipt,
+                event,
+                error,
+                native_session_entered=resource_boundary["entered"],
+            )
 
 
 def _invoke_native_operation(
@@ -1529,19 +1546,6 @@ class CaptureHandler:
             expected_upstream_artifacts=_upstream_records(inputs),
             expected_execution=execution_record,
         )
-        from ..sources.solidworks.capture_projection import (
-            load_native_capture_observation,
-            validate_native_capture_plan,
-        )
-
-        observation = load_native_capture_observation(admitted)
-        plan = read_data(admitted / "input/capture-plan.json")
-        if not isinstance(plan, dict):
-            raise ProtocolError(
-                "capture.plan_invalid",
-                {"where": "input/capture-plan.json"},
-            )
-        validate_native_capture_plan(observation, plan)
         checks = digest(
             {
                 "effect_key": request.effect_key,

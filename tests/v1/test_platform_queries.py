@@ -18,6 +18,8 @@ class _Cursor:
         self.statements: list[str] = []
         self.result = []
         self.closed = False
+        self.effect_intent_result = []
+        self.effect_fact_result = []
 
     def execute(self, statement: str, parameters) -> None:
         self.statements.append(statement)
@@ -77,6 +79,10 @@ class _Cursor:
                     None,
                 )
             ]
+        elif "FROM effect_intent AS effect" in statement:
+            self.result = self.effect_intent_result
+        elif "FROM effect_fact AS fact" in statement:
+            self.result = self.effect_fact_result
         else:
             self.result = []
 
@@ -138,6 +144,61 @@ class RunQueryTests(unittest.TestCase):
         }
         summary = render_stage_summary(projection)
         self.assertEqual(summary[0]["state"], "unresolved")
+
+    def test_effect_projection_keeps_reconciliation_metadata_and_resume_phase(self):
+        connection = _Connection()
+        cursor = connection._cursor
+        cursor.effect_intent_result = [
+            (
+                "effect-1",
+                "freeze-command",
+                "airflow_dispatch",
+                "airflow_dispatch",
+                {"dag_id": "solidwork_to_urdf", "dag_run_id": "run-1"},
+                {"state": "pending"},
+                digest({"state": "pending"}),
+                "outbound-1",
+                "2" * 64,
+                datetime(2026, 10, 25, tzinfo=UTC),
+            )
+        ]
+        cursor.effect_fact_result = [
+            (
+                "fact-1",
+                "effect-1",
+                1,
+                None,
+                None,
+                "conflict",
+                "airflow-dispatch",
+                None,
+                "payload-1",
+                "3" * 64,
+                datetime(2026, 10, 25, tzinfo=UTC),
+                None,
+                None,
+            ),
+            (
+                "fact-2",
+                "effect-1",
+                2,
+                None,
+                None,
+                "reconciled",
+                "reconciler",
+                "known",
+                "payload-2",
+                "4" * 64,
+                datetime(2026, 10, 25, tzinfo=UTC),
+                "metadata-1",
+                None,
+            ),
+        ]
+        projection = read_run_projection(connection, "run-1")
+        self.assertEqual(projection["technical"]["effects"][0]["state"], "satisfied")
+        query = " ".join(cursor.statements)
+        self.assertIn("fact.metadata_artifact_id", query)
+        self.assertIn("fact.resume_phase", query)
 
 
 if __name__ == "__main__":

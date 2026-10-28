@@ -40,7 +40,17 @@ from ..delivery import read_delivery_manifest, read_source_record
 from ..geometry.native_transform import rigid_matrix_from_row_major
 from ..interface_records import validate_request_record
 from ..io import PipelineError, confined, digest, parse_data
-from ..schemas import NATIVE_DISCOVERY_SCHEMA, exporter_declaration_present
+from ..schemas import (
+    NATIVE_DISCOVERY_BUDGET_KEYS,
+    NATIVE_DISCOVERY_CONTROL_KEYS,
+    NATIVE_DISCOVERY_DERIVATION_KEYS,
+    NATIVE_DISCOVERY_ENVELOPE_KEYS,
+    NATIVE_DISCOVERY_IDENTITY_KEYS,
+    NATIVE_DISCOVERY_OPTIONAL_ENVELOPE_KEYS,
+    NATIVE_DISCOVERY_RECORD_KEYS,
+    NATIVE_DISCOVERY_SCHEMA,
+    exporter_declaration_present,
+)
 from ..sources.solidworks.direction import canonicalize_axis
 from ..sources.solidworks.naming import robot_name as format_robot_name
 from ..sources.solidworks.native_limits import (
@@ -2988,18 +2998,6 @@ def _record_value(package: Path, entry: dict, key: str):
     return node
 
 
-def _primary_name(mates: list[dict]) -> str:
-    """Mirror of the documented primary-mate rule: limits, then shaft, then order."""
-
-    for mate in mates:
-        if isinstance(mate.get("limits"), dict):
-            return str(mate.get("name") or "")
-    for mate in mates:
-        if any(isinstance(item.get("cylinder"), dict) for item in _entities(mate)):
-            return str(mate.get("name") or "")
-    return str(mates[0].get("name") or "") if mates else ""
-
-
 def _joint_properties(raw: dict, mates: list[dict]) -> tuple[dict, dict]:
     """Merged scalars plus every key two native sources declare differently."""
 
@@ -3105,6 +3103,57 @@ def verify_discovery(package: Path) -> dict:
                 f"discovery record is not valid UTF-8 JSON: {error}",
             ) from error
         _require(payload.get("schema_version") == DISCOVERY_SCHEMA, "discovery.binding", "unexpected discovery schema")
+        _require(
+            set(payload) - NATIVE_DISCOVERY_OPTIONAL_ENVELOPE_KEYS
+            == NATIVE_DISCOVERY_ENVELOPE_KEYS,
+            "discovery.binding",
+            "discovery envelope must carry exact keys",
+        )
+        identity_claim = payload.get("identity")
+        _require(
+            isinstance(identity_claim, dict)
+            and set(identity_claim) == NATIVE_DISCOVERY_IDENTITY_KEYS,
+            "discovery.binding",
+            "discovery identity must carry exact keys",
+        )
+        control_claim = identity_claim.get("control")
+        _require(
+            control_claim is None
+            or (
+                isinstance(control_claim, dict)
+                and set(control_claim) == NATIVE_DISCOVERY_CONTROL_KEYS
+            ),
+            "discovery.binding",
+            "discovery control identity must carry exact keys",
+        )
+        derivation_claim = payload.get("derivation")
+        _require(
+            isinstance(derivation_claim, dict)
+            and set(derivation_claim) == NATIVE_DISCOVERY_DERIVATION_KEYS,
+            "discovery.binding",
+            "discovery derivation must carry exact keys",
+        )
+        record_claims = payload.get("records")
+        _require(
+            isinstance(record_claims, list)
+            and all(
+                isinstance(item, dict)
+                and set(item) == NATIVE_DISCOVERY_RECORD_KEYS
+                for item in record_claims
+            ),
+            "discovery.binding",
+            "discovery records must carry exact keys",
+        )
+        budget_claim = payload.get("budget")
+        _require(
+            budget_claim is None
+            or (
+                isinstance(budget_claim, dict)
+                and set(budget_claim) == NATIVE_DISCOVERY_BUDGET_KEYS
+            ),
+            "discovery.binding",
+            "discovery budget index must carry exact keys",
+        )
         files = payload.get("native_files")
         _require(
             isinstance(files, dict)

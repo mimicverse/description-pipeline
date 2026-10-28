@@ -270,6 +270,16 @@ class ValidationTests(unittest.TestCase):
                 "comma or whitespace",
             ),
             (
+                "tenant key carries control",
+                lambda d: d["auth"].__setitem__("tenant_keys", ["tenant-a\x00tenant-b"]),
+                "unique non-empty strings",
+            ),
+            (
+                "admin id carries control",
+                lambda d: d["auth"].__setitem__("admin_open_ids", ["ou-a\x00ou-b"]),
+                "unique non-empty strings",
+            ),
+            (
                 "relative feishu secret",
                 lambda d: d["auth"].__setitem__("feishu_secret_file", "secrets/feishu.json"),
                 "absolute path",

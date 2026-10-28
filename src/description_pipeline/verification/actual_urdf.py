@@ -353,7 +353,7 @@ def _warning_comments(model: dict) -> list[str]:
             detail["provenance"] = subject
             payload = json.dumps(detail, ensure_ascii=True, sort_keys=True).replace("--", r"\u002d\u002d")
             code = str(item["code"]).replace("--", "- -")
-            expected.append(f"WARNING {code}: {payload} See reports/quality.json.")
+            expected.append(f"WARNING {code}: {payload} See reports/verification-certificate.json.")
     return expected
 
 
