@@ -54,6 +54,7 @@ from .publish_contract import (
     REPOSITORY_SNAPSHOT_SCHEMA,
 )
 from .verify_contract import (
+    CERTIFICATE_FIELDS,
     CERTIFICATE_FILENAME,
     CERTIFICATE_SCHEMA,
     EXECUTION_RECEIPT_FILENAME,
@@ -834,32 +835,7 @@ class VerifiedVerifyResult:
             certificate = parse_data(certificate_bytes, Path(CERTIFICATE_FILENAME))
         except PipelineError as error:
             raise ProtocolError("admission.verify_result_invalid", {"where": "certificate"}) from error
-        required = {
-            "actual_verifier",
-            "actual_verifier_sha256",
-            "capture_artifact",
-            "checks",
-            "closure_sha256",
-            "config_snapshot_sha256",
-            "contract_sha256",
-            "decision",
-            "diagnostics",
-            "evaluation_subject_sha256",
-            "generate_artifact",
-            "generate_receipt_sha256",
-            "passed",
-            "pipeline_id",
-            "policy_sha256",
-            "purpose",
-            "qualifications",
-            "request",
-            "request_sha256",
-            "required_checks",
-            "schema_version",
-            "subject_sha256",
-            "subject_status",
-            "verification_key",
-        }
+        required = CERTIFICATE_FIELDS
         if not isinstance(certificate, Mapping) or set(certificate) != required:
             raise ProtocolError("admission.verify_result_invalid", {"where": "certificate"})
         proof = {key: certificate[key] for key in certificate if key != "verification_key"}

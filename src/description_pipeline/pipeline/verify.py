@@ -49,6 +49,7 @@ from .generate_contract import (
     GENERATE_RECEIPT,
 )
 from .verify_contract import (
+    CERTIFICATE_FIELDS,
     CERTIFICATE_FILENAME,
     CERTIFICATE_SCHEMA,
     EXECUTION_RECEIPT_FILENAME,
@@ -701,32 +702,7 @@ class VerifyHandler:
 
 
 def _validate_certificate_structure(certificate: Mapping[str, Any]) -> None:
-    required = {
-        "actual_verifier",
-        "actual_verifier_sha256",
-        "capture_artifact",
-        "checks",
-        "closure_sha256",
-        "config_snapshot_sha256",
-        "contract_sha256",
-        "decision",
-        "diagnostics",
-        "evaluation_subject_sha256",
-        "generate_artifact",
-        "generate_receipt_sha256",
-        "passed",
-        "pipeline_id",
-        "policy_sha256",
-        "purpose",
-        "qualifications",
-        "request",
-        "request_sha256",
-        "required_checks",
-        "schema_version",
-        "subject_sha256",
-        "subject_status",
-        "verification_key",
-    }
+    required = CERTIFICATE_FIELDS
     if set(certificate) != required:
         raise PipelineError(
             "Verification certificate fields differ from the contract: "

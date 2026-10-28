@@ -62,6 +62,7 @@ from ..publish_contract import PUBLISH_OUTPUT_CONTRACT, REPOSITORY_SNAPSHOT_KIND
 from ..reconciliation import EffectReconciliationEvidence
 from ..verify import current_verifier_sha256
 from ..verify_contract import (
+    CERTIFICATE_FIELDS,
     CERTIFICATE_FILENAME as VERIFY_CERTIFICATE,
     EXECUTION_RECEIPT_FILENAME as VERIFY_EXECUTION,
     VERIFY_ARTIFACT_KIND,
@@ -387,32 +388,7 @@ def _certificate(
     certificate = _require_object(read_data(certificate_path), "verification certificate")
     if raw != canonical(certificate):
         raise PipelineError("Verification certificate is not canonically encoded")
-    required = {
-        "actual_verifier",
-        "actual_verifier_sha256",
-        "capture_artifact",
-        "checks",
-        "closure_sha256",
-        "config_snapshot_sha256",
-        "contract_sha256",
-        "decision",
-        "diagnostics",
-        "evaluation_subject_sha256",
-        "generate_artifact",
-        "generate_receipt_sha256",
-        "passed",
-        "pipeline_id",
-        "policy_sha256",
-        "purpose",
-        "qualifications",
-        "request",
-        "request_sha256",
-        "required_checks",
-        "schema_version",
-        "subject_sha256",
-        "subject_status",
-        "verification_key",
-    }
+    required = CERTIFICATE_FIELDS
     if set(certificate) != required:
         raise PipelineError("Verification certificate fields are incomplete or unknown")
     proof = dict(certificate)
