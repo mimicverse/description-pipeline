@@ -6,6 +6,9 @@ import copy
 import hashlib
 import importlib.util
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +18,8 @@ from description_pipeline.delivery import PIPELINE_ID
 from description_pipeline.pipeline.contracts import NativeTargetIdentity
 
 from .contract_wheel import write_contract_wheel
+from .test_interface_records import config_snapshot, health as interface_health
+from .test_interface_records import install_record as interface_install_record
 
 ROOT = Path(__file__).resolve().parents[2]
 OPERATOR = ROOT / "deploy" / "operator"
@@ -207,6 +212,26 @@ def build_record(
 
 def record_document(root: Path, *, install_id: str = "gen-1") -> dict:
     return build_record(root, install_id=install_id)
+
+
+def windows_health(record: dict, *, ready: bool = True) -> dict:
+    windows = record["ends"]["windows"]
+    document = interface_health(ready)
+    document.update(
+        release=windows["release"],
+        install_id=windows["install_id"],
+        config_digest=windows["config_digest"],
+        target_identity=windows["target_identity"],
+        endpoint={"port": config_snapshot()["resolved"]["windows"]["endpoint_port"]},
+    )
+    return document
+
+
+def running_windows_identity(record: dict) -> dict:
+    return {
+        **record["ends"]["windows"],
+        "port": config_snapshot()["resolved"]["windows"]["endpoint_port"],
+    }
 
 
 class InstallRecordTests(unittest.TestCase):
@@ -460,6 +485,360 @@ class InstallRecordTests(unittest.TestCase):
             with mock.patch.object(install_record, "_canonical_records", return_value=Records):
                 verified = install_record.verify_active_generation(config, state)
             self.assertEqual(verified["install_id"], "gen-1")
+
+    def test_windows_result_reader_preserves_last_line_and_unknown_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result = root / "windows-result.out"
+            document = {
+                "schema_version": install_record.WINDOWS_RESULT_SCHEMA,
+                "passed": True,
+                "verb": "status",
+            }
+            result.write_text(
+                "transport diagnostic\n" + json.dumps(document) + "\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(install_record.load_windows_result(result), document)
+            result.write_text("not json\n", encoding="utf-8")
+            self.assertIsNone(install_record.load_windows_result(result))
+            self.assertEqual(
+                install_record.verify_windows_result(
+                    {"verb": "status"},
+                    remote_rc=2,
+                    verb="status",
+                    record_path=None,
+                ),
+                3,
+            )
+
+    def test_windows_result_validator_accepts_current_producer_shapes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            record = interface_install_record()
+            record_path = root / "install-record.json"
+            record_path.write_text(json.dumps(record), encoding="utf-8")
+            identity = running_windows_identity(record)
+
+            start = {
+                "schema_version": install_record.WINDOWS_RESULT_SCHEMA,
+                "passed": True,
+                "verb": "start",
+                "task": {"state": "Running"},
+                "identity": identity,
+                "health": windows_health(record),
+                "listener": {"listener_pid": 42},
+            }
+            result_path = root / "windows-start.json"
+            result_path.write_text(json.dumps(start), encoding="utf-8")
+            command = [
+                sys.executable, str(OPERATOR / "install_record.py"),
+                "verify-windows-result", "--result", str(result_path),
+                "--remote-rc", "0", "--verb", "start",
+                "--install-record", str(record_path),
+            ]
+            environment = {**os.environ, "PYTHONPATH": str(ROOT / "src")}
+            result = subprocess.run(command, env=environment, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            drifted = copy.deepcopy(start)
+            drifted["health"]["endpoint"]["port"] += 1
+            result_path.write_text(json.dumps(drifted), encoding="utf-8")
+            result = subprocess.run(command, env=environment, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertEqual(
+                install_record.verify_windows_result(
+                    start,
+                    remote_rc=0,
+                    verb="start",
+                    record_path=record_path,
+                ),
+                0,
+            )
+
+            drain = copy.deepcopy(start)
+            drain["verb"] = "drain"
+            drain["health"] = windows_health(record, ready=False)
+            drain["safety"] = {
+                "jobs": {"active": 0, "queued": 0, "unresolved": 0},
+                "cad": {
+                    "external_session_detected": False,
+                    "owned_sessions": 0,
+                    "lease_held": False,
+                    "solidworks_processes": 0,
+                },
+                "listener_pid": 42,
+                "task_state": "Running",
+            }
+            self.assertEqual(
+                install_record.verify_windows_result(
+                    drain,
+                    remote_rc=0,
+                    verb="drain",
+                    record_path=record_path,
+                ),
+                0,
+            )
+
+            stopped = {
+                "listener_count": 0,
+                "writer_count": 0,
+                "solidworks_process_count": 0,
+            }
+            stop_from_running = copy.deepcopy(start)
+            stop_from_running["verb"] = "stop"
+            stop_from_running["task"] = {"state": "Disabled"}
+            stop_from_running["health"] = None
+            stop_from_running["listener"] = None
+            stop_from_running["safety"] = {
+                "jobs": {"active": 0, "queued": 0, "unresolved": 0},
+                "cad": {
+                    "external_session_detected": False,
+                    "owned_sessions": 0,
+                    "lease_held": False,
+                    "solidworks_processes": 0,
+                },
+                "listener_pid": 42,
+                "task_state": "Running",
+            }
+            stop_from_running["stopped"] = stopped
+            self.assertEqual(
+                install_record.verify_windows_result(
+                    stop_from_running,
+                    remote_rc=0,
+                    verb="stop",
+                    record_path=record_path,
+                ),
+                0,
+            )
+
+            stop_already_stopped = copy.deepcopy(stop_from_running)
+            stop_already_stopped["identity"] = {
+                key: value for key, value in identity.items() if key != "target_identity"
+            }
+            stop_already_stopped["safety"] = {
+                "jobs": None,
+                "cad": {
+                    "external_session_detected": False,
+                    "owned_sessions": 0,
+                    "lease_held": False,
+                    "solidworks_processes": 0,
+                },
+                "listener_pid": None,
+                "task_state": "Disabled",
+                "source": "already_stopped",
+            }
+            self.assertEqual(
+                install_record.verify_windows_result(
+                    stop_already_stopped,
+                    remote_rc=0,
+                    verb="stop",
+                    record_path=record_path,
+                ),
+                0,
+            )
+
+    def test_windows_result_validator_refuses_identity_and_outcome_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            record = interface_install_record()
+            record_path = root / "install-record.json"
+            record_path.write_text(json.dumps(record), encoding="utf-8")
+            identity = running_windows_identity(record)
+            document = {
+                "schema_version": install_record.WINDOWS_RESULT_SCHEMA,
+                "passed": True,
+                "verb": "start",
+                "task": {"state": "Running"},
+                "identity": identity,
+                "health": windows_health(record),
+                "listener": {"listener_pid": 42},
+            }
+            mismatch = copy.deepcopy(document)
+            mismatch["identity"]["install_id"] = "win-" + "8" * 32
+            self.assertEqual(
+                install_record.verify_windows_result(
+                    mismatch,
+                    remote_rc=0,
+                    verb="start",
+                    record_path=record_path,
+                ),
+                1,
+            )
+
+            for name, mutate in {
+                "contract digest": lambda value: value["health"]["contract"].__setitem__(
+                    "digest", "0" * 64
+                ),
+                "policy digest": lambda value: value["health"]["resource_policy"].__setitem__(
+                    "digest", "0" * 64
+                ),
+                "endpoint port": lambda value: value["health"]["endpoint"].__setitem__("port", 9999),
+            }.items():
+                with self.subTest(drift=name):
+                    drifted = copy.deepcopy(document)
+                    mutate(drifted)
+                    self.assertEqual(
+                        install_record.verify_windows_result(
+                            drifted,
+                            remote_rc=0,
+                            verb="start",
+                            record_path=record_path,
+                        ),
+                        1,
+                    )
+
+            refused = {
+                "schema_version": install_record.WINDOWS_RESULT_SCHEMA,
+                "passed": False,
+                "verb": "start",
+                "code": "start_failed",
+            }
+            self.assertEqual(
+                install_record.verify_windows_result(
+                    refused,
+                    remote_rc=1,
+                    verb="start",
+                    record_path=record_path,
+                ),
+                1,
+            )
+            self.assertEqual(
+                install_record.verify_windows_result(
+                    refused,
+                    remote_rc=2,
+                    verb="start",
+                    record_path=record_path,
+                ),
+                3,
+            )
+
+    def test_windows_result_validator_refuses_incomplete_lifecycle_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            record = interface_install_record()
+            record_path = root / "install-record.json"
+            record_path.write_text(json.dumps(record), encoding="utf-8")
+            identity = running_windows_identity(record)
+            start = {
+                "schema_version": install_record.WINDOWS_RESULT_SCHEMA,
+                "passed": True,
+                "verb": "start",
+                "task": {"state": "Running"},
+                "identity": identity,
+                "health": windows_health(record),
+                "listener": {"listener_pid": 42},
+            }
+            drain = copy.deepcopy(start)
+            drain["verb"] = "drain"
+            drain["health"] = windows_health(record, ready=False)
+            drain["safety"] = {
+                "jobs": {"active": 0, "queued": 0, "unresolved": 0},
+                "cad": {
+                    "external_session_detected": False,
+                    "owned_sessions": 0,
+                    "lease_held": False,
+                    "solidworks_processes": 0,
+                },
+                "listener_pid": 42,
+                "task_state": "Running",
+            }
+            stopped = {
+                "listener_count": 0,
+                "writer_count": 0,
+                "solidworks_process_count": 0,
+            }
+            stop_from_running = {
+                "schema_version": install_record.WINDOWS_RESULT_SCHEMA,
+                "passed": True,
+                "verb": "stop",
+                "task": {"state": "Disabled"},
+                "identity": identity,
+                "listener": None,
+                "health": None,
+                "safety": copy.deepcopy(drain["safety"]),
+                "stopped": stopped,
+            }
+            stop_already_stopped = copy.deepcopy(stop_from_running)
+            stop_already_stopped["identity"] = {
+                key: value for key, value in identity.items() if key != "target_identity"
+            }
+            stop_already_stopped["safety"].update(
+                jobs=None,
+                listener_pid=None,
+                task_state="Disabled",
+                source="already_stopped",
+            )
+
+            cases = (
+                ("start-task", start, "start", lambda value: value["task"].update(state="Ready")),
+                ("start-listener", start, "start", lambda value: value.update(listener={})),
+                ("drain-task", drain, "drain", lambda value: value["task"].update(state="Ready")),
+                ("drain-listener", drain, "drain", lambda value: value.update(listener=None)),
+                ("drain-safety", drain, "drain", lambda value: value.pop("safety")),
+                (
+                    "drain-jobs",
+                    drain,
+                    "drain",
+                    lambda value: value["safety"]["jobs"].update(unresolved=1),
+                ),
+                (
+                    "drain-solidworks",
+                    drain,
+                    "drain",
+                    lambda value: value["safety"]["cad"].update(solidworks_processes=1),
+                ),
+                (
+                    "stop-running-jobs",
+                    stop_from_running,
+                    "stop",
+                    lambda value: value["safety"].update(jobs=None),
+                ),
+                (
+                    "stop-running-listener",
+                    stop_from_running,
+                    "stop",
+                    lambda value: value["safety"].update(listener_pid=None),
+                ),
+                (
+                    "stop-final-task",
+                    stop_from_running,
+                    "stop",
+                    lambda value: value["task"].update(state="Running"),
+                ),
+                (
+                    "stop-final-task-ready",
+                    stop_from_running,
+                    "stop",
+                    lambda value: value["task"].update(state="Ready"),
+                ),
+                (
+                    "stop-residue",
+                    stop_from_running,
+                    "stop",
+                    lambda value: value["stopped"].update(writer_count=1),
+                ),
+                (
+                    "already-stopped-jobs",
+                    stop_already_stopped,
+                    "stop",
+                    lambda value: value["safety"].update(
+                        jobs={"active": 0, "queued": 0, "unresolved": 0}
+                    ),
+                ),
+            )
+            for name, document, verb, mutate in cases:
+                with self.subTest(case=name):
+                    candidate = copy.deepcopy(document)
+                    mutate(candidate)
+                    self.assertEqual(
+                        install_record.verify_windows_result(
+                            candidate,
+                            remote_rc=0,
+                            verb=verb,
+                            record_path=record_path,
+                        ),
+                        1,
+                    )
 
 
 if __name__ == "__main__":

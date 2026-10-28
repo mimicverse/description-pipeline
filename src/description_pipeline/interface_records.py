@@ -1039,7 +1039,7 @@ def validate_install_record(record) -> dict:
     return record
 
 
-def require_endpoint_matches_install_record(health, record) -> None:
+def require_endpoint_matches_install_record(health, record, *, require_ready: bool = True) -> None:
     """Runtime-only cross-check of the Windows end against ``/health`` (IF-16).
 
     Static validation cannot know the endpoint; this helper is the single runtime admission /
@@ -1047,8 +1047,9 @@ def require_endpoint_matches_install_record(health, record) -> None:
     is not compared), install id / config digest, the immutable snapshot's configured endpoint
     port, the contract and resource-policy digests to their single owners, and ``ready`` with
     every precondition ``validate_health`` enforces (external CAD session, unresolved
-    operations, registered native platform).  Cross-end config digest equality is never
-    required.
+    operations, registered native platform) unless ``require_ready`` is false for a
+    caller such as drain that owns a separate readiness decision. Cross-end config
+    digest equality is never required.
     """
 
     validate_health(health)
@@ -1075,11 +1076,12 @@ def require_endpoint_matches_install_record(health, record) -> None:
         "endpoint_end_mismatch",
         {"field": "target_identity"},
     )
-    _require(
-        health["ready"] is True,
-        "endpoint_not_ready",
-        {"reason_code": health["readiness"]["reason_code"]},
-    )
+    if require_ready:
+        _require(
+            health["ready"] is True,
+            "endpoint_not_ready",
+            {"reason_code": health["readiness"]["reason_code"]},
+        )
     # The snapshot is consumed as a config-identity reference: the existing IF-11 file checks
     # (absolute, no links, 0600, inside the record's state root), the recorded digest, and the
     # single strict IO on exactly those checked bytes - then the schema and the generation bind.

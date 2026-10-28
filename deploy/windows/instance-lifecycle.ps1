@@ -3042,8 +3042,10 @@ function Invoke-Stop($Binding) {
   }
   $task = Get-RequiredTask $Binding
   $projection = Get-TaskProjection $task
-  if ([string]$projection.state -eq 'Running') {
-    Die 'stop_failed' 'the scheduled task remains Running after stop'
+  if ([string]$projection.state -cne 'Disabled') {
+    Die 'stop_failed' (
+      'the scheduled task did not reach Disabled after stop: ' +
+      [string]$projection.state)
   }
   return [ordered]@{
     schema_version = $script:ResultSchema
@@ -3132,6 +3134,13 @@ function Invoke-Status($Binding) {
       $document.health = $running.health
     } else {
       Assert-ListenerPortFree ([int]$state.port)
+      $writers = @(Get-WriterResidue $state)
+      if ($writers.Count -ne 0) {
+        Die 'writer_residue' (
+          'managed writer processes remain while the task is not Running') @{
+          writer_count = $writers.Count
+        }
+      }
     }
     $document.status.solidworks_processes = @(Get-SolidWorksProcesses).Count
     $document.status.consistent = (

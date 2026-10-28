@@ -694,128 +694,13 @@ PY
 
 verify_windows_result() {
   local output="$1" remote_rc="$2" verb="$3" record_file="$4"
-  "$AIRFLOW_VENV/bin/python" - "$output" "$remote_rc" "$verb" "$record_file" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-from description_pipeline import interface_records
-
-output = Path(sys.argv[1])
-remote_rc = int(sys.argv[2])
-verb = sys.argv[3]
-record_path = Path(sys.argv[4]) if sys.argv[4] else None
-RESULT_SCHEMA = "solidworks-to-urdf.windows-lifecycle-result/v1"
-
-
-def refuse():
-    raise SystemExit(1)
-
-
-def canonical_fields(identity):
-    if not isinstance(identity, dict):
-        refuse()
-    return {
-        key: identity.get(key)
-        for key in ("install_id", "config_digest", "release", "target_identity")
-    }
-
-
-def require_expected(identity, expected):
-    fields = canonical_fields(identity)
-    if (
-        fields["install_id"] != expected.get("install_id")
-        or fields["config_digest"] != expected.get("config_digest")
-        or fields["release"] != expected.get("release")
-        or (
-            fields["target_identity"] is not None
-            and fields["target_identity"] != expected.get("target_identity")
-        )
-    ):
-        refuse()
-
-
-def load_record():
-    try:
-        record = json.loads(record_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        raise SystemExit(3)
-    if not isinstance(record, dict) or not isinstance(record.get("ends", {}).get("windows"), dict):
-        raise SystemExit(3)
-    return record
-
-
-def validate_health(health, record):
-    try:
-        interface_records.require_endpoint_matches_install_record(health, record)
-    except Exception:
-        refuse()
-
-
-try:
-    document = json.loads(output.read_text(encoding="utf-8").strip().splitlines()[-1])
-except (OSError, ValueError, IndexError):
-    raise SystemExit(3)
-if not isinstance(document, dict) or document.get("verb") != verb:
-    raise SystemExit(3)
-if (
-    remote_rc in (0, 1)
-    and document.get("passed") is False
-    and isinstance(document.get("code"), str)
-    and document["code"]
-):
-    raise SystemExit(1)
-if remote_rc != 0 or document.get("passed") is not True:
-    raise SystemExit(3)
-if document.get("schema_version") != RESULT_SCHEMA:
-    refuse()
-
-identity = document.get("identity")
-task = document.get("task")
-if verb == "status":
-    status = document.get("status")
-    if (
-        not isinstance(task, dict)
-        or not isinstance(status, dict)
-        or status.get("consistent") is not True
-        or status.get("error") is not None
-        or status.get("task_exists") is not True
-        or type(status.get("solidworks_processes")) is not int
-        or status["solidworks_processes"] < 0
-        or status.get("task_state") not in {"Disabled", "Ready", "Running"}
-        or task.get("state") != status.get("task_state")
-    ):
-        refuse()
-    task_state = status["task_state"]
-    canonical_fields(identity)
-    if task_state == "Running":
-        if record_path is None:
-            refuse()
-        record = load_record()
-        validate_health(document.get("health"), record)
-        require_expected(identity, record["ends"]["windows"])
-    elif record_path is not None:
-        record = load_record()
-        require_expected(identity, record["ends"]["windows"])
-elif verb in {"start", "health"}:
-    if identity is None or record_path is None:
-        refuse()
-    record = load_record()
-    validate_health(document.get("health"), record)
-    require_expected(identity, record["ends"]["windows"])
-elif verb in {"drain", "stop"}:
-    if identity is not None and record_path is not None:
-        require_expected(identity, load_record()["ends"]["windows"])
-else:
-    raise SystemExit(3)
-
-if record_path is None and verb == "status":
-    output.with_name("windows-status.json").write_text(
-        json.dumps(document, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    raise SystemExit(5)
-PY
+  local -a arguments=(
+    verify-windows-result --result "$output" --remote-rc "$remote_rc" --verb "$verb"
+  )
+  if [ -n "$record_file" ] && [ "$record_file" != "-" ]; then
+    arguments+=(--install-record "$record_file")
+  fi
+  "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" "${arguments[@]}"
 }
 
 drift_check() {
@@ -1100,6 +985,9 @@ case "$ACTION" in
     load_installed
     drift_check || exit 1
     OPERATOR_STATE="$STATE_ROOT" bash "$HERE/health.sh"
+    windows_action health "$STATE_ROOT/install-record.json" >/dev/null \
+      || die "the Windows endpoint health did not pass"
+    echo "health complete: Linux and Windows endpoints passed"
     ;;
   reconcile)
     [ -n "$RUN_ID" ] && [ -n "$STAGE" ] && [ -n "$EFFECT_KEY" ] \

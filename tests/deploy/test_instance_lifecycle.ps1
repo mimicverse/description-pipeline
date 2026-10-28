@@ -1674,9 +1674,21 @@ function Stop-ScheduledTask {
 }
 function Disable-ScheduledTask {
   [CmdletBinding()] param([string]$TaskName, [string]$TaskPath)
-  $script:FixtureTask.State = 'Disabled'
+  if ($script:LeaveStoppedTaskReady) {
+    $script:FixtureTask.State = 'Ready'
+  } else {
+    $script:FixtureTask.State = 'Disabled'
+  }
 }
-function Get-WriterResidue($State) { return @() }
+$script:LeaveStoppedTaskReady = $false
+$script:WriterResidueRows = @()
+$script:WriterResidueObservationFailed = $false
+function Get-WriterResidue($State) {
+  if ($script:WriterResidueObservationFailed) {
+    DieUnknown 'windows_observer_failed' 'the writer process table could not be observed'
+  }
+  return @($script:WriterResidueRows)
+}
 function Get-TaskProjection($Task) {
   $generation = Join-Path $installRoot 'state/lifecycle/generation'
   $taskState = [string]$Task.State
@@ -1778,6 +1790,29 @@ Check 'status.disabled_after_stop_is_consistent' (
   $null -eq $stoppedStatus.status.error -and
   $stoppedStatus.identity.install_id -ceq $fakeState.install_id) (
     $stoppedStatus.status.error | ConvertTo-Json -Depth 5 -Compress)
+
+$script:WriterResidueRows = @([pscustomobject]@{ExecutablePath='fixture-writer'})
+$writerResidueStatus = Invoke-Status $fixedBinding
+$script:WriterResidueRows = @()
+Check 'status.non_running_rejects_managed_writer_residue' (
+  $writerResidueStatus.status.consistent -eq $false -and
+  $writerResidueStatus.status.error.code -ceq 'writer_residue' -and
+  $writerResidueStatus.status.error.message -match 'writer processes remain')
+
+$script:WriterResidueObservationFailed = $true
+$writerObserverStatus = Invoke-Status $fixedBinding
+$script:WriterResidueObservationFailed = $false
+Check 'status.non_running_writer_observation_failure_is_error' (
+  $writerObserverStatus.status.consistent -eq $false -and
+  $writerObserverStatus.status.error.code -ceq 'windows_observer_failed')
+
+$script:LeaveStoppedTaskReady = $true
+$readyStopRefusal = Invoke-Refusal { Invoke-Stop $fixedBinding }
+$script:LeaveStoppedTaskReady = $false
+Check 'stop.requires_disabled_final_state' (
+  $readyStopRefusal.code -ceq 'stop_failed' -and
+  $script:FixtureTask.State -ceq 'Ready')
+$script:FixtureTask.State = 'Disabled'
 
 $script:FixtureTask.SemanticSha256 = $null
 $script:MutateTaskDefinitionOnEnable = $true
