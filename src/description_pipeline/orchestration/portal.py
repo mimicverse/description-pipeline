@@ -2176,10 +2176,9 @@ class PortalApp:
         # The purpose authority of both pages is the registered freeze request: a
         # mutable conf echo never decides the display, and an unfinished
         # registration reads as "not recorded".
-        display_job = self._registered_stage_job(job, projection)
-        # Registered stage rows own the terminal partition. The run's coarse
-        # failure must not turn the final downstream blocked row into a failure.
-        stage_view_payload = stage_view({**(display_job or {}), "status": None})
+        stage_job = self._registered_stage_job(job, projection)
+        stage_view_payload = stage_view(stage_job)
+        display_job = None if stage_job is None else {**stage_job, "status": (job or {}).get("status")}
         try:
             report = build_report(display_job or {}, view=stage_view_payload)
         except PipelineError as error:
@@ -3307,6 +3306,9 @@ class PortalApp:
             display["discovery"] = discovery
             display["hardware_id"] = discovery["hardware_id"]
             display["revision"] = discovery["revision"]
+        # The registered rows own stage states; coarse run failure must not
+        # replace a downstream blocked state when rendering this stage view.
+        display.pop("status", None)
         return display
 
     @staticmethod
