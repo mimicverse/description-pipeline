@@ -69,6 +69,13 @@ RECOVERY_TEMPORARY_DISCONNECTION = "temporary_disconnection"
 RECOVERY_EVIDENCE_CORRUPTION = "evidence_corruption"
 RECOVERY_ENGINEERING_TERMINAL = "engineering_terminal_failure"
 RECOVERY_UNKNOWN_PUBLICATION = "unknown_publication_response"
+RECOVERY_RECONCILIATION_REQUIRED = "reconciliation_required"
+_REGISTERED_RECOVERY_CLASSIFICATION = {
+    "failed": RECOVERY_ENGINEERING_TERMINAL,
+    "cancelled": RECOVERY_ENGINEERING_TERMINAL,
+    "succeeded": "run_succeeded",
+    "unresolved": RECOVERY_RECONCILIATION_REQUIRED,
+}
 
 
 @dataclass(frozen=True)
@@ -342,6 +349,60 @@ def recorded_run_facts(dag_id: str, run_id: str) -> tuple[str | None, object, di
     return recorded_actor_principal(run.triggering_user_name), run.state, task_states
 
 
+def registered_recovery_block(record: dict | None) -> tuple[str, str] | None:
+    """Return the reason and class blocking in-place recovery from a platform projection."""
+
+    state = record.get("state") if isinstance(record, dict) else None
+    if state in {"queued", "running"}:
+        return None
+    if isinstance(state, str) and state in _REGISTERED_RECOVERY_CLASSIFICATION:
+        return f"registered_{state}", _REGISTERED_RECOVERY_CLASSIFICATION[state]
+    return "registration_missing", RECOVERY_TEMPORARY_DISCONNECTION
+
+
+def recorded_canonical_projection(dag_id: str, dag_run_id: str) -> dict | None:
+    """Read the exact platform projection used by the Portal recovery gate."""
+
+    dsn = os.environ.get("PLATFORM_OPERATOR_DSN")
+    if not dsn:
+        return None
+    try:
+        import psycopg2  # noqa: PLC0415 - Airflow runtime dependency only
+
+        from ..platform.queries import read_run_projection  # noqa: PLC0415
+        from .airflow_client import native_run_id  # noqa: PLC0415
+
+        canonical_run_id = native_run_id(dag_run_id)
+        with psycopg2.connect(dsn, connect_timeout=5) as connection:
+            connection.set_session(readonly=True)
+            projection = read_run_projection(connection, canonical_run_id)
+    except Exception:  # noqa: BLE001 - authorization fails closed on unavailable authority
+        return None
+    if not isinstance(projection, dict):
+        return None
+    if projection.get("run_id") != canonical_run_id:
+        return None
+    request = projection.get("request")
+    technical = projection.get("technical")
+    commands = technical.get("commands") if isinstance(technical, dict) else None
+    if not isinstance(request, dict) or not isinstance(commands, list):
+        return None
+    dispatches = [
+        command
+        for command in commands
+        if isinstance(command, dict)
+        and command.get("kind") == "dispatch"
+        and isinstance(command.get("request"), dict)
+        and command.get("run_id") == canonical_run_id
+        and command["request"].get("run_id") == canonical_run_id
+        and command["request"].get("dag_id") == dag_id
+        and command["request"].get("dag_run_id") == dag_run_id
+    ]
+    if len(dispatches) != 1:
+        return None
+    return projection
+
+
 def owner_retry_allowed(user: Any, dag_id: str, run_id: str) -> bool:
     """True only for the caller's own run that is a positively classified transport recovery."""
     facts = recorded_run_facts(dag_id, run_id)
@@ -349,6 +410,14 @@ def owner_retry_allowed(user: Any, dag_id: str, run_id: str) -> bool:
         return False
     principal, run_state, task_states = facts
     if principal is None or principal != user.get_id():
+        return False
+    projection = recorded_canonical_projection(dag_id, run_id)
+    request = projection.get("request") if isinstance(projection, dict) else None
+    if (
+        not isinstance(request, dict)
+        or request.get("principal") != principal
+        or registered_recovery_block(projection) is not None
+    ):
         return False
     return classify_recovery(run_state, task_states).eligible
 

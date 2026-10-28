@@ -834,11 +834,12 @@ def merge_warnings(*groups: list[dict]) -> list[dict]:
 
     unique = {}
     for row in (item for group in groups for item in group):
+        if row.get("blocking") is not False:
+            raise PipelineError("A warning requires an explicit non-blocking diagnostic")
         identity = dict(row)
         # These values identify the display surface, not an engineering source.
         if identity.get("source") in ("input", "discovery", "verification"):
             identity.pop("source")
-        identity.setdefault("blocking", False)
         unique.setdefault(canonical_json_value(identity), row)
     return [unique[key] for key in sorted(unique)]
 

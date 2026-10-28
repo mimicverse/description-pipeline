@@ -624,12 +624,23 @@ def _validate_evidence(
         isinstance(input_stability, dict),
         "Raw Capture observation has no input stability record",
     )
-    unchanged = input_stability.get("originals_unchanged")
-    # ``freeze`` records a structured observation (files checked / states recorded) and raises on
-    # any change; a boolean or empty claim is not that evidence.
     _require(
-        isinstance(unchanged, dict) and int(unchanged.get("files_checked") or 0) >= 1,
+        set(input_stability) == {"originals_unchanged", "source_hashes"},
+        "Raw Capture input stability fields are incomplete or unknown",
+    )
+    unchanged = input_stability.get("originals_unchanged")
+    _require(
+        isinstance(unchanged, dict),
         "Evidence does not prove the CAD bytes were unchanged",
+    )
+    _require(
+        set(unchanged) == {"files_checked"},
+        "Raw Capture input stability fields are incomplete or unknown",
+    )
+    files_checked = unchanged["files_checked"]
+    _require(
+        type(files_checked) is int and files_checked > 0,
+        "Input stability files_checked must be a positive integer",
     )
     source_hashes = input_stability.get("source_hashes")
     _require(isinstance(source_hashes, dict) and source_hashes, "Evidence lacks native source hashes")
@@ -650,6 +661,12 @@ def _validate_evidence(
     _require(
         source_inputs == native_source_inputs,
         "Evidence source hashes differ from the native discovery inventory",
+    )
+    # The producer counts every rehashed prepared CAD file; this exact comparison uses the
+    # existing canonical source map and does not create another inventory.
+    _require(
+        files_checked == len(native_source_inputs),
+        "Input stability files_checked differs from the complete native source inventory",
     )
     _require(
         identity.get("dependency_digest") == digest(sorted(source_inputs.items())),

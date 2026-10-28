@@ -91,10 +91,10 @@ from .feishu_oauth import (
 from .run_ownership import (
     AMBIGUOUS_TASK_STATE,
     RECOVERY_ENGINEERING_TERMINAL,
-    RECOVERY_TEMPORARY_DISCONNECTION,
     RECOVERY_UNKNOWN_PUBLICATION,
     RecoveryAssessment,
     classify_recovery,
+    registered_recovery_block as _registered_recovery_block,
     recorded_actor_principal,
 )
 from .report_view import build_report, merge_warnings
@@ -261,13 +261,19 @@ def _delivery_warnings(members: dict) -> list[dict]:
     if handoff is not None:
         for item in _registered_source_rows(_parse_registered_json(handoff), "warnings", code_required=True):
             warning = dict(item)
+            # Handoff's warnings list is non-blocking by contract.
+            warning.setdefault("blocking", False)
+            if warning["blocking"] is not False:
+                raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered input warning has an invalid blocking state")
             warning.setdefault("source", "input")
             warnings.append(warning)
     discovery = members.get("input/discovery/native-discovery.json")
     if discovery is not None:
         findings = _registered_source_rows(_parse_registered_json(discovery), "findings", code_required=True)
         for item in findings:
-            if item.get("blocking") is True:
+            if type(item.get("blocking")) is not bool:
+                raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered discovery finding has an invalid blocking state")
+            if item["blocking"]:
                 continue
             warning = dict(item)
             warning.setdefault("source", "discovery")
@@ -1046,7 +1052,7 @@ def _findings(job: dict | None) -> list[dict]:
         findings.append(
             {
                 "id": str(item.get("code") or ""),
-                "severity": "error" if item.get("blocking", True) else "warning",
+                "severity": "warning" if item.get("blocking") is False else "error",
                 "stage": "discover",
                 "object": str(item.get("object") or ""),
                 "message": str(item.get("message") or "native discovery finding"),
@@ -1186,35 +1192,6 @@ _RETRY_REFUSED_MESSAGES = {
         "This run cannot be retried in place."
     ),
 }
-
-
-#: The recovery classification of a registered outcome that blocks in-place retry.
-#: An unresolved outcome is stage-neutral: it requires reconciliation, and only a
-#: registration whose own evidence names the publication scope may say so.
-RECOVERY_RECONCILIATION_REQUIRED = "reconciliation_required"
-_REGISTERED_RECOVERY_CLASSIFICATION = {
-    "failed": RECOVERY_ENGINEERING_TERMINAL,
-    "cancelled": RECOVERY_ENGINEERING_TERMINAL,
-    "succeeded": "run_succeeded",
-    "unresolved": RECOVERY_RECONCILIATION_REQUIRED,
-}
-
-
-def _registered_recovery_block(record: dict | None) -> tuple[str, str] | None:
-    """The (reason, classification) blocking in-place recovery, or None while it may proceed.
-
-    Only a known live admitted registration (``queued``/``running``) opens the
-    scheduling recovery: decided terminal outcomes refuse with their recorded
-    reason, an unresolved outcome requires reconciliation, and a missing or
-    unproven registration fails closed - Airflow or native facts never
-    substitute for the platform admission.
-    """
-    state = record.get("state") if isinstance(record, dict) else None
-    if state in {"queued", "running"}:
-        return None
-    if isinstance(state, str) and state in _REGISTERED_RECOVERY_CLASSIFICATION:
-        return f"registered_{state}", _REGISTERED_RECOVERY_CLASSIFICATION[state]
-    return "registration_missing", RECOVERY_TEMPORARY_DISCONNECTION
 
 
 def _retry_assessment(run: dict, tasks: list[dict], job: dict | None, endpoint_error: str | None) -> RecoveryAssessment:
@@ -2164,19 +2141,6 @@ class PortalApp:
         retry_job = dict(job or {})
         retry_job["native_status"] = _canonical_native_status(projection)
         retry = _retry_assessment(airflow_run, tasks, retry_job, endpoint_error)
-        if isinstance(projection, dict):
-            fact_state = projection.get("state")
-            if fact_state in {"succeeded", "failed", "cancelled"}:
-                classification = _REGISTERED_RECOVERY_CLASSIFICATION.get(
-                    str(fact_state),
-                    RECOVERY_ENGINEERING_TERMINAL,
-                )
-                retry = RecoveryAssessment(
-                    False,
-                    classification,
-                    f"registered_{fact_state}",
-                    (),
-                )
         recovery_block = _registered_recovery_block(projection)
         if recovery_block is not None:
             reason, classification = recovery_block

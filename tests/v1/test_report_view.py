@@ -89,6 +89,43 @@ def passed_job() -> dict:
 
 
 class ReportViewTests(unittest.TestCase):
+    def test_discovery_warning_requires_explicit_boolean_blocking(self) -> None:
+        import json
+        from description_pipeline.orchestration.portal import (
+            PortalError, _delivery_warnings, _findings, _preview_warnings,
+        )
+        from description_pipeline.io import PipelineError
+
+        for fields in ({}, {"blocking": None}, {"blocking": "false"}, {"blocking": 0}, {"blocking": 1}):
+            finding = {"code": "native.observation", "message": "Recorded observation", **fields}
+            with self.subTest(fields=fields):
+                members = {"input/discovery/native-discovery.json": json.dumps({"findings": [finding]}).encode()}
+                with self.assertRaises(PortalError):
+                    _delivery_warnings(members)
+                with self.assertRaises(PipelineError):
+                    _preview_warnings([finding])
+                self.assertEqual(_findings({"discovery": {"findings": [finding]}})[0]["severity"], "error")
+        for blocking in (True, False):
+            finding = {"code": "native.observation", "blocking": blocking, "detail": {"object": "part"}}
+            members = {"input/discovery/native-discovery.json": json.dumps({"findings": [finding]}).encode()}
+            warnings = _preview_warnings(_delivery_warnings(members))
+            self.assertEqual(warnings, [] if blocking else [{**finding, "source": "discovery"}])
+
+    def test_handoff_warning_contract_projects_explicit_false(self) -> None:
+        import json
+        from description_pipeline.orchestration.portal import PortalError, _delivery_warnings, _preview_warnings
+
+        warning = {"code": "input.name", "message": "Normalized name"}
+        members = {"input/handoff.json": json.dumps({"warnings": [warning]}).encode()}
+        self.assertEqual(
+            _preview_warnings(_delivery_warnings(members)),
+            [{**warning, "blocking": False, "source": "input"}],
+        )
+        for blocking in (True, None, "false", 0):
+            members = {"input/handoff.json": json.dumps({"warnings": [{**warning, "blocking": blocking}]}).encode()}
+            with self.subTest(blocking=blocking), self.assertRaises(PortalError):
+                _delivery_warnings(members)
+
     def test_nested_blocking_and_unknown_diagnostics_are_not_downgraded(self) -> None:
         from description_pipeline.orchestration.report_view import _recorded_warnings, _warning_row
         from description_pipeline.io import PipelineError
