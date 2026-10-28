@@ -403,6 +403,31 @@ class ExporterDiscoveryTests(unittest.TestCase):
         self.assertEqual(joints[0]["limit_source"], "declared_author")
         self.assertEqual(joints[0]["limits"], {"lower": -1.0, "upper": 1.0, "effort": 1.0, "velocity": 1.0})
 
+    def test_engineering_native_range_conflicts_with_zero_author_range(self) -> None:
+        record = raw_record()
+        record["exporter"]["raw_xml"] = wire_xml(
+            {
+                "lower": 0.0,
+                "upper": 0.0,
+                "effort": 1.0,
+                "velocity": 1.0,
+            }
+        )
+        record["exporter"]["raw_xml_sha256"] = hashlib.sha256(
+            record["exporter"]["raw_xml"].encode()
+        ).hexdigest()
+        record["mates"] = [native_limit_mate(-1.0, 1.0)]
+
+        _bodies, joints, findings = self.derive(record)
+
+        self.assertEqual(joints, [])
+        conflict = next(
+            item
+            for item in findings
+            if item["code"] == "discovery.joint_limits_conflict"
+        )
+        self.assertTrue(conflict["blocking"])
+
     def test_continuous_joints_keep_only_drive_limits_for_both_purposes(self) -> None:
         for purpose in (PURPOSE_ENGINEERING, PURPOSE_INSPECTION_PREVIEW):
             for native, bounds in ((False, (None, None)), (True, (None, None)), (False, (0.0, 0.0))):

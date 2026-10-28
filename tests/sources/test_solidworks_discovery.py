@@ -1559,6 +1559,128 @@ class DiscoveryTests(unittest.TestCase):
         result, _source, _output = self._prepare(mutate=mutate, joint_record=record_value)
         self.assertIn("discovery.joint_limits_conflict", self._codes(result))
 
+    def test_native_valid_range_conflicts_with_zero_author_record(self):
+        record_value = {
+            "limits": {"lower": 0.0, "upper": 0.0},
+            "drive": {"effort": 6.0, "velocity": 2.0},
+        }
+
+        def mutate(payload):
+            payload["mates"][0]["limits"] = {
+                "lower": -1.0,
+                "upper": 1.0,
+                "unit": "rad",
+            }
+            payload["properties"]["mates"][
+                "shoulder_pitch_joint__coaxial"
+            ]["dp.joint.limits_record"] = "joints/arm.json#limits"
+
+        result, _source, _output = self._prepare(
+            mutate=mutate,
+            joint_record=record_value,
+        )
+        self.assertIn("discovery.joint_limits_conflict", self._codes(result))
+
+    def test_independent_verify_rejects_native_range_over_zero_author_record(
+        self,
+    ):
+        record_value = {
+            "limits": {"lower": 0.0, "upper": 0.0},
+            "drive": {"effort": 6.0, "velocity": 2.0},
+        }
+
+        def baseline_mutation(payload):
+            payload["mates"][0]["limits"] = None
+            payload["properties"]["mates"][
+                "shoulder_pitch_joint__coaxial"
+            ]["dp.joint.limits_record"] = "joints/arm.json#limits"
+
+        result, _source, output = self._prepare(
+            mutate=baseline_mutation,
+            joint_record=record_value,
+        )
+        self.assertTrue(result.passed, result.findings)
+
+        def add_native_limit(payload):
+            mate = copy.deepcopy(payload["raw"]["mates"][1])
+            for index, entity in enumerate(mate["entities"]):
+                entity.update(
+                    {
+                        "entity_index": index,
+                        "reference_configuration": "Default",
+                        "mate_entity_reference": {
+                            "error": None,
+                            "geometry": {
+                                "kind": "point",
+                                "point": [0.0, 0.0, 0.0],
+                                "frame": "component-local",
+                            },
+                        },
+                    }
+                )
+            mate.update(
+                {
+                    "name": "shoulder_pitch_joint__limit",
+                    "type": "limitangle",
+                    "limits": {
+                        "lower": -1.0,
+                        "upper": 1.0,
+                        "unit": "rad",
+                    },
+                    "is_advanced_mate": True,
+                    "is_advanced_mate_error": None,
+                    "is_advanced_mate_api": (
+                        "IAngleMateFeatureData.IsAdvancedMate"
+                    ),
+                    "native_limit": {
+                        "type_index": 6,
+                        "definition_interface": (
+                            "IAngleMateFeatureData"
+                        ),
+                        "definition_interface_iid": (
+                            "{EF4303D7-B4FD-46E7-AD34-D942C420E096}"
+                        ),
+                        "nominal_dimension": {
+                            "value": 1.0,
+                            "api": "IAngleMateFeatureData.Angle",
+                            "unit": "rad",
+                        },
+                        "minimum_variation": {
+                            "value": -2.0,
+                            "api": "IMate2.MinimumVariation",
+                            "unit": "rad",
+                        },
+                        "maximum_variation": {
+                            "value": 0.0,
+                            "api": "IMate2.MaximumVariation",
+                            "unit": "rad",
+                        },
+                        "minimum_limit": {
+                            "value": -1.0,
+                            "api": (
+                                "IAngleMateFeatureData.MinimumAngle"
+                            ),
+                            "unit": "rad",
+                        },
+                        "maximum_limit": {
+                            "value": 1.0,
+                            "api": (
+                                "IAngleMateFeatureData.MaximumAngle"
+                            ),
+                            "unit": "rad",
+                        },
+                    },
+                }
+            )
+            payload["raw"]["mates"].append(mate)
+
+        report = self._verify_mutated_record(output, add_native_limit)
+        self.assertFalse(report["passed"])
+        self.assertIn(
+            "discovery.joint_limits_conflict",
+            {item["code"] for item in report["errors"]},
+        )
+
     def test_unreadable_native_limit_uses_default_and_retains_read_errors(self):
         payload = record()
         cluster_findings: list[dict] = []

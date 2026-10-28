@@ -1243,6 +1243,27 @@ class NativeDeclarationsTests(unittest.TestCase):
         self.assertFalse(report["passed"])
         self.assertIn("v14.native_limits_conflict", {item["code"] for item in report["errors"]})
 
+    def test_engineering_native_range_conflicts_with_zero_author_range(self) -> None:
+        raw = fixture()
+
+        def zero_position(root):
+            for item in root.iter():
+                kind = item.find(NS_TAG + "AttributeType")
+                if (
+                    (item.get(Z_TAG + "Id") or "").startswith("joint_limit_")
+                    and kind is not None
+                    and kind.text in {"lower", "upper"}
+                ):
+                    item.find(NS_TAG + "Value").text = "0"
+
+        rewrite(raw, zero_position)
+        report = verify_declarations(raw, purpose=PURPOSE_ENGINEERING)
+        self.assertFalse(report["passed"])
+        self.assertIn(
+            "v14.native_limits_conflict",
+            {item["code"] for item in report["errors"]},
+        )
+
     def test_engineering_unreadable_native_limit_defaults_and_retains_errors(self) -> None:
         raw = zero_limit_values(fixture())
         raw["mates"] = [

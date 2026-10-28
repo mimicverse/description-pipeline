@@ -2208,7 +2208,7 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
             limit_source = "native"
             if declared_bounds is not None:
                 declared_lower, declared_upper = declared_bounds
-                if declared_bounds not in {(0.0, 0.0), (limits["lower"], limits["upper"])}:
+                if declared_bounds != (limits["lower"], limits["upper"]):
                     findings.append(
                         _finding(
                             "discovery.joint_limits_conflict",
@@ -3571,7 +3571,10 @@ def _exporter_joint_facts(
                     continue
                 native_lower, native_upper = next(iter(native_values))
                 declared_values = (float(limits.get("lower")), float(limits.get("upper"))) if bounds_usable else None
-                if declared_values not in {None, (0.0, 0.0), (native_lower, native_upper)}:
+                if declared_values is not None and declared_values != (
+                    native_lower,
+                    native_upper,
+                ):
                     findings.append(
                         _finding(
                             "discovery.joint_limits_conflict",

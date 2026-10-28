@@ -2527,7 +2527,10 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
                 {"pair": [left, right], "unit": native_limits.get("unit")},
             )
             limits = {"lower": float(native_limits["lower"]), "upper": float(native_limits["upper"])}
-            if author_limits not in {None, (0.0, 0.0), (limits["lower"], limits["upper"])}:
+            if author_limits is not None and author_limits != (
+                limits["lower"],
+                limits["upper"],
+            ):
                 raise _Failure(
                     "discovery.joint_limits_conflict",
                     "native range disagrees with the saved author declaration",
