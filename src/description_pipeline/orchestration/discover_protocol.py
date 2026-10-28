@@ -285,7 +285,7 @@ class ArchiveDiscoverAdapter:
         *,
         artifacts: ArtifactStore,
         native_tool: Mapping[str, object],
-            backend_factory: Callable | None = None,
+        backend_factory: Callable | None = None,
         cad_ownership_file: Path | None = None,
         on_activity=None,
     ) -> None:
