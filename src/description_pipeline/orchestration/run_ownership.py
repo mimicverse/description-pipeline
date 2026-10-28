@@ -257,6 +257,18 @@ def routed_route() -> RoutedRoute | None:
     return None
 
 
+def single_run_clear_requested() -> bool:
+    """Whether the resolved request endpoint is the guarded single-run clear route."""
+
+    request = bound_request()
+    if request is None:
+        return False
+    return _endpoint_named(
+        getattr(request, "scope", {}).get("endpoint"),
+        SINGLE_RUN_CLEAR_ENDPOINT,
+    )
+
+
 def _state_value(state: object) -> str | None:
     value = getattr(state, "value", state)
     return value if isinstance(value, str) else None
@@ -373,7 +385,11 @@ def recorded_canonical_projection(dag_id: str, dag_run_id: str) -> dict | None:
         from .airflow_client import native_run_id  # noqa: PLC0415
 
         canonical_run_id = native_run_id(dag_run_id)
-        with psycopg2.connect(dsn, connect_timeout=5) as connection:
+        with psycopg2.connect(
+            dsn,
+            connect_timeout=5,
+            options="-c statement_timeout=5000",
+        ) as connection:
             connection.set_session(readonly=True)
             projection = read_run_projection(connection, canonical_run_id)
     except Exception:  # noqa: BLE001 - authorization fails closed on unavailable authority
@@ -403,44 +419,36 @@ def recorded_canonical_projection(dag_id: str, dag_run_id: str) -> dict | None:
     return projection
 
 
-def canonical_clear_projection_authorized(
-    projection: dict | None,
+def retry_allowed(
+    user: Any,
+    dag_id: str,
+    run_id: str,
     *,
-    principal: str | None = None,
+    require_owner: bool,
 ) -> bool:
-    """Whether one validated projection may be cleared in place."""
+    """Require canonical registration plus positively classified scheduling recovery."""
 
-    request = projection.get("request") if isinstance(projection, dict) else None
-    if not isinstance(request, dict) or not isinstance(request.get("principal"), str):
-        return False
-    if principal is not None and request.get("principal") != principal:
-        return False
-    return registered_recovery_block(projection) is None
-
-
-def canonical_clear_allowed(dag_id: str, dag_run_id: str) -> bool:
-    """The canonical safety gate for administrator direct Airflow clear."""
-
-    return canonical_clear_projection_authorized(
-        recorded_canonical_projection(dag_id, dag_run_id)
-    )
-
-
-def owner_retry_allowed(user: Any, dag_id: str, run_id: str) -> bool:
-    """True only for the caller's own run that is a positively classified transport recovery."""
     facts = recorded_run_facts(dag_id, run_id)
     if facts is None:
         return False
     principal, run_state, task_states = facts
-    if principal is None or principal != user.get_id():
+    if principal is None or (require_owner and principal != user.get_id()):
         return False
     projection = recorded_canonical_projection(dag_id, run_id)
-    if not canonical_clear_projection_authorized(
-        projection,
-        principal=principal,
+    request = projection.get("request") if isinstance(projection, dict) else None
+    if (
+        not isinstance(request, dict)
+        or request.get("principal") != principal
+        or registered_recovery_block(projection) is not None
     ):
         return False
     return classify_recovery(run_state, task_states).eligible
+
+
+def owner_retry_allowed(user: Any, dag_id: str, run_id: str) -> bool:
+    """True only for the caller's own run that is a positively classified transport recovery."""
+
+    return retry_allowed(user, dag_id, run_id, require_owner=True)
 
 
 def owner_create_allowed(user: Any, dag_id: str) -> bool:

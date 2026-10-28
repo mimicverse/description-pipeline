@@ -97,7 +97,11 @@ from .run_ownership import (
     registered_recovery_block as _registered_recovery_block,
     recorded_actor_principal,
 )
-from .report_view import build_report, merge_warnings
+from .report_view import (
+    build_report,
+    merge_warnings,
+    registered_discovery_findings,
+)
 from .uploads import (
     MAX_FILE_BYTES,
     MAX_FILES,
@@ -1044,15 +1048,18 @@ def _findings(job: dict | None) -> list[dict]:
     if not isinstance(job, dict):
         return findings
     result = job.get("result") if isinstance(job.get("result"), dict) else {}
+    try:
+        discovery_findings = registered_discovery_findings(job)
+    except PipelineError as error:
+        raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
     discovery = job.get("discovery") if isinstance(job.get("discovery"), dict) else {}
     digest = str(discovery.get("discovery_sha256") or "")
-    for item in discovery.get("findings") or []:
-        if not isinstance(item, dict):
-            continue
+    for item in discovery_findings:
         findings.append(
             {
-                "id": str(item.get("code") or ""),
-                "severity": "warning" if item.get("blocking") is False else "error",
+                "id": item["code"],
+                "severity": "warning" if item["blocking"] is False else "error",
+                "blocking": item["blocking"],
                 "stage": "discover",
                 "object": str(item.get("object") or ""),
                 "message": str(item.get("message") or "native discovery finding"),

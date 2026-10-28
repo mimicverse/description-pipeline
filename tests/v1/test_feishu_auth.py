@@ -630,6 +630,7 @@ class FeishuAuthManagerTests(unittest.TestCase):
             run_id: str | None = None,
             user=owner,
             clear_body_safe: bool | None = True,
+            details=allowed,
         ) -> bool:
             with (
                 request_context.use_request(
@@ -651,7 +652,7 @@ class FeishuAuthManagerTests(unittest.TestCase):
                 return manager.is_authorized_dag(
                     method=method,
                     access_entity=entity,
-                    details=allowed,
+                    details=details,
                     user=user,
                 )
 
@@ -702,13 +703,24 @@ class FeishuAuthManagerTests(unittest.TestCase):
                 user=admin,
             )
         )
-        # The exact immutable-retry body is part of the owner grant; admins are exempt.
+        self.assertFalse(
+            decide(
+                "PUT",
+                run,
+                clear_dag_run,
+                run_id="run-own",
+                user=admin,
+                details=None,
+            )
+        )
+        # The exact immutable-retry body and canonical state gate apply to every direct clear.
         self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-own", clear_body_safe=False))
         self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-own", clear_body_safe=None))
         self.assertTrue(decide("PUT", run, clear_dag_run, run_id="run-own", user=admin))
-        self.assertTrue(decide("PUT", run, clear_dag_run, run_id="run-own", user=admin, clear_body_safe=False))
+        self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-own", user=admin, clear_body_safe=False))
         # Same (method, entity) but any other route stays administrator-only.
         self.assertFalse(decide("PUT", run, patch_dag_run, run_id="run-own"))
+        self.assertTrue(decide("PUT", run, patch_dag_run, run_id="run-own", user=admin))
         self.assertFalse(decide("PUT", run, clear_dag_run_partitions, run_id="run-own"))
         self.assertFalse(decide("PUT", run, bulk_dag_runs, run_id="run-own"))
         self.assertFalse(decide("DELETE", run, delete_dag_run, run_id="run-own"))
@@ -736,6 +748,7 @@ class FeishuAuthManagerTests(unittest.TestCase):
         self.assertFalse(manager.is_authorized_dag(method="POST", access_entity=run, details=allowed, user=owner))
         self.assertFalse(manager.is_authorized_dag(method="PUT", access_entity=run, details=allowed, user=owner))
         self.assertTrue(manager.is_authorized_dag(method="GET", details=allowed, user=owner))
+        self.assertFalse(manager.is_authorized_dag(method="PUT", access_entity=run, details=allowed, user=admin))
         self.assertTrue(manager.is_authorized_dag(method="POST", access_entity=run, details=allowed, user=admin))
 
     def test_request_context_middleware_binds_and_resets_the_scope(self) -> None:

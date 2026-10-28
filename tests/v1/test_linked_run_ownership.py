@@ -14,12 +14,12 @@ from description_pipeline.orchestration import request_context as context
 from description_pipeline.orchestration.airflow_client import native_run_id
 from description_pipeline.orchestration.run_ownership import (
     CreateDispatchBinding,
-    canonical_clear_allowed,
     owner_create_allowed,
     owner_retry_allowed,
     recorded_create_binding,
     recorded_canonical_projection,
     registered_recovery_block,
+    retry_allowed,
 )
 from description_pipeline.pipeline.contracts import DispatchConf
 from description_pipeline.schemas import AIRFLOW_DISPATCH_CONF_SCHEMA
@@ -357,7 +357,19 @@ class LinkedRunOwnershipTests(unittest.TestCase):
         ):
             self.assertFalse(owner_retry_allowed(user, "solidworks_to_urdf", DAG_RUN_ID))
 
-    def test_administrator_clear_uses_the_same_canonical_safety_gate(self) -> None:
+    def test_retry_without_owner_still_requires_the_canonical_safety_gate(self) -> None:
+        user = SimpleNamespace(get_id=lambda: "cli_app:tenant-a:ou_admin")
+        facts = (
+            PRINCIPAL,
+            "failed",
+            {
+                "freeze": "success",
+                "discover": "success",
+                "capture": "success",
+                "generate": "success",
+                "verify": "failed",
+            },
+        )
         cases = (
             ("queued", True),
             ("running", True),
@@ -373,12 +385,21 @@ class LinkedRunOwnershipTests(unittest.TestCase):
             with (
                 self.subTest(state=state),
                 patch(
+                    "description_pipeline.orchestration.run_ownership.recorded_run_facts",
+                    return_value=facts,
+                ),
+                patch(
                     "description_pipeline.orchestration.run_ownership.recorded_canonical_projection",
                     return_value=projection,
                 ),
             ):
                 self.assertIs(
-                    canonical_clear_allowed("solidworks_to_urdf", DAG_RUN_ID),
+                    retry_allowed(
+                        user,
+                        "solidworks_to_urdf",
+                        DAG_RUN_ID,
+                        require_owner=False,
+                    ),
                     expected,
                 )
 
@@ -437,6 +458,7 @@ class LinkedRunOwnershipTests(unittest.TestCase):
         psycopg2.connect.assert_called_once_with(
             "operator-ro-dsn",
             connect_timeout=5,
+            options="-c statement_timeout=5000",
         )
         connection.set_session.assert_called_once_with(readonly=True)
         read.assert_called_once_with(connection, run_id)

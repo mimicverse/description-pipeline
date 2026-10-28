@@ -94,6 +94,7 @@ class ReportViewTests(unittest.TestCase):
         from description_pipeline.orchestration.portal import (
             PortalError, _delivery_warnings, _findings, _preview_warnings,
         )
+        from description_pipeline.orchestration.report_view import build_report
         from description_pipeline.io import PipelineError
 
         for fields in ({}, {"blocking": None}, {"blocking": "false"}, {"blocking": 0}, {"blocking": 1}):
@@ -104,12 +105,21 @@ class ReportViewTests(unittest.TestCase):
                     _delivery_warnings(members)
                 with self.assertRaises(PipelineError):
                     _preview_warnings([finding])
-                self.assertEqual(_findings({"discovery": {"findings": [finding]}})[0]["severity"], "error")
+                with self.assertRaises(PortalError):
+                    _findings({"discovery": {"findings": [finding]}})
+                with self.assertRaises(PipelineError):
+                    build_report({"discovery": {"findings": [finding]}})
         for blocking in (True, False):
             finding = {"code": "native.observation", "blocking": blocking, "detail": {"object": "part"}}
             members = {"input/discovery/native-discovery.json": json.dumps({"findings": [finding]}).encode()}
             warnings = _preview_warnings(_delivery_warnings(members))
             self.assertEqual(warnings, [] if blocking else [{**finding, "source": "discovery"}])
+            projected = _findings({"discovery": {"findings": [finding]}})[0]
+            self.assertIs(projected["blocking"], blocking)
+            self.assertEqual(
+                projected["severity"],
+                "error" if blocking else "warning",
+            )
 
     def test_handoff_warning_contract_projects_explicit_false(self) -> None:
         import json

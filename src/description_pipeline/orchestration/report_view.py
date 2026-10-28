@@ -44,6 +44,43 @@ _OVERALL_STATE_LABELS = {
     "not_run": "Not started",
 }
 
+
+def _validated_discovery_findings(value: object) -> list[dict]:
+    """Validate the discovery finding shape shared by reports and the run API."""
+
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise PipelineError("Registered discovery findings have an invalid structure")
+    findings: list[dict] = []
+    for item in value:
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("code"), str)
+            or not item["code"]
+        ):
+            raise PipelineError("Registered discovery finding has an invalid code")
+        if type(item.get("blocking")) is not bool:
+            raise PipelineError(
+                "Registered discovery finding has an invalid blocking state"
+            )
+        findings.append(item)
+    return findings
+
+
+def registered_discovery_findings(job: dict | None) -> list[dict]:
+    """Read and validate registered discovery findings from one job projection."""
+
+    if not isinstance(job, dict):
+        return []
+    discovery = job.get("discovery")
+    if discovery is None:
+        return []
+    if not isinstance(discovery, dict):
+        raise PipelineError("Registered discovery record has an invalid structure")
+    return _validated_discovery_findings(discovery.get("findings"))
+
+
 _BOUNDARY_LABELS = {
     "handoff.admission": "Handoff admission (path, regular files, native package)",
     "handoff.integrity": "Handoff integrity (digest and file inventory)",
@@ -898,6 +935,8 @@ def _recorded_warnings(
     """Warnings from recorded evidence only: non-blocking findings and check diagnostics."""
 
     warnings: list[dict] = []
+    if stage.get("id") == "discover":
+        findings = _validated_discovery_findings(findings)
     if quality_diagnostics is not None and not isinstance(
         quality_diagnostics,
         list,
@@ -993,8 +1032,7 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
     view = view if isinstance(view, dict) else stage_view(job)
     result = job.get("result") if isinstance(job.get("result"), dict) else {}
     quality = result.get("quality") if isinstance(result.get("quality"), dict) else {}
-    discovery = job.get("discovery") if isinstance(job.get("discovery"), dict) else {}
-    discovery_findings = discovery.get("findings") if isinstance(discovery.get("findings"), list) else []
+    discovery_findings = registered_discovery_findings(job)
     quality_rows = [row for row in (quality.get("checks") or []) if isinstance(row, dict)]
     stages_out: list[dict] = []
     first_failed: dict | None = None
