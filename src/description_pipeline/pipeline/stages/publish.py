@@ -530,6 +530,24 @@ def _publication_warning_text(certificate: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _publication_text(
+    request: PublishDomainRequest,
+    *,
+    certificate: Mapping[str, Any],
+    certificate_sha256: str,
+    subject_sha256: str,
+) -> tuple[str, str]:
+    body = (
+        request.commit.body.rstrip()
+        + _publication_warning_text(certificate)
+        + "\n\n"
+        + f"Verification-Certificate-SHA256: {certificate_sha256}\n"
+        + f"Publication-Subject-SHA256: {subject_sha256}\n"
+        + f"Repository: {request.repository_slug}\n"
+    )
+    return request.commit.subject, body
+
+
 def _publication_root(
     *,
     request: PublishDomainRequest,
@@ -555,20 +573,11 @@ def _publication_root(
         policy={"schema_version": CHECK_POLICY_SCHEMA, "digest": command.policy_sha256},
     )
     subject = subject_digest(destination)
-    title = request.commit.subject
-    certificate = read_data(verify_root / VERIFY_CERTIFICATE)
-    warning_text = (
-        _publication_warning_text(certificate)
-        if isinstance(certificate, Mapping)
-        else ""
-    )
-    body = (
-        request.commit.body.rstrip()
-        + warning_text
-        + "\n\n"
-        + f"Verification-Certificate-SHA256: {file_digest(verify_root / VERIFY_CERTIFICATE)}\n"
-        + f"Publication-Subject-SHA256: {subject}\n"
-        + f"Repository: {request.repository_slug}\n"
+    title, body = _publication_text(
+        request,
+        certificate=_require_object(read_data(verify_root / VERIFY_CERTIFICATE), "verification certificate"),
+        certificate_sha256=file_digest(verify_root / VERIFY_CERTIFICATE),
+        subject_sha256=subject,
     )
     return destination, subject, title, body
 
@@ -670,18 +679,6 @@ class _SealedGit:
     body: str
 
 
-def _recovery_text(request: PublishDomainRequest, plan: dict[str, Any]) -> tuple[str, str]:
-    title = request.commit.subject
-    body = (
-        request.commit.body.rstrip()
-        + "\n\n"
-        + f"Verification-Certificate-SHA256: {plan['verification_certificate_sha256']}\n"
-        + f"Publication-Subject-SHA256: {plan['publication_subject_sha256']}\n"
-        + f"Repository: {request.repository_slug}\n"
-    )
-    return title, body
-
-
 def _read_sealed_git_outbound_root(
     *,
     repository: PublicationRepository,
@@ -760,16 +757,31 @@ def _read_sealed_git_outbound_root(
     if outbound_request != expected_outbound:
         raise PublicationError("publish.git_recovery_request")
 
-    title, body = _recovery_text(request, plan)
-    if plan["pr_title_sha256"] != digest({"title": title}) or plan["pr_body_sha256"] != digest({"body": body}):
-        raise PublicationError("publish.git_recovery_pr_text")
-
     repository.verify_candidate_bundle(
         outbound_root / "candidate.bundle",
         commit=commit,
         tree=tree,
         parents=tuple(parents),
     )
+    certificate_raw = repository.read_blob(commit=commit, path=f"reports/{VERIFY_CERTIFICATE}")
+    try:
+        certificate = json.loads(certificate_raw)
+    except ValueError as error:
+        raise PublicationError("publish.git_recovery_certificate") from error
+    if (
+        not isinstance(certificate, dict)
+        or certificate_raw != canonical(certificate)
+        or digest(certificate) != plan["verification_certificate_sha256"]
+    ):
+        raise PublicationError("publish.git_recovery_certificate")
+    title, body = _publication_text(
+        request,
+        certificate=certificate,
+        certificate_sha256=plan["verification_certificate_sha256"],
+        subject_sha256=subject,
+    )
+    if plan["pr_title_sha256"] != digest({"title": title}) or plan["pr_body_sha256"] != digest({"body": body}):
+        raise PublicationError("publish.git_recovery_pr_text")
     return _SealedGit(
         outbound_root=Path(outbound_root),
         candidate=_PublishedCandidate(

@@ -416,7 +416,7 @@ class _HttpPullRequests:
 
 
 class PublishFixture:
-    def __init__(self) -> None:
+    def __init__(self, *, diagnostics: list[dict] | None = None) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="publish-fixture-")
         self.root = Path(self.temporary.name)
         self.store = ArtifactStore(self.root / "cas")
@@ -455,7 +455,7 @@ class PublishFixture:
             producer_stage="generate",
             producer_tool_sha256=self.executor,
         )
-        verify_root, self.certificate = self._make_verify(capture_root, generate_root)
+        verify_root, self.certificate = self._make_verify(capture_root, generate_root, diagnostics=diagnostics)
         self.verify_ref = self.store.seal_tree(
             verify_root,
             kind=VERIFY_ARTIFACT_KIND,
@@ -567,7 +567,9 @@ class PublishFixture:
         git(self.repo, "config", "user.name", "Seed")
         git(self.repo, "config", "user.email", "seed@example.test")
 
-    def _make_verify(self, capture_root: Path, generate_root: Path) -> tuple[Path, dict]:
+    def _make_verify(
+        self, capture_root: Path, generate_root: Path, *, diagnostics: list[dict] | None = None
+    ) -> tuple[Path, dict]:
         pair_subject = tree_digest(
             {
                 **{"input/" + path: checksum for path, checksum in inventory(capture_root / "input").items()},
@@ -603,7 +605,7 @@ class PublishFixture:
             "config_snapshot_sha256": CONFIG_SHA,
             "contract_sha256": CONTRACT_SHA,
             "decision": "PASS",
-            "diagnostics": [],
+            "diagnostics": diagnostics or [],
             "evaluation_subject_sha256": pair_subject,
             "generate_artifact": self.generate_ref.to_record(),
             "generate_receipt_sha256": file_digest(generate_root / "reports/generate.json"),
@@ -1784,6 +1786,39 @@ else:
         self.assertIs(self.fixture.effects.states[effect_id], EffectState.UNKNOWN)
         self.assertEqual(self.fixture.pr.create_calls, 1)
         self.assertEqual(self.fixture.pr.update_calls, 0)
+
+    def test_git_reconciliation_binds_warning_source_to_the_sealed_candidate(self) -> None:
+        self._run()
+        wait, _artifact, outbound = self._probe_source(publish_stage.GIT_EFFECT_KEY, "git-certificate-binding")
+        plan_path = outbound / publish_stage.PUBLICATION_PLAN
+        original = read_data(plan_path)
+        request_path = outbound / "request.json"
+        original_request = read_data(request_path)
+        for field, changed, code in (
+            ("verification_certificate_sha256", "f" * 64, "publish.git_recovery_certificate"),
+            ("candidate_tree", "f" * 40, "publish.candidate_bundle_facts"),
+            ("pr_body_sha256", "f" * 64, "publish.git_recovery_pr_text"),
+        ):
+            with self.subTest(field=field):
+                write_json(plan_path, {**original, field: changed})
+                write_json(
+                    request_path,
+                    {**original_request, field: changed} if field == "candidate_tree" else original_request,
+                )
+                workspace = self.fixture.root / f"git-certificate-binding-{field}"
+                with (
+                    patch.object(
+                        PublicationRepository, "observe", side_effect=AssertionError("invalid source was queried")
+                    ),
+                    self.assertRaisesRegex(PipelineError, code),
+                ):
+                    publish_stage.PublishGitReconciliationAdapter().observe(
+                        command=self.fixture.command,
+                        intent=self.fixture.effects.intents[wait.effect_id],
+                        outbound_root=outbound,
+                        workspace_root=workspace,
+                    )
+                self.assertFalse((workspace / "publish-evidence").exists())
 
     def test_resume_reuses_settled_effects_without_external_writes(self) -> None:
         first = self._run()

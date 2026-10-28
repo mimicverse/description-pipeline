@@ -646,6 +646,11 @@ class PublicationRepository:
                 },
             )
 
+    def read_blob(self, *, commit: str, path: str) -> bytes:
+        """Read exact file bytes from an already verified candidate commit."""
+
+        return _run(self.path, "cat-file", "blob", f"{commit}:{path}").stdout
+
     def candidate(
         self,
         *,

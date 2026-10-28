@@ -223,7 +223,13 @@ def _resume(args) -> int:
     )
     command = facts.load_command(args.command_id)
     handler = PublishHandler(artifacts, pull_requests=pull_requests)
-    execute_stage(command_id=command.command_id, handler=handler, services=services)
+    with (
+        patch.object(PublicationRepository, "push", side_effect=AssertionError("recovery must not resend Git")),
+        patch.object(
+            PublishHandler, "_prepare", side_effect=AssertionError("recovery must not rebuild verification inputs")
+        ),
+    ):
+        execute_stage(command_id=command.command_id, handler=handler, services=services)
     return 0
 
 
