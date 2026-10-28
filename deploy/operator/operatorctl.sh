@@ -998,10 +998,6 @@ case "$ACTION" in
   reconcile)
     [ -n "$RUN_ID" ] && [ -n "$STAGE" ] && [ -n "$EFFECT_KEY" ] \
       || die "reconcile requires --run-id, --stage and --effect-key"
-    case "$STAGE" in
-      freeze|discover|capture|generate|verify|publish) ;;
-      *) die "reconcile requires a canonical pipeline stage" ;;
-    esac
     snapshot_config
     resolve_config
     acquire_lifecycle_lock

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from ..interface_records import REQUEST_PURPOSES
+from ..stages import STAGE_IDS
 from ..io import PipelineError, artifact_path_parts, digest, parse_data
 from ..repository.publish import CommitSpec
 from ..schemas import (
@@ -60,7 +61,6 @@ from .verify_contract import (
     REQUEST_SCHEMA as VERIFY_REQUEST_SCHEMA,
 )
 
-SUPPORTED_PROJECTION_STAGES = ("freeze", "discover", "capture", "generate", "verify", "publish")
 _SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")
 _OID40 = re.compile(r"\A[0-9a-f]{40}\Z")
 _ADMISSION_FIELDS = frozenset(
@@ -250,11 +250,11 @@ class StageExecutors:
     publish: str
 
     def __post_init__(self) -> None:
-        for name in ("freeze", "discover", "capture", "generate", "verify", "publish"):
+        for name in STAGE_IDS:
             _require_digest(getattr(self, name), "admission.invalid", f"executors.{name}")
 
     def for_stage(self, stage: StageId) -> str:
-        if stage not in {"freeze", "discover", "capture", "generate", "verify", "publish"}:
+        if stage not in STAGE_IDS:
             raise ProtocolError("admission.invalid", {"where": "executors.stage", "value": stage})
         return str(getattr(self, stage))
 
@@ -270,7 +270,7 @@ class StageExecutors:
 
     @classmethod
     def from_record(cls, record: Mapping[str, Any]) -> StageExecutors:
-        expected = {"freeze", "discover", "capture", "generate", "verify", "publish"}
+        expected = set(STAGE_IDS)
         if not isinstance(record, Mapping) or set(record) != expected:
             raise ProtocolError("admission.invalid", {"where": "executors"})
         return cls(**dict(record))
@@ -398,7 +398,7 @@ class AdmissionSpec:
             _require_text(self.parent_run_id, "admission.invalid", "parent_run_id")
             if self.parent_run_id == self.run_id:
                 raise ProtocolError("admission.invalid", {"where": "parent_run_id", "reason": "self-reference"})
-        if self.from_stage not in {None, "freeze", "discover", "capture", "generate", "verify", "publish"}:
+        if self.from_stage is not None and self.from_stage not in STAGE_IDS:
             raise ProtocolError("admission.invalid", {"where": "from_stage", "value": self.from_stage})
         if self.purpose not in REQUEST_PURPOSES:
             raise ProtocolError("admission.invalid", {"where": "purpose"})
@@ -1580,7 +1580,6 @@ __all__ = [
     "GENERATE_ARTIFACT_KIND",
     "GENERATE_OUTPUT_CONTRACT",
     "GENERATE_REQUEST_SCHEMA",
-    "SUPPORTED_PROJECTION_STAGES",
     "VERIFY_OUTPUT_CONTRACT",
     "VERIFY_REQUEST_SCHEMA",
     "AdmissionSpec",
