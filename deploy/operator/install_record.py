@@ -40,6 +40,7 @@ from platform_config import (  # noqa: E402  (single owners)
 
 INSTALL_RECORD_SCHEMA = "solidworks-to-urdf.install-record/v1"
 RELEASE_SCHEMA = "solidworks-to-urdf.release/v1"
+WINDOWS_RESULT_SCHEMA = "solidworks-to-urdf.windows-lifecycle-result/v1"
 DAG_ID = "solidworks_to_urdf"
 DAG_MEMBER = "deploy/airflow/dags/solidworks_to_urdf.py"
 #: Frozen stage contract size; tests guard parity with description_pipeline.stages.STAGE_IDS.
@@ -273,6 +274,188 @@ def endpoint_identity_from_status(status_document, release: dict) -> dict:
         },
         "target_identity": target.to_record(),
     }
+
+
+def _windows_identity_matches(record: dict, identity: dict, *, target_required: bool) -> bool:
+    expected = record["ends"]["windows"]
+    target = identity.get("target_identity")
+    return (
+        identity.get("install_id") == expected["install_id"]
+        and identity.get("config_digest") == expected["config_digest"]
+        and identity.get("release") == expected["release"]
+        and (not target_required or target == expected["target_identity"])
+        and (target is None or target == expected["target_identity"])
+    )
+
+
+def _zero_fields(document, names: tuple[str, ...]) -> bool:
+    return isinstance(document, dict) and all(
+        type(document.get(name)) is int and document[name] == 0 for name in names
+    )
+
+
+def _windows_safety_matches(safety, *, require_jobs: bool) -> bool:
+    if not isinstance(safety, dict):
+        return False
+    jobs = safety.get("jobs")
+    if require_jobs:
+        if not _zero_fields(jobs, ("active", "queued", "unresolved")):
+            return False
+    elif jobs is not None:
+        return False
+    cad = safety.get("cad")
+    listener_pid = safety.get("listener_pid")
+    return (
+        isinstance(cad, dict)
+        and cad.get("external_session_detected") is False
+        and type(cad.get("owned_sessions")) is int
+        and cad["owned_sessions"] == 0
+        and cad.get("lease_held") is False
+        and type(cad.get("solidworks_processes")) is int
+        and cad["solidworks_processes"] == 0
+        and (
+            (type(listener_pid) is int and listener_pid > 0)
+            if require_jobs
+            else listener_pid is None
+        )
+    )
+
+
+def _windows_stopped_is_empty(stopped) -> bool:
+    return _zero_fields(
+        stopped,
+        ("listener_count", "writer_count", "solidworks_process_count"),
+    )
+
+
+def verify_windows_result(
+    document,
+    *,
+    remote_rc: int,
+    verb: str,
+    record_path: Path | None,
+) -> int:
+    """Validate one Windows lifecycle result; return the operatorctl exit code."""
+
+    if not isinstance(document, dict) or document.get("verb") != verb:
+        return 3
+    if (
+        remote_rc in (0, 1)
+        and document.get("passed") is False
+        and isinstance(document.get("code"), str)
+        and document["code"]
+    ):
+        return 1
+    if remote_rc != 0 or document.get("passed") is not True:
+        return 3
+    if document.get("schema_version") != WINDOWS_RESULT_SCHEMA:
+        return 1
+
+    identity = document.get("identity")
+    task = document.get("task")
+    if not isinstance(identity, dict) or not isinstance(task, dict):
+        return 1
+
+    record = None
+    if record_path is not None:
+        try:
+            loaded_record = json.loads(Path(record_path).read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return 3
+        try:
+            interface_records = _canonical_records()
+            record = interface_records.validate_install_record(loaded_record)
+        except (Exception, SystemExit):
+            return 3
+
+    if verb == "status":
+        status = document.get("status")
+        task_state = status.get("task_state") if isinstance(status, dict) else None
+        if (
+            not isinstance(status, dict)
+            or status.get("consistent") is not True
+            or status.get("error") is not None
+            or status.get("task_exists") is not True
+            or type(status.get("solidworks_processes")) is not int
+            or status["solidworks_processes"] < 0
+            or task_state not in {"Disabled", "Ready", "Running"}
+            or task.get("state") != task_state
+        ):
+            return 1
+        if task_state == "Running":
+            if record is None or not isinstance(document.get("listener"), dict) or not document["listener"]:
+                return 1
+            try:
+                interface_records.require_endpoint_matches_install_record(document.get("health"), record)
+            except Exception:
+                return 1
+            return 0 if _windows_identity_matches(record, identity, target_required=True) else 1
+        if document.get("listener") is not None or document.get("health") is not None:
+            return 1
+        if record is None:
+            return 5
+        return 0 if _windows_identity_matches(record, identity, target_required=False) else 1
+
+    if record is None:
+        return 3
+    if verb in {"start", "health"}:
+        if task.get("state") != "Running":
+            return 1
+        listener = document.get("listener")
+        if not isinstance(listener, dict) or not listener:
+            return 1
+        try:
+            interface_records.require_endpoint_matches_install_record(document.get("health"), record)
+        except Exception:
+            return 1
+        return 0 if _windows_identity_matches(record, identity, target_required=True) else 1
+    if verb == "drain":
+        health = document.get("health")
+        try:
+            interface_records.require_endpoint_matches_install_record(
+                health,
+                record,
+                require_ready=False,
+            )
+        except Exception:
+            return 1
+        listener = document.get("listener")
+        safety = document.get("safety")
+        if (
+            task.get("state") != "Running"
+            or not isinstance(listener, dict)
+            or not listener
+            or not _windows_safety_matches(safety, require_jobs=True)
+            or safety.get("task_state") != "Running"
+        ):
+            return 1
+        return 0 if _windows_identity_matches(record, identity, target_required=True) else 1
+    if verb == "stop":
+        safety = document.get("safety")
+        safety_task_state = safety.get("task_state") if isinstance(safety, dict) else None
+        if (
+            task.get("state") != "Disabled"
+            or document.get("listener") is not None
+            or document.get("health") is not None
+            or safety_task_state not in {"Disabled", "Ready", "Running"}
+            or not _windows_safety_matches(
+                safety,
+                require_jobs=safety_task_state == "Running",
+            )
+            or not _windows_stopped_is_empty(document.get("stopped"))
+        ):
+            return 1
+        return 0 if _windows_identity_matches(record, identity, target_required=False) else 1
+    return 3
+
+
+def load_windows_result(path: Path):
+    """Read the final JSON line emitted by the Windows lifecycle transport."""
+
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8").strip().splitlines()[-1])
+    except (OSError, TypeError, ValueError, IndexError):
+        return None
 
 
 def require_matching_release(release: dict, endpoint: dict) -> None:
@@ -583,8 +766,29 @@ def main(argv: list[str] | None = None) -> int:
     identity.add_argument("--status", type=Path, required=True)
     identity.add_argument("--release-file", type=Path, required=True)
     identity.add_argument("--out", type=Path, required=True)
+    windows_result = subparsers.add_parser("verify-windows-result")
+    windows_result.add_argument("--result", type=Path, required=True)
+    windows_result.add_argument("--remote-rc", type=int, required=True)
+    windows_result.add_argument("--verb", required=True)
+    windows_result.add_argument("--install-record", type=Path)
     args = parser.parse_args(argv)
 
+    if args.action == "verify-windows-result":
+        document = load_windows_result(args.result)
+        if document is None:
+            return 3
+        code = verify_windows_result(
+            document,
+            remote_rc=args.remote_rc,
+            verb=args.verb,
+            record_path=args.install_record,
+        )
+        if code == 5:
+            args.result.with_name("windows-status.json").write_text(
+                json.dumps(document, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        return code
     if args.action == "verify-active":
         record = verify_active_generation(args.config, args.state_root, args.release_file)
         print(f"install_id={record['install_id']}")

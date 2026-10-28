@@ -694,60 +694,13 @@ PY
 
 verify_windows_result() {
   local output="$1" remote_rc="$2" verb="$3" record_file="$4"
-  "$CONTROL_PYTHON" - "$output" "$remote_rc" "$verb" "$record_file" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-output = Path(sys.argv[1])
-remote_rc = int(sys.argv[2])
-verb = sys.argv[3]
-record_path = Path(sys.argv[4]) if sys.argv[4] else None
-try:
-    document = json.loads(output.read_text(encoding="utf-8").strip().splitlines()[-1])
-except (OSError, ValueError, IndexError):
-    raise SystemExit(3)
-if not isinstance(document, dict) or document.get("verb") != verb:
-    raise SystemExit(3)
-if (
-    remote_rc in (0, 1)
-    and document.get("passed") is False
-    and isinstance(document.get("code"), str)
-    and document["code"]
-):
-    raise SystemExit(1)
-if remote_rc != 0 or document.get("passed") is not True:
-    raise SystemExit(3)
-if record_path is not None:
-    identity = document.get("identity", document.get("endpoint_identity"))
-    if identity is not None:
-        record = json.loads(record_path.read_text(encoding="utf-8"))
-        expected = record["ends"]["windows"]
-        if (
-            identity.get("install_id") != expected["install_id"]
-            or identity.get("config_digest") != expected["config_digest"]
-            or {
-                key: identity.get("release", {}).get(key)
-                for key in ("version", "source_commit", "source_sha256", "role")
-            }
-            != expected["release"]
-        ):
-            raise SystemExit(4)
-    elif verb == "status" and isinstance(document.get("identity"), dict):
-        output.with_name("windows-status.json").write_text(
-            json.dumps(document, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        raise SystemExit(5)
-else:
-    if verb != "status" or not isinstance(document.get("identity"), dict):
-        raise SystemExit(3)
-    output.with_name("windows-status.json").write_text(
-        json.dumps(document, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    raise SystemExit(5)
-PY
+  local -a arguments=(
+    verify-windows-result --result "$output" --remote-rc "$remote_rc" --verb "$verb"
+  )
+  if [ -n "$record_file" ] && [ "$record_file" != "-" ]; then
+    arguments+=(--install-record "$record_file")
+  fi
+  "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" "${arguments[@]}"
 }
 
 drift_check() {
@@ -1032,6 +985,9 @@ case "$ACTION" in
     load_installed
     drift_check || exit 1
     OPERATOR_STATE="$STATE_ROOT" bash "$HERE/health.sh"
+    windows_action health "$STATE_ROOT/install-record.json" >/dev/null \
+      || die "the Windows endpoint health did not pass"
+    echo "health complete: Linux and Windows endpoints passed"
     ;;
   reconcile)
     [ -n "$RUN_ID" ] && [ -n "$STAGE" ] && [ -n "$EFFECT_KEY" ] \

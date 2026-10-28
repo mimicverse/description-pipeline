@@ -1,4 +1,4 @@
-# 仓库级编辑器配置：与 ruff format（ruff.toml）保持一致，避免编辑器各写各的。
+# Keep repository editor settings aligned with ruff format (ruff.toml).
 root = true
 
 [*]
@@ -17,5 +17,5 @@ indent_style = space
 indent_size = 2
 
 [*.md]
-# Markdown 里行尾两个空格表示硬换行，不能裁掉。
+# Preserve the two trailing spaces used for Markdown hard line breaks.
 trim_trailing_whitespace = false

@@ -37,7 +37,7 @@ part 内材质按 `face > feature > body > part document` 解析；document targ
 | [机械交付规范](docs/mechanical-handoff-spec.md) | 原生工程要求及工程责任 |
 | [质量规范](docs/quality.md) | 独立验证、数值判据与资格边界 |
 | [操作指南](docs/operations.md) | 提交、检查、修正、重跑与模型评审 |
-| [部署指南](docs/deployment.md) | 安装、配置、验收、升级与恢复 |
+| [部署指南](docs/deployment.md) | 首次安装、配置、运行与灾难恢复 |
 | [开发指南](CONTRIBUTING.md) | 代码组织、测试与文档维护 |
 | [工具发布](RELEASING.md) | 构建、原生验收与发行物发布 |
 

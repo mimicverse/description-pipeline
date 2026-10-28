@@ -14,9 +14,10 @@ import unittest
 import zipfile
 from pathlib import Path
 
-from description_pipeline import schemas
+from description_pipeline import interface_records, schemas
 from description_pipeline.delivery import PIPELINE_ID
 from description_pipeline.pipeline.contracts import NativeTargetIdentity
+from description_pipeline.stages import CONTRACT, CONTRACT_SHA256
 
 ROOT = Path(__file__).resolve().parents[2]
 OPERATOR = ROOT / "deploy" / "operator"
@@ -38,6 +39,39 @@ AIRFLOW_UNITS = [
     "description-airflow-api-server",
     "description-solidworks-tunnel",
 ]
+
+
+def running_windows_health(identity: dict) -> dict:
+    return {
+        "schema_version": schemas.HEALTH_SCHEMA,
+        "pipeline_id": PIPELINE_ID,
+        "native_platform": True,
+        "ready": True,
+        "release": identity["release"],
+        "contract": {
+            "schema_version": CONTRACT["schema_version"],
+            "digest": CONTRACT_SHA256,
+        },
+        "resource_policy": {
+            "schema_version": schemas.RESOURCE_POLICY_SCHEMA,
+            "digest": interface_records.resource_policy_v1_digest(),
+        },
+        "install_id": identity["install_id"],
+        "config_digest": identity["config_digest"],
+        "target_identity": identity["target_identity"],
+        "endpoint": {"port": identity["port"]},
+        "cad": {
+            "external_session_detected": False,
+            "owned_sessions": 0,
+            "lease_held": False,
+        },
+        "jobs": {"active": 0, "queued": 0, "unresolved": 0},
+        "capacity": {"free_bytes": 1, "reserved_bytes": 0},
+        "readiness": {
+            "reason_code": None,
+            "native": {"ok": True, "problems": []},
+        },
+    }
 
 
 def run(
@@ -132,13 +166,56 @@ def validate_config_snapshot(snapshot):
 
 
 def validate_health(health):
+    required = {
+        "schema_version",
+        "pipeline_id",
+        "native_platform",
+        "ready",
+        "release",
+        "contract",
+        "resource_policy",
+        "install_id",
+        "config_digest",
+        "target_identity",
+        "endpoint",
+        "cad",
+        "jobs",
+        "capacity",
+        "readiness",
+    }
+    if (
+        not isinstance(health, dict)
+        or set(health) != required
+        or health.get("schema_version") != __HEALTH_SCHEMA__
+        or health.get("pipeline_id") != "solidworks-to-urdf"
+        or health.get("native_platform") is not True
+        or type(health.get("ready")) is not bool
+    ):
+        raise ValueError("invalid health")
     return health
-""",
+
+
+def require_endpoint_matches_install_record(health, record, *, require_ready=True):
+    validate_health(health)
+    expected = record["ends"]["windows"]
+    if (
+        health.get("install_id") != expected.get("install_id")
+        or health.get("config_digest") != expected.get("config_digest")
+        or health.get("release") != expected.get("release")
+        or health.get("target_identity") != expected.get("target_identity")
+        or (require_ready and health.get("ready") is not True)
+    ):
+        raise ValueError("health identity differs")
+""".replace("__HEALTH_SCHEMA__", repr(schemas.HEALTH_SCHEMA)),
         encoding="utf-8",
     )
     (package / "pipeline" / "__init__.py").write_text("", encoding="utf-8")
     (package / "pipeline" / "contracts.py").write_text(
         """\
+import hashlib
+import json
+
+
 class NativeTargetIdentity:
     def __init__(self, record):
         self.record = dict(record)
@@ -163,8 +240,10 @@ class NativeTargetIdentity:
             "schema_version": "__NATIVE_TARGET_SCHEMA__",
             "install_id": install_id,
             "pipeline_id": pipeline_id,
-            "target_id": "0" * 64,
         }
+        record["target_id"] = hashlib.sha256(
+            json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
         return cls(record)
 
     def to_record(self):
@@ -590,6 +669,7 @@ esac
             {
                 "install_id": windows_target["install_id"],
                 "config_digest": "9" * 64,
+                "port": 9765,
                 "release": {
                     "version": "1.0.0",
                     "source_commit": "a" * 40,
@@ -622,6 +702,7 @@ if match is None:
     raise SystemExit("missing lifecycle call")
 verb, raw_binding = match.groups()
 identity = json.loads(Path(os.environ["FIXTURE_WINDOWS_IDENTITY"]).read_text(encoding="utf-8"))
+listener = {"listener_pid": 42}
 document = {
     "schema_version": "solidworks-to-urdf.windows-lifecycle-result/v1",
     "passed": True,
@@ -646,16 +727,97 @@ if verb == "status":
             "solidworks_processes": 0,
         },
     })
-else:
+elif verb in {"start", "drain", "health"}:
+    document["task"] = {
+        "task_name": "description-e2e-endpoint",
+        "task_path": "\\\\URDF\\\\",
+        "state": "Running",
+    }
+    document["listener"] = listener
     document["health"] = {
+        "schema_version": __HEALTH_SCHEMA__,
+        "pipeline_id": "solidworks-to-urdf",
+        "native_platform": True,
+        "ready": True,
+        "release": identity["release"],
+        "contract": {
+            "schema_version": __CONTRACT_SCHEMA__,
+            "digest": __CONTRACT_SHA256__,
+        },
+        "resource_policy": {
+            "schema_version": __RESOURCE_POLICY_SCHEMA__,
+            "digest": __POLICY_DIGEST__,
+        },
         "install_id": identity["install_id"],
         "config_digest": identity["config_digest"],
-        "release": identity["release"],
         "target_identity": identity["target_identity"],
         "endpoint": {"port": 9765},
+        "cad": {
+            "external_session_detected": False,
+            "owned_sessions": 0,
+            "lease_held": False,
+        },
+        "jobs": {"active": 0, "queued": 0, "unresolved": 0},
+        "capacity": {"free_bytes": 1, "reserved_bytes": 0},
+        "readiness": {
+            "reason_code": None,
+            "native": {"ok": True, "problems": []},
+        },
     }
+    if verb == "drain":
+        document["safety"] = {
+            "jobs": {"active": 0, "queued": 0, "unresolved": 0},
+            "cad": {
+                "external_session_detected": False,
+                "owned_sessions": 0,
+                "lease_held": False,
+                "solidworks_processes": 0,
+            },
+            "listener_pid": 42,
+            "task_state": "Running",
+        }
+elif verb == "stop":
+    document["task"] = {
+        "task_name": "description-e2e-endpoint",
+        "task_path": "\\\\URDF\\\\",
+        "state": "Disabled",
+    }
+    document["listener"] = None
+    document["health"] = None
+    document["safety"] = {
+        "jobs": None,
+        "cad": {
+            "external_session_detected": False,
+            "owned_sessions": 0,
+            "lease_held": False,
+            "solidworks_processes": 0,
+        },
+        "listener_pid": None,
+        "task_state": "Disabled",
+        "source": "already_stopped",
+    }
+    document["stopped"] = {
+        "listener_count": 0,
+        "writer_count": 0,
+        "solidworks_process_count": 0,
+    }
+override_path = os.environ.get("FIXTURE_WINDOWS_RESULT")
+if override_path:
+    override = json.loads(Path(override_path).read_text(encoding="utf-8"))
+    document = (
+        override
+        if isinstance(override, dict) and "schema_version" in override
+        else override.get(verb, override)
+        if isinstance(override, dict)
+        else override
+    )
 print(json.dumps(document))
-""",
+"""
+        .replace("__HEALTH_SCHEMA__", repr(schemas.HEALTH_SCHEMA))
+        .replace("__CONTRACT_SCHEMA__", repr(CONTRACT["schema_version"]))
+        .replace("__CONTRACT_SHA256__", repr(CONTRACT_SHA256))
+        .replace("__RESOURCE_POLICY_SCHEMA__", repr(schemas.RESOURCE_POLICY_SCHEMA))
+        .replace("__POLICY_DIGEST__", repr(interface_records.resource_policy_v1_digest())),
     )
     environment = {
         "PATH": f"{bins}:{Path(sys.executable).parent}:{os.environ.get('PATH', '/usr/bin:/bin')}",
@@ -953,6 +1115,50 @@ class FirstInstallTests(unittest.TestCase):
         started = run(self._command("start"), self.environment)
         self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
         self.assertEqual(self.paths["admission"].read_text(encoding="utf-8"), "false")
+        identity = json.loads(Path(self.environment["FIXTURE_WINDOWS_IDENTITY"]).read_text(encoding="utf-8"))
+        windows_results = self.root / "bound-shutdown-results.json"
+        windows_results.write_text(
+            json.dumps(
+                {
+                    verb: {
+                        "schema_version": "solidworks-to-urdf.windows-lifecycle-result/v1",
+                        "passed": True,
+                        "verb": verb,
+                        "task": {
+                            "task_name": "description-e2e-endpoint",
+                            "task_path": "\\\\URDF\\\\",
+                            "state": "Running" if verb == "drain" else "Disabled",
+                        },
+                        "identity": identity,
+                        "listener": {"listener_pid": 42} if verb == "drain" else None,
+                        "health": running_windows_health(identity) if verb == "drain" else None,
+                        "safety": {
+                            "jobs": {"active": 0, "queued": 0, "unresolved": 0},
+                            "cad": {
+                                "external_session_detected": False,
+                                "owned_sessions": 0,
+                                "lease_held": False,
+                                "solidworks_processes": 0,
+                            },
+                            "listener_pid": 42,
+                            "task_state": "Running",
+                        },
+                        "stopped": (
+                            {
+                                "listener_count": 0,
+                                "writer_count": 0,
+                                "solidworks_process_count": 0,
+                            }
+                            if verb == "stop"
+                            else None
+                        ),
+                    }
+                    for verb in ("drain", "stop")
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.environment["FIXTURE_WINDOWS_RESULT"] = str(windows_results)
         drained = run(self._command("drain"), self.environment)
         self.assertEqual(drained.returncode, 0, drained.stdout + drained.stderr)
         self.assertEqual(self.paths["admission"].read_text(encoding="utf-8"), "true")
@@ -966,6 +1172,54 @@ class FirstInstallTests(unittest.TestCase):
         self.assertIn("airflow_services stop-executors", order)
         self.assertNotIn("promote", order)
         self.assertNotIn("rollback", order)
+
+    def test_stop_accepts_an_already_stopped_windows_endpoint(self) -> None:
+        installed = self._install()
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        identity = json.loads(Path(self.environment["FIXTURE_WINDOWS_IDENTITY"]).read_text(encoding="utf-8"))
+        identity.pop("target_identity")
+        result_path = self.root / "already-stopped.json"
+        result_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "solidworks-to-urdf.windows-lifecycle-result/v1",
+                    "passed": True,
+                    "verb": "stop",
+                    "task": {
+                        "task_name": "description-e2e-endpoint",
+                        "task_path": "\\\\URDF\\\\",
+                        "state": "Disabled",
+                    },
+                    "identity": identity,
+                    "listener": None,
+                    "health": None,
+                    "safety": {
+                        "jobs": None,
+                        "cad": {
+                            "external_session_detected": False,
+                            "owned_sessions": 0,
+                            "lease_held": False,
+                            "solidworks_processes": 0,
+                        },
+                        "listener_pid": None,
+                        "task_state": "Disabled",
+                        "source": "already_stopped",
+                    },
+                    "stopped": {
+                        "listener_count": 0,
+                        "writer_count": 0,
+                        "solidworks_process_count": 0,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.environment["FIXTURE_WINDOWS_RESULT"] = str(result_path)
+        stopped = run(
+            self._command("stop", "--keep-database"),
+            self.environment,
+        )
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
 
     def test_stop_fails_when_an_operator_unit_remains_active(self) -> None:
         installed = self._install()
@@ -1019,7 +1273,321 @@ class FirstInstallTests(unittest.TestCase):
         self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
         health = run(self._command("health"), self.environment)
         self.assertEqual(health.returncode, 0, health.stdout + health.stderr)
+        self.assertTrue(list((self.paths["state"] / "lifecycle").glob("windows-health-*")))
         self.assertEqual((self.paths["state"] / "install-record.json").read_bytes(), record_before)
+
+    def test_health_refuses_windows_lifecycle_evidence_without_health(self) -> None:
+        installed = self._install()
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        for unit in ALL_UNITS:
+            (self.paths["unit_state"] / f"{unit}.service").write_text("active\n", encoding="utf-8")
+        identity = json.loads(Path(self.environment["FIXTURE_WINDOWS_IDENTITY"]).read_text(encoding="utf-8"))
+        result_path = self.root / "windows-health-missing.json"
+        result_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "solidworks-to-urdf.windows-lifecycle-result/v1",
+                    "passed": True,
+                    "verb": "health",
+                    "task": {"state": "Running"},
+                    "identity": identity,
+                    "listener": {"listener_pid": 42},
+                    "health": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.environment["FIXTURE_WINDOWS_RESULT"] = str(result_path)
+        health = run(self._command("health"), self.environment)
+        self.assertNotEqual(health.returncode, 0, health.stdout + health.stderr)
+        self.assertIn("Windows health was refused", health.stderr)
+
+    def test_status_rejects_untrusted_windows_endpoint_evidence(self) -> None:
+        installed = self._install()
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        for unit in ALL_UNITS:
+            (self.paths["unit_state"] / f"{unit}.service").write_text("active\n", encoding="utf-8")
+        identity = json.loads(Path(self.environment["FIXTURE_WINDOWS_IDENTITY"]).read_text(encoding="utf-8"))
+        unrelated_target = NativeTargetIdentity.create(
+            install_id="win-" + "2" * 32,
+            pipeline_id=PIPELINE_ID,
+        ).to_record()
+        unrelated_identity = {
+            **identity,
+            "install_id": unrelated_target["install_id"],
+            "target_identity": unrelated_target,
+        }
+        wrong_health_schema = running_windows_health(identity)
+        wrong_health_schema["schema_version"] = "unexpected-health/v1"
+        running_health = running_windows_health(identity)
+        running_health["cad"]["owned_sessions"] = 1
+        running_status = {
+            "schema_version": "solidworks-to-urdf.windows-lifecycle-result/v1",
+            "passed": True,
+            "verb": "status",
+            "task": {"state": "Running"},
+            "identity": identity,
+            "listener": {"listener_pid": 42},
+            "health": running_health,
+            "status": {
+                "consistent": True,
+                "task_exists": True,
+                "task_state": "Running",
+                "error": None,
+                "solidworks_processes": 1,
+            },
+        }
+        cases = {
+            "run2-mismatch": {
+                "schema_version": "solidworks-to-urdf.windows-lifecycle-result/v1",
+                "passed": True,
+                "verb": "status",
+                "task": {"state": "Running"},
+                "identity": None,
+                "listener": None,
+                "health": None,
+                "status": {
+                    "consistent": False,
+                    "task_exists": True,
+                    "task_state": "Running",
+                    "error": {"code": "install_receipt_mismatch"},
+                    "solidworks_processes": None,
+                },
+            },
+            "missing-identity": {
+                "schema_version": "solidworks-to-urdf.windows-lifecycle-result/v1",
+                "passed": True,
+                "verb": "status",
+                "task": {"state": "Running"},
+                "identity": None,
+                "listener": {"listener_pid": 42},
+                "health": {"ready": True},
+                "status": {
+                    "consistent": True,
+                    "task_exists": True,
+                    "task_state": "Running",
+                    "error": None,
+                    "solidworks_processes": 0,
+                },
+            },
+            "projection-mismatch": {
+                "schema_version": "solidworks-to-urdf.windows-lifecycle-result/v1",
+                "passed": True,
+                "verb": "status",
+                "task": {"state": "Running"},
+                "identity": identity,
+                "listener": None,
+                "health": None,
+                "status": {
+                    "consistent": True,
+                    "task_exists": True,
+                    "task_state": "Disabled",
+                    "error": None,
+                    "solidworks_processes": 0,
+                },
+            },
+            "running-listener": {
+                **running_status,
+                "listener": None,
+            },
+            "running-health": {
+                **running_status,
+                "health": None,
+            },
+            "stopped-listener": {
+                "schema_version": "solidworks-to-urdf.windows-lifecycle-result/v1",
+                "passed": True,
+                "verb": "status",
+                "task": {"state": "Disabled"},
+                "identity": identity,
+                "listener": {"listener_pid": 42},
+                "health": None,
+                "status": {
+                    "consistent": True,
+                    "task_exists": True,
+                    "task_state": "Disabled",
+                    "error": None,
+                    "solidworks_processes": 0,
+                },
+            },
+            "stopped-health": {
+                "schema_version": "solidworks-to-urdf.windows-lifecycle-result/v1",
+                "passed": True,
+                "verb": "status",
+                "task": {"state": "Ready"},
+                "identity": identity,
+                "listener": None,
+                "health": running_windows_health(identity),
+                "status": {
+                    "consistent": True,
+                    "task_exists": True,
+                    "task_state": "Ready",
+                    "error": None,
+                    "solidworks_processes": 0,
+                },
+            },
+            "status-error": {
+                "schema_version": "solidworks-to-urdf.windows-lifecycle-result/v1",
+                "passed": True,
+                "verb": "status",
+                "task": {"state": "Disabled"},
+                "identity": identity,
+                "listener": None,
+                "health": None,
+                "status": {
+                    "consistent": True,
+                    "task_exists": True,
+                    "task_state": "Disabled",
+                    "error": {"code": "install_receipt_mismatch"},
+                    "solidworks_processes": 0,
+                },
+            },
+            "record-mismatch": {
+                "schema_version": "solidworks-to-urdf.windows-lifecycle-result/v1",
+                "passed": True,
+                "verb": "status",
+                "task": {"state": "Disabled"},
+                "identity": unrelated_identity,
+                "listener": None,
+                "health": None,
+                "status": {
+                    "consistent": True,
+                    "task_exists": True,
+                    "task_state": "Disabled",
+                    "error": None,
+                    "solidworks_processes": 0,
+                },
+            },
+            "lifecycle-schema": {
+                "schema_version": "unexpected-lifecycle/v1",
+                "passed": True,
+                "verb": "status",
+                "task": {"state": "Disabled"},
+                "identity": identity,
+                "listener": None,
+                "health": None,
+                "status": {
+                    "consistent": True,
+                    "task_exists": True,
+                    "task_state": "Disabled",
+                    "error": None,
+                    "solidworks_processes": 0,
+                },
+            },
+            "health-schema": {
+                **running_status,
+                "health": wrong_health_schema,
+            },
+            "process-invalid": {
+                "schema_version": "solidworks-to-urdf.windows-lifecycle-result/v1",
+                "passed": True,
+                "verb": "status",
+                "task": {"state": "Disabled"},
+                "identity": identity,
+                "listener": None,
+                "health": None,
+                "status": {
+                    "consistent": True,
+                    "task_exists": True,
+                    "task_state": "Disabled",
+                    "error": None,
+                    "solidworks_processes": -1,
+                },
+            },
+        }
+        result_path = self.root / "windows-status-result.json"
+        self.environment["FIXTURE_WINDOWS_RESULT"] = str(result_path)
+        for label, document in cases.items():
+            with self.subTest(case=label):
+                result_path.write_text(json.dumps(document), encoding="utf-8")
+                status = run(self._command("status"), self.environment)
+                self.assertNotEqual(status.returncode, 0, status.stdout + status.stderr)
+                self.assertIn("Windows status was refused", status.stderr)
+
+    def test_status_accepts_running_windows_evidence_bound_to_the_record(self) -> None:
+        installed = self._install()
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        for unit in ALL_UNITS:
+            (self.paths["unit_state"] / f"{unit}.service").write_text("active\n", encoding="utf-8")
+        identity = json.loads(Path(self.environment["FIXTURE_WINDOWS_IDENTITY"]).read_text(encoding="utf-8"))
+        health = running_windows_health(identity)
+        health["cad"]["owned_sessions"] = 1
+        result_path = self.root / "windows-running-status.json"
+        result_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "solidworks-to-urdf.windows-lifecycle-result/v1",
+                    "passed": True,
+                    "verb": "status",
+                    "task": {"state": "Running"},
+                    "identity": identity,
+                    "listener": {"listener_pid": 42},
+                    "health": health,
+                    "status": {
+                        "consistent": True,
+                        "task_exists": True,
+                        "task_state": "Running",
+                        "error": None,
+                        "solidworks_processes": 1,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.environment["FIXTURE_WINDOWS_RESULT"] = str(result_path)
+        status = run(self._command("status"), self.environment)
+        self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+
+        ready_identity = {
+            key: value for key, value in identity.items() if key != "target_identity"
+        }
+        result_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "solidworks-to-urdf.windows-lifecycle-result/v1",
+                    "passed": True,
+                    "verb": "status",
+                    "task": {"state": "Ready"},
+                    "identity": ready_identity,
+                    "listener": None,
+                    "health": None,
+                    "status": {
+                        "consistent": True,
+                        "task_exists": True,
+                        "task_state": "Ready",
+                        "error": None,
+                        "solidworks_processes": 0,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        ready = run(self._command("status"), self.environment)
+        self.assertEqual(ready.returncode, 0, ready.stdout + ready.stderr)
+
+    def test_start_rejects_a_successful_windows_result_without_identity(self) -> None:
+        installed = self._install()
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        identity = json.loads(Path(self.environment["FIXTURE_WINDOWS_IDENTITY"]).read_text(encoding="utf-8"))
+        result_path = self.root / "windows-start-no-identity.json"
+        result_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "solidworks-to-urdf.windows-lifecycle-result/v1",
+                    "passed": True,
+                    "verb": "start",
+                    "task": {"state": "Running"},
+                    "identity": None,
+                    "listener": {"listener_pid": 42},
+                    "health": running_windows_health(identity),
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.environment["FIXTURE_WINDOWS_RESULT"] = str(result_path)
+        started = run(self._command("start"), self.environment)
+        self.assertNotEqual(started.returncode, 0, started.stdout + started.stderr)
+        self.assertIn("Windows start was refused", started.stderr)
 
     def test_reconcile_runs_only_current_business_effect(self) -> None:
         installed = self._install()

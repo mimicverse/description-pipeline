@@ -755,6 +755,17 @@ class InterfaceRecordTests(unittest.TestCase):
             "native": {"ok": False, "problems": ["solidworks_unregistered"]},
         }
         self.reject("endpoint_not_ready", lambda: ir.require_endpoint_matches_install_record(not_ready, record))
+        ir.require_endpoint_matches_install_record(not_ready, record, require_ready=False)
+        not_ready_drift = copy.deepcopy(not_ready)
+        not_ready_drift["endpoint"]["port"] = 8766
+        self.reject(
+            "endpoint_end_mismatch",
+            lambda: ir.require_endpoint_matches_install_record(
+                not_ready_drift,
+                record,
+                require_ready=False,
+            ),
+        )
         external = copy.deepcopy(payload)
         external.update(ready=False)
         external["cad"]["external_session_detected"] = True
