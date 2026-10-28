@@ -61,6 +61,15 @@ def _document_key(value):
     return ntpath.normcase(ntpath.normpath(str(value).replace("/", "\\")))
 
 
+def _semantic_token(value):
+    try:
+        return token(value)
+    except ValueError as error:
+        raise SavedNativeReferenceError(
+            "Native reference feature cannot form a legal semantic identity", native_name=value,
+        ) from error
+
+
 def _component_tokens(component):
     # Revision dates and occurrence indices select name candidates only. A
     # candidate must independently match both current native interface axes.
@@ -152,8 +161,9 @@ def bind_saved_native_references(record: dict, *, purpose: str) -> dict:
         isinstance(exporter, dict) and exporter.get("state") == "absent"
         and exporter.get("configuration") == configuration
         and _document_key(exporter.get("document")) == _document_key(main)
-        and exporter.get("error") is None and exporter.get("raw_xml") is None
-        and not exporter.get("pid_bindings"),
+        and exporter.get("error") is None and exporter.get("raw_xml") in (None, "")
+        and exporter.get("registration") in (None, {}) and exporter.get("pid_bindings") in (None, [])
+        and all(value is None for key, value in exporter.items() if key.endswith("_error")),
         "Saved native references require an explicitly absent exporter in the same native context",
     )
     for name, row in components.items():
@@ -170,7 +180,7 @@ def bind_saved_native_references(record: dict, *, purpose: str) -> dict:
             and _document_key(context.get("document")) == _document_key(defining),
             "The native occurrence has inconsistent defining context", component=name,
         )
-    for name, row in roots.items():
+    for name, row in components.items():
         children = [item for item in components.values() if item["parent_occurrence"] == name]
         if row["document"].lower().endswith(".sldasm"):
             observation = row["solver_observation"].get("solving")
@@ -185,6 +195,7 @@ def bind_saved_native_references(record: dict, *, purpose: str) -> dict:
             )
         else:
             _require(not children, "A native part unexpectedly contains occurrence children", component=name)
+    for name, row in roots.items():
         _require(type(row.get("fixed")) is bool and row.get("fixed_error") is None,
                  "The saved fixed-root observation is unreadable", component=name)
     fixed = [name for name, row in roots.items() if row["fixed"] is True]
@@ -206,9 +217,18 @@ def bind_saved_native_references(record: dict, *, purpose: str) -> dict:
                  "A native coordinate system has no readable identity")
         if not row["name"].startswith("c_"):
             continue
-        key = token(row["name"][2:])
+        key = _semantic_token(row["name"][2:])
         _require(key not in coordinates and row.get("owner") == "" and row.get("configuration") == configuration,
                  "A native coordinate pair is duplicated or belongs to another scope", feature=row["name"])
+        _require(
+            isinstance(row.get("references"), dict)
+            and row["references"].get("context") == {"document": main, "configuration": configuration, "scope": ""}
+            and row.get("context", {"document": main, "configuration": configuration, "scope": ""})
+            == {"document": main, "configuration": configuration, "scope": ""}
+            and row.get("error") is None
+            and all(value is None for field, value in row.items() if field.endswith("_error")),
+            "A native coordinate pair has a conflicting context or read error", feature=row["name"],
+        )
         _vector(row.get("array"), 16)
         coordinates[key] = row
     for row in record.get("reference_axes") or []:
@@ -218,12 +238,17 @@ def bind_saved_native_references(record: dict, *, purpose: str) -> dict:
         feature = selector.get("feature_name")
         if not isinstance(feature, str) or not feature.startswith("a_"):
             continue
-        key = token(feature[2:])
+        key = _semantic_token(feature[2:])
         _require(key not in axes and selector.get("component") == "" and row.get("component") == ""
                  and selector.get("kind") == "reference_axis" and row.get("kind") == "reference_axis"
                  and row.get("coordinate_frame") == "assembly"
                  and row.get("used_api") == "IFeature.GetSpecificFeature2/IRefAxis.GetRefAxisParams"
-                 and row.get("direction_semantics") == "undirected_axis_line",
+                 and row.get("direction_semantics") == "undirected_axis_line"
+                 and row.get("configuration", configuration) == configuration
+                 and row.get("context", {"document": main, "configuration": configuration, "scope": ""})
+                 == {"document": main, "configuration": configuration, "scope": ""}
+                 and row.get("error") is None
+                 and all(value is None for field, value in row.items() if field.endswith("_error")),
                  "A native axis pair is duplicated or belongs to another scope", feature=feature)
         endpoints = _vector(row.get("raw_endpoints_m"), 6)
         direction = _unit([endpoints[i + 3] - endpoints[i] for i in range(3)])
@@ -241,14 +266,39 @@ def bind_saved_native_references(record: dict, *, purpose: str) -> dict:
 
     edges = {}
     pose_mates = []
+    mate_identities = set()
     for mate in record["mates"]:
         if mate.get("suppressed") is True:
             continue
         _require(mate.get("suppressed") is False and type(mate.get("error_code")) is int
                  and mate["error_code"] == 0, "A saved mate has an unreadable or erroneous native state",
                  mate=mate.get("name"))
+        identity = (mate.get("scope"), mate.get("name"))
+        _require(all(isinstance(value, str) for value in identity) and bool(identity[1])
+                 and identity not in mate_identities
+                 and isinstance(mate.get("type"), str) and bool(mate["type"])
+                 and isinstance(mate.get("configuration"), str) and bool(mate["configuration"]),
+                 "A saved mate has a missing or duplicate scoped identity", mate=mate.get("name"))
+        mate_identities.add(identity)
+        if mate["type"] == "inplace":
+            _require(
+                mate.get("native_feature_type") == "MateInPlace" and mate.get("native_interface") == "IMateInPlace"
+                and isinstance(mate.get("inplace"), dict)
+                and (identity[0] == "" or identity[0] in components)
+                and mate["configuration"]
+                == (components[identity[0]]["configuration"] if identity[0] else configuration),
+                "An in-place observation lacks its exact native owner context", mate=mate["name"],
+            )
+            pose_mates.append({"mate": mate, "owners": [owner[identity[0]]] if identity[0] else []})
+            continue
         entities = mate.get("entities")
-        _require(isinstance(entities, list) and all(isinstance(entity, dict) for entity in entities),
+        _require(isinstance(entities, list) and bool(entities)
+                 and type(mate.get("entity_count")) is int and mate["entity_count"] == len(entities)
+                 and all(isinstance(entity, dict) and type(entity.get("entity_index")) is int
+                         and entity["entity_index"] == index
+                         and isinstance(entity.get("mate_entity_reference"), dict)
+                         and entity["mate_entity_reference"].get("error") is None
+                         for index, entity in enumerate(entities)),
                  "A saved mate has unreadable native endpoints", mate=mate.get("name"))
         owners = set()
         for entity in entities:
@@ -261,7 +311,11 @@ def bind_saved_native_references(record: dict, *, purpose: str) -> dict:
         _require(len(owners) <= 2, "A saved mate crosses several declared carrier interfaces", mate=mate.get("name"))
         if mate.get("type") == "concentric" and mate.get("scope") == "" and len(owners) == 2:
             _require(len(entities) == 2 and type(mate.get("entity_count")) is int
-                     and mate["entity_count"] == 2 and mate.get("lock_rotation") is False,
+                     and mate["entity_count"] == 2 and mate.get("lock_rotation") is False
+                     and mate.get("lock_rotation_api") == "IConcentricMateFeatureData.LockRotation"
+                     and all((isinstance(entity.get("feature"), str) and bool(entity["feature"]))
+                             or (type(entity.get("face_index")) is int and entity["face_index"] >= 0)
+                             for entity in entities),
                      "A concentric interface is incomplete or explicitly rotation-locked", mate=mate.get("name"))
             key = tuple(sorted(owners))
             edges.setdefault(key, []).append({"mate": mate, "lines": [_axial_reference(e) for e in entities]})

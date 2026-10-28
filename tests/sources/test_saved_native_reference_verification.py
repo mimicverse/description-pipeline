@@ -304,6 +304,14 @@ class SavedNativeTests(unittest.TestCase):
             limits_only = self.run_fixture(raw, payload={"records": records}, package=package)
             limits_joint = next(item for item in limits_only["joints"] if item["source_name"] == "a_boom")
             self.assertEqual(limits_joint["limits"], joint["limits"])
+            self.assertEqual(limits_joint["drive_source"], "controlled")
+            self.assertEqual(limits_joint["drive_evidence"]["reference"], "author.json#bounds")
+            self.assertEqual(limits_joint["limit_evidence"]["native_observation_errors"], [])
+            self.assertEqual(
+                limits_joint["drive_evidence"]["declared_values"], {"lower": 0, "upper": 0, "effort": 2, "velocity": 3}
+            )
+            self.assertNotIn("note", joint["limit_evidence"]["declared_values"])
+            self.assertNotIn("metadata", joint["drive_evidence"]["declared_values"])
             native_properties["dp.joint.drive_record"] = reference
             value["drive"]["effort"] = 4
             content = json.dumps(value).encode()
@@ -314,6 +322,56 @@ class SavedNativeTests(unittest.TestCase):
                 self.run_fixture(raw, payload={"records": records}, package=package)
             (package / "records/author.json").write_bytes(b"{}")
             with self.assertRaisesRegex(Failure, "bytes changed"):
+                self.run_fixture(raw, payload={"records": records}, package=package)
+
+    def test_partial_drive_values_from_range_and_drive_records_remain_bound(self):
+        raw = fixture()
+        value = {
+            "bounds": {"lower": 0, "upper": 0, "effort": 2, "note": "author"},
+            "drive": {"velocity": 3, "metadata": {"source": "author"}},
+        }
+        with tempfile.TemporaryDirectory() as folder:
+            package = Path(folder)
+            (package / "records").mkdir()
+            content = json.dumps(value).encode()
+            (package / "records/author.json").write_bytes(content)
+            records = [
+                {
+                    "file": "author.json",
+                    "key": key,
+                    "package_file": "records/author.json",
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "anchor": "joint:boom",
+                }
+                for key in value
+            ]
+            properties = {"dp.joint.limits_record": "author.json#bounds"}
+            raw["properties"]["mates"]["hinge_one"] = properties
+            joint = next(
+                item
+                for item in self.run_fixture(raw, payload={"records": records}, package=package)["joints"]
+                if item["source_name"] == "a_boom"
+            )
+            self.assertEqual(joint["limits"], {"lower": 0.0, "upper": 0.0, "effort": 2.0})
+            self.assertEqual(joint["drive"]["value"], {"effort": 2.0})
+            self.assertEqual(joint["drive_evidence"]["declared_values"], {"lower": 0, "upper": 0, "effort": 2})
+            properties["dp.joint.drive_record"] = "author.json#drive"
+            joint = next(
+                item
+                for item in self.run_fixture(raw, payload={"records": records}, package=package)["joints"]
+                if item["source_name"] == "a_boom"
+            )
+            self.assertEqual(joint["limits"], {"lower": 0.0, "upper": 0.0, "effort": 2.0, "velocity": 3.0})
+            self.assertEqual(joint["limit_evidence"]["declared_values"], {"lower": 0, "upper": 0, "effort": 2})
+            self.assertEqual(joint["drive_evidence"]["declared_values"], {"velocity": 3})
+            self.assertEqual(joint["drive"]["value"], {"velocity": 3.0})
+            self.assertEqual(joint["drive_source"], "controlled")
+            value["bounds"]["velocity"] = None
+            content = json.dumps(value).encode()
+            (package / "records/author.json").write_bytes(content)
+            for entry in records:
+                entry["sha256"] = hashlib.sha256(content).hexdigest()
+            with self.assertRaisesRegex(Failure, "finite"):
                 self.run_fixture(raw, payload={"records": records}, package=package)
 
     def test_residual_auto_binding_is_unique_and_independent_of_inventory_order(self):
@@ -363,6 +421,124 @@ class SavedNativeTests(unittest.TestCase):
         self.assertEqual(frame["source_name"], "TCP_probe")
         raw["datums"][-1]["configuration"] = "Other"
         with self.assertRaisesRegex(Failure, "frame configuration"):
+            self.run_fixture(raw)
+
+    def test_continuous_joint_has_only_existing_drive_and_no_position_window(self):
+        raw = fixture()
+        raw["properties"]["mates"]["hinge_one"] = {"dp.joint.type": "continuous"}
+        joint = next(item for item in self.run_fixture(raw)["joints"] if item["source_name"] == "a_boom")
+        self.assertEqual(joint["type"], "continuous")
+        self.assertEqual(joint["limits"], {})
+        self.assertEqual(joint["limit_source"], "declared_author")
+        self.assertNotIn("preview_policy", joint)
+        value = {"drive": {"effort": 2, "velocity": 3}, "bounds": {"lower": 0, "upper": 0}}
+        with tempfile.TemporaryDirectory() as folder:
+            package = Path(folder)
+            (package / "records").mkdir()
+            content = json.dumps(value).encode()
+            (package / "records/author.json").write_bytes(content)
+            records = [
+                {
+                    "file": "author.json",
+                    "key": key,
+                    "package_file": "records/author.json",
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "anchor": "joint:boom",
+                }
+                for key in value
+            ]
+            properties = raw["properties"]["mates"]["hinge_one"]
+            properties["dp.joint.drive_record"] = "author.json#drive"
+            joint = next(
+                item
+                for item in self.run_fixture(raw, payload={"records": records}, package=package)["joints"]
+                if item["source_name"] == "a_boom"
+            )
+            self.assertEqual(joint["limits"], {"effort": 2.0, "velocity": 3.0})
+            self.assertNotIn("preview_policy", joint)
+            properties["dp.joint.limits_record"] = "author.json#bounds"
+            with self.assertRaisesRegex(Failure, "continuous joint.*position record"):
+                self.run_fixture(raw, payload={"records": records}, package=package)
+        raw["properties"]["mates"]["hinge_one"] = {"dp.joint.type": "continuous"}
+        raw["mates"][0]["is_advanced_mate_error"] = "unread"
+        with self.assertRaisesRegex(Failure, "absence is not completely observed"):
+            self.run_fixture(raw)
+
+    def test_distinct_consistent_concentric_witnesses_share_one_edge(self):
+        raw = fixture()
+        extra = copy.deepcopy(raw["mates"][0])
+        extra["name"] = "second_native_bearing"
+        raw["mates"].append(extra)
+        self.assertEqual(len(self.run_fixture(raw)["joints"]), 2)
+        extra["entities"][0]["mate_entity_reference"]["params"][0] += 0.1
+        with self.assertRaises(Failure):
+            self.run_fixture(raw)
+
+    def test_inplace_is_preserved_only_in_its_exact_native_context(self):
+        from .test_inplace_mates import observed_mate
+
+        raw = fixture()
+        observation = observed_mate(scope="boom")
+        raw["mates"].append(observation)
+        self.assertEqual(len(self.run_fixture(raw)["joints"]), 2)
+        observation["configuration"] = "Other"
+        with self.assertRaises(Failure):
+            self.run_fixture(raw)
+
+    def test_undirected_recorded_axis_may_reverse_or_translate_along_the_line(self):
+        raw = fixture()
+        baseline = self.run_fixture(raw)
+        axis = raw["reference_axes"][1]
+        axis["axis_direction"] = [0, 0, -1]
+        axis["axis_point_m"] = [1, 0, 8]
+        result = self.run_fixture(raw)
+        before = next(item for item in baseline["joints"] if item["source_name"] == "a_boom")
+        after = next(item for item in result["joints"] if item["source_name"] == "a_boom")
+        self.assertEqual(after["axis"], before["axis"])
+        self.assertEqual(after["axis_provenance"]["assembly_direction"], [0.0, 0.0, 1.0])
+        axis["axis_point_m"][0] += 2e-7
+        with self.assertRaisesRegex(Failure, "endpoints disagree"):
+            self.run_fixture(raw)
+        axis["axis_point_m"] = [1, 0, 8]
+        axis["axis_direction"] = [2e-4, 0, -1]
+        with self.assertRaisesRegex(Failure, "endpoints disagree"):
+            self.run_fixture(raw)
+
+    def test_typed_concentric_radius_is_complete_positive_and_finite(self):
+        for reference_type in (4, 7):
+            for radius in (0, -0.1, None, True, float("nan")):
+                raw = fixture()
+                reference = raw["mates"][0]["entities"][0]["mate_entity_reference"]
+                reference["reference_type"] = reference_type
+                reference["params"] = [1, 0, 0, 0, 0, 1] if radius is None else [1, 0, 0, 0, 0, 1, radius]
+                with self.subTest(reference_type=reference_type, radius=radius), self.assertRaises(Failure):
+                    self.run_fixture(raw)
+        raw = fixture()
+        reference = raw["mates"][0]["entities"][0]["mate_entity_reference"]
+        reference.update(reference_type=2, params=[1, 0, 0, 0, 0, 1])
+        self.assertEqual(len(self.run_fixture(raw)["joints"]), 2)
+        reference["error"] = "native read failed"
+        with self.assertRaisesRegex(Failure, "reference is unreadable"):
+            self.run_fixture(raw)
+
+    def test_invalid_native_tokens_raise_structured_failures(self):
+        raw = fixture()
+        raw["datums"][2]["name"] = "c_???"
+        raw["reference_axes"][2]["selector"]["feature_name"] = "a_???"
+        with self.assertRaisesRegex(Failure, "cannot be tokenized") as caught:
+            self.run_fixture(raw)
+        self.assertEqual(caught.exception.code, "discovery.saved_native")
+        raw = fixture()
+        raw["datums"].append({"name": "TCP_???", "owner": "tool", "configuration": "Default", "array_raw": transform()})
+        with self.assertRaisesRegex(Failure, "cannot be tokenized"):
+            self.run_fixture(raw)
+
+    def test_body_datum_declarations_are_consumed_exactly(self):
+        raw = fixture()
+        raw["properties"]["components"]["boom"] = {"dp.body_datum": "c_boom"}
+        self.assertEqual(len(self.run_fixture(raw)["bodies"]), 3)
+        raw["properties"]["components"]["boom"]["dp.body_datum"] = "c_tool"
+        with self.assertRaisesRegex(Failure, "body datum conflicts"):
             self.run_fixture(raw)
 
     def test_arbitrary_datum_rotation_and_origin_along_axis_are_valid(self):
@@ -429,10 +605,31 @@ class SavedNativeTests(unittest.TestCase):
         leaf["solver_observation"]["context"] = context("inner.SLDASM", "boom/inner")
         raw["components"].extend((inner, leaf))
         self.assertEqual(len(self.run_fixture(raw)["bodies"]), 3)
+        solving = inner["solver_observation"]["solving"]
+        for field, value in (
+            ("value", 1),
+            ("value", True),
+            ("error", "unread"),
+            ("method", "Other.Method"),
+            ("family", "OtherEnum"),
+        ):
+            old = solving[field]
+            solving[field] = value
+            with self.subTest(field=field, value=value), self.assertRaisesRegex(Failure, "rigid solving"):
+                self.run_fixture(raw)
+            solving[field] = old
+        raw["components"].remove(leaf)
+        with self.assertRaisesRegex(Failure, "direct active child"):
+            self.run_fixture(raw)
+        raw["components"].append(leaf)
+        inner["document"] = "inner.SLDPRT"
+        leaf["solver_observation"]["context"] = context("inner.SLDPRT", "boom/inner")
+        with self.assertRaisesRegex(Failure, "part must have no assembly subtree"):
+            self.run_fixture(raw)
+        inner["document"] = "inner.SLDASM"
         leaf["solver_observation"]["context"] = context("boom.SLDASM", "boom")
         with self.assertRaisesRegex(Failure, "immediate parent context"):
             self.run_fixture(raw)
-
 
 
 if __name__ == "__main__":

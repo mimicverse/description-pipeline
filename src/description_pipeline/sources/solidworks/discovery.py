@@ -6801,12 +6801,16 @@ def _saved_native_carriers(
                     local = [value * valid_signs[0] for value in local]
                     signed_direction = [value * valid_signs[0] for value in direction]
             findings.append(_finding(
-                "direction.preview_endpoint_order", f"joint:{selector['feature_name']}",
+                "direction.native_axis_sign" if signs else "direction.preview_endpoint_order",
+                f"joint:{selector['feature_name']}",
+                "The native axis-sign declaration selects the inspection direction; "
+                "native positive motion and hardware direction remain unqualified" if signs else
                 "The saved undirected axis uses an explicit inspection direction convention; "
                 "native positive motion and hardware direction remain unqualified",
-                {"rule_id": "stored_endpoint_order/v1", "native_selector": selector,
+                {"rule_id": "native_axis_sign/v1" if signs else "stored_endpoint_order/v1", "native_selector": selector,
                  "raw_endpoints_m": axis_record["record"]["raw_endpoints_m"], "signed_local_axis": local,
-                 "native_positive_motion": bool(signs), "hardware_direction_qualified": False}, blocking=False,
+                 "native_axis_sign_present": bool(signs), "native_positive_motion": False,
+                 "hardware_direction_qualified": False}, blocking=False,
             ))
             kind = properties.get("dp.joint.type", "revolute")
             if kind not in {"revolute", "continuous"}:
@@ -6820,6 +6824,10 @@ def _saved_native_carriers(
             ):
                 if property_name not in properties:
                     continue
+                if record_field == "limit_evidence" and kind == "continuous":
+                    findings.append(_finding("discovery.joint_limits_unexpected", f"joint:{selector['feature_name']}",
+                                             "A continuous joint cannot bind a controlled position record"))
+                    continue
                 reference = properties[property_name]
                 if not _text(reference):
                     findings.append(_finding("discovery.record_reference_invalid", f"joint:{selector['feature_name']}",
@@ -6828,11 +6836,12 @@ def _saved_native_carriers(
                 entry = _resolve_record(settings, reference, findings, f"joint:{selector['feature_name']}")
                 if entry is None:
                     continue
-                values = {field: _controlled_number(entry["value"].get(field)) for field in fields}
+                values = {field: _controlled_number(entry["value"].get(field)) for field in fields
+                          if record_field == "limit_evidence" or field in entry["value"]}
                 if record_field == "limit_evidence":
                     values.update({field: _controlled_number(entry["value"][field]) for field in
                                    ("effort", "velocity") if field in entry["value"]})
-                if any(value is None for value in values.values()):
+                if not values or any(value is None for value in values.values()):
                     findings.append(_finding("discovery.joint_control_invalid", f"joint:{selector['feature_name']}",
                                              "Controlled joint values must be finite", {"reference": reference}))
                     continue
@@ -6842,6 +6851,10 @@ def _saved_native_carriers(
                     continue
                 limits = {**(limits or {}), **values}
                 control[record_field] = entry
+            if "drive" not in control and "limit_evidence" in control and any(
+                field in (limits or {}) for field in ("effort", "velocity")
+            ):
+                control["drive"] = control["limit_evidence"]
             controlled[feature] = control
             joint = {"name": selector["feature_name"], "type": kind, "axis_name": selector["feature_name"],
                      "axis": local, "limits": limits, "optional": {}, "origin": None,
@@ -7182,21 +7195,17 @@ def source_definition(
                 }
                 entry["drive_source"] = "controlled"
         elif joint["type"] == "continuous":
-            if joint.get("drive") is not None:
-                entry["limits"] = {
-                    key: float(joint["drive"]["value"][key]) for key in ("effort", "velocity")
-                    if joint["drive"]["value"].get(key) is not None
-                }
+            entry["limits"] = {key: float(joint["limits"][key]) for key in ("effort", "velocity")
+                               if joint["limits"].get(key) is not None}
         else:
-            entry["limits"] = {
-                "lower": float(joint["limits"]["lower"]),
-                "upper": float(joint["limits"]["upper"]),
-            }
-            if joint.get("drive") is not None:
-                entry["limits"].update({
-                    key: float(joint["drive"]["value"][key]) for key in ("effort", "velocity")
-                    if joint["drive"]["value"].get(key) is not None
-                })
+            entry["limits"] = {key: float(joint["limits"][key])
+                               for key in ("lower", "upper", "effort", "velocity")
+                               if joint["limits"].get(key) is not None}
+        if isinstance(joint.get("drive"), dict):
+            entry.setdefault("limits", {}).update({
+                key: float(joint["drive"]["value"][key]) for key in ("effort", "velocity")
+                if joint["drive"]["value"].get(key) is not None
+            })
         limit_evidence = joint.get("limit_evidence")
         if isinstance(limit_evidence, dict):
             embedded = next(

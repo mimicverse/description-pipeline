@@ -60,7 +60,7 @@ SAVED_NATIVE_WARNING_MESSAGE = (
 def saved_native_reference_warnings(raw: dict, *, purpose: str) -> list[dict]:
     """Format raw field locators; admission and independent interpretation remain separate."""
 
-    from ...schemas import saved_native_reference_present
+    from ...schemas import SAVED_NATIVE_REFERENCE_RULE, saved_native_reference_present
 
     if not saved_native_reference_present(raw, purpose):
         return []
@@ -70,7 +70,7 @@ def saved_native_reference_warnings(raw: dict, *, purpose: str) -> list[dict]:
             objects.append({
                 "object_type": "component", "object": component["name2"], "field": "carrier_membership",
                 "source": f"input/discovery/native-discovery.json#raw.components[{index}]",
-                "configuration": component["configuration"], "rule_id": "inspection_saved_native_carrier/v1",
+                "configuration": component["configuration"], "rule_id": SAVED_NATIVE_REFERENCE_RULE,
                 "original": {"fixed": component.get("fixed"),
                              "solver_observation": component.get("solver_observation")},
                 "mechanical_qualified": False, "hardware_qualified": False,
@@ -80,15 +80,15 @@ def saved_native_reference_warnings(raw: dict, *, purpose: str) -> list[dict]:
             objects.append({
                 "object_type": "coordinate_system", "object": datum["name"], "field": "body_frame",
                 "source": f"input/discovery/native-discovery.json#raw.datums[{index}]",
-                "rule_id": "inspection_saved_native_carrier/v1", "attachment_qualified": False,
+                "rule_id": SAVED_NATIVE_REFERENCE_RULE, "attachment_qualified": False,
             })
     for index, axis in enumerate(raw.get("reference_axes") or []):
         feature = (axis.get("selector") or {}).get("feature_name")
         if isinstance(feature, str) and feature.startswith("a_"):
             objects.append({
-                "object_type": "reference_axis", "object": feature, "field": "direction",
+                "object_type": "reference_axis", "object": feature, "fields": ["direction", "joint_type"],
                 "source": f"input/discovery/native-discovery.json#raw.reference_axes[{index}]",
-                "rule_id": "stored_endpoint_order/v1", "direction_semantics": axis.get("direction_semantics"),
+                "rule_id": SAVED_NATIVE_REFERENCE_RULE, "direction_semantics": axis.get("direction_semantics"),
                 "native_positive_motion": False, "hardware_direction_qualified": False,
             })
     for index, mate in enumerate(raw.get("mates") or []):
@@ -97,9 +97,23 @@ def saved_native_reference_warnings(raw: dict, *, purpose: str) -> list[dict]:
                 "object_type": "mate", "object": mate["name"], "field": "saved_pose_constraint",
                 "scope": mate.get("scope"), "native_type": mate.get("type"),
                 "source": f"input/discovery/native-discovery.json#raw.mates[{index}]",
-                "rule_id": "inspection_saved_native_carrier/v1", "constraint_rows_used": False,
+                "rule_id": SAVED_NATIVE_REFERENCE_RULE, "constraint_rows_used": False,
                 "mechanical_qualified": False,
             })
+    properties = raw.get("properties") or {}
+    buckets = [("document", "", properties.get("document") or {})]
+    buckets.extend((scope, name, values) for scope in ("mates", "components")
+                   for name, values in (properties.get(scope) or {}).items())
+    for scope, name, values in buckets:
+        for key, value in values.items():
+            if key.startswith("dp.joint.") and key.endswith("axis_sign"):
+                objects.append({
+                    "object_type": "native_property", "object": name or "assembly", "field": key,
+                    "source": "input/discovery/native-discovery.json#raw.properties."
+                    + scope + ("." + name if name else "") + "." + key,
+                    "original": copy.deepcopy(value), "rule_id": "native_axis_sign/v1",
+                    "native_positive_motion": False, "hardware_direction_qualified": False,
+                })
     return [{"code": SAVED_NATIVE_WARNING_CODE, "message": SAVED_NATIVE_WARNING_MESSAGE, "objects": objects}]
 
 

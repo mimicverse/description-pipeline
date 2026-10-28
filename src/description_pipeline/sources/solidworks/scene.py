@@ -1149,13 +1149,14 @@ def _value_warnings(
                         "reason": "controlled author position range is not a native CAD reading",
                     }
                 )
-        declared_drive = drive_evidence.get("declared_values")
-        declared_drive = declared_drive if isinstance(declared_drive, dict) else {}
         for field in ("effort", "velocity"):
             if field not in joint["limits"]:
                 continue
-            if field not in declared_drive:
+            field_evidence = next((evidence for evidence in (drive_evidence, limit_evidence)
+                                   if field in (evidence.get("declared_values") or {})), None)
+            if field_evidence is None:
                 continue
+            declared_drive = field_evidence["declared_values"]
             row = {
                 "object_type": "joint",
                 "object": joint["name"],
@@ -1163,11 +1164,11 @@ def _value_warnings(
                 "actual": joint["limits"][field],
                 "source": "controlled author dp.joint.drive_record",
                 "original": declared_drive[field],
-                "file": drive_evidence.get("file"),
-                "sha256": drive_evidence.get("sha256"),
-                "anchor": drive_evidence.get("anchor"),
-                "key": drive_evidence.get("key"),
-                "reference": drive_evidence.get("reference"),
+                "file": field_evidence.get("file"),
+                "sha256": field_evidence.get("sha256"),
+                "anchor": field_evidence.get("anchor"),
+                "key": field_evidence.get("key"),
+                "reference": field_evidence.get("reference"),
                 "rule_id": "drive.declared_author",
                 "rule_version": "v1",
                 "reason": "controlled author drive value is not a native CAD reading",

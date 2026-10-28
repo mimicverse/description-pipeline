@@ -281,6 +281,98 @@ class ValueWarningTests(unittest.TestCase):
             },
         }
 
+    def test_rotation_policy_and_missing_drive_defaults_compose_independently(self):
+        for mode in ("preview", "default"):
+            with self.subTest(mode=mode):
+                source, model = copy.deepcopy(self.source), copy.deepcopy(self.model)
+                policy = {
+                    "rule_id": ("inspection_rotation_full_turn/v1" if mode == "preview"
+                                else "engineering_rotation_default_window/v1"),
+                    "rule_version": "v1", "window_rad": [-math.pi, math.pi],
+                    "native_cad_ranges": False, "hardware_qualified": False, "author_limits": None,
+                }
+                source["joints"] = [{
+                    "name": "right_elbow_pitch_joint", "source_name": "right_elbow_pitch_joint",
+                    "type": "revolute", "limit_source": mode + "_policy", mode + "_policy": policy,
+                    "limits": {"lower": -math.pi, "upper": math.pi},
+                }]
+                model["joints"] = [{
+                    "name": "right_elbow_pitch_joint",
+                    "limits": {"lower": -math.pi, "upper": math.pi, "effort": 0.0, "velocity": 0.0},
+                    "provenance": {"drive_defaults": {
+                        "rule_id": "drive.missing_zero", "rule_version": "v1",
+                        "fields": ["effort", "velocity"], "drive_qualified": False,
+                    }},
+                }]
+                model["provenance"]["value_warnings"] = _value_warnings(
+                    source, source["bodies"], model["links"], model["joints"], [],
+                )
+                self.assertIn("drive.default_zero", _value_warning_gate(self.root, source, model)["codes"])
+                policy_warning = next(row for row in model["provenance"]["value_warnings"]
+                                      if row["code"] == "limits." + mode + "_policy")
+                policy_warning["objects"][0]["actual"]["velocity"] = 1.0
+                with self.assertRaises(PipelineError):
+                    _value_warning_gate(self.root, source, model)
+
+    def test_controlled_range_and_drive_records_compose_by_existing_field_evidence(self):
+        for shared in (False, True):
+            with self.subTest(shared=shared):
+                source, model = copy.deepcopy(self.source), copy.deepcopy(self.model)
+                values = {"lower": 0, "upper": 0, "effort": 2, "velocity": 3}
+                common = {"kind": "controlled_record", "file": "records/joint.json", "sha256": "a" * 64}
+                limits = {**common, "anchor": "bounds", "key": "bounds", "reference": "joint.json#bounds",
+                          "declared_values": values if shared else {"lower": 0, "upper": 0, "effort": 2},
+                          "native_observation_errors": []}
+                drive = {key: value for key, value in limits.items() if key != "native_observation_errors"}
+                if not shared:
+                    drive.update(anchor="drive", key="drive", reference="joint.json#drive",
+                                 declared_values={"velocity": 3})
+                source["joints"] = [{
+                    "name": "right_elbow_pitch_joint", "source_name": "right_elbow_pitch_joint", "type": "revolute",
+                    "limit_source": "declared_author", "limits": values,
+                    "limit_evidence": limits, "drive_evidence": drive, "drive_source": "controlled",
+                }]
+                model["joints"] = [{
+                    "name": "right_elbow_pitch_joint", "limits": dict(values),
+                    "provenance": {"limits_evidence": limits, "drive_evidence": drive},
+                }]
+                model["provenance"]["value_warnings"] = _value_warnings(
+                    source, source["bodies"], model["links"], model["joints"], [],
+                )
+                self.assertIn("drive.declared_author", _value_warning_gate(self.root, source, model)["codes"])
+                rows = next(row for row in model["provenance"]["value_warnings"]
+                            if row["code"] == "drive.declared_author")["objects"]
+                effort = next(row for row in rows if row["field"] == "effort")
+                self.assertEqual(effort["reference"], "joint.json#bounds")
+                effort["original"] = 4
+                with self.assertRaises(PipelineError):
+                    _value_warning_gate(self.root, source, model)
+
+    def test_direction_warning_accepts_normalization_noise_but_preserves_identity_and_values(self):
+        source, model = copy.deepcopy(self.source), copy.deepcopy(self.model)
+        source["joints"] = [{
+            "name": "right_elbow_pitch_joint", "source_name": "right_elbow_pitch_joint", "type": "revolute",
+            "limits": {"effort": 1.0, "velocity": 2.0},
+            "axis_provenance": {"parent_axis": [1e-17, 1.0, 0.0], "reason": "Native motion is unqualified"},
+        }]
+        model["joints"] = [{
+            "name": "right_elbow_pitch_joint", "axis": [0.0, 0.0, 1.0],
+            "limits": {"effort": 1.0, "velocity": 2.0},
+        }]
+        model["provenance"]["value_warnings"] = _value_warnings(
+            source, source["bodies"], model["links"], model["joints"], [],
+        )
+        source["joints"][0]["axis_provenance"]["parent_axis"] = [-1e-17, 1.0, 0.0]
+        self.assertIn("direction.semantics_unresolved", _value_warning_gate(self.root, source, model)["codes"])
+        for original in ([1e-4, 1.0, 0.0], [0.0, True, 0.0]):
+            with self.subTest(original=original):
+                forged = copy.deepcopy(model)
+                warning = next(row for row in forged["provenance"]["value_warnings"]
+                               if row["code"] == "direction.semantics_unresolved")
+                warning["objects"][0]["original"] = original
+                with self.assertRaises(PipelineError):
+                    _value_warning_gate(self.root, source, forged)
+
     def test_valid_cad_derived_warning_inventory_passes(self):
         result = _value_warning_gate(self.root, self.source, self.model)
         self.assertEqual(result["objects"], 7)

@@ -17,7 +17,7 @@ from description_pipeline.sources.solidworks.naming import (
     disambiguated_frame_name,
     frame_identity,
     frame_name,
-    token,
+    token as format_token,
 )
 from description_pipeline.sources.solidworks.native_limits import (
     PREVIEW_POLICY_ID,
@@ -39,6 +39,13 @@ REFERENCE_TYPES = {2: "Line", 4: "Cylinder", 7: "Circle"}
 def _require(condition, message, **detail):
     if not condition:
         raise _Failure("discovery.saved_native", message, detail)
+
+
+def _token(value):
+    try:
+        return format_token(value)
+    except ValueError as error:
+        raise _Failure("discovery.saved_native", "native name cannot be tokenized", {"native_name": value}) from error
 
 
 def _number(value):
@@ -101,11 +108,14 @@ def _semantic(datum, component):
     document = str(component.get("document") or "").replace("\\", "/").rsplit("/", 1)[-1]
     document = re.sub(r"\.(?:sldasm|sldprt)$", "", document, flags=re.IGNORECASE)
     candidates = [re.sub(r"[_-]\d{8}$", "", value) for value in (occurrence, document)]
-    try:
-        semantic = token(datum[2:])
-        return any(token(candidate) == semantic for candidate in candidates if candidate)
-    except ValueError:
-        return False
+    semantic = _token(datum[2:])
+    for candidate in candidates:
+        try:
+            if candidate and format_token(candidate) == semantic:
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 def _unique_binding(domains):
@@ -208,13 +218,17 @@ def _controlled(reference, payload, package):
         "anchor": entry["anchor"],
         "key": found["key"],
         "reference": reference,
-        "declared_values": dict(value),
+        "declared_values": {
+            key: value[key] for key in ("lower", "upper", "effort", "velocity") if value.get(key) is not None
+        },
     }
     return value, evidence
 
 
-def _limits(mates, properties, components, direction, payload, package):
+def _limits(mates, properties, components, direction, payload, package, *, joint_type):
     for mate in mates:
+        if mate.get("suppressed") is True:
+            continue
         kind = mate.get("type")
         if (
             kind in {"limitangle", "limitdistance"}
@@ -236,12 +250,6 @@ def _limits(mates, properties, components, direction, payload, package):
                 unit == "rad",
                 "saved rotational carrier requires a native angular range",
             )
-            _require(
-                "axis_sign" in properties,
-                "native range requires a declared direction binding",
-                mate=mate.get("name"),
-                native_range=[lower, upper],
-            )
             # An angular range's plane vectors alone do not identify its signed
             # motion coordinate. Never copy such a range onto a reference axis.
             _require(
@@ -255,36 +263,49 @@ def _limits(mates, properties, components, direction, payload, package):
         native_limit_inventory_complete(mates),
         "native limit absence is not completely observed",
     )
-    limits = None
+    limits = {}
     evidence = None
-    source = "preview_policy"
+    drive = None
+    drive_evidence = None
+    source = "declared_author" if joint_type == "continuous" else None
     policy = None
     if "limits_record" in properties:
-        value, evidence = _controlled(properties["limits_record"], payload, package)
-        lower, upper = _number(value.get("lower")), _number(value.get("upper"))
-        _require(lower <= upper, "controlled position range is inverted")
-        limits = {"lower": lower, "upper": upper}
-        for key in ("effort", "velocity"):
-            if key in value:
-                limits[key] = _number(value[key])
-                _require(limits[key] >= 0, "controlled drive values must be nonnegative")
-        source = "declared_author"
-    else:
+        _require(joint_type != "continuous", "continuous joint cannot bind a controlled position record")
+        value, record_evidence = _controlled(properties["limits_record"], payload, package)
+        evidence = {**record_evidence, "native_observation_errors": []}
+        if joint_type == "continuous":
+            _require(
+                all(value.get(key) is None for key in ("lower", "upper")),
+                "continuous joint cannot carry controlled position bounds",
+            )
+        else:
+            lower, upper = _number(value.get("lower")), _number(value.get("upper"))
+            _require(lower <= upper, "controlled position range is inverted")
+            limits = {"lower": lower, "upper": upper}
+            source = "declared_author"
+        readings = {key: _number(value[key]) for key in ("effort", "velocity") if key in value}
+        _require(all(number >= 0 for number in readings.values()), "controlled drive values must be nonnegative")
+        limits.update(readings)
+        if readings:
+            drive_evidence = record_evidence
+            drive = {
+                "file": record_evidence["file"],
+                "sha256": record_evidence["sha256"],
+                "anchor": record_evidence["anchor"],
+                "value": readings,
+            }
+    elif joint_type == "revolute":
         limits = {"lower": -PREVIEW_WINDOW_RAD, "upper": PREVIEW_WINDOW_RAD}
+        source = "preview_policy"
         policy = rotation_window_policy(
             PREVIEW_POLICY_ID,
             author_limits=None,
             native_absence="complete_mate_inventory_no_enabled_limit",
         )
-    drive_evidence = None
-    drive = None
     if "drive_record" in properties:
         value, drive_evidence = _controlled(properties["drive_record"], payload, package)
-        _require(
-            set(value) >= {"effort", "velocity"},
-            "controlled drive record lacks effort or velocity",
-        )
-        readings = {key: _number(value[key]) for key in ("effort", "velocity")}
+        readings = {key: _number(value[key]) for key in ("effort", "velocity") if key in value}
+        _require(bool(readings), "controlled drive record has no readable effort or velocity")
         _require(
             all(number >= 0 for number in readings.values()),
             "controlled drive values must be nonnegative",
@@ -298,7 +319,7 @@ def _limits(mates, properties, components, direction, payload, package):
             "file": drive_evidence["file"],
             "sha256": drive_evidence["sha256"],
             "anchor": drive_evidence["anchor"],
-            "value": value,
+            "value": readings,
         }
     return limits, source, policy, evidence, drive, drive_evidence
 
@@ -359,13 +380,11 @@ def rebuild_saved_native_references(raw, *, purpose, payload=None, package=None)
             "component solver observation has the wrong immediate parent context",
             component=name,
         )
-    tops = {name: item for name, item in active.items() if not item["parent_occurrence"]}
-    _require(bool(tops), "saved-native carrier has no material bodies")
-    materials = {}
-    for name, item in tops.items():
+    for name, item in active.items():
         extension = str(item.get("document") or "").lower()
-        members = [key for key in active if key == name or key.startswith(name + "/")]
+        children = [child for child in active.values() if child["parent_occurrence"] == name]
         if extension.endswith(".sldasm"):
+            _require(bool(children), "folded assembly needs a direct active child", component=name)
             solving = item["solver_observation"].get("solving")
             _require(
                 isinstance(solving, dict)
@@ -374,24 +393,20 @@ def rebuild_saved_native_references(raw, *, purpose, payload=None, package=None)
                 and type(solving.get("value")) is int
                 and solving["value"] == 0
                 and solving.get("error") is None,
-                "top-level occurrence is not a clean native rigid solving observation",
-                component=name,
-            )
-            children = [child for child in active.values() if child["parent_occurrence"] == name]
-            _require(
-                bool(children)
-                and all(_context(child, item["document"], item["configuration"], name) for child in children),
-                "assembly rigidity needs direct children observed in the parent context",
+                "folded assembly is not a clean native rigid solving observation",
                 component=name,
             )
         else:
             _require(
-                extension.endswith(".sldprt")
-                and members == [name]
-                and not any(key.startswith(name + "/") for key in components),
+                extension.endswith(".sldprt") and not any(key.startswith(name + "/") for key in components),
                 "a material part must have no assembly subtree",
                 component=name,
             )
+    tops = {name: item for name, item in active.items() if not item["parent_occurrence"]}
+    _require(bool(tops), "saved-native carrier has no material bodies")
+    materials = {}
+    for name in tops:
+        members = [key for key in active if key == name or key.startswith(name + "/")]
         leaves = sorted(key for key in members if str(active[key].get("document") or "").lower().endswith(".sldprt"))
         _require(bool(leaves), "top-level occurrence has no material part", component=name)
         materials[name] = leaves
@@ -415,7 +430,10 @@ def rebuild_saved_native_references(raw, *, purpose, payload=None, package=None)
         _require(
             datum.get("owner") == ""
             and datum.get("configuration") == configuration
-            and context == {"document": document, "configuration": configuration, "scope": ""},
+            and context == {"document": document, "configuration": configuration, "scope": ""}
+            and datum.get("context", context) == context
+            and datum.get("error") is None
+            and all(value is None for key, value in datum.items() if key.endswith("_error")),
             "saved coordinate has the wrong native scope or configuration",
             datum=name,
         )
@@ -461,7 +479,7 @@ def rebuild_saved_native_references(raw, *, purpose, payload=None, package=None)
         point = _vector(axis.get("axis_point_m"))
         recorded = _unit(axis.get("axis_direction"))
         _require(
-            math.dist(point, endpoints[:3]) <= 1e-10 and _dot(direction, recorded) >= 1 - 1e-10,
+            _same_line(endpoints[:3], direction, point, recorded),
             "saved axis endpoints disagree with the captured point or direction",
             axis=name,
         )
@@ -528,6 +546,7 @@ def rebuild_saved_native_references(raw, *, purpose, payload=None, package=None)
     edge_mates = {}
     edges = []
     poses = []
+    mate_identities = set()
     for mate in view["mates"]:
         _require(
             type(mate.get("suppressed")) is bool,
@@ -541,15 +560,32 @@ def rebuild_saved_native_references(raw, *, purpose, payload=None, package=None)
             "active native mate has an error",
             mate=mate.get("name"),
         )
-        if mate.get("scope"):
+        identity = (mate.get("scope"), mate.get("name"))
+        _require(
+            all(isinstance(value, str) for value in identity) and bool(identity[1])
+            and identity not in mate_identities
+            and isinstance(mate.get("type"), str) and bool(mate["type"])
+            and isinstance(mate.get("configuration"), str) and bool(mate["configuration"]),
+            "native mate scoped identity is missing or duplicated", mate=mate.get("name"),
+        )
+        mate_identities.add(identity)
+        if mate["type"] == "inplace":
+            _require(
+                mate.get("native_feature_type") == "MateInPlace" and mate.get("native_interface") == "IMateInPlace"
+                and isinstance(mate.get("inplace"), dict)
+                and (identity[0] == "" or identity[0] in active)
+                and mate["configuration"] == (active[identity[0]]["configuration"] if identity[0] else configuration),
+                "in-place observation has no exact native owner context", mate=mate["name"],
+            )
+            poses.append((mate, frozenset({identity[0].split("/", 1)[0]}) if identity[0] else frozenset()))
             continue
         entities = endpoints(mate)
         owners = [owner(entity) for entity in entities]
         material_owners = frozenset(value for value in owners if value is not None)
-        edge_mates.setdefault(material_owners, []).append(mate)
-        if mate.get("type") != "concentric":
+        if mate.get("type") != "concentric" or mate.get("scope") or len(material_owners) < 2:
             poses.append((mate, material_owners))
             continue
+        edge_mates.setdefault(material_owners, []).append(mate)
         _require(
             len(entities) == 2 and len(material_owners) == 2 and None not in owners,
             "concentric must bind two distinct material bodies",
@@ -580,24 +616,29 @@ def rebuild_saved_native_references(raw, *, purpose, payload=None, package=None)
                 mate=mate.get("name"),
             )
             params = reference.get("params")
+            minimum = 7 if reference_type in (4, 7) else 6
             _require(
-                isinstance(params, list) and len(params) >= 6,
+                isinstance(params, list) and len(params) >= minimum,
                 "native EntityParams are incomplete",
                 mate=mate.get("name"),
             )
             values = [_number(value) for value in params]
+            _require(
+                reference_type == 2 or values[6] > 0,
+                "native concentric endpoint radius must be positive",
+                mate=mate.get("name"),
+            )
             geometry.append((values[:3], _unit(values[3:6])))
         _require(
             _same_line(*geometry[0], *geometry[1]),
             "concentric endpoints disagree geometrically",
             mate=mate.get("name"),
         )
-        _require(
-            all(edge["owners"] != material_owners for edge in edges),
-            "duplicate concentric edge is ambiguous",
-            mate=mate.get("name"),
-        )
-        edges.append({"owners": material_owners, "mate": mate, "geometry": geometry})
+        previous = next((edge for edge in edges if edge["owners"] == material_owners), None)
+        if previous is None:
+            edges.append({"owners": material_owners, "geometry": geometry})
+        else:
+            previous["geometry"].extend(geometry)
     _require(
         len(edges) == len(tops) - 1,
         "active concentric edges do not form a complete tree",
@@ -644,7 +685,7 @@ def rebuild_saved_native_references(raw, *, purpose, payload=None, package=None)
             component=child,
         )
     binding = {root_occurrence: "c_base_link", **_unique_binding(domains)}
-    native_names = {occurrence: token(datum[2:]) for occurrence, datum in binding.items()}
+    native_names = {occurrence: _token(datum[2:]) for occurrence, datum in binding.items()}
     _require(
         len(set(native_names.values())) == len(native_names),
         "native coordinate suffixes collide after formatting",
@@ -700,8 +741,9 @@ def rebuild_saved_native_references(raw, *, purpose, payload=None, package=None)
         members = edge_mates[edge["owners"]]
         properties, consumed = _properties(view, members, datum, namespace)
         consumed_properties.update(consumed)
+        joint_type = properties.get("type", "revolute")
         _require(
-            properties.get("type", "revolute") == "revolute",
+            isinstance(joint_type, str) and joint_type in {"revolute", "continuous"},
             "native joint type is unsupported by the rotational preview",
             component=child,
         )
@@ -724,7 +766,7 @@ def rebuild_saved_native_references(raw, *, purpose, payload=None, package=None)
             local,
             pairs[binding[parent]]["frame"],
             pair["frame"],
-            joint_type="revolute",
+            joint_type=joint_type,
         )
         provenance.update(
             {
@@ -741,13 +783,13 @@ def rebuild_saved_native_references(raw, *, purpose, payload=None, package=None)
             }
         )
         limits, source, policy, evidence, drive, drive_evidence = _limits(
-            members, properties, components, direction, payload, package
+            view["mates"], properties, components, direction, payload, package, joint_type=joint_type
         )
         joint = {
             "id": axis_name,
             "name": axis_name,
             "source_name": axis_name,
-            "type": "revolute",
+            "type": joint_type,
             "parent": native_names[parent],
             "child": native_names[child],
             "axis": local,
@@ -769,6 +811,8 @@ def rebuild_saved_native_references(raw, *, purpose, payload=None, package=None)
         ):
             if value is not None:
                 joint[key] = value
+        if drive_evidence is not None:
+            joint["drive_source"] = "controlled"
         joints.append(joint)
         diagnostics.append(
             {
@@ -866,7 +910,13 @@ def rebuild_saved_native_references(raw, *, purpose, payload=None, package=None)
         )
         identities.add(identity)
         native_parent = native_names[root_occurrence if owner == "" else owner.split("/", 1)[0]]
-        frame_candidates.append((identity, frame_name(name), name, link_names[native_parent]))
+        try:
+            formatted = frame_name(name)
+        except ValueError as error:
+            raise _Failure(
+                "discovery.saved_native", "native interface name cannot be tokenized", {"datum": name}
+            ) from error
+        frame_candidates.append((identity, formatted, name, link_names[native_parent]))
     frames = []
     used_names = set(link_names.values())
     for identity, formatted, native, parent in sorted(frame_candidates):

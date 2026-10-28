@@ -2862,7 +2862,7 @@ def _value_warning_gate(
                     "object_type": "joint",
                     "object": joint["name"],
                     "field": "limits",
-                    "actual": joint["limits"],
+                    "actual": _delivered_joint_limits(joint),
                     "source": "inspection preview full-turn policy",
                     "original": policy.get("author_limits"),
                     "rule_id": PREVIEW_POLICY_ID,
@@ -2880,7 +2880,7 @@ def _value_warning_gate(
                     "object_type": "joint",
                     "object": joint["name"],
                     "field": "limits",
-                    "actual": joint["limits"],
+                    "actual": _delivered_joint_limits(joint),
                     "source": "engineering default rotation window policy",
                     "original": policy.get("author_limits"),
                     "rule_id": ENGINEERING_DEFAULT_POLICY_ID,
@@ -2933,7 +2933,7 @@ def _value_warning_gate(
             declared = evidence.get("declared_values")
             _require(
                 isinstance(declared, dict)
-                and set(declared) == set(fields)
+                and set(fields) <= set(declared) <= {"lower", "upper", "effort", "velocity"}
                 and (
                     not selected
                     or (
@@ -3002,37 +3002,39 @@ def _value_warning_gate(
                 model_provenance.get("drive_evidence") == drive_evidence,
                 "Model drive evidence is missing, foreign, or differs from the controlled record",
             )
-            drive_fields = tuple(field for field in ("effort", "velocity") if source_limits.get(field) is not None)
-            observe_evidence(drive_evidence, drive_fields, selected=True)
-            declared = drive_evidence.get("declared_values") or {}
-            for field in drive_fields:
-                row = {
-                    "object_type": "joint",
-                    "object": joint["name"],
-                    "field": field,
-                    "actual": model_limits[field],
-                    "source": "controlled author dp.joint.drive_record",
-                    "original": declared[field],
-                    "file": drive_evidence.get("file"),
-                    "sha256": drive_evidence.get("sha256"),
-                    "anchor": drive_evidence.get("anchor"),
-                    "key": drive_evidence.get("key"),
-                    "reference": drive_evidence.get("reference"),
-                    "rule_id": "drive.declared_author",
-                    "rule_version": "v1",
-                    "reason": "controlled author drive value is not a native CAD reading",
-                }
-                controlled_drive.append(row)
-                if model_limits[field] == 0:
-                    unqualified_drive.append(
-                        {
-                            **row,
-                            "rule_id": "drive.nonzero_required",
-                            "reason": (
-                                "zero effort or velocity is retained but does not qualify drive sizing"
-                            ),
-                        }
-                    )
+        for field in ("effort", "velocity"):
+            field_evidence = next((record for record in (drive_evidence, limit_evidence)
+                                   if field in (record.get("declared_values") or {})), None)
+            if field_evidence is None:
+                continue
+            observe_evidence(field_evidence, (field,), selected=True)
+            row = {
+                "object_type": "joint",
+                "object": joint["name"],
+                "field": field,
+                "actual": model_limits[field],
+                "source": "controlled author dp.joint.drive_record",
+                "original": field_evidence["declared_values"][field],
+                "file": field_evidence.get("file"),
+                "sha256": field_evidence.get("sha256"),
+                "anchor": field_evidence.get("anchor"),
+                "key": field_evidence.get("key"),
+                "reference": field_evidence.get("reference"),
+                "rule_id": "drive.declared_author",
+                "rule_version": "v1",
+                "reason": "controlled author drive value is not a native CAD reading",
+            }
+            controlled_drive.append(row)
+            if model_limits[field] == 0:
+                unqualified_drive.append(
+                    {
+                        **row,
+                        "rule_id": "drive.nonzero_required",
+                        "reason": (
+                            "zero effort or velocity is retained but does not qualify drive sizing"
+                        ),
+                    }
+                )
     if declared_author_limits:
         for row in declared_author_limits:
             add("limits.declared_author", row)
@@ -3366,6 +3368,34 @@ def _value_warning_gate(
         "Non-native value provenance warning messages differ from the delivery",
     )
     for code in sorted(expected):
+        if code == "direction.semantics_unresolved":
+            # Independently normalized parent-frame unit vectors use the same
+            # absolute tolerance as the signed-axis gate. All other warning
+            # fields, object identities and multiplicities still compare exactly.
+            expected_by_object = {row["object"]: row for row in expected[code]}
+            observed_by_object = {row["object"]: row for row in actual[code]}
+            _require(
+                len(expected_by_object) == len(expected[code])
+                and len(observed_by_object) == len(actual[code])
+                and expected_by_object.keys() == observed_by_object.keys(),
+                "Direction warning object identities or multiplicities differ",
+            )
+            for name, expected_row in expected_by_object.items():
+                observed_row = observed_by_object[name]
+                left, right = observed_row.get("original"), expected_row.get("original")
+                _require(
+                    (left is None and right is None)
+                    or (left is not None and right is not None
+                        and isinstance(left, list) and all(type(value) in (int, float) for value in left)
+                        and np.allclose(_vector(left), _vector(right), atol=1e-12, rtol=0)),
+                    f"Direction warning parent-frame axis differs for {name}",
+                )
+                _require(
+                    {key: value for key, value in observed_row.items() if key != "original"}
+                    == {key: value for key, value in expected_row.items() if key != "original"},
+                    f"Direction warning fields differ for {name}",
+                )
+            continue
         actual_rows = canonical(actual[code])
         expected_rows = canonical(expected[code])
         _require(
