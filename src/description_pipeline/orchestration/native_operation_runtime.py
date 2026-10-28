@@ -1069,11 +1069,12 @@ class CaptureOperationExecutor:
 
             transaction = _capture_native_transaction
         output = workspace / "capture-output"
-        backend = (
-            self.backend_factory(staged.stage)
-            if self.backend_factory is not None
-            else None
-        )
+        if self.backend_factory is None:
+            from ..sources.solidworks.native import SolidWorksBackend
+
+            backend = SolidWorksBackend()
+        else:
+            backend = self.backend_factory(staged.stage)
         try:
             result = dict(
                 transaction(

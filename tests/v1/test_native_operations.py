@@ -1216,6 +1216,9 @@ class NativeOperationRuntimeTests(unittest.TestCase):
             result = client.wait_for_terminal("operation-capture-transaction")
         self.assertEqual(result.state, "satisfied")
         native_transaction.assert_called_once()
+        from description_pipeline.sources.solidworks.native import SolidWorksBackend
+
+        self.assertIsInstance(captured["kwargs"]["backend"], SolidWorksBackend)
         self.assertEqual(captured["package_inventory"], prepared_files)
         self.assertEqual(
             captured["kwargs"]["native_tool_factory"](),
