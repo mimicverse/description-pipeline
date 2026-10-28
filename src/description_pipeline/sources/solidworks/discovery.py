@@ -97,7 +97,7 @@ from .native_limits import (
     rotation_window_policy,
     validate_native_limit,
 )
-from .native_selection import (
+from .session_artifacts import (
     session_source_identity,
     session_source_identity_sha256,
 )

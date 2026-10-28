@@ -15,7 +15,7 @@ from .discovery import (
     native_component_identity,
     sealed_embedded_virtual_document,
 )
-from .native_selection import sealed_session_source, session_source_identity_sha256
+from .session_artifacts import sealed_session_source, session_source_identity_sha256
 from .selection import selection_bindings
 
 _PLAN_KEYS = frozenset(
@@ -446,10 +446,6 @@ def consume_sealed_definition(package: Path) -> tuple[dict, dict]:
             if len(matches) != 1:
                 raise PipelineError(
                     "The sealed closure carries no unique cached session occurrence"
-                )
-            if matches[0].get("author_imported_error") != provenance.get("author_imported_error"):
-                raise PipelineError(
-                    "The sealed closure does not preserve cached author metadata"
                 )
             try:
                 identity = sealed_session_source(

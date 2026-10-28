@@ -26,21 +26,19 @@ from ...geometry.native_scope import NATIVE_SOURCE_SCOPE_RULE
 from ...geometry.native_transform import transform_from_solidworks as _shared_transform
 from ...schemas import NATIVE_DISCOVERY_SCHEMA
 from .errors import CadError, EnvironmentError_
-from .native_selection import (
-    current_session_source_matches,
-    session_source_identity,
-    session_source_identity_sha256,
-)
 from .protocol import CadBackend
 from .saved_state import normalize_open_status
 from .session_artifacts import (
     SESSION_DOCUMENT_API,
+    current_session_source_matches,
     embedded_virtual_component_marker,
     embedded_virtual_component_path,
     embedded_virtual_component_root,
     session_artifact_path,
     session_materialization_path,
     session_root_pid,
+    session_source_identity,
+    session_source_identity_sha256,
     session_temp_root,
 )
 

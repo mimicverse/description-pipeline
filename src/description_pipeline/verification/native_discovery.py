@@ -74,11 +74,11 @@ from ..sources.solidworks.saved_state import (
 from ..sources.solidworks.session_artifacts import (
     SESSION_DOCUMENT_API,
     embedded_virtual_component_under_root,
+    sealed_session_source,
     has_session_document_marker,
     session_materialization_under_root,
     session_root_pid,
 )
-from ..sources.solidworks.native_selection import sealed_session_source
 from .capture_evidence import is_container
 
 VERIFICATION_SCHEMA = "solidworks-to-urdf.native-discovery-verification/v1"

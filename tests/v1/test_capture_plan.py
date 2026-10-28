@@ -518,6 +518,15 @@ class CapturePlanTests(unittest.TestCase):
             steps._consume_sealed_definition(self.root)
 
     def test_plan_entry_binds_an_api_proven_cached_import(self) -> None:
+        self._check_cached_plan()
+
+    def test_cached_plan_preserves_distinct_author_errors_per_session(self) -> None:
+        self._check_cached_plan(
+            selection_error="RuntimeError: selection author read failed",
+            discovery_error="RuntimeError: discovery author read failed",
+        )
+
+    def _check_cached_plan(self, *, selection_error=None, discovery_error=None) -> None:
         session_path = "C:\\Users\\operator\\AppData\\Local\\Temp\\swx7\\IC~~\\arm.step.SLDPRT"
         session_root = "C:\\Users\\operator\\AppData\\Local\\Temp\\swx7"
         selection_root = "C:\\selection\\m3-flat"
@@ -556,6 +565,12 @@ class CapturePlanTests(unittest.TestCase):
                 "configuration": "Default",
             },
         )
+        if discovery_error is not None:
+            component["source_provenance"].update(
+                author_imported_path=None, author_imported_error=discovery_error,
+                author_imported_relative=None, author_imported_in_source_root=False,
+                author_imported_exists=None,
+            )
         identity = {
             "kind": "native_import_materialization",
             "state": "cached_materialization",
@@ -593,6 +608,12 @@ class CapturePlanTests(unittest.TestCase):
             "used_api": identity["used_api"],
             "session_source_sha256": session_source_sha256,
         }
+        if selection_error is not None:
+            entry.update(
+                author_imported_path=None, author_imported_error=selection_error,
+                author_imported_relative=None, author_imported_exists=None,
+                author_metadata_in_stage=False, bound_source=None,
+            )
         files = dict(discovery_document["raw"]["files"])
         from description_pipeline.sources.solidworks.selection import seal_closure_selection
         from tests.sources.selection_support import closure_evidence
@@ -608,17 +629,18 @@ class CapturePlanTests(unittest.TestCase):
             imports=[entry],
             stage_root=selection_root,
         )
-        next(
-            edge
-            for edge in evidence["documents"][MAIN]["resolved_edges"]
-            if edge["resolved"].replace("\\", "/") == "cad/arm.SLDPRT"
-        ).update(
-            kind="native_imported_document",
-            instance="arm-1",
-            resolved="cad/arm.SLDPRT",
-            configuration="Default",
-            suppression_state=2,
-        )
+        if selection_error is None:
+            next(
+                edge
+                for edge in evidence["documents"][MAIN]["resolved_edges"]
+                if edge["resolved"].replace("\\", "/") == "cad/arm.SLDPRT"
+            ).update(
+                kind="native_imported_document",
+                instance="arm-1",
+                resolved="cad/arm.SLDPRT",
+                configuration="Default",
+                suppression_state=2,
+            )
         manifest = seal_closure_selection(
             files,
             MAIN,

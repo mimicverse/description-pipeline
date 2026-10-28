@@ -641,7 +641,7 @@ class SourceScopeTests(unittest.TestCase):
 
 
     def test_cached_identity_uses_canonical_utf8_for_unicode_native_names(self) -> None:
-        from description_pipeline.sources.solidworks.native_selection import session_source_identity_sha256
+        from description_pipeline.sources.solidworks.session_artifacts import session_source_identity_sha256
         from description_pipeline.sources.solidworks.session_artifacts import SESSION_SOURCE_IDENTITY_FIELDS
 
         self._use_cached_source()

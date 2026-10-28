@@ -601,7 +601,7 @@ class ClosureAdmissionTests(unittest.TestCase):
         self.assertEqual(warning["owner_sha256"], self.files["robot.SLDASM"])
 
     def test_cached_session_identity_is_stable_across_owned_processes(self) -> None:
-        from description_pipeline.sources.solidworks.native_selection import (
+        from description_pipeline.sources.solidworks.session_artifacts import (
             current_session_source_matches,
             session_source_identity,
             session_source_identity_sha256,
