@@ -33,6 +33,7 @@ from ..sources.solidworks.discover_stage import (
     NativeDiscoverRefusal,
     NativeDiscoverRequest,
 )
+from ..sources.solidworks.errors import BridgeError
 from ..sources.solidworks.handoff import MAX_HANDOFF_BYTES
 from ..sources.solidworks.selection import validate_file_index
 from .discover_protocol import run_windows_discover, seal_observation_bundle
@@ -983,6 +984,11 @@ class DiscoverOperationExecutor:
             raise NativeOperationUnresolved(
                 "discover.native_unknown",
                 f"{type(error).__name__}: {error}",
+                detail=(
+                    {"native_error": error.to_dict()}
+                    if isinstance(error, BridgeError)
+                    else None
+                ),
             ) from error
         try:
             artifact = seal_observation_bundle(

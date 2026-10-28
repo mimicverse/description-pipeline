@@ -81,6 +81,7 @@ from description_pipeline.sources.solidworks.discover_stage import (
     NATIVE_REQUEST_SCHEMA,
     NativeDiscoverRequest,
 )
+from description_pipeline.sources.solidworks.errors import CadError
 from tests.sources.selection_support import closure_evidence
 from tests.sources.test_solidworks_discovery import FakeBackend, record
 
@@ -2577,6 +2578,54 @@ class NativeDiscoverOperationTests(unittest.TestCase):
             }
         )
         return command, intent, outbound
+
+    def test_native_read_error_is_preserved_without_releasing_unknown_resource(self) -> None:
+        native_error = CadError(
+            "cad_mate_unreadable",
+            "A native mate could not be read",
+            {"feature": "placement", "type": "MateInPlace", "api": "GetSpecificFeature2"},
+        )
+
+        class UnreadableBackend(_CountingBackend):
+            def discover_native(self, frozen_source, settings, *, on_activity=None):
+                self.calls += 1
+                raise native_error
+
+        reader = _NativeObservationFixture(self.inventory, self.MAIN, self.edges)
+        backend = UnreadableBackend(copy.deepcopy(self.native_record))
+        client = self.runtime(reader, backend)
+        workspace = self.root / "unreadable-native-mate"
+        archive = seal_source_archive(
+            self.source, self.inventory, workspace / "input-source-set.zip"
+        )
+        request = self.request("discover-unreadable-native-mate")
+        client.create_operation(
+            _operation(
+                request.operation_id,
+                archive,
+                kind=DISCOVER_KIND,
+                request=request.to_record(),
+                output_contract=NATIVE_OBSERVATION_SCHEMA,
+            )
+        )
+        client.upload_input(request.operation_id, archive)
+        unknown = client.wait_for_terminal(request.operation_id, timeout=5)
+        self.assertEqual(unknown.state, "unknown")
+        self.assertFalse(unknown.resource_terminated)
+        self.assertIsNone(unknown.artifact)
+        self.assertEqual(unknown.failure.code, "discover.native_unknown")
+        self.assertEqual(backend.calls, 1)
+        with sqlite3.connect(self.root / "state/native-operations/operations.sqlite3") as database:
+            payload = database.execute(
+                "SELECT payload_json FROM native_operation_event "
+                "WHERE operation_id=? AND event_type='unknown'",
+                (request.operation_id,),
+            ).fetchone()[0]
+            self.assertEqual(json.loads(payload)["detail"], {"native_error": native_error.to_dict()})
+            self.assertEqual(
+                database.execute("SELECT COUNT(*) FROM native_resource_lease").fetchone()[0],
+                1,
+            )
 
     def test_single_discover_operation_selects_full_bound_archive_and_stops(self) -> None:
         reader = _NativeObservationFixture(self.inventory, self.MAIN, self.edges)
