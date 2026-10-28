@@ -197,6 +197,59 @@ class PlatformEnvTests(unittest.TestCase):
         }
         self.assertEqual(parsed, env)
 
+    def test_service_environment_prevents_imports_from_mutating_release(self) -> None:
+        result = self.derive(self.snapshot, install_id="gen-1")
+        env = render_operator.read_env(result["env_path"])
+        units_root = self.root / "systemd-config"
+        rendered = subprocess.run(
+            ["/bin/bash", str(ROOT / "deploy/airflow/services.sh"), "render"],
+            env={
+                **env,
+                "PATH": "/usr/bin:/bin",
+                "HOME": str(self.root),
+                "XDG_CONFIG_HOME": str(units_root),
+                "AIRFLOW_API_PORT": "8080",
+                "OPERATOR_DERIVED_ENV": str(result["env_path"]),
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        for unit in render_operator.systemd_units.units_for_role("airflow"):
+            service = (units_root / "systemd/user" / f"{unit}.service").read_text(encoding="utf-8")
+            self.assertIn(f"EnvironmentFile={result['env_path']}\n", service)
+        module = self.tree / "release_import_probe.py"
+        module.write_text("VALUE = 42\n", encoding="utf-8")
+        before = tree_digest(self.tree)
+        script = (
+            "import importlib.util, sys; "
+            "spec = importlib.util.spec_from_file_location('release_import_probe', sys.argv[1]); "
+            "module = importlib.util.module_from_spec(spec); "
+            "spec.loader.exec_module(module); assert module.VALUE == 42"
+        )
+        imported = subprocess.run(
+            [sys.executable, "-c", script, str(module)],
+            env=env,
+            cwd="/tmp",
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(imported.returncode, 0, imported.stderr)
+        self.assertEqual(tree_digest(self.tree), before)
+        without_policy = {key: value for key, value in env.items() if key != "PYTHONDONTWRITEBYTECODE"}
+        imported = subprocess.run(
+            [sys.executable, "-c", script, str(module)],
+            env=without_policy,
+            cwd="/tmp",
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(imported.returncode, 0, imported.stderr)
+        self.assertNotEqual(tree_digest(self.tree), before)
+
     def test_the_env_encoding_round_trips_every_boundary_value(self) -> None:
         """One contract: encode -> decode -> bash source reproduce the exact bytes."""
 
