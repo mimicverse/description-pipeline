@@ -675,6 +675,33 @@ class FeishuAuthManagerTests(unittest.TestCase):
         self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-no-failed"))
         self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-terminal"))
         self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-unresolved"))
+        self.assertFalse(
+            decide(
+                "PUT",
+                run,
+                clear_dag_run,
+                run_id="run-terminal",
+                user=admin,
+            )
+        )
+        self.assertFalse(
+            decide(
+                "PUT",
+                run,
+                clear_dag_run,
+                run_id="run-unresolved",
+                user=admin,
+            )
+        )
+        self.assertFalse(
+            decide(
+                "PUT",
+                run,
+                clear_dag_run,
+                run_id="run-success",
+                user=admin,
+            )
+        )
         # The exact immutable-retry body is part of the owner grant; admins are exempt.
         self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-own", clear_body_safe=False))
         self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-own", clear_body_safe=None))

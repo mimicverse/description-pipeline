@@ -56,6 +56,7 @@ from description_pipeline.orchestration.request_context import bound_request
 from description_pipeline.orchestration.run_ownership import (
     MANUAL_CREATE_ENDPOINT,
     SINGLE_RUN_CLEAR_ENDPOINT,
+    canonical_clear_allowed,
     owner_retry_allowed,
     owner_create_allowed,
     routed_route,
@@ -411,22 +412,21 @@ class FeishuAuthManager(BaseAuthManager[FeishuUser]):
         access_entity: DagAccessEntity | None = None,
         details: DagDetails | None = None,
     ) -> bool:
-        if self._is_admin(user):
-            return True
+        is_admin = self._is_admin(user)
         if details is None or details.id != ALLOWED_DAG_ID:
-            return False
+            return is_admin
         if method == "GET":
             return True
         if access_entity is not DagAccessEntity.RUN:
-            return False
+            return is_admin
         if bound_request() is None:
             # The packaged request-context middleware is not active: every operator RUN grant
             # fails closed. Without routed context a POST cannot be distinguished from backfill
             # or bulk creation, so even manual creation is refused until the guard is installed.
-            return False
+            return is_admin and method != "PUT"
         route = routed_route()
         if route is None or route.dag_id != ALLOWED_DAG_ID:
-            return False
+            return is_admin
         if (
             method == "POST"
             and route.endpoint == MANUAL_CREATE_ENDPOINT
@@ -434,18 +434,27 @@ class FeishuAuthManager(BaseAuthManager[FeishuUser]):
             and route.dag_run_id is None
         ):
             # The body is untrusted; persisted admission, dispatch and parent ownership must match.
-            return owner_create_allowed(user, route.dag_id)
+            return (
+                True
+                if is_admin
+                else owner_create_allowed(user, route.dag_id)
+            )
         if (
             method == "PUT"
             and route.endpoint == SINGLE_RUN_CLEAR_ENDPOINT
             and route.http_method == "POST"
             and route.dag_run_id
-            and route.clear_body_safe
         ):
+            if not canonical_clear_allowed(route.dag_id, route.dag_run_id):
+                return False
+            if is_admin:
+                return True
+            if not route.clear_body_safe:
+                return False
             # The one owner mutation: retrying the caller's own run. Note/state patches,
             # partitions, bulk, wildcard, backfills and deletion stay administrator-only.
             return owner_retry_allowed(user, route.dag_id, route.dag_run_id)
-        return False
+        return is_admin
 
     def is_authorized_configuration(
         self, *, method: ResourceMethod, user: FeishuUser, details: ConfigurationDetails | None = None

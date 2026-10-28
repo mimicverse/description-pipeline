@@ -403,6 +403,29 @@ def recorded_canonical_projection(dag_id: str, dag_run_id: str) -> dict | None:
     return projection
 
 
+def canonical_clear_projection_authorized(
+    projection: dict | None,
+    *,
+    principal: str | None = None,
+) -> bool:
+    """Whether one validated projection may be cleared in place."""
+
+    request = projection.get("request") if isinstance(projection, dict) else None
+    if not isinstance(request, dict) or not isinstance(request.get("principal"), str):
+        return False
+    if principal is not None and request.get("principal") != principal:
+        return False
+    return registered_recovery_block(projection) is None
+
+
+def canonical_clear_allowed(dag_id: str, dag_run_id: str) -> bool:
+    """The canonical safety gate for administrator direct Airflow clear."""
+
+    return canonical_clear_projection_authorized(
+        recorded_canonical_projection(dag_id, dag_run_id)
+    )
+
+
 def owner_retry_allowed(user: Any, dag_id: str, run_id: str) -> bool:
     """True only for the caller's own run that is a positively classified transport recovery."""
     facts = recorded_run_facts(dag_id, run_id)
@@ -412,11 +435,9 @@ def owner_retry_allowed(user: Any, dag_id: str, run_id: str) -> bool:
     if principal is None or principal != user.get_id():
         return False
     projection = recorded_canonical_projection(dag_id, run_id)
-    request = projection.get("request") if isinstance(projection, dict) else None
-    if (
-        not isinstance(request, dict)
-        or request.get("principal") != principal
-        or registered_recovery_block(projection) is not None
+    if not canonical_clear_projection_authorized(
+        projection,
+        principal=principal,
     ):
         return False
     return classify_recovery(run_state, task_states).eligible

@@ -14,6 +14,7 @@ from description_pipeline.orchestration import request_context as context
 from description_pipeline.orchestration.airflow_client import native_run_id
 from description_pipeline.orchestration.run_ownership import (
     CreateDispatchBinding,
+    canonical_clear_allowed,
     owner_create_allowed,
     owner_retry_allowed,
     recorded_create_binding,
@@ -355,6 +356,31 @@ class LinkedRunOwnershipTests(unittest.TestCase):
             ),
         ):
             self.assertFalse(owner_retry_allowed(user, "solidworks_to_urdf", DAG_RUN_ID))
+
+    def test_administrator_clear_uses_the_same_canonical_safety_gate(self) -> None:
+        cases = (
+            ("queued", True),
+            ("running", True),
+            ("failed", False),
+            ("cancelled", False),
+            ("succeeded", False),
+            ("unresolved", False),
+            ("unknown", False),
+            (None, False),
+        )
+        for state, expected in cases:
+            projection = canonical_projection(state=state) if state is not None else None
+            with (
+                self.subTest(state=state),
+                patch(
+                    "description_pipeline.orchestration.run_ownership.recorded_canonical_projection",
+                    return_value=projection,
+                ),
+            ):
+                self.assertIs(
+                    canonical_clear_allowed("solidworks_to_urdf", DAG_RUN_ID),
+                    expected,
+                )
 
     def test_registered_recovery_block_matches_canonical_state_authority(self) -> None:
         from description_pipeline.orchestration import portal  # noqa: PLC0415
