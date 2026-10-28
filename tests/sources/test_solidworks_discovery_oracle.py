@@ -94,14 +94,24 @@ def native_record() -> dict:
 
     files = {
         name: hashlib.sha256(f"placeholder {name}\n".encode()).hexdigest()
-        for name in ("cad/robot.SLDASM", "cad/base.SLDPRT", "cad/arm.SLDPRT")
+        for name in (
+            "cad/robot.SLDASM",
+            "cad/base.SLDPRT",
+            "cad/sub.SLDASM",
+            "cad/arm.SLDPRT",
+        )
     }
     source_selection = sealed_selection(
         files,
         "cad/robot.SLDASM",
         edges={
-            "cad/robot.SLDASM": ["cad/base.SLDPRT", "cad/arm.SLDPRT"],
+            "cad/robot.SLDASM": [
+                "cad/base.SLDPRT",
+                "cad/sub.SLDASM",
+                "cad/arm.SLDPRT",
+            ],
             "cad/base.SLDPRT": [],
+            "cad/sub.SLDASM": [],
             "cad/arm.SLDPRT": [],
         },
     )
@@ -311,7 +321,12 @@ class OracleSemanticsTests(unittest.TestCase):
         """One delivery produced by the generator from the analytic fixture (or a variant)."""
         self.serial += 1
         source = self.tmp / f"native{self.serial}"
-        for name in ("cad/robot.SLDASM", "cad/base.SLDPRT", "cad/arm.SLDPRT"):
+        for name in (
+            "cad/robot.SLDASM",
+            "cad/base.SLDPRT",
+            "cad/sub.SLDASM",
+            "cad/arm.SLDPRT",
+        ):
             path = source / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(f"placeholder {name}\n".encode())
