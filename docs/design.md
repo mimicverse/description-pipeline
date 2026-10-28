@@ -76,7 +76,7 @@ CAD 有值时先读取、保留和检查，再按有据规则修正。规则不�
 | `platform/` | canonical facts、查询投影及诊断存储组合 |
 | `orchestration/` | Airflow、HTTP/native operation、Portal、认证和传输适配 |
 | `repository/` | 固定目标及基线下的候选分支、Git 和 PR 适配 |
-| `build/`、`deploy/` | 确定性打包、受管安装、健康、数据库切换与灾难恢复 |
+| `build/`、`deploy/` | 确定性打包、受管安装、健康与同版灾难恢复 |
 
 核心调用链是：
 

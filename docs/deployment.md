@@ -36,7 +36,7 @@ Linux 使用一份私有 `platform.json`。schema 拒绝未知键、不安全路
 
 `solidworks_windows` 连接的 `host`、`password` 为空，`port` 为 `null`，`extra` 恰含 `config_identity`；该引用只含快照的 `schema_version`、绝对 `path` 和 `sha256`。消费者按同一契约检查受控目录、普通非链接文件、`0600` 权限、快照格式及字节摘要。新接纳再核对当前安装记录；已冻结运行继续读取自己的配置身份，不能回退到当前连接的路由。
 
-安装、晋升和回退在关闭准入期间写入对应配置引用，完整核验后才能开放准入；失败保留原步骤证据。端点地址、目录、产品路由及凭据文件引用均从快照解析，不复制到连接字段。令牌轮换只更新受控凭据文件并验证认证，不重建旧式连接。
+首次安装在关闭准入期间写入配置引用，完整核验后才能开放准入；失败保留本次证据并保持准入关闭。同版业务恢复沿用同一配置身份。端点地址、目录、产品路由及凭据文件引用均从快照解析，不复制到连接字段。令牌轮换只更新受控凭据文件并验证认证，不重建旧式连接。
 
 Windows target 的生产接纳只读取一次 `PLATFORM_CONFIG_SNAPSHOT` exact bytes，并以同一
 组 bytes 校验 snapshot、state root 下的唯一 `install-record.json`、record 的
