@@ -15,12 +15,12 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
+from description_pipeline.stages import STAGE_IDS
 from description_pipeline import cli
 from description_pipeline.artifacts import ArtifactStore
 from description_pipeline.io import PipelineError, digest, write_json
 from description_pipeline.pipeline.admission import build_run_admission
 from description_pipeline.pipeline.application import (
-    STAGES,
     ApplicationError,
     ApplicationPortMissing,
     EffectWakeupHint,
@@ -672,7 +672,7 @@ class StageApplicationTests(unittest.TestCase):
     def test_execute_run_routes_all_six_stages_through_the_same_admission(self):
         handlers = {
             stage: _CompletingHandler(self.harness.native_tool if stage == "discover" else None)
-            for stage in STAGES
+            for stage in STAGE_IDS
         }
         application = StageApplication(
             services=self.backend,
@@ -687,7 +687,7 @@ class StageApplicationTests(unittest.TestCase):
         self.assertEqual(outcome.stage, "publish")
         self.assertEqual(
             {stage: handler.executions for stage, handler in handlers.items()},
-            dict.fromkeys(STAGES, 1),
+            dict.fromkeys(STAGE_IDS, 1),
         )
 
     def test_replay_refuses_until_common_command_scope_is_available(self):

@@ -28,12 +28,10 @@ from description_pipeline.schemas import (
     TOOL_SCHEMA,
     VERIFICATION_CERTIFICATE_SCHEMA,
 )
-from description_pipeline.stages import CONTRACT, CONTRACT_SHA256, stage_view
+from description_pipeline.stages import CONTRACT, CONTRACT_SHA256, STAGE_IDS, stage_view
 
 from .protocol_support import protocol_events
 from .source_record_support import source_record
-
-STAGES = ("freeze", "discover", "capture", "generate", "verify", "publish")
 
 
 def build_sealed_delivery(
@@ -513,7 +511,7 @@ class RegisteredPlatform:
         stage_rows: list[dict] = []
         by_stage: dict[str, dict[str, dict]] = {}
         members: dict[str, dict] = {}
-        for stage in STAGES:
+        for stage in STAGE_IDS:
             row = registered.get(stage)
             if not isinstance(row, dict):
                 stage_rows.append(

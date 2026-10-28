@@ -30,6 +30,7 @@ from ..orchestration.native_operation_client import (
 )
 from ..repository.publish import REPOSITORY_SNAPSHOT_METADATA
 from ..runtime import tool_record
+from ..stages import STAGE_IDS
 from ..schemas import AIRFLOW_DISPATCH_CONF_SCHEMA
 from .admission import (
     AdmissionSpec,
@@ -84,14 +85,6 @@ from .stages.publish import PublishHandler
 from .verify import VerifyHandler
 from .verify_contract import CERTIFICATE_FILENAME
 
-STAGES: tuple[StageId, ...] = (
-    "freeze",
-    "discover",
-    "capture",
-    "generate",
-    "verify",
-    "publish",
-)
 _EFFECT_KINDS = frozenset(get_args(EffectKind))
 _REQUIRED_RECONCILIATION_KINDS = (
     "native_operation",
@@ -596,7 +589,7 @@ class StageApplication:
             )
         self.cancellation_controllers = MappingProxyType(controllers)
         for name, values in (("handlers", handlers), ("builders", builders)):
-            unknown = set(values) - set(STAGES)
+            unknown = set(values) - set(STAGE_IDS)
             if unknown:
                 raise ApplicationError(
                     "application.registry_invalid",
@@ -610,8 +603,8 @@ class StageApplication:
 
     def missing_capabilities(self) -> dict[str, list[str]]:
         return {
-            "handlers": [stage for stage in STAGES if stage not in self.handlers],
-            "builders": [stage for stage in STAGES if stage not in self.builders],
+            "handlers": [stage for stage in STAGE_IDS if stage not in self.handlers],
+            "builders": [stage for stage in STAGE_IDS if stage not in self.builders],
             "reconciliation": (
                 [
                     kind
@@ -1083,8 +1076,8 @@ class StageApplication:
         tuple[VerifiedPredecessor, ...],
         VerifiedDiscoverResult | None,
     ]:
-        index = STAGES.index(stage)
-        previous = predecessors.get(STAGES[index - 1]) if index else None
+        index = STAGE_IDS.index(stage)
+        previous = predecessors.get(STAGE_IDS[index - 1]) if index else None
         supporting: tuple[VerifiedPredecessor, ...] = ()
         if stage == "capture":
             supporting = (predecessors["freeze"],)
@@ -1182,7 +1175,7 @@ class StageApplication:
     def run_stage(self, run_id: str, stage: StageId) -> StageAttemptResult:
         """Execute one admitted stage or return its canonical pending wait."""
 
-        if stage not in STAGES:
+        if stage not in STAGE_IDS:
             raise ApplicationError("application.stage_invalid", f"Unknown stage {stage!r}")
         self._validate_airflow_task_binding(run_id, stage)
         spec, admission = self._load_spec(run_id)
@@ -1196,8 +1189,8 @@ class StageApplication:
         predecessors: dict[StageId, VerifiedPredecessor] = {}
         discover_result: VerifiedDiscoverResult | None = None
         verify_result: VerifiedVerifyResult | None = None
-        target_index = STAGES.index(stage)
-        for current_stage in STAGES[: target_index + 1]:
+        target_index = STAGE_IDS.index(stage)
+        for current_stage in STAGE_IDS[: target_index + 1]:
             command = self._build_command(
                 spec,
                 current_stage,
@@ -1360,11 +1353,11 @@ class StageApplication:
     def execute_run(self, run_id: str, *, through: StageId = "publish") -> ApplicationOutcome:
         """Run stages one at a time from one admission; no downstream work is hidden in a handler."""
 
-        if through not in STAGES:
+        if through not in STAGE_IDS:
             raise ApplicationError("application.stage_invalid", f"Unknown stage {through!r}")
         last: StageAttemptResult | None = None
         completed_stage: StageId | None = None
-        for stage in STAGES[: STAGES.index(through) + 1]:
+        for stage in STAGE_IDS[: STAGE_IDS.index(through) + 1]:
             last = self.run_stage(run_id, stage)
             outcome, payload = _stage_attempt_record(last)
             if outcome != "completed":
@@ -1630,7 +1623,6 @@ def application_from_environment(
         native_target_identity=registered_target,
     )
 __all__ = [
-    "STAGES",
     "AdmissionOutcome",
     "AirflowTaskBinding",
     "ApplicationError",

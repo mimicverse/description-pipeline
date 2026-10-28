@@ -16,6 +16,7 @@ from datetime import datetime
 from typing import Protocol
 
 from ..io import PipelineError, digest
+from ..stages import STAGE_IDS
 from ..pipeline.admission import (
     AdmissionSpec,
     VerifiedDiscoverResult,
@@ -48,7 +49,6 @@ from ..pipeline.contracts import (
     StagePending,
     StageQualification,
     StageResult,
-    STAGES,
     StageStatus,
     project_run_status,
     project_stage_status,
@@ -155,7 +155,7 @@ def _run_state_from_canonical_facts(
     """Consume the common stage/run projectors; this layer only loads raw DB facts."""
 
     if request.get("schema_version") != DIAGNOSTIC_ADMISSION_SCHEMA:
-        outcomes = tuple(decisions.get(stage) for stage in STAGES)
+        outcomes = tuple(decisions.get(stage) for stage in STAGE_IDS)
         return project_run_status(
             stage_outcomes=outcomes,
             effect_states=effect_states,
@@ -1232,7 +1232,7 @@ class FactStore(RunControlStore):
         return command
 
     def load_stage_command(self, run_id: str, stage: str) -> StageCommand:
-        if stage not in STAGES:
+        if stage not in STAGE_IDS:
             raise FactStoreError(f"The stage {stage!r} is not a canonical pipeline stage")
         with self._transaction() as connection:
             cursor = connection.cursor()
@@ -1567,7 +1567,7 @@ class FactStore(RunControlStore):
         seen = set()
         while current.predecessor_decision_id is not None:
             chain_key = (current.run_id, current.predecessor_decision_id)
-            if chain_key in seen or len(seen) >= len(STAGES):
+            if chain_key in seen or len(seen) >= len(STAGE_IDS):
                 raise FactConflict("The command predecessor chain is cyclic or too deep")
             seen.add(chain_key)
             decision_row = self._decision_by_id_cursor(cursor, current.predecessor_decision_id)
@@ -1580,7 +1580,7 @@ class FactStore(RunControlStore):
             if (
                 decision.outcome != "completed"
                 or predecessor.run_id != command.run_id
-                or STAGES.index(predecessor.stage) >= STAGES.index(current.stage)
+                or STAGE_IDS.index(predecessor.stage) >= STAGE_IDS.index(current.stage)
             ):
                 raise FactConflict("The predecessor decision is not an earlier completed stage of this run")
             chain.append(predecessor)

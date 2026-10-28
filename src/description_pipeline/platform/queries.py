@@ -6,10 +6,10 @@ from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
 
+from ..stages import STAGE_IDS
 from ..artifacts import ArtifactStore
 from ..io import PipelineError
 from ..pipeline.contracts import (
-    STAGES,
     ArtifactRef,
     FailureEnvelope,
     RunAdmission,
@@ -552,7 +552,7 @@ def read_run_projection(
                 claim["fence"],
                 claim["yield_effect_id"],
             )
-    for stage in STAGES:
+    for stage in STAGE_IDS:
         command = next(
             (
                 command
@@ -621,7 +621,7 @@ def read_run_projection(
         pending_effect_states = tuple(
             "unknown" for _effect_id in pending_effects
         )
-        stage_index = STAGES.index(stage)
+        stage_index = STAGE_IDS.index(stage)
         predecessor_completed = (
             stage_index == 0
             or diagnostic_target == stage

@@ -11,9 +11,10 @@ from pathlib import Path
 from . import __version__
 from .io import PipelineError, pin_utf8_streams, read_data
 from .pipeline.admission import AdmissionSpec
-from .pipeline.application import AdmissionOutcome, ApplicationOutcome, STAGES, StageApplication
+from .pipeline.application import AdmissionOutcome, ApplicationOutcome, StageApplication
 from .pipeline.contracts import FailureEnvelope, StagePending, StageResult
 from .runtime import tool_record
+from .stages import STAGE_IDS
 
 ApplicationFactory = Callable[[], StageApplication]
 CLI_VERSION_PREFIX = "description-pipeline"
@@ -35,7 +36,7 @@ def parser() -> argparse.ArgumentParser:
 
     run = operations.add_parser("run", help="execute admitted stages through one boundary")
     run.add_argument("run_id")
-    run.add_argument("--through", choices=STAGES, default="publish")
+    run.add_argument("--through", choices=STAGE_IDS, default="publish")
 
     operations.add_parser("doctor", help="show the actual portable runtime identity")
     return commands
