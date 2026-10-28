@@ -2376,7 +2376,7 @@ class NativeOperationRuntime:
             "queued": sum(
                 view.state in {"accepted", "awaiting_input"} for view in views
             ),
-            "unresolved": sum(view.state == "unknown" for view in views),
+            "unresolved": sum(view.state == "unknown" and not view.resource_terminated for view in views),
         }
 
     def _operation_ids(self) -> list[tuple[str]]:

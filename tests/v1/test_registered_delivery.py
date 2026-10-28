@@ -201,6 +201,130 @@ class RegisteredFailureReadoutTests(unittest.TestCase):
         self.assertEqual(payload["pr"]["url"], "https://github.com/example/robot/pull/1")
 
 
+class RegisteredStagePresentationTests(unittest.TestCase):
+    """The actual run API projects registered stage rows without a coarse override."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="registered-stage-display-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _platform(self, capture_state: str) -> RegisteredPlatform:
+        platform = RegisteredPlatform(self.tmp / capture_state)
+        platform.admit(WSGI_RUN)
+        states = {
+            "freeze": "completed",
+            "discover": "completed",
+            "capture": capture_state,
+            "generate": "blocked",
+            "verify": "blocked",
+            "publish": "blocked",
+        }
+        for stage, state in states.items():
+            platform.stage(WSGI_RUN, stage, state=state)
+        platform.events(WSGI_RUN, protocol_events(subject=SUBJECT))
+        return platform
+
+    def _get(self, platform: RegisteredPlatform) -> dict:
+        app = portal_module.PortalApp(
+            portal_module.PortalConfig(
+                airflow=_PermissiveAirflow(),
+                run_control_store=platform.run_control,
+                config_identity_provider=lambda: "c" * 64,
+            )
+        )
+        session = app.sessions.create("user", "token", principal="fixture:local:reader")
+        response: dict = {}
+
+        def start(status, headers):
+            response["status"] = int(status.split()[0])
+
+        body = b"".join(
+            app(
+                {
+                    "REQUEST_METHOD": "GET",
+                    "PATH_INFO": f"/api/runs/{DAG}",
+                    "HTTP_COOKIE": f"{portal_module.DEFAULT_SESSION_COOKIE}={session.session_id}",
+                    "wsgi.input": io.BytesIO(b""),
+                },
+                start,
+            )
+        )
+        self.assertEqual(response["status"], 200)
+        return json.loads(body)
+
+    def test_actual_run_api_preserves_canonical_stage_and_report_states(self) -> None:
+        expected = {
+            "active": ("running", "running", "In progress"),
+            "waiting": ("waiting", "waiting", "Waiting"),
+            "blocked": ("blocked", "blocked", "Blocked by incomplete predecessor"),
+            "failed": ("failed", "failed", "Failed"),
+            "cancelled": ("cancelled", "cancelled", "Cancelled"),
+            "unresolved": ("unresolved", "unresolved", "Unresolved"),
+        }
+        for canonical, (stage_state, overall_state, stage_label) in expected.items():
+            with self.subTest(state=canonical):
+                payload = self._get(self._platform(canonical))
+                stages = {
+                    stage["id"]: stage for stage in payload["stage_view"]["stages"]
+                }
+                report_stages = {
+                    stage["id"]: stage for stage in payload["report"]["stages"]
+                }
+                self.assertEqual(stages["capture"]["state"], stage_state)
+                self.assertEqual(payload["report"]["overall"]["state"], overall_state)
+                self.assertEqual(report_stages["capture"]["state_label"], stage_label)
+                if canonical == "cancelled":
+                    self.assertEqual(payload["job"]["status"], "cancelled")
+                    self.assertEqual(payload["automatic"]["state"], "unverified")
+                    self.assertEqual(payload["activity"]["state"], "finished")
+                for downstream in ("generate", "verify", "publish"):
+                    self.assertEqual(stages[downstream]["state"], "blocked")
+                    self.assertEqual(
+                        report_stages[downstream]["state_label"],
+                        "Blocked by incomplete predecessor",
+                    )
+
+    def test_actual_run_api_fails_closed_for_noncanonical_stage_states(self) -> None:
+        for injected in ("queued", "ready", "invented"):
+            with self.subTest(state=injected):
+                payload = self._get(self._platform(injected))
+                stages = {
+                    stage["id"]: stage for stage in payload["stage_view"]["stages"]
+                }
+                report_stages = {
+                    stage["id"]: stage for stage in payload["report"]["stages"]
+                }
+                self.assertEqual(stages["capture"]["state"], "not_run")
+                self.assertEqual(report_stages["capture"]["state"], "not_run")
+
+    def test_actual_run_api_prioritizes_unresolved_over_other_terminal_rows(self) -> None:
+        platform = self._platform("unresolved")
+        platform.stage(WSGI_RUN, "verify", state="failed")
+        payload = self._get(platform)
+        stages = {stage["id"]: stage for stage in payload["stage_view"]["stages"]}
+        self.assertEqual(stages["capture"]["state"], "unresolved")
+        self.assertEqual(stages["verify"]["state"], "failed")
+        self.assertEqual(payload["report"]["overall"]["state"], "unresolved")
+
+    def test_actual_run_api_keeps_failed_qc_above_a_completed_event(self) -> None:
+        platform = self._platform("completed")
+        events = protocol_events(subject=SUBJECT)
+        capture_checks = [
+            event
+            for event in events
+            if event["stage"] == "capture" and isinstance(event.get("check"), dict)
+        ]
+        self.assertTrue(capture_checks)
+        capture_checks[0]["check"]["state"] = "failed"
+        platform.events(WSGI_RUN, events)
+
+        payload = self._get(platform)
+        stages = {stage["id"]: stage for stage in payload["stage_view"]["stages"]}
+        self.assertEqual(stages["capture"]["state"], "failed")
+        self.assertEqual(payload["report"]["overall"]["state"], "failed")
+        self.assertEqual(payload["report"]["failure"]["stage"], "capture")
+
+
 class _RetryAirflow(_PermissiveAirflow):
     """A retry-capable Airflow double that records every clear it is asked for."""
 

@@ -467,7 +467,10 @@ class ReportViewTests(unittest.TestCase):
         for downstream in ("capture", "generate", "verify", "publish"):
             with self.subTest(stage=downstream):
                 self.assertEqual(stages[downstream]["state"], "blocked")
-                self.assertEqual(stages[downstream]["state_label"], "Blocked by upstream failure")
+                self.assertEqual(
+                    stages[downstream]["state_label"],
+                    "Blocked by incomplete predecessor",
+                )
                 self.assertEqual(stages[downstream]["counts"]["boundary"]["executed"], 0)
                 self.assertTrue(all(not row["executed"] for row in stages[downstream]["boundary"]))
 
@@ -835,6 +838,49 @@ class ReportViewTests(unittest.TestCase):
             empty["stages"][0]["counts"]["boundary"],
             {"passed": 0, "executed": 0, "total": 2},
         )
+
+    def test_canonical_stage_states_reach_report_and_block_downstream(self) -> None:
+        expected = {
+            "active": ("running", "running"),
+            "cancelled": ("cancelled", "cancelled"),
+            "unresolved": ("unresolved", "unresolved"),
+        }
+        for canonical, (stage_state, overall_state) in expected.items():
+            with self.subTest(state=canonical):
+                events = protocol_events(subject=SHA)
+                for event in reversed(events):
+                    if event["stage"] != "capture" or "check" in event:
+                        continue
+                    event["state"] = canonical
+                    break
+                for event in reversed(events):
+                    if event["stage"] in {"generate", "verify", "publish"} and "check" not in event:
+                        event["state"] = "blocked"
+                report = build_report(
+                    {
+                        "run_id": RUN_ID,
+                        "request": {"handoff_sha256": HSHA},
+                        "events": events,
+                    }
+                )
+                stages = {stage["id"]: stage for stage in report["stages"]}
+                self.assertEqual(stages["capture"]["state"], stage_state)
+                self.assertEqual(stages["generate"]["state"], "blocked")
+                self.assertEqual(stages["publish"]["state"], "blocked")
+                self.assertEqual(report["overall"]["state"], overall_state)
+                self.assertEqual(
+                    report["overall"]["state_label"],
+                    {
+                        "running": "In progress",
+                        "cancelled": "Cancelled",
+                        "unresolved": "Unresolved",
+                    }[overall_state],
+                )
+                if canonical != "active":
+                    self.assertEqual(
+                        stages["capture"]["manual_scope_note"],
+                        "Automatic checks are not complete. Manual confirmations are not applicable yet.",
+                    )
 
     def test_incomplete_boundary_rows_never_fabricate_passes(self) -> None:
         job = passed_job()

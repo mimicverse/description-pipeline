@@ -172,6 +172,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'the editable install failed' }
           & py -3.12 -m unittest tests.v1.test_endpoint_config_boundary
           if ($LASTEXITCODE -ne 0) { throw 'the endpoint configuration boundary suite failed' }
+      - name: The native source batch staging boundary (real Windows CPython 3.12)
+        run: |
+          & py -3.12 -m unittest tests.v1.test_selection_transport tests.v1.test_selection_closure
+          if ($LASTEXITCODE -ne 0) { throw 'the native source batch staging suite failed' }
 
   distribution:
     runs-on: ubuntu-24.04

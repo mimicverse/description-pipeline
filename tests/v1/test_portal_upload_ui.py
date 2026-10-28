@@ -340,16 +340,31 @@ class ReportUiContractTests(unittest.TestCase):
         self.assertIn("localStorage.getItem", app)
         self.assertIn("localStorage.setItem", app)
         self.assertIn("portal.stage.", app)
-        self.assertIn('stage.state === "failed"', app)
+        self.assertIn("const STAGE_SELECTION_PRIORITY = [", app)
+        self.assertIn('"unresolved",\n  "failed",\n  "cancelled",\n  "running",', app)
 
     def test_blocked_stages_are_neutral_not_failed(self) -> None:
         app = self.app()
         self.assertNotIn('state === "failed" || state === "blocked") return "bad"', app)
-        self.assertIn('if (state === "failed") return "bad"', app)
+        self.assertIn('if (state === "failed" || state === "unresolved") return "bad"', app)
         css = (STATIC / "style.css").read_text(encoding="utf-8")
         self.assertNotIn(".step.blocked .step-meta { color: var(--bad); }", css)
         self.assertNotIn(".chip.failed, .chip.blocked", css)
         self.assertIn(".step.blocked .step-meta { color: var(--muted); }", css)
+
+    def test_stage_state_vocabulary_keeps_canonical_terminal_states(self) -> None:
+        app = self.app()
+        self.assertNotIn("const STAGE_STATES", app)
+        for token in (
+            'waiting: "Waiting"',
+            'cancelled: "Cancelled"',
+            'unresolved: "Unresolved"',
+            'if (state === "failed" || state === "unresolved") return "bad"',
+            "const STAGE_SELECTION_PRIORITY = [",
+            '"unresolved",\n  "failed",\n  "cancelled",\n  "running",',
+            'for (const state of STAGE_SELECTION_PRIORITY)',
+        ):
+            self.assertIn(token, app)
 
     def test_preview_uses_full_width_when_absent(self) -> None:
         app = self.app()
@@ -613,6 +628,25 @@ class ActivityJsLogicTests(unittest.TestCase):
             "node is required to run the JS logic regression; install the pinned runtime (.nvmrc)",
         )
         script = ROOT / "tests" / "js" / "activity_logic_test.mjs"
+        result = subprocess.run(
+            [node, str(script)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, f"{result.stdout}\n{result.stderr}")
+
+
+class StageStateJsLogicTests(unittest.TestCase):
+    """Focused Node regression for stage labels, dot styles and default selection."""
+
+    def test_stage_state_logic_regression(self) -> None:
+        node = shutil.which("node")
+        self.assertIsNotNone(
+            node,
+            "node is required to run the JS logic regression; install the pinned runtime (.nvmrc)",
+        )
+        script = ROOT / "tests" / "js" / "stage_state_logic_test.mjs"
         result = subprocess.run(
             [node, str(script)],
             capture_output=True,

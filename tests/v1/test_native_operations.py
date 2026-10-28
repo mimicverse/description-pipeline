@@ -3428,6 +3428,9 @@ class NativeDiscoverOperationTests(unittest.TestCase):
         self.assertEqual(unobservable.state_class, "unobservable")
 
     def test_only_verified_resource_termination_without_output_is_absent(self) -> None:
+        from description_pipeline.orchestration.native_operation_server import _health
+        from description_pipeline.sources.solidworks import isolation
+
         def unknown_executor(request, source_archive, workspace, native_tool):
             del request, source_archive, workspace, native_tool
             raise RuntimeError("native result is unknown")
@@ -3436,6 +3439,8 @@ class NativeDiscoverOperationTests(unittest.TestCase):
             state_root=self.root / "terminal-state",
             native_tool_factory=lambda: NATIVE_TOOL,
             executors={DISCOVER_KIND: unknown_executor},
+            endpoint_config_digest="d" * 64,
+            endpoint_port=8443,
         )
         server = _Server(runtime)
         self.addCleanup(server.close)
@@ -3468,6 +3473,23 @@ class NativeDiscoverOperationTests(unittest.TestCase):
         operation = client.wait_for_terminal(request.operation_id)
         self.assertEqual(operation.state, "unknown")
         self.assertFalse(operation.resource_terminated)
+        self.assertEqual(runtime.stats()["unresolved"], 1)
+
+        def health():
+            with (
+                mock.patch("description_pipeline.orchestration.native_operation_server.sys.platform", "win32"),
+                mock.patch.object(isolation, "registered_executable", return_value=Path("SolidWorks.exe")),
+                mock.patch.object(isolation, "cad_session_facts", return_value={
+                    "external_session_detected": False,
+                    "owned_sessions": 0,
+                    "lease_held": False,
+                    "problems": [],
+                }),
+                mock.patch("description_pipeline.runtime.native_readiness"),
+            ):
+                return _health(runtime)
+
+        self.assertFalse(health()["ready"])
         observer = NativeOperationEffectObserver(client)
         unresolved = observer.observe(
             command=command,
@@ -3491,6 +3513,11 @@ class NativeDiscoverOperationTests(unittest.TestCase):
         )
         self.assertEqual(reconciled.fact_type, "reconciled")
         self.assertEqual(reconciled.state_class, "absent")
+        terminal = runtime.view(request.operation_id)
+        self.assertEqual(terminal["state"], "unknown")
+        self.assertTrue(terminal["resource_terminated"])
+        self.assertEqual(runtime.stats(), {"active": 0, "queued": 0, "unresolved": 0})
+        self.assertTrue(health()["ready"])
 
     def test_tool_refusal_is_terminal_and_never_reads_native_record(self) -> None:
         refused_tool_sha256 = "cd" * 32

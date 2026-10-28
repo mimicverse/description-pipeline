@@ -49,6 +49,7 @@ from ..stages import (
     CONTRACT_SHA256,
     VIEW_SCHEMA,
     activity_view,
+    stage_display_state,
     stage_view,
 )
 from ..geometry.native_scope import (
@@ -2955,12 +2956,7 @@ class PortalApp:
             )
         return {
             "run_id": projection.get("run_id"),
-            "status": {
-                "succeeded": "passed",
-                "failed": "failed",
-                "cancelled": "failed",
-                "running": "running",
-            }.get(str(projection.get("state")), str(projection.get("state"))),
+            "status": "passed" if projection.get("state") == "succeeded" else str(projection.get("state")),
             "scope": projection.get("scope"),
             "formal_eligible": formal_eligible,
             "events": events,
@@ -3277,11 +3273,7 @@ class PortalApp:
             events.append(
                 {
                     "stage": stage_id,
-                    "state": (
-                        platform_state
-                        if platform_state in {"completed", "failed", "blocked", "running"}
-                        else "not_run"
-                    ),
+                    "state": stage_display_state(platform_state),
                     **({"at": at} if at is not None else {}),
                     **({"reuse": reuse} if reuse is not None else {}),
                 }

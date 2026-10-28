@@ -403,7 +403,7 @@ def activity_view(job) -> dict:
     final = job.get("activity_final") if isinstance(job.get("activity_final"), dict) else None
     if final is None and isinstance(job.get("activity"), dict):
         final = job["activity"]
-    if status in {"passed", "failed", "native_complete"}:
+    if status in {"passed", "failed", "cancelled", "native_complete"}:
         view["state"] = "finished"
         if final is not None or view["recent"]:
             view["available"] = True
@@ -473,6 +473,28 @@ def checked(emit, stage, boundary, identifier, action, *, describe=None):
 def _complete_checks(details):
     """Nested gates must be explicit, unique and individually passed."""
     return required_rows_complete(details.get("required_checks"), details.get("checks"))
+
+
+DISPLAY_STAGE_STATES = frozenset(
+    {
+        "waiting",
+        "running",
+        "completed",
+        "failed",
+        "blocked",
+        "cancelled",
+        "unresolved",
+        "not_run",
+    }
+)
+
+
+def stage_display_state(state):
+    """Map one canonical/live stage state into the bounded UI state vocabulary."""
+
+    if state == "active":
+        return "running"
+    return state if state in DISPLAY_STAGE_STATES else "not_run"
 
 
 def stage_view(job=None):
@@ -548,17 +570,15 @@ def stage_view(job=None):
         checks = stage["input_qc"] + stage["output_qc"]
         failed = any(item["state"] == "failed" for item in checks)
         complete = all(item["state"] == "passed" for item in checks)
-        state = latest.get("state", "not_run")
+        state = stage_display_state(latest.get("state", "not_run"))
         if job.get("status") == "failed" and observed and observed[-1] is events[-1]:
             state = "failed"
         if failed or state == "failed":
             state = "failed"
-        elif blocked:
+        elif state == "blocked" or blocked:
             state = "blocked"
         elif state == "completed" and not complete:
             state = "failed"
-        elif state not in {"running", "completed"}:
-            state = "not_run"
         stage.update(
             state=state,
             in_scope=stage["id"] in view["execution_scope"],
@@ -575,6 +595,8 @@ def stage_view(job=None):
                 if any(name == path or (path.endswith("/") and name.startswith(path)) for path in paths)
             }
             item.update(files=matches, availability="recorded" if matches else "not_produced")
+        if state in {"failed", "cancelled", "unresolved", "blocked"}:
+            blocked = True
         if state == "failed":
             stage["error"] = job.get("error") or result.get("error") or "Required stage checks failed or were not run"
             stage["diagnostic"] = job.get("detail") or result.get("detail") or latest.get("detail")
