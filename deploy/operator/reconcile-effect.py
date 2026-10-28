@@ -8,7 +8,8 @@ import json
 import sys
 
 from description_pipeline.io import PipelineError
-from description_pipeline.pipeline.application import STAGES, application_from_environment
+from description_pipeline.pipeline.application import application_from_environment
+from description_pipeline.stages import STAGE_IDS
 
 
 class MaintenanceError(RuntimeError):
@@ -18,7 +19,7 @@ class MaintenanceError(RuntimeError):
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-id", required=True)
-    parser.add_argument("--stage", choices=STAGES, required=True)
+    parser.add_argument("--stage", choices=STAGE_IDS, required=True)
     parser.add_argument("--effect-key", required=True)
     return parser.parse_args(argv)
 
