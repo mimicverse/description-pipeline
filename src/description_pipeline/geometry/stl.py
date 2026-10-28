@@ -99,7 +99,7 @@ def vertices_bytes(data: bytes):
     return np.array(
         [
             [float(value) for value in fields[1:]]
-            for line in data.decode("ascii", errors="ignore").splitlines()
+            for line in data.decode("ascii").splitlines()
             if len(fields := line.split()) == 4 and fields[0] == "vertex"
         ]
     )
@@ -141,7 +141,10 @@ def _read_binary(data: bytes) -> MeshStats:
 
 
 def _read_ascii(data: bytes) -> MeshStats:
-    text = data.decode("ascii", errors="ignore")
+    try:
+        text = data.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise StlError("ASCII STL contains non-ASCII bytes") from error
     if "vertex" not in text or not text.lstrip().lower().startswith("solid"):
         raise StlError("data is neither binary STL nor ASCII STL with a solid header")
     low = [float("inf")] * 3

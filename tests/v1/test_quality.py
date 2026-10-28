@@ -2719,6 +2719,28 @@ class SurfaceOnlyGeometryExemptionTests(unittest.TestCase):
         self.assertAlmostEqual(ascii_stats.degenerate_area, 1e-14, places=12)
         self.assertAlmostEqual(ascii_stats.area, 5e-7 + 1e-14, places=12)
 
+    def test_stl_rejects_non_ascii_bytes_without_repairing_geometry(self):
+        from description_pipeline.geometry import stl
+
+        valid = (
+            b"solid mesh\nfacet normal 0 0 1\nouter loop\n"
+            b"vertex 0 0 0\nvertex 1 0 0\nvertex 0 1 0\n"
+            b"endloop\nendfacet\nendsolid mesh\n"
+        )
+        self.assertEqual(stl.read_bytes(valid).triangles, 1)
+        np.testing.assert_array_equal(stl.vertices_bytes(valid), [[0, 0, 0], [1, 0, 0], [0, 1, 0]])
+        for original, corrupted in (
+            (b"vertex 1", b"v\xffertex 1"),
+            (b"vertex 1", b"vertex \xff1"),
+        ):
+            damaged = valid.replace(original, corrupted)
+            for reader in (stl.read_bytes, stl.vertices_bytes):
+                with (
+                    self.subTest(reader=reader.__name__, corrupted=corrupted),
+                    self.assertRaisesRegex(stl.StlError, "non-ASCII"),
+                ):
+                    reader(damaged)
+
     def test_degenerate_plane_is_still_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(PipelineError) as caught:
