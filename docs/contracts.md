@@ -679,6 +679,11 @@ raw/STL 一致性证明本次原始三角事实到交付的派生一致性，不
 当前 health 自报或迁移后的 URL 自行晋升为新的权威。系统继续消费该既有登记，不新增
 target registry。
 
+原生端点的 `jobs.unresolved` 只计尚无可信资源终止事实的 `unknown` operation。
+经既有对账入口追加 `resource_released` 后，历史 operation 仍保留 `unknown`，但不再
+阻塞原生资源就绪；平台 effect 仍须通过原 observer 按精确请求独立对账，端点恢复
+就绪不会把业务结果改为成功，也不授权重发 CAD。
+
 经过核验的 endpoint preparation 在 `endpoint-identity.json` 顶层记录
 `target_identity={schema_version,install_id,pipeline_id,target_id}`，并保留原有
 `install_id`、`config_digest` 与 release identity。写入 install record 时将该完整
