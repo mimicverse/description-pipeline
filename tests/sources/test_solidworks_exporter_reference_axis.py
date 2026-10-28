@@ -372,8 +372,8 @@ class ImportedSourceBindingTests(unittest.TestCase):
             backend = N.SolidWorksBackend(session_factory=lambda: _Session(app))
             real = N._component_source_document
 
-            def forged(component_arg, source_root):
-                result = real(component_arg, source_root)
+            def forged(component_arg, source_root, **kwargs):
+                result = real(component_arg, source_root, **kwargs)
                 provenance = result.get("source_provenance") or {}
                 if provenance.get("state") == "cached_materialization":
                     provenance["author_imported_in_source_root"] = True

@@ -5863,7 +5863,7 @@ class MainAssemblySelectionTests(unittest.TestCase):
                 self.assertEqual(caught.exception.code, "cad_document_open_failed")
                 self.assertEqual(caught.exception.detail["errors"], error_value)
 
-    def test_already_open_document_does_not_fabricate_zero_status(self) -> None:
+    def test_exact_root_probe_observes_the_native_status_even_if_already_resident(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             assembly = _write(root, "robot.SLDASM")
@@ -5872,9 +5872,9 @@ class MainAssemblySelectionTests(unittest.TestCase):
             with _com_stubs():
                 backend.seal_documents([assembly])
                 entry = backend._probe_document(str(assembly))
-            self.assertTrue(entry["already_open"])
-            self.assertIsNone(entry["errors"])
-            self.assertIsNone(entry["warnings"])
+            self.assertNotIn("already_open", entry)
+            self.assertEqual(entry["errors"], 0)
+            self.assertEqual(entry["warnings"], 0)
 
     def test_clean_reference_open_keeps_selected_main_status(self) -> None:
         with TemporaryDirectory() as tmp:

@@ -102,7 +102,7 @@ from description_pipeline.schemas import (
 
 from .split_capture_fixture import fixture_backend
 from .test_pipeline_discover import (
-    ClosureReader,
+    NativeObservationFixture,
     CountingBackend,
     DiscoverHarness,
 )
@@ -575,7 +575,7 @@ class CaptureHandlerTests(unittest.TestCase):
         )
         discover_execution = DiscoverHandler(
             self.stage_fixture.port(
-                reader=ClosureReader(
+                reader=NativeObservationFixture(
                     transform=_capture_component_closure,
                     reader_sha256=self.expected_native_tool_sha256,
                 ),

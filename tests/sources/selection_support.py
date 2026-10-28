@@ -100,3 +100,56 @@ def sealed_selection(
     kwargs["reader_sha256"] = reader_sha256
     evidence = closure_evidence(upload_files, main_assembly, **kwargs)
     return seal_closure_selection(upload_files, main_assembly, evidence, reader_sha256=reader_sha256)
+
+
+def observation_from_closure_fixture(record: dict, closure: dict) -> dict:
+    """Give one test backend the same primitive carrier as native Discover."""
+
+    import copy
+
+    record = copy.deepcopy(record)
+    rows = []
+    edges = [
+        (owner, edge)
+        for owner, document in closure["documents"].items()
+        for edge in document.get("resolved_edges", [])
+    ]
+    for row in record["components"]:
+        match = next(((owner, edge) for owner, edge in edges if edge["resolved"] == row["document"]), None)
+        if match is None:
+            continue
+        owner, edge = match
+        row["native_reference"] = {
+            "defining": owner,
+            "native_owner": owner,
+            "defining_anchor": None,
+            "resolved_path": edge["resolved_path"],
+            "is_virtual": False,
+        }
+        rows.append(row)
+    for slot in closure.get("virtual_components", []):
+        rows.append({
+            "instance_id": slot["instance"],
+            "name2": slot["instance"],
+            "document": slot["session_document_path"],
+            "configuration": slot["configuration"],
+            "suppression_state": slot["suppression_state"],
+            "native_reference": {
+                "defining": slot["document"],
+                "native_owner": slot["owner"],
+                "defining_anchor": slot["owner_anchor"],
+                "resolved_path": slot["session_document_path"],
+                "is_virtual": True,
+                "imported_path": None,
+            },
+        })
+    record["components"] = rows
+    record["unresolved_components"] = []
+    record["open_status"] = closure["open_status"]
+    record["search"] = closure["search_configuration"]
+    record["session"] = {"native_api_pid": 21040, **closure["session"]}
+    record["stored_references_phase"] = "preopen"
+    record["stored_references"] = {
+        name: document["stored_references"] for name, document in closure["documents"].items()
+    }
+    return record

@@ -950,7 +950,6 @@ class NativeOperationExecutor(Protocol):
 class DiscoverOperationExecutor:
     """The production Discover operation over the existing native core."""
 
-    selection_reader_factory: Callable | None = None
     backend_factory: Callable | None = None
     cad_ownership_file: Path | None = None
     on_activity: Callable | None = None
@@ -969,7 +968,6 @@ class DiscoverOperationExecutor:
                 native_request,
                 workspace / "discover",
                 native_tool=native_tool,
-                selection_reader_factory=self.selection_reader_factory,
                 backend_factory=self.backend_factory,
                 cad_ownership_file=self.cad_ownership_file,
                 on_activity=self.on_activity,

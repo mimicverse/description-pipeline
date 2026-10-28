@@ -14,7 +14,7 @@ from ...io import PipelineError, canonical, confined, digest, file_digest, read_
 from ...interface_records import REQUEST_PURPOSES
 from ...schemas import ARTIFACT_MANIFEST_SCHEMA, NATIVE_OBSERVATION_SCHEMA, NATIVE_SOURCE_SET_SCHEMA
 from ...schemas import NATIVE_DISCOVER_REQUEST_SCHEMA as NATIVE_REQUEST_SCHEMA
-from .discovery import DISCOVERY_SCHEMA, DiscoverySettings, read_native_record
+from .discovery import DISCOVERY_SCHEMA
 from .revision import package_inventory
 from .selection import selection_bindings, validate_file_index
 
@@ -215,7 +215,7 @@ def _validated_tool(
     return tool
 
 
-def observe_native_record(
+def seal_native_observation(
     selected_source: Path,
     output: Path,
     request: NativeDiscoverRequest,
@@ -223,14 +223,9 @@ def observe_native_record(
     selection: Mapping[str, Any],
     native_tool: Mapping[str, Any],
     source_archive_sha256: str,
-    backend=None,
-    on_activity=None,
+    record: Mapping[str, Any],
 ) -> NativeObservation:
-    """Read one selected staged source and seal all native observations.
-
-    This function runs on the native host. It performs no rule derivation and
-    starts no Capture operation.
-    """
+    """Seal the released native observation after its closure was admitted."""
 
     selected_source = Path(selected_source)
     output = Path(output)
@@ -251,9 +246,7 @@ def observe_native_record(
         request.expected_native_tool_sha256,
         request.expected_native_tool_record_sha256,
     )
-    settings = DiscoverySettings(main_assembly=request.main_assembly)
-    record = read_native_record(selected_source, settings, backend=backend, on_activity=on_activity)
-    record = copy.deepcopy(record)
+    record = copy.deepcopy(dict(record))
     record["source_selection"] = copy.deepcopy(bindings["selection"])
     _require(
         isinstance(record.get("files"), Mapping) and dict(record["files"]) == dict(bindings["files"]),
@@ -478,5 +471,5 @@ __all__ = [
     "NativeDiscoverRequest",
     "NativeObservation",
     "admit_native_observation",
-    "observe_native_record",
+    "seal_native_observation",
 ]

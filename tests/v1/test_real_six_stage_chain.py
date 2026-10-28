@@ -99,7 +99,7 @@ from tests.v1.verification_fixture import (
     _portable_tool,
 )
 from tests.v1.test_pipeline_discover import (
-    ClosureReader,
+    NativeObservationFixture,
     CountingBackend,
 )
 from tests.v1.test_pipeline_publish import PublishFixture, _PullRequests
@@ -542,12 +542,12 @@ class RealSixStageChainTests(unittest.TestCase):
             ArchiveDiscoverAdapter(
                 artifacts=self.store,
                 native_tool=self.native,
-                selection_reader_factory=lambda: ClosureReader(
-                    transform=_capture_component_closure,
-                    reader_sha256=self.native["source_sha256"],
-                ),
                 backend_factory=lambda _root, _files: CountingBackend(
-                    copy.deepcopy(capture_record())
+                    copy.deepcopy(capture_record()),
+                    observation_fixture=NativeObservationFixture(
+                        transform=_capture_component_closure,
+                        reader_sha256=self.native["source_sha256"],
+                    ),
                 ),
             )
         )
@@ -680,13 +680,13 @@ class RealSixStageChainTests(unittest.TestCase):
             native_tool_factory=lambda: copy.deepcopy(self.native),
             executors={
                 DISCOVER_KIND: DiscoverOperationExecutor(
-                    selection_reader_factory=lambda: ClosureReader(
+                    backend_factory=lambda _root, _files: CountingBackend(
+                    copy.deepcopy(capture_record()),
+                    observation_fixture=NativeObservationFixture(
                         transform=_capture_component_closure,
                         reader_sha256=self.native["source_sha256"],
                     ),
-                    backend_factory=lambda _root, _files: CountingBackend(
-                        copy.deepcopy(capture_record())
-                    ),
+                ),
                 ),
                 CAPTURE_KIND: CaptureOperationExecutor(
                     backend_factory=_qualified_backend

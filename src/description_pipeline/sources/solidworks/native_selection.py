@@ -1,42 +1,9 @@
-"""Native closure admission for the provisionally staged upload inventory.
+"""Pure closure admission projected from the one native Discover observation.
 
-The whole uploaded folder is staged first (per-file hash-verified by the
-endpoint); this reader then performs **one** closure walk over the staged
-bytes in the backend's owned session:
-
-* the session search scope is pinned to the staged root
-  (``SolidWorksBackend.configure_staged_search`` /
-  ``ISldWorks.SetSearchFolders``) before any document is opened,
-* closed no-search ``GetDocumentDependencies2(path, False, False, False)``
-  stored references are recorded verbatim **before any document is opened**
-  (query A over every staged native document; once an assembly is open, a
-  false-Searchflag query reports the in-session resolution, not the saved
-  author references) and are evidence only, never admission,
-* the sealed staged main is opened read-only and every occurrence's actual
-  resolved document (and, for imports, the materialization/author-metadata
-  readings) is recorded,
-* admission is the native closure: every resolved document must lie under the
-  staged root and be a staged upload-index file with matching sha256; any
-  out-of-stage, unresolved or unbound-import edge refuses the run with the
-  verbatim stored/resolved paths,
-* the CU pre-verification (W6, the W5 probe-v4 check set) reads the main
-  document's declared delivery identity (``dp.*``) in the same read-only pass
-  and refuses when a required declaration is absent or the property set is
-  unreadable: submitted values never replace CAD-authored declarations, and
-  no definition exchange or native capture runs on such a package.  The
-  sealed selection record carries the ``preverify`` block as its receipt.
-
-No basename or suffix substitution exists anywhere in this module: engine
-reported paths are mapped to upload-index names by their exact staged
-relative location.  A suppressed placement (state 0) loads nothing: it is
-recorded as evidence and omitted from the closure graph.  A lightweight
-placement (state 1/4) stays graph-admissible and is flagged; measurement paths
-refuse it elsewhere.  State 5 (internal-ID mismatch) and unreadable or
-undocumented states refuse the run with the exact instance.
-
-The return contract is documented in
-``reviews/incident094339/native-closure-reader-contract-20261011.md`` (agreed
-with worker B, 2026-10-11).
+The native reader owns pre-open references, exact main opening, occurrence
+readings, search restoration and release. This module never starts CAD. It
+maps those same primitives to the sealed selection using exact staged paths;
+unknown bindings and unreadable required facts refuse rather than substitute.
 """
 from __future__ import annotations
 
@@ -61,7 +28,7 @@ from .session_artifacts import (
 from .saved_state import normalize_open_status
 from .selection import MAX_SELECTION_FILES, SelectionError, selection_path, validate_file_index
 
-__all__ = ["MAX_SELECTION_FILES", "NativeSelectionReader"]
+__all__ = ["MAX_SELECTION_FILES", "project_native_closure"]
 
 CLOSURE_SCHEMA = "solidworks-to-urdf.native-closure/v1"
 
@@ -933,59 +900,50 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
         ),
         "excluded": excluded,
         "session": readings.get("session") or {},
-        "sealed_count": len(readings.get("sealed") or []),
-        "documents_before": readings.get("documents_before"),
-        "documents_after": readings.get("documents_after"),
     }
 
 
-class NativeSelectionReader:
-    """One-shot closure reader over the provisionally staged upload inventory.
+def project_native_closure(stage, main_assembly, upload_files, record, *, reader_sha256):
+    """Admit the released observation without another native walk or open."""
 
-    ``observe(stage, main_assembly, upload_files)`` runs exactly one closure
-    walk in the backend's owned session and returns the evidence payload; the
-    session is closed before it returns.  Inject ``walker`` in tests (a
-    callable ``(stage_root, main, files) -> readings``); inject ``backend`` to
-    reuse a configured ``SolidWorksBackend`` (its staged search pin applies).
-    ``cad_ownership_file`` pinpoints the default backend's CAD ownership
-    ledger, so an endpoint-side reader shares the endpoint's single
-    state-root ledger instead of the library default.  Admission is
-    fail-closed; see the module docstring for the rules.
-    """
-
-    def __init__(self, *, walker=None, backend=None, reader_sha256=None, cad_ownership_file=None):
-        if walker is not None and backend is not None:
-            raise SelectionError("selection_reader_invalid", "Inject either a walker or a backend, not both")
-        if cad_ownership_file is not None and (walker is not None or backend is not None):
-            raise SelectionError(
-                "selection_reader_invalid", "A CAD ownership file applies only to the default backend"
-            )
-        if reader_sha256 is not None and (
-            not isinstance(reader_sha256, str) or _SHA.fullmatch(reader_sha256) is None
-        ):
-            raise SelectionError("selection_reader_invalid", "reader_sha256 must be a SHA-256 digest")
-        if walker is None:
-            if backend is None:
-                from .native import SolidWorksBackend
-
-                backend = SolidWorksBackend(
-                    cad_ownership_file=None if cad_ownership_file is None else Path(cad_ownership_file)
-                )
-            walker = backend.closure_readings
-        if not callable(walker):
-            raise SelectionError("selection_reader_invalid", "The closure walker must be callable")
-        self._walker = walker
-        self._reader_sha256 = reader_sha256
-
-    def observe(self, stage, main_assembly, upload_files):
-        """One native closure walk; the evidence payload or a fail-closed refusal."""
-
-        stage_root = _stage_root(stage)
-        files = validate_file_index(upload_files)
-        main = selection_path(main_assembly)
-        if not main.lower().endswith(".sldasm") or main not in files:
-            raise SelectionError("selection_main_invalid", "Choose an indexed SolidWorks assembly", path=main)
-        readings = self._walker(stage_root, main, files)
-        if not isinstance(readings, Mapping):
-            raise SelectionError("selection_reader_result_invalid", "The closure walk returned no readings")
-        return _closure_payload(stage_root, main, files, readings, self._reader_sha256)
+    stage_root = _stage_root(stage)
+    files = validate_file_index(upload_files)
+    main = selection_path(main_assembly)
+    if not main.lower().endswith(".sldasm") or main not in files:
+        raise SelectionError("selection_main_invalid", "Choose an indexed SolidWorks assembly", path=main)
+    if not isinstance(reader_sha256, str) or _SHA.fullmatch(reader_sha256) is None:
+        raise SelectionError("selection_reader_invalid", "reader_sha256 must be a SHA-256 digest")
+    if not isinstance(record, Mapping):
+        raise SelectionError("selection_reader_result_invalid", "Native Discover returned no observation")
+    components = record.get("components")
+    unresolved = record.get("unresolved_components")
+    if not isinstance(components, list) or not isinstance(unresolved, list):
+        raise SelectionError("selection_reader_result_invalid", "Native occurrence observations are missing")
+    occurrences = []
+    for row in [*components, *unresolved]:
+        reference = row.get("native_reference") if isinstance(row, Mapping) else None
+        if not isinstance(reference, Mapping):
+            raise SelectionError("selection_reader_result_invalid", "A native occurrence has no source reading")
+        instance = row.get("instance_id") or row.get("name2") or row.get("instance")
+        occurrences.append({
+            **reference,
+            "instance": instance,
+            "name": instance,
+            "configuration": row.get("configuration"),
+            "suppression_state": row.get("suppression_state"),
+        })
+    properties = record.get("properties")
+    if not isinstance(properties, Mapping) or not isinstance(properties.get("document"), Mapping):
+        raise SelectionError("selection_identity_unreadable", "The native document property set is unreadable")
+    readings = {
+        "occurrences": occurrences,
+        "open": record.get("open_status"),
+        "identity_properties": properties["document"],
+        "saved_configuration": record.get("saved_configuration"),
+        "document_state": record.get("document_state"),
+        "stored_references": record.get("stored_references"),
+        "stored_references_phase": record.get("stored_references_phase"),
+        "search": record.get("search"),
+        "session": record.get("session"),
+    }
+    return _closure_payload(stage_root, main, files, readings, reader_sha256)

@@ -748,26 +748,6 @@ def pin_search_folders(app, root, folder_type=SEARCH_FOLDER_DOCUMENT_TYPE):
     return evidence
 
 
-def _stage_relative(root, value) -> str | None:
-    """Path of ``value`` under ``root`` in portable form, or ``None``."""
-
-    try:
-        relative = Path(str(value)).resolve().relative_to(Path(str(root)).resolve())
-    except (OSError, ValueError):
-        return None
-    return relative.as_posix()
-
-
-def _index_spelling(index, relative) -> str | None:
-    """The upload-index spelling of a staged-relative path (case-tolerant)."""
-
-    if relative in index:
-        return relative
-    folded = relative.casefold()
-    matches = [name for name in index if name.casefold() == folded]
-    return matches[0] if len(matches) == 1 else None
-
-
 def _matches_assembly_root(reference, root, reference_full, reference_name, assembly_full) -> bool:
     """True when a mate entity references the owning assembly's own root component.
 
@@ -2662,7 +2642,8 @@ def _urdf_exporter_pid_bindings(xml_text, extension, source_root, *, native_api_
                     raise ValueError("GetObjectByPersistReference3 returned no object")
                 component = _component(_dynamic(resolved))
                 row["name2"] = str(_property(component, "Name2") or "") or None
-                row.update(_component_source_document(component, source_root))
+                source_document = _component_source_document(component, source_root)
+                row.update({key: value for key, value in source_document.items() if key != "native_reference"})
                 if isinstance(row.get("source_provenance"), dict) and type(native_api_pid) is int:
                     row["source_provenance"]["native_api_pid"] = native_api_pid
                 row["configuration"] = str(_property(component, "ReferencedConfiguration") or "") or None
@@ -2820,6 +2801,7 @@ def _require_missing_component(component, name, native_path):
                 "imported_path_error": imported_error,
             },
         )
+    return {"resolved_path": native_path or "", "is_virtual": virtual, "imported_path": imported_path}
 
 
 def _component_source_document(component, source_root, *, native_path=None):
@@ -2856,7 +2838,8 @@ def _component_source_document(component, source_root, *, native_path=None):
         "author_imported_error": None,
         "used_api": SESSION_DOCUMENT_API,
     }
-    result = {"document": None, "source_provenance": provenance}
+    reference = {"resolved_path": native_path, "is_virtual": None}
+    result = {"document": None, "source_provenance": provenance, "native_reference": reference}
     virtual = None
     try:
         reading = _property(component, "IsVirtual")
@@ -2864,9 +2847,12 @@ def _component_source_document(component, source_root, *, native_path=None):
     except Exception as error:  # noqa: BLE001 - an unreadable virtual flag stays unknown
         provenance["virtual_error"] = f"{type(error).__name__}: {error}"[:200]
     provenance["is_virtual"] = virtual
+    reference["is_virtual"] = virtual
+    if "virtual_error" in provenance:
+        reference["virtual_error"] = provenance["virtual_error"]
     relative = _relative_document(native_path, source_root)
     if relative and virtual is False:
-        return {"document": relative}
+        return {"document": relative, "native_reference": reference}
     if relative and virtual is None:
         provenance["error"] = (
             "ValueError: a delivered document requires an explicit False IsVirtual reading"
@@ -2874,8 +2860,10 @@ def _component_source_document(component, source_root, *, native_path=None):
         return result
     imported_path, imported_error = _imported_path_reading(component)
     provenance["author_imported_path"] = imported_path
+    reference["imported_path"] = imported_path
     if imported_error is not None:
         provenance["author_imported_error"] = imported_error
+        reference["import_error"] = imported_error
     if virtual is True:
         if provenance.get("author_imported_error") is not None:
             provenance["error"] = (
@@ -7199,244 +7187,81 @@ class SolidWorksBackend(CadBackend):
 
 
 
-    def closure_readings(self, stage_root, main_assembly, index):
-        """Raw native readings for the staged closure walk (mechanical only).
+    @contextmanager
+    def _discover_session(self, source_root, source_files):
+        """Own one observation window and finish restoration before admission."""
 
-        Pins the session search scope to ``stage_root``, seals the staged
-        inventory, opens the staged main read-only and records every
-        occurrence's identity, referenced configuration, raw suppression
-        state, resolved document path and virtual/import readings, plus
-        pre-open query-A stored references over every staged native document.
-        The session search scope is restored before return and both the
-        restoration outcome and the per-session pinning evidence are recorded.
-        State 5 and unreadable/invalid states are recorded, not raised:
-        admission policy (``native_selection``) refuses with the exact
-        instance.  Nothing is saved, moved or exported.
-        """
-
-        stage = Path(stage_root).resolve()
-        names = sorted(str(name) for name in index)
-        self.configure_staged_search(stage)
-        sealed = self.seal_documents([str(stage / name) for name in names])
-        readings: dict = {"stage_root": str(stage), "main_assembly": str(main_assembly), "sealed": sealed}
-        session_info: dict = {}
-        pinned: dict = {}
+        if getattr(self._local, "depth", 0):
+            raise CadError("cad_discovery_nested_session", "Discover must own its complete native session")
+        self.configure_staged_search(source_root)
+        self.seal_documents([str(source_root / name) for name in source_files])
+        observation = {}
+        pinned = {}
         restored_folders = None
         restored_raw = None
         restore_error = None
         with self.session():
             app = self._app_obj()
-            session_info = {
+            identity = {
                 "native_api_pid": int(_method(app, "GetProcessID")),
                 "solidworks_revision": str(_method(app, "RevisionNumber")),
             }
-            evidence = self.staged_search_evidence()
-            pinned = dict(evidence[-1]) if evidence else {}
+            search = self.staged_search_evidence()
+            pinned = dict(search[-1]) if search else {}
             try:
-                # Query A over every staged native document BEFORE any document is
-                # opened: once an assembly is open, a false-Searchflag query reports
-                # the in-session resolution rather than the saved author references.
-                # The pre-open result is the verbatim stored-reference evidence.
                 stored = {}
-                for name in names:
+                for name in sorted(source_files):
                     if not name.lower().endswith((".sldasm", ".sldprt")):
                         continue
                     try:
-                        entries = closed_document_dependencies(app, str(stage / name))
+                        entries = closed_document_dependencies(app, str(source_root / name))
                         stored[name] = [
                             {"name": item.get("name"), "location": item.get("location")} for item in entries
                         ]
-                    except Exception as error:  # noqa: BLE001 - recorded; closure policy refuses elsewhere
+                    except Exception as error:  # noqa: BLE001 - admission retains the native read failure
                         stored[name] = {"error": f"{type(error).__name__}: {error}"[:200]}
-                readings["stored_references"] = stored
-                readings["stored_references_phase"] = "preopen"
-                readings["stored_references_count"] = len(stored)
-                readings["documents_before"] = int(_method(app, "GetDocumentCount"))
-                entry = self._probe_document(str(stage / main_assembly))
-                raw_open = {
-                    "already_open": entry.get("already_open"),
-                    "open_exception": entry.get("open_exception"),
-                    "errors": entry.get("errors"),
-                    "warnings": entry.get("warnings"),
-                }
-                missing = (
-                    self._missing_reference_evidence(str(stage / main_assembly))
-                    if entry.get("errors") == 2 else {"state": "unavailable", "items": []}
-                )
-                try:
-                    readings["open"] = normalize_open_status(
-                        {
-                            **raw_open,
-                            "missing_references": missing,
-                        }
-                    )
-                except ValueError as error:
-                    readings["open"] = {**raw_open, "status_error": str(error)}
-                doc = entry.get("doc")
-                if doc is None:
-                    raise CadError(
-                        "cad_staged_main_unopenable",
-                        "the staged main assembly could not be opened read-only in the owned session",
-                        {"main_assembly": str(main_assembly), "open": readings["open"]},
-                    )
-                document_state_before = _discovery_document_state(doc)
-                _manager, configuration = _active_configuration_view(doc)
-                # CU pre-verification input: the main document's declared delivery
-                # identity (dp.*), read-only with the primitive configuration name.
-                # An unreadable declaration set is recorded, never raised; the
-                # admission policy (native_selection) refuses it fail-closed.
-                try:
-                    _context_manager, _context_configuration, configuration_name = _configuration_context(doc)
-                    readings["configuration_name_error"] = None
-                except CadError as error:
-                    configuration_name = ""
-                    readings["configuration_name_error"] = f"{type(error).__name__}: {error}"[:200]
-                try:
-                    identity_properties = _custom_properties(doc, configuration_name)
-                except Exception as error:  # noqa: BLE001 - recorded; admission refuses unreadable declarations
-                    identity_properties = None
-                    readings["identity_properties_error"] = f"{type(error).__name__}: {error}"[:200]
-                else:
-                    readings["identity_properties_error"] = None
-                readings["identity_properties"] = identity_properties
-                # Delivery-configuration evidence in the same shape as the native
-                # discovery record: the actual saved configuration name plus the
-                # before/after saved-state observations of the opened document.
-                # Persisted as read - unknowns and read errors stay explicit.
-                # The "after" snapshot is taken when the native walk below has
-                # completed and before the document is closed.
-                readings["saved_configuration"] = str(configuration_name or "") or None
-                root = _component(_method(configuration, "GetRootComponent3", True))
-                occurrences = []
-                stack = [
-                    (child, "", 0, str(main_assembly), None, str(main_assembly))
-                    for child in reversed(_as_list(_method(root, "GetChildren")))
-                ]
-                while stack:
-                    item, context, depth, defining, anchor, native_owner = stack.pop()
-                    if depth > 40:
-                        raise CadError("cad_assembly_too_deep", str(stage / main_assembly), {"depth": depth})
-                    component = _component(item)
-                    name = str(_property(component, "Name2") or _property(component, "Name") or "")
-                    instance = name if not context or name.startswith(context + "/") else f"{context}/{name}"
-                    record = {
-                        "instance": instance,
-                        "name": name,
-                        "depth": depth,
-                        "defining": defining,
-                        "defining_anchor": anchor,
-                        "native_owner": native_owner,
-                    }
-                    referenced = _property(component, "ReferencedConfiguration")
-                    record["configuration"] = str(referenced) if referenced is not None else None
-                    try:
-                        state = _method(component, "GetSuppression2")
-                        record["suppression_state"] = int(state) if type(state) is int else None
-                        if record["suppression_state"] is None:
-                            record["state_error"] = f"non-integer reading: {state!r}"[:200]
-                    except Exception as error:  # noqa: BLE001 - recorded for the policy refusal
-                        record["suppression_state"] = None
-                        record["state_error"] = f"{type(error).__name__}: {error}"[:200]
-                    try:
-                        record["resolved_path"] = str(_method(component, "GetPathName") or "")
-                    except Exception as error:  # noqa: BLE001 - recorded for the policy refusal
-                        record["resolved_path"] = ""
-                        record["path_error"] = f"{type(error).__name__}: {error}"[:200]
-                    virtual = None
-                    try:
-                        reading = _property(component, "IsVirtual")
-                        virtual = reading if type(reading) is bool else None
-                    except Exception:  # noqa: BLE001 - an unreadable virtual flag stays unknown
-                        virtual = None
-                    record["is_virtual"] = virtual
-                    resolved = record["resolved_path"]
-                    relative = _stage_relative(stage, resolved) if resolved else None
-                    record["resolved_relative"] = relative
-                    materialized = session_materialization_path(resolved) or (
-                        virtual is True and embedded_virtual_component_path(resolved)
-                    )
-                    anchor_for_children = instance if materialized else anchor
-                    child_owner = native_owner
-                    if not materialized and relative:
-                        child_owner = _index_spelling(index, relative) or native_owner
-                    if (
-                        (not resolved)
-                        or relative is None
-                        or virtual is True
-                        or session_artifact_path(resolved)
-                    ):
-                        imported, import_error = _imported_path_reading(component)
-                        record["imported_path"] = imported
-                        if import_error is not None:
-                            record["import_error"] = import_error
-                    occurrences.append(record)
-                    if record["suppression_state"] == COMPONENT_SUPPRESSED:
-                        continue
-                    child_defining = relative or resolved or defining
-                    for child in reversed(_as_list(_method(component, "GetChildren"))):
-                        stack.append((child, instance, depth + 1, child_defining, anchor_for_children, child_owner))
-                readings["occurrences"] = occurrences
-                readings["documents_after"] = int(_method(app, "GetDocumentCount"))
-                readings["document_state"] = {
-                    "before": document_state_before,
-                    "after": _discovery_document_state(doc),
-                    "used_api": (
-                        "IModelDoc2.GetSaveFlag/IModelDocExtension.NeedsRebuild2/"
-                        "IConfiguration.Name/IConfiguration.NeedsRebuild"
-                    ),
-                }
+                observation.update({
+                    "stored_references": stored,
+                    "stored_references_phase": "preopen",
+                })
+                yield observation
             finally:
                 try:
                     _method(app, "SetSearchFolders", SEARCH_FOLDER_DOCUMENT_TYPE, ";".join(pinned.get("before") or []))
                     restored = read_search_folders(app, SEARCH_FOLDER_DOCUMENT_TYPE)
-                    restored_folders = restored["folders"]
-                    restored_raw = restored["raw"]
-                except Exception as error:  # noqa: BLE001 - recorded, never masked
+                    restored_folders, restored_raw = restored["folders"], restored["raw"]
+                except Exception as error:  # noqa: BLE001 - release still runs before the refusal
                     restore_error = f"{type(error).__name__}: {error}"[:300]
         before_folders = list(pinned.get("before") or [])
         restored_ok = restored_folders is not None and sorted(
             str(item).casefold() for item in restored_folders
         ) == sorted(str(item).casefold() for item in before_folders)
-        readings["search"] = {
+        observation["search"] = {
             "folder_type": pinned.get("folder_type", SEARCH_FOLDER_DOCUMENT_TYPE),
             "apis": ["ISldWorks.GetSearchFolders", "ISldWorks.SetSearchFolders"],
             "before": before_folders,
             "before_raw": pinned.get("before_raw"),
-            "pinned": pinned.get("pinned", [str(stage)]),
+            "pinned": pinned.get("pinned", [str(source_root)]),
             "observed_after_pin": pinned.get("observed_after_pin", []),
             "after_raw": pinned.get("after_raw"),
             "set_return": pinned.get("set_return"),
             "restored": restored_ok,
             "restored_raw": restored_raw,
             "restore_error": restore_error,
-            "evidence": [dict(item) for item in self.staged_search_evidence()],
         }
-        readings["session"] = {**session_info, "sealed": True, "closed": True}
-        return readings
-
+        observation["session"] = {**identity, "sealed": True, "closed": True}
 
     def _probe_document(self, path):
         """Open the selected assembly without strict gating.
 
-        Documents already open in the owned session are reused.  Otherwise the
-        read-only open is attempted and its CAD-reported errors are recorded
+        The exact selected-root read-only open is attempted once, even if a
+        native application reports a resident document. Its errors are recorded
         instead of raised; the selected document is validated strictly before
         anything downstream reads it.  Only the exact vendor integer status is
         recorded: an unreadable VARIANT leaves the counts unset and blocks the
         selected root instead of coercing to zero.
         """
 
-        try:
-            doc = self._document_by_path(path)
-        except CadError as exc:
-            if exc.code != "document_not_open":
-                raise
-        else:
-            return {
-                "doc": doc, "errors": None, "warnings": None,
-                "open_exception": "the initial open status is unavailable for an already-open document",
-                "already_open": True,
-            }
         try:
             doc, errors, warnings = self._open_document_raw(path)
         except Exception as exc:  # noqa: BLE001 - a per-open failure is recorded, not fatal
@@ -7445,7 +7270,6 @@ class SolidWorksBackend(CadBackend):
                 "errors": None,
                 "warnings": None,
                 "open_exception": f"{type(exc).__name__}: {exc}"[:300],
-                "already_open": False,
             }
         if type(errors.value) is int and type(warnings.value) is int:
             counts = (errors.value, warnings.value)
@@ -7458,15 +7282,7 @@ class SolidWorksBackend(CadBackend):
             "errors": counts[0],
             "warnings": counts[1],
             "open_exception": None,
-            "already_open": False,
         }
-
-    def _main_entry(self, path):
-        """The selected assembly opened read-only; per-open failures are recorded."""
-
-        entry = self._probe_document(str(path))
-        entry["path"] = path
-        return entry
 
     def discover_native(self, frozen_source: Path, settings: dict, *, on_activity=None) -> dict:
         """Read the raw native record for CAD-only discovery (owned session).
@@ -7592,37 +7408,19 @@ class SolidWorksBackend(CadBackend):
                 )
             selected_path = candidates[0]
             selection_mode = "sole_candidate"
+        from .revision import package_inventory
+
+        source_files = package_inventory(source_root)
         activity.emit("session_start", force=True)
-        with self.session():
+        with self._discover_session(source_root, source_files) as observation:
             native_api_pid = int(_method(self._app_obj(), "GetProcessID"))
             # Exactly the selected frozen entry is opened; zero or several
             # assemblies already failed before this session started.
             activity.emit("open_document", current_object=_activity_object(selected_path, source_root), force=True)
-            main_entry = self._main_entry(selected_path)
-            main_entry["selection_mode"] = selection_mode
-            main_path = main_entry["path"]
+            main_path = selected_path
+            main_entry = self._probe_document(str(main_path))
             errors = main_entry.get("errors")
             warnings = main_entry.get("warnings")
-            if main_entry.get("already_open"):
-                # A document already open in the owned session may have been
-                # loaded as a transitive dependency of another document; only a
-                # fresh exact-root open reports this document's own status.
-                try:
-                    doc, raw_errors, raw_warnings = self._open_document_raw(str(main_path))
-                except Exception as exc:  # noqa: BLE001 - reported as the strict open failure
-                    raise self._open_failure(
-                        str(main_path), None, None, exception=f"{type(exc).__name__}: {exc}"[:300]
-                    ) from exc
-                if doc is None:
-                    raise self._open_failure(
-                        str(main_path), None, None, exception="exact-root open returned no document"
-                    )
-                if type(raw_errors.value) is not int or type(raw_warnings.value) is not int:
-                    raise self._open_failure(
-                        str(main_path), None, None, exception="exact-root open status is not an integer"
-                    )
-                errors, warnings = raw_errors.value, raw_warnings.value
-                main_entry = {**main_entry, "doc": doc, "errors": errors, "warnings": warnings}
             if main_entry.get("doc") is None or type(errors) is not int or type(warnings) is not int:
                 raise self._open_failure(
                     str(main_path),
@@ -7741,6 +7539,11 @@ class SolidWorksBackend(CadBackend):
                     # capture, not be silently traversed as a resolved occurrence.
                     state = _component_state(component)
                     document_path = _method(component, "GetPathName")
+                    reference_context = {
+                        "defining": _relative_document(assembly_path, source_root) or str(assembly_path),
+                        "defining_anchor": anchor,
+                        "native_owner": _relative_document(owner_path, source_root) or str(owner_path),
+                    }
                     loaded_document = _method(component, "GetModelDoc2")
                     if state != COMPONENT_SUPPRESSED and loaded_document is None:
                         raise CadError(
@@ -7752,10 +7555,11 @@ class SolidWorksBackend(CadBackend):
                         open_status["errors"] == 2 and state == COMPONENT_SUPPRESSED
                         and document_path in (None, "")
                     ):
-                        _require_missing_component(component, path_name, document_path)
+                        reference = _require_missing_component(component, path_name, document_path)
                         unresolved_components.append(
                             {
                                 "instance": path_name,
+                                "native_reference": {**reference, **reference_context},
                                 "document": (
                                     normalize_document_path(str(document_path))
                                     if _is_text_name(document_path)
@@ -7774,7 +7578,7 @@ class SolidWorksBackend(CadBackend):
                         )
                         components_done += 1
                         continue
-                    source_document = _component_source_document(component, source_root)
+                    source_document = _component_source_document(component, source_root, native_path=document_path)
                     # The native materialization identity is recorded inside
                     # source_provenance. Reading it from the outer record would
                     # make cached descendants lose their defining anchor.
@@ -7860,6 +7664,7 @@ class SolidWorksBackend(CadBackend):
                     entry = {
                         "name2": path_name,
                         "instance_id": path_name,
+                        "native_reference": {**source_document["native_reference"], **reference_context},
                         "document": source_document["document"]
                         or (normalize_document_path(str(document_path)) if _is_text_name(document_path) else ""),
                         "configuration": str(_property(component, "ReferencedConfiguration") or ""),
@@ -7883,7 +7688,7 @@ class SolidWorksBackend(CadBackend):
                     components.append(entry)
                     # Keep primitives beyond this traversal scope. Later
                     # configuration changes must not reuse borrowed occurrences.
-                    by_component[path_name] = (str(document_path), _method(component, "GetModelDoc2") is not None)
+                    by_component[path_name] = (str(document_path), loaded_document is not None)
                     by_document[path_name] = entry["document"]
                     children = list(_method(component, "GetChildren") or [])
                     if children:
@@ -7895,9 +7700,9 @@ class SolidWorksBackend(CadBackend):
                             # empty transform stays a blocking native finding
                             # downstream.
                             notes.append(f"transform:{path_name}:subtree_skipped_unreadable_parent")
-                        part = _method(component, "GetModelDoc2") if transform else None
+                        part = loaded_document if transform else None
                         if part is not None:
-                            referenced = str(_property(component, "ReferencedConfiguration") or "")
+                            referenced = entry["configuration"]
                             # A containment chain that repeats a document (an assembly
                             # holding itself, directly or through its ancestors) is a
                             # reference cycle: recursing would never converge and the
@@ -8308,12 +8113,17 @@ class SolidWorksBackend(CadBackend):
             files = {}
             hash_plan = []
             planned = set()
-            for path in (main_path, *[Path(item[0]) for item in by_component.values()]):
+            observed_paths = [
+                Path(by_component[entry["name2"]][0]) for entry in components if not entry["suppressed"]
+            ]
+            for path in (main_path, *observed_paths):
                 relative = _relative_document(path, source_root)
                 if relative and relative not in planned:
                     planned.add(relative)
                     hash_plan.append((path, relative))
             for entry in components:
+                if entry["suppressed"]:
+                    continue
                 provenance = entry.get("source_provenance", {})
                 relative = provenance.get("document") if provenance.get("state") == "resolved" else None
                 if relative and relative not in planned:
@@ -8354,7 +8164,7 @@ class SolidWorksBackend(CadBackend):
                 force=True,
                 params={"components": len(components), "mates": len(mates), "datums": len(datums)},
             )
-            return {
+            record = {
                 "schema_version": NATIVE_DISCOVERY_SCHEMA,
                 "contract": "native-discovery/v1",
                 "namespace": "dp",
@@ -8391,13 +8201,15 @@ class SolidWorksBackend(CadBackend):
                 "properties": property_buckets,
                 "files": files,
                 "selection": {
-                    "mode": main_entry.get("selection_mode"),
+                    "mode": selection_mode,
                     "main_assembly": _relative_document(main_path, source_root),
                 },
                 "open_status": open_status,
                 "unresolved_components": unresolved_components,
                 "notes": notes,
             }
+        record.update(observation)
+        return record
 
 
 

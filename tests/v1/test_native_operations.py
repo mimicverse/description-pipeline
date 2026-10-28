@@ -2251,14 +2251,20 @@ class _CountingBackend(FakeBackend):
 
     def discover_native(self, frozen_source, settings, *, on_activity=None):
         self.calls += 1
-        return super().discover_native(
-            frozen_source,
-            settings,
-            on_activity=on_activity,
+        return self._observation(frozen_source, settings, on_activity=on_activity)
+
+    def _observation(self, frozen_source, settings, *, on_activity=None):
+        from description_pipeline.sources.solidworks.revision import package_inventory
+        from tests.sources.selection_support import observation_from_closure_fixture
+
+        record = super().discover_native(frozen_source, settings, on_activity=on_activity)
+        closure = self.observation_fixture.closure_facts(
+            frozen_source, settings["main_assembly"], package_inventory(frozen_source),
         )
+        return observation_from_closure_fixture(record, closure)
 
 
-class _ClosureReader:
+class _NativeObservationFixture:
     def __init__(
         self,
         files: dict[str, str],
@@ -2273,7 +2279,7 @@ class _ClosureReader:
         self.reader_sha256 = reader_sha256
         self.calls = 0
 
-    def observe(self, stage, main_assembly, upload_files):
+    def closure_facts(self, stage, main_assembly, upload_files):
         self.calls += 1
         evidence = closure_evidence(
             upload_files,
@@ -2356,10 +2362,8 @@ class NativeDiscoverOperationTests(unittest.TestCase):
         )
 
     def runtime(self, reader, backend):
-        executor = DiscoverOperationExecutor(
-            selection_reader_factory=lambda: reader,
-            backend_factory=lambda _root, _files: backend,
-        )
+        backend.observation_fixture = reader
+        executor = DiscoverOperationExecutor(backend_factory=lambda _root, _files: backend)
         runtime = NativeOperationRuntime(
             state_root=self.root / "state",
             native_tool_factory=lambda: NATIVE_TOOL,
@@ -2465,7 +2469,7 @@ class NativeDiscoverOperationTests(unittest.TestCase):
         return command, intent, outbound
 
     def test_single_discover_operation_selects_full_bound_archive_and_stops(self) -> None:
-        reader = _ClosureReader(self.inventory, self.MAIN, self.edges)
+        reader = _NativeObservationFixture(self.inventory, self.MAIN, self.edges)
         backend = _CountingBackend(copy.deepcopy(self.native_record))
         client = self.runtime(reader, backend)
         port = NativeOperationDiscoverPort(
@@ -2536,14 +2540,13 @@ class NativeDiscoverOperationTests(unittest.TestCase):
                 *,
                 on_activity=None,
             ):
-                del frozen_source, settings, on_activity
                 self.calls += 1
                 entered.set()
                 if not release.wait(5):
                     raise AssertionError("native Discover was not released")
-                return copy.deepcopy(self.payload)
+                return self._observation(frozen_source, settings, on_activity=on_activity)
 
-        reader = _ClosureReader(self.inventory, self.MAIN, self.edges)
+        reader = _NativeObservationFixture(self.inventory, self.MAIN, self.edges)
         backend = GatedBackend(copy.deepcopy(self.native_record))
         client = self.runtime(reader, backend)
         client.create_operation = mock.Mock(
@@ -2605,14 +2608,13 @@ class NativeDiscoverOperationTests(unittest.TestCase):
                 *,
                 on_activity=None,
             ):
-                del frozen_source, settings, on_activity
                 self.calls += 1
                 entered.set()
                 if not release.wait(5):
                     raise AssertionError("native Discover was not released")
-                return copy.deepcopy(self.payload)
+                return self._observation(frozen_source, settings, on_activity=on_activity)
 
-        reader = _ClosureReader(self.inventory, self.MAIN, self.edges)
+        reader = _NativeObservationFixture(self.inventory, self.MAIN, self.edges)
         backend = GatedBackend(copy.deepcopy(self.native_record))
         client = self.runtime(reader, backend)
         port = NativeOperationDiscoverPort(
@@ -2685,7 +2687,7 @@ class NativeDiscoverOperationTests(unittest.TestCase):
         self.assertEqual(client.upload_input.call_count, 1)
 
     def test_discover_transfer_unobservable_conditions_remain_pending(self) -> None:
-        reader = _ClosureReader(self.inventory, self.MAIN, self.edges)
+        reader = _NativeObservationFixture(self.inventory, self.MAIN, self.edges)
         backend = _CountingBackend(copy.deepcopy(self.native_record))
         client = self.runtime(reader, backend)
         port = NativeOperationDiscoverPort(client, NATIVE_TOOL)
@@ -2731,7 +2733,7 @@ class NativeDiscoverOperationTests(unittest.TestCase):
                 )
 
     def test_effect_observer_downloads_satisfied_discover_without_posting(self) -> None:
-        reader = _ClosureReader(self.inventory, self.MAIN, self.edges)
+        reader = _NativeObservationFixture(self.inventory, self.MAIN, self.edges)
         backend = _CountingBackend(copy.deepcopy(self.native_record))
         client = self.runtime(reader, backend)
         port = NativeOperationDiscoverPort(
@@ -2818,7 +2820,7 @@ class NativeDiscoverOperationTests(unittest.TestCase):
     def test_effect_observer_accepts_pre_execution_cancel_as_known_absence(
         self,
     ) -> None:
-        reader = _ClosureReader(self.inventory, self.MAIN, self.edges)
+        reader = _NativeObservationFixture(self.inventory, self.MAIN, self.edges)
         backend = _CountingBackend(copy.deepcopy(self.native_record))
         client = self.runtime(reader, backend)
         workspace = self.root / "workspace-pre-execution-cancel"
@@ -2898,7 +2900,7 @@ class NativeDiscoverOperationTests(unittest.TestCase):
     def test_effect_observer_rejects_self_bound_foreign_discover_target(
         self,
     ) -> None:
-        reader = _ClosureReader(self.inventory, self.MAIN, self.edges)
+        reader = _NativeObservationFixture(self.inventory, self.MAIN, self.edges)
         backend = _CountingBackend(copy.deepcopy(self.native_record))
         client = self.runtime(reader, backend)
         other_target = NativeTargetIdentity.create(
@@ -2995,7 +2997,7 @@ class NativeDiscoverOperationTests(unittest.TestCase):
     def test_effect_observer_rejects_self_consistent_discover_outbound_drift(
         self,
     ) -> None:
-        reader = _ClosureReader(self.inventory, self.MAIN, self.edges)
+        reader = _NativeObservationFixture(self.inventory, self.MAIN, self.edges)
         backend = _CountingBackend(copy.deepcopy(self.native_record))
         client = self.runtime(reader, backend)
 
@@ -3084,7 +3086,7 @@ class NativeDiscoverOperationTests(unittest.TestCase):
                 client.get_operation.assert_not_called()
 
     def test_effect_observer_rejects_foreign_discover_executor(self) -> None:
-        reader = _ClosureReader(self.inventory, self.MAIN, self.edges)
+        reader = _NativeObservationFixture(self.inventory, self.MAIN, self.edges)
         backend = _CountingBackend(copy.deepcopy(self.native_record))
         client = self.runtime(reader, backend)
         port = NativeOperationDiscoverPort(
@@ -3137,7 +3139,7 @@ class NativeDiscoverOperationTests(unittest.TestCase):
         client.download_artifact.assert_not_called()
 
     def test_download_identity_recheck_rejects_a_changed_operation(self) -> None:
-        reader = _ClosureReader(self.inventory, self.MAIN, self.edges)
+        reader = _NativeObservationFixture(self.inventory, self.MAIN, self.edges)
         backend = _CountingBackend(copy.deepcopy(self.native_record))
         client = self.runtime(reader, backend)
         port = NativeOperationDiscoverPort(
@@ -3188,13 +3190,13 @@ class NativeDiscoverOperationTests(unittest.TestCase):
 
         class GatedBackend(_CountingBackend):
             def discover_native(self, frozen_source, settings, *, on_activity=None):
-                del frozen_source, settings, on_activity
+                self.calls += 1
                 entered.set()
                 if not release.wait(5):
                     raise AssertionError("gated backend was not released")
-                return copy.deepcopy(self.payload)
+                return self._observation(frozen_source, settings, on_activity=on_activity)
 
-        reader = _ClosureReader(self.inventory, self.MAIN, self.edges)
+        reader = _NativeObservationFixture(self.inventory, self.MAIN, self.edges)
         backend = GatedBackend(copy.deepcopy(self.native_record))
         client = self.runtime(reader, backend)
         request = self.request("discover-operation-cancel-race")
@@ -3382,7 +3384,7 @@ class NativeDiscoverOperationTests(unittest.TestCase):
 
     def test_tool_refusal_is_terminal_and_never_reads_native_record(self) -> None:
         refused_tool_sha256 = "cd" * 32
-        reader = _ClosureReader(
+        reader = _NativeObservationFixture(
             self.inventory,
             self.MAIN,
             self.edges,
