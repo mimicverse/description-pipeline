@@ -300,3 +300,27 @@ class InPlaceConsumerTests(unittest.TestCase):
                     (native.CadError, native_discovery._Failure)
                 ):
                     projector(raw)
+
+    def test_typed_entity_fields_cannot_be_truncated_or_forged(self):
+        for kind, field, count in ((2, "plane_params", 6), (4, "transform_raw", 16)):
+            for value, allowed in (("missing", False), ([0.0, 1.0], False), ([0.0] * count, True), (None, True)):
+                mate = observed_mate()
+                endpoint = mate["inplace"]["entities"][0]
+                endpoint["entity_type"]["value"] = kind
+                geometry = {
+                    "interface_iid": {"value": None, "error": {"code": "unavailable", "message": "No type info"}},
+                    "component": {"value": None, "error": None},
+                }
+                if value != "missing":
+                    geometry[field] = {"value": value, "error": None}
+                endpoint["entity"] = {"value": geometry, "error": None}
+                raw = native_record(mate)
+                for projector in (
+                    discovery._project_native_record, native_discovery.project_native_verification_record
+                ):
+                    with self.subTest(kind=kind, value=value, projector=projector.__name__):
+                        if allowed:
+                            projector(raw)
+                        else:
+                            with self.assertRaises((native.CadError, native_discovery._Failure)):
+                                projector(raw)

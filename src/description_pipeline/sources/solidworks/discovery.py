@@ -750,21 +750,19 @@ def _validate_inplace_record(mate: dict) -> None:
         require(isinstance(entity, dict) and set(entity) == {"index", "component_name", "entity_type", "entity"})
         require(type(entity["index"]) is int and entity["index"] == index)
         reading(entity["component_name"], str)
-        reading(entity["entity_type"], int)
+        entity_type = reading(entity["entity_type"], int)
         geometry = reading(entity["entity"], dict)
         if geometry is not None:
-            require(
-                {"interface_iid", "component"} <= set(geometry)
-                <= {"interface_iid", "component", "plane_params", "transform_raw"}
-            )
+            typed_fields = {2: {"plane_params": 6}, 4: {"transform_raw": 16}}.get(entity_type, {})
+            require(set(geometry) == {"interface_iid", "component"} | set(typed_fields))
             reading(geometry["interface_iid"], str)
             component(geometry["component"])
-            for field in ("plane_params", "transform_raw"):
-                if field in geometry:
-                    values = reading(geometry[field], list)
-                    require(
-                        values is None or all(type(value) in (int, float) and math.isfinite(value) for value in values)
-                    )
+            for field, count in typed_fields.items():
+                values = reading(geometry[field], list)
+                require(values is None or (
+                    len(values) == count
+                    and all(type(value) in (int, float) and math.isfinite(value) for value in values)
+                ))
 
 
 def _project_native_record(record: dict) -> dict:

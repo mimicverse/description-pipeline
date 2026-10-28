@@ -1432,19 +1432,21 @@ def _check_inplace_observations(mate: dict) -> None:
         expect(isinstance(endpoint, dict) and set(endpoint) == {"index", "component_name", "entity_type", "entity"})
         expect(type(endpoint["index"]) is int and endpoint["index"] == index)
         read_value(endpoint["component_name"], str)
-        read_value(endpoint["entity_type"], int)
+        entity_type = read_value(endpoint["entity_type"], int)
         geometry = read_value(endpoint["entity"], dict)
         if geometry is not None:
-            expect({"interface_iid", "component"}.issubset(geometry))
-            expect(not (set(geometry) - {"interface_iid", "component", "plane_params", "transform_raw"}))
+            geometry_fields = (
+                {"plane_params": 6} if entity_type == 2 else {"transform_raw": 16} if entity_type == 4 else {}
+            )
+            expect(set(geometry) == {"interface_iid", "component"}.union(geometry_fields))
             read_value(geometry["interface_iid"], str)
             check_component(geometry["component"])
-            for key in ("plane_params", "transform_raw"):
-                if key in geometry:
-                    values = read_value(geometry[key], list)
-                    expect(
-                        values is None or all(type(value) in (int, float) and math.isfinite(value) for value in values)
-                    )
+            for key, length in geometry_fields.items():
+                values = read_value(geometry[key], list)
+                expect(values is None or (
+                    len(values) == length
+                    and all(type(value) in (int, float) and math.isfinite(value) for value in values)
+                ))
 
 
 def project_native_verification_record(record: dict) -> dict:
