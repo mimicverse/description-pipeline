@@ -1487,6 +1487,33 @@ class DiscoveryTests(unittest.TestCase):
                 )
                 self.assertIn(code, [finding["code"] for finding in findings if finding["blocking"]])
 
+    def test_falsey_property_objects_cannot_be_resealed_as_missing_evidence(self):
+        baseline, _source, output = self._prepare()
+        self.assertTrue(baseline.passed, baseline.findings)
+        paths = (
+            ("properties",),
+            ("properties", "document"),
+            ("properties", "components"),
+            ("properties", "components", "arm-1"),
+            ("properties", "mates"),
+            ("properties", "mates", "shoulder_pitch_joint__coaxial"),
+        )
+        for path in paths:
+            for value in ([], False, 0, ""):
+                with self.subTest(path=path, value=value):
+                    def mutate(payload, path=path, value=value):
+                        target = payload.get("raw", payload)
+                        for key in path[:-1]:
+                            target = target.setdefault(key, {})
+                        target[path[-1]] = value
+
+                    with self.assertRaises(CadError) as caught:
+                        self._prepare(mutate=mutate)
+                    self.assertEqual(caught.exception.code, "cad_property_unreadable")
+                    report = self._verify_mutated_record(output, mutate)
+                    self.assertFalse(report["passed"])
+                    self.assertIn("discovery.properties", {item["code"] for item in report["errors"]})
+
     def test_present_nontext_identity_is_invalid_instead_of_missing(self):
         complete = {
             "identity": {

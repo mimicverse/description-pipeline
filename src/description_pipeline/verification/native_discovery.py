@@ -111,8 +111,27 @@ def _require(condition: bool, code: str, message: str, detail=None) -> None:
         raise _Failure(code, message, detail)
 
 
+def _validate_property_objects(raw: dict) -> None:
+    def object_or_absent(value, field):
+        _require(
+            value is None or isinstance(value, dict),
+            "discovery.properties",
+            "raw properties must be objects when present",
+            {"field": field, "value_type": type(value).__name__},
+        )
+        return {} if value is None else value
+
+    properties = object_or_absent(raw.get("properties"), "properties")
+    for section in ("document", "components", "mates"):
+        bucket = object_or_absent(properties.get(section), f"properties.{section}")
+        if section != "document":
+            for name, value in bucket.items():
+                object_or_absent(value, f"properties.{section}.{name}")
+
+
 def _authored_identity(raw: dict, namespace: str) -> dict:
     """Read optional authored metadata without inventing a publication identity."""
+    _validate_property_objects(raw)
     identity = raw.get("identity")
     properties = (raw.get("properties") or {}).get("document") or {}
     _require(identity is None or isinstance(identity, dict), "discovery.identity", "raw identity is not an object")
@@ -1985,6 +2004,7 @@ def rebuild_rigid_bodies(record: dict) -> list[dict]:
 
     if isinstance(record.get("raw"), dict):
         record = record["raw"]
+    _validate_property_objects(record)
     by_material, _by_component = _cluster_bindings(record)
     attached = _frame_attached_members(record)
     properties = (record.get("properties") or {}).get("components") or {}
@@ -3124,6 +3144,7 @@ def verify_discovery(package: Path) -> dict:
             {"field": "main_assembly"},
         )
         raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
+        _validate_property_objects(raw)
         sealed_selection = (
             raw.get("source_selection") if isinstance(raw.get("source_selection"), dict) else {}
         )

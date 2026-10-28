@@ -305,6 +305,26 @@ def _snake(value: Any) -> str | None:
     return folded
 
 
+def _validate_property_objects(record: dict) -> None:
+    def object_or_absent(value, field):
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise CadError(
+                "cad_property_unreadable",
+                "raw properties must be objects when present",
+                {"field": field, "value_type": type(value).__name__},
+            )
+        return value
+
+    properties = object_or_absent(record.get("properties"), "properties")
+    for section in ("document", "components", "mates"):
+        bucket = object_or_absent(properties.get(section), f"properties.{section}")
+        if section != "document":
+            for name, value in bucket.items():
+                object_or_absent(value, f"properties.{section}.{name}")
+
+
 def _property(record: dict, section: str, key: str) -> Any:
     properties = record.get("properties") or {}
     bucket = properties.get(section) or {}
@@ -5304,6 +5324,7 @@ def derive_native_package(
     handoff_sha256 = digest(native_files)
     _check_authored_files(native_files)
     _validate_native_record(record)
+    _validate_property_objects(record)
     record_files = record.get("files")
     if not isinstance(record_files, dict) or not record_files:
         raise PipelineError(
