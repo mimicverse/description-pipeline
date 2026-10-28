@@ -932,7 +932,7 @@ case "$ACTION" in
       if ! platform_open_admission; then
         airflow_set_dag_paused true \
           || echo "operatorctl: admission open failed and the DAG could not be repaused" >&2
-        die "admission could not be opened; DAG restored to paused"
+        die "admission could not be opened; inspect the DAG pause result"
       fi
       echo "start complete: admission open"
     fi
