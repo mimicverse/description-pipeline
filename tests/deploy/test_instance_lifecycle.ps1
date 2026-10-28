@@ -484,6 +484,8 @@ Check 'task_receipt.acl_drift_refused' (
     Assert-TaskDefinitionReceipt $definitionReceipt $definitionProjection
   }).code -ceq 'install_receipt_mismatch')
 
+$taskProjectionResolveSid = ${function:Resolve-Sid}
+function Resolve-Sid([string]$Identity) { return [string]$Identity }
 $projectionRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
   'description-task-projection-' + [guid]::NewGuid().ToString('N'))
 $projectionGeneration = Join-Path $projectionRoot 'state/lifecycle/generation'
@@ -538,6 +540,7 @@ foreach ($setting in @(
       Assert-TaskProjection $mutatedProjection $projectionBinding
     }).code -ceq 'task_identity_mismatch')
 }
+Set-Item Function:\Resolve-Sid -Value $taskProjectionResolveSid
 
 # SID and ACL APIs require Windows; the Linux matrix keeps its existing stubs.
 if ($env:OS -eq 'Windows_NT') {
@@ -1579,6 +1582,14 @@ $fixedBinding = Read-Binding $fixedBindingPath
 $script:LifecycleScriptPath = Join-Path $installRoot 'state/instance-lifecycle.ps1'
 
 function Get-ListenerConnections([int]$Port) { return @() }
+$script:WriterResidueRows = @()
+$script:WriterResidueObservationFailed = $false
+function Get-WriterResidue($State) {
+  if ($script:WriterResidueObservationFailed) {
+    DieUnknown 'windows_observer_failed' 'the writer process table could not be observed'
+  }
+  return @($script:WriterResidueRows)
+}
 $script:ProtectedAclSetPaths.Clear()
 $script:ProtectedAclAssertPaths.Clear()
 $script:ProtectedAclEvents.Clear()
@@ -1681,14 +1692,6 @@ function Disable-ScheduledTask {
   }
 }
 $script:LeaveStoppedTaskReady = $false
-$script:WriterResidueRows = @()
-$script:WriterResidueObservationFailed = $false
-function Get-WriterResidue($State) {
-  if ($script:WriterResidueObservationFailed) {
-    DieUnknown 'windows_observer_failed' 'the writer process table could not be observed'
-  }
-  return @($script:WriterResidueRows)
-}
 function Get-TaskProjection($Task) {
   $generation = Join-Path $installRoot 'state/lifecycle/generation'
   $taskState = [string]$Task.State
