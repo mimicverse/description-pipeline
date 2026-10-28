@@ -570,6 +570,56 @@ class FeishuAuthManagerTests(unittest.TestCase):
             auth.build_actor_name("cli_app:tenant-a:ou_owner", "崔工"),
             tasks={"freeze": "success"},
         )
+        self._record_run(
+            "run-terminal",
+            auth.build_actor_name("cli_app:tenant-a:ou_owner", "崔工"),
+            tasks={"freeze": "success", "verify": "failed"},
+        )
+        self._record_run(
+            "run-unresolved",
+            auth.build_actor_name("cli_app:tenant-a:ou_owner", "崔工"),
+            tasks={"freeze": "success", "publish": "failed"},
+        )
+
+        canonical_states = {
+            "run-own": "running",
+            "run-other": "running",
+            "run-legacy": "running",
+            "run-damaged": "running",
+            "run-resolve-failed": "running",
+            "run-start-failed": "running",
+            "run-start-unproven": "running",
+            "run-mapped": "running",
+            "run-success": "succeeded",
+            "run-running": "running",
+            "run-no-failed": "running",
+            "run-terminal": "failed",
+            "run-unresolved": "unresolved",
+        }
+
+        def canonical_projection(dag_run_id: str):
+            state = canonical_states.get(dag_run_id)
+            if state is None:
+                return None
+            canonical_run_id = "canonical-" + dag_run_id
+            return {
+                "run_id": canonical_run_id,
+                "state": state,
+                "request": {"principal": "cli_app:tenant-a:ou_owner"},
+                "technical": {
+                    "commands": [
+                        {
+                            "kind": "dispatch",
+                            "run_id": canonical_run_id,
+                            "request": {
+                                "run_id": canonical_run_id,
+                                "dag_id": auth.ALLOWED_DAG_ID,
+                                "dag_run_id": dag_run_id,
+                            },
+                        }
+                    ]
+                },
+            }
 
         def decide(
             method: str,
@@ -580,9 +630,31 @@ class FeishuAuthManagerTests(unittest.TestCase):
             run_id: str | None = None,
             user=owner,
             clear_body_safe: bool | None = True,
+            details=allowed,
         ) -> bool:
-            with request_context.use_request(_RoutedRequest(endpoint, dag_id, run_id, clear_body_safe=clear_body_safe)):
-                return manager.is_authorized_dag(method=method, access_entity=entity, details=allowed, user=user)
+            with (
+                request_context.use_request(
+                    _RoutedRequest(
+                        endpoint,
+                        dag_id,
+                        run_id,
+                        clear_body_safe=clear_body_safe,
+                    )
+                ),
+                mock.patch.object(
+                    run_ownership,
+                    "recorded_canonical_projection",
+                    side_effect=lambda _dag_id, dag_run_id: canonical_projection(
+                        dag_run_id
+                    ),
+                ),
+            ):
+                return manager.is_authorized_dag(
+                    method=method,
+                    access_entity=entity,
+                    details=details,
+                    user=user,
+                )
 
         run = auth.DagAccessEntity.RUN
         # The one owner mutation: the caller's own run through the routed clear endpoint.
@@ -602,13 +674,53 @@ class FeishuAuthManagerTests(unittest.TestCase):
         self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-success"))
         self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-running"))
         self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-no-failed"))
-        # The exact immutable-retry body is part of the owner grant; admins are exempt.
+        self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-terminal"))
+        self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-unresolved"))
+        self.assertFalse(
+            decide(
+                "PUT",
+                run,
+                clear_dag_run,
+                run_id="run-terminal",
+                user=admin,
+            )
+        )
+        self.assertFalse(
+            decide(
+                "PUT",
+                run,
+                clear_dag_run,
+                run_id="run-unresolved",
+                user=admin,
+            )
+        )
+        self.assertFalse(
+            decide(
+                "PUT",
+                run,
+                clear_dag_run,
+                run_id="run-success",
+                user=admin,
+            )
+        )
+        self.assertFalse(
+            decide(
+                "PUT",
+                run,
+                clear_dag_run,
+                run_id="run-own",
+                user=admin,
+                details=None,
+            )
+        )
+        # The exact immutable-retry body and canonical state gate apply to every direct clear.
         self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-own", clear_body_safe=False))
         self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-own", clear_body_safe=None))
         self.assertTrue(decide("PUT", run, clear_dag_run, run_id="run-own", user=admin))
-        self.assertTrue(decide("PUT", run, clear_dag_run, run_id="run-own", user=admin, clear_body_safe=False))
+        self.assertFalse(decide("PUT", run, clear_dag_run, run_id="run-own", user=admin, clear_body_safe=False))
         # Same (method, entity) but any other route stays administrator-only.
         self.assertFalse(decide("PUT", run, patch_dag_run, run_id="run-own"))
+        self.assertTrue(decide("PUT", run, patch_dag_run, run_id="run-own", user=admin))
         self.assertFalse(decide("PUT", run, clear_dag_run_partitions, run_id="run-own"))
         self.assertFalse(decide("PUT", run, bulk_dag_runs, run_id="run-own"))
         self.assertFalse(decide("DELETE", run, delete_dag_run, run_id="run-own"))
@@ -636,6 +748,7 @@ class FeishuAuthManagerTests(unittest.TestCase):
         self.assertFalse(manager.is_authorized_dag(method="POST", access_entity=run, details=allowed, user=owner))
         self.assertFalse(manager.is_authorized_dag(method="PUT", access_entity=run, details=allowed, user=owner))
         self.assertTrue(manager.is_authorized_dag(method="GET", details=allowed, user=owner))
+        self.assertFalse(manager.is_authorized_dag(method="PUT", access_entity=run, details=allowed, user=admin))
         self.assertTrue(manager.is_authorized_dag(method="POST", access_entity=run, details=allowed, user=admin))
 
     def test_request_context_middleware_binds_and_resets_the_scope(self) -> None:

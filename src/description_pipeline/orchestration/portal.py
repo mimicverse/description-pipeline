@@ -91,13 +91,19 @@ from .feishu_oauth import (
 from .run_ownership import (
     AMBIGUOUS_TASK_STATE,
     RECOVERY_ENGINEERING_TERMINAL,
-    RECOVERY_TEMPORARY_DISCONNECTION,
     RECOVERY_UNKNOWN_PUBLICATION,
     RecoveryAssessment,
     classify_recovery,
+    registered_recovery_block as _registered_recovery_block,
     recorded_actor_principal,
 )
-from .report_view import build_report, merge_warnings
+from .report_view import (
+    build_report,
+    merge_warnings,
+    registered_discovery_record,
+    registered_discovery_findings,
+    registered_handoff_warnings,
+)
 from .uploads import (
     MAX_FILE_BYTES,
     MAX_FILES,
@@ -247,7 +253,9 @@ def _registered_source_rows(report: dict, field: str, *, code_required: bool = F
         return []
     rows = report[field]
     if not isinstance(rows, list) or any(
-        not isinstance(row, dict) or (code_required and not row.get("code")) for row in rows
+        not isinstance(row, dict)
+        or (code_required and (not isinstance(row.get("code"), str) or not row["code"]))
+        for row in rows
     ):
         raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered diagnostic content has an invalid structure")
     return rows
@@ -258,20 +266,24 @@ def _delivery_warnings(members: dict) -> list[dict]:
 
     warnings: list[dict] = []
     handoff = members.get("input/handoff.json")
-    if handoff is not None:
-        for item in _registered_source_rows(_parse_registered_json(handoff), "warnings", code_required=True):
-            warning = dict(item)
-            warning.setdefault("source", "input")
-            warnings.append(warning)
     discovery = members.get("input/discovery/native-discovery.json")
-    if discovery is not None:
-        findings = _registered_source_rows(_parse_registered_json(discovery), "findings", code_required=True)
-        for item in findings:
-            if item.get("blocking") is True:
-                continue
-            warning = dict(item)
-            warning.setdefault("source", "discovery")
-            warnings.append(warning)
+    try:
+        if handoff is not None:
+            for warning in registered_handoff_warnings(
+                _parse_registered_json(handoff).get("warnings")
+            ):
+                warning.setdefault("source", "input")
+                warnings.append(warning)
+        if discovery is not None:
+            record = registered_discovery_record(_parse_registered_json(discovery))
+            for item in record["findings"]:
+                if item["blocking"]:
+                    continue
+                warning = dict(item)
+                warning.setdefault("source", "discovery")
+                warnings.append(warning)
+    except PipelineError as error:
+        raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
     return warnings
 
 
@@ -1038,15 +1050,18 @@ def _findings(job: dict | None) -> list[dict]:
     if not isinstance(job, dict):
         return findings
     result = job.get("result") if isinstance(job.get("result"), dict) else {}
+    try:
+        discovery_findings = registered_discovery_findings(job)
+    except PipelineError as error:
+        raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
     discovery = job.get("discovery") if isinstance(job.get("discovery"), dict) else {}
     digest = str(discovery.get("discovery_sha256") or "")
-    for item in discovery.get("findings") or []:
-        if not isinstance(item, dict):
-            continue
+    for item in discovery_findings:
         findings.append(
             {
-                "id": str(item.get("code") or ""),
-                "severity": "error" if item.get("blocking", True) else "warning",
+                "id": item["code"],
+                "severity": "warning" if item["blocking"] is False else "error",
+                "blocking": item["blocking"],
                 "stage": "discover",
                 "object": str(item.get("object") or ""),
                 "message": str(item.get("message") or "native discovery finding"),
@@ -1186,35 +1201,6 @@ _RETRY_REFUSED_MESSAGES = {
         "This run cannot be retried in place."
     ),
 }
-
-
-#: The recovery classification of a registered outcome that blocks in-place retry.
-#: An unresolved outcome is stage-neutral: it requires reconciliation, and only a
-#: registration whose own evidence names the publication scope may say so.
-RECOVERY_RECONCILIATION_REQUIRED = "reconciliation_required"
-_REGISTERED_RECOVERY_CLASSIFICATION = {
-    "failed": RECOVERY_ENGINEERING_TERMINAL,
-    "cancelled": RECOVERY_ENGINEERING_TERMINAL,
-    "succeeded": "run_succeeded",
-    "unresolved": RECOVERY_RECONCILIATION_REQUIRED,
-}
-
-
-def _registered_recovery_block(record: dict | None) -> tuple[str, str] | None:
-    """The (reason, classification) blocking in-place recovery, or None while it may proceed.
-
-    Only a known live admitted registration (``queued``/``running``) opens the
-    scheduling recovery: decided terminal outcomes refuse with their recorded
-    reason, an unresolved outcome requires reconciliation, and a missing or
-    unproven registration fails closed - Airflow or native facts never
-    substitute for the platform admission.
-    """
-    state = record.get("state") if isinstance(record, dict) else None
-    if state in {"queued", "running"}:
-        return None
-    if isinstance(state, str) and state in _REGISTERED_RECOVERY_CLASSIFICATION:
-        return f"registered_{state}", _REGISTERED_RECOVERY_CLASSIFICATION[state]
-    return "registration_missing", RECOVERY_TEMPORARY_DISCONNECTION
 
 
 def _retry_assessment(run: dict, tasks: list[dict], job: dict | None, endpoint_error: str | None) -> RecoveryAssessment:
@@ -2164,19 +2150,6 @@ class PortalApp:
         retry_job = dict(job or {})
         retry_job["native_status"] = _canonical_native_status(projection)
         retry = _retry_assessment(airflow_run, tasks, retry_job, endpoint_error)
-        if isinstance(projection, dict):
-            fact_state = projection.get("state")
-            if fact_state in {"succeeded", "failed", "cancelled"}:
-                classification = _REGISTERED_RECOVERY_CLASSIFICATION.get(
-                    str(fact_state),
-                    RECOVERY_ENGINEERING_TERMINAL,
-                )
-                retry = RecoveryAssessment(
-                    False,
-                    classification,
-                    f"registered_{fact_state}",
-                    (),
-                )
         recovery_block = _registered_recovery_block(projection)
         if recovery_block is not None:
             reason, classification = recovery_block
@@ -2203,9 +2176,13 @@ class PortalApp:
         # The purpose authority of both pages is the registered freeze request: a
         # mutable conf echo never decides the display, and an unfinished
         # registration reads as "not recorded".
-        display_job = self._registered_stage_job(job, projection)
-        stage_view_payload = stage_view(display_job)
-        report = build_report(job or {}, view=stage_view_payload)
+        stage_job = self._registered_stage_job(job, projection)
+        stage_view_payload = stage_view(stage_job)
+        display_job = None if stage_job is None else {**stage_job, "status": (job or {}).get("status")}
+        try:
+            report = build_report(display_job or {}, view=stage_view_payload)
+        except PipelineError as error:
+            raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
         purpose = projection.get("purpose") if projection is not None else None
         request = projection.get("request") if projection is not None else None
         request = request if isinstance(request, dict) else {}
@@ -2276,20 +2253,20 @@ class PortalApp:
                 "failure_diagnostics": job.get("failure_diagnostics"),
             },
             "discovery": None
-            if not isinstance(job, dict) or not isinstance(job.get("discovery"), dict)
+            if not isinstance(display_job, dict) or not isinstance(display_job.get("discovery"), dict)
             else {
-                "passed": job["discovery"].get("passed"),
-                "hardware_id": job["discovery"].get("hardware_id"),
-                "revision": job["discovery"].get("revision"),
-                "discovery_sha256": job["discovery"].get("discovery_sha256"),
+                "passed": display_job["discovery"].get("passed"),
+                "hardware_id": display_job["discovery"].get("hardware_id"),
+                "revision": display_job["discovery"].get("revision"),
+                "discovery_sha256": display_job["discovery"].get("discovery_sha256"),
             },
             "stage_view": stage_view_payload,
             "report": report,
             "verification_reports": self._verification_report_links(dag_run_id, projection),
-            "findings": _findings(job),
-            "activity": activity_view(job),
-            "automatic": _automatic_summary(job),
-            "coverage": _coverage_report(job, report),
+            "findings": _findings(display_job),
+            "activity": activity_view(display_job),
+            "automatic": _automatic_summary(display_job),
+            "coverage": _coverage_report(display_job, report),
             "pr": pr,
             "endpoint_error": endpoint_error,
             # Display rename / reversible tombstone; an unreadable ledger fails closed above.
@@ -3065,6 +3042,51 @@ class PortalApp:
             )
         return artifact
 
+    def _registered_discovery_projection(
+        self,
+        projection: dict,
+    ) -> dict | None:
+        """Read the registered Capture input's native discovery record for display."""
+
+        by_stage = projection.get("by_stage")
+        capture = by_stage.get("capture") if isinstance(by_stage, dict) else None
+        if not isinstance(capture, dict):
+            return None
+        member = capture.get("input/discovery/native-discovery.json")
+        if not isinstance(member, dict):
+            return None
+        try:
+            self._registered_stage_artifact(capture, stage="capture")
+            discover = by_stage.get("discover")
+            if not isinstance(discover, dict) or not discover:
+                raise PipelineError("Registered discovery record has no Discover artifact")
+            source = self._registered_stage_artifact(discover, stage="discover")
+            data = self._registered_member_bytes(
+                "input/discovery/native-discovery.json",
+                member,
+            )
+            record = registered_discovery_record(
+                _parse_registered_json(data)
+            )
+            findings = registered_discovery_findings({"discovery": record})
+            if record["run_id"] != source.producer_run_id:
+                raise PipelineError(
+                    "Registered discovery record belongs to another producer run"
+                )
+        except PipelineError as error:
+            raise PortalError(
+                HTTPStatus.BAD_GATEWAY,
+                str(error),
+            ) from error
+        identity = record["identity"]
+        return {
+            "findings": findings,
+            "passed": not any(item["blocking"] for item in findings),
+            "hardware_id": identity.get("hardware_id"),
+            "revision": identity.get("revision"),
+            "discovery_sha256": hashlib.sha256(data).hexdigest(),
+        }
+
     def _registered_stage_job(self, job: dict | None, projection: dict | None) -> dict | None:
         """A display snapshot whose stage states come from registered rows.
 
@@ -3266,8 +3288,26 @@ class PortalApp:
             )
         display = dict(job)
         display["events"] = events
-        # Registered stage rows own the terminal partition. The mutable job's
-        # coarse failure flag must not convert a final blocked row to failed.
+        capture_members = by_stage.get("capture")
+        if isinstance(capture_members, dict) and "input/handoff.json" in capture_members:
+            handoff = _parse_registered_json(self._registered_member_bytes(
+                "input/handoff.json", capture_members["input/handoff.json"]
+            ))
+            try:
+                warnings = registered_handoff_warnings(handoff.get("warnings"))
+            except PipelineError as error:
+                raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
+            for event in events:
+                check = event.get("check")
+                if event["stage"] == "capture" and isinstance(check, dict) and check.get("id") == "input.valid":
+                    check["details"] = {**check["details"], "warnings": warnings}
+        discovery = self._registered_discovery_projection(projection)
+        if discovery is not None:
+            display["discovery"] = discovery
+            display["hardware_id"] = discovery["hardware_id"]
+            display["revision"] = discovery["revision"]
+        # The registered rows own stage states; coarse run failure must not
+        # replace a downstream blocked state when rendering this stage view.
         display.pop("status", None)
         return display
 

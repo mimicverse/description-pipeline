@@ -35,48 +35,35 @@ class InputSealReadinessTests(unittest.TestCase):
     def _root(self, directory, *, raw_identity, revision):
         root = Path(directory) / "delivery"
         content = b"native bytes for the admin-deferral tests"
+        raw = support.local_native_record_payload(
+            {
+                "identity": raw_identity,
+                "components": [
+                    {
+                        "name2": "base_part-1",
+                        "document": "robot.SLDPRT",
+                        "suppressed": False,
+                        "lightweight": False,
+                        "suppression_state": 2,
+                        "fixed": False,
+                    }
+                ],
+                "datums": [
+                    {
+                        "name": "CS_base_link",
+                        "owner": "base_part-1",
+                        "array": list(support.placement()),
+                    }
+                ],
+                "mates": [],
+                "properties": {"components": {}},
+            },
+            default_mate_scope=True,
+        )
         record = support.frozen_discovery_payload(
             {
                 "namespace": "dp",
-                "raw": {
-                    "identity": raw_identity,
-                    "components": [
-                        {
-                            "name2": "base_part-1",
-                            "document": "robot.SLDPRT",
-                            "suppressed": False,
-                            "lightweight": False,
-                            "suppression_state": 2,
-                            "fixed": False,
-                        }
-                    ],
-                    "datums": [
-                        {
-                            "name": "CS_base_link",
-                            "owner": "base_part-1",
-                            "array": [
-                                1.0,
-                                0.0,
-                                0.0,
-                                0.0,
-                                0.0,
-                                1.0,
-                                0.0,
-                                0.0,
-                                0.0,
-                                0.0,
-                                1.0,
-                                0.0,
-                                0.0,
-                                0.0,
-                                0.0,
-                                1.0,
-                            ],
-                        }
-                    ],
-                    "mates": [],
-                    "properties": {"components": {}},
-                },
+                "raw": raw,
                 "identity": raw_identity,
             },
             files={"robot.SLDASM": hashlib.sha256(content).hexdigest()},

@@ -131,6 +131,14 @@ class RawCaptureFreezeTests(unittest.TestCase):
             set(facts["geometry_raw"]),
             {"base-1", "arm-1"},
         )
+        self.assertEqual(
+            facts["input_stability"]["originals_unchanged"],
+            {
+                "files_checked": len(
+                    facts["input_stability"]["source_hashes"]
+                )
+            },
+        )
 
     def test_cad_is_released_after_the_native_reads(self) -> None:
         self.capture()

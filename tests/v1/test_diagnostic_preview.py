@@ -30,6 +30,7 @@ from description_pipeline.orchestration import portal as portal_module
 from description_pipeline.orchestration.airflow_client import native_run_id
 
 from .portal_read_support import RegisteredPlatform, build_sealed_delivery
+from .protocol_support import discovery_finding, native_discovery_record
 
 DAG_RUN_ID = "portal-20261010T000000-abcdef01"
 RUN = native_run_id(DAG_RUN_ID)
@@ -49,24 +50,24 @@ FAILING_CHECKS = [
     },
     {"id": "urdf.topology", "state": "passed", "passed": True, "details": {}},
 ]
-DISCOVERY_FINDINGS = {
-    "schema_version": "solidworks-to-urdf.native-findings/v1",
-    "findings": [
-        {
-            "code": "discovery.exporter_membership_uncovered",
-            "object": "assembly",
-            "message": "active material occurrences are not covered by exactly one declared selection",
-            "detail": {"components": ["headM3.0-1/垫片2-1"]},
-            "blocking": False,
-        },
-        {
-            "code": "discovery.internal_error",
-            "object": "assembly",
-            "message": "a blocking finding is never a warning",
-            "blocking": True,
-        },
-    ],
-}
+DISCOVERY_FINDINGS = [
+    discovery_finding(
+        code="discovery.exporter_membership_uncovered",
+        object="assembly",
+        message=(
+            "active material occurrences are not covered by exactly one "
+            "declared selection"
+        ),
+        detail={"components": ["headM3.0-1/垫片2-1"]},
+        blocking=False,
+    ),
+    discovery_finding(
+        code="discovery.internal_error",
+        object="assembly",
+        message="a blocking finding is never a warning",
+        blocking=True,
+    ),
+]
 INPUT_WARNINGS = {
     "passed": True,
     "warnings": [
@@ -161,7 +162,12 @@ class DiagnosticPreviewTests(unittest.TestCase):
         (tree / "evidence").mkdir()
         write_json(
             tree / "input/discovery/native-discovery.json",
-            DISCOVERY_FINDINGS,
+            native_discovery_record(
+                RUN,
+                DISCOVERY_FINDINGS,
+                main_assembly="cad/robot.SLDASM",
+                native_files={"cad/robot.SLDASM": "a" * 64},
+            ),
         )
         members = []
         for path in (
@@ -492,7 +498,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
                 tree / "input/discovery/native-discovery.json"
             ).read_text(encoding="utf-8")
         )
-        discovery["findings"] = DISCOVERY_FINDINGS["findings"]
+        discovery["findings"] = DISCOVERY_FINDINGS
         write_json(
             tree / "input/discovery/native-discovery.json",
             discovery,

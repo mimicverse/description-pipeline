@@ -9,11 +9,28 @@ from pathlib import Path
 from description_pipeline.orchestration.report_view import build_report
 from description_pipeline.stages import CONTRACT, activity_view
 from description_pipeline.verification.solidworks_urdf import evaluate_bundle
-from tests.v1.protocol_support import protocol_events
+from tests.v1.protocol_support import discovery_finding, native_discovery_record, protocol_events
 
 RUN_ID = "portal-20261009T094843-d5230467"
 SHA = "a" * 64
 HSHA = "b" * 64
+
+
+def discovery_payload(
+    findings: list[dict],
+    *,
+    passed: bool,
+    hardware_id: str | None = None,
+    revision: str | None = None,
+    digest: str = "c" * 64,
+) -> dict:
+    return {
+        "passed": passed,
+        "hardware_id": hardware_id,
+        "revision": revision,
+        "discovery_sha256": digest,
+        "findings": [discovery_finding(**item) for item in findings],
+    }
 
 
 def quality_rows() -> dict:
@@ -89,6 +106,124 @@ def passed_job() -> dict:
 
 
 class ReportViewTests(unittest.TestCase):
+    def test_discovery_warning_requires_explicit_boolean_blocking(self) -> None:
+        import json
+        from description_pipeline.orchestration.portal import (
+            PortalError, _delivery_warnings, _findings, _preview_warnings,
+        )
+        from description_pipeline.orchestration.report_view import build_report
+        from description_pipeline.io import PipelineError
+
+        for fields in ({}, {"blocking": None}, {"blocking": "false"}, {"blocking": 0}, {"blocking": 1}):
+            finding = discovery_finding(message="Recorded observation", **fields)
+            if not fields:
+                finding.pop("blocking")
+            with self.subTest(fields=fields):
+                record = native_discovery_record(RUN_ID, [finding])
+                members = {
+                    "input/discovery/native-discovery.json": json.dumps(
+                        record
+                    ).encode()
+                }
+                with self.assertRaises(PortalError):
+                    _delivery_warnings(members)
+                with self.assertRaises(PipelineError):
+                    _preview_warnings([finding])
+                with self.assertRaises(PortalError):
+                    _findings({"discovery": record})
+                with self.assertRaises(PipelineError):
+                    build_report({"discovery": record})
+        for blocking in (True, False):
+            finding = discovery_finding(blocking=blocking, detail={"object": "part"})
+            record = native_discovery_record(RUN_ID, [finding])
+            members = {
+                "input/discovery/native-discovery.json": json.dumps(
+                    record
+                ).encode()
+            }
+            warnings = _preview_warnings(_delivery_warnings(members))
+            self.assertEqual(warnings, [] if blocking else [{**finding, "source": "discovery"}])
+            projected = _findings({"discovery": record})[0]
+            self.assertIs(projected["blocking"], blocking)
+            self.assertEqual(
+                projected["severity"],
+                "error" if blocking else "warning",
+            )
+
+    def test_registered_discovery_record_requires_the_current_schema(self) -> None:
+        from description_pipeline.io import PipelineError
+        from description_pipeline.orchestration.report_view import (
+            registered_discovery_record,
+        )
+
+        record = native_discovery_record(RUN_ID)
+        record.pop("schema_version")
+        with self.assertRaisesRegex(PipelineError, "invalid schema"):
+            registered_discovery_record(record)
+
+    def test_handoff_warning_contract_projects_explicit_false(self) -> None:
+        import json
+        from description_pipeline.orchestration.portal import PortalError, _delivery_warnings, _preview_warnings
+
+        warning = {"code": "input.name", "message": "Normalized name"}
+        members = {"input/handoff.json": json.dumps({"warnings": [warning]}).encode()}
+        self.assertEqual(
+            _preview_warnings(_delivery_warnings(members)),
+            [{**warning, "blocking": False, "source": "input"}],
+        )
+        from description_pipeline.io import PipelineError
+        from description_pipeline.orchestration.report_view import _recorded_warnings
+
+        stage = {"id": "capture"}
+        rows = [{"id": "input.valid", "raw_details": {"warnings": [warning]}}]
+        self.assertIs(_recorded_warnings(stage, [], rows, [])[0]["blocking"], False)
+        for blocking in (True, None, "false", 0):
+            members = {"input/handoff.json": json.dumps({"warnings": [{**warning, "blocking": blocking}]}).encode()}
+            with self.subTest(blocking=blocking), self.assertRaises(PortalError):
+                _delivery_warnings(members)
+            rows[0]["raw_details"]["warnings"] = [{**warning, "blocking": blocking}]
+            with self.subTest(blocking=blocking), self.assertRaises(PipelineError):
+                _recorded_warnings(stage, [], rows, [])
+
+    def test_warning_consumers_reject_non_string_codes(self) -> None:
+        import json
+        from description_pipeline.io import PipelineError
+        from description_pipeline.orchestration.portal import (
+            PortalError,
+            _delivery_warnings,
+            _findings,
+            _preview_warnings,
+        )
+        from description_pipeline.orchestration.report_view import _recorded_warnings
+
+        for code in (123, True, [], {}, ""):
+            warning = discovery_finding(code=code)
+            record = native_discovery_record(RUN_ID, [warning])
+            for member, payload in (
+                ("input/discovery/native-discovery.json", record),
+                ("input/handoff.json", {"warnings": [warning]}),
+            ):
+                with self.subTest(code=code, member=member), self.assertRaises(PortalError):
+                    _delivery_warnings({member: json.dumps(payload).encode()})
+            with self.subTest(code=code), self.assertRaises(PortalError):
+                _findings({"discovery": record})
+            with self.subTest(code=code), self.assertRaises(PipelineError):
+                _preview_warnings([warning])
+            with self.subTest(code=code), self.assertRaises(PipelineError):
+                build_report({"discovery": record})
+            with self.subTest(code=code), self.assertRaises(PipelineError):
+                _recorded_warnings(
+                    {"id": "capture"}, [],
+                    [{"id": "input.valid", "raw_details": {"warnings": [warning]}}], [],
+                )
+
+    def test_discovery_with_unresolved_identity_remains_reportable(self) -> None:
+        from description_pipeline.orchestration.report_view import registered_discovery_record
+
+        record = native_discovery_record(RUN_ID, [discovery_finding(blocking=True)], hardware_id=None, revision=None)
+        record["identity"]["main_assembly"] = None
+        self.assertEqual(registered_discovery_record(record), record)
+
     def test_nested_blocking_and_unknown_diagnostics_are_not_downgraded(self) -> None:
         from description_pipeline.orchestration.report_view import _recorded_warnings, _warning_row
         from description_pipeline.io import PipelineError
@@ -341,12 +476,8 @@ class ReportViewTests(unittest.TestCase):
         job["status"] = "failed"
         job["events"] = protocol_events(subject=SHA, failed_stage="discover")
         job["error"] = "PipelineError: Required check failed: discovery.definition"
-        job["discovery"] = {
-            "passed": False,
-            "hardware_id": None,
-            "revision": None,
-            "discovery_sha256": "c" * 64,
-            "findings": [
+        job["discovery"] = discovery_payload(
+            findings=[
                 {
                     "code": "discovery.link_name_missing",
                     "object": f"body:{name}",
@@ -365,7 +496,8 @@ class ReportViewTests(unittest.TestCase):
                 {"code": "discovery.unknown_code", "object": "x", "message": "m", "blocking": True},
                 {"code": "discovery.link_name_missing", "object": "body:skipped", "message": "w", "blocking": False},
             ],
-        }
+            passed=False,
+        )
         failure = build_report(job)["failure"]
         self.assertEqual(failure["title"], "Structure discovery checks failed")
         self.assertEqual(failure["kind"], "definition")
@@ -392,13 +524,12 @@ class ReportViewTests(unittest.TestCase):
         job["events"] = protocol_events(subject=SHA, failed_stage="capture")
         job["error"] = "CadError: C:\\packages\\imports\\x\\robot.SLDASM"
         job["detail"] = {"errors": 2, "warnings": 0}
-        job["discovery"] = {
-            "passed": False,
-            "discovery_sha256": "c" * 64,
-            "findings": [
+        job["discovery"] = discovery_payload(
+            [
                 {"code": "discovery.link_name_missing", "object": "body:a", "message": "no CS", "blocking": True}
             ],
-        }
+            passed=False,
+        )
         failure = build_report(job)["failure"]
         self.assertEqual(failure["stage"], "capture")
         self.assertEqual(failure["title"], "Native CAD open failed")
@@ -722,10 +853,8 @@ class ReportViewTests(unittest.TestCase):
 
     def test_declaration_warnings_render_values_without_passing_or_confirmations(self) -> None:
         job = passed_job()
-        job["discovery"] = {
-            "passed": True,
-            "discovery_sha256": "d" * 64,
-            "findings": [
+        job["discovery"] = discovery_payload(
+            [
                 {
                     "code": "discovery.exporter_membership_uncovered",
                     "object": "assembly",
@@ -757,7 +886,11 @@ class ReportViewTests(unittest.TestCase):
                 },
                 {"code": "discovery.link_name_missing", "object": "body:a", "message": "no CS", "blocking": True},
             ],
-        }
+            passed=True,
+            hardware_id="m3.0",
+            revision="r1",
+            digest="d" * 64,
+        )
         report = build_report(job)
         self.assertEqual(report["overall"]["state"], "passed")
         self.assertEqual(report["overall"]["engineering_state"], "external_review")

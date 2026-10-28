@@ -19,7 +19,7 @@ from description_pipeline.orchestration import portal as portal_module
 from description_pipeline.orchestration.airflow_client import native_run_id
 from description_pipeline.orchestration.feishu_oauth import build_actor_name
 from description_pipeline.stages import STAGE_IDS
-from description_pipeline.io import write_json
+from description_pipeline.io import read_data, write_json
 
 from .portal_read_support import RegisteredPlatform
 from .protocol_support import protocol_events
@@ -29,7 +29,11 @@ SUBJECT = "a" * 64
 def _register_delivery(platform: RegisteredPlatform, *, run_id: str = RUN) -> None:
     """Register six stages with their sealed certificate and publication receipt."""
     platform.admit(run_id)
-    platform.register_capture(run_id)
+    capture = platform.register_capture(run_id)
+    write_json(
+        platform.tree(run_id, "discover") / "prepared/discovery/native-discovery.json",
+        read_data(capture / "input/discovery/native-discovery.json"),
+    )
     for stage in ("freeze", "discover", "generate", "verify", "publish"):
         platform.stage(run_id, stage)
     write_json(

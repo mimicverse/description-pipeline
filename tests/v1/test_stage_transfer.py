@@ -221,6 +221,25 @@ def _capture_events(
     ]
 
 
+def rewrite_native_evidence_receipts(root: Path, *, handoff: str) -> None:
+    """Re-seal the evidence manifest and stage receipt after a fixture mutation."""
+
+    manifest = read_data(root / "evidence/manifest.json")
+    write_manifest(
+        root / "evidence",
+        kind=manifest["kind"],
+        identity=manifest["identity"],
+        evidence_class=manifest["evidence_class"],
+    )
+    write_json(
+        root / "reports/native-stages.json",
+        stage_view(
+            handoff=handoff,
+            events=_capture_events(root, handoff=handoff),
+        ),
+    )
+
+
 def capture_root(
     base: Path,
     *,
@@ -821,6 +840,149 @@ class StageTransferTests(unittest.TestCase):
         (missing / "input/capture-plan.json").unlink()
         with self.assertRaisesRegex(PipelineError, "capture-plan.json"):
             seal(missing, self.base / "missing-capture-plan.zip")
+
+    def _assert_input_stability_rejected(
+        self,
+        label: str,
+        mutate,
+        message: str,
+    ) -> None:
+        base = self.base / label
+        root = capture_root(
+            base,
+            extra_native_files={"part.SLDPRT": b"PART"},
+        )
+        native_files = read_data(
+            root / "input/discovery/native-discovery.json"
+        )["native_files"]
+        handoff = digest(native_files)
+        valid = base / "valid.zip"
+        seal(
+            root,
+            valid,
+            handoff_sha256=handoff,
+            upload_sha256=handoff,
+        )
+        facts_path = root / "evidence/raw/native_capture_facts.json"
+        facts = read_data(facts_path)
+        mutate(facts["input_stability"])
+        write_json(facts_path, facts)
+        rewrite_native_evidence_receipts(root, handoff=handoff)
+
+        with self.assertRaisesRegex(PipelineError, message):
+            seal(
+                root,
+                base / "forged-root.zip",
+                handoff_sha256=handoff,
+                upload_sha256=handoff,
+            )
+
+        forged = base / "forged.zip"
+        repack(
+            valid,
+            forged,
+            {
+                "evidence/raw/native_capture_facts.json": facts_path.read_bytes(),
+                "evidence/manifest.json": (
+                    root / "evidence/manifest.json"
+                ).read_bytes(),
+                "reports/native-stages.json": (
+                    root / "reports/native-stages.json"
+                ).read_bytes(),
+            },
+        )
+        with self.assertRaisesRegex(PipelineError, message):
+            admit(
+                forged,
+                base / "admitted",
+                expected_handoff_sha256=handoff,
+                expected_upload_sha256=handoff,
+            )
+
+    def test_input_stability_count_matches_complete_source_inventory(self) -> None:
+        base = self.base / "complete-source-inventory"
+        root = capture_root(
+            base,
+            extra_native_files={"part.SLDPRT": b"PART"},
+        )
+        native_files = read_data(
+            root / "input/discovery/native-discovery.json"
+        )["native_files"]
+        facts = read_data(
+            root / "evidence/raw/native_capture_facts.json"
+        )
+        self.assertEqual(len(native_files), 2)
+        self.assertEqual(
+            len(facts["input_stability"]["source_hashes"]),
+            len(native_files),
+        )
+        self.assertEqual(
+            facts["input_stability"]["originals_unchanged"],
+            {"files_checked": len(native_files)},
+        )
+        handoff = digest(native_files)
+        archive = base / "complete-source-inventory.zip"
+        seal(
+            root,
+            archive,
+            handoff_sha256=handoff,
+            upload_sha256=handoff,
+        )
+        admit(
+            archive,
+            base / "admitted",
+            expected_handoff_sha256=handoff,
+            expected_upload_sha256=handoff,
+        )
+
+    def test_input_stability_rejects_forged_count_at_seal_and_admit(self) -> None:
+        for label, forged, message in (
+            ("underreported", 1, "files_checked.*complete native source inventory"),
+            ("overreported", 3, "files_checked.*complete native source inventory"),
+            ("boolean", True, "files_checked must be a positive integer"),
+            ("string", "2", "files_checked must be a positive integer"),
+            ("float", 2.0, "files_checked must be a positive integer"),
+        ):
+            with self.subTest(label=label):
+                self._assert_input_stability_rejected(
+                    f"count-{label}",
+                    lambda stability, value=forged: stability[
+                        "originals_unchanged"
+                    ].__setitem__("files_checked", value),
+                    message,
+                )
+
+    def test_input_stability_rejects_unknown_or_missing_fields(self) -> None:
+        cases = (
+            (
+                "unknown-stability-field",
+                lambda stability: stability.__setitem__("extra", True),
+            ),
+            (
+                "unknown-unchanged-field",
+                lambda stability: stability["originals_unchanged"].__setitem__(
+                    "extra",
+                    True,
+                ),
+            ),
+            (
+                "missing-source-hashes",
+                lambda stability: stability.pop("source_hashes"),
+            ),
+            (
+                "missing-files-checked",
+                lambda stability: stability["originals_unchanged"].pop(
+                    "files_checked"
+                ),
+            ),
+        )
+        for label, mutate in cases:
+            with self.subTest(label=label):
+                self._assert_input_stability_rejected(
+                    label,
+                    mutate,
+                    "input stability fields are incomplete or unknown",
+                )
 
     def test_transfer_requires_exact_upstream_and_execution_bindings(self) -> None:
         seal(self.root, self.archive)

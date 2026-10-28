@@ -30,6 +30,7 @@ exporter state is a proven ``absent`` runs the mate-inference suite.  Gate owner
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import math
 import ntpath
@@ -37,9 +38,12 @@ import re
 from pathlib import Path, PurePosixPath
 
 from ..delivery import read_delivery_manifest, read_source_record
-from ..geometry.native_transform import rigid_matrix_from_row_major
+from ..geometry.native_transform import (
+    rigid_matrix_from_row_major,
+    transform_from_solidworks,
+)
 from ..interface_records import validate_request_record
-from ..io import PipelineError, confined, digest, parse_data
+from ..io import PipelineError, artifact_path_parts, confined, digest, parse_data
 from ..schemas import (
     NATIVE_DISCOVERY_BUDGET_KEYS,
     NATIVE_DISCOVERY_CONTROL_KEYS,
@@ -1065,6 +1069,671 @@ def _apply_vector(vector, frame):
     ]
 
 
+class _ProjectedNativeRecord(dict):
+    """A verifier-only typed view that cannot be asserted by serialized JSON."""
+
+
+_PROJECTED_IDENTITY = (
+    (1.0, 0.0, 0.0, 0.0),
+    (0.0, 1.0, 0.0, 0.0),
+    (0.0, 0.0, 1.0, 0.0),
+    (0.0, 0.0, 0.0, 1.0),
+)
+_ENTITY_TYPE_NAMES = {
+    0: "Point",
+    1: "Line",
+    3: "Plane",
+    4: "Cylinder",
+    7: "Cone",
+}
+_ENTITY_MINIMUMS = {
+    0: 3,
+    1: 6,
+    3: 6,
+    4: 7,
+    7: 8,
+}
+
+
+def _verification_frame(values):
+    try:
+        numbers = tuple(transform_from_solidworks(values))
+    except (TypeError, ValueError) as error:
+        raise _Failure(
+            "discovery.local_transform",
+            "a raw local SolidWorks transform is invalid",
+            {"error": str(error)},
+        ) from error
+    return tuple(numbers[index : index + 4] for index in range(0, 16, 4))
+
+
+def _verification_multiply(left, right):
+    return tuple(
+        tuple(
+            sum(left[row][index] * right[index][column] for index in range(4))
+            for column in range(4)
+        )
+        for row in range(4)
+    )
+
+
+def _verification_inverse(frame):
+    rotation = tuple(tuple(frame[row][column] for column in range(3)) for row in range(3))
+    translation = tuple(frame[row][3] for row in range(3))
+    inverse_rotation = tuple(
+        tuple(rotation[column][row] for column in range(3))
+        for row in range(3)
+    )
+    inverse_translation = tuple(
+        -sum(inverse_rotation[row][column] * translation[column] for column in range(3))
+        for row in range(3)
+    )
+    return (
+        (*inverse_rotation[0], inverse_translation[0]),
+        (*inverse_rotation[1], inverse_translation[1]),
+        (*inverse_rotation[2], inverse_translation[2]),
+        (0.0, 0.0, 0.0, 1.0),
+    )
+
+
+def _verification_point(frame, point):
+    return [
+        sum(frame[row][column] * float(point[column]) for column in range(3))
+        + frame[row][3]
+        for row in range(3)
+    ]
+
+
+def _verification_vector(frame, vector):
+    return [
+        sum(frame[row][column] * float(vector[column]) for column in range(3))
+        for row in range(3)
+    ]
+
+
+def _verification_document_key(value: object) -> str:
+    return ntpath.normcase(
+        ntpath.normpath(str(value or "").replace("/", "\\"))
+    )
+
+
+def _verification_sealed_embedded_virtual_document(
+    component: dict,
+    name: str,
+    native_files: object,
+) -> bool:
+    provenance = component.get("source_provenance")
+    if not isinstance(provenance, dict):
+        return False
+    if (
+        provenance.get("kind") != "native_embedded_virtual_component"
+        or provenance.get("state") != "embedded_virtual_component"
+        or provenance.get("is_virtual") is not True
+        or provenance.get("occurrence") != name
+        or not isinstance(provenance.get("owner"), str)
+        or not provenance["owner"]
+        or not isinstance(provenance.get("owner_sha256"), str)
+        or _HEX.fullmatch(provenance["owner_sha256"]) is None
+        or not isinstance(native_files, dict)
+        or native_files.get(provenance["owner"]) != provenance["owner_sha256"]
+        or provenance.get("used_api") != SESSION_DOCUMENT_API
+        or provenance.get("author_imported_path") is not None
+        or provenance.get("author_imported_error") is not None
+        or provenance.get("document") is not None
+    ):
+        return False
+    session_document = provenance.get("session_document_path")
+    native_document = provenance.get("native_document_path")
+    materialization = provenance.get("materialization_path")
+    session_root = provenance.get("session_temp_root")
+    native_api_pid = provenance.get("native_api_pid")
+    if not (
+        isinstance(session_document, str)
+        and isinstance(native_document, str)
+        and isinstance(materialization, str)
+        and ntpath.normcase(session_document)
+        == ntpath.normcase(native_document)
+        == ntpath.normcase(materialization)
+    ):
+        return False
+    if (
+        not embedded_virtual_component_under_root(
+            session_document,
+            session_root,
+        )
+        or type(native_api_pid) is not int
+        or native_api_pid <= 0
+        or session_root_pid(session_root) != native_api_pid
+    ):
+        return False
+    document = component.get("document")
+    return (
+        isinstance(document, str)
+        and bool(document.strip())
+        and ntpath.normcase(document) == ntpath.normcase(session_document)
+        and isinstance(component.get("configuration"), str)
+        and bool(component["configuration"].strip())
+    )
+
+
+def _verification_component_document_is_bound(
+    component: dict,
+    name: str,
+    reference_document: str,
+    native_files: object,
+) -> bool:
+    document = component.get("document")
+    if (
+        not isinstance(document, str)
+        or not document.strip()
+        or _verification_document_key(document)
+        != _verification_document_key(reference_document)
+    ):
+        return False
+    try:
+        artifact_path_parts(document.replace("\\", "/"))
+    except PipelineError:
+        return _verification_sealed_embedded_virtual_document(
+            component,
+            name,
+            native_files,
+        )
+    return (
+        isinstance(native_files, dict)
+        and isinstance(
+            native_files.get(document.replace("\\", "/")),
+            str,
+        )
+    )
+
+
+def _verification_entity_params(params):
+    if not isinstance(params, list):
+        raise _Failure(
+            "discovery.mate_entity_reference",
+            "EntityParams must be a native numeric array",
+            {"value_type": type(params).__name__},
+        )
+    if any(
+        type(value) not in (int, float)
+        or not math.isfinite(float(value))
+        for value in params
+    ):
+        raise _Failure(
+            "discovery.mate_entity_reference",
+            "EntityParams must contain only finite non-boolean numbers",
+        )
+    return [float(value) for value in params]
+
+
+def _verification_entity_geometry(reference_type, params):
+    params = _verification_entity_params(params)
+    if type(reference_type) is not int:
+        raise _Failure(
+            "discovery.mate_entity_reference",
+            "ReferenceType must be an exact native integer",
+            {"value_type": type(reference_type).__name__},
+        )
+    minimum = _ENTITY_MINIMUMS.get(reference_type)
+    if minimum is None:
+        return None, None
+    if len(params) < minimum:
+        return None, (
+            f"EntityParams has {len(params)} values; the documented layout for "
+            f"{_ENTITY_TYPE_NAMES[reference_type]} needs at least {minimum}"
+        )
+    point = list(params[0:3])
+    if reference_type == 0:
+        return {"kind": "point", "point": point}, None
+    vector = list(params[3:6])
+    norm = math.hypot(*vector)
+    if norm <= 0:
+        return None, "EntityParams vector is zero-length"
+    unit = [value / norm for value in vector]
+    if reference_type == 1:
+        return {"kind": "line", "point": point, "direction": unit}, None
+    if reference_type == 3:
+        return {"kind": "plane", "point": point, "normal": unit}, None
+    radius = params[6]
+    if radius <= 0:
+        return None, "EntityParams radius is not positive"
+    if reference_type == 4:
+        return {
+            "kind": "cylinder",
+            "point": point,
+            "direction": unit,
+            "radius": radius,
+        }, None
+    radius2 = params[7]
+    if radius2 <= 0:
+        return None, "EntityParams second radius is not positive"
+    return {
+        "kind": "cone",
+        "point": point,
+        "direction": unit,
+        "radius": radius,
+        "radius2": radius2,
+    }, None
+
+
+def _verification_mate_reference(block, component, owner, frames):
+    if (
+        not isinstance(block, dict)
+        or "geometry" in block
+        or block.get("source") != "mate-entity-params"
+        or block.get("space") != "mate-assembly"
+        or not {"reference_type", "params", "error"}.issubset(block)
+    ):
+        raise _Failure(
+            "discovery.mate_entity_reference",
+            "native mate evidence requires EntityParams in its owning assembly space",
+        )
+    projected = copy.deepcopy(block)
+    native_error = projected.get("error")
+    if native_error is not None and (not isinstance(native_error, str) or not native_error.strip()):
+        raise _Failure(
+            "discovery.mate_entity_reference",
+            "a native EntityParams read error must be non-empty text or null",
+        )
+    params = projected.get("params")
+    if native_error is None and params is None:
+        raise _Failure(
+            "discovery.mate_entity_reference",
+            "null EntityParams requires an explicit native read error",
+        )
+    if params is not None:
+        if native_error is not None:
+            projected["params"] = _verification_entity_params(params)
+            projected["geometry"] = None
+        else:
+            projected["geometry"], error = _verification_entity_geometry(
+                projected.get("reference_type"),
+                params,
+            )
+            projected["params"] = [
+                float(value) for value in params
+            ]
+            if error is not None:
+                projected["error"] = error
+    else:
+        projected["geometry"] = None
+    if projected.get("error") is not None or projected.get("geometry") is None:
+        return projected
+    component_frame = frames.get(component) if component else _PROJECTED_IDENTITY
+    owner_frame = frames.get(owner) if owner else _PROJECTED_IDENTITY
+    if component_frame is None or owner_frame is None:
+        projected["geometry"] = None
+        projected["error"] = "the recorded occurrence frame for this reference is unavailable"
+        return projected
+    local = _verification_multiply(
+        _verification_inverse(component_frame),
+        owner_frame,
+    )
+    geometry = dict(projected["geometry"])
+    if "point" in geometry:
+        geometry["point"] = _verification_point(local, geometry["point"])
+        if not all(math.isfinite(value) for value in geometry["point"]):
+            projected["geometry"] = None
+            projected["error"] = "the localized reference point is not finite"
+            return projected
+    for key in ("direction", "normal"):
+        if key not in geometry:
+            continue
+        value = _verification_vector(local, geometry[key])
+        norm = math.hypot(*value)
+        if norm <= 0 or not all(math.isfinite(item) for item in value):
+            projected["geometry"] = None
+            projected["error"] = "the recorded reference direction is unusable"
+            return projected
+        geometry[key] = [item / norm for item in value]
+    geometry["frame"] = "component-local"
+    projected["geometry"] = geometry
+    return projected
+
+
+def project_native_verification_record(record: dict) -> dict:
+    """Materialize a verifier-only view from preserved local native facts."""
+
+    if not isinstance(record, dict):
+        raise _Failure("discovery.raw", "native discovery raw record is not an object")
+    if isinstance(record, _ProjectedNativeRecord):
+        return copy.deepcopy(record)
+    projected = copy.deepcopy(record)
+    components = projected.get("components")
+    if not isinstance(components, list):
+        raise _Failure("discovery.raw", "native discovery components are unavailable")
+    by_component: dict[str, dict] = {}
+    for component in components:
+        if not isinstance(component, dict):
+            raise _Failure("discovery.raw", "a native discovery component is malformed")
+        name = component.get("name2")
+        parent = component.get("parent_occurrence")
+        if not isinstance(name, str) or not name or not isinstance(parent, str):
+            raise _Failure(
+                "discovery.local_occurrence",
+                "a native occurrence lacks its stable name or parent",
+            )
+        if name in by_component:
+            raise _Failure(
+                "discovery.component_identity",
+                "two native occurrences share one stable identity",
+                {"component": name},
+            )
+        if "transform" in component or "transform_raw" not in component:
+            raise _Failure(
+                "discovery.local_transform",
+                "native occurrence must carry local transform_raw, not a normalized transform",
+                {"component": name},
+            )
+        expected_parent = name.rsplit("/", 1)[0] if "/" in name else ""
+        if parent != expected_parent:
+            raise _Failure(
+                "discovery.local_parent",
+                "native occurrence parent disagrees with its scoped identity",
+                {
+                    "component": name,
+                    "parent": parent,
+                    "expected_parent": expected_parent,
+                },
+            )
+        by_component[name] = component
+    for name, component in by_component.items():
+        parent = component["parent_occurrence"]
+        if parent and parent not in by_component:
+            raise _Failure(
+                "discovery.local_parent",
+                "native occurrence names an unknown parent",
+                {"component": name, "parent": parent},
+            )
+
+    frames = {}
+    visiting = set()
+
+    def resolve_frame(name):
+        if name in frames:
+            return frames[name]
+        if name in visiting:
+            raise _Failure(
+                "discovery.local_parent_cycle",
+                "native occurrence parent chain contains a cycle",
+                {"component": name},
+            )
+        visiting.add(name)
+        component = by_component[name]
+        if component.get("suppressed") is True:
+            visiting.remove(name)
+            frames[name] = None
+            return None
+        raw_local = component.get("transform_raw")
+        if raw_local is None:
+            visiting.remove(name)
+            raise _Failure(
+                "discovery.local_transform",
+                "native occurrence transform_raw is null rather than a raw value or explicit read failure",
+                {"component": name},
+            )
+        if raw_local == []:
+            visiting.remove(name)
+            frames[name] = None
+            component["transform"] = []
+            return None
+        parent = component["parent_occurrence"]
+        parent_frame = _PROJECTED_IDENTITY if not parent else resolve_frame(parent)
+        if parent_frame is None:
+            visiting.remove(name)
+            frames[name] = None
+            component["transform"] = []
+            return None
+        local = _verification_frame(raw_local)
+        world = _verification_multiply(parent_frame, local)
+        visiting.remove(name)
+        frames[name] = world
+        component["transform"] = [value for row in world for value in row]
+        return world
+
+    for name in sorted(by_component):
+        resolve_frame(name)
+
+    by_document = {
+        name: str(component.get("document") or "")
+        for name, component in by_component.items()
+    }
+    native_files = projected.get("files")
+    mates = projected.get("mates")
+    if not isinstance(mates, list):
+        raise _Failure(
+            "discovery.raw",
+            "native mate inventory is unavailable",
+        )
+    for mate in mates:
+        if not isinstance(mate, dict):
+            raise _Failure("discovery.raw", "a native mate is malformed")
+        scope = mate.get("scope")
+        if not isinstance(scope, str):
+            raise _Failure(
+                "discovery.mate_scope",
+                "native mate has no owner scope",
+                {"mate": mate.get("name")},
+            )
+        if scope and scope not in by_component:
+            raise _Failure(
+                "discovery.mate_scope",
+                "native mate owner scope is not a known occurrence",
+                {"mate": mate.get("name"), "scope": scope},
+            )
+        owner_configuration = (
+            by_component[scope].get("configuration")
+            if scope
+            else projected.get("saved_configuration")
+        )
+        mate_configuration = mate.get("configuration")
+        if (
+            not isinstance(owner_configuration, str)
+            or not owner_configuration.strip()
+            or not isinstance(mate_configuration, str)
+            or not mate_configuration.strip()
+            or mate_configuration != owner_configuration
+        ):
+            raise _Failure(
+                "discovery.mate_configuration",
+                "native mate configuration does not match its owner assembly",
+                {
+                    "mate": mate.get("name"),
+                    "scope": scope,
+                    "configuration": mate_configuration,
+                    "expected": owner_configuration,
+                },
+            )
+        entities = mate.get("entities")
+        if not isinstance(entities, list):
+            raise _Failure(
+                "discovery.mate_scope",
+                "native mate has no entity list",
+                {"mate": mate.get("name")},
+            )
+        for entity in entities:
+            if not isinstance(entity, dict) or "component" in entity:
+                raise _Failure(
+                    "discovery.mate_scope",
+                    "native mate entity must preserve reference_name instead of a bound component",
+                    {"mate": mate.get("name")},
+                )
+            reference_name = entity.get("reference_name")
+            reference_document = entity.get("reference_document")
+            reference_configuration = entity.get(
+                "reference_configuration"
+            )
+            assembly_frame = entity.get("assembly_frame")
+            if (
+                not isinstance(reference_name, str)
+                or not reference_name
+                or not isinstance(reference_document, str)
+                or not reference_document.strip()
+                or type(assembly_frame) is not bool
+            ):
+                raise _Failure(
+                    "discovery.mate_scope",
+                    "native mate entity lacks raw reference identity or document",
+                    {
+                        "mate": mate.get("name"),
+                        "component": reference_name,
+                    },
+                )
+            if (
+                "reference_configuration" not in entity
+                or (
+                    reference_configuration is not None
+                    and not isinstance(reference_configuration, str)
+                )
+            ):
+                raise _Failure(
+                    "discovery.mate_configuration",
+                    "native mate entity has no explicit configuration reading",
+                    {
+                        "mate": mate.get("name"),
+                        "component": reference_name,
+                    },
+                )
+            if assembly_frame:
+                if scope:
+                    exact_owner = (
+                        scope in by_component
+                        and _verification_component_document_is_bound(
+                            by_component[scope],
+                            scope,
+                            reference_document,
+                            native_files,
+                        )
+                    )
+                else:
+                    identity = projected.get("identity")
+                    main_assembly = (
+                        identity.get("main_assembly")
+                        if isinstance(identity, dict)
+                        else None
+                    )
+                    exact_owner = (
+                        isinstance(main_assembly, str)
+                        and bool(main_assembly)
+                        and _verification_document_key(reference_document)
+                        == _verification_document_key(main_assembly)
+                    )
+                if not exact_owner:
+                    raise _Failure(
+                        "discovery.mate_scope",
+                        "mate entity does not resolve to its exact scoped occurrence",
+                        {
+                            "mate": mate.get("name"),
+                            "component": reference_name,
+                            "scope": scope,
+                        },
+                    )
+                component = scope
+            else:
+                component = (
+                    f"{scope}/{reference_name}"
+                    if scope and not reference_name.startswith(scope + "/")
+                    else reference_name
+                )
+                if component not in by_component or (
+                    not _verification_component_document_is_bound(
+                        by_component[component],
+                        component,
+                        reference_document,
+                        native_files,
+                    )
+                ):
+                    raise _Failure(
+                        "discovery.mate_scope",
+                        "mate entity does not resolve to its exact scoped occurrence",
+                        {
+                            "mate": mate.get("name"),
+                            "component": reference_name,
+                            "scope": scope,
+                        },
+                    )
+                if (
+                    not isinstance(reference_configuration, str)
+                    or not reference_configuration.strip()
+                    or by_component[component].get("configuration")
+                    != reference_configuration
+                ):
+                    raise _Failure(
+                        "discovery.mate_configuration",
+                        "mate entity configuration does not match its recorded component",
+                        {
+                            "mate": mate.get("name"),
+                            "component": component,
+                            "reference_configuration": reference_configuration,
+                        },
+                    )
+                owner_document = (
+                    by_document.get(scope, "")
+                    if scope
+                    else str((projected.get("identity") or {}).get("main_assembly") or "")
+                )
+                if _verification_document_key(
+                    by_document[component]
+                ) == _verification_document_key(owner_document):
+                    raise _Failure(
+                        "discovery.reference_cycle",
+                        "mate entity resolves to an occurrence holding the owning assembly document",
+                        {
+                            "mate": mate.get("name"),
+                            "component": reference_name,
+                            "scope": scope,
+                        },
+                    )
+            entity["component"] = component
+            entity["mate_entity_reference"] = _verification_mate_reference(
+                entity.get("mate_entity_reference"),
+                component,
+                scope,
+                frames,
+            )
+
+    datums = projected.get("datums")
+    if not isinstance(datums, list):
+        raise _Failure(
+            "discovery.raw",
+            "native datum inventory is unavailable",
+        )
+    for datum in datums:
+        if not isinstance(datum, dict) or "array" in datum:
+            raise _Failure(
+                "discovery.local_datum",
+                "native datum must carry local array_raw, not a normalized array",
+                {
+                    "datum": (
+                        datum.get("name")
+                        if isinstance(datum, dict)
+                        else None
+                    )
+                },
+            )
+        owner = datum.get("owner")
+        if not isinstance(owner, str) or (owner and owner not in by_component):
+            raise _Failure(
+                "discovery.datum_owner",
+                "native datum has no known occurrence owner",
+                {"datum": datum.get("name"), "owner": owner},
+            )
+        local = _verification_frame(datum.get("array_raw"))
+        if owner:
+            owner_frame = frames.get(owner)
+            if owner_frame is None:
+                raise _Failure(
+                    "discovery.datum_owner",
+                    "native datum owner has no usable local frame",
+                    {"datum": datum.get("name"), "owner": owner},
+                )
+            composed = _verification_multiply(owner_frame, local)
+        else:
+            composed = local
+        datum["array"] = [value for row in composed for value in row]
+    return _ProjectedNativeRecord(projected)
+
+
 def _plane_basis(axis: list[float]) -> list[list[float]]:
     """Two orthonormal directions spanning the plane orthogonal to the axis."""
 
@@ -2014,6 +2683,7 @@ def rebuild_rigid_bodies(record: dict) -> list[dict]:
 
     if isinstance(record.get("raw"), dict):
         record = record["raw"]
+    record = project_native_verification_record(record)
     _validate_property_objects(record)
     by_material, _by_component = _cluster_bindings(record)
     attached = _frame_attached_members(record)
@@ -2158,6 +2828,7 @@ def rebuild_interface_frames(
     """
 
     raw = record["raw"] if isinstance(record.get("raw"), dict) else record
+    raw = project_native_verification_record(raw)
     if bodies is None:
         bodies = rebuild_rigid_bodies(raw)
         by_material, _by_component = _cluster_bindings(raw)
@@ -2331,7 +3002,8 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
     """
 
     payload = record if isinstance(record.get("raw"), dict) else {"raw": record}
-    raw = payload["raw"]
+    raw = project_native_verification_record(payload["raw"])
+    payload = {**payload, "raw": raw}
     component_records = {
         str(item.get("name2")): item
         for item in raw.get("components") or []
@@ -3249,6 +3921,10 @@ def verify_discovery(package: Path) -> dict:
             },
         }
         state["definition"] = definition
+        payload = {
+            **payload,
+            "raw": project_native_verification_record(raw),
+        }
         state["payload"] = payload
         return {
             "discovery_sha256": hashlib.sha256(payload_bytes).hexdigest(),
@@ -3885,9 +4561,9 @@ def verify_discovery(package: Path) -> dict:
             for entity in _entities(mate):
                 frame_flag = entity.get("assembly_frame")
                 _require(
-                    frame_flag is None or frame_flag is True,
+                    frame_flag is None or type(frame_flag) is bool,
                     "discovery.graph",
-                    "an assembly-frame flag must be exactly true when present",
+                    "an assembly-frame flag must be an explicit boolean when present",
                     {"mate": mate.get("name"), "assembly_frame": frame_flag},
                 )
                 component = entity.get("component")

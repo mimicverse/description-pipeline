@@ -58,7 +58,9 @@ from description_pipeline.orchestration.run_ownership import (
     SINGLE_RUN_CLEAR_ENDPOINT,
     owner_retry_allowed,
     owner_create_allowed,
+    retry_allowed,
     routed_route,
+    single_run_clear_requested,
 )
 
 if TYPE_CHECKING:
@@ -412,6 +414,27 @@ class FeishuAuthManager(BaseAuthManager[FeishuUser]):
         details: DagDetails | None = None,
     ) -> bool:
         if self._is_admin(user):
+            route = routed_route()
+            direct_clear = (
+                method == "PUT"
+                and access_entity is DagAccessEntity.RUN
+                and (single_run_clear_requested() or bound_request() is None)
+            )
+            if direct_clear:
+                return bool(
+                    details is not None
+                    and details.id == ALLOWED_DAG_ID
+                    and route is not None
+                    and route.http_method == "POST"
+                    and route.dag_run_id
+                    and route.clear_body_safe
+                    and retry_allowed(
+                        user,
+                        route.dag_id,
+                        route.dag_run_id,
+                        require_owner=False,
+                    )
+                )
             return True
         if details is None or details.id != ALLOWED_DAG_ID:
             return False
@@ -440,8 +463,9 @@ class FeishuAuthManager(BaseAuthManager[FeishuUser]):
             and route.endpoint == SINGLE_RUN_CLEAR_ENDPOINT
             and route.http_method == "POST"
             and route.dag_run_id
-            and route.clear_body_safe
         ):
+            if not route.clear_body_safe:
+                return False
             # The one owner mutation: retrying the caller's own run. Note/state patches,
             # partitions, bulk, wildcard, backfills and deletion stay administrator-only.
             return owner_retry_allowed(user, route.dag_id, route.dag_run_id)

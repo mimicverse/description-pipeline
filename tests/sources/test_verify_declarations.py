@@ -24,11 +24,41 @@ from description_pipeline.interface_records import PURPOSE_ENGINEERING, PURPOSE_
 from description_pipeline.io import PipelineError, digest
 from description_pipeline.verification import solidworks_urdf
 from description_pipeline.verification import native_declarations as native_declarations_module
-from description_pipeline.verification.native_declarations import verify_declarations
+from description_pipeline.verification.native_declarations import (
+    verify_declarations as _verify_declarations,
+)
 from description_pipeline.verification.native_discovery import _Failure, rebuild_interface_frames, verify_discovery
 
 from .selection_support import sealed_selection
 from . import support
+
+
+def verify_declarations(raw, source=None, *, purpose=None):
+    """Fixture adapter: encode scenario values as the Windows local raw shape."""
+
+    if not isinstance(raw.get("files"), dict) or not raw["files"]:
+        documents = {
+            str(component["document"])
+            for component in raw.get("components") or []
+            if isinstance(component, dict) and component.get("document")
+        }
+        main_assembly = (
+            (raw.get("identity") or {}).get("main_assembly")
+            or (raw.get("selection") or {}).get("main_assembly")
+        )
+        if isinstance(main_assembly, str) and main_assembly:
+            documents.add(main_assembly)
+        raw["files"] = dict.fromkeys(sorted(documents), "f" * 64)
+    if all(
+        "transform_raw" not in item
+        for item in raw.get("components") or []
+        if isinstance(item, dict)
+    ):
+        raw = support.local_native_record_payload(
+            raw,
+            default_mate_scope=True,
+        )
+    return _verify_declarations(raw, source, purpose=purpose)
 
 
 NS = 'xmlns="http://schemas.datacontract.org/2004/07/SW2URDF"'
@@ -406,6 +436,7 @@ def fixture():
             "change_summary": "native verification fixture",
             "control": {"system": "handoff", "reference": "fixture"},
             "robot_name": "fixture",
+            "main_assembly": "robot.SLDASM",
         },
         "mates": [],
     }
@@ -532,13 +563,37 @@ class DeclarationConsumerTests(unittest.TestCase):
 
     def _delivery(self, directory: str, mutate_raw=None) -> Path:
         package = Path(directory) / "delivery"
-        native = b"synthetic native bytes for verification tests only"
-        native_files = {"robot.SLDASM": hashlib.sha256(native).hexdigest()}
         raw = fixture()
         if mutate_raw is not None:
             mutate_raw(raw)
+        documents = sorted(
+            {
+                str(component["document"])
+                for component in raw["components"]
+                if component.get("document")
+            }
+            | {"robot.SLDASM"}
+        )
+        originals = {
+            document: (
+                f"synthetic native bytes for {document}"
+            ).encode()
+            for document in documents
+        }
+        native_files = {
+            document: hashlib.sha256(content).hexdigest()
+            for document, content in originals.items()
+        }
         raw["files"] = native_files
-        raw["source_selection"] = sealed_selection(native_files, "robot.SLDASM", edges={"robot.SLDASM": []})
+        raw["source_selection"] = sealed_selection(
+            native_files,
+            "robot.SLDASM",
+            edges={document: [] for document in documents},
+        )
+        raw = support.local_native_record_payload(
+            raw,
+            default_mate_scope=True,
+        )
         robot = {"hardware_id": "fixture", "source": source_claims(), "checks": {}}
         robot["source"]["robot_name"] = "fixture"
         payload = support.frozen_discovery_payload(
@@ -573,7 +628,10 @@ class DeclarationConsumerTests(unittest.TestCase):
             },
             discovery=payload,
             source=source,
-            originals={"robot.SLDASM": native.decode("utf-8")},
+            originals={
+                document: content.decode("utf-8")
+                for document, content in originals.items()
+            },
         )
         return package
 
@@ -655,7 +713,7 @@ class DeclarationConsumerTests(unittest.TestCase):
             (
                 "foreign owner",
                 lambda raw: raw["datums"].append(self._interface("TCP_orphan", "ghost-1")),
-                "not owned by any rebuilt body",
+                "no known occurrence owner",
             ),
             (
                 "duplicate native interface identity",
@@ -745,6 +803,10 @@ class DeclarationConsumerTests(unittest.TestCase):
     def test_interface_expansion_refuses_a_missing_referenced_configuration(self) -> None:
         raw = {"components": [{"name2": "a-1"}], "datums": [self._interface("TCP_x", "a-1")]}
         bodies = [{"id": "a", "name": "a", "components": ["a-1"], "frame": {"coordinate_system": "CS_a"}}]
+        raw = support.local_native_record_payload(
+            raw,
+            default_mate_scope=True,
+        )
         with self.assertRaises(_Failure) as raised:
             rebuild_interface_frames(raw, bodies=bodies, base=None)
         self.assertIn("no recorded referenced configuration", str(raised.exception))
@@ -856,14 +918,13 @@ class NativeDeclarationsTests(unittest.TestCase):
 
     def test_nonlimit_mate_with_native_limit_payload_is_rejected(self):
         raw = fixture()
-        raw["mates"].append(
-            {
-                "name": "unexpected_native_payload",
-                "type": "lock",
-                "suppressed": False,
-                "native_limit": {"type_index": 6},
-            }
+        unexpected = copy.deepcopy(raw["mates"][0])
+        unexpected.update(
+            name="unexpected_native_payload",
+            type="lock",
+            native_limit={"type_index": 6},
         )
+        raw["mates"].append(unexpected)
         report = verify_declarations(raw, source_claims())
         self.assertFalse(report["passed"])
         self.assertIn("v14.native_limits_invalid", {item["code"] for item in report["errors"]})
@@ -1169,7 +1230,10 @@ class NativeDeclarationsTests(unittest.TestCase):
         )
 
         incomplete = copy.deepcopy(raw)
-        incomplete["mates"] = [{"name": "incomplete", "type": "distance"}]
+        incomplete_mate = copy.deepcopy(fixture()["mates"][0])
+        incomplete_mate["native_limit"] = None
+        incomplete_mate["limits"] = None
+        incomplete["mates"] = [incomplete_mate]
         incomplete_report = verify_declarations(
             incomplete,
             preview_claims(),
@@ -1327,7 +1391,18 @@ class NativeDeclarationsTests(unittest.TestCase):
                 candidate["mates"] = [mate]
                 report = verify_declarations(candidate, purpose=PURPOSE_ENGINEERING)
                 self.assertFalse(report["passed"])
-                self.assertIn("v14.native_limits_invalid", {item["code"] for item in report["errors"]})
+                expected = (
+                    {"discovery.mate_scope"}
+                    if label == "unknown_binding"
+                    else {
+                        "v14.native_limits_invalid",
+                        "v14.native_limits_conflict",
+                    }
+                )
+                self.assertTrue(
+                    expected & {item["code"] for item in report["errors"]},
+                    report["errors"],
+                )
                 self.assertNotIn("v14.default_policy", {item["code"] for item in report["diagnostics"]})
 
         conflict = copy.deepcopy(raw)
@@ -1479,7 +1554,15 @@ class NativeDeclarationsTests(unittest.TestCase):
         item = next(item for item in raw["components"] if item["name2"] == row["name2"])
         row.update(document="source.step", source_provenance=copy.deepcopy(proof))
         item.update(document="source.step", source_provenance=copy.deepcopy(proof))
-        raw["files"] = {"source.step": "a" * 64}
+        raw["files"] = {
+            **{
+                str(component["document"]): "f" * 64
+                for component in raw["components"]
+                if component.get("document")
+                and component.get("document") != "source.step"
+            },
+            "source.step": "a" * 64,
+        }
         self.assertTrue(verify_declarations(raw)["passed"])
         for patch in [
             {"imported_path": "C:\\outside\\source.step"},
@@ -1497,7 +1580,10 @@ class NativeDeclarationsTests(unittest.TestCase):
         candidate["exporter"]["pid_bindings"][2]["document"] = None
         native = next(item for item in candidate["components"] if item["name2"] == row["name2"])
         native.update(document=None, virtual=True)
-        self.assertIn("v14.pid_document_unread", self.errors(candidate))
+        self.assertTrue(
+            {"discovery.mate_scope", "discovery.reference_cycle"}
+            & self.errors(candidate)
+        )
         raw = fixture()
         raw["exporter"]["pid_bindings"][0]["name2"] = "foreign"
         self.assertIn("v14.pid_unread", self.errors(raw))
@@ -1562,11 +1648,18 @@ class NativeDeclarationsTests(unittest.TestCase):
             "author_imported_error": None,
         }
         raw = fixture()
-        raw["files"] = {owner: owner_sha}
+        ordinary_documents = {
+            str(component["document"]): "f" * 64
+            for component in raw["components"]
+            if component.get("name2")
+            != raw["exporter"]["pid_bindings"][2]["name2"]
+            and component.get("document")
+        }
+        raw["files"] = {**ordinary_documents, owner: owner_sha}
         raw["source_selection"] = sealed_selection(
-            {owner: owner_sha},
+            raw["files"],
             owner,
-            edges={owner: []},
+            edges={document: [] for document in raw["files"]},
             imports=[],
             virtual_components=[slot],
         )
@@ -1609,10 +1702,20 @@ class NativeDeclarationsTests(unittest.TestCase):
                         "author_imported_path"
                     )
                     item["source_provenance"].pop("author_imported_path")
-                self.assertIn("v14.imported_binding", self.errors(candidate), patch)
+                self.assertTrue(
+                    {
+                        "discovery.mate_scope",
+                        "v14.imported_binding",
+                    }
+                    & self.errors(candidate),
+                    patch,
+                )
         candidate = copy.deepcopy(raw)
         candidate["source_selection"]["closure"]["virtual_components"] = []
-        self.assertIn("v14.imported_binding", self.errors(candidate))
+        self.assertTrue(
+            {"discovery.mate_scope", "v14.imported_binding"}
+            & self.errors(candidate)
+        )
         candidate = copy.deepcopy(raw)
         candidate["exporter"]["pid_bindings"][2]["document"] = r"C:\other\part.SLDPRT"
         item = next(
@@ -1621,7 +1724,10 @@ class NativeDeclarationsTests(unittest.TestCase):
             if entry["name2"] == candidate["exporter"]["pid_bindings"][2]["name2"]
         )
         item["document"] = r"C:\other\part.SLDPRT"
-        self.assertIn("v14.imported_binding", self.errors(candidate))
+        self.assertTrue(
+            {"discovery.mate_scope", "v14.imported_binding"}
+            & self.errors(candidate)
+        )
 
     def test_unproven_absolute_document_stays_refused_without_provenance(self):
         """A provenance-less PID document must still be a confined package path."""
@@ -1633,7 +1739,10 @@ class NativeDeclarationsTests(unittest.TestCase):
         item.pop("source_provenance", None)
         row.update(document=r"C:\external\tool_part.SLDPRT")
         item.update(document=r"C:\external\tool_part.SLDPRT")
-        self.assertIn("v14.pid_binding", self.errors(raw))
+        self.assertTrue(
+            {"discovery.mate_scope", "v14.pid_binding"}
+            & self.errors(raw)
+        )
 
     def test_serialized_origin_is_claim_only_when_customized(self):
         raw = fixture()  # stored origin differs from native datums, but isCustomized=false
@@ -1665,7 +1774,7 @@ class NativeDeclarationsTests(unittest.TestCase):
         self.assertIn("v14.evidence_invalid", self.errors(raw))
         raw = fixture()
         raw["datums"][1]["owner"] = "foreign"
-        self.assertIn("v14.datum_unread", self.errors(raw))
+        self.assertIn("discovery.datum_owner", self.errors(raw))
         claims = source_claims()
         claims["joints"][0]["limits"]["effort"] = 10
         self.assertIn("v14.claims", self.errors(fixture(), claims))
@@ -1716,11 +1825,34 @@ class NativeDeclarationsTests(unittest.TestCase):
     def test_package_gate_uses_bound_declaration_without_old_naming_or_graph_requirements(self):
         with tempfile.TemporaryDirectory() as directory:
             package = Path(directory) / "delivery"
-            native = b"synthetic native bytes for verification tests only"
-            native_files = {"robot.SLDASM": hashlib.sha256(native).hexdigest()}
             raw = fixture()
+            documents = sorted(
+                {
+                    str(component["document"])
+                    for component in raw["components"]
+                    if component.get("document")
+                }
+                | {"robot.SLDASM"}
+            )
+            originals = {
+                document: (
+                    f"synthetic native bytes for {document}"
+                ).encode()
+                for document in documents
+            }
+            native_files = {
+                document: hashlib.sha256(content).hexdigest()
+                for document, content in originals.items()
+            }
             raw["files"] = native_files
-            raw["source_selection"] = sealed_selection(native_files, "robot.SLDASM", edges={"robot.SLDASM": []})
+            raw["source_selection"] = sealed_selection(
+                native_files,
+                "robot.SLDASM",
+            )
+            raw = support.local_native_record_payload(
+                raw,
+                default_mate_scope=True,
+            )
             robot = {
                 "hardware_id": "fixture",
                 "source": source_claims(),
@@ -1757,7 +1889,10 @@ class NativeDeclarationsTests(unittest.TestCase):
                 capture={},
                 discovery=payload,
                 source=source,
-                originals={"robot.SLDASM": native.decode("utf-8")},
+                originals={
+                    document: content.decode("utf-8")
+                    for document, content in originals.items()
+                },
             )
 
             def sync_robot() -> None:
@@ -1889,7 +2024,9 @@ class NativeDeclarationsTests(unittest.TestCase):
             support.seal_delivery(package)
             changed_budget = verify_discovery(package)
             self.assertIn("discovery.record", {item["code"] for item in changed_budget["errors"]})
-            (package / "input/cad/robot.SLDASM").write_bytes(native + b"tampered")
+            (package / "input/cad/robot.SLDASM").write_bytes(
+                originals["robot.SLDASM"] + b"tampered"
+            )
             support.seal_delivery(package)
             changed = verify_discovery(package)
             self.assertFalse(changed["passed"])

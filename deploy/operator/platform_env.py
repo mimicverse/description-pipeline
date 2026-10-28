@@ -243,6 +243,8 @@ def derive(
     postgres_root = f"{state_root.rstrip('/')}/airflow-pg"
     postgres_port = PORT_DEFAULTS["POSTGRES_PORT"]
     env = {
+        # systemd services do not inherit operatorctl's shell environment.
+        "PYTHONDONTWRITEBYTECODE": "1",
         "OPERATOR_HOST": host,
         "OPERATOR_HTTPS_PORT": str(https_port),
         "OPERATOR_BIND": "0.0.0.0",

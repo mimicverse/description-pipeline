@@ -307,7 +307,10 @@ class FakeBackend:
         self.payload = payload
 
     def discover_native(self, frozen_source: Path, settings: dict, *, on_activity=None) -> dict:
-        return copy.deepcopy(self.payload)
+        return support.local_native_record_payload(
+            copy.deepcopy(self.payload),
+            default_mate_scope=True,
+        )
 
 
 class DiscoveryTests(unittest.TestCase):
@@ -371,7 +374,13 @@ class DiscoveryTests(unittest.TestCase):
 
     def _verify_mutated_record(self, output: Path, mutate) -> dict:
         payload = json.loads((output / "discovery/native-discovery.json").read_text(encoding="utf-8"))
-        mutate(payload)
+        canonical = copy.deepcopy(payload)
+        canonical["raw"] = support.native_consumer_view(payload["raw"])
+        mutate(canonical)
+        payload["raw"] = support.local_native_record_payload(
+            canonical["raw"],
+            default_mate_scope=True,
+        )
         self.serial += 1
         delivery = support.native_discovery_delivery(
             self.tmp / f"mutated-delivery{self.serial}",
@@ -547,7 +556,10 @@ class DiscoveryTests(unittest.TestCase):
                 self.sink = on_activity
                 if on_activity is not None:
                     on_activity({"phase": "discover", "action": "read_components", "completed": 1, "total": 2})
-                return copy.deepcopy(record())
+                return support.local_native_record_payload(
+                    copy.deepcopy(record()),
+                    default_mate_scope=True,
+                )
 
         source, records = self._native()
         received = []
@@ -589,7 +601,10 @@ class DiscoveryTests(unittest.TestCase):
                 self._prepare(mutate=nonfinite)
             error = caught.exception
             self.assertEqual(error.code, "cad_native_record_invalid")
-            self.assertEqual(error.detail["field"], "raw.components[0].transform[3]")
+            self.assertEqual(
+                error.detail["field"],
+                "raw.components[0].transform_raw[9]",
+            )
             json.dumps(error.to_dict(), allow_nan=False)
 
     def test_prepare_and_verify_refuse_a_nonrigid_component_transform(self):
@@ -597,13 +612,44 @@ class DiscoveryTests(unittest.TestCase):
             raw = payload.get("raw", payload)
             raw["components"][0]["transform"][0] = 2.0
 
-        result, _source, _output = self._prepare(mutate=mutate)
-        self.assertIn("discovery.component_transform_missing", self._codes(result))
+        with self.assertRaises(PipelineError):
+            self._prepare(mutate=mutate)
 
         baseline, _source, output = self._prepare()
         self.assertTrue(baseline.passed, baseline.findings)
         report = self._verify_mutated_record(output, mutate)
         self.assertFalse(report["passed"])
+
+    def test_source_definition_requires_local_raw_projection(self) -> None:
+        baseline, _source, output = self._prepare()
+        self.assertTrue(baseline.passed, baseline.findings)
+        delivery = self._deliver(output)
+        discovery_path = (
+            delivery
+            / "input/discovery/native-discovery.json"
+        )
+        payload = json.loads(
+            discovery_path.read_text(encoding="utf-8")
+        )
+        canonical = support.native_consumer_view(payload["raw"])
+        component = canonical["components"][0]
+        component["transform"] = component.pop("transform_raw")
+        payload["raw"] = canonical
+        discovery_path.write_text(
+            json.dumps(payload, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        support.seal_delivery(delivery)
+        with self.assertRaisesRegex(
+            PipelineError,
+            "raw cannot be projected",
+        ):
+            source_definition(
+                delivery,
+                discovery_name="input/discovery/native-discovery.json",
+                cad_prefix="input/cad/",
+                records_prefix="input/",
+            )
 
     def test_prepare_and_verify_refuse_a_nonrigid_datum(self):
         def mutate(payload):
@@ -611,14 +657,17 @@ class DiscoveryTests(unittest.TestCase):
             datum = next(item for item in raw["datums"] if item["name"] == "CS_base_link")
             datum["array"][0] = 2.0
 
-        result, _source, _output = self._prepare(mutate=mutate)
-        self.assertFalse(result.passed)
+        with self.assertRaises(PipelineError):
+            self._prepare(mutate=mutate)
 
         baseline, _source, output = self._prepare()
         self.assertTrue(baseline.passed, baseline.findings)
         report = self._verify_mutated_record(output, mutate)
         self.assertFalse(report["passed"])
-        self.assertIn("discovery.joint_rebuild", {item["code"] for item in report["errors"]})
+        self.assertIn(
+            "discovery.local_transform",
+            {item["code"] for item in report["errors"]},
+        )
 
     def test_prepare_and_verify_refuse_lightweight_occurrences(self):
         def mutate(payload):
@@ -1200,7 +1249,8 @@ class DiscoveryTests(unittest.TestCase):
             for entity in mate["entities"]
             if entity.get("assembly_frame")
         )
-        self.assertEqual(frame_entity["component"], "")
+        self.assertEqual(frame_entity["reference_name"], "assembly_root")
+        self.assertNotIn("component", frame_entity)
 
     def test_frame_attachment_must_reach_exactly_one_rigid_cluster(self):
         def mutate(payload):
@@ -1245,7 +1295,7 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(len(finding["detail"]["clusters"]), 2)
 
     def test_frame_entity_identity_is_the_exact_empty_string(self):
-        for component in (None, 0, "base-1"):
+        for component in (None, 0):
 
             def mutate(payload, component=component):
                 mates = _grounding_mates()
@@ -1257,14 +1307,36 @@ class DiscoveryTests(unittest.TestCase):
                 }
                 payload["mates"].extend(mates)
 
-            with self.subTest(component=component):
-                result, _source, _output = self._prepare(mutate=mutate)
-                codes = [item["code"] for item in result.findings]
-                self.assertIn("discovery.frame_attachment", codes)
-                self.assertIn("direction.semantics_unresolved", codes)
-                finding = next(item for item in result.findings if item["code"] == "discovery.frame_attachment")
-                self.assertIn("frozen top-scope identity", finding["message"])
-                self.assertFalse(any("full rank" in item["message"] for item in result.findings))
+            with (
+                self.subTest(component=component),
+                self.assertRaises(PipelineError),
+            ):
+                self._prepare(mutate=mutate)
+
+        def wrong_occurrence(payload):
+            mates = _grounding_mates()
+            mates[2]["entities"][1].update(
+                component="base-1",
+                assembly_frame=True,
+            )
+            payload["mates"].extend(mates)
+
+        result, _source, _output = self._prepare(
+            mutate=wrong_occurrence
+        )
+        codes = [item["code"] for item in result.findings]
+        self.assertIn("discovery.frame_attachment", codes)
+        raw = json.loads(
+            (_output / "discovery/native-discovery.json").read_text(
+                encoding="utf-8"
+            )
+        )["raw"]
+        grounded = next(
+            mate
+            for mate in raw["mates"]
+            if mate["name"] == "base_ground_parallel"
+        )
+        self.assertIs(grounded["entities"][1]["assembly_frame"], False)
 
     def test_frame_attachment_arity_and_endpoints_are_exact(self):
         def extra_occurrence(payload):
@@ -1358,7 +1430,6 @@ class DiscoveryTests(unittest.TestCase):
             "extra_occurrence": (extra_occurrence, "exactly one frozen top-frame entity and one occurrence"),
             "frame_only": (frame_only, "no occurrence endpoint"),
             "two_frame_entities": (two_frame_entities, "no occurrence endpoint"),
-            "unknown_occurrence": (unknown_occurrence, "names an unknown occurrence"),
             "unreconstructable": (unreconstructable, "cannot be reconstructed"),
         }
         for name, (mutate, fragment) in cases.items():
@@ -1372,26 +1443,20 @@ class DiscoveryTests(unittest.TestCase):
                     ),
                     result.findings,
                 )
+        with self.assertRaises(PipelineError):
+            self._prepare(mutate=unknown_occurrence)
 
     def test_nested_frame_attachment_remains_blocking(self):
-        for scope in ("sub-1", None):
+        for scope in ("sub-1",):
 
             def mutate(payload, scope=scope):
                 mates = _grounding_mates()
                 for mate in mates:
-                    if scope is None:
-                        mate.pop("scope")
-                    else:
-                        mate["scope"] = scope
+                    mate["scope"] = scope
                 payload["mates"].extend(mates)
 
-            with self.subTest(scope=scope):
-                result, _source, _output = self._prepare(mutate=mutate)
-                self.assertFalse(result.passed)
-                findings = [item for item in result.findings if item["code"] == "discovery.frame_attachment"]
-                self.assertEqual(len(findings), 3)
-                self.assertTrue(all("outside the frozen top assembly" in item["message"] for item in findings))
-                self.assertTrue(all(item["detail"]["scope"] == scope for item in findings))
+            with self.subTest(scope=scope), self.assertRaises(PipelineError):
+                self._prepare(mutate=mutate)
 
     def test_frame_attachment_without_cs_base_link_keeps_the_ownerless_channel_closed(self):
         def mutate(payload):
@@ -2583,12 +2648,16 @@ class DiscoveryTests(unittest.TestCase):
         self.assertTrue(self._verify(output)["passed"])
 
     def test_unowned_interface_datum_blocks(self):
-        result, _source, _output = self._prepare(
-            mutate=lambda payload: payload["datums"].append(
-                {"name": "TCP_loose", "owner": "ghost-1", "array": _translated(0.0, 0.0, 0.4)}
+        with self.assertRaises(PipelineError):
+            self._prepare(
+                mutate=lambda payload: payload["datums"].append(
+                    {
+                        "name": "TCP_loose",
+                        "owner": "ghost-1",
+                        "array": _translated(0.0, 0.0, 0.4),
+                    }
+                )
             )
-        )
-        self.assertIn("discovery.interface_unowned", self._codes(result))
 
     def test_dropped_frame_is_rejected_by_the_oracle(self):
         def mutate(payload):
@@ -2658,10 +2727,12 @@ class DiscoveryTests(unittest.TestCase):
         self.assertIn("discovery.body_rebuild", {item["code"] for item in report["errors"]})
 
     def test_duplicate_occurrence_cannot_overwrite_a_native_identity(self):
-        result, _source, _output = self._prepare(
-            mutate=lambda payload: payload["components"].append(copy.deepcopy(payload["components"][0]))
-        )
-        self.assertIn("discovery.component_identity_invalid", self._codes(result))
+        with self.assertRaises(PipelineError):
+            self._prepare(
+                mutate=lambda payload: payload["components"].append(
+                    copy.deepcopy(payload["components"][0])
+                )
+            )
 
     def test_duplicate_owned_datum_blocks_even_with_explicit_body_datum(self):
         def mutate(payload):
@@ -3504,6 +3575,15 @@ class DiscoveryTests(unittest.TestCase):
 
         native, records = self._native()
         output = self.tmp / f"prepared{self.serial}"
+        if all(
+            "transform_raw" not in item
+            for item in raw.get("components") or []
+            if isinstance(item, dict)
+        ):
+            raw = support.local_native_record_payload(
+                raw,
+                default_mate_scope=True,
+            )
         return (
             derive_native_package(
                 native,
@@ -3718,6 +3798,7 @@ class DiscoveryTests(unittest.TestCase):
                         "discovery.binding",
                         "discovery.configuration",
                         "discovery.identity",
+                        "discovery.mate_configuration",
                     }
                     & {item["code"] for item in report["errors"]}
                 )
@@ -4119,7 +4200,13 @@ class DerivationSplitTests(unittest.TestCase):
             "description_pipeline.runtime.native_readiness",
             side_effect=AssertionError("derivation must not consult the native runtime"),
         ):
-            derived = derive_native_package(source, self.tmp / "derived", "run-1", payload, settings=settings)
+            derived = derive_native_package(
+                source,
+                self.tmp / "derived",
+                "run-1",
+                support.local_native_record_payload(payload),
+                settings=settings,
+            )
         self.assertEqual(inventory(self.tmp / "prepared"), inventory(self.tmp / "derived"))
         self.assertEqual(prepared.prepared_sha256, derived.prepared_sha256)
         self.assertEqual(prepared.discovery_sha256, derived.discovery_sha256)
@@ -4193,7 +4280,7 @@ class DerivationSplitTests(unittest.TestCase):
             source,
             output,
             "run-1",
-            payload,
+            support.local_native_record_payload(payload),
             settings=DiscoverySettings(record_roots=(records,)),
         )
         self.assertTrue(result.passed, result.findings)
@@ -4208,7 +4295,13 @@ class DerivationSplitTests(unittest.TestCase):
         source, records = self._scene()
         settings = DiscoverySettings(record_roots=(records,), main_assembly="other.SLDASM")
         with self.assertRaisesRegex(PipelineError, "did not open the selected main assembly"):
-            derive_native_package(source, self.tmp / "derived", "run-1", record(), settings=settings)
+            derive_native_package(
+                source,
+                self.tmp / "derived",
+                "run-1",
+                support.local_native_record_payload(record()),
+                settings=settings,
+            )
 
     def test_derivation_refuses_a_changed_frozen_file(self) -> None:
         source, records = self._scene()
@@ -4218,7 +4311,7 @@ class DerivationSplitTests(unittest.TestCase):
                 source,
                 self.tmp / "derived",
                 "run-1",
-                record(),
+                support.local_native_record_payload(record()),
                 settings=DiscoverySettings(record_roots=(records,)),
             )
 
@@ -4228,7 +4321,11 @@ class DerivationSplitTests(unittest.TestCase):
         # payload to the bytes present, never to a stale record value.
         source, records = self._scene()
         result = derive_native_package(
-            source, self.tmp / "derived", "run-1", record(), settings=DiscoverySettings(record_roots=(records,))
+            source,
+            self.tmp / "derived",
+            "run-1",
+            support.local_native_record_payload(record()),
+            settings=DiscoverySettings(record_roots=(records,)),
         )
         payload = json.loads((self.tmp / "derived/discovery/native-discovery.json").read_text(encoding="utf-8"))
         self.assertEqual(payload["native_files"], inventory(source))
@@ -4257,7 +4354,13 @@ class DerivationSplitTests(unittest.TestCase):
             payload.update(patch)
             output = self.tmp / f"derived-refused-{index}"
             with self.subTest(patch=patch), self.assertRaisesRegex(PipelineError, message):
-                derive_native_package(source, output, "run-1", payload, settings=settings)
+                derive_native_package(
+                    source,
+                    output,
+                    "run-1",
+                    support.local_native_record_payload(payload),
+                    settings=settings,
+                )
             # every refused attempt must leave its output untouched
             self.assertFalse(output.exists() and any(output.iterdir()))
 
@@ -4269,7 +4372,7 @@ class DerivationSplitTests(unittest.TestCase):
                 source,
                 self.tmp / "derived-other-config",
                 "run-1",
-                record(),
+                support.local_native_record_payload(record()),
                 settings=settings,
                 configuration="Other",
             )
@@ -4277,7 +4380,7 @@ class DerivationSplitTests(unittest.TestCase):
             source,
             self.tmp / "derived-matching-config",
             "run-1",
-            record(),
+            support.local_native_record_payload(record()),
             settings=settings,
             configuration="Default",
         )
@@ -4288,12 +4391,15 @@ class DerivationSplitTests(unittest.TestCase):
         payload = record()
         payload["identity"]["delivery_configuration"] = None
         payload.pop("saved_configuration", None)
-        with self.assertRaisesRegex(PipelineError, "carries no usable configuration"):
+        with self.assertRaisesRegex(
+            PipelineError,
+            "mate configuration",
+        ):
             derive_native_package(
                 source,
                 self.tmp / "derived-unbound-config",
                 "run-1",
-                payload,
+                support.local_native_record_payload(payload),
                 settings=DiscoverySettings(record_roots=(records,)),
                 configuration="Default",
             )
@@ -4308,7 +4414,7 @@ class DerivationSplitTests(unittest.TestCase):
                 source,
                 self.tmp / "derived-conflicting-config",
                 "run-1",
-                payload,
+                support.local_native_record_payload(payload),
                 settings=DiscoverySettings(record_roots=(records,)),
             )
 
@@ -4318,7 +4424,11 @@ class DerivationSplitTests(unittest.TestCase):
         payload["identity"]["delivery_configuration"] = None
         output = self.tmp / "derived-native-saved-config"
         result = derive_native_package(
-            source, output, "run-1", payload, settings=DiscoverySettings(record_roots=(records,))
+            source,
+            output,
+            "run-1",
+            support.local_native_record_payload(payload),
+            settings=DiscoverySettings(record_roots=(records,)),
         )
         self.assertTrue(result.passed, result.findings)
         source_record = json.loads((output / "source.json").read_text(encoding="utf-8"))

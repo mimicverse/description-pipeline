@@ -19,6 +19,23 @@ from ..geometry.native_scope import (
     native_gate_warning_details_match,
 )
 from ..io import PipelineError, canonical_json_value
+from ..schemas import (
+    NATIVE_DISCOVERY_BUDGET_KEYS,
+    NATIVE_DISCOVERY_CONTROL_KEYS,
+    NATIVE_DISCOVERY_DERIVATION_KEYS,
+    NATIVE_DISCOVERY_ENVELOPE_KEYS,
+    NATIVE_DISCOVERY_FINDING_SCHEMA,
+    NATIVE_DISCOVERY_IDENTITY_KEYS,
+    NATIVE_DISCOVERY_OPTIONAL_ENVELOPE_KEYS,
+    NATIVE_DISCOVERY_RECORD_KEYS,
+    NATIVE_DISCOVERY_SCHEMA,
+)
+from ..sources.solidworks.discovery import (
+    CONTRACT as DISCOVERY_CONTRACT,
+    GENERATOR as DISCOVERY_GENERATOR,
+    GENERATOR_VERSION as DISCOVERY_GENERATOR_VERSION,
+    NAMESPACE as DISCOVERY_NAMESPACE,
+)
 from ..sources.solidworks.evidence import METADATA_WARNING_CODE
 from ..sources.solidworks.saved_state import SAVED_STATE_WARNING_CODE
 from ..stages import stage_view
@@ -43,6 +60,133 @@ _OVERALL_STATE_LABELS = {
     "failed": "Failed",
     "not_run": "Not started",
 }
+
+
+def _validated_discovery_findings(value: object) -> list[dict]:
+    """Validate the discovery finding shape shared by reports and the run API."""
+
+    if not isinstance(value, list):
+        raise PipelineError("Registered discovery findings have an invalid structure")
+    findings: list[dict] = []
+    for item in value:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"schema_version", "code", "object", "message", "detail", "blocking"}
+            or item.get("schema_version") != NATIVE_DISCOVERY_FINDING_SCHEMA
+        ):
+            raise PipelineError("Registered discovery finding has an invalid schema")
+        if (
+            not isinstance(item.get("code"), str)
+            or not item["code"]
+        ):
+            raise PipelineError("Registered discovery finding has an invalid code")
+        if not isinstance(item["object"], str) or not isinstance(item["message"], str):
+            raise PipelineError("Registered discovery finding has an invalid description")
+        if type(item.get("blocking")) is not bool:
+            raise PipelineError(
+                "Registered discovery finding has an invalid blocking state"
+            )
+        findings.append(item)
+    return findings
+
+
+def registered_discovery_record(value: object) -> dict:
+    """Validate the one sealed native-discovery record consumed by every display surface."""
+
+    if not isinstance(value, dict):
+        raise PipelineError("Registered discovery record has an invalid structure")
+    if value.get("schema_version") != NATIVE_DISCOVERY_SCHEMA:
+        raise PipelineError("Registered discovery record has an invalid schema")
+    if set(value) - NATIVE_DISCOVERY_OPTIONAL_ENVELOPE_KEYS != NATIVE_DISCOVERY_ENVELOPE_KEYS:
+        raise PipelineError("Registered discovery envelope must carry exact keys")
+    for field, expected in (
+        ("contract", DISCOVERY_CONTRACT),
+        ("namespace", DISCOVERY_NAMESPACE),
+        ("generator", DISCOVERY_GENERATOR),
+        ("generator_version", DISCOVERY_GENERATOR_VERSION),
+    ):
+        if value[field] != expected:
+            raise PipelineError(f"Registered discovery record has an invalid {field}")
+    run_id = value.get("run_id")
+    if not isinstance(run_id, str) or not run_id:
+        raise PipelineError("Registered discovery record has an invalid run identifier")
+    identity = value.get("identity")
+    if not isinstance(identity, dict) or set(identity) != NATIVE_DISCOVERY_IDENTITY_KEYS:
+        raise PipelineError("Registered discovery record has an invalid identity")
+    control = identity["control"]
+    if control is not None and (
+        not isinstance(control, dict) or set(control) != NATIVE_DISCOVERY_CONTROL_KEYS
+    ):
+        raise PipelineError("Registered discovery record has an invalid control identity")
+    derivation = value["derivation"]
+    if not isinstance(derivation, dict) or set(derivation) != NATIVE_DISCOVERY_DERIVATION_KEYS:
+        raise PipelineError("Registered discovery record has an invalid derivation")
+    records = value["records"]
+    if not isinstance(records, list) or any(
+        not isinstance(item, dict) or set(item) != NATIVE_DISCOVERY_RECORD_KEYS
+        for item in records
+    ):
+        raise PipelineError("Registered discovery record has invalid records")
+    budget = value.get("budget")
+    if budget is not None and (
+        not isinstance(budget, dict) or set(budget) != NATIVE_DISCOVERY_BUDGET_KEYS
+    ):
+        raise PipelineError("Registered discovery record has an invalid budget")
+    native_files = value["native_files"]
+    if not isinstance(native_files, dict) or not native_files or any(
+        not isinstance(name, str) or not name or not isinstance(checksum, str) or not checksum
+        for name, checksum in native_files.items()
+    ):
+        raise PipelineError("Registered discovery record has an invalid native inventory")
+    if not isinstance(value["raw"], dict) or not isinstance(value["derived_interface_names"], dict):
+        raise PipelineError("Registered discovery record has invalid native evidence")
+    main_assembly = identity.get("main_assembly")
+    if main_assembly is not None and (not isinstance(main_assembly, str) or not main_assembly):
+        raise PipelineError("Registered discovery record has an invalid main assembly")
+    for field in ("hardware_id", "revision"):
+        item = identity.get(field)
+        if item is not None and (not isinstance(item, str) or not item):
+            raise PipelineError(
+                f"Registered discovery identity has an invalid {field}"
+            )
+    _validated_discovery_findings(value.get("findings"))
+    return value
+
+
+def registered_discovery_findings(job: dict | None) -> list[dict]:
+    """Read and validate registered discovery findings from one job projection."""
+
+    if not isinstance(job, dict):
+        return []
+    discovery = job.get("discovery")
+    if discovery is None:
+        return []
+    if not isinstance(discovery, dict):
+        raise PipelineError("Registered discovery record has an invalid structure")
+    return _validated_discovery_findings(discovery.get("findings"))
+
+
+def registered_handoff_warnings(value: object) -> list[dict]:
+    """Validate handoff warnings and apply their contractually implicit non-blocking state."""
+
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise PipelineError("Registered input warnings have an invalid structure")
+    warnings: list[dict] = []
+    for item in value:
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("code"), str)
+            or not item["code"]
+        ):
+            raise PipelineError("Registered input warning has an invalid code")
+        blocking = item.get("blocking", False)
+        if blocking is not False:
+            raise PipelineError("Registered input warning has an invalid blocking state")
+        warnings.append({**item, "blocking": False})
+    return warnings
+
 
 _BOUNDARY_LABELS = {
     "handoff.admission": "Handoff admission (path, regular files, native package)",
@@ -834,11 +978,14 @@ def merge_warnings(*groups: list[dict]) -> list[dict]:
 
     unique = {}
     for row in (item for group in groups for item in group):
+        if not isinstance(row, dict) or not isinstance(row.get("code"), str) or not row["code"]:
+            raise PipelineError("A warning requires a non-empty string code")
+        if row.get("blocking") is not False:
+            raise PipelineError("A warning requires an explicit non-blocking diagnostic")
         identity = dict(row)
         # These values identify the display surface, not an engineering source.
         if identity.get("source") in ("input", "discovery", "verification"):
             identity.pop("source")
-        identity.setdefault("blocking", False)
         unique.setdefault(canonical_json_value(identity), row)
     return [unique[key] for key in sorted(unique)]
 
@@ -846,6 +993,8 @@ def merge_warnings(*groups: list[dict]) -> list[dict]:
 def _warning_row(stage: dict, item: dict) -> dict:
     """One recorded non-blocking observation as a warning row (never a pass, never a gate)."""
 
+    if not isinstance(item.get("code"), str) or not item["code"]:
+        raise PipelineError("A warning requires a non-empty string code")
     if item.get("blocking") is not False:
         raise PipelineError("A warning requires an explicit non-blocking diagnostic")
     code = str(item.get("code") or "")
@@ -897,6 +1046,8 @@ def _recorded_warnings(
     """Warnings from recorded evidence only: non-blocking findings and check diagnostics."""
 
     warnings: list[dict] = []
+    if stage.get("id") == "discover":
+        findings = _validated_discovery_findings(findings)
     if quality_diagnostics is not None and not isinstance(
         quality_diagnostics,
         list,
@@ -924,6 +1075,12 @@ def _recorded_warnings(
         if row.get("id") == "geometry.native_tessellation" and row_passed:
             native_gate_seen = True
         recorded = details.get("warnings") if isinstance(details, dict) else None
+        if stage.get("id") == "capture" and row.get("id") == "input.valid":
+            warnings.extend(
+                _warning_row(stage, item)
+                for item in registered_handoff_warnings(recorded)
+            )
+            continue
         if isinstance(recorded, list):
             raw_native = [
                 item
@@ -992,8 +1149,7 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
     view = view if isinstance(view, dict) else stage_view(job)
     result = job.get("result") if isinstance(job.get("result"), dict) else {}
     quality = result.get("quality") if isinstance(result.get("quality"), dict) else {}
-    discovery = job.get("discovery") if isinstance(job.get("discovery"), dict) else {}
-    discovery_findings = discovery.get("findings") if isinstance(discovery.get("findings"), list) else []
+    discovery_findings = registered_discovery_findings(job)
     quality_rows = [row for row in (quality.get("checks") or []) if isinstance(row, dict)]
     stages_out: list[dict] = []
     first_failed: dict | None = None

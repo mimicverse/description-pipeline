@@ -30,7 +30,13 @@ from .feishu_oauth import (
     recorded_display_name,
     valid_actor_principal,
 )
-from ..pipeline.contracts import DispatchConf, ProtocolError
+from ..io import digest
+from ..pipeline.contracts import (
+    DispatchCommand,
+    DispatchConf,
+    ProtocolError,
+    StageCommand,
+)
 from .request_context import (
     CLEAR_BODY_SCOPE_KEY,
     CREATE_BODY_SCOPE_KEY,
@@ -69,6 +75,13 @@ RECOVERY_TEMPORARY_DISCONNECTION = "temporary_disconnection"
 RECOVERY_EVIDENCE_CORRUPTION = "evidence_corruption"
 RECOVERY_ENGINEERING_TERMINAL = "engineering_terminal_failure"
 RECOVERY_UNKNOWN_PUBLICATION = "unknown_publication_response"
+RECOVERY_RECONCILIATION_REQUIRED = "reconciliation_required"
+_REGISTERED_RECOVERY_CLASSIFICATION = {
+    "failed": RECOVERY_ENGINEERING_TERMINAL,
+    "cancelled": RECOVERY_ENGINEERING_TERMINAL,
+    "succeeded": "run_succeeded",
+    "unresolved": RECOVERY_RECONCILIATION_REQUIRED,
+}
 
 
 @dataclass(frozen=True)
@@ -250,6 +263,18 @@ def routed_route() -> RoutedRoute | None:
     return None
 
 
+def single_run_clear_requested() -> bool:
+    """Whether the resolved request endpoint is the guarded single-run clear route."""
+
+    request = bound_request()
+    if request is None:
+        return False
+    return _endpoint_named(
+        getattr(request, "scope", {}).get("endpoint"),
+        SINGLE_RUN_CLEAR_ENDPOINT,
+    )
+
+
 def _state_value(state: object) -> str | None:
     value = getattr(state, "value", state)
     return value if isinstance(value, str) else None
@@ -342,15 +367,195 @@ def recorded_run_facts(dag_id: str, run_id: str) -> tuple[str | None, object, di
     return recorded_actor_principal(run.triggering_user_name), run.state, task_states
 
 
-def owner_retry_allowed(user: Any, dag_id: str, run_id: str) -> bool:
-    """True only for the caller's own run that is a positively classified transport recovery."""
+def registered_recovery_block(record: dict | None) -> tuple[str, str] | None:
+    """Return the reason and class blocking in-place recovery from a platform projection."""
+
+    state = record.get("state") if isinstance(record, dict) else None
+    if state in {"queued", "running"}:
+        return None
+    if isinstance(state, str) and state in _REGISTERED_RECOVERY_CLASSIFICATION:
+        return f"registered_{state}", _REGISTERED_RECOVERY_CLASSIFICATION[state]
+    return "registration_missing", RECOVERY_TEMPORARY_DISCONNECTION
+
+
+def validated_canonical_projection(
+    projection: object,
+    *,
+    dag_id: str,
+    dag_run_id: str,
+    canonical_run_id: str,
+) -> dict | None:
+    """Authenticate one registered run from the existing admission and command contracts."""
+
+    if not isinstance(projection, dict):
+        return None
+    try:
+        from ..pipeline.admission import (  # noqa: PLC0415 - authorization runtime only
+            AdmissionSpec,
+            build_freeze_command,
+            build_run_admission,
+        )
+
+        request = projection.get("request")
+        spec = AdmissionSpec.from_record(request)
+        admission = build_run_admission(spec)
+        if (
+            projection.get("run_id") != canonical_run_id
+            or admission.run_id != canonical_run_id
+            or projection.get("request_id") != admission.request_id
+            or projection.get("parent_run_id") != admission.parent_run_id
+            or projection.get("from_stage") != admission.from_stage
+            or request != spec.to_record()
+            or projection.get("request_digest") != admission.request_digest
+            or projection.get("created_at") != admission.created_at.isoformat()
+        ):
+            return None
+
+        technical = projection.get("technical")
+        commands = technical.get("commands") if isinstance(technical, dict) else None
+        stages = projection.get("stages")
+        if (
+            not isinstance(commands, list)
+            or not all(isinstance(command, dict) for command in commands)
+            or not isinstance(stages, list)
+            or not all(isinstance(stage, dict) for stage in stages)
+        ):
+            return None
+
+        dispatch_rows = [
+            command for command in commands if command.get("kind") == "dispatch"
+        ]
+        freeze_rows = [
+            command
+            for command in commands
+            if command.get("kind") == "stage" and command.get("stage") == "freeze"
+        ]
+        freeze_stages = [stage for stage in stages if stage.get("stage") == "freeze"]
+        if len(dispatch_rows) != 1 or len(freeze_rows) != 1 or len(freeze_stages) != 1:
+            return None
+
+        dispatch_row = dispatch_rows[0]
+        dispatch = DispatchCommand.from_record(dispatch_row.get("request"))
+        freeze = StageCommand.from_record(freeze_stages[0].get("command"))
+        if (
+            freeze != build_freeze_command(spec)
+            or dispatch.run_id != canonical_run_id
+            or dispatch.dag_id != dag_id
+            or dispatch.dag_run_id != dag_run_id
+            or dispatch.freeze_command_id != freeze.command_id
+            or dispatch.expected_executor_sha256 != spec.dispatch_executor_sha256
+        ):
+            return None
+
+        expected_dispatch_id = "dispatch:" + digest(
+            {
+                "admission_sha256": spec.admission_sha256,
+                "dag_id": dag_id,
+                "dag_run_id": dag_run_id,
+                "freeze_command_id": freeze.command_id,
+                "run_id": canonical_run_id,
+            }
+        )
+        if (
+            dispatch.command_id != expected_dispatch_id
+            or dispatch_row.get("command_id") != dispatch.command_id
+            or dispatch_row.get("run_id") != canonical_run_id
+            or dispatch_row.get("request") != dispatch.to_record()
+            or dispatch_row.get("request_digest") != dispatch.request_digest
+            or dispatch_row.get("idempotency_key") != dispatch.idempotency_key
+            or dispatch_row.get("expected_executor_sha256")
+            != dispatch.expected_executor_sha256
+            or dispatch_row.get("predecessor_decision_id") is not None
+        ):
+            return None
+
+        freeze_row = freeze_rows[0]
+        if (
+            freeze_row.get("command_id") != freeze.command_id
+            or freeze_row.get("run_id") != canonical_run_id
+            or any(
+                freeze_row.get(field) != getattr(freeze, field)
+                for field in (
+                    "config_snapshot_sha256",
+                    "contract_sha256",
+                    "policy_sha256",
+                )
+            )
+            or any(
+                dispatch_row.get(field) != freeze_row.get(field)
+                for field in (
+                    "config_snapshot_sha256",
+                    "contract_sha256",
+                    "policy_sha256",
+                )
+            )
+        ):
+            return None
+    except Exception:  # noqa: BLE001 - damaged authority always fails closed
+        return None
+    return projection
+
+
+def recorded_canonical_projection(dag_id: str, dag_run_id: str) -> dict | None:
+    """Read the exact platform projection used by the Portal recovery gate."""
+
+    dsn = os.environ.get("PLATFORM_OPERATOR_DSN")
+    if not dsn:
+        return None
+    try:
+        import psycopg2  # noqa: PLC0415 - Airflow runtime dependency only
+
+        from ..platform.queries import read_run_projection  # noqa: PLC0415
+        from .airflow_client import native_run_id  # noqa: PLC0415
+
+        canonical_run_id = native_run_id(dag_run_id)
+        with psycopg2.connect(
+            dsn,
+            connect_timeout=5,
+            options="-c statement_timeout=5000",
+        ) as connection:
+            connection.set_session(readonly=True)
+            projection = read_run_projection(connection, canonical_run_id)
+    except Exception:  # noqa: BLE001 - authorization fails closed on unavailable authority
+        return None
+    return validated_canonical_projection(
+        projection,
+        dag_id=dag_id,
+        dag_run_id=dag_run_id,
+        canonical_run_id=canonical_run_id,
+    )
+
+
+def retry_allowed(
+    user: Any,
+    dag_id: str,
+    run_id: str,
+    *,
+    require_owner: bool,
+) -> bool:
+    """Require canonical registration plus positively classified scheduling recovery."""
+
     facts = recorded_run_facts(dag_id, run_id)
     if facts is None:
         return False
     principal, run_state, task_states = facts
-    if principal is None or principal != user.get_id():
+    if principal is None or (require_owner and principal != user.get_id()):
+        return False
+    projection = recorded_canonical_projection(dag_id, run_id)
+    request = projection.get("request") if isinstance(projection, dict) else None
+    if (
+        not isinstance(request, dict)
+        or request.get("principal") != principal
+        or registered_recovery_block(projection) is not None
+    ):
         return False
     return classify_recovery(run_state, task_states).eligible
+
+
+def owner_retry_allowed(user: Any, dag_id: str, run_id: str) -> bool:
+    """True only for the caller's own run that is a positively classified transport recovery."""
+
+    return retry_allowed(user, dag_id, run_id, require_owner=True)
 
 
 def owner_create_allowed(user: Any, dag_id: str) -> bool:

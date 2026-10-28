@@ -179,6 +179,20 @@ class ImportedSourceTests(unittest.TestCase):
                     main,
                     edges={main: references, **{name: [] for name in references}},
                 )
+        raw = {
+            "components": components,
+            "files": raw_inventory,
+            "identity": {},
+            "saved_configuration": "Default",
+            "document_state": support.saved_document_state(),
+            **({"source_selection": source_selection} if isinstance(source_selection, dict) else {}),
+            **extra_raw,
+        }
+        raw = support.local_native_record_payload(
+            raw,
+            default_mate_scope=True,
+            fill_missing_parents=True,
+        )
         payload = {
             "schema_version": DISCOVERY_SCHEMA,
             "contract": "native-discovery/v1",
@@ -189,15 +203,7 @@ class ImportedSourceTests(unittest.TestCase):
                 if isinstance(source_selection, dict)
                 else "0" * 64
             ),
-            "raw": {
-                "components": components,
-                "files": raw_inventory,
-                "identity": {},
-                "saved_configuration": "Default",
-                "document_state": support.saved_document_state(),
-                **({"source_selection": source_selection} if isinstance(source_selection, dict) else {}),
-                **extra_raw,
-            },
+            "raw": raw,
             "identity": {},
         }
         payload = support.frozen_discovery_payload(
