@@ -2397,7 +2397,6 @@ class NativeOperationRuntime:
         if not self._stopping:
             self._stopping = True
             self._queue.put(None)
-        self._queue.join()
         self._thread.join(timeout=30)
         if self._thread.is_alive():
             raise NativeOperationUnresolved(

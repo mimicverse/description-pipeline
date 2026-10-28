@@ -265,6 +265,55 @@ class NativeOperationRuntimeTests(unittest.TestCase):
             resource_terminated=True,
         )
 
+    def test_close_timeout_keeps_ownership_until_native_worker_finishes(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        def executor(*args):
+            entered.set()
+            release.wait(5)
+            return self.executor(*args)
+
+        state = self.root / "close-timeout-state"
+        runtime = NativeOperationRuntime(
+            state_root=state,
+            native_tool_factory=lambda: NATIVE_TOOL,
+            executors={CAPTURE_KIND: executor},
+        )
+        runtime.create(_operation("operation-close-timeout", self.archive))
+        runtime.admit_input("operation-close-timeout", self.archive)
+        self.assertTrue(entered.wait(5))
+        join = runtime._thread.join
+        fallback_release = threading.Timer(1, release.set)
+        fallback_release.start()
+        try:
+            with mock.patch.object(
+                runtime._thread, "join", side_effect=lambda timeout: join(timeout=0.01)
+            ) as bounded_join:
+                with self.assertRaises(NativeOperationUnresolved) as raised:
+                    runtime.close()
+                bounded_join.assert_called_once_with(timeout=30)
+            self.assertEqual(raised.exception.code, "native_worker_still_running")
+            self.assertTrue(runtime._thread.is_alive())
+            self.assertEqual(runtime.view("operation-close-timeout")["state"], "running")
+            with self.assertRaisesRegex(OSError, "ownership lock is already held"):
+                NativeOperationRuntime(
+                    state_root=state,
+                    native_tool_factory=lambda: NATIVE_TOOL,
+                    executors={CAPTURE_KIND: self.executor},
+                )
+        finally:
+            release.set()
+            fallback_release.cancel()
+            fallback_release.join()
+            runtime.close()
+        successor = NativeOperationRuntime(
+            state_root=state,
+            native_tool_factory=lambda: NATIVE_TOOL,
+            executors={CAPTURE_KIND: self.executor},
+        )
+        successor.close()
+
     def test_http_roundtrip_is_idempotent_and_downloads_the_sealed_artifact(self) -> None:
         runtime = NativeOperationRuntime(
             state_root=self.root / "state",
