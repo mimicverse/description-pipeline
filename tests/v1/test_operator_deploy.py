@@ -254,6 +254,19 @@ class NativeTargetIdentity:
     (package / "orchestration" / "__init__.py").write_text("", encoding="utf-8")
     (package / "orchestration" / "portal.py").write_text("", encoding="utf-8")
     (package / "orchestration" / "feishu_auth.py").write_text("", encoding="utf-8")
+    (package / "orchestration" / "airflow_client.py").write_text(
+        """\
+import os
+import sys
+
+order = os.environ.get("ORDER_LOG")
+if order:
+    with open(order, "a", encoding="utf-8") as handle:
+        handle.write("airflow connection\\n")
+raise SystemExit(int(os.environ.get("FIXTURE_AIRFLOW_CONNECTION_RC", "0")))
+""",
+        encoding="utf-8",
+    )
     (package / "orchestration" / "lifecycle_state.py").write_text(
         """\
 import argparse
@@ -574,6 +587,16 @@ chmod 755 "$bin/psql" "$bin/createdb" "$bin/pg_isready"
         airflow / "scripts" / "add_connection.py",
         """\
 #!/usr/bin/env python3
+import os
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+record = Path(args[args.index("--record-file") + 1])
+if not record.is_file():
+    raise SystemExit("prepared install record missing")
+if os.environ.get("FIXTURE_CONNECTION_FAILURE") == "1":
+    raise SystemExit("injected Airflow connection binding failure")
 print("connection bound")
 """,
     )
@@ -802,6 +825,17 @@ elif verb == "stop":
         "writer_count": 0,
         "solidworks_process_count": 0,
     }
+if verb == "health" and os.environ.get("FIXTURE_WINDOWS_HEALTH_FAILURE") == "1":
+    document = {
+        "schema_version": "solidworks-to-urdf.windows-lifecycle-result/v1",
+        "passed": False,
+        "verb": "health",
+        "code": "health_failed",
+    }
+order = os.environ.get("ORDER_LOG")
+if order:
+    with open(order, "a", encoding="utf-8") as handle:
+        handle.write("windows " + verb + "\\n")
 override_path = os.environ.get("FIXTURE_WINDOWS_RESULT")
 if override_path:
     override = json.loads(Path(override_path).read_text(encoding="utf-8"))
@@ -1110,12 +1144,32 @@ class FirstInstallTests(unittest.TestCase):
         self.assertNotEqual(retried.returncode, 0)
         self.assertIn("unknown residual state", retried.stderr)
 
+    def test_connection_failure_does_not_publish_the_active_install_record(self) -> None:
+        self.environment["FIXTURE_CONNECTION_FAILURE"] = "1"
+        installed = self._install()
+        self.assertNotEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        self.assertIn("before the active install record was published", installed.stderr)
+        self.assertFalse((self.paths["state"] / "install-record.json").exists())
+        self.assertFalse((self.paths["state"] / "install-records").exists())
+
+    def test_install_refuses_a_tampered_deployment_member_before_writes(self) -> None:
+        target = self.paths["release"] / "deploy" / "operator" / "health.sh"
+        target.write_bytes(target.read_bytes() + b"\n# unbound deployment member\n")
+        installed = self._install()
+        self.assertNotEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        self.assertIn("deployment members differ", installed.stderr)
+        self.assertFalse(self.paths["state"].exists())
+        self.assertFalse(any(self.paths["unit_state"].iterdir()))
+
     def test_start_drain_stop_use_current_generation_only(self) -> None:
         installed = self._install()
         self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
         started = run(self._command("start"), self.environment)
         self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
         self.assertEqual(self.paths["admission"].read_text(encoding="utf-8"), "false")
+        start_order = self.paths["order"].read_text(encoding="utf-8")
+        self.assertLess(start_order.index("health_gate"), start_order.index("windows health"))
+        self.assertLess(start_order.index("windows health"), start_order.index("airflow dags unpause"))
         identity = json.loads(Path(self.environment["FIXTURE_WINDOWS_IDENTITY"]).read_text(encoding="utf-8"))
         windows_results = self.root / "bound-shutdown-results.json"
         windows_results.write_text(
@@ -1252,17 +1306,59 @@ class FirstInstallTests(unittest.TestCase):
         self.assertNotEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
         self.assertIn("description-operator-proxy.service is still unknown after stop", stopped.stderr)
 
-    def test_start_keep_admission_closed_skips_health_and_open(self) -> None:
+    def test_start_health_failure_keeps_dag_paused_and_admission_closed(self) -> None:
         installed = self._install()
         self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        self.paths["order"].write_text("", encoding="utf-8")
         self.environment["HEALTH_GATE_RC"] = "9"
+        started = run(self._command("start"), self.environment)
+        self.assertNotEqual(started.returncode, 0, started.stdout + started.stderr)
+        self.assertEqual(self.paths["admission"].read_text(encoding="utf-8"), "true")
+        order = self.paths["order"].read_text(encoding="utf-8")
+        self.assertIn("airflow dags pause", order)
+        self.assertIn("health_gate", order)
+        self.assertNotIn("airflow dags unpause", order)
+
+    def test_start_keep_closed_runs_full_health_and_never_unpauses(self) -> None:
+        installed = self._install()
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        self.paths["order"].write_text("", encoding="utf-8")
         started = run(
             self._command("start", "--keep-admission-closed"),
             self.environment,
         )
         self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
         self.assertEqual(self.paths["admission"].read_text(encoding="utf-8"), "true")
-        self.assertNotIn("health_gate", self.paths["order"].read_text(encoding="utf-8"))
+        order = self.paths["order"].read_text(encoding="utf-8")
+        self.assertIn("airflow connection", order)
+        self.assertIn("health_gate", order)
+        self.assertIn("windows health", order)
+        self.assertNotIn("airflow dags unpause", order)
+
+    def test_start_connection_failure_keeps_admission_closed(self) -> None:
+        installed = self._install()
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        self.paths["order"].write_text("", encoding="utf-8")
+        self.environment["FIXTURE_AIRFLOW_CONNECTION_RC"] = "7"
+        for options in ((), ("--keep-admission-closed",)):
+            with self.subTest(options=options):
+                self.paths["order"].write_text("", encoding="utf-8")
+                started = run(self._command("start", *options), self.environment)
+                self.assertNotEqual(started.returncode, 0, started.stdout + started.stderr)
+                self.assertEqual(self.paths["admission"].read_text(encoding="utf-8"), "true")
+                self.assertNotIn("airflow dags unpause", self.paths["order"].read_text(encoding="utf-8"))
+
+    def test_start_rechecks_windows_health_after_the_linux_gate(self) -> None:
+        installed = self._install()
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        self.paths["order"].write_text("", encoding="utf-8")
+        self.environment["FIXTURE_WINDOWS_HEALTH_FAILURE"] = "1"
+        started = run(self._command("start"), self.environment)
+        self.assertNotEqual(started.returncode, 0, started.stdout + started.stderr)
+        self.assertEqual(self.paths["admission"].read_text(encoding="utf-8"), "true")
+        order = self.paths["order"].read_text(encoding="utf-8")
+        self.assertLess(order.index("health_gate"), order.index("windows health"))
+        self.assertNotIn("airflow dags unpause", order)
 
     def test_status_and_health_are_read_only(self) -> None:
         installed = self._install()

@@ -250,6 +250,26 @@ class ValidationTests(unittest.TestCase):
             ("empty tenant keys", lambda d: d["auth"].__setitem__("tenant_keys", []), "must not be empty"),
             ("duplicate tenant keys", lambda d: d["auth"].__setitem__("tenant_keys", ["a", "a"]), "unique"),
             (
+                "tenant key carries comma",
+                lambda d: d["auth"].__setitem__("tenant_keys", ["tenant-a,tenant-b"]),
+                "comma or whitespace",
+            ),
+            (
+                "admin id carries comma",
+                lambda d: d["auth"].__setitem__("admin_open_ids", ["ou-a,ou-b"]),
+                "comma or whitespace",
+            ),
+            (
+                "tenant key carries space",
+                lambda d: d["auth"].__setitem__("tenant_keys", ["tenant a"]),
+                "comma or whitespace",
+            ),
+            (
+                "admin id carries whitespace",
+                lambda d: d["auth"].__setitem__("admin_open_ids", ["ou-a ou-b"]),
+                "comma or whitespace",
+            ),
+            (
                 "relative feishu secret",
                 lambda d: d["auth"].__setitem__("feishu_secret_file", "secrets/feishu.json"),
                 "absolute path",

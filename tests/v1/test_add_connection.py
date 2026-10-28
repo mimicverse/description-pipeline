@@ -66,6 +66,22 @@ class AddConnectionReferenceTests(unittest.TestCase):
             self.assertIn("not the active install record's snapshot", result.stderr)
             self.assertEqual(row, {})
 
+    def test_writer_can_bind_a_projected_record_before_activation(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="add-connection-") as tmp:
+            root = Path(tmp)
+            snapshot, _record = activate(root, "gen-1")
+            active = root / "state" / "install-record.json"
+            prepared = root / "prepared-install-record.json"
+            prepared.write_bytes(active.read_bytes())
+            prepared.chmod(0o600)
+            active.unlink()
+            result, row = run_writer(root, snapshot, prepared)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(active.exists())
+            self.assertEqual(row["host"], "")
+            self.assertIsNone(row["port"])
+            self.assertIn('"config_identity"', row["extra"])
+
 
 if __name__ == "__main__":
     unittest.main()

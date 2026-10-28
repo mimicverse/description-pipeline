@@ -80,10 +80,12 @@ RESOLVED_CONFIG=""
 RENDER_LOG=""
 TOOLCHAIN_LOG=""
 INSTALL_WHEELHOUSE=""
+PREPARED_INSTALL_DIR=""
 INSTALL_DATABASE_STARTED=""
 INSTALL_COMMITTED=""
 cleanup_operatorctl() {
   [ -z "$INSTALL_WHEELHOUSE" ] || rm -rf -- "$INSTALL_WHEELHOUSE" 2>/dev/null || true
+  [ -z "$PREPARED_INSTALL_DIR" ] || rm -rf -- "$PREPARED_INSTALL_DIR" 2>/dev/null || true
   [ -z "$RENDER_LOG" ] || rm -f -- "$RENDER_LOG" 2>/dev/null || true
   [ -z "$TOOLCHAIN_LOG" ] || rm -f -- "$TOOLCHAIN_LOG" 2>/dev/null || true
   [ -z "$RESOLVED_CONFIG" ] || rm -f -- "$RESOLVED_CONFIG" 2>/dev/null || true
@@ -541,6 +543,12 @@ airflow_set_dag_paused() {
   AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/airflow" dags "$verb" solidworks_to_urdf
 }
 
+verify_airflow_connection() {
+  AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" \
+    -m description_pipeline.orchestration.airflow_client \
+    --conn-id solidworks_windows --state-root "$STATE_ROOT"
+}
+
 platform_close_admission() {
   local reason="${1:-drain}" actor="${2:-operatorctl drain}"
   [ -n "${PLATFORM_SERVICE_DSN:-}" ] || die "PLATFORM_SERVICE_DSN is missing"
@@ -599,6 +607,9 @@ load_generation_env() {
 load_installed() {
   local verified
   resolve_config
+  "$CONTROL_PYTHON" "$HERE/install_record.py" verify-deployment \
+    --release-file "$HERE/../../release.json" --tree "$RELEASE_ROOT" >/dev/null \
+    || exit $?
   load_current_environment "$STATE_ROOT"
   load_generation_env
   TARGET="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
@@ -750,16 +761,8 @@ drift_check() {
 
 install_from_config() {
   local install_output snapshot_digest snapshot_path derived_env proxy_bin stable_wheel
-  local windows_output windows_identity services_csv
+  local windows_output windows_identity services_csv prepared_record
   first_install_preflight
-  resolve_release_file
-  if [ -n "$WHEEL_FILE" ]; then
-    "$CONTROL_PYTHON" "$HERE/install_record.py" check --release-file "$RELEASE_FILE" \
-      --tree "$RELEASE_ROOT" --wheel "$WHEEL_FILE" >/dev/null || exit $?
-  else
-    "$CONTROL_PYTHON" "$HERE/install_record.py" check --release-file "$RELEASE_FILE" \
-      --tree "$RELEASE_ROOT" >/dev/null || exit $?
-  fi
   INSTALL_WHEELHOUSE="$(mktemp -d)"
   "$CONTROL_PYTHON" "$HERE/install_record.py" extract-linux-wheelhouse \
     --release-file "$RELEASE_FILE" --destination "$INSTALL_WHEELHOUSE" || exit $?
@@ -855,16 +858,23 @@ install_from_config() {
   [ -f "$windows_identity" ] \
     || die "the installed Windows endpoint returned no usable identity"
   services_csv="$(IFS=,; printf '%s' "${UNITS[*]}")"
+  PREPARED_INSTALL_DIR="$(mktemp -d)"
+  prepared_record="$PREPARED_INSTALL_DIR/install-record.json"
   "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" build \
     --state-root "$STATE_ROOT" --install-id "$INSTALL_ID" \
     --snapshot "$snapshot_path" --release-file "$RELEASE_FILE" \
     --endpoint-identity "$windows_identity" --services "$services_csv" \
     --dag "$AIRFLOW_HERE/dags/solidworks_to_urdf.py" \
-    --deployment-root "$RELEASE_ROOT" --wheel "$stable_wheel"
+    --deployment-root "$RELEASE_ROOT" --wheel "$stable_wheel" \
+    --prepared-record "$prepared_record"
   AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" \
     "$AIRFLOW_HERE/scripts/add_connection.py" \
     --state-root "$STATE_ROOT" --snapshot "$snapshot_path" \
-    || die "installation state exists but the Airflow connection binding failed; preserve it for diagnosis"
+    --record-file "$prepared_record" \
+    || die "the Airflow connection binding failed before the active install record was published"
+  "$AIRFLOW_VENV/bin/python" "$HERE/install_record.py" activate \
+    --record-file "$prepared_record" --state-root "$STATE_ROOT" \
+    --wheel "$stable_wheel"
   INSTALL_COMMITTED=1
   echo "install complete: ${OPERATOR_URL:-unknown}"
 }
@@ -877,6 +887,14 @@ case "$ACTION" in
   install)
     snapshot_config
     resolve_config
+    resolve_release_file
+    if [ -n "$WHEEL_FILE" ]; then
+      "$CONTROL_PYTHON" "$HERE/install_record.py" check --release-file "$RELEASE_FILE" \
+        --tree "$RELEASE_ROOT" --wheel "$WHEEL_FILE" >/dev/null || exit $?
+    else
+      "$CONTROL_PYTHON" "$HERE/install_record.py" check --release-file "$RELEASE_FILE" \
+        --tree "$RELEASE_ROOT" >/dev/null || exit $?
+    fi
     prepare_install_state_root
     acquire_lifecycle_lock
     install_from_config
@@ -891,20 +909,31 @@ case "$ACTION" in
     platform_close_admission "start-window" "operatorctl start"
     airflow_lifecycle start
     airflow_wait_dag_identity >/dev/null
+    airflow_set_dag_paused true \
+      || die "the DAG could not be paused; admission stays closed"
     systemctl --user enable --now "${OPERATOR_UNIT_FILES[@]}" \
       || die "ingress services failed to start; admission stays closed"
     systemctl --user is-active --quiet "${OPERATOR_UNIT_FILES[@]}" \
       || die "ingress services are not active; admission stays closed"
     windows_action start "$STATE_ROOT/install-record.json" >/dev/null \
       || die "the Windows endpoint did not start; admission stays closed"
+    verify_airflow_connection >/dev/null \
+      || die "the Airflow connection identity did not pass; admission stays closed"
+    OPERATOR_STATE="$STATE_ROOT" bash "$HERE/health_gate.sh" \
+      "$STATE_ROOT/health-gate/start-$(date -u +%Y%m%dT%H%M%SZ)" \
+      || die "the Linux health gate did not pass; admission stays closed"
+    windows_action health "$STATE_ROOT/install-record.json" >/dev/null \
+      || die "the Windows endpoint health did not pass; admission stays closed"
     if [ -n "$KEEP_ADMISSION_CLOSED" ]; then
-      echo "start complete: services are running; admission stays closed"
+      echo "start complete: services are healthy; DAG and admission stay closed"
     else
-      airflow_set_dag_paused false
-      OPERATOR_STATE="$STATE_ROOT" bash "$HERE/health_gate.sh" \
-        "$STATE_ROOT/health-gate/start-$(date -u +%Y%m%dT%H%M%SZ)" \
-        || die "the Linux health gate did not pass; admission stays closed"
-      platform_open_admission
+      airflow_set_dag_paused false \
+        || die "the DAG could not be unpaused; admission stays closed"
+      if ! platform_open_admission; then
+        airflow_set_dag_paused true \
+          || echo "operatorctl: admission open failed and the DAG could not be repaused" >&2
+        die "admission could not be opened; DAG restored to paused"
+      fi
       echo "start complete: admission open"
     fi
     ;;

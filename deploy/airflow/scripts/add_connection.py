@@ -19,14 +19,14 @@ from description_pipeline import interface_records
 from description_pipeline.io import parse_data
 
 
-def _active_snapshot_reference(state_root: Path, snapshot: Path) -> dict:
+def _snapshot_reference(state_root: Path, snapshot: Path, record_file: Path | None) -> dict:
     if not state_root.is_absolute():
         raise SystemExit("state root must be absolute")
     if not snapshot.is_absolute():
         raise SystemExit("snapshot path must be absolute")
-    record_path = state_root / "install-record.json"
+    record_path = record_file or state_root / "install-record.json"
     if not record_path.is_file():
-        raise SystemExit(f"active install record is missing: {record_path}")
+        raise SystemExit(f"install record is missing: {record_path}")
     record = interface_records.validate_install_record(parse_data(record_path.read_bytes(), record_path))
     if record["paths"].get("state_root") != str(state_root):
         raise SystemExit("active install record belongs to another state root")
@@ -63,9 +63,10 @@ def main() -> int:
     parser.add_argument("--conn-id", default="solidworks_windows")
     parser.add_argument("--state-root", type=Path, required=True)
     parser.add_argument("--snapshot", type=Path, required=True)
+    parser.add_argument("--record-file", type=Path)
     args = parser.parse_args()
 
-    reference = _active_snapshot_reference(args.state_root, args.snapshot)
+    reference = _snapshot_reference(args.state_root, args.snapshot, args.record_file)
     with Session() as session:
         connection = session.query(Connection).filter(Connection.conn_id == args.conn_id).one_or_none()
         if connection is None:

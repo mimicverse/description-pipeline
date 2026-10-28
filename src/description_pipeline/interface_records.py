@@ -745,6 +745,16 @@ def _string_list(value, code: str, where: str, *, allow_empty: bool) -> list:
     return value
 
 
+def _auth_string_list(value, code: str, where: str, *, allow_empty: bool) -> list:
+    items = _string_list(value, code, where, allow_empty=allow_empty)
+    _require(
+        all(not any(character == "," or character.isspace() for character in item) for item in items),
+        code,
+        {"where": where, "rule": "entries carry no comma or whitespace"},
+    )
+    return items
+
+
 def validate_config_snapshot(snapshot) -> dict:
     """Immutable generation snapshot (IF-16): the full rendered platform tree, no secrets.
 
@@ -833,8 +843,8 @@ def validate_config_snapshot(snapshot) -> dict:
     auth = resolved["auth"]
     _exact_keys(auth, {"feishu_secret_file", "tenant_keys", "admin_open_ids"}, code, "resolved.auth")
     _absolute_path(auth["feishu_secret_file"], code, "resolved.auth.feishu_secret_file")
-    _string_list(auth["tenant_keys"], code, "resolved.auth.tenant_keys", allow_empty=False)
-    _string_list(auth["admin_open_ids"], code, "resolved.auth.admin_open_ids", allow_empty=True)
+    _auth_string_list(auth["tenant_keys"], code, "resolved.auth.tenant_keys", allow_empty=False)
+    _auth_string_list(auth["admin_open_ids"], code, "resolved.auth.admin_open_ids", allow_empty=True)
     targets = resolved["targets"]
     _require(isinstance(targets, dict) and bool(targets), code, {"where": "resolved.targets"})
     slugs = set()

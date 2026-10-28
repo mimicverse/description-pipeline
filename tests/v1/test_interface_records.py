@@ -648,6 +648,20 @@ class InterfaceRecordTests(unittest.TestCase):
             ("config_snapshot_invalid", lambda value: value["resolved"]["auth"].__setitem__("tenant_keys", [])),
             (
                 "config_snapshot_invalid",
+                lambda value: value["resolved"]["auth"].__setitem__(
+                    "tenant_keys",
+                    ["tenant-a,tenant-b"],
+                ),
+            ),
+            (
+                "config_snapshot_invalid",
+                lambda value: value["resolved"]["auth"].__setitem__(
+                    "admin_open_ids",
+                    ["ou-a,ou-b"],
+                ),
+            ),
+            (
+                "config_snapshot_invalid",
                 lambda value: value["resolved"]["windows"].__setitem__("endpoint_port", "8765"),
             ),
             (

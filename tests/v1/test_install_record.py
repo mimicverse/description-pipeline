@@ -460,6 +460,30 @@ class InstallRecordTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 install_record.verify_artifacts(deployment, release["artifacts"])
 
+    def test_deployment_tree_is_the_exact_release_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            deployment, release_document, fixture = self._fixture(root)
+            self.assertEqual(
+                install_record.verify_deployment_tree(deployment, release_document),
+                1,
+            )
+            fixture["dag"].write_bytes(b"# changed\n")
+            with self.assertRaisesRegex(SystemExit, "deployment members differ"):
+                install_record.verify_deployment_tree(deployment, release_document)
+            fixture["dag"].write_bytes(b"# dag\n")
+            extra = deployment / "deploy" / "operator" / "unbound.py"
+            extra.write_text("UNBOUND = True\n", encoding="utf-8")
+            with self.assertRaisesRegex(SystemExit, "deployment tree members differ"):
+                install_record.verify_deployment_tree(deployment, release_document)
+            extra.unlink()
+            linked_source = root / "linked-source.py"
+            linked_source.write_bytes(fixture["dag"].read_bytes())
+            fixture["dag"].unlink()
+            fixture["dag"].symlink_to(linked_source)
+            with self.assertRaisesRegex(SystemExit, "crosses a link"):
+                install_record.verify_deployment_tree(deployment, release_document)
+
     def test_record_is_create_once_and_never_repoints(self) -> None:
         class Owner:
             @staticmethod

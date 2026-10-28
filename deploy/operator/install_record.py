@@ -103,13 +103,26 @@ def release_identity(document) -> dict:
     return {"version": version, "source_commit": commit, "source_sha256": source_sha, "artifacts": rows}
 
 
-def release_dag_digest(document) -> str:
-    """The release's one deployment member that may become the active Airflow DAG."""
+def release_deployment_files(document) -> dict[str, str]:
+    """The exact path-to-digest inventory extracted beside release.json."""
 
     require(isinstance(document, dict), "release.json must be an object")
     files = document.get("deployment_files")
-    require(isinstance(files, dict), "release.json deployment_files must be an object")
-    return _hex64(files.get(DAG_MEMBER), f"release.json deployment member {DAG_MEMBER!r}")
+    require(
+        isinstance(files, dict) and bool(files),
+        "release.json deployment_files must be a non-empty object",
+    )
+    inventory = {}
+    for name, checksum in files.items():
+        confined_relative(name, "release.json deployment member")
+        inventory[name] = _hex64(checksum, f"release.json deployment member {name!r}")
+    return inventory
+
+
+def release_dag_digest(document) -> str:
+    """The release's one deployment member that may become the active Airflow DAG."""
+
+    return release_deployment_files(document)[DAG_MEMBER]
 
 
 def _is_link(path: Path) -> bool:
@@ -170,6 +183,45 @@ def verify_artifacts(root: Path, artifacts: list[dict]) -> int:
         require(actual == row["sha256"], f"artifact {row['name']} does not match release.json ({actual})")
         verified += 1
     return verified
+
+
+def verify_deployment_tree(root: Path, document) -> int:
+    """Verify the extracted deployment tree against the release's exact member inventory."""
+
+    root = Path(root)
+    require(not _is_link(root) and root.is_dir(), f"deployment root must be a real directory: {root}")
+    release_manifest = root / "release.json"
+    require(
+        release_manifest.is_file() and not _is_link(release_manifest),
+        f"deployment release.json must be a regular non-link file: {release_manifest}",
+    )
+    expected = release_deployment_files(document)
+    release = release_identity(document)
+    allowed_root_files = {"release.json", *(row["name"] for row in release["artifacts"])}
+    observed = {}
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                path = Path(entry.path)
+                require(not _is_link(path), f"deployment tree crosses a link: {path}")
+                relative = path.relative_to(root).as_posix()
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(path)
+                    continue
+                require(entry.is_file(follow_symlinks=False), f"deployment member is not a regular file: {relative}")
+                if directory == root and relative in allowed_root_files:
+                    continue
+                observed[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+    require(
+        set(observed) == set(expected),
+        "deployment tree members differ from release.json "
+        f"(missing={sorted(set(expected) - set(observed))}, extra={sorted(set(observed) - set(expected))})",
+    )
+    differing = sorted(name for name, checksum in expected.items() if observed[name] != checksum)
+    require(not differing, f"deployment members differ from release.json: {differing}")
+    return len(expected)
 
 
 def _native_target_contract():
@@ -763,6 +815,71 @@ def write_install_record(record: dict, state_root: Path, owner) -> tuple[Path, P
     return generation, active
 
 
+def write_prepared_record(path: Path, record: dict, owner) -> Path:
+    """Stage the exact record bytes without publishing an active installation."""
+
+    path = Path(path)
+    require(path.is_absolute(), "prepared record path must be absolute")
+    require(not path.exists() and not path.is_symlink(), f"prepared record already exists: {path}")
+    return atomic_write_once(path, owner.canonical(record))
+
+
+def activate_prepared_record(record_file: Path, state_root: Path, wheel: Path) -> tuple[Path, Path]:
+    """Validate and atomically publish one record after all external bindings succeed."""
+
+    record_file = Path(record_file)
+    require(
+        record_file.is_file() and not _is_link(record_file),
+        f"prepared record must be a regular non-link file: {record_file}",
+    )
+    require(
+        (record_file.stat().st_mode & 0o777) == 0o600,
+        f"prepared record must be mode 0600: {record_file}",
+    )
+    owner = load_contract_owner(extract_contract_closure(Path(wheel)))
+    payload = record_file.read_bytes()
+    try:
+        records = _canonical_records()
+        record = records.validate_install_record(json.loads(payload.decode("utf-8")))
+    except Exception as error:
+        raise SystemExit(f"install_record: prepared install record is invalid: {error}") from error
+    require(
+        payload == owner.canonical(record),
+        "prepared install record is not in canonical byte form",
+    )
+    state_root = Path(state_root)
+    require(state_root.is_absolute(), "prepared install state root must be absolute")
+    require(
+        record["paths"].get("state_root") == str(state_root),
+        "prepared install record belongs to another state root",
+    )
+    snapshot = Path(record["snapshot"]["path"])
+    require(
+        snapshot.is_file() and not _is_link(snapshot),
+        f"prepared record snapshot must be a regular non-link file: {snapshot}",
+    )
+    snapshot_bytes = snapshot.read_bytes()
+    require(
+        hashlib.sha256(snapshot_bytes).hexdigest() == record["snapshot"]["digest"],
+        "prepared record snapshot digest differs",
+    )
+    try:
+        snapshot_document = json.loads(snapshot_bytes.decode("utf-8"))
+        records.validate_config_snapshot(snapshot_document)
+    except Exception as error:
+        raise SystemExit(f"install_record: prepared record snapshot is invalid: {error}") from error
+    require(
+        snapshot_document["install_id"] == record["install_id"],
+        "prepared record snapshot names another install generation",
+    )
+    require(
+        snapshot_document["resolved"]["storage"]["state_root"] == str(state_root),
+        "prepared record snapshot belongs to another state root",
+    )
+    wheel_binding(record["release"], wheel=Path(wheel))
+    return write_install_record(record, state_root, owner)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="install_record.py", description=__doc__.splitlines()[0])
     subparsers = parser.add_subparsers(dest="action", required=True)
@@ -778,10 +895,23 @@ def main(argv: list[str] | None = None) -> int:
     build.add_argument("--deployment-root", type=Path, required=True)
     build.add_argument("--wheel", type=Path, default=None, help="the installed wheel (contract owner source)")
     build.add_argument("--tree", type=Path, default=None, help="deployment tree for wheel discovery")
+    build.add_argument(
+        "--prepared-record",
+        type=Path,
+        default=None,
+        help="stage the record here without publishing it",
+    )
+    activate = subparsers.add_parser("activate")
+    activate.add_argument("--record-file", type=Path, required=True)
+    activate.add_argument("--state-root", type=Path, required=True)
+    activate.add_argument("--wheel", type=Path, required=True)
     check = subparsers.add_parser("check")
     check.add_argument("--release-file", type=Path, required=True)
     check.add_argument("--wheel", type=Path, default=None, help="the wheel that will be installed")
     check.add_argument("--tree", type=Path, default=None, help="deployment tree for wheel discovery")
+    verify_deployment = subparsers.add_parser("verify-deployment")
+    verify_deployment.add_argument("--release-file", type=Path, required=True)
+    verify_deployment.add_argument("--tree", type=Path, required=True)
     stage = subparsers.add_parser("stage-wheel")
     stage.add_argument("--release-file", type=Path, required=True)
     stage.add_argument("--release-root", type=Path, required=True)
@@ -850,18 +980,36 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(stable)
         return 0
+    if args.action == "activate":
+        generation, active = activate_prepared_record(
+            args.record_file,
+            args.state_root,
+            args.wheel,
+        )
+        print(f"generation={generation}")
+        print(f"active={active}")
+        return 0
     if args.action == "check":
-        release = release_identity(_load_json(args.release_file, "release file"))
+        release_document = _load_json(args.release_file, "release file")
+        release = release_identity(release_document)
         verified = verify_artifacts(args.release_file.parent, release["artifacts"])
+        deployment_members = verify_deployment_tree(args.release_file.parent, release_document)
         if args.wheel is not None or args.tree is not None:
             wheel_binding(release, wheel=args.wheel, tree_root=args.tree)
         print("check=ok")
         print(f"verified_artifacts={verified}")
+        print(f"verified_deployment_members={deployment_members}")
+        return 0
+    if args.action == "verify-deployment":
+        release_document = _load_json(args.release_file, "release file")
+        deployment_members = verify_deployment_tree(args.tree, release_document)
+        print(f"verified_deployment_members={deployment_members}")
         return 0
 
     timestamp = args.timestamp or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     release_document = _load_json(args.release_file, "release file")
     release = release_identity(release_document)
+    verified_deployment_members = verify_deployment_tree(args.deployment_root, release_document)
     release_dag_sha256 = release_dag_digest(release_document)
     verified = verify_artifacts(args.release_file.parent, release["artifacts"])
     endpoint = endpoint_identity(_load_json(args.endpoint_identity, "endpoint identity"))
@@ -879,11 +1027,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     bound_wheel = wheel_binding(release, wheel=args.wheel, tree_root=args.tree)
     contract = load_contract_owner(extract_contract_closure(bound_wheel))
+    if args.prepared_record is not None:
+        prepared = write_prepared_record(args.prepared_record, record, contract)
+        print(f"prepared={prepared}")
+        print(f"record_digest={hashlib.sha256(contract.canonical(record)).hexdigest()}")
+        print(f"verified_artifacts={verified}")
+        print(f"verified_deployment_members={verified_deployment_members}")
+        return 0
     generation, active = write_install_record(record, args.state_root, contract)
     print(f"generation={generation}")
     print(f"active={active}")
     print(f"record_digest={hashlib.sha256(contract.canonical(record)).hexdigest()}")
     print(f"verified_artifacts={verified}")
+    print(f"verified_deployment_members={verified_deployment_members}")
     return 0
 
 

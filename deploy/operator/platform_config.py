@@ -139,6 +139,17 @@ def string_list(value, where: str, *, allow_empty: bool) -> list[str]:
     return value
 
 
+def auth_string_list(value, where: str, *, allow_empty: bool) -> list[str]:
+    """Identity-list entries must survive CSV environment serialization unchanged."""
+
+    items = string_list(value, where, allow_empty=allow_empty)
+    require(
+        all(not any(character == "," or character.isspace() for character in item) for item in items),
+        f"{where} entries must not contain comma or whitespace",
+    )
+    return items
+
+
 def tcp_port(value, where: str) -> int:
     require(type(value) is int and 0 < value < 65536, f"{where} must be a TCP port (1-65535)")
     return value
@@ -217,8 +228,8 @@ def validate_platform(document) -> dict:
     auth = document["auth"]
     require_keys(auth, allowed=_AUTH_KEYS, required=_AUTH_KEYS, where="auth")
     absolute_path(auth["feishu_secret_file"], "auth.feishu_secret_file")
-    string_list(auth["tenant_keys"], "auth.tenant_keys", allow_empty=False)
-    string_list(auth["admin_open_ids"], "auth.admin_open_ids", allow_empty=True)
+    auth_string_list(auth["tenant_keys"], "auth.tenant_keys", allow_empty=False)
+    auth_string_list(auth["admin_open_ids"], "auth.admin_open_ids", allow_empty=True)
 
     targets = document["targets"]
     require(isinstance(targets, dict) and bool(targets), "targets must be a non-empty object")
