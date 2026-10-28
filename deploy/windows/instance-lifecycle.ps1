@@ -2442,6 +2442,36 @@ function Remove-OwnedInstallTask($Binding, [string]$Generation) {
   }
 }
 
+function Assert-FirstInstallRoots($Config) {
+  $control = Get-ControlPaths ([string]$Config.state_root)
+  $lifecycleRoot = Normalize-PathIdentity (Join-Path $Config.state_root 'lifecycle')
+  foreach ($path in @($Config.package_root, $Config.output_root, $Config.state_root)) {
+    Assert-NoReparseAncestor $path
+    if (-not (Test-Path -LiteralPath $path)) { continue }
+    if (-not (Test-Path -LiteralPath $path -PathType Container)) {
+      Die 'install_target_not_empty' ('install requires a directory: ' + $path)
+    }
+    foreach ($entry in @(Get-ChildItem -LiteralPath $path -Force -ErrorAction Stop)) {
+      $identity = Normalize-PathIdentity $entry.FullName
+      if ((Normalize-PathIdentity $path) -ceq $control.state_root) {
+        if ($identity -ceq $control.binding) {
+          Assert-RegularFile $entry.FullName 'binding_invalid' 'the install binding'
+          continue
+        }
+        if ($identity -ceq $lifecycleRoot) {
+          Assert-NoReparseAncestor $entry.FullName
+          if ($entry.PSIsContainer -and
+              @(Get-ChildItem -LiteralPath $entry.FullName -Force -ErrorAction Stop).Count -eq 0) {
+            continue
+          }
+        }
+      }
+      Die 'install_target_not_empty' (
+        'first install refuses unknown target contents: ' + $entry.FullName)
+    }
+  }
+}
+
 function Invoke-Install($Binding) {
   $script:LifecyclePhase = 'install-preflight'
   Assert-OperatorIsServiceAccount $Binding
@@ -2486,6 +2516,8 @@ function Invoke-Install($Binding) {
       Die 'control_version_mismatch' (
         'the lifecycle or bootstrap helper differs from install-receipt.json')
     }
+  } else {
+    Assert-FirstInstallRoots $config
   }
   $bootstrap = Invoke-ManagedRootBootstrap $common ([string]$Binding.service_account)
   $serviceSid = [string]$bootstrap.service_sid
@@ -2501,6 +2533,7 @@ function Invoke-Install($Binding) {
   $staging = Join-Path $lifecycleRoot (
     '.install-' + [guid]::NewGuid().ToString('N'))
   $createdInstallId = $false
+  $receiptWriteAttempted = $false
   $taskRegistrationAttempted = $false
   $generationMoved = $false
   $previousPins = $null
@@ -2643,10 +2676,8 @@ function Invoke-Install($Binding) {
         bootstrap = [string]$controlFiles.bootstrap.path
       }
     }
+    $receiptWriteAttempted = $true
     Write-JsonAtomic $receiptPath $receipt $serviceSid
-    foreach ($path in $stableManagedPaths) {
-      Assert-ProtectedAcl $path $serviceSid
-    }
     return $result
   } catch {
     $primary = $_
@@ -2737,7 +2768,25 @@ function Invoke-Install($Binding) {
         Set-InstallCleanupStep $cleanup 'staging' $false $true $null $false ''
       }
 
-      if ($createdInstallId -and -not $taskRemaining) {
+      $receiptRemaining = Test-Path -LiteralPath $receiptPath
+      if ($receiptWriteAttempted -and -not $installState.install_id_present -and
+          -not $taskRemaining) {
+        $errorText = ''
+        try {
+          if ($receiptRemaining) {
+            Remove-Item -LiteralPath $receiptPath -Force -ErrorAction Stop
+          }
+        } catch {
+          $errorText = $_.Exception.Message
+        }
+        $receiptRemaining = Test-Path -LiteralPath $receiptPath
+        Set-InstallCleanupStep $cleanup 'receipt' $true $true `
+          (-not $receiptRemaining) $receiptRemaining $errorText
+      } else {
+        Set-InstallCleanupStep $cleanup 'receipt' $false $true $null $receiptRemaining ''
+      }
+
+      if ($createdInstallId -and -not $taskRemaining -and -not $receiptRemaining) {
         $errorText = ''
         try {
           if (Test-Path -LiteralPath $installIdPath) {
@@ -2753,6 +2802,8 @@ function Invoke-Install($Binding) {
         $remaining = Test-Path -LiteralPath $installIdPath
         $reason = if ($taskRemaining -and $createdInstallId) {
           'preserved because the managed task is not proven absent'
+        } elseif ($createdInstallId -and $receiptRemaining) {
+          'preserved because the install receipt is not proven absent'
         } else {
           ''
         }
