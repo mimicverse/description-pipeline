@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import math
 import os
 from collections.abc import Mapping
@@ -19,7 +20,7 @@ from ...geometry.native_tessellation import (
     parse_native_tessellation,
     write_native_triangle_stream,
 )
-from ...io import PipelineError, file_digest
+from ...io import PipelineError, _physical_path, file_digest
 from .errors import CadError
 
 
@@ -49,6 +50,8 @@ def _require(condition: object, message: str, detail=None) -> None:
 
 
 def _publish_if_absent(temporary: Path, target: Path, expected_sha256: str) -> None:
+    temporary = Path(_physical_path(temporary))
+    target = Path(_physical_path(target))
     if target.is_file():
         _require(
             file_digest(target) == expected_sha256,
@@ -308,7 +311,7 @@ def seal_native_geometry(
             "source_scopes": sorted(source_scopes),
         },
     )
-    root = Path(evidence_root)
+    root = Path(_physical_path(evidence_root))
     raw_directory = root / "raw" / "triangles"
     records = {}
     for component in sorted(raw_geometry):
@@ -327,7 +330,8 @@ def seal_native_geometry(
             facts["body_counts"],
             triangle_count,
         )
-        temporary = raw_directory / f".{component.casefold()}.partial.triangles"
+        component_key = hashlib.sha256(component.encode("utf-8")).hexdigest()
+        temporary = raw_directory / f".{component_key}.partial.triangles"
         temporary.parent.mkdir(parents=True, exist_ok=True)
         temporary.unlink(missing_ok=True)
         written_count = write_native_triangle_stream(

@@ -414,6 +414,8 @@ authorization 事务提交之后，数据库锁不得跨 HTTP、CAD、Git 或 PR
 
 失败归属实际执行阶段。原生主装配打开或选择失败登记为 `discover` 失败，保留已完成的冻结收据。未执行后继由共同 projector 根据前置失败投影为 `blocked`，不补造后继执行或第二份阻断状态。对账保留已有 decision 和诊断，并核验尚未结算的真实 effect。
 
+Portal 不以静态 QC 清单重新裁决上述状态。Freeze/Discover 的实际 `checks.json` 须绑定同一 command、request digest 和结果中的 checks digest；Capture 的原生报告仅提供该阶段详细观察。失败结果若绑定原生 output，则从同阶段 `native-result.json` 核对 kind、state、failure code 并保留 exact message；不将缺失错误类型伪造为推断类型。来源 warning 从 Discover 自身密封输出读取，Capture 失败不影响已成功 Discover 的来源展示。证据读取损坏返回完整性错误，不改写已有业务决定，也不合成未执行检查。
+
 关闭准入阻止新请求与新运行；已准入运行的合法后继、同键重试、取消、对账和释放继续按原身份与前提执行。已知前提失败的 `blocked` 阶段不是活动操作。停止服务要求准入已关闭，且业务与实际调度均无活动、未决或未知；仅有业务终态或暂停 DAG 不满足此条件。
 
 `start --keep-admission-closed` 复用普通启动的来源、双端身份和服务检查，但成功后仍保持平台准入关闭，过程中不得短暂开闸。该选项只适用于 `start`，不形成配置文件中的另一份准入状态；任一失败或未知状态都不得开放。对账和维护验收完成后，再由不带该选项的 `start` 重新通过同一检查并开放准入。
@@ -440,6 +442,8 @@ owner/fence 约束下安全重试或恢复；已有终态决定时只复核并�
 `input_transfer_pending` 的原生 operation，按受限续传协议取得窄 claim 与独立发送授权。
 technical dispatch UNKNOWN 仅由
 `StageApplication.dispatch`/`TechnicalDispatchService` 观察原 DagRun/conf。
+
+用户显式重试已接纳的 technical dispatch 时，先核对原 DagRun 与完整 conf。目标已存在且身份一致时只收敛原 effect；不可观察时保留 UNKNOWN。仅原 `airflow_dispatch` 的最新密封观察明确为 absent 时，才允许在同一不可变 command/effect/DagRun 上再次发送。该观察的 fact ID 同时绑定重试 claim 与发送授权，两处均在锁内核验；活跃旧 claim、较新事实、错目标、错 kind 或错 conf 均拒绝。此规则依赖 Airflow 同一 DagRun 身份去重，不适用于 native、Git 或 PR，不把普通 absent 观察改判为确定失败，也不建立新的状态表。
 
 恢复判断使用当前阶段及其受控操作，不保留已删除任务的状态兼容表。工程失败、运输中断、产物损坏和外部结果未知分别记录；运输恢复不得改写工程失败或重复原生执行。门户、重跑授权、维护和后台对账读取同一平台权威及实际调度关联。
 

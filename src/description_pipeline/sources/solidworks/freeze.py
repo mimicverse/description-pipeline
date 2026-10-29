@@ -25,7 +25,7 @@ from .evidence import capture_environment
 from .jsonio import digest_json, sha256_file, write_json
 
 # The native adapter binds exported bytes; full mesh analysis runs on Linux.
-from ...io import confined, inventory
+from ...io import _filesystem_path, _physical_path, confined, inventory
 
 #: Freeze/capture records use the current solidworks-to-urdf contract.
 FREEZE_SCHEMA = "solidworks-to-urdf.freeze/v1"
@@ -284,9 +284,10 @@ def _document_state(backend: Any, cfg: dict[str, Any]) -> dict[str, Any]:
 
 def _native_lock_files(source_dir: Path) -> set[Path]:
     """SolidWorks session locks are transient siblings of native documents."""
+    physical_root = Path(_physical_path(source_dir))
     return {
-        path
-        for path in source_dir.rglob("~$*")
+        source_dir / path.relative_to(physical_root)
+        for path in physical_root.rglob("~$*")
         if path.is_file()
         and path.suffix.lower() in DEFAULT_ALLOWED_SUFFIXES
         and path.with_name(path.name[2:]).is_file()
@@ -555,8 +556,8 @@ def _copy_sealed_capture_source(
 ) -> dict[str, str]:
     """Copy the immutable prepared CAD files without collecting or rewriting."""
 
-    prepared_root = Path(prepared_root).resolve()
-    source_root = Path(source_root).resolve()
+    prepared_root = Path(_physical_path(prepared_root)).resolve()
+    source_root = Path(_physical_path(source_root)).resolve()
     copied: dict[str, str] = {}
     for relative, expected in sorted(files.items()):
         source = confined(prepared_root, relative)
@@ -835,7 +836,7 @@ def _capture_prepared_local(
     cfg = validate_source_config(config)
     package = Path(package).resolve()
     prepared_root = Path(prepared_root).resolve()
-    if not prepared_root.is_dir():
+    if not Path(_physical_path(prepared_root)).is_dir():
         raise BridgeError(
             "sealed_capture_incomplete",
             "the archived prepared CAD source is unavailable",
@@ -844,7 +845,7 @@ def _capture_prepared_local(
         )
     staging = destination.with_name(destination.name + ".partial")
     if staging.exists():
-        shutil.rmtree(staging)
+        shutil.rmtree(_physical_path(staging))
     staging.mkdir(parents=True)
     source_root = staging / "source"
     request = {
@@ -1002,10 +1003,10 @@ def _capture_prepared_local(
         )
 
         for lock in _native_lock_files(source_root):
-            lock.unlink()
+            Path(_filesystem_path(lock)).unlink()
         originals = _verify_sealed_capture_copy(closure)
         source_inputs = _source_inputs(cfg, closure)
-        shutil.rmtree(source_root)
+        shutil.rmtree(_physical_path(source_root))
         raw_facts = {
             **raw_facts,
             "source_scopes": source_scopes,

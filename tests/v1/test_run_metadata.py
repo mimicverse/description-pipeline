@@ -11,6 +11,7 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 from wsgiref.simple_server import make_server
 
 from tests.v1.test_portal import (
@@ -31,6 +32,7 @@ from tests.v1.test_portal import (
 from description_pipeline.orchestration.airflow_client import native_run_id
 from description_pipeline.orchestration.portal import AirflowApi, PortalApp, PortalConfig
 from description_pipeline.platform.facts import (
+    AdmittedRunSummary,
     FactStoreError,
     RunDisplayMetadata,
     RunNotAdmittedError,
@@ -41,24 +43,44 @@ NOW = datetime(2026, 10, 14, 10, 0, tzinfo=UTC)
 
 class _RunWorld:
     def __init__(self) -> None:
+        self.admissions: dict[str, dict] = {}
         self.run_display_rows: dict[str, list] = {}
         self.run_states: dict[str, str] = {}
 
 
 class FakeRunControlStore:
-    """Canonical run-control surface backed by the fixture's display rows."""
+    """Canonical admissions and optional display rows remain separate fixture facts."""
 
-    def __init__(self, rows: dict[str, list]) -> None:
-        self.rows = rows
+    def __init__(self, world: _RunWorld) -> None:
+        self.world = world
+        self.rows = world.run_display_rows
 
     def admission(self):
         return SimpleNamespace(state="open")
 
     def _display(self, run_id: str) -> RunDisplayMetadata:
-        row = self.rows.get(run_id)
-        if row is None:
+        if run_id not in self.world.admissions:
             raise RunNotAdmittedError("The run is not admitted")
+        row = self.rows.setdefault(run_id, [None, None, None, NOW])
         return RunDisplayMetadata(run_id, *row)
+
+    def list_admitted_runs(self) -> list[AdmittedRunSummary]:
+        ordered = sorted(
+            self.world.admissions.items(),
+            key=lambda item: (-item[1]["created_at"].timestamp(), item[0]),
+        )
+        return [
+            AdmittedRunSummary(
+                run_id=run_id,
+                request_id=admission["request_id"],
+                parent_run_id=admission["parent_run_id"],
+                from_stage=admission["from_stage"],
+                state=self.world.run_states[run_id],
+                created_at=admission["created_at"],
+                updated_at=admission["created_at"],
+            )
+            for run_id, admission in ordered
+        ]
 
     def list_run_display_metadata(self) -> dict[str, RunDisplayMetadata]:
         return {
@@ -72,26 +94,23 @@ class FakeRunControlStore:
         return RunDisplayMetadata(run_id, *row) if row is not None else None
 
     def rename_run(self, run_id: str, display_name: str | None) -> RunDisplayMetadata:
-        row = self.rows.get(run_id)
-        if row is None:
-            raise RunNotAdmittedError("The run is not admitted")
+        self._display(run_id)
+        row = self.rows[run_id]
         row[0] = display_name
         row[3] = NOW
         return RunDisplayMetadata(run_id, *row)
 
     def hide_run(self, run_id: str, *, actor: str) -> RunDisplayMetadata:
-        row = self.rows.get(run_id)
-        if row is None:
-            raise RunNotAdmittedError("The run is not admitted")
+        self._display(run_id)
+        row = self.rows[run_id]
         row[1] = row[1] or NOW
         row[2] = row[2] or actor
         row[3] = NOW
         return RunDisplayMetadata(run_id, *row)
 
     def restore_run(self, run_id: str) -> RunDisplayMetadata:
-        row = self.rows.get(run_id)
-        if row is None:
-            raise RunNotAdmittedError("The run is not admitted")
+        self._display(run_id)
+        row = self.rows[run_id]
         row[1] = None
         row[2] = None
         row[3] = NOW
@@ -99,6 +118,9 @@ class FakeRunControlStore:
 
 
 class UnavailableRunControlStore:
+    def list_admitted_runs(self):
+        raise FactStoreError("canonical storage unavailable")
+
     def admission(self):
         raise FactStoreError("canonical storage unavailable")
 
@@ -124,8 +146,7 @@ class RunMetadataTests(unittest.TestCase):
         self.airflow.__enter__()
         self.addCleanup(self.airflow.__exit__, None, None, None)
         self.world = _RunWorld()
-        self.run_control = FakeRunControlStore(self.world.run_display_rows)
-        self.projection_metadata = {}
+        self.run_control = FakeRunControlStore(self.world)
         self.upload_root = Path(tempfile.mkdtemp(prefix="portal-upload-"))
         self.addCleanup(shutil.rmtree, self.upload_root, ignore_errors=True)
         self.static_dir = Path(__file__).resolve().parents[2] / "src/description_pipeline/orchestration/static"
@@ -152,18 +173,11 @@ class RunMetadataTests(unittest.TestCase):
         return server
 
     def _projection(self, run_id: str) -> dict | None:
-        dag_run_id = next(
-            (
-                dag_id
-                for dag_id in self.airflow.dag_runs
-                if native_run_id(dag_id) == run_id
-            ),
-            None,
-        )
-        if dag_run_id is None:
+        metadata = self.world.admissions.get(run_id)
+        if metadata is None:
             return None
-        metadata = self.projection_metadata.get(run_id, {})
-        state = self.world.run_states.get(run_id, "succeeded")
+        dag_run_id = metadata["request_id"]
+        state = self.world.run_states[run_id]
         stages = [
             {
                 "stage": stage,
@@ -178,7 +192,7 @@ class RunMetadataTests(unittest.TestCase):
             "request_id": dag_run_id,
             "parent_run_id": metadata.get("parent_run_id"),
             "from_stage": metadata.get("from_stage"),
-            "request": metadata.get("request", {}),
+            "request": metadata["request"],
             "purpose": "engineering",
             "scope": {
                 "kind": "formal",
@@ -237,10 +251,13 @@ class RunMetadataTests(unittest.TestCase):
         }.get(state, state)
         conf = conf or {}
         parent = conf.get("parent_dag_run_id")
-        self.projection_metadata[native_id] = {
+        self.world.admissions[native_id] = {
+            "request_id": dag_run_id,
+            "created_at": datetime.fromisoformat(start.replace("Z", "+00:00")),
             "parent_run_id": native_run_id(parent) if isinstance(parent, str) and parent else None,
             "from_stage": conf.get("resume_from"),
             "request": {
+                "principal": profile["principal"],
                 "change_summary": conf.get("change_summary"),
                 "main_assembly": conf.get("main_assembly"),
                 "purpose": conf.get("purpose"),
@@ -427,6 +444,7 @@ class RunMetadataTests(unittest.TestCase):
         status, first = self._list(self.client, limit=20, offset=0)
         self.assertEqual(status, 200)
         self.assertEqual(len(first["runs"]), 20)
+        self.assertEqual([row["dag_run_id"] for row in first["runs"]], list(reversed(run_ids[2:22])))
         self.assertEqual(first["next_offset"], 20)
         self.assertTrue(all(not row["deleted"] for row in first["runs"]))
         status, second = self._list(self.client, limit=20, offset=20)
@@ -446,13 +464,22 @@ class RunMetadataTests(unittest.TestCase):
         other_run = self._seed(self._uuid(), owner=VIEWER_TOKEN, start="2026-10-09T00:01:00Z")
         viewer = self._login(VIEWER_TOKEN)
         hits = self.airflow.hits
-        status, payload = self._list(viewer)
+        original_profile = AirflowApi.profile
+        profile_calls = []
+
+        def read_profile(api, token):
+            profile_calls.append(token)
+            return original_profile(api, token)
+
+        with mock.patch.object(AirflowApi, "profile", read_profile):
+            status, payload = self._list(viewer)
         self.assertEqual(status, 200)
+        self.assertEqual(profile_calls, [VIEWER_TOKEN])
         flags = {row["dag_run_id"]: row["can_manage"] for row in payload["runs"]}
         self.assertFalse(flags[owner_run])
         self.assertTrue(flags[other_run])
-        # One live profile recheck and one Airflow page request for the whole list.
-        self.assertEqual(self.airflow.hits - hits, 2)
+        # One profile recheck, then one DAG observation for each admitted row on the page.
+        self.assertEqual(self.airflow.hits - hits, 1 + len(payload["runs"]))
         admin = self._login(ADMIN_TOKEN)
         status, payload = self._list(admin)
         self.assertTrue(all(row["can_manage"] for row in payload["runs"]))
@@ -487,26 +514,49 @@ class RunMetadataTests(unittest.TestCase):
         status, _, body = client.request("DELETE", f"/api/runs/{run_id}")
         self.assertEqual(status, 503, body)
 
-    def test_runs_without_a_platform_row_refuse_display_writes(self) -> None:
+    def test_runs_without_admission_refuse_display_writes_and_reads(self) -> None:
         run_id = self._seed(self._uuid())
-        self.world.run_display_rows.pop(native_run_id(run_id))
-        for method, path, payload in (
-            ("PATCH", f"/api/runs/{run_id}", {"title": "x"}),
-            ("DELETE", f"/api/runs/{run_id}", None),
-            ("POST", f"/api/runs/{run_id}/restore", None),
+        native_id = native_run_id(run_id)
+        self.world.admissions.pop(native_id)
+        self.world.run_display_rows.pop(native_id)
+        for method, path, payload, expected in (
+            ("PATCH", f"/api/runs/{run_id}", {"title": "x"}, 404),
+            ("DELETE", f"/api/runs/{run_id}", None, 409),
+            ("POST", f"/api/runs/{run_id}/restore", None, 404),
         ):
             with self.subTest(case=method):
                 status, _, body = self.client.request(method, path, payload)
-                self.assertEqual(status, 404, body)
-                self.assertIn("platform registration", json.loads(body)["error"])
+                self.assertEqual(status, expected, body)
+                if method == "DELETE":
+                    self.assertEqual(json.loads(body)["reason"], "registration_missing")
+                else:
+                    self.assertIn("platform registration", json.loads(body)["error"])
+        status, _, body = self.client.request("GET", f"/api/runs/{run_id}")
+        self.assertEqual(status, 404, body)
+        self.assertEqual(json.loads(body)["error"], "The run has no canonical admission")
+        self.assertNotIn(native_id, self.world.run_display_rows)
+
+    def test_runs_without_display_rows_remain_readable(self) -> None:
+        run_id = self._seed(self._uuid())
+        native_id = native_run_id(run_id)
+        self.world.run_display_rows.pop(native_id)
         status, _, body = self.client.request("GET", f"/api/runs/{run_id}")
         self.assertEqual(status, 200, body)
         self.assertFalse(json.loads(body)["deleted"])
+        status, listing = self._list(self.client)
+        self.assertEqual(status, 200, listing)
+        row = next(item for item in listing["runs"] if item["dag_run_id"] == run_id)
+        self.assertIsNone(row["title"])
+        self.assertFalse(row["deleted"])
+        self.assertNotIn(native_id, self.world.run_display_rows)
+        # A first display mutation creates metadata only for an existing admission.
+        status, _, body = self.client.request("PATCH", f"/api/runs/{run_id}", {"title": "first display row"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.world.run_display_rows[native_id][0], "first display row")
+        self.assertIn(native_id, self.world.admissions)
 
     def test_unknown_native_status_refuses_and_list_failure_is_503(self) -> None:
         run_id = self._seed(self._uuid())
-        from unittest import mock
-
         from description_pipeline.orchestration.portal import AirflowApi as PortalAirflowApi
         from description_pipeline.orchestration.portal import AirflowApiError
 
@@ -515,8 +565,8 @@ class RunMetadataTests(unittest.TestCase):
         status, _, body = self.client.request("DELETE", f"/api/runs/{run_id}")
         self.assertEqual(status, 409, body)
         self.assertEqual(json.loads(body)["reason"], "unconfirmed")
-        # An Airflow list failure is an actionable 503, never a silently truncated history.
-        with mock.patch.object(PortalAirflowApi, "list_dag_runs", side_effect=AirflowApiError("boom")):
+        # A required DAG observation failure is an actionable 503, never a partial history.
+        with mock.patch.object(PortalAirflowApi, "dag_run", side_effect=AirflowApiError("boom")):
             status, _, body = self.client.request("GET", "/api/runs")
         self.assertEqual(status, 503, body)
 

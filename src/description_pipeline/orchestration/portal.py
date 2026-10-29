@@ -73,12 +73,15 @@ from ..io import PipelineError, canonical_json_value, digest
 from ..interface_records import REQUEST_PURPOSES
 from ..delivery import PIPELINE_ID, SUBJECT_DIRECTORIES, SUBJECT_FILES
 from ..platform.queries import read_run_projection
-from ..schemas import RUN_ACTIVITY_SCHEMA
+from ..schemas import PUBLICATION_RECEIPT_SCHEMA, RUN_ACTIVITY_SCHEMA
 from ..pipeline.contracts import ArtifactRef, StageStatus
 from ..pipeline.dispatch import DispatchObservation
 from ..pipeline.effects import EffectState
-from ..pipeline.verify import CERTIFICATE_FILENAME, EXECUTION_RECEIPT_FILENAME
-from ..pipeline.verify_contract import validate_certificate_diagnostics
+from ..pipeline.verify import (
+    CERTIFICATE_FILENAME,
+    EXECUTION_RECEIPT_FILENAME,
+    validate_certificate_structure,
+)
 from ..platform.facts import FactStoreError, RunNotAdmittedError
 from ..ports import PORTAL_HTTP_PORT
 from .feishu_oauth import (
@@ -583,9 +586,6 @@ class AirflowApi:
         """Validate one browser's Airflow SSO cookie and return its Feishu identity."""
         return self._request("GET", "/auth/feishu/profile", cookie_token=token)
 
-    def dag(self, token: str, dag_id: str) -> dict:
-        return self._request("GET", f"{self.api_root}/dags/{urlparse.quote(dag_id)}", token=token)
-
     def trigger_dag_run(self, token: str, dag_id: str, dag_run_id: str, conf: dict) -> dict:
         # Airflow 3.3.2's TriggerDAGRunPostBody requires ``logical_date`` to be present (nullable);
         # this workflow is schedule=None, so the run intentionally carries no logical date.
@@ -622,23 +622,6 @@ class AirflowApi:
             {"dry_run": dry_run, "only_failed": True, "only_new": False, "run_on_latest_version": False},
             token=token,
         )
-
-    def list_dag_runs(self, token: str, dag_id: str, *, limit: int = 20, offset: int = 0) -> list[dict]:
-        """Recent runs of one DAG, so the operator page survives portal restarts.
-
-        The per-DAG GET is authorized as a read of that DAG; the POST wildcard list would ask for
-        authorization on ``~`` and is deliberately not used.
-        """
-        query = urlparse.urlencode({"limit": int(limit), "offset": int(offset), "order_by": "-start_date"})
-        payload = self._request(
-            "GET",
-            f"{self.api_root}/dags/{urlparse.quote(dag_id)}/dagRuns?{query}",
-            token=token,
-        )
-        runs = payload.get("dag_runs")
-        if not isinstance(runs, list):
-            raise AirflowApiError("Airflow returned no dag run list")
-        return [item for item in runs if isinstance(item, dict)]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1335,6 +1318,8 @@ class PortalApp:
         self,
         session: PortalSession,
         command_id: str,
+        *,
+        retry_absent: bool = False,
     ):
         application = self.config.production_application
         dispatch = getattr(application, "dispatch", None)
@@ -1346,6 +1331,7 @@ class PortalApp:
         return dispatch(
             command_id,
             AirflowDispatchAdapter(self.config.airflow, session.token),
+            retry_absent=retry_absent,
         )
 
     def _read_fact_projection(self, run_id: str) -> dict | None:
@@ -1369,8 +1355,13 @@ class PortalApp:
                 )
             finally:
                 connection.close()
-        except PipelineError:
+        except RunNotAdmittedError:
             return None
+        except PipelineError as error:
+            raise PortalError(
+                HTTPStatus.BAD_GATEWAY,
+                f"Registered run evidence cannot be verified: {error}",
+            ) from error
         except Exception as error:
             raise PortalError(
                 HTTPStatus.SERVICE_UNAVAILABLE,
@@ -1572,116 +1563,88 @@ class PortalApp:
             self.config,
         )
 
+    @staticmethod
+    def _registered_owner(projection: dict) -> str:
+        request = projection.get("request")
+        owner = request.get("principal") if isinstance(request, Mapping) else None
+        if not valid_actor_principal(owner):
+            raise PortalError(HTTPStatus.BAD_GATEWAY, "The admitted initiator cannot be verified")
+        return owner
+
+    @staticmethod
+    def _dispatch_state(projection: dict) -> str | None:
+        technical = projection.get("technical")
+        effects = technical.get("effects") if isinstance(technical, Mapping) else None
+        matches = [
+            effect for effect in effects or ()
+            if isinstance(effect, Mapping) and effect.get("effect_kind") == "airflow_dispatch"
+        ]
+        if len(matches) != 1:
+            return None
+        return matches[0].get("state")
+
     def _list_runs(self, environ: dict, start_response: Callable) -> Iterable[bytes]:
         session = self._session(environ)
         query = urlparse.parse_qs(str(environ.get("QUERY_STRING") or ""), keep_blank_values=True)
         limit = _page_integer(query, "limit", default=20, minimum=1, maximum=100)
         offset = _page_integer(query, "offset", default=0, minimum=0, maximum=100_000)
         include_deleted = str((query.get("include_deleted") or [""])[0]).lower() in {"1", "true"}
-        metadata = self._metadata_snapshot()
         principal, is_admin = self._viewer_identity(session)
-        runs: list[dict] = []
-        seen: set[str] = set()
-        # Scan past recently deleted runs so tombstones never push older runs off the page.
-        # The budget scales with the requested offset and a bounded extra scan; when the budget
-        # runs out before the end of the history is proven, the list fails closed instead of
-        # presenting a truncated result as the complete one.
-        page_size = 100
-        required = offset + limit + 1
-        scan_budget = ((required + page_size - 1) // page_size) + 10
-        pages = 0
-        while True:
-            if pages >= scan_budget:
-                raise PortalError(
-                    HTTPStatus.SERVICE_UNAVAILABLE, "Run history is too long to locate more records; retry later"
-                )
+        metadata = self._metadata_snapshot()
+        try:
+            admitted = self._run_control().list_admitted_runs()
+        except FactStoreError as error:
+            raise PortalError(HTTPStatus.SERVICE_UNAVAILABLE, "Admitted runs are temporarily unavailable") from error
+        visible = [
+            item for item in admitted
+            if include_deleted or not (metadata.get(item.run_id) or _EMPTY_OVERLAY)["deleted"]
+        ]
+        runs = []
+        for item in visible[offset : offset + limit]:
+            dag_run_id = self._dag_run_id_from_request_id(item.request_id)
+            projection = self._read_projection(item.run_id)
+            if dag_run_id is None or projection is None:
+                raise PortalError(HTTPStatus.BAD_GATEWAY, "An admitted run identity cannot be verified")
+            owner = self._registered_owner(projection)
+            request = projection["request"]
+            display_name = None
+            airflow_run = {}
             try:
-                items = self.config.airflow.list_dag_runs(
-                    session.token, self.config.dag_id, limit=page_size, offset=pages * page_size
-                )
+                airflow_run = self.config.airflow.dag_run(session.token, self.config.dag_id, dag_run_id)
             except AirflowAuthError as error:
                 raise PortalError(HTTPStatus.UNAUTHORIZED, str(error)) from error
             except AirflowApiError as error:
-                # Never present a partial history as the complete one.
-                raise PortalError(
-                    HTTPStatus.SERVICE_UNAVAILABLE, "Run list is temporarily unavailable; retry later"
-                ) from error
-            pages += 1
-            for item in items:
-                dag_run_id = str(item.get("dag_run_id") or "")
-                if not dag_run_id or dag_run_id in seen:
-                    continue
-                seen.add(dag_run_id)
-                owner, name = _actor_identity(item.get("triggering_user_name"))
-                native_id = native_run_id(dag_run_id)
-                projection = self._read_fact_projection(native_id)
-                request = (
-                    projection.get("request")
-                    if isinstance(projection, dict)
-                    else None
-                )
-                request = request if isinstance(request, Mapping) else {}
-                overlay = metadata.get(native_id) or _EMPTY_OVERLAY
-                parent_native = (
-                    projection.get("parent_run_id")
-                    if isinstance(projection, dict)
-                    else None
-                )
-                parent_projection = (
-                    self._read_fact_projection(parent_native)
-                    if isinstance(parent_native, str) and parent_native
-                    else None
-                )
-                parent_dag_run_id = (
-                    self._dag_run_id_from_request_id(
-                        parent_projection.get("request_id")
-                    )
-                    if isinstance(parent_projection, dict)
-                    else None
-                )
-                if overlay["deleted"] and not include_deleted:
-                    continue
-                runs.append(
-                    {
-                        "dag_run_id": dag_run_id,
-                        "handoff_path": None,
-                        "main_assembly": _optional_str(
-                            request.get("main_assembly")
-                        ),
-                        # The recorded initiator, never the current viewer; missing names stay null.
-                        "user": name,
-                        # Airflow's own record outlives any portal restart.
-                        "principal": owner,
-                        "state": _run_state(projection),
-                        "started_at": item.get("start_date"),
-                        "parent_dag_run_id": parent_dag_run_id,
-                        "resume_from": (
-                            _optional_str(projection.get("from_stage"))
-                            if isinstance(projection, dict)
-                            else None
-                        ),
-                        "resume_from_name": (
-                            _stage_name(projection.get("from_stage"))
-                            if isinstance(projection, dict)
-                            else None
-                        ),
-                        # Row-level action gate for the operator page (one profile check per list).
-                        "can_manage": is_admin or owner == principal,
-                        **overlay,
-                    }
-                )
-            if len(runs) >= required or len(items) < page_size:
-                break
-        page_runs = runs[offset : offset + limit]
-        return _json_response(
-            start_response,
-            200,
-            {
-                "runs": page_runs,
-                "next_offset": offset + limit if len(runs) > offset + limit else None,
-            },
-            self.config,
-        )
+                if not (isinstance(error.__cause__, urlerror.HTTPError) and error.__cause__.code == 404):
+                    raise PortalError(
+                        HTTPStatus.SERVICE_UNAVAILABLE, "Run observations are temporarily unavailable"
+                    ) from error
+            if _actor_identity(airflow_run.get("triggering_user_name"))[0] == owner:
+                display_name = _actor_identity(airflow_run.get("triggering_user_name"))[1]
+            parent = (
+                self._read_projection(item.parent_run_id)
+                if item.parent_run_id else None
+            )
+            runs.append({
+                "dag_run_id": dag_run_id,
+                "handoff_path": None,
+                "main_assembly": _optional_str(request.get("main_assembly")),
+                "user": display_name,
+                "principal": owner,
+                "state": _run_state(projection),
+                "started_at": airflow_run.get("start_date") or item.created_at.isoformat(),
+                "parent_dag_run_id": (
+                    self._dag_run_id_from_request_id(parent.get("request_id"))
+                    if isinstance(parent, dict) else None
+                ),
+                "resume_from": item.from_stage,
+                "resume_from_name": _stage_name(item.from_stage),
+                "can_manage": is_admin or owner == principal,
+                **(metadata.get(item.run_id) or _EMPTY_OVERLAY),
+            })
+        return _json_response(start_response, 200, {
+            "runs": runs,
+            "next_offset": offset + limit if len(visible) > offset + limit else None,
+        }, self.config)
 
     def _start_run(self, environ: dict, start_response: Callable) -> Iterable[bytes]:
         """One uploaded SolidWorks folder starts one run; manual platform paths are gone."""
@@ -1880,6 +1843,7 @@ class PortalApp:
             dispatch_result = self._dispatch_technical(
                 session,
                 dispatch_command.command_id,
+                retry_absent=existing_outcome is not None,
             )
         except AirflowAuthError:
             return _json_response(
@@ -2134,20 +2098,36 @@ class PortalApp:
         session = self._session(environ)
         if _RUN_ID.fullmatch(dag_run_id) is None:
             raise PortalError(HTTPStatus.BAD_REQUEST, "Run identifier is invalid")
+        viewer, is_admin = self._viewer_identity(session)
+        run_id = native_run_id(dag_run_id)
+        projection = self._read_projection(run_id)
+        if projection is None:
+            raise PortalError(HTTPStatus.NOT_FOUND, "The run has no canonical admission")
+        principal = self._registered_owner(projection)
+        can_manage = is_admin or viewer == principal
+        airflow_run = {}
+        tasks = []
+        endpoint_error = None
         try:
             airflow_run = self.config.airflow.dag_run(session.token, self.config.dag_id, dag_run_id)
-            tasks = self.config.airflow.task_instances(session.token, self.config.dag_id, dag_run_id)
         except AirflowAuthError as error:
             raise PortalError(HTTPStatus.UNAUTHORIZED, str(error)) from error
         except AirflowApiError as error:
-            missing = isinstance(error.__cause__, urlerror.HTTPError) and error.__cause__.code == 404
-            raise PortalError(HTTPStatus.NOT_FOUND if missing else HTTPStatus.BAD_GATEWAY, str(error)) from error
-        can_manage = self._can_manage(session, airflow_run)
-        run_id = native_run_id(dag_run_id)
-        projection = self._read_projection(run_id)
-        job = self._fact_display_job(projection) if projection is not None else None
-        endpoint_error: str | None = None
-        principal, operator = _actor_identity(airflow_run.get("triggering_user_name"))
+            if not (isinstance(error.__cause__, urlerror.HTTPError) and error.__cause__.code == 404):
+                raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
+            endpoint_error = str(error)
+        else:
+            try:
+                tasks = self.config.airflow.task_instances(session.token, self.config.dag_id, dag_run_id)
+            except AirflowAuthError as error:
+                raise PortalError(HTTPStatus.UNAUTHORIZED, str(error)) from error
+            except AirflowApiError as error:
+                raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
+        operator = (
+            _actor_identity(airflow_run.get("triggering_user_name"))[1]
+            if _actor_identity(airflow_run.get("triggering_user_name"))[0] == principal else None
+        )
+        job = self._fact_display_job(projection)
         retry_job = dict(job or {})
         retry_job["native_status"] = _canonical_native_status(projection)
         retry = _retry_assessment(airflow_run, tasks, retry_job, endpoint_error)
@@ -2155,6 +2135,11 @@ class PortalApp:
         if recovery_block is not None:
             reason, classification = recovery_block
             retry = RecoveryAssessment(False, classification, reason, ())
+        if self._dispatch_state(projection) in {"prepared", "unknown"}:
+            retry = RecoveryAssessment(
+                can_manage, "temporary_disconnection",
+                "Reconcile the original Airflow dispatch; resend only after exact absence is observed", (),
+            )
         pr = None
         if isinstance(job, dict) and isinstance(job.get("pr"), dict):
             pr = dict(job["pr"])
@@ -2177,9 +2162,8 @@ class PortalApp:
         # The purpose authority of both pages is the registered freeze request: a
         # mutable conf echo never decides the display, and an unfinished
         # registration reads as "not recorded".
-        stage_job = self._registered_stage_job(job, projection)
-        stage_view_payload = stage_view(stage_job)
-        display_job = None if stage_job is None else {**stage_job, "status": (job or {}).get("status")}
+        stage_view_payload = self._registered_stage_view(job, projection)
+        display_job = job
         try:
             report = build_report(display_job or {}, view=stage_view_payload)
         except PipelineError as error:
@@ -2229,7 +2213,7 @@ class PortalApp:
                 "reason": retry.reason,
                 "classification": retry.classification,
             },
-            "started_at": airflow_run.get("start_date"),
+            "started_at": airflow_run.get("start_date") or projection.get("created_at"),
             "ended_at": airflow_run.get("end_date"),
             "tasks": [
                 {
@@ -2283,6 +2267,40 @@ class PortalApp:
             raise PortalError(HTTPStatus.BAD_REQUEST, "Run identifier is invalid")
         if self._body(environ):
             raise PortalError(HTTPStatus.BAD_REQUEST, "Retry does not accept run parameters")
+        principal, is_admin = self._viewer_identity(session)
+        run_id = native_run_id(dag_run_id)
+        projection = self._read_projection(run_id)
+        if projection is None:
+            raise PortalError(HTTPStatus.NOT_FOUND, "The run has no canonical admission")
+        if not is_admin and self._registered_owner(projection) != principal:
+            raise PortalError(HTTPStatus.FORBIDDEN, "Only the initiator or a platform administrator can retry this run")
+        if self._dispatch_state(projection) in {"prepared", "unknown"}:
+            with self._rerun_lock:
+                if self._metadata_overlay(dag_run_id)["deleted"]:
+                    raise PortalError(HTTPStatus.CONFLICT, "Deleted runs cannot be retried; restore first")
+                application = self.config.production_application
+                loader = getattr(application, "load_admission_outcome", None)
+                if not callable(loader):
+                    raise PortalError(HTTPStatus.SERVICE_UNAVAILABLE, "The production admission reader is unavailable")
+                outcome = loader(run_id)
+                if outcome is None or outcome.dispatch_command.dag_run_id != dag_run_id:
+                    raise PortalError(HTTPStatus.CONFLICT, "The original Airflow dispatch cannot be verified")
+                try:
+                    result = self._dispatch_technical(
+                        session, outcome.dispatch_command.command_id, retry_absent=True,
+                    )
+                except FactStoreError as error:
+                    raise PortalError(HTTPStatus.CONFLICT, str(error)) from error
+                settled = result.state is EffectState.SATISFIED
+                return _json_response(start_response, 200 if settled else 409, {
+                    "dag_run_id": dag_run_id,
+                    "state": "queued" if settled else "unresolved",
+                    "trigger": result.state.value,
+                    "cleared_tasks": [],
+                    **({} if settled else {
+                        "error": "The original dispatch remains unresolved; no new run was created"
+                    }),
+                }, self.config)
         try:
             run = self.config.airflow.dag_run(session.token, self.config.dag_id, dag_run_id)
             if not self._can_manage(session, run):
@@ -2497,6 +2515,7 @@ class PortalApp:
         principal: str,
         dag_run_id: str,
         body: dict,
+        submission_key: str,
     ) -> Iterable[bytes]:
         """Create one current-generation request from a completed parent Freeze."""
 
@@ -2586,17 +2605,7 @@ class PortalApp:
                     "Select a main assembly from the parent's sealed Freeze originals",
                 )
 
-            frame = {
-                "change_summary": change_summary,
-                "main_assembly": main_assembly,
-                "parent_dag_run_id": dag_run_id,
-                "parent_run_id": parent_run_id,
-                "principal": principal,
-                "purpose": purpose,
-                "stage": "freeze",
-                "target_hardware": target_hardware,
-            }
-            new_dag_run_id = "portal-freeze-" + digest(frame)[:24]
+            new_dag_run_id = "portal-freeze-" + submission_key
             new_run_id = native_run_id(new_dag_run_id)
             loader = self.config.production_freeze_successor_loader
             if not callable(loader) or self.config.production_application is None:
@@ -2609,6 +2618,7 @@ class PortalApp:
                     ProductionFreezeSuccessorRequest,
                 )
 
+                existing_outcome = self.config.production_application.load_admission_outcome(new_run_id)
                 outcome = loader(
                     ProductionFreezeSuccessorRequest(
                         run_id=new_run_id,
@@ -2652,6 +2662,7 @@ class PortalApp:
                 dispatch_result = self._dispatch_technical(
                     session,
                     dispatch_command.command_id,
+                    retry_absent=existing_outcome is not None,
                 )
             except AirflowAuthError as error:
                 raise PortalError(
@@ -2701,6 +2712,12 @@ class PortalApp:
             raise PortalError(HTTPStatus.UNAUTHORIZED, "Feishu session expired; sign in again")
         if _RUN_ID.fullmatch(dag_run_id) is None:
             raise PortalError(HTTPStatus.BAD_REQUEST, "Run identifier is invalid")
+        submission_key = str(environ.get("HTTP_IDEMPOTENCY_KEY") or "").strip()
+        if not submission_key or _RUN_ID.fullmatch(submission_key) is None or len(submission_key) > 120:
+            raise PortalError(
+                HTTPStatus.BAD_REQUEST,
+                "Idempotency-Key must be a non-empty safe identifier of at most 120 characters",
+            )
         body = self._body(environ)
         stage = body.get("stage")
         keys = {"stage", "target_hardware", "change_summary", "main_assembly"}
@@ -2751,6 +2768,7 @@ class PortalApp:
             principal,
             dag_run_id,
             body,
+            submission_key,
         )
 
     # --------------------------------------------------------------- preview
@@ -2841,7 +2859,9 @@ class PortalApp:
             failure = failed_receipt
         failure = failure if isinstance(failure, dict) else {}
         failure_message = failure.get("error_message") or failure.get("error")
-        failure_code = failure.get("reason_code") or failure.get("error_code")
+        failure_code = failure.get("reason_code") or failure.get("error_code") or (
+            (failed.get("decision") or {}).get("reason_code") if isinstance(failed, dict) else None
+        )
         failure_detail = failure.get("error_detail") or failure.get("detail")
         failure_diagnostic_path = (
             failure.get("diagnostic_path") or failed_receipt.get("diagnostic_path")
@@ -2852,6 +2872,23 @@ class PortalApp:
         )
         by_stage = projection.get("by_stage")
         by_stage = by_stage if isinstance(by_stage, dict) else {}
+        native_failure_member = (by_stage.get(failed.get("stage")) or {}).get("native-result.json") if failed else None
+        if not failure_message and isinstance(native_failure_member, dict):
+            native_result = _parse_registered_json(
+                self._registered_member_bytes("native-result.json", native_failure_member)
+            )
+            native_failure = native_result.get("failure")
+            if (
+                not isinstance(native_failure, dict)
+                or native_result.get("kind") != failed.get("stage")
+                or native_result.get("state") != failed.get("state")
+                or native_failure.get("code") != failure_code
+                or not isinstance(native_failure.get("message"), str)
+                or not native_failure["message"]
+            ):
+                raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered native failure conflicts with its stage decision")
+            failure_message = native_failure["message"]
+            failure_detail = native_result
         verify_row = stages.get("verify")
         verify_row = verify_row if isinstance(verify_row, dict) else {}
         qualification = verify_row.get("qualification")
@@ -2865,30 +2902,43 @@ class PortalApp:
         )
         scope_kind = qualification.get("scope_kind", verify_row.get("scope_kind"))
         certificate_member = (by_stage.get("verify") or {}).get(CERTIFICATE_FILENAME)
+        if verify_row.get("state") == "completed" and not isinstance(certificate_member, dict):
+            raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered completed Verify certificate is missing")
         certificate = None
         if isinstance(certificate_member, dict):
-            try:
-                certificate = _parse_registered_json(
-                    self._registered_member_bytes(CERTIFICATE_FILENAME, certificate_member)
-                )
-            except PortalError:
-                certificate = None
+            certificate = _parse_registered_json(
+                self._registered_member_bytes(CERTIFICATE_FILENAME, certificate_member)
+            )
         certificate = certificate if isinstance(certificate, dict) else {}
-        if certificate:
-            validate_certificate_diagnostics(certificate)
+        if isinstance(certificate_member, dict):
+            try:
+                self._bind_verification_certificate(projection, verify_row, certificate)
+            except PipelineError as error:
+                raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
         formal_eligible = (
             formal_eligible and certificate.get("decision") == "PASS"
             and certificate.get("passed") is True
         )
         publish_member = (by_stage.get("publish") or {}).get("publication-receipt.json")
+        if (stages.get("publish") or {}).get("state") == "completed" and not isinstance(publish_member, dict):
+            raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered completed Publish receipt is missing")
         publication = None
         if isinstance(publish_member, dict):
-            try:
-                publication = _parse_registered_json(
-                    self._registered_member_bytes("publication-receipt.json", publish_member)
-                )
-            except PortalError:
-                publication = None
+            publication = _parse_registered_json(
+                self._registered_member_bytes("publication-receipt.json", publish_member)
+            )
+            publish_row = stages.get("publish") or {}
+            publish_command = publish_row.get("command") or {}
+            if (
+                digest(publication) != (publish_row.get("receipt") or {}).get("checks_sha256")
+                or publication.get("schema_version") != PUBLICATION_RECEIPT_SCHEMA
+                or not isinstance(publish_command.get("command_id"), str)
+                or not isinstance(publish_command.get("request_digest"), str)
+                or publication.get("command_id") != publish_command["command_id"]
+                or publication.get("request_digest") != publish_command["request_digest"]
+                or publication.get("run_id") != projection.get("run_id")
+            ):
+                raise PortalError(HTTPStatus.BAD_GATEWAY, "Publication receipt differs from its canonical stage result")
         publication = publication if isinstance(publication, dict) else {}
         pr_observation = (
             (publication.get("pr_effect") or {}).get("observation")
@@ -3042,23 +3092,22 @@ class PortalApp:
         self,
         projection: dict,
     ) -> dict | None:
-        """Read the registered Capture input's native discovery record for display."""
+        """Read discovery facts from their original sealed Discover output."""
 
         by_stage = projection.get("by_stage")
-        capture = by_stage.get("capture") if isinstance(by_stage, dict) else None
-        if not isinstance(capture, dict):
+        discover = by_stage.get("discover") if isinstance(by_stage, dict) else None
+        if not isinstance(discover, dict):
             return None
-        member = capture.get("input/discovery/native-discovery.json")
+        path = "prepared/discovery/native-discovery.json"
+        member = discover.get(path)
         if not isinstance(member, dict):
+            if ((projection.get("stages") or {}).get("discover") or {}).get("state") == "completed":
+                raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered completed Discover source evidence is missing")
             return None
         try:
-            self._registered_stage_artifact(capture, stage="capture")
-            discover = by_stage.get("discover")
-            if not isinstance(discover, dict) or not discover:
-                raise PipelineError("Registered discovery record has no Discover artifact")
             source = self._registered_stage_artifact(discover, stage="discover")
             data = self._registered_member_bytes(
-                "input/discovery/native-discovery.json",
+                path,
                 member,
             )
             record = registered_discovery_record(
@@ -3083,225 +3132,125 @@ class PortalApp:
             "discovery_sha256": hashlib.sha256(data).hexdigest(),
         }
 
-    def _registered_stage_job(self, job: dict | None, projection: dict | None) -> dict | None:
-        """A display snapshot whose stage states come from registered rows.
+    def _registered_stage_view(self, job: dict | None, projection: dict | None) -> dict:
+        """Project committed stage decisions and their sealed evidence without re-deciding outcomes."""
 
-        A completed platform row can arrive as a bare live event after its check
-        observations have already been sealed. Rebuild each registered stage from
-        the authoritative row state and its receipt-bound report, then pass the
-        result through the unchanged fail-closed ``stage_view``. Unregistered
-        stages retain their live observations so in-progress runs remain visible.
-        """
-
-        if not isinstance(job, dict) or not isinstance(projection, dict):
-            return job
-        stages = projection.get("stages")
-        if not isinstance(stages, dict) or not stages:
-            return job
+        view = stage_view()
+        if not isinstance(projection, dict):
+            return view
+        job = job if isinstance(job, dict) else {}
         run_id = projection.get("run_id")
         if not isinstance(run_id, str) or not run_id:
-            run_id = job.get("run_id")
-        if not isinstance(run_id, str) or not run_id:
-            return job
-        parent_run_id = projection.get("parent_run_id")
-        by_stage = projection.get("by_stage")
-        by_stage = by_stage if isinstance(by_stage, dict) else {}
-        original_events = job.get("events") if isinstance(job.get("events"), list) else []
-        events: list[dict] = []
-        for definition in CONTRACT["stages"]:
-            stage_id = definition["id"]
-            row = stages.get(stage_id)
-            if not isinstance(row, dict):
-                events.extend(
-                    event
-                    for event in original_events
-                    if isinstance(event, dict) and event.get("stage") == stage_id
-                )
-                continue
-            original_stage_events = [
-                event for event in original_events if isinstance(event, dict) and event.get("stage") == stage_id
-            ]
-            stage_members = by_stage.get(stage_id)
-            reuse = None
-            if isinstance(stage_members, dict) and stage_members:
-                artifact = self._registered_stage_artifact(
-                    stage_members,
-                    stage=stage_id,
-                )
-                if artifact.producer_run_id != run_id:
-                    if (
-                        not isinstance(parent_run_id, str)
-                        or artifact.producer_run_id != parent_run_id
-                    ):
-                        raise PortalError(
-                            HTTPStatus.BAD_GATEWAY,
-                            "Registered stage artifact has no proven parent run",
-                        )
-                    reuse = {
-                        "parent_run": parent_run_id,
-                        "reused": True,
-                        "source_run": artifact.producer_run_id,
-                    }
-            report = (
-                self._registered_stage_report(projection, stage=stage_id)
-                if row.get("state") != "waiting"
-                else None
-            )
-            reported = None
-            if isinstance(report, dict):
-                rows = report.get("stages")
-                if (
-                    not isinstance(rows, list)
-                    or any(not isinstance(item, dict) for item in rows)
-                    or [item.get("id") for item in rows] != [item["id"] for item in CONTRACT["stages"]]
-                    or len(rows) != len(CONTRACT["stages"])
-                ):
-                    raise PortalError(
-                        HTTPStatus.BAD_GATEWAY,
-                        "Registered stage report check inventory is malformed",
-                    )
-                reported = next(item for item in rows if item.get("id") == stage_id)
-            observed_at = {
-                (
-                    (event.get("check") or {}).get("boundary"),
-                    (event.get("check") or {}).get("id"),
-                ): event.get("at")
-                for event in original_stage_events
-                if isinstance(event.get("check"), dict)
-                and isinstance(event.get("at"), str)
-                and event.get("at")
-            }
-            expected_boundaries = {
-                boundary: [item["id"] for item in definition[f"{boundary}_qc"]]
-                for boundary in ("input", "output")
-            }
-            for event in original_stage_events:
-                check = event.get("check")
-                if not isinstance(check, dict):
-                    continue
-                boundary = check.get("boundary")
-                identifier = check.get("id")
-                if boundary not in expected_boundaries or identifier not in expected_boundaries[boundary]:
-                    continue
-                if check.get("state") not in {"passed", "failed"} or not isinstance(
-                    check.get("details"),
-                    dict,
-                ):
-                    raise PortalError(
-                        HTTPStatus.BAD_GATEWAY,
-                        "Registered stage check observation is malformed",
-                    )
-            if isinstance(reported, dict):
-                for boundary in ("input", "output"):
-                    rows = reported.get(f"{boundary}_qc")
-                    expected = [item["id"] for item in definition[f"{boundary}_qc"]]
-                    if rows is None:
-                        continue
-                    if (
-                        not isinstance(rows, list)
-                        or any(not isinstance(item, dict) for item in rows)
-                        or [item.get("id") for item in rows] != expected
-                    ):
-                        raise PortalError(
-                            HTTPStatus.BAD_GATEWAY,
-                            "Registered stage report check inventory is malformed",
-                        )
-                    for item in rows:
-                        check_state = item.get("state")
-                        details = item.get("details")
-                        if check_state not in {"passed", "failed"}:
-                            continue
-                        if not isinstance(details, dict):
-                            raise PortalError(
-                                HTTPStatus.BAD_GATEWAY,
-                                "Registered stage report check details are malformed",
-                            )
-                        events.append(
-                            {
-                                "stage": stage_id,
-                                "state": "running",
-                                **(
-                                    {"at": observed_at[(boundary, item["id"])]}
-                                    if (boundary, item["id"]) in observed_at
-                                    else {}
-                                ),
-                                **({"reuse": reuse} if reuse is not None else {}),
-                                "check": {
-                                    "id": item["id"],
-                                    "boundary": boundary,
-                                    "state": check_state,
-                                    "details": details,
-                                },
-                            }
-                        )
-            else:
-                for event in original_stage_events:
-                    check = event.get("check")
-                    if not isinstance(check, dict):
-                        continue
-                    boundary = check.get("boundary")
-                    identifier = check.get("id")
-                    if boundary not in expected_boundaries or identifier not in expected_boundaries[boundary]:
-                        continue
-                    events.append(
-                        {
-                            "stage": stage_id,
-                            "state": "running",
-                            **({"at": event["at"]} if isinstance(event.get("at"), str) else {}),
-                            **({"reuse": reuse} if reuse is not None else {}),
-                            "check": {
-                                "id": identifier,
-                                "boundary": boundary,
-                                "state": check["state"],
-                                "details": check["details"],
-                            },
-                        }
-                    )
-            platform_state = row.get("state")
+            raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered run identity is missing")
+        result = job.get("result") or {}
+        view.update(run_id=run_id, subject_sha256=result.get("subject_sha256"))
+        stages = projection.get("stages") or {}
+        by_stage = projection.get("by_stage") or {}
+        for stage in view["stages"]:
+            stage_id = stage["id"]
+            row = stages.get(stage_id) or {}
+            state = stage_display_state(row.get("state", "waiting"))
             at = row.get("updated_at") or row.get("original_executed_at")
             if hasattr(at, "isoformat"):
                 at = at.isoformat()
-            if not isinstance(at, str) or not at:
-                at = next(
-                    (
-                        event.get("at")
-                        for event in reversed(original_stage_events)
-                        if isinstance(event.get("at"), str) and event.get("at")
-                    ),
-                    None,
-                )
-            events.append(
-                {
-                    "stage": stage_id,
-                    "state": stage_display_state(platform_state),
-                    **({"at": at} if at is not None else {}),
-                    **({"reuse": reuse} if reuse is not None else {}),
-                }
+            stage.update(
+                state=state, at=at, in_scope=row.get("in_scope") is not False,
+                input_qc=[], output_qc=[], inputs=[], outputs=[], findings=[],
             )
-        display = dict(job)
-        display["events"] = events
-        capture_members = by_stage.get("capture")
-        if isinstance(capture_members, dict) and "input/handoff.json" in capture_members:
-            handoff = _parse_registered_json(self._registered_member_bytes(
-                "input/handoff.json", capture_members["input/handoff.json"]
-            ))
-            try:
-                warnings = registered_handoff_warnings(handoff.get("warnings"))
-            except PipelineError as error:
-                raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
-            for event in events:
-                check = event.get("check")
-                if event["stage"] == "capture" and isinstance(check, dict) and check.get("id") == "input.valid":
-                    check["details"] = {**check["details"], "warnings": warnings}
+            command = row.get("command") or {}
+            stage["inputs"] = [{
+                "path": artifact["locator"], "label": artifact["kind"], "availability": "recorded",
+            } for artifact in command.get("input_artifacts", [])]
+            members = by_stage.get(stage_id) or {}
+            if members:
+                artifact = self._registered_stage_artifact(members, stage=stage_id)
+                if artifact.producer_run_id != run_id:
+                    parent = projection.get("parent_run_id")
+                    if not parent or artifact.producer_run_id != parent:
+                        raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered stage artifact has no proven parent run")
+                    stage["reuse"] = {"parent_run": parent, "source_run": parent, "reused": True}
+                stage["outputs"] = [{
+                    "path": ".", "label": "Sealed stage output", "availability": "recorded",
+                    "files": {name: member["sha256"] for name, member in members.items()},
+                }]
+            if state == "completed" and not members:
+                raise PortalError(HTTPStatus.BAD_GATEWAY, f"Registered {stage_id} output evidence is missing")
+            if stage_id in {"freeze", "discover"} and members:
+                member = members.get("checks.json")
+                if not isinstance(member, dict):
+                    raise PortalError(HTTPStatus.BAD_GATEWAY, f"Registered {stage_id} checks are missing")
+                checks = _parse_registered_json(self._registered_member_bytes("checks.json", member))
+                receipt = row.get("receipt") or {}
+                if (
+                    not isinstance(command.get("command_id"), str)
+                    or not isinstance(command.get("request_digest"), str)
+                    or checks.get("command_id") != command.get("command_id")
+                    or checks.get("request_digest") != command.get("request_digest")
+                    or digest(checks) != receipt.get("checks_sha256")
+                ):
+                    raise PortalError(HTTPStatus.BAD_GATEWAY, f"Registered {stage_id} checks conflict with its result")
+                recorded = checks.get("checks")
+                if not isinstance(recorded, list) or not recorded:
+                    raise PortalError(HTTPStatus.BAD_GATEWAY, f"Registered {stage_id} check inventory is malformed")
+                identifiers = set()
+                for check in recorded:
+                    if (
+                        not isinstance(check, dict) or not isinstance(check.get("id"), str)
+                        or not check["id"] or check["id"] in identifiers
+                        or check.get("state") not in {"passed", "failed"}
+                        or not isinstance(check.get("details"), dict)
+                    ):
+                        raise PortalError(
+                            HTTPStatus.BAD_GATEWAY, f"Registered {stage_id} check observation is malformed"
+                        )
+                    identifiers.add(check["id"])
+                    stage["output_qc"].append({**check, "boundary": "stage"})
+                if stage_id == "freeze":
+                    inventory_check = next((item for item in recorded if item["id"] == "handoff.integrity"), {})
+                    files = (inventory_check.get("details") or {}).get("files")
+                    if isinstance(files, dict):
+                        stage["input_inventory_count"] = len(files)
+                        view["handoff_sha256"] = (inventory_check.get("details") or {}).get("handoff_sha256")
+            elif stage_id == "capture" and state == "completed":
+                # The native report remains detailed Capture evidence, never a stage-state authority.
+                report = self._registered_stage_report(projection, stage=stage_id)
+                if not isinstance(report, dict):
+                    raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered native Capture observations are missing")
+                captured = next((item for item in report.get("stages", []) if item.get("id") == stage_id), None)
+                if not isinstance(captured, dict):
+                    raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered native Capture observations are malformed")
+                for boundary in ("input", "output"):
+                    stage[f"{boundary}_qc"] = [dict(item) for item in captured.get(f"{boundary}_qc", [])]
+                handoff_member = members.get("input/handoff.json")
+                if isinstance(handoff_member, dict):
+                    handoff = _parse_registered_json(
+                        self._registered_member_bytes("input/handoff.json", handoff_member)
+                    )
+                    try:
+                        warnings = registered_handoff_warnings(handoff.get("warnings"))
+                    except PipelineError as error:
+                        raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
+                    for check in stage["input_qc"]:
+                        if check.get("id") == "input.valid":
+                            check["details"] = {**check.get("details", {}), "warnings": warnings}
+            checks = stage["input_qc"] + stage["output_qc"]
+            stage.update(checks_total=len(checks), checks_passed=sum(item.get("state") == "passed" for item in checks))
+            if state == "failed":
+                decision = row.get("decision") or {}
+                stage["error_code"] = decision.get("reason_code")
+                if job.get("failed_stage") == stage_id:
+                    stage.update(error=job.get("error"), diagnostic=job.get("detail"))
+        view["execution_scope"] = [stage["id"] for stage in view["stages"] if stage["in_scope"]]
         discovery = self._registered_discovery_projection(projection)
         if discovery is not None:
-            display["discovery"] = discovery
-            display["hardware_id"] = discovery["hardware_id"]
-            display["revision"] = discovery["revision"]
-        # The registered rows own stage states; coarse run failure must not
-        # replace a downstream blocked state when rendering this stage view.
-        display.pop("status", None)
-        return display
+            job["discovery"] = discovery
+            job["hardware_id"] = discovery["hardware_id"]
+            job["revision"] = discovery["revision"]
+        if any(stage["id"] == "verify" and stage["state"] == "completed" for stage in view["stages"]):
+            for stage in view["stages"]:
+                for confirmation in stage["confirmations"]:
+                    confirmation["state"] = "external_review"
+        return view
 
     @staticmethod
     def _registered_member_fields(member: dict) -> tuple[str, int, dict]:
@@ -3437,6 +3386,12 @@ class PortalApp:
     ) -> tuple[ArtifactRef, ArtifactRef, str | None]:
         """Bind a certificate to this projection's exact Generate/Capture pair."""
 
+        try:
+            validate_certificate_structure(certificate)
+        except PipelineError as error:
+            raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
+        if digest(certificate) != (verify_row.get("receipt") or {}).get("checks_sha256"):
+            raise PipelineError("The verification certificate differs from its stage result")
         by_stage = projection.get("by_stage")
         by_stage = by_stage if isinstance(by_stage, dict) else {}
         generate, capture = self._verification_input_pair(verify_row, by_stage)
@@ -3526,7 +3481,6 @@ class PortalApp:
         )
         if not isinstance(certificate, dict):
             raise PipelineError("Verification certificate must be an object")
-        validate_certificate_diagnostics(certificate)
         generate_artifact, capture_artifact, evaluation_subject = self._bind_verification_certificate(
             projection,
             verify,

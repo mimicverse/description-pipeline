@@ -71,6 +71,8 @@ CAD 有值时先读取、保留和检查，再按有据规则修正。规则不�
 
 新运行只能从 Freeze 接纳。首次上传封存新 originals；Freeze successor 仅复用父运行已验证的 originals，当前请求、规则、配置、目标、Git 基线和工具要求重新封存，重新执行六阶段。不得继承父运行下游 decision 或成功资格。同一已登记命令的受控重试与新建运行是两种操作，详见[状态与恢复](contracts.md#recovery)。
 
+门户每次有意新建请求使用新的 `Idempotency-Key`；结果未确认时保留同一键重试，不能由相同表单值推断这是旧请求。运行列表来自已接纳事实，尚未创建 Airflow DagRun 的请求同样可见；详情及重试读取原不可变请求。浏览器只维护当前请求的读取生命周期，列表、分页和详情的过期响应不得覆盖新读取；读取失败撤下旧成功与预览，不据缓存重判业务状态。
+
 ## 模块与依赖
 
 | 目录 | 职责 |
@@ -102,6 +104,10 @@ Discover result 表达原生选择、prepared 输入和证据绑定，不作为�
 Capture 在一次原生采集中保留已保存配置、几何、轴线、配合、物性和外观事实，不执行 CAD 重建，不保留重建图、恢复日志或强制清零资格。manifest 绑定的 raw 成员是唯一封存来源，不另存 capture 投影、重复环境或计划副本。外观复用同一几何遍历的对象与 face triangle spans；对象引用必须在已证明的同一文档与 occurrence 上下文中解释。Generate 在 Linux 完成坐标转换、惯量规范化、STL 物化、面材质分组和 URDF 生成。Verify 从原始事实与交付字节独立复算，不调用生成器投影作为答案。详细外观规则见[原生外观读数与交付](contracts.md#原生外观读数与交付)。
 
 Windows 的既有 `native_operation_event` 经同一 operation view 与 poll 形成 `run_display_metadata.activity`，Portal 展示当前活动、时间与历史。原生 sequence 与事件时间用于识别重复观察；activity 是显示数据，不建立第二套阶段状态、成功资格或 CAD 控制权，不增加独立轮询链。
+
+Portal 直接展示 canonical 阶段状态，详细检查读取该阶段实际密封证据：Freeze/Discover 的 `checks.json`、Capture 的原生报告及 Verify 的独立 certificate。不以静态检查模板或其他阶段报告重新判定终态；证据身份、摘要或结构冲突作为读取错误拒绝展示。原生失败从同阶段密封 `native-result.json` 保留原始消息。Discover 的来源与 warning 直接读取其自身输出，不等待 Capture。
+
+Windows 文件系统读写、遍历、摘要、三角流封存和传输打包统一复用 `io` 的物理路径边界，支持长路径；扩展路径前缀仅用于本地 Python I/O，不写入 manifest，不传入 CAD/COM。临时三角文件使用 occurrence 标识的摘要命名，原始 occurrence 名称与几何流字节保持不变。
 
 ## 持久化与一致性
 

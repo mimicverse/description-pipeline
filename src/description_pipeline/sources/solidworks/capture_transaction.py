@@ -16,6 +16,7 @@ from ...interface_records import (
 )
 from ...io import (
     PipelineError,
+    _physical_path,
     confined,
     digest,
     file_digest,
@@ -53,7 +54,7 @@ def _require(condition: object, message: str) -> None:
 def inspect_prepared_package(package: Path) -> dict:
     """Validate the prepared package's source identity without changing it."""
 
-    package = Path(package)
+    package = Path(_physical_path(package))
     report = {
         "passed": True,
         "errors": [],
@@ -103,6 +104,8 @@ def inspect_prepared_package(package: Path) -> dict:
 def _archive_input(package: Path, staging: Path) -> None:
     """Archive identity, CAD originals and controlled records once."""
 
+    package = Path(_physical_path(package))
+    staging = Path(_physical_path(staging))
     payload = read_data(package / DISCOVERY_FILE)
     native_files = (
         payload.get("native_files")
@@ -230,7 +233,7 @@ def capture_native_package(
         _sealed_source, plan = consume_sealed_definition(package)
         main = str(plan["main_assembly"] or "")
         assembly = package / main
-        if not assembly.is_file():
+        if not Path(_physical_path(assembly)).is_file():
             raise PipelineError(
                 "The sealed capture plan names no staged main assembly"
             )

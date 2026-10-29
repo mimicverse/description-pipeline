@@ -139,6 +139,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         passed: bool = False,
         diagnostics: list[dict] | None = None,
         state: str = "failed",
+        certificate_overrides: dict | None = None,
     ) -> RegisteredPlatform:
         """The registered state a failing verify stage leaves: sealed members, failed receipt."""
         platform = RegisteredPlatform(self.tmp / "platform")
@@ -152,7 +153,11 @@ class DiagnosticPreviewTests(unittest.TestCase):
             {
                 "passed": passed,
                 "subject_sha256": hashlib.sha256(URDF).hexdigest(),
-                "checks": FAILING_CHECKS,
+                "checks": [
+                    {**row, "state": "passed", "passed": True} if passed else row
+                    for row in FAILING_CHECKS
+                ],
+                "fixture_certificate_overrides": certificate_overrides or {},
                 "diagnostics": diagnostics or [],
             },
         )
@@ -271,7 +276,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         platform = self._registered_failed_verify(
             passed=True,
             state="completed",
-            diagnostics=[BLOCKING_QUALITY_DIAGNOSTIC],
+            certificate_overrides={"diagnostics": [BLOCKING_QUALITY_DIAGNOSTIC]},
         )
         app = portal_module.PortalApp(
             portal_module.PortalConfig(
@@ -326,7 +331,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
         platform = self._registered_failed_verify(
             passed=True,
             state="completed",
-            diagnostics=[{"code": "quality.unknown_blocking", "message": "flag is missing"}],
+            certificate_overrides={"diagnostics": [{"code": "quality.unknown_blocking", "message": "flag is missing"}]},
         )
         app = portal_module.PortalApp(
             portal_module.PortalConfig(

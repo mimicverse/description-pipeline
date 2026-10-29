@@ -56,13 +56,13 @@ from description_pipeline.schemas import (
     AIRFLOW_DISPATCH_CONF_SCHEMA,
     NATIVE_DISCOVERY_SCHEMA,
     NATIVE_DISCOVERY_FINDING_SCHEMA,
-    VERIFICATION_CERTIFICATE_SCHEMA,
-    VERIFY_REQUEST_SCHEMA,
+    PUBLICATION_RECEIPT_SCHEMA,
 )
 from description_pipeline.sources.solidworks import discovery
 from description_pipeline.stages import CONTRACT, stage_view
 
 from .protocol_support import discovery_finding, native_discovery_record, protocol_events
+from .portal_read_support import registered_check_fixture, registered_certificate_fixture
 
 AIRFLOW_TOKEN = "airflow-session-token"
 FEISHU_NAME = "崔工"
@@ -379,6 +379,8 @@ class PortalClient:
         self.last_set_cookies: list[str] = []
 
     def request(self, method: str, path: str, payload: dict | None = None, headers: dict | None = None):
+        if headers is None and method == "POST" and path.endswith("/attempts"):
+            headers = {"Idempotency-Key": "fixture-freeze-request"}
         headers = {"Accept": "application/json", **(headers or {})}
         data = None
         if payload is not None:
@@ -586,11 +588,19 @@ class PreviewStore:
         checkpoints: tuple[str, ...] = (),
         merged: dict | None = None,
     ) -> None:
+        bound_artifacts = dict(artifacts or {})
+        if preview is not None and "reports/native-stages.json" not in bound_artifacts:
+            capture_observations = stage_view({"run_id": run_id, "events": protocol_events(stages=("capture",))})
+            bound_artifacts["reports/native-stages.json"] = json.dumps(capture_observations).encode()
+        if "reports/native-stages.json" in bound_artifacts and preview is not None:
+            preview.setdefault("report_files", {}).setdefault(
+                "reports/native-stages.json", hashlib.sha256(bound_artifacts["reports/native-stages.json"]).hexdigest(),
+            )
         self.runs[run_id] = {
             "meta": meta,
             "delivery": delivery,
             "preview": preview,
-            "artifacts": dict(artifacts or {}),
+            "artifacts": bound_artifacts,
             "checkpoints": tuple(checkpoints),
             "merged": dict(merged or {}),
         }
@@ -727,7 +737,7 @@ class FakeRunControl:
             return None
         entry = self.fixtures.runs.get(run_id)
         if entry is None:
-            if not any(row.get("run_id") == run_id for row in self.admits):
+            if run_id not in self.runs and not any(row.get("run_id") == run_id for row in self.admits):
                 return None
             entry = {
                 "meta": None,
@@ -798,6 +808,7 @@ class FakeRunControl:
             if preview and stage == "capture" and not selected:
                 selected["input/handoff.json"] = b'{"fixture":true}\n'
             if preview and stage == "generate":
+                selected.setdefault("tool.json", b'{"fixture":"generate-tool"}\n')
                 if not selected:
                     selected["proof/placeholder.json"] = b"{}\n"
                 capture_member = next(iter((by_stage.get("capture") or {}).values()), None)
@@ -860,56 +871,21 @@ class FakeRunControl:
                     generate_receipt_bytes = b"{}\n"
                 generate_artifact = generate_member["artifact"]
                 capture_artifact = capture_member["artifact"]
-                pair_files = {
-                    path: member["sha256"]
-                    for path, member in {
-                        **by_stage["capture"],
-                        **by_stage["generate"],
-                    }.items()
-                    if (
-                        path in {"tool.json"}
-                        or path.startswith(("input/", "evidence/", "model/", "urdf/", "meshes/"))
-                    )
-                }
-                request = {
-                    "capture_artifact": capture_artifact,
-                    "config_snapshot_sha256": "e" * 64,
-                    "contract_sha256": "f" * 64,
-                    "expected_verifier_sha256": generate_artifact["producer_tool_sha256"],
-                    "generate_artifact": generate_artifact,
-                    "output_contract": "solidworks-to-urdf.verification-artifact/v1",
-                    "policy_sha256": "1" * 64,
-                    "purpose": preview.get("purpose") or "engineering",
-                    "schema_version": VERIFY_REQUEST_SCHEMA,
-                }
-                certificate = {
-                    "schema_version": VERIFICATION_CERTIFICATE_SCHEMA,
-                    "decision": "PASS"
-                    if preview.get("verified") is not False
-                    else "FAIL",
-                    "passed": preview.get("verified") is not False,
-                    "subject_sha256": generate_artifact["set_sha256"],
-                    "checks": quality_record.get("checks") or preview.get("checks") or [],
-                    "diagnostics": quality_record.get("diagnostics")
-                    or preview.get("warnings")
-                    or [],
-                    "actual_verifier": {"executor": "verify"},
-                    "actual_verifier_sha256": generate_artifact["producer_tool_sha256"],
-                    "capture_artifact": capture_artifact,
-                    "config_snapshot_sha256": "e" * 64,
-                    "contract_sha256": "f" * 64,
-                    "evaluation_subject_sha256": digest(pair_files),
-                    "generate_artifact": generate_artifact,
-                    "generate_receipt_sha256": hashlib.sha256(
-                        generate_receipt_bytes
-                    ).hexdigest(),
-                    "policy_sha256": "1" * 64,
-                    "purpose": preview.get("purpose") or "engineering",
-                    "request": request,
-                    "request_sha256": digest(request),
-                }
+                certificate = registered_certificate_fixture(
+                    generate=generate_artifact, capture=capture_artifact,
+                    generate_files=self.projection_artifacts.objects[generate_artifact["artifact_id"]],
+                    capture_files=self.projection_artifacts.objects[capture_artifact["artifact_id"]],
+                    report={
+                        "passed": preview.get("verified") is not False,
+                        "checks": quality_record.get("checks") or preview.get("checks") or [],
+                        "diagnostics": quality_record.get("diagnostics") or preview.get("warnings") or [],
+                    },
+                    purpose=preview.get("purpose") or "engineering",
+                )
                 certificate.update(entry.get("certificate_override") or {})
-                certificate["verification_key"] = digest(certificate)
+                certificate["verification_key"] = digest({
+                    key: value for key, value in certificate.items() if key != "verification_key"
+                })
                 selected["verification-certificate.json"] = (
                     json.dumps(certificate, sort_keys=True).encode("utf-8") + b"\n"
                 )
@@ -920,9 +896,7 @@ class FakeRunControl:
                 and isinstance(current.get("input/request.json"), (bytes, bytearray))
             ):
                 selected["request.json"] = bytes(current["input/request.json"])
-            if stage_report is not None and (
-                stage in (entry.get("checkpoints") or ()) or preview
-            ):
+            if stage == "capture" and stage_report is not None:
                 selected["reports/native-stages.json"] = stage_report
             merged_status = str((entry.get("merged") or {}).get("status") or "")
             state = "completed" if stage in (entry.get("checkpoints") or ()) else None
@@ -940,9 +914,14 @@ class FakeRunControl:
                 result = (entry.get("merged") or {}).get("result") or {}
                 submission = result.get("submission") if isinstance(result, dict) else None
                 if isinstance(submission, dict):
+                    publish_command, _checks = registered_check_fixture(run_id, stage)
                     selected["publication-receipt.json"] = (
                         json.dumps(
                             {
+                                "schema_version": PUBLICATION_RECEIPT_SCHEMA,
+                                "command_id": publish_command["command_id"],
+                                "request_digest": publish_command["request_digest"],
+                                "run_id": run_id,
                                 "base_ref": submission.get("base"),
                                 "branch_ref": submission.get("branch"),
                                 "candidate_parents": ["0" * 40],
@@ -980,11 +959,30 @@ class FakeRunControl:
                 }
                 by_stage[stage] = {}
                 continue
+            command = None
+            checks_sha256 = None
+            if stage in {"freeze", "discover"}:
+                command, checks = registered_check_fixture(run_id, stage)
+                selected["checks.json"] = json.dumps(checks).encode()
+                checks_sha256 = digest(checks)
+            elif stage == "verify" and "verification-certificate.json" in selected:
+                checks_sha256 = digest(json.loads(selected["verification-certificate.json"]))
+            elif stage == "publish" and "publication-receipt.json" in selected:
+                command, _checks = registered_check_fixture(run_id, stage)
+                checks_sha256 = digest(json.loads(selected["publication-receipt.json"]))
+            discovery_path = "prepared/discovery/native-discovery.json"
+            if stage == "discover" and "input/discovery/native-discovery.json" in current:
+                selected[discovery_path] = bytes(current["input/discovery/native-discovery.json"])
+            elif stage == "discover":
+                selected[discovery_path] = json.dumps(native_discovery_record(run_id)).encode()
             artifact = self.projection_artifacts.register(run_id, stage, selected)
             rows = {}
             artifacts = []
             for path, data in sorted(selected.items()):
-                expected = files[path] if path in files else hashlib.sha256(data).hexdigest()
+                if stage == "discover" and path == discovery_path:
+                    expected = files.get("input/discovery/native-discovery.json", hashlib.sha256(data).hexdigest())
+                else:
+                    expected = files[path] if path in files else hashlib.sha256(data).hexdigest()
                 member = {
                     "bytes": len(data),
                     "sha256": expected,
@@ -1007,10 +1005,12 @@ class FakeRunControl:
             stages[stage] = {
                 "stage": stage,
                 "state": state,
+                "command": command,
                 "decision": decision,
                 "receipt": {
                     "artifacts": artifacts,
                     "failure": failure,
+                    "checks_sha256": checks_sha256,
                 },
                 "updated_at": None,
             }
@@ -1052,7 +1052,7 @@ class FakeRunControl:
             if not isinstance(stage_state, str):
                 continue
             stages[stage]["state"] = stage_state
-            stages[stage]["receipt"] = row.get("receipt") or stages[stage]["receipt"]
+            stages[stage]["receipt"] = {**stages[stage]["receipt"], **(row.get("receipt") or {})}
             stages[stage]["decision"] = {
                 "command_id": row.get("command_id", f"{run_id}-{stage}"),
                 "outcome": stage_state,
@@ -1062,6 +1062,12 @@ class FakeRunControl:
         scope_kind = str((scope or {}).get("kind") or "formal")
         target_stage = (scope or {}).get("target_stage")
         for stage, row in stages.items():
+            stage_index = stage_order.index(stage)
+            if (
+                row["state"] == "waiting" and stage_index
+                and stages[stage_order[stage_index - 1]]["state"] != "completed"
+            ):
+                row["state"] = "blocked"
             decision = row.get("decision")
             outcome = decision.get("outcome") if isinstance(decision, dict) else None
             stage_scope = (
@@ -1118,7 +1124,7 @@ class FakeRunControl:
                 for row in reversed(self.admits)
                 if row.get("run_id") == run_id
             ),
-            {},
+            self.runs.get(run_id, {}),
         )
         configuration = admitted.get("configuration")
         configuration = configuration if isinstance(configuration, dict) else {}
@@ -1143,6 +1149,7 @@ class FakeRunControl:
                 "target_hardware": admitted.get("target_hardware") or TEST_TARGET,
             }
         )
+        request_payload.setdefault("principal", admitted.get("principal", FEISHU_PRINCIPAL))
         return {
             "run_id": run_id,
             "request_id": entry.get("request_id") or admitted.get("request_id"),
@@ -1391,6 +1398,19 @@ class FakeRunControl:
             for run_id, record in self.runs.items()
         ]
 
+    def list_admitted_runs(self):
+        rows = []
+        for run_id in reversed(tuple(self.runs)):
+            projection = self.fact_projection(run_id)
+            rows.append(SimpleNamespace(
+                run_id=run_id, request_id=projection["request_id"],
+                parent_run_id=projection.get("parent_run_id"),
+                from_stage=projection.get("from_stage"),
+                state=projection["state"],
+                created_at=datetime(2026, 10, 7, tzinfo=UTC),
+            ))
+        return rows
+
     def list_run_display_metadata(self) -> dict:
         return dict(self.displays)
 
@@ -1450,6 +1470,7 @@ class FakeProductionApplication:
         self.outcomes = {}
         self.dispatch_records = {}
         self.dispatch_calls = []
+        self.dispatch_retry_modes = []
         self.dispatched = set()
         self.admission_requests = []
         self.freeze_successor_requests = []
@@ -1464,11 +1485,13 @@ class FakeProductionApplication:
             conf,
         )
 
-    def dispatch(self, command_id: str, adapter) -> DispatchResult:
+    def dispatch(self, command_id: str, adapter, *, retry_absent: bool = False) -> DispatchResult:
         self.dispatch_calls.append(command_id)
+        self.dispatch_retry_modes.append(retry_absent)
         command, conf = self.dispatch_records[command_id]
         response = None
-        if command_id not in self.dispatched:
+        retry_missing = retry_absent and adapter.observe(command, conf).state_class == "absent"
+        if command_id not in self.dispatched or retry_missing:
             self.dispatched.add(command_id)
             with contextlib.suppress(AirflowApiError):
                 response = adapter.trigger(command, conf)
@@ -1767,197 +1790,34 @@ class PortalTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-    def _seed_7b_stage_display(self) -> str:
-        """Register the failed 7b-shaped run, including its bound native stage report."""
-        from description_pipeline.stages import CONTRACT_FILE_SHA256, CONTRACT_SHA256, STAGE_IDS
-
-        self._seed_airflow_run(
-            DAG_RUN_ID,
-            state="failed",
-            conf={
-                "handoff_path": "/home/andy/cad-handoffs/M3.0.3_20261016",
-                "main_assembly": "M3.0.3_20261016.SLDASM",
-                "target_hardware": TEST_TARGET,
-                "change_summary": TEST_SUMMARY,
-                "purpose": "inspection_preview",
-            },
-        )
+    def _seed_registered_capture_failure(self) -> str:
+        """Register a canonical failure with same-stage sealed observations."""
+        self._seed_airflow_run(DAG_RUN_ID, state="failed", conf={"purpose": "inspection_preview"})
         run_id = native_run_id(DAG_RUN_ID)
-        states = {
-            "freeze": "completed",
-            "discover": "completed",
-            "capture": "failed",
-            "generate": "blocked",
-            "verify": "blocked",
-            "publish": "blocked",
-        }
-        report_stages = []
-        for definition in CONTRACT["stages"]:
-            stage_id = definition["id"]
-            boundary_rows = {}
-            for boundary in ("input", "output"):
-                rows = []
-                for item in definition[f"{boundary}_qc"]:
-                    passed = (
-                        (stage_id in {"freeze", "discover"} and states[stage_id] == "completed")
-                        or (stage_id == "capture" and boundary == "input")
-                    )
-                    rows.append(
-                        {
-                            "id": item["id"],
-                            "label": item["label"],
-                            "state": "passed" if passed else "not_run",
-                            "details": {"passed": True} if passed else {"reason": "No recorded check result"},
-                        }
-                    )
-                boundary_rows[boundary] = rows
-            checks = boundary_rows["input"] + boundary_rows["output"]
-            report_stages.append(
-                {
-                    "id": stage_id,
-                    "name": definition["name"],
-                    "state": states[stage_id],
-                    "checks_passed": sum(row["state"] == "passed" for row in checks),
-                    "checks_total": len(checks),
-                    "input_qc": boundary_rows["input"],
-                    "output_qc": boundary_rows["output"],
-                }
-            )
-        handoff = "d" * 64
-        native_report = json.dumps(
-            {
-                "schema_version": "solidworks-to-urdf.stages/v1",
-                "pipeline_id": PIPELINE_ID,
-                "contract_sha256": CONTRACT_SHA256,
-                "contract_file_sha256": CONTRACT_FILE_SHA256,
-                "run_id": run_id,
-                "execution_scope": list(STAGE_IDS),
-                "subject_sha256": None,
-                "handoff_sha256": handoff,
-                "release_approval": "required",
-                "stages": report_stages,
-                "events": [],
-                "unsupported": [],
-            },
-            sort_keys=True,
-        ).encode("utf-8")
-        native_report_digest = hashlib.sha256(native_report).hexdigest()
-        native_stages_member = {
-            "path": "reports/native-stages.json",
-            "bytes": len(native_report),
-            "sha256": native_report_digest,
-        }
+        events = protocol_events(failed_stage="capture", subject="a" * 64)
+        native_report = json.dumps(stage_view({"run_id": run_id, "events": events})).encode()
         failure = {
             "error": "the link group payload echoes another selection",
             "error_code": "cad_link_group_payload_invalid",
-            "detail": {
-                "code": "cad_link_group_payload_invalid",
-                "message": "the link group payload echoes another selection",
-                "body": "r_thigh_yaw",
-            },
+            "detail": {"code": "cad_link_group_payload_invalid",
+                       "message": "the link group payload echoes another selection", "body": "arm"},
         }
+        states = {"freeze": "completed", "discover": "completed", "capture": "failed",
+                  "generate": "blocked", "verify": "blocked", "publish": "blocked"}
         self.platform.stages[run_id] = {
-            stage_id: {
-                "stage": stage_id,
-                "state": state,
-                "receipt": {
-                    "subject_sha256": None,
-                    "artifacts": [native_stages_member] if stage_id == "discover" else [],
-                    "handoff_sha256": handoff,
-                    **(failure if stage_id == "capture" else {}),
-                },
-                "original_executed_at": None,
-            }
-            for stage_id, state in states.items()
+            stage: {"stage": stage, "state": state,
+                    "receipt": failure if stage == "capture" else {}, "original_executed_at": None}
+            for stage, state in states.items()
         }
         self.platform.runs[run_id] = {
-            "run_id": run_id,
-            "state": "failed",
-            "request_id": f"request-{DAG_RUN_ID}",
-            "parent_run_id": None,
-            "from_stage": None,
-            "tool_identity": None,
+            "run_id": run_id, "state": "failed", "request_id": f"request-{DAG_RUN_ID}",
+            "parent_run_id": None, "from_stage": None, "tool_identity": None,
         }
-        events = [
-            {"stage": "freeze", "state": "running", "at": "2026-10-19T18:37:14Z"},
-            {
-                "stage": "freeze",
-                "state": "running",
-                "at": "2026-10-19T18:37:14Z",
-                "check": {
-                    "id": "handoff.admission",
-                    "boundary": "input",
-                    "state": "passed",
-                    "details": {"handoff_sha256": handoff},
-                },
-            },
-            {
-                "stage": "freeze",
-                "state": "running",
-                "at": "2026-10-19T18:37:14Z",
-                "check": {
-                    "id": "handoff.integrity",
-                    "boundary": "output",
-                    "state": "passed",
-                    "details": {"handoff_sha256": handoff},
-                },
-            },
-            {"stage": "freeze", "state": "completed", "at": "2026-10-19T18:37:14Z"},
-            # The registered event stream carries discovery's completion without
-            # check rows; the sealed report is the only place those rows survive.
-            {"stage": "discover", "state": "completed", "at": "2026-10-19T18:49:40Z"},
-            {
-                "stage": "capture",
-                "state": "running",
-                "at": "2026-10-19T18:49:41Z",
-                "check": {
-                    "id": "input.valid",
-                    "boundary": "input",
-                    "state": "passed",
-                    "details": {"passed": True},
-                },
-            },
-            {"stage": "capture", "state": "failed", "at": "2026-10-19T18:49:35Z"},
-            {"stage": "generate", "state": "blocked", "at": "2026-10-19T18:49:41Z"},
-            {"stage": "verify", "state": "blocked", "at": "2026-10-19T18:49:41Z"},
-            {"stage": "publish", "state": "blocked", "at": "2026-10-19T18:49:41Z"},
-            {
-                "kind": "binding",
-                "stage": "capture",
-                "at": "2026-10-19T18:49:47Z",
-                "dag_id": DEFAULT_DAG_ID,
-                "task_id": "discover",
-                "actual_stage": "capture",
-                "intent_stage": "discover",
-                "closure_shape": "bound_native_capture_failed",
-                "native_run_id": run_id,
-                "operation_key": f"{run_id}/native:0",
-                "reported_stage": "capture",
-                "reconciled_stage": "discover",
-                "reconciled_state": "failed",
-            },
-        ]
-        self._seed_job(
-            DAG_RUN_ID,
-            status="failed",
-            error="the link group payload echoes another selection",
-            result=None,
-            events=events,
-        )
+        self._seed_job(DAG_RUN_ID, status="failed", error=failure["error"], result=None, events=events)
         self.store.add(
-            run_id,
-            meta={"handoff_sha256": handoff},
-            preview={
-                "schema_version": "solidworks-to-urdf.preview/v1",
-                "pipeline_id": PIPELINE_ID,
-                "run_id": run_id,
-                "subject_sha256": None,
-                "urdf": "urdf/robot.urdf",
-                "files": {},
-                "report_files": {"reports/native-stages.json": native_report_digest},
-                "verified": False,
-                "state": "unverified",
-            },
+            run_id, meta={"handoff_sha256": "d" * 64},
+            preview={"run_id": run_id, "files": {}, "verified": False,
+                     "report_files": {"reports/native-stages.json": hashlib.sha256(native_report).hexdigest()}},
             artifacts={"reports/native-stages.json": native_report},
             merged={"status": "failed", "events": events},
         )
@@ -2136,7 +1996,7 @@ class PortalTests(unittest.TestCase):
             preview={
                 "subject_sha256": "d" * 64,
                 "verified": True,
-                "files": {"urdf/robot.urdf": "f" * 64, "input/request.json": digest},
+                "files": {"urdf/robot.urdf": hashlib.sha256(b"<robot/>").hexdigest(), "input/request.json": digest},
                 "report_files": {},
             },
             artifacts={"urdf/robot.urdf": b"<robot/>", "input/request.json": payload_bytes},
@@ -2202,6 +2062,19 @@ class PortalTests(unittest.TestCase):
             "start_date": "2026-10-07T00:00:00Z",
             "end_date": "2026-10-07T00:05:00Z" if state != "running" else None,
         }
+
+        # Seed the immutable admission separately from its Airflow observation.
+        owner = FEISHU_PRINCIPAL
+        actor = self.airflow.dag_runs[dag_run_id]["triggering_user_name"]
+        if isinstance(actor, str):
+            from description_pipeline.orchestration.feishu_oauth import valid_actor_principal
+            candidate = actor.split("|", 1)[0]
+            if valid_actor_principal(candidate):
+                owner = candidate
+        self.platform.runs.setdefault(native_run_id(dag_run_id), {
+            "run_id": native_run_id(dag_run_id), "request_id": dag_run_id,
+            "principal": owner, "state": state, "parent_run_id": None, "from_stage": None,
+        })
 
     def _seed_retryable_run(self) -> None:
         self._seed_passed_job()
@@ -2315,7 +2188,7 @@ class PortalTests(unittest.TestCase):
                 )
         self.client.login()
         self.airflow.dag_runs[DAG_RUN_ID]["triggering_user_name"] = f"{FEISHU_PRINCIPAL}|broken"
-        self.assertFalse(json.loads(self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")[2])["can_manage"])
+        self.assertTrue(json.loads(self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")[2])["can_manage"])
 
     def test_owner_and_admin_retry_preserve_frozen_job_and_successful_tasks(self) -> None:
         for token in [AIRFLOW_TOKEN, ADMIN_TOKEN]:
@@ -2602,7 +2475,7 @@ class PortalTests(unittest.TestCase):
                     return self.outcome
                 return None
 
-            def dispatch(self, command_id, adapter):
+            def dispatch(self, command_id, adapter, *, retry_absent=False):
                 command = self.outcome.dispatch_command
                 if command_id not in self.dispatched:
                     adapter.trigger(
@@ -3200,13 +3073,13 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(structural["principal"], "cli:租户:ou")
         two_part = runs["portal-20261007T050006-twopart"]
         self.assertIsNone(two_part["user"])
-        self.assertEqual(two_part["principal"], f"cli:ou|{json.dumps('名字', ensure_ascii=False)}")
+        self.assertEqual(two_part["principal"], FEISHU_PRINCIPAL)
         overlong = runs["portal-20261007T050007-overlong"]
         self.assertIsNone(overlong["user"])
-        self.assertGreater(len(overlong["principal"]), TRIGGERING_USER_NAME_LIMIT)
+        self.assertEqual(overlong["principal"], FEISHU_PRINCIPAL)
         missing = runs["portal-20261007T050004-nouser"]
         self.assertIsNone(missing["user"])
-        self.assertIsNone(missing["principal"])
+        self.assertEqual(missing["principal"], FEISHU_PRINCIPAL)
 
     def test_session_adoption_enforces_the_recorded_name_budget(self) -> None:
         principal = "cli_app:tenant-a:ou_boundary"
@@ -3604,8 +3477,12 @@ class PortalTests(unittest.TestCase):
 
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
 
-        self.assertEqual(status, 409, body)
-        self.assertIn("another Generate/Capture pair", json.loads(body)["error"])
+        self.assertEqual(status, 502, body)
+        self.assertIn("pair binding differs", json.loads(body)["error"])
+
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
+        self.assertEqual(status, 502, body)
+        self.assertIn("pair binding differs", json.loads(body)["error"])
 
     def test_conflicting_effect_rejects_current_formal_status_and_preview(self) -> None:
         self.client.login()
@@ -3942,21 +3819,19 @@ class PortalTests(unittest.TestCase):
         only supplements display detail and never overrides them."""
 
         self.client.login()
-        self._seed_airflow_run(DAG_RUN_ID, state="failed")
+        self._seed_passed_job()
         self._seed_job(DAG_RUN_ID, status="running", events=[{"stage": "capture", "state": "running", "at": "t0"}])
         run_id = native_run_id(DAG_RUN_ID)
         recorded = protocol_events(failed_stage="verify", subject="a" * 64)
-        self.store.add(
-            run_id,
-            meta={"handoff_sha256": "d" * 64},
-            merged={"status": "failed", "events": recorded},
-        )
+        recorded.append({"stage": "verify", "state": "failed"})
+        self.store.runs[run_id]["merged"] = {"status": "failed", "events": recorded}
+        self.store.runs[run_id]["preview"]["verified"] = False
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
         self.assertEqual(status, 200, body)
         payload = json.loads(body)
         # The registered run state outranks the native job's "running".
         self.assertEqual(payload["job"]["status"], "failed")
-        # The recorded events - not the native-only capture event - drive the stage view.
+        # The registered decision, rather than the native-only event, owns the stage outcome.
         self.assertEqual(payload["report"]["failure"]["stage"], "verify")
 
     def test_registered_diagnostics_are_the_only_servable_copy(self) -> None:
@@ -3990,14 +3865,15 @@ class PortalTests(unittest.TestCase):
         definitions = {stage["id"]: stage for stage in CONTRACT["stages"]}
         for stage in view["stages"]:
             self.assertTrue(stage["evidence"], stage["id"])
-            self.assertEqual(
-                [item["id"] for item in stage["input_qc"]],
-                [item["id"] for item in definitions[stage["id"]]["input_qc"]],
-            )
-            self.assertEqual(
-                [item["id"] for item in stage["output_qc"]],
-                [item["id"] for item in definitions[stage["id"]]["output_qc"]],
-            )
+            if stage["id"] == "capture":
+                for boundary in ("input", "output"):
+                    self.assertEqual([item["id"] for item in stage[f"{boundary}_qc"]],
+                                     [item["id"] for item in definitions[stage["id"]][f"{boundary}_qc"]])
+            elif stage["id"] in {"freeze", "discover"}:
+                self.assertEqual(stage["input_qc"], [])
+                self.assertEqual([item["id"] for item in stage["output_qc"]], ["fixture.recorded_boundary"])
+            else:
+                self.assertEqual(stage["input_qc"] + stage["output_qc"], [])
             expected_unsupported = [item for item in CONTRACT["unsupported"] if item["stage"] == stage["id"]]
             self.assertEqual(
                 [item["label"] for item in stage["unsupported"]], [item["label"] for item in expected_unsupported]
@@ -4010,13 +3886,13 @@ class PortalTests(unittest.TestCase):
         preview = json.loads(body)
         self.assertTrue(preview["files"])
         for name in preview["files"]:
-            self.assertTrue(name.startswith(("urdf/", "meshes/")), name)
+            self.assertTrue(name == "tool.json" or name.startswith(("model/", "urdf/", "meshes/")), name)
 
-    def test_run_page_uses_registered_stage_states_and_bound_native_checks_for_7b_shape(self) -> None:
+    def test_run_page_uses_registered_stage_states_and_same_stage_checks(self) -> None:
         """A completed platform row and its sealed checks survive a bare event stream."""
 
         self.client.login()
-        run_id = self._seed_7b_stage_display()
+        run_id = self._seed_registered_capture_failure()
         self.assertEqual(run_id, native_run_id(DAG_RUN_ID))
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
         self.assertEqual(status, 200, body)
@@ -4025,11 +3901,11 @@ class PortalTests(unittest.TestCase):
 
         stages = {stage["id"]: stage for stage in payload["stage_view"]["stages"]}
         self.assertEqual(stages["freeze"]["state"], "completed")
-        self.assertEqual(stages["freeze"]["checks_passed"], 2)
-        self.assertEqual(stages["freeze"]["checks_total"], 2)
+        self.assertEqual(stages["freeze"]["checks_passed"], 1)
+        self.assertEqual(stages["freeze"]["checks_total"], 1)
         self.assertEqual(stages["discover"]["state"], "completed")
-        self.assertEqual(stages["discover"]["checks_passed"], 3)
-        self.assertEqual(stages["discover"]["checks_total"], 3)
+        self.assertEqual(stages["discover"]["checks_passed"], 1)
+        self.assertEqual(stages["discover"]["checks_total"], 1)
         self.assertTrue(
             all(row["state"] == "passed" for row in stages["discover"]["input_qc"] + stages["discover"]["output_qc"])
         )
@@ -4043,7 +3919,7 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(report_stages["discover"]["state"], "completed")
         self.assertEqual(
             report_stages["discover"]["counts"]["boundary"],
-            {"passed": 3, "executed": 3, "total": 3},
+            {"passed": 1, "executed": 1, "total": 1},
         )
         self.assertEqual(report_stages["capture"]["state"], "failed")
         for downstream in ("generate", "verify", "publish"):
@@ -4056,7 +3932,8 @@ class PortalTests(unittest.TestCase):
 
     def test_run_page_refuses_a_stage_report_bound_to_another_run(self) -> None:
         self.client.login()
-        run_id = self._seed_7b_stage_display()
+        self._seed_passed_job()
+        run_id = native_run_id(DAG_RUN_ID)
         entry = self.store.runs[run_id]
         report = json.loads(entry["artifacts"]["reports/native-stages.json"])
         report["run_id"] = "00000000-0000-0000-0000-000000000000"
@@ -4064,10 +3941,6 @@ class PortalTests(unittest.TestCase):
         digest = hashlib.sha256(payload).hexdigest()
         entry["artifacts"]["reports/native-stages.json"] = payload
         entry["preview"]["report_files"]["reports/native-stages.json"] = digest
-        for stage in ("discover",):
-            member = self.platform.stages[run_id][stage]["receipt"]["artifacts"][0]
-            member.update(bytes=len(payload), sha256=digest)
-
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
 
         self.assertEqual(status, 502, body)
@@ -4075,7 +3948,8 @@ class PortalTests(unittest.TestCase):
 
     def test_run_page_refuses_a_digest_mismatched_stage_report(self) -> None:
         self.client.login()
-        run_id = self._seed_7b_stage_display()
+        self._seed_passed_job()
+        run_id = native_run_id(DAG_RUN_ID)
         self.store.runs[run_id]["artifacts"]["reports/native-stages.json"] = b'{"tampered":true}'
 
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
@@ -4085,7 +3959,7 @@ class PortalTests(unittest.TestCase):
 
     def test_run_page_keeps_the_registered_failure_before_native_settlement(self) -> None:
         self.client.login()
-        run_id = self._seed_7b_stage_display()
+        run_id = self._seed_registered_capture_failure()
         self.platform.stages[run_id] = {
             stage: self.platform.stages[run_id][stage] for stage in ("freeze", "discover")
         }
@@ -4103,15 +3977,15 @@ class PortalTests(unittest.TestCase):
                 "freeze": "completed",
                 "discover": "completed",
                 "capture": "waiting",
-                "generate": "waiting",
-                "verify": "waiting",
-                "publish": "waiting",
+                "generate": "blocked",
+                "verify": "blocked",
+                "publish": "blocked",
             },
         )
 
-    def test_run_page_refuses_a_later_malformed_known_check_state(self) -> None:
+    def test_run_page_ignores_live_check_state_outside_sealed_evidence(self) -> None:
         self.client.login()
-        run_id = self._seed_7b_stage_display()
+        run_id = self._seed_registered_capture_failure()
         self.store.runs[run_id]["merged"]["events"].append(
             {
                 "stage": "freeze",
@@ -4127,12 +4001,12 @@ class PortalTests(unittest.TestCase):
 
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
 
-        self.assertEqual(status, 502, body)
-        self.assertIn("check observation is malformed", json.loads(body)["error"])
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["stage_view"]["stages"][0]["state"], "completed")
 
-    def test_run_page_refuses_later_malformed_known_check_details(self) -> None:
+    def test_run_page_ignores_live_check_details_outside_sealed_evidence(self) -> None:
         self.client.login()
-        run_id = self._seed_7b_stage_display()
+        run_id = self._seed_registered_capture_failure()
         self.store.runs[run_id]["merged"]["events"].append(
             {
                 "stage": "freeze",
@@ -4148,12 +4022,12 @@ class PortalTests(unittest.TestCase):
 
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
 
-        self.assertEqual(status, 502, body)
-        self.assertIn("check observation is malformed", json.loads(body)["error"])
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["stage_view"]["stages"][0]["state"], "completed")
 
-    def test_run_page_uses_the_latest_registered_check_state(self) -> None:
+    def test_run_page_does_not_use_capture_observations_to_redecide_freeze(self) -> None:
         self.client.login()
-        run_id = self._seed_7b_stage_display()
+        run_id = self._seed_registered_capture_failure()
         report = json.loads(self.store.runs[run_id]["artifacts"]["reports/native-stages.json"])
         freeze = next(row for row in report["stages"] if row["id"] == "freeze")
         admission = next(
@@ -4168,10 +4042,8 @@ class PortalTests(unittest.TestCase):
 
         self.assertEqual(status, 200, body)
         stages = {stage["id"]: stage for stage in json.loads(body)["stage_view"]["stages"]}
-        self.assertEqual(stages["freeze"]["state"], "failed")
-        admission = next(row for row in stages["freeze"]["input_qc"] if row["id"] == "handoff.admission")
-        self.assertEqual(admission["state"], "failed")
-        self.assertEqual(admission["details"], {"error": "later registered failure"})
+        self.assertEqual(stages["freeze"]["state"], "completed")
+        self.assertEqual(stages["freeze"]["checks_passed"], 1)
 
     def test_preview_waits_for_verification(self) -> None:
         self.client.login()
@@ -4182,8 +4054,9 @@ class PortalTests(unittest.TestCase):
             checkpoints=("freeze", "discover"),
             merged={"status": "running"},
         )
-        status, _, _ = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
-        self.assertEqual(status, 404)
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
+        self.assertEqual(status, 409)
+        self.assertIn("not passed independent verification", json.loads(body)["error"])
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
         self.assertEqual(status, 200, body)
         automatic = json.loads(body)["automatic"]
@@ -4704,11 +4577,11 @@ class PortalTests(unittest.TestCase):
     def test_run_detail_exposes_only_a_freeze_successor_when_facts_exist(self) -> None:
         self._seed_retryable_run()
         self.client.login()
-        # Without canonical admission facts the key is omitted.
+        # Airflow alone cannot supply a registered run detail.
         self.store.runs.pop(native_run_id(DAG_RUN_ID))
+        self.platform.runs.pop(native_run_id(DAG_RUN_ID))
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
-        self.assertEqual(status, 200, body)
-        self.assertNotIn("stage_reruns", json.loads(body))
+        self.assertEqual(status, 404, body)
         # A completed Freeze exposes one new-request option derived from sealed facts.
         self._seed_retryable_run()
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")

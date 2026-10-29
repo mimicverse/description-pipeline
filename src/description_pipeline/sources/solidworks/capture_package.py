@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-from ...io import PipelineError, artifact_path_parts, digest, read_data
+from ...io import PipelineError, _physical_path, artifact_path_parts, digest, read_data
 from ...schemas import CAPTURE_EVIDENCE_REQUESTS
 from .discovery import (
     DISCOVERY_FILE,
@@ -276,6 +276,7 @@ def _require_selector_state(item: dict, component: object) -> None:
 def consume_sealed_definition(package: Path) -> tuple[dict, dict]:
     """Consume the sealed source identity and Capture plan from one package."""
 
+    package = Path(_physical_path(package))
     discovery_path = package / DISCOVERY_FILE
     source_path = package / SOURCE_FILE
     plan_path = package / PLAN_FILE

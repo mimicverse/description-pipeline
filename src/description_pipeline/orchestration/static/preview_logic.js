@@ -361,7 +361,9 @@ export function stageSummaryRows(stageId, { files, stage, certificate, pr, subje
   const rows = [];
   const counts = segmentCounts(files);
   if (stageId === "freeze") {
-    rows.push({ label: "Input inventory", value: `${counts.input} files in the verified input/ tree` });
+    if (Number.isFinite(stage?.inputInventoryCount)) {
+      rows.push({ label: "Input inventory", value: `${stage.inputInventoryCount} files in the frozen source` });
+    }
   } else if (stageId === "capture") {
     rows.push({ label: "Evidence files", value: `${counts.evidence} files in evidence/` });
     rows.push({ label: "Mesh files", value: `${counts.meshes} files in meshes/` });

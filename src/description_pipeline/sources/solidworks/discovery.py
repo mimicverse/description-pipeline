@@ -6506,7 +6506,10 @@ def derive_native_package(
         if saved_state_warning is not None:
             if not capture_open_matches(source_selection["closure"]["open_status"], record.get("open_status")):
                 raise ValueError("Discover open status differs from selection")
-            findings.append(saved_state_warning)
+            findings.append(_finding(
+                saved_state_warning["code"], saved_state_warning["objects"][0]["object"],
+                saved_state_warning["message"], saved_state_warning["detail"], blocking=False,
+            ))
     except ValueError as error:
         raise PipelineError(f"Saved-state source evidence is incoherent: {error}") from error
     _validate_component_states(record, findings)

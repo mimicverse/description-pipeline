@@ -98,6 +98,14 @@ def _encoded_run_activity(activity: Mapping[str, object]) -> str:
     )
 
 
+def airflow_retry_claim_id(absent_fact_id: str) -> str:
+    """Bind one retry execution identity to its immutable absence observation."""
+
+    if not isinstance(absent_fact_id, str) or not absent_fact_id:
+        raise FactStoreError("An Airflow retry requires its exact observation id")
+    return "claim-airflow-retry-" + absent_fact_id
+
+
 class FactStoreError(PipelineError):
     """A canonical platform fact cannot be read or committed safely."""
 
@@ -1787,6 +1795,7 @@ class FactStore(RunControlStore):
         map_index: int | None = None,
         claim_scope: str = "execution",
         effect_scope_id: str | None = None,
+        airflow_absent_fact_id: str | None = None,
     ) -> ExecutionClaim:
         """Acquire one open fenced execution right without treating lease expiry as success."""
 
@@ -1833,6 +1842,18 @@ class FactStore(RunControlStore):
                 lock=False,
             )
             effect_states = {effect_id: item.state for effect_id, item in effect_settlements.items()}
+            retry_effect_id = None
+            if airflow_absent_fact_id is not None:
+                if (
+                    claim_scope != "execution"
+                    or claim_id != airflow_retry_claim_id(airflow_absent_fact_id)
+                ):
+                    raise FactConflict("Airflow retry claim must bind its exact absent observation")
+                retry_effect_id = self._require_airflow_absent_retry_cursor(
+                    cursor, command_id, airflow_absent_fact_id,
+                )
+                if set(effect_states) != {retry_effect_id}:
+                    raise FactConflict("Airflow dispatch retry contains unexpected effects")
             if claim_scope == "transfer_resume":
                 scoped = effect_settlements.get(effect_scope_id)
                 if (
@@ -1862,7 +1883,8 @@ class FactStore(RunControlStore):
                 if claim_scope == "transfer_resume"
                 else any(
                     state in {EffectState.UNKNOWN, EffectState.CONFLICT}
-                    for state in effect_states.values()
+                    for effect_id, state in effect_states.items()
+                    if effect_id != retry_effect_id
                 )
             )
             if command[4] != executor_sha256:
@@ -1901,6 +1923,7 @@ class FactStore(RunControlStore):
                 if unresolved:
                     raise FactConflict("An expired claim carries an unresolved effect and requires reconciliation")
                 closure_code = (
+                    "operator_closed" if retry_effect_id is not None else
                     "reconciled"
                     if any(state is not EffectState.PREPARED for state in effect_states.values())
                     else "abandoned_before_effect"
@@ -2622,6 +2645,52 @@ class FactStore(RunControlStore):
         )
         return fact
 
+    def _require_airflow_absent_retry_cursor(
+        self, cursor, command_id: str, absent_fact_id: str,
+    ) -> str:
+        """Allow an idempotent Airflow resend without making absence terminal."""
+
+        command = self._load_dispatch_command_cursor(cursor, command_id)
+        if command is None:
+            raise FactConflict("Airflow dispatch retry requires its original command")
+        admission = self._load_admission_cursor(cursor, command.run_id)
+        if admission is None:
+            raise FactConflict("Airflow dispatch retry requires its original admission")
+        expected = self._dispatch_effect_intent(admission, command)
+        intent, facts = self._effect_cursor(cursor, expected.effect_id, lock=False)
+        if intent.identity_digest != expected.identity_digest:
+            raise FactConflict("Airflow dispatch retry differs from its immutable intent")
+        settlement = project_effect_settlement(intent, facts)
+        if settlement.state is not EffectState.UNKNOWN or not facts:
+            raise FactConflict("Airflow dispatch retry requires an unresolved original send")
+        latest = facts[-1]
+        if (
+            latest.fact_id != absent_fact_id
+            or latest.fact_type != "observation"
+            or latest.source != "airflow-dispatch"
+            or latest.state_class != "absent"
+            or latest.payload_artifact_id is None
+        ):
+            raise FactConflict("Airflow dispatch retry requires the latest exact absent observation")
+        artifact = self._artifact_cursor(cursor, latest.payload_artifact_id)
+        reader = getattr(self._result_reader, "read_metadata_member", None)
+        if not callable(reader):
+            raise FactStoreError("The artifact reader cannot verify Airflow absence evidence")
+        if (
+            artifact.kind != "airflow_dispatch_observation"
+            or artifact.producer_run_id != command.run_id
+            or artifact.producer_stage is not None
+            or artifact.producer_tool_sha256 != command.expected_executor_sha256
+            or artifact.set_sha256 != latest.payload_digest
+        ):
+            raise FactConflict("Airflow absence evidence differs from its original command")
+        raw, _member, _manifest = reader(artifact, "observation.json", max_bytes=65536)
+        payload = json.loads(raw)
+        if payload != {"dag_id": command.dag_id, "dag_run_id": command.dag_run_id}:
+            raise FactConflict("Airflow absence evidence names another target")
+        self._read_dispatch_conf(command.conf_artifact)
+        return intent.effect_id
+
     def authorize_effect_dispatch(
         self,
         *,
@@ -2632,6 +2701,7 @@ class FactStore(RunControlStore):
         observed_at: datetime,
         fact_id: str,
         expected_command_id: str | None = None,
+        airflow_absent_fact_id: str | None = None,
     ) -> EffectFact:
         """Persist the only permission that may precede the external call.
 
@@ -2690,7 +2760,20 @@ class FactStore(RunControlStore):
             if expiry is None or observed_at >= expiry[0]:
                 raise FactConflict("Lease expiry does not authorize an external dispatch")
             state = self._effect_state_cursor(cursor, effect_id)
-            if state is not EffectState.PREPARED:
+            if airflow_absent_fact_id is not None:
+                if claim.claim_id != airflow_retry_claim_id(airflow_absent_fact_id):
+                    raise FactConflict("Airflow retry authorization must bind its claim observation")
+                retry_effect_id = self._require_airflow_absent_retry_cursor(
+                    cursor, claim.command_id, airflow_absent_fact_id,
+                )
+                command = self._load_dispatch_command_cursor(cursor, claim.command_id)
+                if (
+                    retry_effect_id != effect_id
+                    or source != "airflow-dispatch"
+                    or payload_digest != command.request_digest
+                ):
+                    raise FactConflict("Airflow dispatch retry differs from its original payload")
+            elif state is not EffectState.PREPARED:
                 raise FactConflict(f"The effect is {state.value}; observe or reconcile it before another dispatch")
             return self._append_effect_fact_cursor(
                 cursor,

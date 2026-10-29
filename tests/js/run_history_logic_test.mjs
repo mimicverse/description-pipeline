@@ -60,10 +60,11 @@ const displayedList = [{ dag_run_id: "run-3", state: "success" }];
 let nextRun = { dag_run_id: "run-3", state: "success", automatic: { state: "passed" } };
 let refreshes = 0;
 let previewLoads = 0;
-const poll = new Function("state", "api", "$", "setError", "clearPreview", "renderRun", "loadPreview", "stopActivityTimer", "shouldRefreshRunList", "refreshRuns", "window", `return (${pollSource});`)(
+const poll = new Function("state", "api", "$", "setError", "clearPreview", "renderRun", "loadPreview", "stopActivityTimer", "shouldRefreshRunList", "refreshRuns", "window", "responseRunId", `return (${pollSource});`)(
   browserState, async () => nextRun, () => ({}), () => {}, () => {}, () => {}, async () => { previewLoads++; }, () => {},
   shouldRefreshRunList, async () => { refreshes++; displayedList[0].state = nextRun.state; },
-  { clearInterval: () => { throw new Error("Canonical polling stopped after success"); } },
+  { clearTimeout() {}, setTimeout: () => 17 },
+  (payload) => payload.dag_run_id,
 );
 await poll();
 assert.equal(browserState.timer, 17);
