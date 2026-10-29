@@ -255,6 +255,56 @@ class SelectionTransportTests(unittest.TestCase):
             for name in manifest["files"]:
                 self.assertEqual(hashlib.sha256(payload.read(name)).hexdigest(), expected[name])
 
+    def test_long_prepared_package_reaches_native_boundary_without_false_missing_files(self) -> None:
+        from description_pipeline.sources.solidworks.capture_transaction import capture_native_package
+        from description_pipeline.sources.solidworks.revision import package_inventory
+        from description_pipeline.io import digest
+        from tests.sources.selection_support import sealed_selection
+        from tests.v1.source_record_support import source_record
+        from tests.v1.test_capture_plan import MAIN as main_assembly, build_package
+
+        long_parent = self.root / ("source-" + "p" * 90)
+        package = long_parent / ("prepared-" + "s" * 130)
+        physical = Path(_physical_path(package))
+        self.addCleanup(lambda: shutil.rmtree(_physical_path(long_parent), ignore_errors=True))
+        build_package(physical)
+        native = {main_assembly: b"assembly", "cad/base.SLDPRT": b"base", "cad/arm.SLDPRT": b"arm"}
+        for name, content in native.items():
+            target = physical / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+        native_files = {name: hashlib.sha256(content).hexdigest() for name, content in native.items()}
+        discovery_path = package / "discovery/native-discovery.json"
+        discovery = read_data(discovery_path)
+        discovery["native_files"] = native_files
+        discovery["raw"]["files"] = native_files
+        discovery["raw"]["source_selection"] = sealed_selection(native_files, main_assembly, stage_root=str(package))
+        write_json(discovery_path, discovery)
+        write_json(package / "discovery/findings.json", {"findings": []})
+        plan_path = package / "capture-plan.json"
+        plan = read_data(plan_path)
+        plan.update(discovery_sha256=file_digest(discovery_path), handoff_sha256=digest(native_files))
+        plan["selection"]["files"] = native_files
+        write_json(plan_path, plan)
+        write_json(package / "source.json", source_record(
+            hardware_id="fixture", handoff_digest=digest(native_files), main_assembly=main_assembly,
+        ))
+        before = package_inventory(package)
+        self.assertGreater(len(str(package / main_assembly)), 260)
+        with patch(
+            "description_pipeline.sources.solidworks.capture_transaction.capture_prepared",
+            side_effect=RuntimeError("native boundary reached"),
+        ) as native_boundary, self.assertRaisesRegex(RuntimeError, "native boundary reached"):
+            capture_native_package(
+                package, self.root / "preflight-output", expected_inputs=before,
+                handoff_sha256=digest(native_files), backend=object(),
+            )
+        self.assertEqual(native_boundary.call_args.args[0]["assembly"], str((package / main_assembly).resolve()))
+        self.assertFalse(native_boundary.call_args.args[0]["assembly"].startswith("\\\\?\\"))
+        self.assertEqual(package_inventory(package), before)
+        (physical / "cad/~$arm.SLDPRT").write_bytes(b"transient native lock")
+        self.assertEqual(package_inventory(package), before)
+
     def test_extra_missing_duplicate_and_noncanonical_members_are_refused(self) -> None:
         cases = {
             "extra": {**DATA, "extra.SLDPRT": b"extra"},

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ...io import inventory
+from ...io import _physical_path, inventory
 
 NATIVE_SUFFIXES = {".sldasm", ".sldprt"}
 
@@ -12,6 +12,7 @@ NATIVE_SUFFIXES = {".sldasm", ".sldprt"}
 def package_inventory(package: Path) -> dict[str, str]:
     """Native document lock files are transient, never part of a handoff."""
 
+    package = Path(_physical_path(package))
     ignored = tuple(
         p.relative_to(package).as_posix()
         for p in package.rglob("~$*")

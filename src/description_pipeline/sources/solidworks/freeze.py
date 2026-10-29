@@ -836,7 +836,7 @@ def _capture_prepared_local(
     cfg = validate_source_config(config)
     package = Path(package).resolve()
     prepared_root = Path(prepared_root).resolve()
-    if not prepared_root.is_dir():
+    if not Path(_physical_path(prepared_root)).is_dir():
         raise BridgeError(
             "sealed_capture_incomplete",
             "the archived prepared CAD source is unavailable",
