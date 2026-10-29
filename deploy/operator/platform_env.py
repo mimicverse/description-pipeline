@@ -159,7 +159,7 @@ def derive(
     release: dict,
     wheel: Path | None = None,
 ) -> dict:
-    """Return ``{env, env_path, derived_dir, wheel}`` for one install generation.
+    """Derive the environment and exact file payloads without changing the installation.
 
     ``snapshot_bytes`` are the exact bytes of the config snapshot document - the same bytes
     the isolated validator consumes, so nothing is re-serialized between the parse here and
@@ -291,22 +291,44 @@ def derive(
     # - the libpq DSNs' "&" and "?" above all - are single-quoted so that a shell `source`
     # and the KEY=VALUE parser read the identical bytes.
     lines = encode_env_lines(env.items())
-    atomic_write_once(repositories_file, contract.canonical(repositories))
-    atomic_write_once(targets_file, contract.canonical(targets))
-    atomic_write_once(discovery_file, contract.canonical(discovery))
-    atomic_write_once(env_path, ("\n".join(lines) + "\n").encode("utf-8"))
-    return {"env": env, "env_path": env_path, "derived_dir": derived_dir, "wheel": wheel_path}
+    return {
+        "env": env,
+        "env_path": env_path,
+        "derived_dir": derived_dir,
+        "wheel": wheel_path,
+        "files": {
+            repositories_file: contract.canonical(repositories),
+            targets_file: contract.canonical(targets),
+            discovery_file: contract.canonical(discovery),
+            env_path: ("\n".join(lines) + "\n").encode("utf-8"),
+        },
+    }
+
+
+def emit(result: dict) -> None:
+    """Persist the validated derivation with the generation's write-once contract."""
+
+    for path, payload in result["files"].items():
+        atomic_write_once(path, payload)
+
+
+def verify(result: dict) -> None:
+    """Read and compare every installed payload with the snapshot-derived bytes."""
+
+    for path, payload in result["files"].items():
+        require(path.is_file() and not path.is_symlink(), f"the derived file is missing or a link: {path}")
+        require(path.read_bytes() == payload, f"the derived file differs from its snapshot: {path}")
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="platform_env.py", description=__doc__.splitlines()[0])
     subparsers = parser.add_subparsers(dest="action", required=True)
-    emit = subparsers.add_parser("emit")
-    emit.add_argument("--snapshot", type=Path, required=True)
-    emit.add_argument("--install-id", required=True)
-    emit.add_argument("--tree", type=Path, required=True, help="deployment tree root")
-    emit.add_argument("--release-file", type=Path, required=True)
-    emit.add_argument("--wheel", type=Path, default=None)
+    emit_parser = subparsers.add_parser("emit")
+    emit_parser.add_argument("--snapshot", type=Path, required=True)
+    emit_parser.add_argument("--install-id", required=True)
+    emit_parser.add_argument("--tree", type=Path, required=True, help="deployment tree root")
+    emit_parser.add_argument("--release-file", type=Path, required=True)
+    emit_parser.add_argument("--wheel", type=Path, default=None)
     args = parser.parse_args(argv)
 
     require(args.snapshot.is_file(), f"snapshot not found: {args.snapshot}")
@@ -327,6 +349,7 @@ def main(argv: list[str] | None = None) -> int:
         release=release,
         wheel=args.wheel,
     )
+    emit(result)
     print(f"env={result['env_path']}")
     print(f"derived={result['derived_dir']}")
     print(f"wheel={result['wheel']}")

@@ -11,6 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 CONTROL = ROOT / "deploy" / "operator" / "operatorctl.sh"
+ENVIRONMENT = ROOT / "deploy" / "operator" / "environment.sh"
 PUBLIC_VERBS = {
     "validate",
     "install",
@@ -134,6 +135,45 @@ class OperatorctlSurfaceTests(unittest.TestCase):
             result = run(["validate", "--config", "/nonexistent/platform.json"], control_python=str(wrapper))
             self.assertEqual(result.returncode, 1)
             self.assertFalse(marker.exists())
+
+    def test_environment_library_prevents_imports_from_mutating_the_release(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            operator = Path(temporary) / "operator"
+            operator.mkdir()
+            (operator / "environment.sh").write_bytes(ENVIRONMENT.read_bytes())
+            (operator / "render_operator.py").write_text(
+                "from pathlib import Path\n"
+                "\n"
+                "def read_env(path):\n"
+                '    key, value = Path(path).read_text(encoding="utf-8").strip().split("=", 1)\n'
+                "    return {key: value}\n",
+                encoding="utf-8",
+            )
+            env_file = Path(temporary) / "operator.env"
+            env_file.write_text("PROBE=present\n", encoding="utf-8")
+            environment = {
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "HOME": str(Path.home()),
+            }
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    'set -euo pipefail; HERE="$1"; CONTROL_PYTHON="$2"; '
+                    'source "$HERE/environment.sh"; load_env_file "$3" PROBE; '
+                    'test "$PROBE" = present; test ! -e "$HERE/__pycache__"',
+                    "bash",
+                    str(operator),
+                    sys.executable,
+                    str(env_file),
+                ],
+                cwd=ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_reconcile_keeps_only_current_business_effect_inputs(self) -> None:
         source = CONTROL.read_text(encoding="utf-8")

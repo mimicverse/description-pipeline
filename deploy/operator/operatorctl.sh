@@ -11,7 +11,6 @@
 #
 # There is no upgrade, rollback, source-generation or previous-package operation.
 set -euo pipefail
-export PYTHONDONTWRITEBYTECODE=1
 CONTROL_PYTHON="${CONTROL_PYTHON:-python3}"
 if ! "$CONTROL_PYTHON" -I -B -c \
     'import sys; raise SystemExit(0 if sys.implementation.name == "cpython" and sys.version_info[:2] == (3, 12) else 1)' \
