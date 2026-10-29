@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import struct
+import sys
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -1017,10 +1018,29 @@ class FixtureCadBackend(CadBackend):
         self.session_pid = 100
 
     @contextmanager
-    def session(self):
+    def session(self, *, resource_settlement=None):
         """Provide the native lifetime boundary for the in-memory fixture."""
 
-        yield self
+        if resource_settlement is not None:
+            resource_settlement.update(settled=False, reason="fixture_native_session_active")
+        try:
+            yield self
+        finally:
+            pending = sys.exception()
+            try:
+                self.release()
+            except Exception as error:
+                if resource_settlement is not None:
+                    resource_settlement.update(
+                        settled=False, reason="fixture_native_cleanup_failed",
+                        cleanup_error={"message": str(error)},
+                    )
+                if pending is None:
+                    raise
+                pending.add_note(f"CAD cleanup also failed: {error}")
+            else:
+                if resource_settlement is not None:
+                    resource_settlement.update(settled=True, reason="fixture_native_sessions_released")
 
     def health(self) -> dict[str, Any]:
         return {

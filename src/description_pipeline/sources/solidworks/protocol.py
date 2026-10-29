@@ -86,7 +86,7 @@ class CadBackend:
 
     name = "abstract"
 
-    def session(self):
+    def session(self, *, resource_settlement=None):
         """Own the capture session and its COM lifetime."""
 
         raise NotImplementedError

@@ -1094,10 +1094,11 @@ def capture_prepared(
     worker_version: str,
     expected_session_sources: Mapping[str, str] | None = None,
     on_activity=None,
+    resource_settlement: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Capture one sealed prepared package through the single production path."""
 
-    with backend.session():
+    with backend.session(resource_settlement=resource_settlement):
         return _capture_prepared_local(
             config,
             destination,

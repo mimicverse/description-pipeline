@@ -2812,7 +2812,7 @@ class CaptureHandlerTests(unittest.TestCase):
             )
         self.assertEqual(operation.call_count, 1)
         self.assertEqual(effects.authorized[0][0], "capture-native")
-        self.assertEqual(effects.observed[0][0], "timeout")
+        self.assertEqual(effects.observed[0][0], "response")
         self.assertEqual(effects.observed[1][0], "unobservable")
 
     def test_native_failure_without_resource_settlement_stays_unknown(self) -> None:

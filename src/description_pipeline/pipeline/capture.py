@@ -1025,7 +1025,7 @@ def _failed_capture(
     event,
     error,
     *,
-    native_session_entered: bool,
+    resource_boundary: Mapping[str, Any],
 ):
     phase = receipt.get("stage") or "capture"
     if not receipt.get("events") or receipt["events"][-1]["state"] != "failed":
@@ -1033,11 +1033,13 @@ def _failed_capture(
             event({"stage": phase, "state": "failed"})
     receipt.update(passed=False, state="failed", stage=phase, error=str(error))
     receipt["native_complete"] = False
-    if not native_session_entered:
-        receipt["resource_settlement"] = {
+    receipt["resource_settlement"] = (
+        {key: value for key, value in resource_boundary.items() if key != "entered"}
+        if resource_boundary["entered"] else {
             "settled": True,
             "reason": "rejected_before_native_session",
         }
+    )
     if hasattr(error, "code"):
         receipt["error_code"] = error.code
     detail = getattr(error, "detail", None) or getattr(error, "details", None)
@@ -1149,7 +1151,7 @@ def _capture_native_transaction(
             handoff_sha256=handoff_sha256,
         )
         event = _capture_event_sink(receipt, on_event)
-        resource_boundary = {"entered": False}
+        resource_boundary = {"entered": False, "settled": False}
         try:
             validate_request_record(request_evidence)
             request_path = staging / "input/request.json"
@@ -1167,6 +1169,8 @@ def _capture_native_transaction(
                 handoff_sha256=handoff_sha256,
                 resource_boundary=resource_boundary,
             )
+            if resource_boundary.get("settled") is not True:
+                raise CaptureUnresolved("capture.native_resources_unknown")
             tool = native_tool_factory()
             return _seal_native_capture_artifact(
                 staging,
@@ -1187,7 +1191,7 @@ def _capture_native_transaction(
                 receipt,
                 event,
                 error,
-                native_session_entered=resource_boundary["entered"],
+                resource_boundary=resource_boundary,
             )
 
 
@@ -1247,7 +1251,7 @@ def _invoke_native_operation(
             Path(result["diagnostic_path"]),
             None,
             result,
-            False,
+            result.get("resource_settlement", {}).get("settled") is True,
             reason,
         )
     return NativeCaptureResult("unknown", None, None, result, False, "capture.native_unknown")
@@ -1745,7 +1749,7 @@ class CaptureHandler:
             timeout_root = workspace.root / "capture-effect-unknown"
             timeout_root.mkdir(parents=True, exist_ok=False)
             write_json(timeout_root / "native-result.json", dict(native.receipt))
-            effects.record_timeout(effect_id, source="capture-handler", detail_root=timeout_root)
+            effects.record_response(effect_id, source="capture-handler", response_root=timeout_root)
             effects.record_observation(
                 effect_id,
                 source="capture-handler",
@@ -1779,6 +1783,10 @@ class CaptureHandler:
                     "reason_code": native.reason_code,
                 }
             )
+            native_failure = native.receipt.get("failure")
+            native_failure = native_failure if isinstance(native_failure, Mapping) else {}
+            failure_detail = native_failure.get("detail", native.receipt.get("detail"))
+            failure_message = native_failure.get("message") or native.receipt.get("error")
             return StageExecution(
                 outcome=native.outcome,
                 candidate_root=str(native.output),
@@ -1786,8 +1794,9 @@ class CaptureHandler:
                 resources_settled=native.resources_settled,
                 failure=StageFailure(
                     native.reason_code or "capture.native_failed",
-                    f"Native Capture ended with {native.outcome}",
+                    str(failure_message or f"Native Capture ended with {native.outcome}"),
                     outcome=native.outcome,
+                    detail=(dict(failure_detail) if isinstance(failure_detail, Mapping) else None),
                     retained_locations=(str(native.output),),
                 ),
             )
