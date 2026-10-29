@@ -73,7 +73,7 @@ from ..io import PipelineError, canonical_json_value, digest
 from ..interface_records import REQUEST_PURPOSES
 from ..delivery import PIPELINE_ID, SUBJECT_DIRECTORIES, SUBJECT_FILES
 from ..platform.queries import read_run_projection
-from ..schemas import RUN_ACTIVITY_SCHEMA
+from ..schemas import PUBLICATION_RECEIPT_SCHEMA, RUN_ACTIVITY_SCHEMA
 from ..pipeline.contracts import ArtifactRef, StageStatus
 from ..pipeline.dispatch import DispatchObservation
 from ..pipeline.effects import EffectState
@@ -2909,6 +2909,18 @@ class PortalApp:
             publication = _parse_registered_json(
                 self._registered_member_bytes("publication-receipt.json", publish_member)
             )
+            publish_row = stages.get("publish") or {}
+            publish_command = publish_row.get("command") or {}
+            if (
+                digest(publication) != (publish_row.get("receipt") or {}).get("checks_sha256")
+                or publication.get("schema_version") != PUBLICATION_RECEIPT_SCHEMA
+                or not isinstance(publish_command.get("command_id"), str)
+                or not isinstance(publish_command.get("request_digest"), str)
+                or publication.get("command_id") != publish_command["command_id"]
+                or publication.get("request_digest") != publish_command["request_digest"]
+                or publication.get("run_id") != projection.get("run_id")
+            ):
+                raise PortalError(HTTPStatus.BAD_GATEWAY, "Publication receipt differs from its canonical stage result")
         publication = publication if isinstance(publication, dict) else {}
         pr_observation = (
             (publication.get("pr_effect") or {}).get("observation")

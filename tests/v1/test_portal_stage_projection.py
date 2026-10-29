@@ -10,6 +10,7 @@ from description_pipeline.orchestration.portal import PortalApp, PortalError, _a
 from description_pipeline.io import digest
 from description_pipeline.orchestration.report_view import build_report
 from description_pipeline.stages import CONTRACT, stage_view
+from description_pipeline.schemas import PUBLICATION_RECEIPT_SCHEMA
 from tests.v1.protocol_support import protocol_events
 from tests.v1.protocol_support import native_discovery_record
 from tests.v1.portal_read_support import RegisteredProjectionArtifacts
@@ -32,17 +33,20 @@ class RegisteredStageProjectionTests(unittest.TestCase):
     def test_display_uses_only_certificate_and_publication_artifact(self) -> None:
         certificate = {"decision": "FAIL", "passed": False, "subject_sha256": SUBJECT,
                        "checks": [], "diagnostics": []}
-        publication = {"publication_subject_sha256": SUBJECT, "repository": "actual/repo",
+        publication = {"schema_version": PUBLICATION_RECEIPT_SCHEMA, "run_id": RUN_ID,
+                       "command_id": "publish-command", "request_digest": SUBJECT,
+                       "publication_subject_sha256": SUBJECT, "repository": "actual/repo",
                        "base_ref": "main", "branch_ref": "work/current", "candidate_parents": ["parent"],
                        "pr_effect": {"observation": {"url": "https://github.com/actual/repo/pull/1",
                                                       "head_oid": "b" * 40, "number": 1}}}
         projection = {
-            "state": "succeeded", "request": {},
+            "run_id": RUN_ID, "state": "succeeded", "request": {},
             "stages": {
                 "verify": {"formal_eligible": True, "qualification": {
                     "formal_eligible": True, "scope_kind": "formal", "outcome": "completed"},
                     "receipt": {"quality": {"passed": True, "checks": [{"id": "stale"}]}}},
-                "publish": {"receipt": {"submission": {
+                "publish": {"command": {"command_id": "publish-command", "request_digest": SUBJECT},
+                            "receipt": {"checks_sha256": digest(publication), "submission": {
                     "passed": True, "state": "published", "subject_sha256": SUBJECT,
                     "url": "https://github.com/stale/repo/pull/2"}}},
             },
@@ -228,6 +232,28 @@ class RegisteredStageProjectionTests(unittest.TestCase):
         projection["stages"]["verify"]["receipt"]["checks_sha256"] = "0" * 64
         with self.assertRaisesRegex(PortalError, "differs from its stage result"):
             self.application._fact_display_job(projection)
+
+    def test_publication_must_match_canonical_digest_and_command_identity(self) -> None:
+        for mismatch in ("digest", "schema", "command_id", "request_digest", "run_id"):
+            with self.subTest(mismatch=mismatch):
+                projection = self.projection({"publish": "completed"})
+                command = projection["stages"]["publish"]["command"]
+                publication = {
+                    "schema_version": PUBLICATION_RECEIPT_SCHEMA, "run_id": RUN_ID,
+                    "command_id": command["command_id"], "request_digest": command["request_digest"],
+                }
+                if mismatch == "schema":
+                    publication = {}
+                elif mismatch != "digest":
+                    publication[mismatch] = "another-identity"
+                projection["by_stage"]["publish"] = self.stage_members(
+                    "publish", {"publication-receipt.json": json.dumps(publication).encode()},
+                )
+                projection["stages"]["publish"]["receipt"]["checks_sha256"] = (
+                    "0" * 64 if mismatch == "digest" else digest(publication)
+                )
+                with self.assertRaisesRegex(PortalError, "differs from its canonical stage result"):
+                    self.application._fact_display_job(projection)
 
 
 if __name__ == "__main__":

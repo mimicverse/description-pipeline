@@ -56,6 +56,7 @@ from description_pipeline.schemas import (
     AIRFLOW_DISPATCH_CONF_SCHEMA,
     NATIVE_DISCOVERY_SCHEMA,
     NATIVE_DISCOVERY_FINDING_SCHEMA,
+    PUBLICATION_RECEIPT_SCHEMA,
     VERIFICATION_CERTIFICATE_SCHEMA,
     VERIFY_REQUEST_SCHEMA,
 )
@@ -947,9 +948,14 @@ class FakeRunControl:
                 result = (entry.get("merged") or {}).get("result") or {}
                 submission = result.get("submission") if isinstance(result, dict) else None
                 if isinstance(submission, dict):
+                    publish_command, _checks = registered_check_fixture(run_id, stage)
                     selected["publication-receipt.json"] = (
                         json.dumps(
                             {
+                                "schema_version": PUBLICATION_RECEIPT_SCHEMA,
+                                "command_id": publish_command["command_id"],
+                                "request_digest": publish_command["request_digest"],
+                                "run_id": run_id,
                                 "base_ref": submission.get("base"),
                                 "branch_ref": submission.get("branch"),
                                 "candidate_parents": ["0" * 40],
@@ -995,6 +1001,9 @@ class FakeRunControl:
                 checks_sha256 = digest(checks)
             elif stage == "verify" and "verification-certificate.json" in selected:
                 checks_sha256 = digest(json.loads(selected["verification-certificate.json"]))
+            elif stage == "publish" and "publication-receipt.json" in selected:
+                command, _checks = registered_check_fixture(run_id, stage)
+                checks_sha256 = digest(json.loads(selected["publication-receipt.json"]))
             discovery_path = "prepared/discovery/native-discovery.json"
             if stage == "discover" and "input/discovery/native-discovery.json" in current:
                 selected[discovery_path] = bytes(current["input/discovery/native-discovery.json"])
