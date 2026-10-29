@@ -20,6 +20,7 @@ from .delivery import PIPELINE_ID, TRANSFER_FILES, CAPTURE_MANIFEST
 from .interface_records import record_archive_path, validate_source_record
 from .io import (
     PipelineError,
+    _physical_path,
     artifact_path_parts,
     confined,
     digest,
@@ -1227,7 +1228,7 @@ def capture_manifest(
     files = {name: checksum for name, checksum in files.items() if name not in ignored}
     _require(files, "Capture root contains no files to seal")
     _require(len(files) <= MAX_TRANSFER_FILES, "Capture exceeds the transfer file limit")
-    total_bytes = sum(confined(root, name).stat().st_size for name in files)
+    total_bytes = sum(Path(_physical_path(confined(root, name))).stat().st_size for name in files)
     _require(total_bytes <= MAX_TRANSFER_BYTES, "Capture exceeds the transfer size limit")
     stray = sorted(name for name in files if not _allowed_payload(name))
     _require(not stray, f"Capture contains files outside the transfer payload: {stray[:5]}")

@@ -34,6 +34,16 @@ from .protocol_support import native_discovery_record, protocol_events
 from .source_record_support import source_record
 
 
+def registered_check_fixture(run_id: str, stage: str) -> tuple[dict, dict]:
+    """Declare a read-port fixture's check record, without claiming a domain execution."""
+
+    command = {"command_id": f"fixture:{run_id}:{stage}",
+               "request_digest": digest({"fixture_run": run_id, "stage": stage}), "input_artifacts": []}
+    checks = {"command_id": command["command_id"], "request_digest": command["request_digest"],
+              "checks": [{"id": "fixture.recorded_boundary", "state": "passed", "details": {}}]}
+    return command, checks
+
+
 def build_sealed_delivery(
     root: Path,
     *,
@@ -543,6 +553,13 @@ class RegisteredPlatform:
                 if tree is not None and tree.is_dir()
                 else {}
             )
+            command = None
+            if stage in {"freeze", "discover"}:
+                command, checks = registered_check_fixture(run_id, stage)
+                selected["checks.json"] = json.dumps(checks).encode()
+                receipt = {**receipt, "checks_sha256": digest(checks)}
+            if stage == "discover" and "input/discovery/native-discovery.json" in selected:
+                selected["prepared/discovery/native-discovery.json"] = selected["input/discovery/native-discovery.json"]
             if stage == "verify" and selected:
                 selected = self._bind_projection_verify(
                     run_id,
@@ -567,7 +584,6 @@ class RegisteredPlatform:
             by_stage[stage] = stage_members
             members.update(stage_members)
             outcome = row.get("state")
-            command = None
             if stage == "verify" and "verification-certificate.json" in selected:
                 pair = self._verify_pair_refs(run_id, selected)
                 command = {
@@ -595,6 +611,7 @@ class RegisteredPlatform:
                         if key not in {"source_run", "source_stage"}
                     },
                     "stage": stage,
+                    "receipt": receipt,
                     "command": command,
                     "decision": {
                         "command_id": (command or {}).get(

@@ -75,6 +75,21 @@ class SavedStatePipelineTests(unittest.TestCase):
         self.assertIn("WARNING source.saved_state_incomplete", urdf)
         self.assertIn("hidden_or_auto_suppressed_objects_unknown", urdf)
 
+    def test_saved_state_discovery_findings_are_readable_by_the_registered_report(self) -> None:
+        from description_pipeline.orchestration.report_view import registered_discovery_record
+        from description_pipeline.schemas import NATIVE_DISCOVERY_FINDING_SCHEMA
+
+        capture, _native = self.fixture._prepare_and_capture(incomplete_saved_state=True)
+        record = read_data(capture / "input/discovery/native-discovery.json")
+        validated = registered_discovery_record(record)
+        finding = next(item for item in validated["findings"] if item["code"] == "source.saved_state_incomplete")
+        warning = warning_from_selection(record["raw"]["source_selection"])
+        self.assertEqual(finding["schema_version"], NATIVE_DISCOVERY_FINDING_SCHEMA)
+        self.assertEqual(finding["object"], warning["objects"][0]["object"])
+        self.assertEqual(finding["detail"], warning["detail"])
+        self.assertEqual(finding["message"], warning["message"])
+        self.assertFalse(finding["blocking"])
+
     def test_missing_drive_defaults_reach_actual_urdf_and_independent_verify(self) -> None:
         from tests.v1.test_pipeline_verify import PipelineVerifyHandlerTests
 

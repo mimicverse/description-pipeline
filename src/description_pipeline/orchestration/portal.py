@@ -2177,9 +2177,8 @@ class PortalApp:
         # The purpose authority of both pages is the registered freeze request: a
         # mutable conf echo never decides the display, and an unfinished
         # registration reads as "not recorded".
-        stage_job = self._registered_stage_job(job, projection)
-        stage_view_payload = stage_view(stage_job)
-        display_job = None if stage_job is None else {**stage_job, "status": (job or {}).get("status")}
+        stage_view_payload = self._registered_stage_view(job, projection)
+        display_job = job
         try:
             report = build_report(display_job or {}, view=stage_view_payload)
         except PipelineError as error:
@@ -2841,7 +2840,9 @@ class PortalApp:
             failure = failed_receipt
         failure = failure if isinstance(failure, dict) else {}
         failure_message = failure.get("error_message") or failure.get("error")
-        failure_code = failure.get("reason_code") or failure.get("error_code")
+        failure_code = failure.get("reason_code") or failure.get("error_code") or (
+            (failed.get("decision") or {}).get("reason_code") if isinstance(failed, dict) else None
+        )
         failure_detail = failure.get("error_detail") or failure.get("detail")
         failure_diagnostic_path = (
             failure.get("diagnostic_path") or failed_receipt.get("diagnostic_path")
@@ -2852,6 +2853,23 @@ class PortalApp:
         )
         by_stage = projection.get("by_stage")
         by_stage = by_stage if isinstance(by_stage, dict) else {}
+        native_failure_member = (by_stage.get(failed.get("stage")) or {}).get("native-result.json") if failed else None
+        if not failure_message and isinstance(native_failure_member, dict):
+            native_result = _parse_registered_json(
+                self._registered_member_bytes("native-result.json", native_failure_member)
+            )
+            native_failure = native_result.get("failure")
+            if (
+                not isinstance(native_failure, dict)
+                or native_result.get("kind") != failed.get("stage")
+                or native_result.get("state") != failed.get("state")
+                or native_failure.get("code") != failure_code
+                or not isinstance(native_failure.get("message"), str)
+                or not native_failure["message"]
+            ):
+                raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered native failure conflicts with its stage decision")
+            failure_message = native_failure["message"]
+            failure_detail = native_result
         verify_row = stages.get("verify")
         verify_row = verify_row if isinstance(verify_row, dict) else {}
         qualification = verify_row.get("qualification")
@@ -3042,23 +3060,20 @@ class PortalApp:
         self,
         projection: dict,
     ) -> dict | None:
-        """Read the registered Capture input's native discovery record for display."""
+        """Read discovery facts from their original sealed Discover output."""
 
         by_stage = projection.get("by_stage")
-        capture = by_stage.get("capture") if isinstance(by_stage, dict) else None
-        if not isinstance(capture, dict):
+        discover = by_stage.get("discover") if isinstance(by_stage, dict) else None
+        if not isinstance(discover, dict):
             return None
-        member = capture.get("input/discovery/native-discovery.json")
+        path = "prepared/discovery/native-discovery.json"
+        member = discover.get(path)
         if not isinstance(member, dict):
             return None
         try:
-            self._registered_stage_artifact(capture, stage="capture")
-            discover = by_stage.get("discover")
-            if not isinstance(discover, dict) or not discover:
-                raise PipelineError("Registered discovery record has no Discover artifact")
             source = self._registered_stage_artifact(discover, stage="discover")
             data = self._registered_member_bytes(
-                "input/discovery/native-discovery.json",
+                path,
                 member,
             )
             record = registered_discovery_record(
@@ -3083,225 +3098,125 @@ class PortalApp:
             "discovery_sha256": hashlib.sha256(data).hexdigest(),
         }
 
-    def _registered_stage_job(self, job: dict | None, projection: dict | None) -> dict | None:
-        """A display snapshot whose stage states come from registered rows.
+    def _registered_stage_view(self, job: dict | None, projection: dict | None) -> dict:
+        """Project committed stage decisions and their sealed evidence without re-deciding outcomes."""
 
-        A completed platform row can arrive as a bare live event after its check
-        observations have already been sealed. Rebuild each registered stage from
-        the authoritative row state and its receipt-bound report, then pass the
-        result through the unchanged fail-closed ``stage_view``. Unregistered
-        stages retain their live observations so in-progress runs remain visible.
-        """
-
-        if not isinstance(job, dict) or not isinstance(projection, dict):
-            return job
-        stages = projection.get("stages")
-        if not isinstance(stages, dict) or not stages:
-            return job
+        view = stage_view()
+        if not isinstance(projection, dict):
+            return view
+        job = job if isinstance(job, dict) else {}
         run_id = projection.get("run_id")
         if not isinstance(run_id, str) or not run_id:
-            run_id = job.get("run_id")
-        if not isinstance(run_id, str) or not run_id:
-            return job
-        parent_run_id = projection.get("parent_run_id")
-        by_stage = projection.get("by_stage")
-        by_stage = by_stage if isinstance(by_stage, dict) else {}
-        original_events = job.get("events") if isinstance(job.get("events"), list) else []
-        events: list[dict] = []
-        for definition in CONTRACT["stages"]:
-            stage_id = definition["id"]
-            row = stages.get(stage_id)
-            if not isinstance(row, dict):
-                events.extend(
-                    event
-                    for event in original_events
-                    if isinstance(event, dict) and event.get("stage") == stage_id
-                )
-                continue
-            original_stage_events = [
-                event for event in original_events if isinstance(event, dict) and event.get("stage") == stage_id
-            ]
-            stage_members = by_stage.get(stage_id)
-            reuse = None
-            if isinstance(stage_members, dict) and stage_members:
-                artifact = self._registered_stage_artifact(
-                    stage_members,
-                    stage=stage_id,
-                )
-                if artifact.producer_run_id != run_id:
-                    if (
-                        not isinstance(parent_run_id, str)
-                        or artifact.producer_run_id != parent_run_id
-                    ):
-                        raise PortalError(
-                            HTTPStatus.BAD_GATEWAY,
-                            "Registered stage artifact has no proven parent run",
-                        )
-                    reuse = {
-                        "parent_run": parent_run_id,
-                        "reused": True,
-                        "source_run": artifact.producer_run_id,
-                    }
-            report = (
-                self._registered_stage_report(projection, stage=stage_id)
-                if row.get("state") != "waiting"
-                else None
-            )
-            reported = None
-            if isinstance(report, dict):
-                rows = report.get("stages")
-                if (
-                    not isinstance(rows, list)
-                    or any(not isinstance(item, dict) for item in rows)
-                    or [item.get("id") for item in rows] != [item["id"] for item in CONTRACT["stages"]]
-                    or len(rows) != len(CONTRACT["stages"])
-                ):
-                    raise PortalError(
-                        HTTPStatus.BAD_GATEWAY,
-                        "Registered stage report check inventory is malformed",
-                    )
-                reported = next(item for item in rows if item.get("id") == stage_id)
-            observed_at = {
-                (
-                    (event.get("check") or {}).get("boundary"),
-                    (event.get("check") or {}).get("id"),
-                ): event.get("at")
-                for event in original_stage_events
-                if isinstance(event.get("check"), dict)
-                and isinstance(event.get("at"), str)
-                and event.get("at")
-            }
-            expected_boundaries = {
-                boundary: [item["id"] for item in definition[f"{boundary}_qc"]]
-                for boundary in ("input", "output")
-            }
-            for event in original_stage_events:
-                check = event.get("check")
-                if not isinstance(check, dict):
-                    continue
-                boundary = check.get("boundary")
-                identifier = check.get("id")
-                if boundary not in expected_boundaries or identifier not in expected_boundaries[boundary]:
-                    continue
-                if check.get("state") not in {"passed", "failed"} or not isinstance(
-                    check.get("details"),
-                    dict,
-                ):
-                    raise PortalError(
-                        HTTPStatus.BAD_GATEWAY,
-                        "Registered stage check observation is malformed",
-                    )
-            if isinstance(reported, dict):
-                for boundary in ("input", "output"):
-                    rows = reported.get(f"{boundary}_qc")
-                    expected = [item["id"] for item in definition[f"{boundary}_qc"]]
-                    if rows is None:
-                        continue
-                    if (
-                        not isinstance(rows, list)
-                        or any(not isinstance(item, dict) for item in rows)
-                        or [item.get("id") for item in rows] != expected
-                    ):
-                        raise PortalError(
-                            HTTPStatus.BAD_GATEWAY,
-                            "Registered stage report check inventory is malformed",
-                        )
-                    for item in rows:
-                        check_state = item.get("state")
-                        details = item.get("details")
-                        if check_state not in {"passed", "failed"}:
-                            continue
-                        if not isinstance(details, dict):
-                            raise PortalError(
-                                HTTPStatus.BAD_GATEWAY,
-                                "Registered stage report check details are malformed",
-                            )
-                        events.append(
-                            {
-                                "stage": stage_id,
-                                "state": "running",
-                                **(
-                                    {"at": observed_at[(boundary, item["id"])]}
-                                    if (boundary, item["id"]) in observed_at
-                                    else {}
-                                ),
-                                **({"reuse": reuse} if reuse is not None else {}),
-                                "check": {
-                                    "id": item["id"],
-                                    "boundary": boundary,
-                                    "state": check_state,
-                                    "details": details,
-                                },
-                            }
-                        )
-            else:
-                for event in original_stage_events:
-                    check = event.get("check")
-                    if not isinstance(check, dict):
-                        continue
-                    boundary = check.get("boundary")
-                    identifier = check.get("id")
-                    if boundary not in expected_boundaries or identifier not in expected_boundaries[boundary]:
-                        continue
-                    events.append(
-                        {
-                            "stage": stage_id,
-                            "state": "running",
-                            **({"at": event["at"]} if isinstance(event.get("at"), str) else {}),
-                            **({"reuse": reuse} if reuse is not None else {}),
-                            "check": {
-                                "id": identifier,
-                                "boundary": boundary,
-                                "state": check["state"],
-                                "details": check["details"],
-                            },
-                        }
-                    )
-            platform_state = row.get("state")
+            raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered run identity is missing")
+        result = job.get("result") or {}
+        view.update(run_id=run_id, subject_sha256=result.get("subject_sha256"))
+        stages = projection.get("stages") or {}
+        by_stage = projection.get("by_stage") or {}
+        for stage in view["stages"]:
+            stage_id = stage["id"]
+            row = stages.get(stage_id) or {}
+            state = stage_display_state(row.get("state", "waiting"))
             at = row.get("updated_at") or row.get("original_executed_at")
             if hasattr(at, "isoformat"):
                 at = at.isoformat()
-            if not isinstance(at, str) or not at:
-                at = next(
-                    (
-                        event.get("at")
-                        for event in reversed(original_stage_events)
-                        if isinstance(event.get("at"), str) and event.get("at")
-                    ),
-                    None,
-                )
-            events.append(
-                {
-                    "stage": stage_id,
-                    "state": stage_display_state(platform_state),
-                    **({"at": at} if at is not None else {}),
-                    **({"reuse": reuse} if reuse is not None else {}),
-                }
+            stage.update(
+                state=state, at=at, in_scope=row.get("in_scope") is not False,
+                input_qc=[], output_qc=[], inputs=[], outputs=[], findings=[],
             )
-        display = dict(job)
-        display["events"] = events
-        capture_members = by_stage.get("capture")
-        if isinstance(capture_members, dict) and "input/handoff.json" in capture_members:
-            handoff = _parse_registered_json(self._registered_member_bytes(
-                "input/handoff.json", capture_members["input/handoff.json"]
-            ))
-            try:
-                warnings = registered_handoff_warnings(handoff.get("warnings"))
-            except PipelineError as error:
-                raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
-            for event in events:
-                check = event.get("check")
-                if event["stage"] == "capture" and isinstance(check, dict) and check.get("id") == "input.valid":
-                    check["details"] = {**check["details"], "warnings": warnings}
+            command = row.get("command") or {}
+            stage["inputs"] = [{
+                "path": artifact["locator"], "label": artifact["kind"], "availability": "recorded",
+            } for artifact in command.get("input_artifacts", [])]
+            members = by_stage.get(stage_id) or {}
+            if members:
+                artifact = self._registered_stage_artifact(members, stage=stage_id)
+                if artifact.producer_run_id != run_id:
+                    parent = projection.get("parent_run_id")
+                    if not parent or artifact.producer_run_id != parent:
+                        raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered stage artifact has no proven parent run")
+                    stage["reuse"] = {"parent_run": parent, "source_run": parent, "reused": True}
+                stage["outputs"] = [{
+                    "path": ".", "label": "Sealed stage output", "availability": "recorded",
+                    "files": {name: member["sha256"] for name, member in members.items()},
+                }]
+            if state == "completed" and not members:
+                raise PortalError(HTTPStatus.BAD_GATEWAY, f"Registered {stage_id} output evidence is missing")
+            if stage_id in {"freeze", "discover"} and members:
+                member = members.get("checks.json")
+                if not isinstance(member, dict):
+                    raise PortalError(HTTPStatus.BAD_GATEWAY, f"Registered {stage_id} checks are missing")
+                checks = _parse_registered_json(self._registered_member_bytes("checks.json", member))
+                receipt = row.get("receipt") or {}
+                if (
+                    not isinstance(command.get("command_id"), str)
+                    or not isinstance(command.get("request_digest"), str)
+                    or checks.get("command_id") != command.get("command_id")
+                    or checks.get("request_digest") != command.get("request_digest")
+                    or digest(checks) != receipt.get("checks_sha256")
+                ):
+                    raise PortalError(HTTPStatus.BAD_GATEWAY, f"Registered {stage_id} checks conflict with its result")
+                recorded = checks.get("checks")
+                if not isinstance(recorded, list) or not recorded:
+                    raise PortalError(HTTPStatus.BAD_GATEWAY, f"Registered {stage_id} check inventory is malformed")
+                identifiers = set()
+                for check in recorded:
+                    if (
+                        not isinstance(check, dict) or not isinstance(check.get("id"), str)
+                        or not check["id"] or check["id"] in identifiers
+                        or check.get("state") not in {"passed", "failed"}
+                        or not isinstance(check.get("details"), dict)
+                    ):
+                        raise PortalError(
+                            HTTPStatus.BAD_GATEWAY, f"Registered {stage_id} check observation is malformed"
+                        )
+                    identifiers.add(check["id"])
+                    stage["output_qc"].append({**check, "boundary": "stage"})
+                if stage_id == "freeze":
+                    inventory_check = next((item for item in recorded if item["id"] == "handoff.integrity"), {})
+                    files = (inventory_check.get("details") or {}).get("files")
+                    if isinstance(files, dict):
+                        stage["input_inventory_count"] = len(files)
+                        view["handoff_sha256"] = (inventory_check.get("details") or {}).get("handoff_sha256")
+            elif stage_id == "capture" and state == "completed":
+                # The native report remains detailed Capture evidence, never a stage-state authority.
+                report = self._registered_stage_report(projection, stage=stage_id)
+                if not isinstance(report, dict):
+                    raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered native Capture observations are missing")
+                captured = next((item for item in report.get("stages", []) if item.get("id") == stage_id), None)
+                if not isinstance(captured, dict):
+                    raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered native Capture observations are malformed")
+                for boundary in ("input", "output"):
+                    stage[f"{boundary}_qc"] = [dict(item) for item in captured.get(f"{boundary}_qc", [])]
+                handoff_member = members.get("input/handoff.json")
+                if isinstance(handoff_member, dict):
+                    handoff = _parse_registered_json(
+                        self._registered_member_bytes("input/handoff.json", handoff_member)
+                    )
+                    try:
+                        warnings = registered_handoff_warnings(handoff.get("warnings"))
+                    except PipelineError as error:
+                        raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
+                    for check in stage["input_qc"]:
+                        if check.get("id") == "input.valid":
+                            check["details"] = {**check.get("details", {}), "warnings": warnings}
+            checks = stage["input_qc"] + stage["output_qc"]
+            stage.update(checks_total=len(checks), checks_passed=sum(item.get("state") == "passed" for item in checks))
+            if state == "failed":
+                decision = row.get("decision") or {}
+                stage["error_code"] = decision.get("reason_code")
+                if job.get("failed_stage") == stage_id:
+                    stage.update(error=job.get("error"), diagnostic=job.get("detail"))
+        view["execution_scope"] = [stage["id"] for stage in view["stages"] if stage["in_scope"]]
         discovery = self._registered_discovery_projection(projection)
         if discovery is not None:
-            display["discovery"] = discovery
-            display["hardware_id"] = discovery["hardware_id"]
-            display["revision"] = discovery["revision"]
-        # The registered rows own stage states; coarse run failure must not
-        # replace a downstream blocked state when rendering this stage view.
-        display.pop("status", None)
-        return display
+            job["discovery"] = discovery
+            job["hardware_id"] = discovery["hardware_id"]
+            job["revision"] = discovery["revision"]
+        if any(stage["id"] == "verify" and stage["state"] == "completed" for stage in view["stages"]):
+            for stage in view["stages"]:
+                for confirmation in stage["confirmations"]:
+                    confirmation["state"] = "external_review"
+        return view
 
     @staticmethod
     def _registered_member_fields(member: dict) -> tuple[str, int, dict]:

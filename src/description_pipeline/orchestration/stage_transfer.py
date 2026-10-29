@@ -17,6 +17,7 @@ from pathlib import Path
 from ..build.archive import ZIP_EPOCH
 from ..io import (
     PipelineError,
+    _physical_path,
     artifact_path_parts,
     canonical,
     confined,
@@ -49,8 +50,8 @@ def seal_capture(
 ) -> dict:
     """Seal a completed Windows capture into one closed, self-describing archive."""
 
-    root = Path(root)
-    archive = Path(archive)
+    root = Path(_physical_path(root))
+    archive = Path(_physical_path(archive))
     _require(not archive.exists(), f"Transfer archive already exists: {archive}")
     manifest = native_transfer.capture_manifest(
         root,
@@ -79,6 +80,8 @@ def _write_streaming_zip(archive: Path, root: Path, files: dict[str, str], manif
     inventory scan and the write is refused instead of being sealed inconsistently.
     """
 
+    archive = Path(_physical_path(archive))
+    root = Path(_physical_path(root))
     total = 0
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as target:
         for name in sorted(files):

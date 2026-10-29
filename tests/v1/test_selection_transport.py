@@ -12,7 +12,7 @@ import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
-from description_pipeline.io import inventory
+from description_pipeline.io import _physical_path, file_digest, inventory, read_data, write_json
 from description_pipeline.orchestration import selection_transport
 from description_pipeline.orchestration.selection_transport import StagedSelection
 from description_pipeline.sources.solidworks.selection import SelectionError
@@ -136,6 +136,124 @@ class SelectionTransportTests(unittest.TestCase):
                 self.assertEqual(inventory(stage), {} if changed else expected)
                 self.assertEqual(session.snapshot()["state"], "awaiting_files" if changed else "reading")
                 self.assertEqual(list(self.root.glob(".selection-upload-*")), [])
+
+    def test_capture_archives_all_input_kinds_under_a_long_physical_root(self) -> None:
+        from description_pipeline.sources.solidworks.capture_transaction import _archive_input
+        from description_pipeline.sources.solidworks.discovery import (
+            DISCOVERY_FILE,
+            FINDINGS_FILE,
+            IDENTITY_FILE,
+            PLAN_FILE,
+        )
+        from description_pipeline.sources.solidworks.freeze import _copy_sealed_capture_source
+        from description_pipeline.sources.solidworks.native import _hash
+
+        package = self.root / "capture-package"
+        native_name = "component-" + "n" * 100 + ".SLDPRT"
+        native = {MAIN: b"assembly bytes", native_name: b"referenced native bytes"}
+        records = {"records/control.json": {"control": True}, "records/budget.json": {"mass": 1}}
+        package.mkdir()
+        for name, content in native.items():
+            (package / name).write_bytes(content)
+        for name, content in records.items():
+            write_json(package / name, content)
+        checksums = {name: file_digest(package / name) for name in native}
+        discovery = {
+            "native_files": checksums,
+            "records": [{"package_file": "records/control.json"}],
+            "budget": {"package_file": "records/budget.json"},
+        }
+        sidecars = {
+            "source.json": {"source": "frozen"},
+            DISCOVERY_FILE: discovery,
+            FINDINGS_FILE: {"findings": []},
+            PLAN_FILE: {"main_assembly": MAIN},
+            IDENTITY_FILE: {"resolved": True},
+        }
+        for name, content in sidecars.items():
+            write_json(package / name, content)
+        before = inventory(package)
+        long_parent = self.root / ("parent-" + "p" * 90)
+        staging = long_parent / ("candidate-" + "s" * 130)
+        self.addCleanup(lambda: shutil.rmtree(_physical_path(long_parent), ignore_errors=True))
+        self.assertGreater(len(str(staging / "input/source.json")), 260)
+
+        _archive_input(package, staging)
+
+        expected = {f"cad/{name}": checksums[name] for name in native}
+        expected.update({name: before[name] for name in (*records, *sidecars)})
+        self.assertEqual(inventory(staging / "input"), expected)
+        self.assertEqual(read_data(staging / "input" / DISCOVERY_FILE), discovery)
+        session_source = staging / "session-source"
+        copied = _copy_sealed_capture_source(staging / "input/cad", session_source, checksums)
+        self.assertEqual(copied, checksums)
+        self.assertEqual(inventory(session_source), checksums)
+        for name, checksum in checksums.items():
+            self.assertEqual(_hash(str(session_source / name)), checksum)
+        self.assertEqual(inventory(package), before)
+
+    def test_native_geometry_seals_long_paths_and_component_names_without_changing_bytes(self) -> None:
+        from description_pipeline.geometry.native_tessellation import inspect_native_triangle_stream
+        from description_pipeline.sources.solidworks.capture_geometry import seal_native_geometry
+        from tests.sources.test_capture_geometry import CaptureGeometryTests
+
+        fixture = CaptureGeometryTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        component = "occurrence/" + "n" * 260
+        original = "arm-1"
+        facts = copy.deepcopy(fixture.raw_geometry[original])
+        facts["component"] = component
+        facts["appearance_raw"]["component"] = component
+        scopes = {component: fixture.raw_facts["source_scopes"][original]}
+        raw = {component: facts}
+        short = seal_native_geometry(raw, scopes, self.root / "short-evidence")
+        long_parent = self.root / ("geometry-" + "p" * 90)
+        evidence = long_parent / ("evidence-" + "s" * 130)
+        self.addCleanup(lambda: shutil.rmtree(_physical_path(long_parent), ignore_errors=True))
+
+        sealed = seal_native_geometry(raw, scopes, evidence)
+
+        self.assertEqual(sealed, short)
+        record = sealed[component]
+        stream = evidence / record["stream_path"]
+        self.assertGreater(len(str(stream)), 260)
+        self.assertEqual(file_digest(stream), record["stream_sha256"])
+        inspected = inspect_native_triangle_stream(
+            stream, expected_sha256=record["stream_sha256"], expected_count=record["triangle_count"],
+        )
+        self.assertEqual(inspected.triangle_count, record["triangle_count"])
+        self.assertFalse(any(name.endswith("partial.triangles") for name in inventory(evidence)))
+
+    def test_closed_capture_sealing_preserves_long_member_bytes(self) -> None:
+        from description_pipeline.orchestration.stage_transfer import seal_capture
+        from tests.v1.test_stage_transfer import (
+            HANDOFF,
+            MAIN_ASSEMBLY,
+            RUN_ID,
+            capture_root,
+            execution,
+            native_tool,
+            upstream_artifacts,
+        )
+
+        long_parent = self.root / ("capture-" + "p" * 90)
+        root = long_parent / ("output-" + "s" * 130)
+        self.addCleanup(lambda: shutil.rmtree(_physical_path(long_parent), ignore_errors=True))
+        physical_root = Path(_physical_path(root))
+        physical_capture = capture_root(physical_root)
+        capture = root / physical_capture.relative_to(physical_root)
+        expected = inventory(capture)
+        self.assertGreater(len(str(root / "input/cad" / MAIN_ASSEMBLY)), 260)
+        archive = self.root / "closed-long-capture.zip"
+        manifest = seal_capture(
+            capture, archive, run_id=RUN_ID, handoff_sha256=HANDOFF, upload_sha256=HANDOFF,
+            main_assembly=MAIN_ASSEMBLY, native_tool=native_tool(),
+            upstream_artifacts=upstream_artifacts(), execution=execution(),
+        )
+        with zipfile.ZipFile(archive) as payload:
+            for name in manifest["files"]:
+                self.assertEqual(hashlib.sha256(payload.read(name)).hexdigest(), expected[name])
 
     def test_extra_missing_duplicate_and_noncanonical_members_are_refused(self) -> None:
         cases = {

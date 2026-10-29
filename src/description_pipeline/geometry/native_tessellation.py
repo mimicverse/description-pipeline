@@ -10,7 +10,7 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..io import PipelineError
+from ..io import PipelineError, _physical_path
 from ..schemas import (
     NATIVE_TESSELLATION_SCHEMA,
     NATIVE_TRIANGLE_STREAM_MAGIC,
@@ -120,7 +120,7 @@ def native_scope_entity(
 def write_native_triangle_stream(path: Path, values: Sequence[float]) -> int:
     """Write one component-local ``GetTessTriangles(True)`` result unchanged."""
 
-    target = Path(path)
+    target = Path(_physical_path(path))
     _require(
         isinstance(values, Sequence)
         and len(values) > 0
@@ -145,7 +145,7 @@ def write_native_triangle_stream(path: Path, values: Sequence[float]) -> int:
 
 
 def read_native_triangle_count(path: Path) -> int:
-    target = Path(path)
+    target = Path(_physical_path(path))
     _require(target.is_file(), f"native triangle stream is missing: {target.name}")
     with target.open("rb") as stream:
         header = stream.read(_RAW_HEADER.size)
@@ -173,7 +173,7 @@ def inspect_native_triangle_stream(
 ) -> VerifiedNativeTriangleStream:
     """Hash and validate one stream in a single buffered pass."""
 
-    target = Path(path)
+    target = Path(_physical_path(path))
     _require(target.is_file(), f"native triangle stream is missing: {target.name}")
     _require(
         isinstance(expected_sha256, str)
@@ -215,7 +215,7 @@ def iter_native_triangles(
 ) -> Iterator[tuple[tuple[float, float, float], ...]]:
     """Yield exact raw-order triangles without applying an occurrence transform."""
 
-    target = Path(path)
+    target = Path(_physical_path(path))
     count = read_native_triangle_count(target) if expected_count is None else expected_count
     _require(_integer(count) and count > 0, "native triangle stream count is invalid")
     with target.open("rb") as stream:
@@ -336,7 +336,7 @@ def materialize_native_stl(
         next_start += span["triangle_count"]
     _require(next_start == triangle_count, "native face spans do not cover the raw triangle stream")
 
-    target = Path(stl_path)
+    target = Path(_physical_path(stl_path))
     target.parent.mkdir(parents=True, exist_ok=True)
     span_index = 0
     local_triangle = 0

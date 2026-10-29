@@ -16,6 +16,7 @@ from ...interface_records import (
 )
 from ...io import (
     PipelineError,
+    _physical_path,
     confined,
     digest,
     file_digest,
@@ -103,6 +104,8 @@ def inspect_prepared_package(package: Path) -> dict:
 def _archive_input(package: Path, staging: Path) -> None:
     """Archive identity, CAD originals and controlled records once."""
 
+    package = Path(_physical_path(package))
+    staging = Path(_physical_path(staging))
     payload = read_data(package / DISCOVERY_FILE)
     native_files = (
         payload.get("native_files")

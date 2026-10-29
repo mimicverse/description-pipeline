@@ -24,6 +24,7 @@ from pathlib import Path
 
 from ...geometry.native_scope import NATIVE_SOURCE_SCOPE_RULE
 from ...geometry.native_transform import transform_from_solidworks as _shared_transform
+from ...io import _filesystem_path, _physical_path, file_digest
 from ...schemas import NATIVE_DISCOVERY_SCHEMA
 from .errors import CadError, EnvironmentError_
 from .protocol import CadBackend
@@ -1737,11 +1738,7 @@ def _raw_component_mass_fact(reading):
 
 
 def _hash(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for block in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(block)
-    return digest.hexdigest()
+    return file_digest(Path(path))
 
 
 def _read_material(obj, method, configuration):
@@ -2672,7 +2669,7 @@ def _mate_features(doc):
 def _relative_document(path_value, source_root):
     try:
         candidate = Path(str(path_value))
-        if not candidate.is_file():
+        if not Path(_filesystem_path(candidate)).is_file():
             return None
         relative = candidate.resolve().relative_to(Path(source_root).resolve())
         return relative.as_posix()
@@ -2778,7 +2775,7 @@ def _component_source_document(component, source_root, *, native_path=None):
     provenance["author_imported_path"] = imported_path
     if imported_path is not None and imported_error is None:
         try:
-            os.stat(imported_path)
+            os.stat(_filesystem_path(Path(imported_path)))
         except FileNotFoundError:
             provenance["author_imported_exists"] = False
         except OSError as error:
@@ -3318,7 +3315,7 @@ class SolidWorksBackend(CadBackend):
                 "prepared Capture root and assembly must be existing paths",
                 {"source_root": str(source_root), "assembly": str(assembly)},
             ) from error
-        if not root.is_dir() or not document.is_file():
+        if not Path(_filesystem_path(root)).is_dir() or not Path(_filesystem_path(document)).is_file():
             raise CadError(
                 "cad_prepared_source_invalid",
                 "prepared Capture root must be a directory and the assembly a file",
@@ -3345,9 +3342,10 @@ class SolidWorksBackend(CadBackend):
                     "prepared Capture policy cannot change while a CAD session is live",
                     {"sessions": sorted(self._sessions)},
                 )
+        physical_root = Path(_physical_path(root))
         documents = sorted(
-            str(path)
-            for path in root.rglob("*")
+            str(root / path.relative_to(physical_root))
+            for path in physical_root.rglob("*")
             if path.is_file() and path.suffix.lower() in {".sldasm", ".sldprt"}
         )
         if str(document) not in documents:
@@ -3717,7 +3715,7 @@ class SolidWorksBackend(CadBackend):
                 name, native_path = raw[index:index + 2]
                 if not _is_text_name(name) or not isinstance(native_path, str):
                     raise ValueError("dependency enumeration contains an unreadable name or path")
-                if os.path.isfile(native_path):
+                if os.path.isfile(_filesystem_path(Path(native_path))):
                     continue
                 unresolved.append({"name": name, "last_known_path": native_path})
             return {
@@ -4850,7 +4848,7 @@ class SolidWorksBackend(CadBackend):
                 # SetReadOnlyState can change native state. Defer it until the
                 # occurrence tree has been captured as primitives and released;
                 # phase-two document acquisition enforces read-only before reads.
-                if not path or not os.path.isfile(path):
+                if not path or not os.path.isfile(_filesystem_path(Path(path))):
                     # Without a file on disk there is no revision to hash or copy, so the
                     # snapshot could not name what it read.
                     raise CadError("cad_component_not_on_disk", name, {"component": name, "path": path})
@@ -4867,7 +4865,7 @@ class SolidWorksBackend(CadBackend):
                     )
                     provenance["owner_sha256"] = (
                         _hash(str(owner_path))
-                        if os.path.isfile(owner_path)
+                        if os.path.isfile(_filesystem_path(Path(owner_path)))
                         else None
                     )
                     provenance["occurrence"] = name
@@ -6872,7 +6870,7 @@ class SolidWorksBackend(CadBackend):
                 "author_imported_exists": provenance.get("author_imported_exists"),
             }
         elif state is None:
-            if not os.path.isfile(source_entry[0]):
+            if not os.path.isfile(_filesystem_path(Path(source_entry[0]))):
                 return None
             if (
                 embedded_virtual_component_marker(source_path)
@@ -7421,7 +7419,7 @@ class SolidWorksBackend(CadBackend):
                     "the selected main assembly is not contained in the frozen engineering directory",
                     {"main_assembly": selection, "error": str(error)},
                 ) from error
-            if not selected_path.is_file():
+            if not Path(_filesystem_path(selected_path)).is_file():
                 raise CadError(
                     "native_discovery_selection_missing",
                     "the selected main assembly is not present in the frozen engineering directory",

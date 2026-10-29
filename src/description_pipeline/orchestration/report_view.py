@@ -1179,7 +1179,7 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
                 state = item.get("state") if item.get("state") in {"passed", "failed"} else "not_run"
                 row = {
                     "id": item.get("id"),
-                    "boundary": boundary,
+                    "boundary": item.get("boundary", boundary),
                     "label": _BOUNDARY_LABELS.get(item.get("id"), str(item.get("label") or item.get("id") or "")),
                     "state": state,
                     "state_label": _CHECK_STATE_LABELS[state],
@@ -1249,6 +1249,7 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
             "state": stage.get("state", "not_run"),
             "state_label": _STAGE_STATE_LABELS.get(stage.get("state"), str(stage.get("state") or "Not run")),
             "at": stage.get("at"),
+            **({"input_inventory_count": stage["input_inventory_count"]} if "input_inventory_count" in stage else {}),
             **({"reuse": stage["reuse"]} if stage.get("reuse") else {}),
             "in_scope": stage.get("in_scope"),
             "counts": {
@@ -1267,7 +1268,7 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
                     ),
                     "path": record.get("path"),
                     "availability": record.get("availability"),
-                    "files": len(record.get("files") or {}),
+                    **({"files": len(record["files"])} if isinstance(record.get("files"), dict) else {}),
                 }
                 for boundary, records in (("input", stage.get("inputs", [])), ("output", stage.get("outputs", [])))
                 for record in records

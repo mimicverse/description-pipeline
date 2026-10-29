@@ -1040,9 +1040,10 @@ function stageList(run) {
       executed: sum("executed"),
       total: sum("total"),
       boundary: (Array.isArray(stage.boundary) ? stage.boundary : []).map((row) =>
-        reportRow(row, row.boundary === "output" ? "output" : "input")),
+        reportRow(row, row.boundary)),
       independent: (Array.isArray(stage.independent) ? stage.independent : []).map((row) => reportRow(row, "independent")),
       files: Array.isArray(stage.files) ? stage.files : [],
+      inputInventoryCount: Number.isFinite(stage.input_inventory_count) ? stage.input_inventory_count : null,
       warnings: Array.isArray(stage.warnings) ? stage.warnings : [],
       unsupported: (Array.isArray(stage.unsupported) ? stage.unsupported : [])
         .map((item) => (item && typeof item === "object" ? item.label || item.id : item))
@@ -1375,7 +1376,7 @@ function renderStageDetail() {
   const counts = document.createElement("p");
   counts.className = "stage-counts muted small";
   const pieces = [];
-  if (stage.boundary.length) pieces.push(`Boundary checks: ${countsText(stage.counts.boundary, stage.boundary)}`);
+  if (stage.boundary.length) pieces.push(`Recorded checks: ${countsText(stage.counts.boundary, stage.boundary)}`);
   if (stage.independent.length) pieces.push(`Independent checks: ${countsText(stage.counts.independent, stage.independent)}`);
   if (Number.isFinite(stage.counts.warnings) && stage.counts.warnings > 0) {
     pieces.push(`Warnings: ${stage.counts.warnings}`);
@@ -1433,6 +1434,7 @@ function renderStageDetail() {
   }
 
   const groups = [
+    ["Stage checks", stage.boundary.filter((row) => row.boundary === "stage")],
     ["Input checks", stage.boundary.filter((row) => row.boundary === "input")],
     ["Output checks", stage.boundary.filter((row) => row.boundary === "output")],
     ["Independent checks", stage.independent],

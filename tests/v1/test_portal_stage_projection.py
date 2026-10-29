@@ -7,7 +7,7 @@ import json
 import unittest
 
 from description_pipeline.orchestration.portal import PortalApp, PortalError, _automatic_summary
-from description_pipeline.io import PipelineError
+from description_pipeline.io import PipelineError, digest
 from description_pipeline.orchestration.report_view import build_report
 from description_pipeline.stages import CONTRACT, stage_view
 from tests.v1.protocol_support import protocol_events
@@ -62,311 +62,139 @@ class RegisteredStageProjectionTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.artifacts = RegisteredProjectionArtifacts()
+        self.application = PortalApp.__new__(PortalApp)
+        self.application._artifact_store = lambda: self.artifacts
 
-    def app(self, report: dict) -> PortalApp:
-        app = PortalApp.__new__(PortalApp)
-        app._registered_stage_report = lambda projection, *, stage: report
-        return app
+    def stage_members(self, stage: str, files: dict[str, bytes], *, producer: str = RUN_ID) -> dict:
+        artifact = self.artifacts.register(run_id=RUN_ID, producer_run_id=producer, stage=stage, files=files)
+        return {name: {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(), "artifact": artifact}
+                for name, data in files.items()}
 
-    def stage_members(
-        self,
-        stage: str,
-        *,
-        producer_run_id: str = RUN_ID,
-        payload: bytes = b"{}\n",
-    ) -> dict[str, dict]:
-        artifact = self.artifacts.register(
-            run_id=RUN_ID,
-            producer_run_id=producer_run_id,
-            stage=stage,
-            files={"reports/native-stages.json": payload},
-        )
-        return {
-            "reports/native-stages.json": {
-                "bytes": len(payload),
-                "sha256": hashlib.sha256(payload).hexdigest(),
-                "artifact": artifact,
+    def projection(self, states: dict[str, str], *, parent: str | None = None) -> dict:
+        projection = {"run_id": RUN_ID, "parent_run_id": parent, "stages": {}, "by_stage": {}}
+        for stage, state in states.items():
+            command = {"command_id": f"command:{stage}", "request_digest": SUBJECT, "input_artifacts": []}
+            checks = {"command_id": command["command_id"], "request_digest": SUBJECT,
+                      "checks": [{"id": "handoff.integrity" if stage == "freeze" else "native.observation",
+                                  "state": "passed", "details": {"files": {"robot.SLDASM": SUBJECT}}}]}
+            files = {"receipt.json": b"{}"}
+            if stage in {"freeze", "discover"}:
+                files = {"checks.json": json.dumps(checks).encode()}
+            if stage == "capture" and state == "completed":
+                files = {"reports/native-stages.json": json.dumps(registered_report()).encode()}
+            projection["by_stage"][stage] = self.stage_members(stage, files)
+            projection["stages"][stage] = {
+                "stage": stage, "state": state, "command": command,
+                "decision": {"outcome": state, "reason_code": "capture.native_failed" if state == "failed" else None},
+                "receipt": {"checks_sha256": digest(checks)}, "updated_at": "2026-10-29T01:09:49Z",
             }
-        }
+        preceding = "completed"
+        for definition in CONTRACT["stages"]:
+            stage = definition["id"]
+            row = projection["stages"].setdefault(stage, {
+                "stage": stage, "state": "waiting" if preceding == "completed" else "blocked",
+            })
+            preceding = row["state"]
+        return projection
 
-    def projection(
-        self,
-        states: dict[str, str],
-        *,
-        parent_run_id: str | None = None,
-        producer_runs: dict[str, str] | None = None,
-    ) -> dict:
-        producer_runs = producer_runs or {}
-        return {
-            "run_id": RUN_ID,
-            "parent_run_id": parent_run_id,
-            "stages": {
-                stage: {
-                    "stage": stage,
-                    "state": state,
-                    "updated_at": "2026-10-20T02:49:41+08:00",
-                }
-                for stage, state in states.items()
-            },
-            "by_stage": {
-                stage: self.stage_members(
-                    stage,
-                    producer_run_id=producer_runs.get(stage, RUN_ID),
-                )
-                for stage in states
-            },
-        }
+    def test_diagnostic_scope_and_pending_states_remain_canonical(self) -> None:
+        projection = self.projection({"capture": "active"})
+        for stage, row in projection["stages"].items():
+            row["in_scope"] = stage == "capture"
+        projection["stages"]["publish"]["state"] = "waiting"
+        view = self.application._registered_stage_view({}, projection)
+        self.assertEqual(view["execution_scope"], ["capture"])
+        self.assertEqual(view["stages"][-1]["state"], "waiting")
+        self.assertEqual([stage["in_scope"] for stage in view["stages"]], [False, False, True, False, False, False])
 
-    def test_complete_projection_keeps_native_checks_and_final_subject(self) -> None:
-        job = {
-            "run_id": RUN_ID,
-            "status": "passed",
-            "result": {"subject_sha256": SUBJECT},
-            "events": [{"stage": stage["id"], "state": "completed"} for stage in CONTRACT["stages"]],
-        }
-        display = self.app(registered_report())._registered_stage_job(
-            job,
-            self.projection({stage["id"]: "completed" for stage in CONTRACT["stages"]}),
-        )
-        view = stage_view(display)
+    def test_actual_stage_checks_keep_completed_predecessors_and_exact_failed_stage(self) -> None:
+        projection = self.projection({"freeze": "completed", "discover": "completed", "capture": "failed"})
+        job = {"run_id": RUN_ID, "status": "failed", "failed_stage": "capture",
+               "error_code": "capture.native_failed", "error": "FileNotFoundError: a long CAD path"}
+        view = self.application._registered_stage_view(job, projection)
+        self.assertEqual([stage["state"] for stage in view["stages"]],
+                         ["completed", "completed", "failed", "blocked", "blocked", "blocked"])
+        self.assertEqual(view["stages"][0]["checks_passed"], 1)
+        self.assertEqual(view["stages"][0]["input_inventory_count"], 1)
+        report = build_report(job, view=view)
+        self.assertEqual(report["failure"]["stage"], "capture")
+        self.assertEqual(report["failure"]["error_code"], "capture.native_failed")
+        self.assertEqual(report["failure"]["raw_error"], job["error"])
+        self.assertEqual(report["stages"][0]["boundary"][0]["boundary"], "stage")
+
+    def test_all_six_completed_decisions_do_not_require_a_legacy_qc_inventory(self) -> None:
+        projection = self.projection({item["id"]: "completed" for item in CONTRACT["stages"]})
+        view = self.application._registered_stage_view({"result": {"subject_sha256": SUBJECT}}, projection)
         self.assertEqual([stage["state"] for stage in view["stages"]], ["completed"] * 6)
-        self.assertTrue(
-            all(
-                check["state"] == "passed"
-                for stage in view["stages"]
-                for check in stage["input_qc"] + stage["output_qc"]
-            )
-        )
         self.assertEqual(view["subject_sha256"], SUBJECT)
+        self.assertEqual(view["stages"][2]["checks_passed"], 3)
+        self.assertTrue(all(item["state"] == "external_review"
+                            for stage in view["stages"] for item in stage["confirmations"]))
 
-    def test_registered_row_preserves_time_and_reuse_lineage(self) -> None:
-        report = registered_report()
-        projection = self.projection(
-            {
-                stage["id"]: "completed"
-                for stage in CONTRACT["stages"]
-            },
-            parent_run_id="origin-run",
-            producer_runs={"generate": "origin-run"},
-        )
-        projection["stages"]["generate"][
-            "reused_from_run"
-        ] = "legacy-forgery"
-        projection["stages"]["generate"][
-            "checkpoint_uri"
-        ] = "store://sealed/legacy-forgery/generate"
-        projection["stages"]["generate"]["updated_at"] = "2026-10-20T03:00:00+08:00"
-        job = {
-            "run_id": RUN_ID,
-            "result": {"subject_sha256": SUBJECT},
-            "events": [
-                {
-                    "stage": "generate",
-                    "state": "completed",
-                    "reuse": {"parent_run": "forged-run", "source_run": "forged-run", "reused": True},
-                }
-            ],
-        }
-        display = self.app(report)._registered_stage_job(job, projection)
-        generate = next(stage for stage in stage_view(display)["stages"] if stage["id"] == "generate")
-        self.assertEqual(generate["at"], "2026-10-20T03:00:00+08:00")
-        self.assertEqual(
-            generate["reuse"],
-            {
-                "parent_run": "origin-run",
-                "reused": True,
-                "source_run": "origin-run",
-            },
-        )
-
-    def test_registered_rows_preserve_canonical_stage_states(self) -> None:
-        expected = {
-            "active": "running",
-            "cancelled": "cancelled",
-            "unresolved": "unresolved",
-        }
-        for canonical, displayed in expected.items():
+    def test_stage_states_are_owned_by_the_registered_decisions(self) -> None:
+        for canonical, displayed in (("active", "running"), ("cancelled", "cancelled"),
+                                     ("unresolved", "unresolved")):
             with self.subTest(state=canonical):
-                states = {stage["id"]: "completed" for stage in CONTRACT["stages"]}
-                states["capture"] = canonical
-                for stage in ("generate", "verify", "publish"):
-                    states[stage] = "blocked"
-                projection = self.projection(states)
-                display = self.app(registered_report())._registered_stage_job(
-                    {
-                        "run_id": RUN_ID,
-                        "request": {},
-                        "result": {"subject_sha256": SUBJECT},
-                    },
-                    projection,
+                projection = self.projection({"freeze": "completed", "discover": "completed", "capture": canonical})
+                view = self.application._registered_stage_view(
+                    {"events": [{"stage": "freeze", "state": "failed"}]}, projection
                 )
-                view = stage_view(display)
-                capture = next(stage for stage in view["stages"] if stage["id"] == "capture")
-                generate = next(stage for stage in view["stages"] if stage["id"] == "generate")
-                self.assertEqual(capture["state"], displayed)
-                self.assertEqual(generate["state"], "blocked")
+                self.assertEqual(view["stages"][0]["state"], "completed")
+                self.assertEqual(view["stages"][2]["state"], displayed)
+                self.assertEqual(view["stages"][3]["state"], "blocked")
 
-    def test_reuse_report_binds_the_artifact_producer_run(self) -> None:
-        app = PortalApp.__new__(PortalApp)
-        source_run = "origin-run"
-        payload = json.dumps(
-            registered_report(source_run),
-            sort_keys=True,
-        ).encode("utf-8")
-        app._registered_member_bytes = lambda path, member: payload
-        projection = self.projection(
-            {"generate": "completed"},
-            parent_run_id=source_run,
-            producer_runs={"generate": source_run},
-        )
+    def test_missing_tampered_or_foreign_checks_refuse_without_redeciding_business_outcome(self) -> None:
+        for mutation in ("missing", "bytes", "digest", "command"):
+            with self.subTest(mutation=mutation):
+                projection = self.projection({"freeze": "completed"})
+                row = projection["stages"]["freeze"]
+                member = projection["by_stage"]["freeze"]["checks.json"]
+                if mutation == "missing":
+                    projection["by_stage"]["freeze"] = {}
+                elif mutation == "bytes":
+                    self.artifacts.objects[member["artifact"]["artifact_id"]]["checks.json"] = b"{}"
+                elif mutation == "digest":
+                    row["receipt"]["checks_sha256"] = "b" * 64
+                else:
+                    row["command"]["command_id"] = "another-command"
+                with self.assertRaises(PortalError):
+                    self.application._registered_stage_view({}, projection)
+                self.assertEqual(row["state"], "completed")
+
+    def test_reused_output_requires_a_proven_parent(self) -> None:
+        projection = self.projection({"generate": "completed"}, parent="parent-run")
         projection["by_stage"]["generate"] = self.stage_members(
-            "generate",
-            producer_run_id=source_run,
-            payload=payload,
+            "generate", {"receipt.json": b"{}"}, producer="parent-run"
         )
-
-        report = app._registered_stage_report(
-            projection,
-            stage="generate",
-        )
-
-        self.assertIsNotNone(report)
-        self.assertEqual(report["run_id"], source_run)
-
-    def test_reuse_requires_the_artifact_to_bind_the_proven_parent(
-        self,
-    ) -> None:
-        app = PortalApp.__new__(PortalApp)
-        app._registered_stage_report = (
-            lambda projection, *, stage: registered_report()
-        )
-        projection = self.projection(
-            {"generate": "completed"},
-            parent_run_id="parent-run",
-            producer_runs={"generate": "other-run"},
-        )
-
-        with self.assertRaisesRegex(
-            PortalError,
-            "no proven parent run",
-        ):
-            app._registered_stage_job(
-                {"run_id": RUN_ID},
-                projection,
-            )
-
-    def test_reuse_report_cannot_bind_another_artifact_producer(
-        self,
-    ) -> None:
-        app = PortalApp.__new__(PortalApp)
-        source_run = "origin-run"
-        payload = json.dumps(
-            registered_report("other-run"),
-            sort_keys=True,
-        ).encode("utf-8")
-        app._registered_member_bytes = lambda path, member: payload
-        projection = self.projection(
-            {"generate": "completed"},
-            parent_run_id=source_run,
-            producer_runs={"generate": source_run},
-        )
+        view = self.application._registered_stage_view({}, projection)
+        self.assertEqual(view["stages"][3]["reuse"]["source_run"], "parent-run")
         projection["by_stage"]["generate"] = self.stage_members(
-            "generate",
-            producer_run_id=source_run,
-            payload=payload,
+            "generate", {"receipt.json": b"{}"}, producer="other-run"
         )
+        with self.assertRaisesRegex(PortalError, "no proven parent"):
+            self.application._registered_stage_view({}, projection)
 
+    def test_native_capture_report_must_bind_its_actual_artifact_producer(self) -> None:
+        projection = self.projection({"capture": "completed"})
+        projection["by_stage"]["capture"] = self.stage_members(
+            "capture", {"reports/native-stages.json": json.dumps(registered_report("other-run")).encode()})
         with self.assertRaisesRegex(PortalError, "conflicts with its run"):
-            app._registered_stage_job(
-                {"run_id": RUN_ID},
-                projection,
-            )
+            self.application._registered_stage_view({}, projection)
 
-    def test_partial_rows_cannot_turn_a_native_failure_into_success(self) -> None:
-        events = protocol_events(subject=SUBJECT, failed_stage="capture")
-        events.extend(
-            {"stage": stage, "state": "blocked"}
-            for stage in ("generate", "verify", "publish")
-        )
-        events.append({"stage": "binding", "state": "failed"})
-        job = {
-            "run_id": RUN_ID,
-            "status": "failed",
-            "result": {"subject_sha256": SUBJECT},
-            "events": events,
-        }
-        display = self.app(registered_report())._registered_stage_job(
-            job,
-            self.projection({"freeze": "completed", "discover": "completed"}),
-        )
-        view = stage_view(display)
-        states = {stage["id"]: stage["state"] for stage in view["stages"]}
-        self.assertEqual(states["capture"], "failed")
-        self.assertEqual(states["publish"], "blocked")
-        job_without_failure_event = {**job, "events": []}
-        pending = self.app(registered_report())._registered_stage_job(
-            job_without_failure_event,
-            self.projection({"freeze": "completed", "discover": "completed"}),
-        )
-        pending_view = stage_view(pending)
-        self.assertEqual(build_report(job_without_failure_event, view=pending_view)["overall"]["state"], "failed")
-
-    def test_completed_row_without_receipt_report_stays_failed(self) -> None:
-        job = {
-            "run_id": RUN_ID,
-            "events": [{"stage": "discover", "state": "completed"}],
-        }
-        display = self.app(None)._registered_stage_job(
-            job,
-            self.projection({"discover": "completed"}),
-        )
-        discover = next(stage for stage in stage_view(display)["stages"] if stage["id"] == "discover")
-        self.assertEqual(discover["state"], "failed")
-        self.assertEqual(discover["checks_passed"], 0)
-
-    def test_completed_row_without_report_preserves_only_its_recorded_checks(self) -> None:
-        events = [
-            {
-                "stage": "freeze",
-                "state": "running",
-                "check": {
-                    "id": "handoff.admission",
-                    "boundary": "input",
-                    "state": "passed",
-                    "details": {"handoff_sha256": SUBJECT},
-                },
-            },
-            {
-                "stage": "freeze",
-                "state": "running",
-                "check": {
-                    "id": "handoff.integrity",
-                    "boundary": "output",
-                    "state": "passed",
-                    "details": {"handoff_sha256": SUBJECT},
-                },
-            },
-            {
-                "stage": "freeze",
-                "state": "running",
-                "check": {
-                    "id": "invented",
-                    "boundary": "output",
-                    "state": "passed",
-                    "details": {},
-                },
-            },
-            {"stage": "freeze", "state": "completed"},
-        ]
-        job = {"run_id": RUN_ID, "events": events}
-        display = self.app(None)._registered_stage_job(
-            job,
-            self.projection({"freeze": "completed"}),
-        )
-        freeze = next(stage for stage in stage_view(display)["stages"] if stage["id"] == "freeze")
-        self.assertEqual(freeze["state"], "completed")
-        self.assertEqual(freeze["checks_passed"], 2)
-        self.assertNotIn("invented", {row["id"] for row in freeze["input_qc"] + freeze["output_qc"]})
+    def test_sealed_native_failure_is_read_from_the_same_failed_stage(self) -> None:
+        projection = self.projection({"capture": "failed"})
+        projection["state"] = "failed"
+        projection["request"] = {}
+        native = {"kind": "capture", "state": "failed", "failure": {
+            "code": "capture.native_failed", "message": "FileNotFoundError: exact native CAD path"}}
+        projection["by_stage"]["capture"] = self.stage_members(
+            "capture", {"native-result.json": json.dumps(native).encode()})
+        job = self.application._fact_display_job(projection)
+        self.assertEqual(job["error"], native["failure"]["message"])
+        self.assertEqual(job["error_code"], "capture.native_failed")
+        projection["stages"]["capture"]["decision"]["reason_code"] = "another_reason"
+        with self.assertRaisesRegex(PortalError, "conflicts with its stage decision"):
+            self.application._fact_display_job(projection)
 
 
 if __name__ == "__main__":
