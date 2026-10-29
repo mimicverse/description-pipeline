@@ -586,9 +586,6 @@ class AirflowApi:
         """Validate one browser's Airflow SSO cookie and return its Feishu identity."""
         return self._request("GET", "/auth/feishu/profile", cookie_token=token)
 
-    def dag(self, token: str, dag_id: str) -> dict:
-        return self._request("GET", f"{self.api_root}/dags/{urlparse.quote(dag_id)}", token=token)
-
     def trigger_dag_run(self, token: str, dag_id: str, dag_run_id: str, conf: dict) -> dict:
         # Airflow 3.3.2's TriggerDAGRunPostBody requires ``logical_date`` to be present (nullable);
         # this workflow is schedule=None, so the run intentionally carries no logical date.
@@ -625,23 +622,6 @@ class AirflowApi:
             {"dry_run": dry_run, "only_failed": True, "only_new": False, "run_on_latest_version": False},
             token=token,
         )
-
-    def list_dag_runs(self, token: str, dag_id: str, *, limit: int = 20, offset: int = 0) -> list[dict]:
-        """Recent runs of one DAG, so the operator page survives portal restarts.
-
-        The per-DAG GET is authorized as a read of that DAG; the POST wildcard list would ask for
-        authorization on ``~`` and is deliberately not used.
-        """
-        query = urlparse.urlencode({"limit": int(limit), "offset": int(offset), "order_by": "-start_date"})
-        payload = self._request(
-            "GET",
-            f"{self.api_root}/dags/{urlparse.quote(dag_id)}/dagRuns?{query}",
-            token=token,
-        )
-        runs = payload.get("dag_runs")
-        if not isinstance(runs, list):
-            raise AirflowApiError("Airflow returned no dag run list")
-        return [item for item in runs if isinstance(item, dict)]
 
 
 @dataclass(frozen=True, slots=True)
