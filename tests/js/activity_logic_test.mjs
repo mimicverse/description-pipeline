@@ -248,3 +248,16 @@ const unresolved = activityView({ available: true, state: "busy", stage: "captur
 assert.equal(unresolved.state, "waiting");
 assert.equal(unresolved.elapsedText, "");
 assert.match(unresolved.note, /reconciliation/);
+
+assert.equal(unresolved.final, false);
+const authorizedWait = activityView({available: false, state: "waiting"}, {runState: "waiting", nowMs});
+assert.equal(authorizedWait.final, false);
+assert.equal(authorizedWait.stateText, "Awaiting external result");
+assert.equal(authorizedWait.actionText, "");
+assert.equal(authorizedWait.countsText, "");
+assert.equal(authorizedWait.elapsedText, "");
+assert.equal(activityPlacement(authorizedWait, {stageId: "capture", stageRunning: true}), "live");
+const recordedWait = activityView({available: true, state: "busy", stage: "capture", action: {code: "capture.geometry_facts"}, counts: {done: 1, total: 111}}, {runState: "waiting", nowMs});
+assert.equal(recordedWait.state, "busy");
+assert.equal(recordedWait.countsText, "Processed 1/111");
+console.log("authorized wait activity preserves evidence OK");

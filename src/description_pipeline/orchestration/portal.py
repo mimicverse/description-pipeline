@@ -1272,6 +1272,17 @@ def _automatic_summary(
     }
 
 
+def _activity_summary(job: dict | None, automatic: dict) -> dict:
+    """Keep recorded telemetry visible during a fact-backed authorized wait."""
+    if (
+        isinstance(job, dict)
+        and job.get("status") == "unresolved"
+        and automatic.get("state") == "waiting"
+    ):
+        job = {**job, "status": "running"}
+    return activity_view(job)
+
+
 def _canonical_native_status(projection: dict | None) -> str | None:
     """Derive retry evidence from stage decisions, never a retired native job row."""
 
@@ -2307,6 +2318,7 @@ class PortalApp:
             if isinstance(parent_projection, dict)
             else None
         )
+        automatic = _automatic_summary(display_job, projection)
         payload = {
             "dag_run_id": dag_run_id,
             "state": _run_state(projection),
@@ -2370,8 +2382,8 @@ class PortalApp:
             "report": report,
             "verification_reports": self._verification_report_links(dag_run_id, projection),
             "findings": _findings(display_job),
-            "activity": activity_view(display_job),
-            "automatic": _automatic_summary(display_job, projection),
+            "activity": _activity_summary(display_job, automatic),
+            "automatic": automatic,
             "coverage": _coverage_report(display_job, report),
             "pr": pr,
             "endpoint_error": endpoint_error,

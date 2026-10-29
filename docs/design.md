@@ -107,7 +107,7 @@ Capture 在一次原生采集中保留已保存配置、几何、轴线、配合
 
 Windows 的既有 `native_operation_event` 经同一 operation view 与 poll 形成 `run_display_metadata.activity`，Portal 展示当前活动、时间与历史。原生 sequence 与事件时间用于识别重复观察；activity 是显示数据，不建立第二套阶段状态、成功资格或 CAD 控制权，不增加独立轮询链。
 
-Portal 直接展示 canonical 阶段状态，详细检查读取该阶段实际密封证据：Freeze/Discover 的 `checks.json`、Capture 的原生报告及 Verify 的独立 certificate。不以静态检查模板或其他阶段报告重新判定终态；证据身份、摘要或结构冲突作为读取错误拒绝展示。原生失败从同阶段密封 `native-result.json` 保留原始消息。Discover 的来源与 warning 直接读取其自身输出，不等待 Capture。
+Portal 从 canonical 阶段事实与既有检查摘要生成只读展示：有效执行权仍待外部结果时统一显示等待，真实 UNKNOWN 显示待对账，实际登记失败保留红色与具体错误；展示不改写阶段或执行权。预览只在已登记验证证据存在后请求。详细检查读取该阶段实际密封证据：Freeze/Discover 的 `checks.json`、Capture 的原生报告及 Verify 的独立 certificate。不以静态检查模板或其他阶段报告重新判定终态；证据身份、摘要或结构冲突作为读取错误拒绝展示。原生失败从同阶段密封 `native-result.json` 保留原始消息。Discover 的来源与 warning 直接读取其自身输出，不等待 Capture。
 
 Windows 文件系统读写、遍历、摘要、三角流封存和传输打包统一复用 `io` 的物理路径边界，支持长路径；扩展路径前缀仅用于本地 Python I/O，不写入 manifest，不传入 CAD/COM。临时三角文件使用 occurrence 标识的摘要命名，原始 occurrence 名称与几何流字节保持不变。
 

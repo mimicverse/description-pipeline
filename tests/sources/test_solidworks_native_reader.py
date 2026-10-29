@@ -4653,9 +4653,11 @@ class AppearanceHelperTests(_FixtureAppearanceInterfaceMixin, unittest.TestCase)
         )
 
     def test_render_material_entities_preserve_null_and_error(self) -> None:
+        count_reads = []
         null_material = types.SimpleNamespace(
             GetLinkedDisplayStates=list,
             GetEntities=lambda: None,
+            GetEntitiesCount=lambda: count_reads.append(1) or 0,
             PrimaryColor=1,
             Transparency=0.0,
             ColorForm=1,
@@ -4671,6 +4673,18 @@ class AppearanceHelperTests(_FixtureAppearanceInterfaceMixin, unittest.TestCase)
         self.assertEqual(null_record["entities_state"], "null_result")
         self.assertIsNone(null_record["entities"])
         self.assertNotIn("entities", null_record["read_errors"])
+        self.assertEqual(null_record["native_entity_count"], 0)
+        self.assertEqual(count_reads, [1])
+
+        null_material.GetEntitiesCount = _raiser(RuntimeError("count read failed"))
+        unreadable_count, _ = _appearance_render_material(null_material, 0, object())
+        self.assertIsNone(unreadable_count["native_entity_count"])
+        self.assertIn("entity_count", unreadable_count["read_errors"])
+
+        null_material.GetEntities = lambda: [None]
+        null_element, _ = _appearance_render_material(null_material, 0, object())
+        self.assertEqual(null_element["entities_state"], "observed")
+        self.assertNotIn("native_entity_count", null_element)
 
         failing_material = types.SimpleNamespace(
             GetLinkedDisplayStates=list,

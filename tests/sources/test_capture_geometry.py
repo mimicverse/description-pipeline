@@ -283,6 +283,58 @@ class CaptureGeometryTests(unittest.TestCase):
         )
         validate_native_capture_plan(container_observation, container_plan)
 
+        def nest(value):
+            if isinstance(value, str):
+                return "carrier-1/base-1" if value == "base-1" else value
+            if isinstance(value, list):
+                return [nest(item) for item in value]
+            if isinstance(value, dict):
+                return {nest(key): nest(item) for key, item in value.items()}
+            return value
+
+        provider_observation = nest(copy.deepcopy(loaded))
+        provider_plan = nest(copy.deepcopy(plan))
+        provider_observation["scene_raw"]["occurrences"].append(
+            {**container_observation["scene_raw"]["occurrences"][-1], "name": "carrier-1"}
+        )
+        provider_plan["objects"].append(
+            {"name": "carrier-1", "document": "sub.SLDASM", "state": 2}
+        )
+        provider_observation["component_mass_raw"]["instances"].append(
+            {"name": "carrier-1", "effective": {"role": "effective_instance"}}
+        )
+        provider_group = provider_observation["link_group_mass_raw"]["links"]["base_link"]
+        provider_group["selection"] = ["carrier-1"]
+        validate_native_capture_plan(provider_observation, provider_plan)
+        for selection in (
+            [],
+            ["carrier-1/base-1"],
+            ["carrier-1", "carrier-1/base-1"],
+            ["carrier-1/base-1", "carrier-1"],
+            ["carrier-1", "carrier-1"],
+            ["carrier"],
+            ["arm-1"],
+            [["carrier-1"]],
+        ):
+            with self.subTest(selection=selection), self.assertRaises(PipelineError):
+                invalid_provider = copy.deepcopy(provider_observation)
+                invalid_provider["link_group_mass_raw"]["links"]["base_link"][
+                    "selection"
+                ] = selection
+                validate_native_capture_plan(invalid_provider, provider_plan)
+        unbacked_provider = copy.deepcopy(provider_observation)
+        unbacked_provider["component_mass_raw"]["instances"].pop()
+        with self.assertRaises(PipelineError):
+            validate_native_capture_plan(unbacked_provider, provider_plan)
+        malformed_instances = copy.deepcopy(provider_observation)
+        malformed_instances["component_mass_raw"]["instances"] = None
+        with self.assertRaises(PipelineError):
+            validate_native_capture_plan(malformed_instances, provider_plan)
+        cross_group_plan = copy.deepcopy(provider_plan)
+        cross_group_plan["groups"][0]["components"].append("arm-1")
+        with self.assertRaises(PipelineError):
+            validate_native_capture_plan(provider_observation, cross_group_plan)
+
         reference_observation = copy.deepcopy(loaded)
         reference_selector = {
             "kind": "reference_axis",

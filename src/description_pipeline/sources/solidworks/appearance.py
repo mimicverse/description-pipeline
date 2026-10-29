@@ -1838,7 +1838,8 @@ def resolve_deliverable_appearance(
             entities = material.get("entity_records")
             entities_state = material.get("entities_state")
             if (
-                material.get("material_index") != material_position
+                type(material.get("material_index")) is not int
+                or material.get("material_index") != material_position
                 or not isinstance(errors, Mapping)
                 or not isinstance(linked, (list, type(None)))
                 or not isinstance(entities, list)
@@ -1853,6 +1854,26 @@ def resolve_deliverable_appearance(
                     errors=dict(errors) if isinstance(errors, Mapping) else errors,
                     linked_display_states=linked,
                 )
+            if entities_state != "null_result" and (
+                "native_entity_count" in material or "entity_count" in errors
+            ):
+                raise _appearance_resolution_error(
+                    component,
+                    "cad_appearance_render_material_invalid",
+                    path,
+                    "only a null entity result may carry its supplemental native count",
+                )
+            if (
+                entities_state == "null_result"
+                and type(material.get("native_entity_count")) is int
+                and material["native_entity_count"] == 0
+                and "entities" in material
+                and material.get("entities") is None
+                and not entities
+                and "entities" not in errors
+                and "entity_count" not in errors
+            ):
+                continue
             if entities_state in {"null_result", "error"}:
                 raise _appearance_resolution_error(
                     component,
@@ -1862,8 +1883,25 @@ def resolve_deliverable_appearance(
                     entities_state=entities_state,
                 )
             if entities_state == "empty":
+                if (
+                    material.get("entities") != []
+                    or entities
+                    or "entities" in errors
+                ):
+                    raise _appearance_resolution_error(
+                        component,
+                        "cad_appearance_render_entities_unresolved",
+                        path + ".entities_state",
+                        "an empty appearance entity inventory is contradictory",
+                    )
                 continue
-            if not entities:
+            if (
+                not entities
+                or not isinstance(material.get("entities"), list)
+                or len(material["entities"]) != len(entities)
+                or any(value is None for value in material["entities"])
+                or "entities" in errors
+            ):
                 raise _appearance_resolution_error(
                     component,
                     "cad_appearance_render_entity_invalid",
@@ -1882,6 +1920,7 @@ def resolve_deliverable_appearance(
                 entity_path = f"{path}.entities[{entity_index}]"
                 if (
                     not isinstance(entity, Mapping)
+                    or type(entity.get("entity_index")) is not int
                     or entity.get("entity_index") != entity_index
                     or not isinstance(entity.get("native_object_type"), str)
                     or not isinstance(

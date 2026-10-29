@@ -70,6 +70,7 @@ const state = {
 const RUN_STATES = {
   queued: "Queued",
   running: "Running",
+  waiting: "Awaiting external result",
   success: "Succeeded",
   failed: "Failed",
   unresolved: "Unresolved",
@@ -384,6 +385,15 @@ function responseRunId(payload, expected = null) {
     throw error;
   }
   return runId;
+}
+
+function displayState(rawState, automatic) {
+  return rawState === "unresolved" && automatic?.state === "waiting" ? "waiting" : rawState;
+}
+
+function hasPreviewEvidence(run) {
+  return run.automatic?.state === "passed" || (run.verification_reports || [])
+    .some((report) => report.path === "verification-certificate.json");
 }
 
 function automaticStateKind(state) {
@@ -807,7 +817,7 @@ function buildRunItem(run) {
   }
   const meta = document.createElement("span");
   meta.className = "run-meta-line";
-  const stateText = RUN_STATES[run.state] || run.state || "State unconfirmed";
+  const stateText = RUN_STATES[displayState(run.state, run.automatic)] || run.state || "State unconfirmed";
   meta.textContent = `${[formatRunTime(run.started_at), stateText].filter(Boolean).join(" · ")}\nInitiator: ${run.user || "not recorded"}`;
   open.append(heading, meta);
   open.title = [
@@ -977,16 +987,16 @@ async function mutateRun(run, method, title) {
 
 function stageDotState(state) {
   if (state === "completed") return "ok";
-  if (state === "failed" || state === "unresolved") return "bad";
-  if (["waiting", "running"].includes(state)) return "run";
+  if (state === "failed") return "bad";
+  if (["waiting", "running", "unresolved"].includes(state)) return "run";
   // Upstream-blocked and not-run stages stay neutral: nothing failed here.
   return "idle";
 }
 
 function runDotState(state) {
   if (state === "success") return "ok";
-  if (state === "failed" || state === "unresolved") return "bad";
-  if (state === "running") return "run";
+  if (state === "failed") return "bad";
+  if (["waiting", "running", "unresolved"].includes(state)) return "run";
   return "idle";
 }
 
@@ -1055,8 +1065,8 @@ function inlineValue(value) {
 
 function stateKind(state) {
   if (state === "completed" || state === "passed" || state === "success") return "ok";
-  if (state === "failed" || state === "unresolved") return "bad";
-  if (["waiting", "running"].includes(state)) return "run";
+  if (state === "failed") return "bad";
+  if (["waiting", "running", "unresolved"].includes(state)) return "pending";
   return "";
 }
 
@@ -1463,6 +1473,7 @@ function renderStageDetail() {
   }
   const stage = state.stages[state.selectedStage];
   if (!stage) return;
+  const shownState = displayState(stage.state, state.lastRun?.automatic);
 
   const summary = document.createElement("div");
   summary.className = "stage-summary";
@@ -1471,8 +1482,8 @@ function renderStageDetail() {
   const title = document.createElement("strong");
   title.textContent = stage.name;
   const chip = document.createElement("span");
-  chip.className = `chip ${stateKind(stage.state)}`.trim();
-  chip.textContent = stage.stateLabel;
+  chip.className = `badge ${stateKind(shownState)}`.trim();
+  chip.textContent = shownState !== stage.state ? RUN_STATES[shownState] : stage.stateLabel;
   head.append(title, chip);
   summary.append(head);
   const counts = document.createElement("p");
@@ -1825,7 +1836,7 @@ function buildActivityCard(view) {
   const dot = document.createElement("span");
   dot.className = `dot ${view.state === "busy" || view.state === "queued" ? "run" : "idle"}`;
   const title = document.createElement("strong");
-  title.textContent = view.final ? "Last activity" : "Live activity";
+  title.textContent = view.final ? "Last activity" : view.state === "waiting" ? "Execution status" : "Live activity";
   const chip = document.createElement("span");
   chip.className = `chip ${view.state === "busy" ? "running" : view.state === "queued" ? "queued" : "blocked"}`;
   chip.textContent = view.stateText;
@@ -1888,14 +1899,20 @@ function renderActivity(run) {
   overview.textContent = "";
   stageHost.textContent = "";
   if (!run || run.dag_run_id !== state.dagRunId) return;
-  const view = activityView(run.activity, { runState: run.state, nowMs: Date.now() });
+  const view = activityView(run.activity, {
+    runState: displayState(run.state, run.automatic),
+    waitingMessage: run.automatic?.message || "",
+    nowMs: Date.now(),
+  });
   if (view.visible) overview.append(buildActivityCard(view));
   const selected = Array.isArray(state.stages) && Number.isInteger(state.selectedStage)
     ? state.stages[state.selectedStage] || null
     : null;
   const mode = activityPlacement(view, {
     stageId: selected ? selected.id : "",
-    stageRunning: Boolean(selected && selected.state === "running"),
+    stageRunning: Boolean(
+      selected && ["running", "waiting"].includes(displayState(selected.state, run.automatic)),
+    ),
     stageFailed: Boolean(selected && selected.state === "failed"),
   });
   if (mode === "live" || mode === "final") {
@@ -1914,12 +1931,13 @@ function renderStepper() {
   const stepper = $("stages");
   stepper.textContent = "";
   state.stages.forEach((stage, index) => {
+    const shownState = displayState(stage.state, state.lastRun?.automatic);
     const step = document.createElement("button");
     step.type = "button";
-    step.className = `step ${stage.state || ""}${index === state.selectedStage ? " selected" : ""}`.trim();
+    step.className = `step ${shownState || ""}${index === state.selectedStage ? " selected" : ""}`.trim();
     step.setAttribute("aria-pressed", index === state.selectedStage ? "true" : "false");
     const dot = document.createElement("span");
-    dot.className = `dot ${stageDotState(stage.state)}`;
+    dot.className = `dot ${stageDotState(shownState)}`;
     const label = document.createElement("span");
     label.className = "step-label";
     label.textContent = stage.name || stage.id;
@@ -1927,7 +1945,7 @@ function renderStepper() {
     meta.className = "step-meta";
     if (!Number.isFinite(stage.total) || stage.total <= 0) {
       // No recorded checks: a short neutral state word instead of a failed percentage.
-      meta.textContent = STEP_STATE_SHORT[stage.state] || stage.stateLabel;
+      meta.textContent = STEP_STATE_SHORT[shownState] || stage.stateLabel;
     } else {
       meta.textContent = `${Number.isFinite(stage.passed) ? stage.passed : 0}/${stage.total} passed`;
     }
@@ -2193,8 +2211,8 @@ function renderRun(run) {
   const deleted = resolveDeleted(run, listEntry);
   const customTitle = resolveTitle(run, listEntry);
   $("run-heading").textContent = customTitle || assemblyLabel(run.main_assembly) || "Engineering delivery";
-  $("run-state-label").textContent = RUN_STATES[run.state] || run.state || "State unconfirmed";
-  $("run-dot").className = `dot ${runDotState(run.state)}`;
+  $("run-state-label").textContent = RUN_STATES[displayState(run.state, run.automatic)] || run.state || "State unconfirmed";
+  $("run-dot").className = `dot ${runDotState(displayState(run.state, run.automatic))}`;
   $("run-initiator").textContent = `Initiator: ${run.operator || run.user || "not recorded"}`;
   const deletedTag = $("run-deleted");
   const deletedAt = run.deleted_at || (listEntry && listEntry.deleted_at) || null;
@@ -2239,7 +2257,7 @@ function renderRun(run) {
   const report = run.report && Array.isArray(run.report.stages) ? run.report : null;
   const coverage = run.coverage || {};
   const rows = [
-    ["State", RUN_STATES[run.state] || run.state || "—"],
+    ["State", RUN_STATES[displayState(run.state, run.automatic)] || run.state || "—"],
     ["Started", formatTime(run.started_at)],
     ["Ended", formatTime(run.ended_at)],
   ];
@@ -2277,7 +2295,9 @@ function renderRun(run) {
   }
 
   const headline = $("run-headline");
-  const headlineText = report && report.overall ? report.overall.headline : "";
+  const headlineText = run.automatic?.state === "waiting" && report?.overall?.state === "unresolved"
+    ? run.automatic.message
+    : report?.overall?.headline || "";
   headline.textContent = headlineText || "";
   headline.hidden = !headlineText;
   const failureCard = $("failure-card");
@@ -2718,17 +2738,19 @@ async function poll() {
     if (!ownsRead()) return;
     responseRunId(run, dagRunId);
     setError($("run-error-detail"), "");
-    const verified = run.automatic && run.automatic.state === "passed";
-    const diagnosable = !verified && ["failed", "unresolved"].includes(run.state);
-    if (!verified && !diagnosable) clearPreview();
+    const previewReady = hasPreviewEvidence(run);
+    if (!previewReady) clearPreview();
     const previous = state.lastRun;
     state.lastRun = run;
     renderRun(run);
-    if (verified || diagnosable) await loadPreview(dagRunId);
+    if (previewReady) await loadPreview(dagRunId);
     if (!ownsRead()) return;
     // Keep canonical polling after terminal states so a late conflict can revoke success.
-    if (["success", "failed", "cancelled", "unresolved"].includes(run.state)) stopActivityTimer();
-    else startActivityTimer();
+    if (["success", "failed", "cancelled", "unresolved"].includes(displayState(run.state, run.automatic))) {
+      stopActivityTimer();
+    } else {
+      startActivityTimer();
+    }
     if (shouldRefreshRunList(previous, run)) await refreshRuns();
   } catch (error) {
     if (!ownsRead()) return;

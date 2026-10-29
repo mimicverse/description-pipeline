@@ -563,6 +563,8 @@ Windows 恢复回传实际读取的 state 对象，由 Linux 按唯一排序紧�
 <a id="exchange"></a>
 ## 原生交换协议
 
+分组物性的 `selection` 是原生 `SelectedItems` 的规范化选择列表，不是计划叶实例的逐项副本。Windows producer、Linux 接纳与投影共用 `top_most_providers+uncovered_leaves` 规则：仅从当次原生 effective 物性记录取得 provider，要求其绑定实际 occurrence；以完整子树覆盖所属组，并补入未覆盖叶实例。计划组必须无重叠且完整覆盖 source scopes，provider 不得跨组、部分覆盖或指向未知实例。实际选择须精确等于规则所得排序列表，拒绝重复、漏项和额外对象。raw 与原件摘要不变；独立 Verify 仍自行复算物性贡献与父子覆盖，不以 producer 的成功标志或投影为答案。
+
 Linux 是工程任务的唯一发起者。Windows 接口只提供健康查询，以及 canonical native
 operation 的 create、upload、get/status、resume、cancel 与 ACK；Capture 仍以
 prepared/Discover producer 校验、sealed archive/receipt 消费和独立
@@ -671,6 +673,8 @@ raw/STL 一致性证明本次原始三角事实到交付的派生一致性，不
 独立参考回归，不是生产或正式发布前置；当前 CAD 的独立工程检查继续执行。
 
 ### 原生外观读数与交付
+
+`IRenderMaterial.GetEntities` 成功返回 null 时，采集端才补读同一材质的 `GetEntitiesCount`，在 raw 材质记录中保留 `native_entity_count` 及既有通道中的读取错误。只有原生计数严格为整数0、原始实体字段明确为null、entity records为空且两个getter均无错误，才证明该材质没有应用实体；不能以颜色相同、其他覆盖或猜测跳过。正常实体数组不重复读取计数，含null元素的非空数组不能当作空数组。Generate与独立Verify各自核验该证据；缺字段、未知、正计数、getter错误和矛盾仍拒绝。旧失败原始数据不补写新事实。
 
 `appearance_raw` 保留 document、occurrence、body、face、feature 和 display-state 的原生观察、实际 API 与参数、原值、配置、对象绑定及读取错误。document 与 face 的无参 active-configuration 属性只在实际 active 与实例 referenced configuration 相同时采用；各顶层、祖先与 leaf owner 使用自己的配置和显示状态。不得以多个旧层颜色相同替代未读覆盖层。
 

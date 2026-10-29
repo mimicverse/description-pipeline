@@ -6,7 +6,7 @@ import copy
 import unittest
 from datetime import UTC, datetime, timedelta
 
-from description_pipeline.orchestration.portal import PortalApp, _automatic_summary
+from description_pipeline.orchestration.portal import PortalApp, _activity_summary, _automatic_summary
 from description_pipeline.orchestration.run_ownership import registered_recovery_block
 
 NOW = datetime(2026, 10, 29, 7, 30, tzinfo=UTC)
@@ -50,6 +50,30 @@ def pending_projection() -> dict:
 
 
 class PortalVerificationStatusTests(unittest.TestCase):
+    def test_authorized_wait_keeps_only_recorded_activity_without_changing_job(self) -> None:
+        projection = pending_projection()
+        app = PortalApp.__new__(PortalApp)
+        job = app._fact_display_job(projection)
+        automatic = _automatic_summary(job, projection, now=NOW)
+        self.assertEqual(_activity_summary(job, automatic)["state"], "waiting")
+        self.assertFalse(_activity_summary(job, automatic)["available"])
+        job["activity"] = {
+            "phase": "capture",
+            "action": "geometry_facts",
+            "completed": 1,
+            "total": 111,
+            "updated_at": NOW.isoformat(),
+        }
+        before = copy.deepcopy(job)
+        activity = _activity_summary(job, automatic)
+        self.assertEqual(activity["state"], "busy")
+        self.assertTrue(activity["available"])
+        self.assertEqual(activity["counts"], {"done": 1, "total": 111})
+        self.assertEqual(job, before)
+        self.assertEqual(_activity_summary(job, {"state": "unresolved"})["state"], "none")
+        job["status"] = "failed"
+        self.assertEqual(_activity_summary(job, {"state": "failed"})["state"], "finished")
+
     def summary(self, projection: dict) -> dict:
         app = PortalApp.__new__(PortalApp)
         return _automatic_summary(app._fact_display_job(projection), projection, now=NOW)

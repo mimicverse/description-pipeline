@@ -55,21 +55,23 @@ console.log("run_history_logic_test OK");
 // Exercise the actual polling consumer across a late conflict without a manual list refresh.
 const appSource = readFileSync(path.join(here, "..", "..", "src", "description_pipeline", "orchestration", "static", "app.js"), "utf8");
 const pollSource = appSource.match(/async function poll\(\) \{[\s\S]*?\n\}/)[0];
+const displayState = new Function(`return (${appSource.match(/function displayState\(rawState, automatic\) \{[\s\S]*?\n\}/)[0]});`)();
+const hasPreviewEvidence = new Function(`return (${appSource.match(/function hasPreviewEvidence\(run\) \{[\s\S]*?\n\}/)[0]});`)();
 const browserState = { dagRunId: "run-3", lastRun: { state: "success" }, timer: 17 };
 const displayedList = [{ dag_run_id: "run-3", state: "success" }];
 let nextRun = { dag_run_id: "run-3", state: "success", automatic: { state: "passed" } };
 let refreshes = 0;
 let previewLoads = 0;
-const poll = new Function("state", "api", "$", "setError", "clearPreview", "renderRun", "loadPreview", "stopActivityTimer", "shouldRefreshRunList", "refreshRuns", "window", "responseRunId", `return (${pollSource});`)(
+const poll = new Function("state", "api", "$", "setError", "clearPreview", "renderRun", "loadPreview", "stopActivityTimer", "shouldRefreshRunList", "refreshRuns", "window", "responseRunId", "displayState", "hasPreviewEvidence", "startActivityTimer", `return (${pollSource});`)(
   browserState, async () => nextRun, () => ({}), () => {}, () => {}, () => {}, async () => { previewLoads++; }, () => {},
   shouldRefreshRunList, async () => { refreshes++; displayedList[0].state = nextRun.state; },
   { clearTimeout() {}, setTimeout: () => 17 },
-  (payload) => payload.dag_run_id,
+  (payload) => payload.dag_run_id, displayState, hasPreviewEvidence, () => {},
 );
 await poll();
 assert.equal(browserState.timer, 17);
 assert.equal(refreshes, 0);
-nextRun = { dag_run_id: "run-3", state: "unresolved", automatic: { state: "unresolved" } };
+nextRun = { dag_run_id: "run-3", state: "unresolved", automatic: { state: "unresolved" }, verification_reports: [{path: "verification-certificate.json"}] };
 await poll();
 assert.equal(displayedList[0].state, "unresolved");
 assert.equal(refreshes, 1);
