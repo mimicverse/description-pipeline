@@ -1098,26 +1098,107 @@ def _findings(job: dict | None) -> list[dict]:
     return findings
 
 
-def _automatic_summary(job: dict | None) -> dict:
+def _waiting_for_effect_results(projection: dict, now: datetime) -> bool:
+    """Describe authorized or yielded waits without changing their UNKNOWN safety state."""
+    technical = projection.get("technical") or {}
+    effects = [
+        row
+        for row in technical.get("effects", ())
+        if isinstance(row, Mapping) and row.get("state") in {"unknown", "conflict"}
+    ]
+    if not effects:
+        return False
+    claims = {
+        row.get("claim_id"): row
+        for row in technical.get("claims", ())
+        if isinstance(row, Mapping)
+    }
+    for effect in effects:
+        if effect.get("state") != "unknown":
+            return False
+        fact = effect.get("decisive_fact") or {}
+        if fact.get("fact_type") not in {"dispatch_authorized", "resume_authorized"}:
+            return False
+        claim = claims.get(fact.get("claim_id")) or {}
+        if (
+            claim.get("command_id") != effect.get("command_id")
+            or claim.get("fence") != fact.get("fence")
+        ):
+            return False
+        if claim.get("closed_at") is not None:
+            if (
+                claim.get("closure_code") == "yielded"
+                and claim.get("yield_effect_id") == effect.get("effect_id")
+            ):
+                continue
+            return False
+        expiry = claim.get("expires_at")
+        if isinstance(expiry, str):
+            try:
+                expiry = datetime.fromisoformat(expiry)
+            except ValueError:
+                return False
+        if (
+            not isinstance(expiry, datetime)
+            or expiry.tzinfo is None
+            or expiry <= now
+        ):
+            return False
+    return True
+
+
+def _automatic_summary(
+    job: dict | None,
+    projection: dict | None,
+    *,
+    now: datetime | None = None,
+) -> dict:
+    """Summarize recorded checks without turning missing verification into failure."""
     if not isinstance(job, dict):
-        return {"state": "pending", "job_state": "pending", "checks": []}
+        return {
+            "state": "pending",
+            "job_state": "pending",
+            "checks": [],
+        }
+    projection = projection if isinstance(projection, dict) else {}
+    stages = projection.get("stages") or {}
+    verify = stages.get("verify") or {}
+    verification_not_started = (
+        not verify.get("decision")
+        and verify.get("state") not in {"active", "unresolved"}
+    )
     status = str(job.get("status") or "pending")
     result = job.get("result") if isinstance(job.get("result"), dict) else {}
     discovery = job.get("discovery") if isinstance(job.get("discovery"), dict) else {}
-    checks = []
-    quality = result.get("quality")
-    if isinstance(quality, dict):
-        checks = [check for check in quality.get("checks") or [] if isinstance(check, dict)]
+    quality = result.get("quality") if isinstance(result.get("quality"), dict) else {}
+    checks = [check for check in quality.get("checks") or [] if isinstance(check, dict)]
+    if status == "unresolved":
+        waiting = _waiting_for_effect_results(projection, now or datetime.now(UTC))
+        message = (
+            "An authorized execution is awaiting its recorded external result"
+            if waiting
+            else "External results are unresolved; reconcile the recorded effects before retrying"
+        )
+        if verification_not_started:
+            message += "; independent verification has not started"
+        return {
+            "state": "waiting" if waiting else "unresolved",
+            "job_state": status,
+            "checks": checks,
+            "message": message,
+        }
     try:
         verified_result(result)
-    except ResultNotPublishable as error:
-        message = str(error)
+    except ResultNotPublishable:
+        pass
     else:
-        if result.get("scope_kind") == "diagnostic" or result.get("formal_eligible") is False:
-            message = "The mechanical verification result has no formal checkpoint qualification"
-        else:
+        if result.get("scope_kind") != "diagnostic" and result.get("formal_eligible") is not False:
             # A verified model stays previewable even when the PR service failed afterwards.
-            return {"state": "passed", "job_state": status, "checks": checks}
+            return {
+                "state": "passed",
+                "job_state": status,
+                "checks": checks,
+            }
     if discovery.get("passed") is False:
         digest = str(discovery.get("discovery_sha256") or "")
         discovery_checks = [
@@ -1135,20 +1216,60 @@ def _automatic_summary(job: dict | None) -> dict:
             "state": "failed",
             "job_state": status,
             "checks": discovery_checks,
-            "message": "Native CAD discovery failed; correct the engineering source for each finding",
+            "message": "Native CAD discovery failed; independent verification has not started",
         }
     if status == "failed":
-        return {"state": "failed", "job_state": status, "checks": checks, "message": message}
-    if status in {"queued", "running", "native_complete"}:
-        # native_complete ends the native half only: the portable half is still the
-        # pipeline's remaining work, so the automatic view stays in progress instead of
-        # surfacing a terminal verdict or a raw protocol message.
+        message = str(job.get("error") or "A recorded automatic check failed")
+        if verification_not_started:
+            message += "; independent verification has not started"
         return {
-            "state": "queued" if status == "queued" else "running",
+            "state": "failed",
             "job_state": status,
             "checks": checks,
+            "message": message,
         }
-    return {"state": "unverified", "job_state": status, "checks": checks, "message": message}
+    if status == "cancelled":
+        return {
+            "state": "cancelled",
+            "job_state": status,
+            "checks": checks,
+            "message": "The run was cancelled; no completed independent verification result is available",
+        }
+    if quality.get("passed") is True:
+        return {
+            "state": "unverified",
+            "job_state": status,
+            "checks": checks,
+            "message": "The mechanical verification result has no formal checkpoint qualification",
+        }
+    if status in {"pending", "queued", "running", "native_complete"}:
+        active = any(
+            row.get("state") == "active"
+            for row in stages.values()
+            if isinstance(row, Mapping)
+        )
+        if status == "queued":
+            state = "queued"
+        elif active or (not stages and status in {"running", "native_complete"}):
+            state = "running"
+        else:
+            state = "pending"
+        return {
+            "state": state,
+            "job_state": status,
+            "checks": checks,
+            "message": (
+                "Independent verification has not started"
+                if verification_not_started
+                else "Independent verification is in progress"
+            ),
+        }
+    return {
+        "state": "unverified",
+        "job_state": status,
+        "checks": checks,
+        "message": "No formal independent verification result is available",
+    }
 
 
 def _canonical_native_status(projection: dict | None) -> str | None:
@@ -2250,7 +2371,7 @@ class PortalApp:
             "verification_reports": self._verification_report_links(dag_run_id, projection),
             "findings": _findings(display_job),
             "activity": activity_view(display_job),
-            "automatic": _automatic_summary(display_job),
+            "automatic": _automatic_summary(display_job, projection),
             "coverage": _coverage_report(display_job, report),
             "pr": pr,
             "endpoint_error": endpoint_error,

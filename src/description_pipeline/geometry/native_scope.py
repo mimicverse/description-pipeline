@@ -75,10 +75,18 @@ NATIVE_SOURCE_SCOPE_RULE = "native-open-edge-scope-binding-v1"
 NATIVE_SCOPE_IDENTITY_RULE = "native-scope-entity-id-v2"
 NATIVE_SCOPE_LOCAL_IDENTITY_DERIVED = "cad_scope_local_identity_derived"
 NATIVE_TRIANGLE_STL_DERIVED = "cad_native_triangle_stl_derived"
+NATIVE_SHEET_DISPLAY_GAP = "cad_native_sheet_face_no_saved_display_triangles"
+NATIVE_SHEET_DISPLAY_GAP_MESSAGE = (
+    "A native sheet face has no saved display triangles: GetTessTriangles(True) "
+    "successfully returned null or an empty array, GetTessTriangleCount returned "
+    "integer zero, and GetArea returned a finite nonnegative area. No triangles "
+    "are reconstructed; complete CAD-surface coverage is not qualified."
+)
 NATIVE_SCOPE_IDENTITY_WARNING_CODES = frozenset({NATIVE_SCOPE_LOCAL_IDENTITY_DERIVED})
 NATIVE_GATE_WARNING_CODES = NATIVE_SCOPE_IDENTITY_WARNING_CODES | frozenset(
     {
         NATIVE_TRIANGLE_STL_DERIVED,
+        NATIVE_SHEET_DISPLAY_GAP,
     }
 )
 _HEX64 = re.compile(r"[0-9a-f]{64}")

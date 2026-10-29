@@ -83,7 +83,7 @@ class PortalSplitTests(unittest.TestCase):
         self.assertEqual(assessment.reason, "sealed_evidence_reimport")
         self.assertEqual(assessment.classification, "evidence_corruption")
         self.assertIn("capture", assessment.cleared_tasks)
-        self.assertEqual(portal_module._automatic_summary(job)["state"], "running")
+        self.assertEqual(portal_module._automatic_summary(job, None)["state"], "running")
 
         session = portal_module.PortalSession(
             session_id="sid",

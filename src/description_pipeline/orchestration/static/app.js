@@ -121,7 +121,10 @@ const PREREQ_STATE = { ok: "ready", invalid: "unavailable", absent: "missing", c
 const AUTOMATIC_STATES = {
   passed: "Automatic checks passed",
   failed: "Automatic checks failed",
-  unverified: "Independent verification failed",
+  unverified: "No formal verification qualification",
+  waiting: "Awaiting external result",
+  unresolved: "External result needs reconciliation",
+  cancelled: "Run cancelled before verification completed",
   pending: "Waiting for automatic checks",
   queued: "Queued",
   running: "Checking",
@@ -381,6 +384,10 @@ function responseRunId(payload, expected = null) {
     throw error;
   }
   return runId;
+}
+
+function automaticStateKind(state) {
+  return state === "passed" ? "ok" : state === "failed" ? "bad" : "pending";
 }
 
 function updateStartEnabled() {
@@ -2317,7 +2324,7 @@ function renderRun(run) {
   const automatic = $("automatic");
   automatic.textContent = "";
   const automaticState = (run.automatic && run.automatic.state) || "pending";
-  const automaticKind = automaticState === "passed" ? "ok" : automaticState === "failed" || automaticState === "unverified" ? "bad" : "pending";
+  const automaticKind = automaticStateKind(automaticState);
   const chipRow = document.createElement("div");
   chipRow.className = "chip-row";
   chipRow.append(badge(AUTOMATIC_STATES[automaticState] || automaticState, automaticKind));

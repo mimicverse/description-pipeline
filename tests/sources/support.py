@@ -221,7 +221,6 @@ def fixture_native_geometry(
         "triangle_values": values,
         "body_inventory": body_inventory,
         "face_inventory": face_inventory,
-        "empty_faces": [],
         "errors": [],
         "faces": 6,
         "units": "m",

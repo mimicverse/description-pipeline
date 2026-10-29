@@ -20,6 +20,8 @@ from .native_scope import (
     NATIVE_SCOPE_IDENTITY_RULE,
     NATIVE_SCOPE_LOCAL_IDENTITY_DERIVED,
     NATIVE_TRIANGLE_STL_DERIVED,
+    NATIVE_SHEET_DISPLAY_GAP,
+    NATIVE_SHEET_DISPLAY_GAP_MESSAGE,
     native_binary64_unit_vector,
     native_scope_identity_sha256,
     native_source_scope_is_valid,
@@ -52,6 +54,39 @@ def _binary32(value: float) -> float:
 
 def _binary32_point(point: Sequence[float]) -> tuple[float, float, float]:
     return tuple(_binary32(value) for value in point)  # type: ignore[return-value]
+
+
+def native_zero_triangle_evidence_is_valid(body_type: object, evidence: object) -> bool:
+    """Validate exact successful same-face API readings without an area threshold."""
+
+    return (
+        type(body_type) is int
+        and body_type == 1
+        and isinstance(evidence, dict)
+        and set(evidence) == {
+            "get_tess_triangles_return", "get_tess_triangle_count", "get_area_m2",
+        }
+        and evidence["get_tess_triangles_return"] in ("null", "empty_array")
+        and type(evidence["get_tess_triangle_count"]) is int
+        and evidence["get_tess_triangle_count"] == 0
+        and _finite_float(evidence["get_area_m2"])
+        and evidence["get_area_m2"] >= 0
+    )
+
+
+def native_display_gap_value_warnings(warnings: Sequence[dict]) -> list[dict]:
+    """Project the verified face gaps into the existing model warning contract."""
+
+    objects = [
+        {"object": warning["object"], **warning["detail"]}
+        for warning in warnings
+        if warning.get("code") == NATIVE_SHEET_DISPLAY_GAP
+    ]
+    return ([{
+        "code": NATIVE_SHEET_DISPLAY_GAP,
+        "message": NATIVE_SHEET_DISPLAY_GAP_MESSAGE,
+        "objects": objects,
+    }] if objects else [])
 
 
 def native_triangle_relative_path(raw_sha: str) -> str:
@@ -330,14 +365,19 @@ def materialize_native_stl(
     next_start = 0
     for span in ordered:
         _require(
-            span["triangle_start"] == next_start and _integer(span["triangle_count"]) and span["triangle_count"] > 0,
-            "native face spans are not a positive contiguous triangle partition",
+            span["triangle_start"] == next_start and _integer(span["triangle_count"])
+            and span["triangle_count"] >= 0
+            and (span["triangle_count"] > 0 or native_zero_triangle_evidence_is_valid(
+                span.get("body_type"), span.get("zero_triangle_evidence"),
+            )),
+            "native face spans are not a complete contiguous triangle partition",
         )
         next_start += span["triangle_count"]
     _require(next_start == triangle_count, "native face spans do not cover the raw triangle stream")
 
     target = Path(_physical_path(stl_path))
     target.parent.mkdir(parents=True, exist_ok=True)
+    ordered = [span for span in ordered if span["triangle_count"] > 0]
     span_index = 0
     local_triangle = 0
     with target.open("xb") as stream:
@@ -487,7 +527,7 @@ def build_native_tessellation(
                 "face_index",
                 "triangle_start",
                 "triangle_count",
-            },
+            } | ({"zero_triangle_evidence"} if span.get("triangle_count") == 0 else set()),
             f"{component}: raw native face inventory has an unknown shape",
         )
         _require(
@@ -632,7 +672,7 @@ def parse_native_tessellation(
                 "face_reference_sha256",
                 "triangle_start",
                 "triangle_count",
-            },
+            } | ({"zero_triangle_evidence"} if span.get("triangle_count") == 0 else set()),
             f"{component}: native face span {span_index} has an unknown shape",
         )
         key = (span["body_type"], span["body_index"])
@@ -642,7 +682,10 @@ def parse_native_tessellation(
             and span["face_index"] == face_counts[key]
             and span["triangle_start"] == next_start
             and _integer(span["triangle_count"])
-            and span["triangle_count"] > 0,
+            and span["triangle_count"] >= 0
+            and (span["triangle_count"] > 0 or native_zero_triangle_evidence_is_valid(
+                span["body_type"], span.get("zero_triangle_evidence"),
+            )),
             f"{component}: native face spans are not a complete ordered partition",
         )
         owner_scope_key = _scope_owner_key(source_scope_sha256, *key)
@@ -651,6 +694,26 @@ def parse_native_tessellation(
             span["face_reference_sha256"] == reference,
             f"{component}: native face reference differs from its sealed scope",
         )
+        if span["triangle_count"] == 0:
+            warnings.append({
+                "code": NATIVE_SHEET_DISPLAY_GAP,
+                "blocking": False,
+                "severity": "warning",
+                "message": NATIVE_SHEET_DISPLAY_GAP_MESSAGE,
+                "object": f"{component}:face:{key[0]}/{key[1]}/{span['face_index']}",
+                "detail": {
+                    "component": component,
+                    "field": "geometry.tessellation.face_spans",
+                    "body_type": key[0],
+                    "body_index": key[1],
+                    "face_index": span["face_index"],
+                    "face_reference_sha256": reference,
+                    "source_scope_sha256": source_scope_sha256,
+                    "triangle_start": span["triangle_start"],
+                    "triangle_count": 0,
+                    "zero_triangle_evidence": dict(span["zero_triangle_evidence"]),
+                },
+            })
         face_counts[key] += 1
         next_start += span["triangle_count"]
         result.append({**span, "face_owner_id": span_index + 1})

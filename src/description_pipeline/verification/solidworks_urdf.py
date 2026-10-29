@@ -23,9 +23,11 @@ import numpy as np
 from ..native_transfer import load_native_receipts
 from ..delivery import PIPELINE_ID, read_delivery_manifest, read_source_record, subject_digest
 from ..geometry import stl
-from ..geometry.native_tessellation import native_stl_subset
+from ..geometry.native_tessellation import native_stl_subset, native_display_gap_value_warnings
 from ..geometry.native_scope import (
     NATIVE_SCOPE_IDENTITY_WARNING_CODES,
+    NATIVE_SHEET_DISPLAY_GAP,
+    NATIVE_SHEET_DISPLAY_GAP_MESSAGE,
     native_scope_warning_diagnostics_are_complete,
     native_warning_projection,
 )
@@ -2011,7 +2013,7 @@ def evaluate_bundle(
         )
     if model is not None:
         for warning in (model.get("provenance") or {}).get("value_warnings") or []:
-            if isinstance(warning, dict) and warning.get("code"):
+            if isinstance(warning, dict) and warning.get("code") != NATIVE_SHEET_DISPLAY_GAP and warning.get("code"):
                 warning_detail = warning.get("detail")
                 warning_objects = warning.get("objects") or []
                 diagnostics.append(
@@ -2163,6 +2165,12 @@ def qualifications(root, definition, checks):
             row = rows.get(fact["check"])
             status = "established" if row is not None and row["passed"] else "unqualified"
         records = _QUALIFICATION_EVIDENCE.get(fact_id, ("input/handoff.json",))
+        if fact_id == "geometry.native_tessellation" and any(
+            warning.get("code") == NATIVE_SHEET_DISPLAY_GAP
+            for warning in (rows.get(fact["check"], {}).get("details") or {}).get("warnings", [])
+        ):
+            status = "unqualified"
+            records = ("evidence/raw/native_capture_facts.json", "model/robot.json")
         evidence = []
         if all((root / record).is_file() for record in records):
             evidence = [{"record": record, "sha256": file_digest(root / record)} for record in records]
@@ -2272,6 +2280,7 @@ def _verify_model(
             model,
             carrier,
             native_geometry_rows=native_geometry_rows,
+            native_geometry_warnings=(native_geometry or {}).get("warnings", []),
             raw_scene=raw,
             native_appearance=native_appearance,
             metadata_warnings=metadata_warnings,
@@ -2539,6 +2548,7 @@ def _value_warning_gate(
     carrier=None,
     *,
     native_geometry_rows=None,
+    native_geometry_warnings=None,
     raw_scene=None,
     native_appearance=False,
     metadata_warnings=None,
@@ -2712,6 +2722,9 @@ def _value_warning_gate(
         for object_row in saved_state_warning["objects"]:
             add(saved_state_warning["code"], object_row)
     for warning in observation_warnings or []:
+        for object_row in warning["objects"]:
+            add(warning["code"], object_row)
+    for warning in native_display_gap_value_warnings(native_geometry_warnings or []):
         for object_row in warning["objects"]:
             add(warning["code"], object_row)
     for warning in cached_source_warnings:
@@ -3347,6 +3360,7 @@ def _value_warning_gate(
             "Link mass properties are transformed, translated or recombined from native readings."
         ),
         "units.si_conversion": "Delivered values use SI units after conversion from native CAD units.",
+        NATIVE_SHEET_DISPLAY_GAP: NATIVE_SHEET_DISPLAY_GAP_MESSAGE,
         METADATA_WARNING_CODE: METADATA_WARNING_MESSAGE,
         INPLACE_WARNING_CODE: INPLACE_WARNING_MESSAGE,
         CACHED_MATERIALIZATION_WARNING_CODE: CACHED_MATERIALIZATION_WARNING_MESSAGE,

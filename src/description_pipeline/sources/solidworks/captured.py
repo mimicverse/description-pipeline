@@ -106,6 +106,7 @@ def derive_engineering_input(
     masses = projected["scene"].mass_properties
     datums = raw["coordinate_systems"]
     link_groups = projected["link_group_mass_properties"]
+    native_geometry_warnings: list[dict] = []
     geometry = list(
         materialize_native_geometry(
             observation["geometry_raw"],
@@ -113,6 +114,7 @@ def derive_engineering_input(
             evidence_root=root,
             destination_root=mesh_root,
             verified_streams=verified_streams,
+            warnings=native_geometry_warnings,
         ).values()
     )
     from .appearance import bind_capture_appearance
@@ -263,6 +265,8 @@ def derive_engineering_input(
         if isinstance(item, dict)
     ):
         raise PipelineError("Saved-state source warning was emitted twice")
+    from ...geometry.native_tessellation import native_display_gap_value_warnings
+
     provenance["value_warnings"] = [
         *existing,
         *inplace_observation_warnings(payload.get("raw") or {}),
@@ -273,5 +277,6 @@ def derive_engineering_input(
         *metadata_warnings,
         *([saved_state_warning] if saved_state_warning is not None else []),
         *cached_warnings,
+        *native_display_gap_value_warnings(native_geometry_warnings),
     ]
     return scene

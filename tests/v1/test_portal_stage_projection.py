@@ -61,7 +61,7 @@ class RegisteredStageProjectionTests(unittest.TestCase):
         job = app._fact_display_job(projection)
         self.assertFalse(job["formal_eligible"])
         self.assertFalse(job["result"]["quality"]["passed"])
-        self.assertNotEqual(_automatic_summary(job)["state"], "passed")
+        self.assertNotEqual(_automatic_summary(job, None)["state"], "passed")
         self.assertEqual(job["pr"]["url"], publication["pr_effect"]["observation"]["url"])
 
     def setUp(self) -> None:

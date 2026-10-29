@@ -18,6 +18,7 @@ from ...appearance_contract import (
     scoped_rgba,
 )
 from ...io import PipelineError
+from ...geometry.native_tessellation import native_zero_triangle_evidence_is_valid
 
 UNRECORDED_APPEARANCE = object()
 IMODELDOC2_IID = "{B90793FB-EF3D-4B80-A5C4-99959CDB6CEB}"
@@ -86,7 +87,8 @@ def appearance_groups(
             )
             or type(face.triangle_start) is not int
             or type(face.triangle_count) is not int
-            or face.triangle_count <= 0
+            or face.triangle_count < 0
+            or (face.triangle_count == 0 and face.body_type != 1)
             or face.triangle_start != next_triangle
             or len(face.rgba) != 4
             or any(
@@ -103,7 +105,8 @@ def appearance_groups(
             raise PipelineError("Resolved appearance repeats a delivered face")
         seen_faces.add(face.face_reference_sha256)
         next_triangle += face.triangle_count
-        by_rgba.setdefault(tuple(float(value) for value in face.rgba), []).append(face)
+        if face.triangle_count > 0:
+            by_rgba.setdefault(tuple(float(value) for value in face.rgba), []).append(face)
 
     groups = []
     for rgba, group_faces in by_rgba.items():
@@ -1476,7 +1479,10 @@ def resolve_deliverable_appearance(
             or key in face_by_key
             or span.get("triangle_start") != next_triangle
             or type(span.get("triangle_count")) is not int
-            or span.get("triangle_count") <= 0
+            or span.get("triangle_count") < 0
+            or (span["triangle_count"] == 0 and not native_zero_triangle_evidence_is_valid(
+                span.get("body_type"), span.get("zero_triangle_evidence"),
+            ))
             or not isinstance(reference, str)
             or len(reference) != 64
         ):

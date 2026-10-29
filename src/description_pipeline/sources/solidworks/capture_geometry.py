@@ -15,6 +15,7 @@ from ...geometry.native_tessellation import (
     build_native_tessellation,
     inspect_native_triangle_stream,
     materialize_native_stl,
+    native_zero_triangle_evidence_is_valid,
     native_stl_relative_path,
     native_triangle_relative_path,
     parse_native_tessellation,
@@ -77,14 +78,12 @@ def _geometry_facts(component: str, facts: object) -> dict:
     )
     _require(
         facts.get("state") == "observed"
-        and not facts.get("errors")
-        and not facts.get("empty_faces"),
+        and not facts.get("errors"),
         "prepared geometry is incomplete",
         {
             "component": component,
             "state": facts.get("state"),
             "errors": copy.deepcopy(facts.get("errors") or []),
-            "empty_faces": copy.deepcopy(facts.get("empty_faces") or []),
         },
     )
     _require(
@@ -205,7 +204,8 @@ def _validate_raw_inventory(
     seen_faces = set()
     for row in face_inventory:
         _require(
-            isinstance(row, dict) and set(row) == face_keys,
+            isinstance(row, dict) and set(row) == face_keys
+            | ({"zero_triangle_evidence"} if row.get("triangle_count") == 0 else set()),
             "raw face inventory has an unknown shape",
             {"component": component},
         )
@@ -222,7 +222,10 @@ def _validate_raw_inventory(
             and type(start) is int
             and type(count) is int
             and start == next_triangle
-            and count > 0,
+            and count >= 0
+            and (count > 0 or native_zero_triangle_evidence_is_valid(
+                body_type, row.get("zero_triangle_evidence"),
+            )),
             "raw face inventory is not contiguous",
             {"component": component},
         )
@@ -376,6 +379,7 @@ def materialize_native_geometry(
         VerifiedNativeTriangleStream,
     ]
     | None = None,
+    warnings: list[dict] | None = None,
 ) -> dict[str, dict]:
     """Materialize STL bytes after Capture admission from the sealed raw streams."""
 
@@ -452,6 +456,8 @@ def materialize_native_geometry(
             source_scope=source_scope,
             warnings=component_warnings,
         )
+        if warnings is not None:
+            warnings.extend(component_warnings)
         stl_directory = destination_root / "geometry"
         stl_directory.mkdir(parents=True, exist_ok=True)
         temporary = stl_directory / f".{component.casefold()}.partial.stl"

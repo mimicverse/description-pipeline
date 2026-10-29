@@ -490,21 +490,43 @@ def _publication_warning_text(certificate: Mapping[str, Any]) -> str:
     ]
     if not warnings:
         return ""
-    lines = ["", f"Verification warnings ({len(warnings)} recorded):"]
-    shown = 0
-    remaining = 48000
+    by_code: dict[str, list[dict]] = {}
     for item in warnings:
+        by_code.setdefault(item["code"], []).append(item)
+    lines = ["", f"Verification warnings ({len(warnings)} recorded):"]
+    lines.extend(f"- `{code}`: {len(rows)} records." for code, rows in sorted(by_code.items()))
+    lines.append("Complete object details are preserved in `reports/verification-certificate.json`.")
+    remaining = 48000 - sum(len(line) + 1 for line in lines)
+    shown = 0
+
+    def record_text(item):
         evidence = {key: value for key, value in item.items() if key not in {"code", "message"}}
-        block = (
+        return (
             f"- `{item['code']}`: {item.get('message') or ''}\n\n```json\n"
             + json.dumps(evidence, ensure_ascii=True, sort_keys=True, indent=2)
             + "\n```"
         )
-        if len(block) > remaining:
-            break
+
+    # Reserve a fair share for one located record of every category before
+    # repeated records can consume the detail budget.
+    for index, (_code, rows) in enumerate(sorted(by_code.items())):
+        block = record_text(rows[0])
+        allowance = remaining // (len(by_code) - index)
+        if len(block) > allowance:
+            prefix = f"- `{rows[0]['code']}` first record excerpt (full record in the certificate):\n\n```text\n"
+            suffix = "\n[record excerpt truncated]\n```"
+            payload = json.dumps(rows[0], ensure_ascii=True, sort_keys=True, indent=2)
+            block = prefix + payload[:max(0, allowance - len(prefix) - len(suffix))] + suffix
         lines.append(block)
         remaining -= len(block) + 1
         shown += 1
+    for _code, rows in sorted(by_code.items()):
+        for item in rows[1:]:
+            block = record_text(item)
+            if len(block) <= remaining:
+                lines.append(block)
+                remaining -= len(block) + 1
+                shown += 1
     if shown < len(warnings):
         lines.append(
             f"{len(warnings) - shown} additional warning records are preserved in the certificate; "

@@ -3519,7 +3519,7 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(status, 200, listed)
         row = next(row for row in json.loads(listed)["runs"] if row["dag_run_id"] == DAG_RUN_ID)
         self.assertEqual(row["state"], run["state"])
-        self.assertEqual(run["automatic"]["state"], "unverified")
+        self.assertEqual(run["automatic"]["state"], "unresolved")
 
         status, _, body = self.client.request(
             "GET",
@@ -4060,7 +4060,8 @@ class PortalTests(unittest.TestCase):
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
         self.assertEqual(status, 200, body)
         automatic = json.loads(body)["automatic"]
-        self.assertEqual(automatic["state"], "running")
+        self.assertEqual(automatic["state"], "pending")
+        self.assertIn("verification has not started", automatic["message"])
         self.assertEqual(automatic["job_state"], "running")
 
     def test_verified_model_without_pull_request_is_still_previewable(self) -> None:
@@ -4175,7 +4176,7 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(status, 200, body)
         payload = json.loads(body)
         self.assertEqual(payload["automatic"]["state"], "failed")
-        self.assertIn("quality is missing or not passed", payload["automatic"]["message"])
+        self.assertEqual(payload["automatic"]["message"], payload["job"]["error"])
         status, _, _ = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
         self.assertEqual(status, 409)
 

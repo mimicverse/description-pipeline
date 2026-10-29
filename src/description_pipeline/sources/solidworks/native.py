@@ -23,6 +23,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from ...geometry.native_scope import NATIVE_SOURCE_SCOPE_RULE
+from ...geometry.native_tessellation import native_zero_triangle_evidence_is_valid
 from ...geometry.native_transform import transform_from_solidworks as _shared_transform
 from ...io import _filesystem_path, _physical_path, file_digest
 from ...schemas import NATIVE_DISCOVERY_SCHEMA
@@ -6159,7 +6160,6 @@ class SolidWorksBackend(CadBackend):
                         "triangle_values": [],
                         "body_inventory": [],
                         "face_inventory": [],
-                        "empty_faces": [],
                         "errors": [],
                         "bodies": {"solid": 0, "sheet": 0},
                         "source_scope": source_scopes[component],
@@ -6197,7 +6197,6 @@ class SolidWorksBackend(CadBackend):
         values: list[float] = []
         spans: list[dict[str, object]] = []
         body_inventory: list[dict[str, object]] = []
-        empty_faces: list[dict[str, object]] = []
         errors: list[dict[str, object]] = []
         body_counts = {"solid": 0, "sheet": 0}
         face_count = 0
@@ -6639,13 +6638,12 @@ class SolidWorksBackend(CadBackend):
                             "GetTessTriangles",
                             True,
                         )
-                        if raw_values is None:
-                            raise ValueError(
-                                "GetTessTriangles returned null"
-                            )
-                        if not isinstance(raw_values, (list, tuple)):
+                        if raw_values is not None and not isinstance(raw_values, (list, tuple)):
                             raise TypeError("GetTessTriangles did not return an array")
-                        face_values = [_json_raw_value(value) for value in raw_values]
+                        face_values = [
+                            _json_raw_value(value) for value in
+                            (() if raw_values is None else raw_values)
+                        ]
                     except Exception as error:  # noqa: BLE001
                         errors.append(
                             {
@@ -6660,16 +6658,35 @@ class SolidWorksBackend(CadBackend):
                             }
                         )
                         continue
+                    zero_triangle_evidence = None
                     if not face_values:
-                        empty_faces.append(
-                            {
+                        zero_triangle_evidence = {
+                            "get_tess_triangles_return": (
+                                "null" if raw_values is None else "empty_array"
+                            ),
+                        }
+                        try:
+                            zero_triangle_evidence["get_tess_triangle_count"] = _json_raw_value(
+                                _method(face, "GetTessTriangleCount")
+                            )
+                            zero_triangle_evidence["get_area_m2"] = _json_raw_value(
+                                _method(face, "GetArea")
+                            )
+                            if not native_zero_triangle_evidence_is_valid(
+                                body_type, zero_triangle_evidence,
+                            ):
+                                raise ValueError("empty display face lacks valid sheet/count/area evidence")
+                        except Exception as error:  # noqa: BLE001 - retain exact failed API evidence
+                            errors.append({
                                 "body_type": body_type,
                                 "body_index": body_index,
                                 "body_name": body_name,
                                 "face_index": face_index,
-                            }
-                        )
-                        continue
+                                "api": "IFace2.GetTessTriangleCount/IFace2.GetArea",
+                                "zero_triangle_evidence": zero_triangle_evidence,
+                                "error": f"{type(error).__name__}: {error}"[:300],
+                            })
+                            continue
                     part_body_observations.append(part_body_observation)
                     count = len(face_values) // 9
                     values.extend(face_values)
@@ -6680,6 +6697,8 @@ class SolidWorksBackend(CadBackend):
                             "face_index": face_index,
                             "triangle_start": triangle_start,
                             "triangle_count": count,
+                            **({"zero_triangle_evidence": zero_triangle_evidence}
+                               if zero_triangle_evidence is not None else {}),
                         }
                     )
                 successful_body_observations = [
@@ -6785,7 +6804,7 @@ class SolidWorksBackend(CadBackend):
             )
         state = (
             "observed"
-            if not errors and not empty_faces and values
+            if not errors and values
             else "empty"
             if not values and not errors
             else "partial"
@@ -6801,7 +6820,6 @@ class SolidWorksBackend(CadBackend):
             "triangle_values": values,
             "body_inventory": body_inventory,
             "face_inventory": spans,
-            "empty_faces": empty_faces,
             "errors": errors,
             "faces": face_count,
             "units": "m",
