@@ -9,6 +9,8 @@ import math
 import unittest
 from pathlib import Path
 
+from description_pipeline.io import PipelineError
+from description_pipeline.verification.native_appearance import _resolved_faces
 from description_pipeline.sources.solidworks.appearance import (
     AppearanceError,
     _rgba_from_colorref,
@@ -544,6 +546,71 @@ class CaptureAppearanceBindingTests(unittest.TestCase):
 
 
 class AppearanceResolutionTests(unittest.TestCase):
+    def test_null_material_entities_require_an_observed_native_zero_count(self):
+        raw = _resolved_raw([[1.0, 0.0, 0.0, 1.0, 1.0, 0.5, 0.3125, 0.0, 0.0]])
+        owner = raw["state_render_materials"][0]
+        owner.update(call_state="observed", native_render_material_count=1)
+        material = {
+            "material_index": 0,
+            "linked_display_states": ["Display State 1"],
+            "entities": None,
+            "entities_state": "null_result",
+            "entity_records": [],
+            "native_entity_count": 0,
+            "read_errors": {},
+        }
+        owner["materials"] = [material]
+
+        def resolve(candidate):
+            return resolve_deliverable_appearance(
+                candidate,
+                component=COMPONENT,
+                expected_document_path=DOCUMENT,
+                expected_configuration=CONFIGURATION,
+                face_spans=[{
+                    "body_type": 0, "body_index": 0, "face_index": 0,
+                    "triangle_start": 0, "triangle_count": 1,
+                    "face_reference_sha256": "a" * 64,
+                }],
+            )
+
+        def independent(candidate):
+            return _resolved_faces(
+                candidate,
+                configuration=CONFIGURATION,
+                where="test appearance",
+                expected_component=COMPONENT,
+                expected_document_path=DOCUMENT,
+            )
+
+        self.assertEqual(resolve(raw).faces[0].rgba, (1.0, 0.0, 0.0, 1.0))
+        self.assertTrue(independent(raw))
+        for change in (
+            {"native_entity_count": None},
+            {"native_entity_count": True},
+            {"native_entity_count": -1},
+            {"native_entity_count": 1},
+            {"entity_records": [{}]},
+            {"entities": []},
+            {"entities_state": "error"},
+            {"read_errors": {"entity_count": {"message": "read failed"}}},
+            {"read_errors": {"entities": {"message": "read failed"}}},
+        ):
+            with self.subTest(change=change):
+                invalid = copy.deepcopy(raw)
+                invalid["state_render_materials"][0]["materials"][0].update(change)
+                with self.assertRaises(AppearanceError):
+                    resolve(invalid)
+                with self.assertRaises(PipelineError):
+                    independent(invalid)
+        for field in ("native_entity_count", "entities"):
+            invalid = copy.deepcopy(raw)
+            del invalid["state_render_materials"][0]["materials"][0][field]
+            with self.subTest(missing=field), self.assertRaises(AppearanceError):
+                resolve(invalid)
+            with self.subTest(missing=field), self.assertRaises(PipelineError):
+                independent(invalid)
+
     def test_part_conversion_evidence_is_required_and_target_specific(self):
         case = json.loads(PART_FACE_OVERRIDE_FIXTURE.read_text(encoding="utf-8"))
         raw = copy.deepcopy(case["raw"])

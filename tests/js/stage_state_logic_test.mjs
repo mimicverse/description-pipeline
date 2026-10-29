@@ -38,11 +38,11 @@ const stages = (...states) =>
 
 assert.equal(stageDotState("completed"), "ok");
 assert.equal(runDotState("failed"), "bad");
-assert.equal(runDotState("unresolved"), "bad");
+assert.equal(runDotState("unresolved"), "run");
 assert.equal(runDotState("cancelled"), "idle");
 assert.equal(runDotState("running"), "run");
 assert.equal(stageDotState("failed"), "bad");
-assert.equal(stageDotState("unresolved"), "bad");
+assert.equal(stageDotState("unresolved"), "run");
 assert.equal(stageDotState("cancelled"), "idle");
 assert.equal(stageDotState("blocked"), "idle");
 for (const state of ["waiting", "running"]) {
@@ -51,11 +51,11 @@ for (const state of ["waiting", "running"]) {
 
 assert.equal(stateKind("completed"), "ok");
 assert.equal(stateKind("failed"), "bad");
-assert.equal(stateKind("unresolved"), "bad");
+assert.equal(stateKind("unresolved"), "pending");
 assert.equal(stateKind("cancelled"), "");
 assert.equal(stateKind("blocked"), "");
 for (const state of ["waiting", "running"]) {
-  assert.equal(stateKind(state), "run");
+  assert.equal(stateKind(state), "pending");
 }
 
 assert.equal(
@@ -101,3 +101,14 @@ assert.equal(automaticStateKind("passed"), "ok");
 assert.match(automaticLabels.waiting, /Awaiting external result/);
 assert.match(automaticLabels.unresolved, /reconciliation/);
 console.log("verification readiness labels OK");
+
+const displayState = new Function(`return (${functionSource("displayState")});`)();
+const hasPreviewEvidence = new Function(`return (${functionSource("hasPreviewEvidence")});`)();
+assert.equal(displayState("unresolved", {state: "waiting"}), "waiting");
+assert.equal(displayState("unresolved", {state: "unresolved"}), "unresolved");
+assert.equal(displayState("failed", {state: "waiting"}), "failed");
+assert.equal(hasPreviewEvidence({state: "unresolved", automatic: {state: "waiting"}}), false);
+assert.equal(hasPreviewEvidence({state: "failed", automatic: {state: "failed"}}), false);
+assert.equal(hasPreviewEvidence({automatic: {state: "passed"}}), true);
+assert.equal(hasPreviewEvidence({state: "unresolved", verification_reports: [{path: "verification-certificate.json"}]}), true);
+console.log("display consistency and preview evidence OK");

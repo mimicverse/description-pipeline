@@ -449,3 +449,26 @@ for (const read of ["refreshRuns", "loadMoreRuns"]) {
   assert.equal(p.app.state.listRequest, null);
 }
 console.log("submission_flow_test OK");
+
+// Canonical UNKNOWN keeps polling and ticks only while its authorized wait is proven.
+for (const automaticState of ["waiting", "unresolved"]) {
+  const p = page(); let previews = 0;
+  p.app.state.dagRunId = "run-wait";
+  p.context.fetch = async () => response(200, {dag_run_id: "run-wait", state: "unresolved", automatic: {state: automaticState}, verification_reports: []});
+  p.context.loadPreview = async () => { previews++; };
+  await p.app.poll();
+  assert.equal(previews, 0);
+  assert.equal(p.timeouts.size, 1);
+  assert.equal(p.app.state.activityTimer !== null, automaticState === "waiting");
+}
+{
+  const p = page(); let previews = 0;
+  p.app.state.dagRunId = "run-failed";
+  p.context.fetch = async () => response(200, {dag_run_id: "run-failed", state: "failed", automatic: {state: "failed", message: "Capture failed"}, verification_reports: []});
+  p.context.loadPreview = async () => { previews++; };
+  await p.app.poll();
+  assert.equal(previews, 0);
+  assert.equal(p.app.state.activityTimer, null);
+  assert.equal(p.timeouts.size, 1);
+}
+console.log("unfinished preview and activity polling OK");

@@ -151,7 +151,7 @@ export function recentRows(activity) {
     .slice(0, 5);
 }
 
-export function activityView(activity, { runState = "", nowMs = Date.now() } = {}) {
+export function activityView(activity, { runState = "", waitingMessage = "", nowMs = Date.now() } = {}) {
   const record = activity && typeof activity === "object" ? activity : null;
   const rawState = record && typeof record.state === "string" ? record.state : "none";
   const available = Boolean(record && record.available === true);
@@ -174,7 +174,7 @@ export function activityView(activity, { runState = "", nowMs = Date.now() } = {
   };
   if (runState === "unresolved") {
     return {
-      ...empty, visible: true, final: true, state: "waiting",
+      ...empty, visible: true, state: "waiting",
       stateText: "Awaiting reconciliation",
       note: "External effects require reconciliation; prior activity does not prove current execution.",
       recent: recentRows(record || {}),
@@ -234,6 +234,14 @@ export function activityView(activity, { runState = "", nowMs = Date.now() } = {
       note: "",
     };
   }
+  if (runState === "waiting") {
+    return {
+      ...base,
+      state: "waiting",
+      stateText: "Awaiting external result",
+      note: waitingMessage || "An authorized execution is awaiting its recorded external result; no detailed progress is available.",
+    };
+  }
   if (rawState === "queued") {
     return {
       ...base,
@@ -260,6 +268,7 @@ export function activityPlacement(view, { stageId = "", stageRunning = false, st
     return stageFailed && (!view.stage || view.stage === stageId) ? "final" : "hidden";
   }
   if (!stageRunning) return "hidden";
+  if (view.state === "waiting" && (!view.stage || view.stage === stageId)) return "live";
   if (view.state === "busy" && view.stage && stageId && view.stage === stageId) return "live";
   return "note";
 }

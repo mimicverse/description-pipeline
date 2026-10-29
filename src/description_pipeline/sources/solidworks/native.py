@@ -28,6 +28,7 @@ from ...geometry.native_transform import transform_from_solidworks as _shared_tr
 from ...io import _filesystem_path, _physical_path, file_digest
 from ...schemas import NATIVE_DISCOVERY_SCHEMA
 from .errors import CadError, EnvironmentError_
+from .group_selection import compose_link_group_selections
 from .protocol import CadBackend
 from .saved_state import normalize_open_status
 from .session_artifacts import (
@@ -1282,9 +1283,15 @@ def _appearance_render_material(material, index: int, extension):
             "null_result"
             if raw_entities is None
             else "empty"
-            if not entity_objects
+            if isinstance(raw_entities, (list, tuple)) and not raw_entities
             else "observed"
         )
+    entity_count = {}
+    if entities_state == "null_result":
+        count, error = _appearance_value(material, "GetEntitiesCount", method=True)
+        entity_count["native_entity_count"] = count
+        if error is not None:
+            errors["entity_count"] = error
     entity_records = []
     for entity_index, entity in enumerate(entity_objects):
         record_errors = {}
@@ -1355,6 +1362,7 @@ def _appearance_render_material(material, index: int, extension):
         "entities": entities,
         "entities_state": entities_state,
         "entity_records": entity_records,
+        **entity_count,
         "primary_color": fields["primary_color"],
         "transparency": fields["transparency"],
         "color_form": fields["color_form"],
@@ -5137,7 +5145,7 @@ class SolidWorksBackend(CadBackend):
                     _raw_component_mass_fact(component_mass_raw)
                 )
             component_names = [str(item["name"]) for item in leaf_components]
-            selection = _compose_link_group_selections(
+            selection = compose_link_group_selections(
                 groups,
                 component_names,
                 {
@@ -8244,79 +8252,3 @@ def _native_error_record(error):
         "message": str(getattr(error, "message", "") or error)[:500],
         "detail": copy.deepcopy(detail) if isinstance(detail, (dict, list)) else detail,
     }
-
-
-def _compose_link_group_selections(groups, leaves, provider_names):
-    if not isinstance(groups, list) or not groups:
-        raise CadError("link_group_body_missing", "native groups must be a non-empty list")
-    leaf_rows = [str(name) for name in leaves]
-    if len(set(leaf_rows)) != len(leaf_rows):
-        raise CadError("link_group_occurrence_duplicate", "the captured scene repeats an occurrence")
-    body_of = {}
-    for group in groups:
-        if not isinstance(group, dict):
-            raise CadError("link_group_body_unnamed", "a native group is not an object")
-        body_name = str(group.get("name") or group.get("id") or "")
-        if not body_name:
-            raise CadError("link_group_body_unnamed", "every native group needs a name")
-        members = [str(item) for item in (group.get("components") or [])]
-        if not members:
-            raise CadError("link_group_empty_selection", "a native group has no components", {"body": body_name})
-        for member in members:
-            if member not in leaf_rows:
-                raise CadError(
-                    "link_group_member_unknown",
-                    "a native group names an unknown occurrence",
-                    {"body": body_name, "component": member},
-                )
-            if member in body_of:
-                raise CadError(
-                    "link_group_member_duplicate",
-                    "an occurrence belongs to several native groups",
-                    {"component": member, "bodies": [body_of[member], body_name]},
-                )
-            body_of[member] = body_name
-    providers = {}
-    for provider in sorted({str(name) for name in provider_names}):
-        subtree = {leaf for leaf in leaf_rows if leaf == provider or leaf.startswith(provider + "/")}
-        if not subtree:
-            raise CadError("link_group_provider_unknown", "an effective instance is not a captured occurrence")
-        owners = {body_of.get(leaf) for leaf in subtree}
-        named = {owner for owner in owners if owner}
-        if len(named) > 1:
-            raise CadError(
-                "link_group_provider_spans_bodies",
-                "an effective instance spans several native groups",
-                {"provider": provider, "bodies": sorted(named)},
-            )
-        if named and len(owners) != 1:
-            raise CadError(
-                "link_group_provider_partial",
-                "an effective instance is only partially assigned",
-                {"provider": provider, "body": sorted(named)[0]},
-            )
-        if named:
-            providers[provider] = subtree
-    selections = {}
-    for group in groups:
-        body_name = str(group.get("name") or group.get("id"))
-        members = {str(item) for item in (group.get("components") or [])}
-        inner = [provider for provider, subtree in providers.items() if subtree <= members]
-        top_most = [
-            provider
-            for provider in inner
-            if not any(other != provider and provider.startswith(other + "/") for other in inner)
-        ]
-        covered = set()
-        for provider in top_most:
-            covered |= providers[provider]
-        uncovered = sorted(members - covered)
-        selection = sorted([*top_most, *uncovered])
-        if not selection:
-            raise CadError("link_group_empty_selection", "a native group has no selectable occurrence")
-        selections[body_name] = {
-            "selection": selection,
-            "providers": sorted(top_most),
-            "uncovered_leaves": uncovered,
-        }
-    return selections

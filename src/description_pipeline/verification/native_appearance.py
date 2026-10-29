@@ -1210,18 +1210,38 @@ def _resolved_faces(
             _require(
                 isinstance(material, Mapping)
                 and material.get("material_index") == index
+                and "entities" in material
                 and isinstance(material.get("read_errors"), Mapping)
                 and isinstance(
                     material.get("linked_display_states"),
                     (list, type(None)),
                 )
-                and isinstance(material.get("entities"), list)
+                and (
+                    isinstance(material.get("entities"), list)
+                    or (
+                        material.get("entities_state") == "null_result"
+                        and material.get("entities") is None
+                    )
+                )
                 and isinstance(material.get("entity_records"), list)
                 and material.get("entities_state")
                 in {"observed", "empty", "null_result", "error"}
                 ,
                 f"{material_path} is malformed",
             )
+            if material["entities_state"] == "null_result":
+                count = material.get("native_entity_count")
+                errors = material["read_errors"]
+                _require(
+                    type(count) is int
+                    and count == 0
+                    and material["entities"] is None
+                    and not material["entity_records"]
+                    and "entities" not in errors
+                    and "entity_count" not in errors,
+                    f"{material_path} has no proven empty entity inventory",
+                )
+                continue
             _require(
                 material["entities_state"] not in {"null_result", "error"},
                 f"{material_path} has no readable entity inventory",

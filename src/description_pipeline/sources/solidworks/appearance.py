@@ -1853,6 +1853,17 @@ def resolve_deliverable_appearance(
                     errors=dict(errors) if isinstance(errors, Mapping) else errors,
                     linked_display_states=linked,
                 )
+            if (
+                entities_state == "null_result"
+                and type(material.get("native_entity_count")) is int
+                and material["native_entity_count"] == 0
+                and "entities" in material
+                and material.get("entities") is None
+                and not entities
+                and "entities" not in errors
+                and "entity_count" not in errors
+            ):
+                continue
             if entities_state in {"null_result", "error"}:
                 raise _appearance_resolution_error(
                     component,
