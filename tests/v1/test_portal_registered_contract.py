@@ -50,7 +50,7 @@ class RegisteredReadErrorTests(unittest.TestCase):
             request_id=self.dag_run_id,
             parent_run_id=None,
             from_stage="freeze",
-            request={"purpose": "engineering"},
+            request={"purpose": "engineering", "principal": "app:tenant:open"},
             created_at=now,
         )
         candidate = self.root / "candidate"
