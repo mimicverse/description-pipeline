@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from ..artifacts.store import path_has_link_ancestor
 from ..io import canonical, write_json
+from ..platform.facts import airflow_retry_claim_id
 from .contracts import DispatchCommand, DispatchConf, ProtocolError
 from .effects import EffectSettlement, EffectState
 
@@ -48,6 +49,7 @@ class DispatchResult:
     effect_id: str
     state: EffectState
     observation: DispatchObservation | None
+    observation_fact_id: str | None = None
 
 
 class DispatchAdapter(Protocol):
@@ -82,7 +84,7 @@ class TechnicalDispatchService:
         self.clock = clock
         self.adapter = adapter
 
-    def dispatch(self, command_id: str) -> DispatchResult:
+    def dispatch(self, command_id: str, *, retry_absent: bool = False) -> DispatchResult:
         command = self.facts.load_dispatch_command(command_id)
         conf = self.artifacts.read_dispatch_conf(command.conf_artifact)
         if conf.run_id != command.run_id or conf.freeze_command_id != command.freeze_command_id:
@@ -91,77 +93,90 @@ class TechnicalDispatchService:
         if settlement is None:
             raise ProtocolError("dispatch.effect_missing", {"command_id": command_id})
 
-        if settlement.state is EffectState.PREPARED:
-            claim = self._claim(command)
-            settlement = self.facts.effect_settlement(
-                settlement.effect_id,
-                expected_command_id=command.command_id,
+        absent_fact_id = None
+        if retry_absent or settlement.state is not EffectState.PREPARED:
+            result = self._observe_existing(command, conf, settlement)
+            if not retry_absent:
+                return result
+            if result.observation is None or result.observation.state_class != "absent":
+                return result
+            if result.state is EffectState.UNKNOWN:
+                absent_fact_id = result.observation_fact_id
+                if absent_fact_id is None:
+                    raise ProtocolError("dispatch.observation_missing", {"command_id": command_id})
+            elif result.state is not EffectState.PREPARED:
+                return result
+
+        claim = self._claim(command, airflow_absent_fact_id=absent_fact_id)
+        settlement = self.facts.effect_settlement(
+            settlement.effect_id,
+            expected_command_id=command.command_id,
+        )
+        if absent_fact_id is None and settlement.state is not EffectState.PREPARED:
+            return self._observe_existing(command, conf, settlement)
+        self.facts.authorize_effect_dispatch(
+            effect_id=settlement.effect_id,
+            claim=claim,
+            source="airflow-dispatch",
+            payload_digest=command.request_digest,
+            observed_at=self._now(),
+            fact_id="fact-" + str(uuid.uuid4()),
+            expected_command_id=command.command_id,
+            airflow_absent_fact_id=absent_fact_id,
+        )
+        try:
+            response = self.adapter.trigger(command, conf)
+        except Exception as error:
+            payload = self._seal_json(
+                command,
+                {
+                    "error_type": type(error).__name__,
+                    "error_message": str(error)[:4096],
+                },
+                kind="airflow_dispatch_timeout",
             )
-            if settlement.state is not EffectState.PREPARED:
-                return self._observe_existing(command, conf, settlement)
-            self.facts.authorize_effect_dispatch(
+            self.facts.append_effect_fact(
                 effect_id=settlement.effect_id,
                 claim=claim,
+                fact_type="timeout",
                 source="airflow-dispatch",
-                payload_digest=command.request_digest,
+                state_class=None,
+                payload_artifact=payload,
+                payload_digest=payload.set_sha256,
                 observed_at=self._now(),
                 fact_id="fact-" + str(uuid.uuid4()),
+                expected_command_id=command.command_id,
             )
-            try:
-                response = self.adapter.trigger(command, conf)
-            except Exception as error:
-                payload = self._seal_json(
-                    command,
-                    {
-                        "error_type": type(error).__name__,
-                        "error_message": str(error)[:4096],
-                    },
-                    kind="airflow_dispatch_timeout",
-                )
-                self.facts.append_effect_fact(
-                    effect_id=settlement.effect_id,
-                    claim=claim,
-                    fact_type="timeout",
-                    source="airflow-dispatch",
-                    state_class=None,
-                    payload_artifact=payload,
-                    payload_digest=payload.set_sha256,
-                    observed_at=self._now(),
-                    fact_id="fact-" + str(uuid.uuid4()),
-                    expected_command_id=command.command_id,
-                )
-            else:
-                if response is not None and not isinstance(response, Mapping):
-                    raise ProtocolError("dispatch.response_invalid", {"command_id": command_id})
-                payload = self._seal_json(
-                    command,
-                    {"response": dict(response or {})},
-                    kind="airflow_dispatch_response",
-                )
-                self.facts.append_effect_fact(
-                    effect_id=settlement.effect_id,
-                    claim=claim,
-                    fact_type="response",
-                    source="airflow-dispatch",
-                    state_class=None,
-                    payload_artifact=payload,
-                    payload_digest=payload.set_sha256,
-                    observed_at=self._now(),
-                    fact_id="fact-" + str(uuid.uuid4()),
-                    expected_command_id=command.command_id,
-                )
-            return self._observe_existing(
+        else:
+            if response is not None and not isinstance(response, Mapping):
+                raise ProtocolError("dispatch.response_invalid", {"command_id": command_id})
+            payload = self._seal_json(
                 command,
-                conf,
-                self.facts.effect_settlement(
-                    settlement.effect_id,
-                    expected_command_id=command.command_id,
-                ),
+                {"response": dict(response or {})},
+                kind="airflow_dispatch_response",
             )
+            self.facts.append_effect_fact(
+                effect_id=settlement.effect_id,
+                claim=claim,
+                fact_type="response",
+                source="airflow-dispatch",
+                state_class=None,
+                payload_artifact=payload,
+                payload_digest=payload.set_sha256,
+                observed_at=self._now(),
+                fact_id="fact-" + str(uuid.uuid4()),
+                expected_command_id=command.command_id,
+            )
+        return self._observe_existing(
+            command,
+            conf,
+            self.facts.effect_settlement(
+                settlement.effect_id,
+                expected_command_id=command.command_id,
+            ),
+        )
 
-        return self._observe_existing(command, conf, settlement)
-
-    def _claim(self, command: DispatchCommand):
+    def _claim(self, command: DispatchCommand, *, airflow_absent_fact_id: str | None = None):
         if self.claim_policy.executor_sha256 != command.expected_executor_sha256:
             raise ProtocolError(
                 "dispatch.executor_mismatch",
@@ -173,7 +188,10 @@ class TechnicalDispatchService:
         now = self._now()
         return self.facts.acquire_claim(
             command.command_id,
-            claim_id=self.claim_policy.claim_id_factory(),
+            claim_id=(
+                airflow_retry_claim_id(airflow_absent_fact_id)
+                if airflow_absent_fact_id is not None else self.claim_policy.claim_id_factory()
+            ),
             owner_sha256=self.claim_policy.owner_sha256,
             executor_sha256=self.claim_policy.executor_sha256,
             now=now,
@@ -183,6 +201,7 @@ class TechnicalDispatchService:
             dag_run_id=command.dag_run_id,
             task_id=self.claim_policy.task_id,
             map_index=self.claim_policy.map_index,
+            airflow_absent_fact_id=airflow_absent_fact_id,
         )
 
     def _observe_existing(
@@ -212,7 +231,7 @@ class TechnicalDispatchService:
                 {"error_type": type(error).__name__, "error_message": str(error)[:4096]},
                 kind="airflow_dispatch_observation",
             )
-            self.facts.append_effect_fact(
+            observation_fact = self.facts.append_effect_fact(
                 effect_id=settlement.effect_id,
                 claim=None,
                 fact_type="observation",
@@ -226,7 +245,7 @@ class TechnicalDispatchService:
             )
             observation = DispatchObservation("unobservable", payload=payload.to_record())
         else:
-            if observation.state_class == "known" and (
+            if observation.state_class in {"known", "absent"} and (
                 observation.payload.get("dag_id") != command.dag_id
                 or observation.payload.get("dag_run_id") != command.dag_run_id
             ):
@@ -236,7 +255,7 @@ class TechnicalDispatchService:
                 dict(observation.payload),
                 kind="airflow_dispatch_observation",
             )
-            self.facts.append_effect_fact(
+            observation_fact = self.facts.append_effect_fact(
                 effect_id=settlement.effect_id,
                 claim=None,
                 fact_type="observation",
@@ -262,7 +281,10 @@ class TechnicalDispatchService:
                 ),
                 closed_at=self._now(),
             )
-        return DispatchResult(command.command_id, settlement.effect_id, final.state, observation)
+        return DispatchResult(
+            command.command_id, settlement.effect_id, final.state, observation,
+            observation_fact.fact_id,
+        )
 
     def _seal_json(
         self,

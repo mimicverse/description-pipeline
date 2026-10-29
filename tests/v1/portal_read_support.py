@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import hashlib
 import shutil
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,6 +20,13 @@ from description_pipeline.interface_records import (
     check_policy_digest,
 )
 from description_pipeline.pipeline.contracts import ArtifactRef
+from description_pipeline.pipeline.verify import (
+    VerifyDomainRequest,
+    _ArtifactInput,
+    _PreparedInput,
+    _certificate,
+    _pair_subject_digest,
+)
 from description_pipeline.request_evidence import (
     build_request_evidence,
     request_evidence_bytes,
@@ -26,7 +34,6 @@ from description_pipeline.request_evidence import (
 from description_pipeline.runtime import tool_record
 from description_pipeline.schemas import (
     TOOL_SCHEMA,
-    VERIFICATION_CERTIFICATE_SCHEMA,
 )
 from description_pipeline.stages import CONTRACT, CONTRACT_SHA256, STAGE_IDS, stage_view
 
@@ -42,6 +49,89 @@ def registered_check_fixture(run_id: str, stage: str) -> tuple[dict, dict]:
     checks = {"command_id": command["command_id"], "request_digest": command["request_digest"],
               "checks": [{"id": "fixture.recorded_boundary", "state": "passed", "details": {}}]}
     return command, checks
+
+
+def registered_certificate_fixture(
+    *,
+    generate: dict,
+    capture: dict,
+    generate_files: dict[str, bytes],
+    capture_files: dict[str, bytes],
+    report: dict,
+    purpose: str = "engineering",
+) -> dict:
+    """Use the production certificate writer over one synthetic registered pair.
+
+    This is a read-port fixture, not a claim that mechanical evaluation ran.
+    Tests that need malformed certificates mutate this complete baseline later.
+    """
+    passed = report.get("passed") is True
+    checks = [
+        dict(row)
+        for row in report.get("checks")
+        or [
+            {
+                "id": "fixture.verification",
+                "state": "passed" if passed else "failed",
+                "passed": passed,
+                "details": {},
+            }
+        ]
+    ]
+    for row in checks:
+        row.setdefault("state", "passed" if row.get("passed", passed) else "failed")
+        row.setdefault("passed", row["state"] == "passed")
+        row.setdefault("details", {})
+    verifier = {"source_sha256": digest({"tool": "verify"})}
+    request = VerifyDomainRequest(
+        generate_artifact=ArtifactRef.from_record(generate),
+        capture_artifact=ArtifactRef.from_record(capture),
+        expected_verifier_sha256=verifier["source_sha256"],
+        config_snapshot_sha256="e" * 64,
+        contract_sha256="f" * 64,
+        policy_sha256="1" * 64,
+        purpose=purpose,
+    )
+    with tempfile.TemporaryDirectory(prefix="registered-certificate-fixture-") as directory:
+        root = Path(directory)
+        roots = []
+        for name, files, ref in (
+            ("generate", generate_files, request.generate_artifact),
+            ("capture", capture_files, request.capture_artifact),
+        ):
+            target = root / name
+            target.mkdir()
+            for part in ("input", "evidence", "model", "urdf", "meshes"):
+                (target / part).mkdir()
+            for path, content in files.items():
+                member = target / path
+                member.parent.mkdir(parents=True, exist_ok=True)
+                member.write_bytes(content)
+            roots.append(_ArtifactInput(ref, target, {}))
+        generate_input, capture_input = roots
+        prepared = _PreparedInput(
+            request,
+            generate_input,
+            capture_input,
+            {},
+            verifier,
+            verifier["source_sha256"],
+            digest(verifier),
+            digest({"capture_artifact": capture, "generate_artifact": generate}),
+        )
+        return _certificate(
+            prepared,
+            {
+                **report,
+                "passed": passed,
+                "checks": checks,
+                "required_checks": [row["id"] for row in checks],
+                "diagnostics": report.get("diagnostics") or [],
+                "pipeline_id": PIPELINE_ID,
+                "subject_sha256": _pair_subject_digest(generate_input, capture_input),
+                "subject_status": "qualified" if passed else "unqualified",
+            },
+        )
 
 
 def build_sealed_delivery(
@@ -785,6 +875,7 @@ class RegisteredPlatform:
                 stage="capture",
                 files=capture_files,
             )
+        generate_files.setdefault("tool.json", b'{"fixture":"generate-tool"}\n')
         config_snapshot_sha256 = "e" * 64
         contract_sha256 = "f" * 64
         generate_executor_sha256 = digest({"tool": "generate"})
@@ -802,7 +893,7 @@ class RegisteredPlatform:
         generate_files["reports/generate.json"] = (
             generate_receipt_bytes
         )
-        files["reports/generate.json"] = generate_receipt_bytes
+        files.update(generate_files)
         generate = self.projection_artifacts.register(
             run_id=run_id,
             stage="generate",
@@ -816,55 +907,15 @@ class RegisteredPlatform:
             quality = {}
         verified = quality.get("passed") is True
         del receipt
-        subject = generate["set_sha256"]
-        request = {
-            "capture_artifact": capture,
-            "generate_artifact": generate,
-        }
-        certificate = {
-            "actual_verifier": {"executor": "fixture"},
-            "actual_verifier_sha256": digest({"tool": "verify"}),
-            "capture_artifact": capture,
-            "checks": quality.get("checks") or [],
-            "config_snapshot_sha256": config_snapshot_sha256,
-            "contract_sha256": contract_sha256,
-            "decision": "PASS" if verified else "FAIL",
-            "diagnostics": quality.get("diagnostics") or [],
-            "evaluation_subject_sha256": digest(
-                {
-                    **{
-                        "input/" + path.removeprefix("input/"): hashlib.sha256(data).hexdigest()
-                        for path, data in capture_files.items()
-                        if path.startswith("input/")
-                    },
-                    **{
-                        "evidence/" + path.removeprefix("evidence/"): hashlib.sha256(data).hexdigest()
-                        for path, data in capture_files.items()
-                        if path.startswith("evidence/")
-                    },
-                    **{
-                        path: hashlib.sha256(data).hexdigest()
-                        for path, data in generate_files.items()
-                        if path == "tool.json"
-                        or path.startswith(
-                            ("model/", "urdf/", "meshes/")
-                        )
-                    },
-                }
-            ),
-            "generate_artifact": generate,
-            "generate_receipt_sha256": hashlib.sha256(
-                generate_receipt_bytes
-            ).hexdigest(),
-            "passed": verified,
-            "policy_sha256": "1" * 64,
-            "purpose": "engineering",
-            "request": request,
-            "request_sha256": digest(request),
-            "schema_version": VERIFICATION_CERTIFICATE_SCHEMA,
-            "subject_sha256": subject,
-        }
-        certificate["verification_key"] = digest(certificate)
+        certificate = registered_certificate_fixture(
+            generate=generate, capture=capture,
+            generate_files=generate_files, capture_files=capture_files,
+            report={**quality, "passed": verified},
+        )
+        certificate.update(quality.get("fixture_certificate_overrides") or {})
+        certificate["verification_key"] = digest({
+            key: value for key, value in certificate.items() if key != "verification_key"
+        })
         files["verification-certificate.json"] = (
             json.dumps(certificate, sort_keys=True).encode("utf-8") + b"\n"
         )

@@ -714,7 +714,9 @@ class VerifyHandler:
         return candidate
 
 
-def _validate_certificate_structure(certificate: Mapping[str, Any]) -> None:
+def validate_certificate_structure(certificate: Mapping[str, Any]) -> None:
+    """Validate the one certificate schema before any consumer trusts its decision."""
+
     required = CERTIFICATE_FIELDS
     if set(certificate) != required:
         raise PipelineError(
@@ -829,7 +831,7 @@ def validate_verification_certificate(
         raise PipelineError("Verification certificate must be an object")
     if payload != canonical(certificate):
         raise PipelineError("Verification certificate is not canonically encoded")
-    _validate_certificate_structure(certificate)
+    validate_certificate_structure(certificate)
     if (
         certificate["generate_artifact"] != generate_artifact.to_record()
         or certificate["capture_artifact"] != capture_artifact.to_record()

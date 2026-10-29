@@ -940,6 +940,8 @@ class StageApplication:
         self,
         command_id: str,
         adapter: DispatchAdapter,
+        *,
+        retry_absent: bool = False,
     ) -> DispatchResult:
         """Drive one admitted dispatch command through the common effect runtime."""
 
@@ -966,7 +968,7 @@ class StageApplication:
             clock=self.clock,
             adapter=adapter,
         )
-        return service.dispatch(command_id)
+        return service.dispatch(command_id, retry_absent=retry_absent)
 
     def cancel(
         self,

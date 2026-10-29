@@ -13,7 +13,7 @@ from description_pipeline.stages import CONTRACT, stage_view
 from description_pipeline.schemas import PUBLICATION_RECEIPT_SCHEMA
 from tests.v1.protocol_support import protocol_events
 from tests.v1.protocol_support import native_discovery_record
-from tests.v1.portal_read_support import RegisteredProjectionArtifacts
+from tests.v1.portal_read_support import RegisteredProjectionArtifacts, registered_certificate_fixture
 
 RUN_ID = "7b7dbb68-b7ae-5545-859e-f351415e0fb9"
 SUBJECT = "a" * 64
@@ -63,9 +63,6 @@ class RegisteredStageProjectionTests(unittest.TestCase):
         self.assertFalse(job["result"]["quality"]["passed"])
         self.assertNotEqual(_automatic_summary(job)["state"], "passed")
         self.assertEqual(job["pr"]["url"], publication["pr_effect"]["observation"]["url"])
-        certificate["diagnostics"] = [{"code": "unknown"}]
-        with self.assertRaisesRegex(PortalError, "blocking"):
-            app._fact_display_job(projection)
 
     def setUp(self) -> None:
         self.artifacts = RegisteredProjectionArtifacts()
@@ -225,7 +222,16 @@ class RegisteredStageProjectionTests(unittest.TestCase):
 
     def test_certificate_must_match_its_canonical_result_digest(self) -> None:
         projection = self.projection({"verify": "failed"})
-        certificate = {"decision": "FAIL", "passed": False, "checks": [], "diagnostics": []}
+        capture_files = {"input/handoff.json": b"{}"}
+        generate_files = {"tool.json": b"{}", "reports/generate.json": b"{}"}
+        capture = self.stage_members("capture", capture_files)
+        generate = self.stage_members("generate", generate_files)
+        certificate = registered_certificate_fixture(
+            capture=next(iter(capture.values()))["artifact"],
+            generate=next(iter(generate.values()))["artifact"],
+            capture_files=capture_files, generate_files=generate_files,
+            report={"passed": False},
+        )
         projection["by_stage"]["verify"] = self.stage_members(
             "verify", {"verification-certificate.json": json.dumps(certificate).encode()},
         )

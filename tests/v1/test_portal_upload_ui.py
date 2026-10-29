@@ -74,8 +74,8 @@ class UploadUiContractTests(unittest.TestCase):
         self.assertIn("temporary lock files", app)
         self.assertIn("state.viewer.resize", app)
         self.assertIn("limits.max_files", app)
-        self.assertIn("Start state is unconfirmed", app)
-        self.assertIn("do not submit again", app)
+        self.assertIn("check the run list or retry the same submission", app)
+        self.assertIn("no automatic retry will occur", app)
         self.assertIn("error.dagRunId", app)
         self.assertIn('$("folder-input").disabled = true', app)
         self.assertIn("Upload complete; creating run", app)
@@ -118,7 +118,7 @@ class UploadUiContractTests(unittest.TestCase):
         app = (STATIC / "app.js").read_text(encoding="utf-8")
         self.assertIn("No publication target is configured", app)
         self.assertIn("Failed to load publication targets", app)
-        self.assertIn("session expired", app)
+        self.assertIn("handleUnauthorized(error, csrf)", app)
         self.assertIn("state.targetsRetryPick", app)
         self.assertIn("if (state.targetsRetryPick) void loadTargets(state.targetsRetryPick);", app)
 
@@ -144,6 +144,21 @@ class UploadUiContractTests(unittest.TestCase):
         self.assertIn('$("upload-view").hidden = true', app)
         self.assertIn('$("detail-card").hidden = true', app)
         self.assertGreaterEqual(app.count("run-error-detail"), 3)
+
+
+class SubmissionFlowJsTests(unittest.TestCase):
+    """Run the real page functions against controlled asynchronous transport."""
+
+    def test_submission_and_selection_ownership(self) -> None:
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "node is required for the submission flow regression")
+        result = subprocess.run(
+            [node, str(ROOT / "tests" / "js" / "submission_flow_test.mjs")],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, f"{result.stdout}\n{result.stderr}")
 
 
 class UploadRenderTests(unittest.TestCase):

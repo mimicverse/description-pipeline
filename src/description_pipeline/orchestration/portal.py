@@ -77,8 +77,11 @@ from ..schemas import PUBLICATION_RECEIPT_SCHEMA, RUN_ACTIVITY_SCHEMA
 from ..pipeline.contracts import ArtifactRef, StageStatus
 from ..pipeline.dispatch import DispatchObservation
 from ..pipeline.effects import EffectState
-from ..pipeline.verify import CERTIFICATE_FILENAME, EXECUTION_RECEIPT_FILENAME
-from ..pipeline.verify_contract import validate_certificate_diagnostics
+from ..pipeline.verify import (
+    CERTIFICATE_FILENAME,
+    EXECUTION_RECEIPT_FILENAME,
+    validate_certificate_structure,
+)
 from ..platform.facts import FactStoreError, RunNotAdmittedError
 from ..ports import PORTAL_HTTP_PORT
 from .feishu_oauth import (
@@ -1335,6 +1338,8 @@ class PortalApp:
         self,
         session: PortalSession,
         command_id: str,
+        *,
+        retry_absent: bool = False,
     ):
         application = self.config.production_application
         dispatch = getattr(application, "dispatch", None)
@@ -1346,6 +1351,7 @@ class PortalApp:
         return dispatch(
             command_id,
             AirflowDispatchAdapter(self.config.airflow, session.token),
+            retry_absent=retry_absent,
         )
 
     def _read_fact_projection(self, run_id: str) -> dict | None:
@@ -1369,8 +1375,13 @@ class PortalApp:
                 )
             finally:
                 connection.close()
-        except PipelineError:
+        except RunNotAdmittedError:
             return None
+        except PipelineError as error:
+            raise PortalError(
+                HTTPStatus.BAD_GATEWAY,
+                f"Registered run evidence cannot be verified: {error}",
+            ) from error
         except Exception as error:
             raise PortalError(
                 HTTPStatus.SERVICE_UNAVAILABLE,
@@ -1572,116 +1583,88 @@ class PortalApp:
             self.config,
         )
 
+    @staticmethod
+    def _registered_owner(projection: dict) -> str:
+        request = projection.get("request")
+        owner = request.get("principal") if isinstance(request, Mapping) else None
+        if not valid_actor_principal(owner):
+            raise PortalError(HTTPStatus.BAD_GATEWAY, "The admitted initiator cannot be verified")
+        return owner
+
+    @staticmethod
+    def _dispatch_state(projection: dict) -> str | None:
+        technical = projection.get("technical")
+        effects = technical.get("effects") if isinstance(technical, Mapping) else None
+        matches = [
+            effect for effect in effects or ()
+            if isinstance(effect, Mapping) and effect.get("effect_kind") == "airflow_dispatch"
+        ]
+        if len(matches) != 1:
+            return None
+        return matches[0].get("state")
+
     def _list_runs(self, environ: dict, start_response: Callable) -> Iterable[bytes]:
         session = self._session(environ)
         query = urlparse.parse_qs(str(environ.get("QUERY_STRING") or ""), keep_blank_values=True)
         limit = _page_integer(query, "limit", default=20, minimum=1, maximum=100)
         offset = _page_integer(query, "offset", default=0, minimum=0, maximum=100_000)
         include_deleted = str((query.get("include_deleted") or [""])[0]).lower() in {"1", "true"}
-        metadata = self._metadata_snapshot()
         principal, is_admin = self._viewer_identity(session)
-        runs: list[dict] = []
-        seen: set[str] = set()
-        # Scan past recently deleted runs so tombstones never push older runs off the page.
-        # The budget scales with the requested offset and a bounded extra scan; when the budget
-        # runs out before the end of the history is proven, the list fails closed instead of
-        # presenting a truncated result as the complete one.
-        page_size = 100
-        required = offset + limit + 1
-        scan_budget = ((required + page_size - 1) // page_size) + 10
-        pages = 0
-        while True:
-            if pages >= scan_budget:
-                raise PortalError(
-                    HTTPStatus.SERVICE_UNAVAILABLE, "Run history is too long to locate more records; retry later"
-                )
+        metadata = self._metadata_snapshot()
+        try:
+            admitted = self._run_control().list_admitted_runs()
+        except FactStoreError as error:
+            raise PortalError(HTTPStatus.SERVICE_UNAVAILABLE, "Admitted runs are temporarily unavailable") from error
+        visible = [
+            item for item in admitted
+            if include_deleted or not (metadata.get(item.run_id) or _EMPTY_OVERLAY)["deleted"]
+        ]
+        runs = []
+        for item in visible[offset : offset + limit]:
+            dag_run_id = self._dag_run_id_from_request_id(item.request_id)
+            projection = self._read_projection(item.run_id)
+            if dag_run_id is None or projection is None:
+                raise PortalError(HTTPStatus.BAD_GATEWAY, "An admitted run identity cannot be verified")
+            owner = self._registered_owner(projection)
+            request = projection["request"]
+            display_name = None
+            airflow_run = {}
             try:
-                items = self.config.airflow.list_dag_runs(
-                    session.token, self.config.dag_id, limit=page_size, offset=pages * page_size
-                )
+                airflow_run = self.config.airflow.dag_run(session.token, self.config.dag_id, dag_run_id)
             except AirflowAuthError as error:
                 raise PortalError(HTTPStatus.UNAUTHORIZED, str(error)) from error
             except AirflowApiError as error:
-                # Never present a partial history as the complete one.
-                raise PortalError(
-                    HTTPStatus.SERVICE_UNAVAILABLE, "Run list is temporarily unavailable; retry later"
-                ) from error
-            pages += 1
-            for item in items:
-                dag_run_id = str(item.get("dag_run_id") or "")
-                if not dag_run_id or dag_run_id in seen:
-                    continue
-                seen.add(dag_run_id)
-                owner, name = _actor_identity(item.get("triggering_user_name"))
-                native_id = native_run_id(dag_run_id)
-                projection = self._read_fact_projection(native_id)
-                request = (
-                    projection.get("request")
-                    if isinstance(projection, dict)
-                    else None
-                )
-                request = request if isinstance(request, Mapping) else {}
-                overlay = metadata.get(native_id) or _EMPTY_OVERLAY
-                parent_native = (
-                    projection.get("parent_run_id")
-                    if isinstance(projection, dict)
-                    else None
-                )
-                parent_projection = (
-                    self._read_fact_projection(parent_native)
-                    if isinstance(parent_native, str) and parent_native
-                    else None
-                )
-                parent_dag_run_id = (
-                    self._dag_run_id_from_request_id(
-                        parent_projection.get("request_id")
-                    )
-                    if isinstance(parent_projection, dict)
-                    else None
-                )
-                if overlay["deleted"] and not include_deleted:
-                    continue
-                runs.append(
-                    {
-                        "dag_run_id": dag_run_id,
-                        "handoff_path": None,
-                        "main_assembly": _optional_str(
-                            request.get("main_assembly")
-                        ),
-                        # The recorded initiator, never the current viewer; missing names stay null.
-                        "user": name,
-                        # Airflow's own record outlives any portal restart.
-                        "principal": owner,
-                        "state": _run_state(projection),
-                        "started_at": item.get("start_date"),
-                        "parent_dag_run_id": parent_dag_run_id,
-                        "resume_from": (
-                            _optional_str(projection.get("from_stage"))
-                            if isinstance(projection, dict)
-                            else None
-                        ),
-                        "resume_from_name": (
-                            _stage_name(projection.get("from_stage"))
-                            if isinstance(projection, dict)
-                            else None
-                        ),
-                        # Row-level action gate for the operator page (one profile check per list).
-                        "can_manage": is_admin or owner == principal,
-                        **overlay,
-                    }
-                )
-            if len(runs) >= required or len(items) < page_size:
-                break
-        page_runs = runs[offset : offset + limit]
-        return _json_response(
-            start_response,
-            200,
-            {
-                "runs": page_runs,
-                "next_offset": offset + limit if len(runs) > offset + limit else None,
-            },
-            self.config,
-        )
+                if not (isinstance(error.__cause__, urlerror.HTTPError) and error.__cause__.code == 404):
+                    raise PortalError(
+                        HTTPStatus.SERVICE_UNAVAILABLE, "Run observations are temporarily unavailable"
+                    ) from error
+            if _actor_identity(airflow_run.get("triggering_user_name"))[0] == owner:
+                display_name = _actor_identity(airflow_run.get("triggering_user_name"))[1]
+            parent = (
+                self._read_projection(item.parent_run_id)
+                if item.parent_run_id else None
+            )
+            runs.append({
+                "dag_run_id": dag_run_id,
+                "handoff_path": None,
+                "main_assembly": _optional_str(request.get("main_assembly")),
+                "user": display_name,
+                "principal": owner,
+                "state": _run_state(projection),
+                "started_at": airflow_run.get("start_date") or item.created_at.isoformat(),
+                "parent_dag_run_id": (
+                    self._dag_run_id_from_request_id(parent.get("request_id"))
+                    if isinstance(parent, dict) else None
+                ),
+                "resume_from": item.from_stage,
+                "resume_from_name": _stage_name(item.from_stage),
+                "can_manage": is_admin or owner == principal,
+                **(metadata.get(item.run_id) or _EMPTY_OVERLAY),
+            })
+        return _json_response(start_response, 200, {
+            "runs": runs,
+            "next_offset": offset + limit if len(visible) > offset + limit else None,
+        }, self.config)
 
     def _start_run(self, environ: dict, start_response: Callable) -> Iterable[bytes]:
         """One uploaded SolidWorks folder starts one run; manual platform paths are gone."""
@@ -1880,6 +1863,7 @@ class PortalApp:
             dispatch_result = self._dispatch_technical(
                 session,
                 dispatch_command.command_id,
+                retry_absent=existing_outcome is not None,
             )
         except AirflowAuthError:
             return _json_response(
@@ -2134,20 +2118,36 @@ class PortalApp:
         session = self._session(environ)
         if _RUN_ID.fullmatch(dag_run_id) is None:
             raise PortalError(HTTPStatus.BAD_REQUEST, "Run identifier is invalid")
+        viewer, is_admin = self._viewer_identity(session)
+        run_id = native_run_id(dag_run_id)
+        projection = self._read_projection(run_id)
+        if projection is None:
+            raise PortalError(HTTPStatus.NOT_FOUND, "The run has no canonical admission")
+        principal = self._registered_owner(projection)
+        can_manage = is_admin or viewer == principal
+        airflow_run = {}
+        tasks = []
+        endpoint_error = None
         try:
             airflow_run = self.config.airflow.dag_run(session.token, self.config.dag_id, dag_run_id)
-            tasks = self.config.airflow.task_instances(session.token, self.config.dag_id, dag_run_id)
         except AirflowAuthError as error:
             raise PortalError(HTTPStatus.UNAUTHORIZED, str(error)) from error
         except AirflowApiError as error:
-            missing = isinstance(error.__cause__, urlerror.HTTPError) and error.__cause__.code == 404
-            raise PortalError(HTTPStatus.NOT_FOUND if missing else HTTPStatus.BAD_GATEWAY, str(error)) from error
-        can_manage = self._can_manage(session, airflow_run)
-        run_id = native_run_id(dag_run_id)
-        projection = self._read_projection(run_id)
-        job = self._fact_display_job(projection) if projection is not None else None
-        endpoint_error: str | None = None
-        principal, operator = _actor_identity(airflow_run.get("triggering_user_name"))
+            if not (isinstance(error.__cause__, urlerror.HTTPError) and error.__cause__.code == 404):
+                raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
+            endpoint_error = str(error)
+        else:
+            try:
+                tasks = self.config.airflow.task_instances(session.token, self.config.dag_id, dag_run_id)
+            except AirflowAuthError as error:
+                raise PortalError(HTTPStatus.UNAUTHORIZED, str(error)) from error
+            except AirflowApiError as error:
+                raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
+        operator = (
+            _actor_identity(airflow_run.get("triggering_user_name"))[1]
+            if _actor_identity(airflow_run.get("triggering_user_name"))[0] == principal else None
+        )
+        job = self._fact_display_job(projection)
         retry_job = dict(job or {})
         retry_job["native_status"] = _canonical_native_status(projection)
         retry = _retry_assessment(airflow_run, tasks, retry_job, endpoint_error)
@@ -2155,6 +2155,11 @@ class PortalApp:
         if recovery_block is not None:
             reason, classification = recovery_block
             retry = RecoveryAssessment(False, classification, reason, ())
+        if self._dispatch_state(projection) in {"prepared", "unknown"}:
+            retry = RecoveryAssessment(
+                can_manage, "temporary_disconnection",
+                "Reconcile the original Airflow dispatch; resend only after exact absence is observed", (),
+            )
         pr = None
         if isinstance(job, dict) and isinstance(job.get("pr"), dict):
             pr = dict(job["pr"])
@@ -2228,7 +2233,7 @@ class PortalApp:
                 "reason": retry.reason,
                 "classification": retry.classification,
             },
-            "started_at": airflow_run.get("start_date"),
+            "started_at": airflow_run.get("start_date") or projection.get("created_at"),
             "ended_at": airflow_run.get("end_date"),
             "tasks": [
                 {
@@ -2282,6 +2287,40 @@ class PortalApp:
             raise PortalError(HTTPStatus.BAD_REQUEST, "Run identifier is invalid")
         if self._body(environ):
             raise PortalError(HTTPStatus.BAD_REQUEST, "Retry does not accept run parameters")
+        principal, is_admin = self._viewer_identity(session)
+        run_id = native_run_id(dag_run_id)
+        projection = self._read_projection(run_id)
+        if projection is None:
+            raise PortalError(HTTPStatus.NOT_FOUND, "The run has no canonical admission")
+        if not is_admin and self._registered_owner(projection) != principal:
+            raise PortalError(HTTPStatus.FORBIDDEN, "Only the initiator or a platform administrator can retry this run")
+        if self._dispatch_state(projection) in {"prepared", "unknown"}:
+            with self._rerun_lock:
+                if self._metadata_overlay(dag_run_id)["deleted"]:
+                    raise PortalError(HTTPStatus.CONFLICT, "Deleted runs cannot be retried; restore first")
+                application = self.config.production_application
+                loader = getattr(application, "load_admission_outcome", None)
+                if not callable(loader):
+                    raise PortalError(HTTPStatus.SERVICE_UNAVAILABLE, "The production admission reader is unavailable")
+                outcome = loader(run_id)
+                if outcome is None or outcome.dispatch_command.dag_run_id != dag_run_id:
+                    raise PortalError(HTTPStatus.CONFLICT, "The original Airflow dispatch cannot be verified")
+                try:
+                    result = self._dispatch_technical(
+                        session, outcome.dispatch_command.command_id, retry_absent=True,
+                    )
+                except FactStoreError as error:
+                    raise PortalError(HTTPStatus.CONFLICT, str(error)) from error
+                settled = result.state is EffectState.SATISFIED
+                return _json_response(start_response, 200 if settled else 409, {
+                    "dag_run_id": dag_run_id,
+                    "state": "queued" if settled else "unresolved",
+                    "trigger": result.state.value,
+                    "cleared_tasks": [],
+                    **({} if settled else {
+                        "error": "The original dispatch remains unresolved; no new run was created"
+                    }),
+                }, self.config)
         try:
             run = self.config.airflow.dag_run(session.token, self.config.dag_id, dag_run_id)
             if not self._can_manage(session, run):
@@ -2496,6 +2535,7 @@ class PortalApp:
         principal: str,
         dag_run_id: str,
         body: dict,
+        submission_key: str,
     ) -> Iterable[bytes]:
         """Create one current-generation request from a completed parent Freeze."""
 
@@ -2585,17 +2625,7 @@ class PortalApp:
                     "Select a main assembly from the parent's sealed Freeze originals",
                 )
 
-            frame = {
-                "change_summary": change_summary,
-                "main_assembly": main_assembly,
-                "parent_dag_run_id": dag_run_id,
-                "parent_run_id": parent_run_id,
-                "principal": principal,
-                "purpose": purpose,
-                "stage": "freeze",
-                "target_hardware": target_hardware,
-            }
-            new_dag_run_id = "portal-freeze-" + digest(frame)[:24]
+            new_dag_run_id = "portal-freeze-" + submission_key
             new_run_id = native_run_id(new_dag_run_id)
             loader = self.config.production_freeze_successor_loader
             if not callable(loader) or self.config.production_application is None:
@@ -2608,6 +2638,7 @@ class PortalApp:
                     ProductionFreezeSuccessorRequest,
                 )
 
+                existing_outcome = self.config.production_application.load_admission_outcome(new_run_id)
                 outcome = loader(
                     ProductionFreezeSuccessorRequest(
                         run_id=new_run_id,
@@ -2651,6 +2682,7 @@ class PortalApp:
                 dispatch_result = self._dispatch_technical(
                     session,
                     dispatch_command.command_id,
+                    retry_absent=existing_outcome is not None,
                 )
             except AirflowAuthError as error:
                 raise PortalError(
@@ -2700,6 +2732,12 @@ class PortalApp:
             raise PortalError(HTTPStatus.UNAUTHORIZED, "Feishu session expired; sign in again")
         if _RUN_ID.fullmatch(dag_run_id) is None:
             raise PortalError(HTTPStatus.BAD_REQUEST, "Run identifier is invalid")
+        submission_key = str(environ.get("HTTP_IDEMPOTENCY_KEY") or "").strip()
+        if not submission_key or _RUN_ID.fullmatch(submission_key) is None or len(submission_key) > 120:
+            raise PortalError(
+                HTTPStatus.BAD_REQUEST,
+                "Idempotency-Key must be a non-empty safe identifier of at most 120 characters",
+            )
         body = self._body(environ)
         stage = body.get("stage")
         keys = {"stage", "target_hardware", "change_summary", "main_assembly"}
@@ -2750,6 +2788,7 @@ class PortalApp:
             principal,
             dag_run_id,
             body,
+            submission_key,
         )
 
     # --------------------------------------------------------------- preview
@@ -2893,7 +2932,6 @@ class PortalApp:
         certificate = certificate if isinstance(certificate, dict) else {}
         if isinstance(certificate_member, dict):
             try:
-                validate_certificate_diagnostics(certificate)
                 self._bind_verification_certificate(projection, verify_row, certificate)
             except PipelineError as error:
                 raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
@@ -3368,6 +3406,10 @@ class PortalApp:
     ) -> tuple[ArtifactRef, ArtifactRef, str | None]:
         """Bind a certificate to this projection's exact Generate/Capture pair."""
 
+        try:
+            validate_certificate_structure(certificate)
+        except PipelineError as error:
+            raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
         if digest(certificate) != (verify_row.get("receipt") or {}).get("checks_sha256"):
             raise PipelineError("The verification certificate differs from its stage result")
         by_stage = projection.get("by_stage")
@@ -3459,7 +3501,6 @@ class PortalApp:
         )
         if not isinstance(certificate, dict):
             raise PipelineError("Verification certificate must be an object")
-        validate_certificate_diagnostics(certificate)
         generate_artifact, capture_artifact, evaluation_subject = self._bind_verification_certificate(
             projection,
             verify,

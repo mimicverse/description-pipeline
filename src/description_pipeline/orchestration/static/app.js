@@ -50,6 +50,7 @@ const state = {
   viewer: null,
   controls: null,
   timer: null,
+  pollRequest: null,
   activityTimer: null,
   retryingRunId: null,
   tabsInitializedFor: null,
@@ -57,7 +58,9 @@ const state = {
   rerunNotice: null,
   rerunError: null,
   rerunMainByRun: {},
+  rerunKeyByRun: {},
   runsList: [],
+  listRequest: null,
   runView: "active",
   runsNextOffset: null,
   runsLoadingMore: false,
@@ -180,7 +183,8 @@ function rerunStageName(rows, stageId) {
 }
 
 function normalizeRelativePath(raw) {
-  const path = String(raw || "").replace(/\\/g, "/");
+  const path = String(raw || "");
+  if (path.includes("\\")) return null;
   const parts = [];
   for (const part of path.split("/")) {
     if (!part || part === ".") continue;
@@ -305,6 +309,10 @@ async function loadTargets(pick) {
     );
   } catch (error) {
     if (requestId !== state.targetsRequest || state.folderPick !== pick) return;
+    if (error.status === 401) {
+      state.targetsRetryPick = pick;
+      return;
+    }
     // A failed fetch is not "no targets configured": keep the pick so the fetch retries once a
     // session is ready again, and say what happened instead of misreporting an empty platform.
     state.targetsRetryPick = pick;
@@ -315,13 +323,7 @@ async function loadTargets(pick) {
     failure.selected = true;
     select.append(failure);
     note.hidden = false;
-    if (error.status === 401) {
-      note.textContent = "The session expired and publication targets could not load; sign in again.";
-      clearSession();
-      setError($("login-error"), "The session expired; sign in again.");
-    } else {
-      note.textContent = "Publication targets could not load because the network or service failed; reselect the folder and retry.";
-    }
+    note.textContent = "Publication targets could not load because the network or service failed; reselect the folder and retry.";
     updateStartEnabled();
     return;
   }
@@ -347,20 +349,47 @@ async function loadTargets(pick) {
     note.hidden = true;
     note.textContent = "";
   }
-  select.onchange = updateStartEnabled;
-  if (summary) summary.oninput = updateStartEnabled;
+  select.onchange = changeSubmission;
+  if (summary) summary.oninput = changeSubmission;
   const purpose = $("purpose-select");
-  if (purpose) purpose.onchange = updateStartEnabled;
+  if (purpose) purpose.onchange = changeSubmission;
   updateStartEnabled();
+}
+
+function changeSubmission() {
+  state.submissionKey = null;
+  state.blockedPick = false;
+  updateStartEnabled();
+}
+
+function requestKey() {
+  return typeof globalThis.crypto?.randomUUID === "function"
+    ? globalThis.crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+function responseRunId(payload, expected = null) {
+  const runId = payload && payload.dag_run_id;
+  if (typeof runId !== "string" || !/^[A-Za-z0-9_.:-]{1,250}$/.test(runId)) {
+    const error = new Error("The server did not confirm a valid run identity; check the run list or retry the same submission.");
+    error.unconfirmed = true;
+    throw error;
+  }
+  if (expected !== null && runId !== expected) {
+    const error = new Error("The server returned a different request identity; retry the same submission.");
+    error.unconfirmed = true;
+    throw error;
+  }
+  return runId;
 }
 
 function updateStartEnabled() {
   const target = $("target-select");
   const summary = $("change-summary");
   const purpose = $("purpose-select");
+  $("start-button").textContent = state.blockedPick ? "Retry same submission" : "Start";
   $("start-button").disabled = !(
     state.folderPick &&
-    !state.blockedPick &&
     !state.uploading &&
     state.assemblyChoice &&
     target &&
@@ -399,14 +428,11 @@ function submitRun(pick, { onProgress } = {}) {
     request.open("POST", "/api/runs");
     request.withCredentials = true;
     request.setRequestHeader("Accept", "application/json");
-    if (!state.submissionKey) {
-      state.submissionKey =
-        typeof globalThis.crypto?.randomUUID === "function"
-          ? globalThis.crypto.randomUUID()
-          : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
-    }
-    request.setRequestHeader("Idempotency-Key", state.submissionKey);
-    if (state.csrf) request.setRequestHeader("X-CSRF-Token", state.csrf);
+    if (!state.submissionKey) state.submissionKey = requestKey();
+    const submissionKey = state.submissionKey;
+    request.setRequestHeader("Idempotency-Key", submissionKey);
+    const csrf = state.csrf;
+    if (csrf) request.setRequestHeader("X-CSRF-Token", csrf);
     request.upload.addEventListener("progress", (event) => {
       if (event.lengthComputable) onProgress(event.loaded / event.total);
     });
@@ -414,26 +440,42 @@ function submitRun(pick, { onProgress } = {}) {
       let payload = {};
       try {
         payload = JSON.parse(request.responseText || "{}");
+        if (payload === null || typeof payload !== "object" || Array.isArray(payload)) payload = {};
       } catch {
         payload = {};
       }
       if (request.status >= 200 && request.status < 300) {
-        resolve(payload);
+        try {
+          responseRunId(payload, `portal-${submissionKey}`);
+          resolve(payload);
+        } catch (error) {
+          error.dagRunId = `portal-${submissionKey}`;
+          reject(error);
+        }
         return;
       }
       const error = new Error(payload.error || `Upload failed (HTTP ${request.status})`);
       error.status = request.status;
       if (payload && payload.dag_run_id) error.dagRunId = String(payload.dag_run_id);
+      if (request.status >= 500) {
+        error.unconfirmed = true;
+        error.dagRunId ||= `portal-${submissionKey}`;
+      }
       reject(error);
+      handleUnauthorized(error, csrf);
     });
     request.addEventListener("error", () => {
       const error = new Error("The network was interrupted before an upload response arrived. If the submission succeeded, confirm it in the run list; the system will not retry automatically.");
       error.network = true;
+      error.unconfirmed = true;
+      error.dagRunId = `portal-${submissionKey}`;
       reject(error);
     });
     request.addEventListener("abort", () => {
       const error = new Error("Upload cancelled.");
       error.aborted = true;
+      error.unconfirmed = true;
+      error.dagRunId = `portal-${submissionKey}`;
       reject(error);
     });
     state.uploadAbort = { abort: () => request.abort() };
@@ -454,10 +496,18 @@ function resetPick() {
   $("start-button").disabled = true;
 }
 
-async function api(path, { method = "GET", body, signal } = {}) {
+function handleUnauthorized(error, csrf) {
+  if (error.status !== 401 || state.csrf !== csrf) return;
+  clearSession();
+  setError($("login-error"), error.message);
+}
+
+async function api(path, { method = "GET", body, signal, idempotencyKey } = {}) {
   const headers = { Accept: "application/json" };
   if (body !== undefined) headers["Content-Type"] = "application/json";
   if (state.csrf && method !== "GET") headers["X-CSRF-Token"] = state.csrf;
+  if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
+  const csrf = state.csrf;
   const response = await fetch(path, {
     method,
     headers,
@@ -467,17 +517,26 @@ async function api(path, { method = "GET", body, signal } = {}) {
   });
   const text = await response.text();
   let payload = {};
+  let validJson = false;
   if (text) {
     try {
       payload = JSON.parse(text);
+      validJson = payload !== null && typeof payload === "object" && !Array.isArray(payload);
     } catch {
       payload = {};
     }
   }
+  if (!validJson) payload = {};
   if (!response.ok) {
     const error = new Error(payload.error || `Request failed (HTTP ${response.status})`);
     error.status = response.status;
     error.payload = payload;
+    handleUnauthorized(error, csrf);
+    throw error;
+  }
+  if (!validJson) {
+    const error = new Error("The server returned an invalid JSON response; the request outcome is unconfirmed.");
+    error.unconfirmed = method !== "GET";
     throw error;
   }
   return payload;
@@ -547,8 +606,25 @@ function clearPreview() {
   updatePreviewLayout();
 }
 
-function clearSession() {
+function stopRunRead() {
+  if (state.timer) window.clearTimeout(state.timer);
+  state.timer = null;
+  if (state.pollRequest) state.pollRequest.abort();
+  state.pollRequest = null;
+  stopActivityTimer();
   clearPreview();
+}
+
+function stopListRead() {
+  if (state.listRequest) state.listRequest.abort();
+  state.listRequest = null;
+  state.runsLoadingMore = false;
+}
+
+function clearSession() {
+  stopRunRead();
+  stopListRead();
+  if (state.uploadAbort) state.uploadAbort.abort();
   state.csrf = null;
   state.user = null;
   state.dagRunId = null;
@@ -561,9 +637,6 @@ function clearSession() {
   state.runsLoadingMore = false;
   state.runActionsFor = null;
   $("stage-rerun").hidden = true;
-  if (state.timer) window.clearInterval(state.timer);
-  state.timer = null;
-  stopActivityTimer();
   $("workspace").hidden = true;
   $("account").hidden = true;
   $("login-card").hidden = false;
@@ -622,38 +695,57 @@ function ghostButton(label) {
 }
 
 async function refreshRuns() {
+  stopListRead();
+  const request = new AbortController();
+  state.listRequest = request;
+  const ownsRead = () => state.listRequest === request && !request.signal.aborted;
   const list = $("runs");
   try {
-    const payload = await api("/api/runs?include_deleted=1&limit=30");
+    const payload = await api("/api/runs?include_deleted=1&limit=30", { signal: request.signal });
+    if (!ownsRead()) return;
     state.runsList = Array.isArray(payload.runs) ? payload.runs : [];
     state.runsNextOffset = typeof payload.next_offset === "number" ? payload.next_offset : null;
     setError($("runs-error"), "");
     renderRunsList();
   } catch (error) {
+    if (!ownsRead()) return;
+    state.runsList = [];
     state.runsNextOffset = null;
     list.textContent = "";
     const item = document.createElement("li");
     item.className = "muted";
     item.textContent = `Run list unavailable: ${error.message}`;
     list.append(item);
+  } finally {
+    if (ownsRead()) state.listRequest = null;
   }
 }
 
 // next_offset paging: a view is never declared empty from the first page alone.
 async function loadMoreRuns() {
-  if (state.runsLoadingMore || state.runsNextOffset === null) return;
+  if (state.listRequest || state.runsLoadingMore || state.runsNextOffset === null) return;
+  const baseline = state.runsList;
+  const offset = state.runsNextOffset;
+  const request = new AbortController();
+  state.listRequest = request;
+  const ownsRead = () => state.listRequest === request && !request.signal.aborted;
   state.runsLoadingMore = true;
   renderRunsList();
   try {
-    const payload = await api(`/api/runs?include_deleted=1&limit=30&offset=${state.runsNextOffset}`);
-    state.runsList = state.runsList.concat(Array.isArray(payload.runs) ? payload.runs : []);
+    const payload = await api(`/api/runs?include_deleted=1&limit=30&offset=${offset}`, { signal: request.signal });
+    if (!ownsRead() || state.runsList !== baseline || state.runsNextOffset !== offset) return;
+    state.runsList = baseline.concat(Array.isArray(payload.runs) ? payload.runs : []);
     state.runsNextOffset = typeof payload.next_offset === "number" ? payload.next_offset : null;
     setError($("runs-error"), "");
   } catch (error) {
+    if (!ownsRead()) return;
     setError($("runs-error"), error.message || "Failed to load more runs; retry.");
   } finally {
-    state.runsLoadingMore = false;
-    renderRunsList();
+    if (ownsRead()) {
+      state.listRequest = null;
+      state.runsLoadingMore = false;
+      renderRunsList();
+    }
   }
 }
 
@@ -892,6 +984,9 @@ function runDotState(state) {
 }
 
 function showUploadView() {
+  stopRunRead();
+  state.dagRunId = null;
+  state.lastRun = null;
   $("upload-view").hidden = false;
   $("detail-card").hidden = true;
 }
@@ -1900,7 +1995,7 @@ function renderRerunPanel(run) {
   line.className = "rerun-row";
   const button = document.createElement("button");
   button.type = "button";
-  button.textContent = busy ? "Creating request..." : "Create new request from Freeze";
+  button.textContent = busy ? "Creating request..." : state.rerunKeyByRun[runId] ? "Retry same Freeze request" : "Create new request from Freeze";
   button.disabled = busy || !canManage || !eligible || deleted || !selectedMain;
   button.addEventListener("click", () => {
     void rerunFromStage(stage.id);
@@ -1930,6 +2025,7 @@ function renderRerunPanel(run) {
     select.disabled = busy || !canManage || deleted;
     select.addEventListener("change", () => {
       const value = String(select.value || "");
+      if (value !== selectedMain) delete state.rerunKeyByRun[runId];
       if (value) state.rerunMainByRun[runId] = value;
       else delete state.rerunMainByRun[runId];
       button.disabled = busy || !canManage || !eligible || deleted || !value;
@@ -2032,6 +2128,8 @@ async function rerunFromStage(stageId) {
     return;
   }
   body.main_assembly = selectedMain;
+  state.rerunKeyByRun[runId] ||= requestKey();
+  const idempotencyKey = state.rerunKeyByRun[runId];
   state.rerunningRunId = runId;
   state.rerunNotice = "";
   state.rerunError = "";
@@ -2040,22 +2138,13 @@ async function rerunFromStage(stageId) {
     const payload = await api(`/api/runs/${encodeURIComponent(runId)}/attempts`, {
       method: "POST",
       body,
+      idempotencyKey,
     });
-    const nextRunId = String(payload.dag_run_id || "");
+    const nextRunId = responseRunId(payload, `portal-freeze-${idempotencyKey}`);
+    if (state.rerunKeyByRun[runId] === idempotencyKey) delete state.rerunKeyByRun[runId];
     const stageToShow = String(payload.resume_from || stageId);
     await refreshRuns();
     if (state.dagRunId !== runId) return; // the operator moved on; the list is refreshed
-    if (!nextRunId) {
-      const name = payload.resume_from_name || stageId;
-      state.rerunNotice = `Created a new request from ${name} with main ${selectedMain}; the original run and evidence remain.`;
-      if (!state.timer) {
-        state.timer = window.setInterval(() => {
-          void poll();
-        }, 3000);
-      }
-      await poll();
-      return;
-    }
     try {
       localStorage.setItem(stageSelectionKey(nextRunId), stageToShow);
     } catch {
@@ -2063,11 +2152,7 @@ async function rerunFromStage(stageId) {
     }
     await selectRun(nextRunId);
   } catch (error) {
-    if (error.status === 401) {
-      clearSession();
-      setError($("login-error"), error.message);
-      return;
-    }
+    if (error.status === 401) return;
     if (state.dagRunId === runId) {
       const detail = error.payload && typeof error.payload === "object" ? error.payload : {};
       state.rerunError = detail.message || error.message || "Rerun was not accepted.";
@@ -2094,6 +2179,8 @@ async function rerunFromStage(stageId) {
 }
 
 function renderRun(run) {
+  $("run-loading").hidden = true;
+  $("run-content").hidden = false;
   const runId = String(run.dag_run_id || "");
   const listEntry = (state.runsList || []).find((item) => item && item.dag_run_id === runId) || null;
   const deleted = resolveDeleted(run, listEntry);
@@ -2613,10 +2700,16 @@ async function loadPreview(dagRunId) {
 
 async function poll() {
   const dagRunId = state.dagRunId;
-  if (!dagRunId) return;
+  if (!dagRunId || state.pollRequest) return;
+  if (state.timer) window.clearTimeout(state.timer);
+  state.timer = null;
+  const request = new AbortController();
+  state.pollRequest = request;
+  const ownsRead = () => state.pollRequest === request && state.dagRunId === dagRunId && !request.signal.aborted;
   try {
-    const run = await api(`/api/runs/${encodeURIComponent(dagRunId)}`);
-    if (state.dagRunId !== dagRunId) return;
+    const run = await api(`/api/runs/${encodeURIComponent(dagRunId)}`, { signal: request.signal });
+    if (!ownsRead()) return;
+    responseRunId(run, dagRunId);
     setError($("run-error-detail"), "");
     const verified = run.automatic && run.automatic.state === "passed";
     const diagnosable = !verified && ["failed", "unresolved"].includes(run.state);
@@ -2624,64 +2717,67 @@ async function poll() {
     const previous = state.lastRun;
     state.lastRun = run;
     renderRun(run);
-    if (verified || diagnosable) {
-      await loadPreview(dagRunId);
-    }
-    if (state.dagRunId !== dagRunId) return;
-    // A late effect conflict can revoke success, so canonical polling continues while
-    // this run is selected. Only live activity animation stops at a known terminal state.
+    if (verified || diagnosable) await loadPreview(dagRunId);
+    if (!ownsRead()) return;
+    // Keep canonical polling after terminal states so a late conflict can revoke success.
     if (["success", "failed", "cancelled", "unresolved"].includes(run.state)) stopActivityTimer();
+    else startActivityTimer();
     if (shouldRefreshRunList(previous, run)) await refreshRuns();
   } catch (error) {
-    if (state.dagRunId !== dagRunId) return;
-    if (error.status === 401) {
-      clearSession();
-      setError($("login-error"), error.message);
-      return;
-    }
+    if (!ownsRead()) return;
+    if (error.status === 401) return;
     if (error.status === 403 || error.status === 404) {
-      clearPreview();
-      state.lastRun = null;
-      state.dagRunId = null;
-      state.selectedStage = null;
-      state.tabsInitializedFor = null;
-      if (state.timer) window.clearInterval(state.timer);
-      state.timer = null;
-      stopActivityTimer();
-      $("retry-panel").hidden = true;
       showUploadView();
       await refreshRuns();
       setError($("run-error"), error.message);
       return;
     }
+    state.lastRun = null;
+    clearPreview();
+    stopActivityTimer();
+    renderRunLoading(dagRunId, true);
     setError($("run-error-detail"), error.message);
+  } finally {
+    if (ownsRead()) {
+      state.pollRequest = null;
+      state.timer = window.setTimeout(() => {
+        state.timer = null;
+        void poll();
+      }, 3000);
+    }
   }
 }
 
+function renderRunLoading(dagRunId, unavailable = false) {
+  $("run-content").hidden = true;
+  $("run-loading").hidden = false;
+  $("run-loading").textContent = unavailable
+    ? `The current state of run ${dagRunId} could not be read. Retrying...`
+    : `Loading run ${dagRunId}...`;
+  $("run-heading").textContent = unavailable ? "Run status unavailable" : "Loading run...";
+  $("run-state-label").textContent = unavailable ? "Unknown" : "Loading";
+  $("run-dot").className = "dot idle";
+  $("run-initiator").textContent = "";
+  for (const id of ["run-origin", "run-deleted", "pr", "retry-panel"]) $(id).hidden = true;
+  $("run-actions").textContent = "";
+  state.runActionsFor = null;
+}
+
 async function selectRun(dagRunId) {
-  if (state.timer) window.clearInterval(state.timer);
-  state.timer = null;
-  stopActivityTimer();
-  clearPreview();
+  stopRunRead();
   state.dagRunId = dagRunId;
   state.lastRun = null;
   state.selectedStage = null;
   state.tabsInitializedFor = null;
   state.rerunNotice = "";
   state.rerunError = "";
-  $("retry-panel").hidden = true;
+  renderRunLoading(dagRunId);
   setError($("run-error-detail"), "");
   setError($("retry-error"), "");
   showRunView();
   renderRunsList();
-  // A run opened from a stale list (deep link, another tab, freshly queued) still lands in the
-  // sidebar: refresh once when the selected id is not part of the cached page.
   const knownRun = (state.runsList || []).some((item) => item && item.dag_run_id === dagRunId);
   if (!knownRun) void refreshRuns();
-  if (state.dagRunId !== dagRunId) return;
-  state.timer = window.setInterval(() => {
-    void poll();
-  }, 3000);
   startActivityTimer();
   await poll();
 }
@@ -2700,15 +2796,13 @@ async function retryRun() {
   try {
     await api(`/api/runs/${encodeURIComponent(dagRunId)}/retry`, { method: "POST", body: {} });
     if (state.dagRunId !== dagRunId) return;
-    if (!state.timer) state.timer = window.setInterval(() => { void poll(); }, 3000);
+    stopRunRead();
     startActivityTimer();
     await poll();
     await refreshRuns();
   } catch (error) {
-    if (error.status === 401) {
-      clearSession();
-      setError($("login-error"), error.message);
-    } else if (state.dagRunId === dagRunId) {
+    if (error.status === 401) return;
+    if (state.dagRunId === dagRunId) {
       setError($("retry-error"), error.message);
       if (error.status === 403 || error.status === 404 || error.status === 409) {
         await poll();
@@ -2736,12 +2830,13 @@ function wire() {
   $("runs-view-deleted").addEventListener("click", () => setRunView("deleted"));
   $("retry-button").addEventListener("click", retryRun);
   $("logout").addEventListener("click", async () => {
+    const csrf = state.csrf;
     try {
       await api("/api/session", { method: "DELETE" });
     } catch {
       // the local session is cleared even if Airflow is unreachable
     }
-    clearSession();
+    if (state.csrf === csrf) clearSession();
   });
 
   $("choose-button").addEventListener("click", () => $("folder-input").click());
@@ -2758,7 +2853,7 @@ function wire() {
       $("start-button").disabled = true;
       return;
     }
-    if (state.folderPick?.top !== picked.top) state.submissionKey = null;
+    state.submissionKey = null;
     state.folderPick = picked;
     summary.hidden = false;
     summary.textContent = `${picked.top} · ${picked.count} files · ${formatBytes(picked.bytes)}`;
@@ -2770,11 +2865,12 @@ function wire() {
 
   $("assembly-select").addEventListener("change", () => {
     state.assemblyChoice = $("assembly-select").value || null;
-    updateStartEnabled();
+    changeSubmission();
     if (state.folderPick) void loadTargets(state.folderPick);
   });
 
   $("cancel-button").addEventListener("click", () => {
+    stopRunRead();
     if (state.uploadAbort) state.uploadAbort.abort();
   });
 
@@ -2784,10 +2880,6 @@ function wire() {
     const picked = state.folderPick;
     if (!picked) {
       setError($("run-error"), "Select a local engineering folder first.");
-      return;
-    }
-    if (state.blockedPick) {
-      setError($("run-error"), "The previous submission state is unconfirmed; check the run list above or reselect the folder before submitting again.");
       return;
     }
     if (!state.assemblyChoice || !picked.assemblies.includes(state.assemblyChoice)) {
@@ -2801,6 +2893,7 @@ function wire() {
     $("choose-button").disabled = true;
     $("folder-input").disabled = true;
     $("assembly-select").disabled = true;
+    for (const id of ["target-select", "purpose-select", "change-summary"]) $(id).disabled = true;
     $("cancel-button").hidden = false;
     status.hidden = false;
     status.textContent = "Uploading engineering folder...";
@@ -2820,23 +2913,13 @@ function wire() {
       await selectRun(payload.dag_run_id);
       resetPick();
     } catch (error) {
-      if (error.aborted) {
-        status.textContent = "Upload cancelled; refreshing runs. If no new run appears, nothing was submitted.";
-        await refreshRuns().catch(() => {});
-      } else if (error.network) {
-        status.textContent = error.message;
-        await refreshRuns().catch(() => {});
-      } else if (error.status === 401) {
-        clearSession();
-        resetPick();
-        setError($("login-error"), "The session expired; sign in again.");
-        return;
-      } else if (error.status === 502 && error.dagRunId) {
+      status.hidden = true;
+      if (error.status === 401) return;
+      if (error.unconfirmed || error.network || error.aborted || (error.status === 502 && error.dagRunId)) {
         state.blockedPick = true;
-        setError(
-          $("run-error"),
-          `Start state is unconfirmed; check the run list and do not submit again. Run ID: ${error.dagRunId}`,
-        );
+        const runId = error.dagRunId || `portal-${state.submissionKey}`;
+        const reason = error.aborted ? "Upload stopped; its outcome is unconfirmed." : error.message;
+        setError($("run-error"), `${reason} Run ID: ${runId}. Check the run list or retry this same submission; no automatic retry will occur.`);
         await refreshRuns().catch(() => {});
       } else {
         setError($("run-error"), error.message);
@@ -2847,8 +2930,9 @@ function wire() {
       $("choose-button").disabled = false;
       $("folder-input").disabled = false;
       $("assembly-select").disabled = false;
+      for (const id of ["target-select", "purpose-select", "change-summary"]) $(id).disabled = false;
       $("cancel-button").hidden = true;
-      if (state.folderPick && !state.blockedPick) {
+      if (state.folderPick) {
         updateStartEnabled();
       } else {
         start.disabled = true;
@@ -2870,8 +2954,7 @@ async function boot() {
     showSession(session);
     await refreshRuns();
   } catch (error) {
-    clearSession();
-    if (error.status === 401) setError($("login-error"), error.message);
+    if (error.status !== 401) clearSession();
   }
 }
 

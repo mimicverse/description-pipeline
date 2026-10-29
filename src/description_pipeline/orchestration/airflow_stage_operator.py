@@ -21,7 +21,7 @@ from ..pipeline.contracts import (
     StageResult,
 )
 from ..stages import STAGE_IDS
-from .airflow_effect_trigger import EffectPollTrigger
+from .airflow_effect_trigger import EffectPollTrigger, _minimum_poll_interval
 
 if TYPE_CHECKING:
     from ..pipeline.contracts import StageEffectWait
@@ -120,13 +120,7 @@ class StageTaskOperator(BaseOperator):
             raise ValueError(f"Unknown stage {stage!r}")
         if self.task_id != stage:
             raise ValueError("StageTaskOperator task_id must equal stage")
-        if isinstance(poll_interval, bool) or not isinstance(
-            poll_interval,
-            (int, float),
-        ):
-            raise ValueError("poll_interval must be a number")
-        if poll_interval <= 0:
-            raise ValueError("poll_interval must be positive")
+        poll_interval = _minimum_poll_interval(poll_interval)
         if defer_timeout is not None and defer_timeout <= 0:
             raise ValueError("defer_timeout must be positive or None")
         self.stage = stage

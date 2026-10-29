@@ -9,6 +9,7 @@ from typing import Any
 from ..stages import STAGE_IDS
 from ..artifacts import ArtifactStore
 from ..io import PipelineError
+from .facts import RunNotAdmittedError
 from ..pipeline.contracts import (
     ArtifactRef,
     FailureEnvelope,
@@ -296,7 +297,7 @@ def read_run_projection(
         )
         admission = cursor.fetchone()
         if admission is None:
-            raise PipelineError(f"Run {run_id!r} is not admitted")
+            raise RunNotAdmittedError(f"Run {run_id!r} is not admitted")
         cursor.execute(
             "SELECT activity FROM run_display_metadata WHERE run_id = %s",
             (run_id,),

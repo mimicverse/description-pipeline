@@ -443,6 +443,8 @@ owner/fence 约束下安全重试或恢复；已有终态决定时只复核并�
 technical dispatch UNKNOWN 仅由
 `StageApplication.dispatch`/`TechnicalDispatchService` 观察原 DagRun/conf。
 
+用户显式重试已接纳的 technical dispatch 时，先核对原 DagRun 与完整 conf。目标已存在且身份一致时只收敛原 effect；不可观察时保留 UNKNOWN。仅原 `airflow_dispatch` 的最新密封观察明确为 absent 时，才允许在同一不可变 command/effect/DagRun 上再次发送。该观察的 fact ID 同时绑定重试 claim 与发送授权，两处均在锁内核验；活跃旧 claim、较新事实、错目标、错 kind 或错 conf 均拒绝。此规则依赖 Airflow 同一 DagRun 身份去重，不适用于 native、Git 或 PR，不把普通 absent 观察改判为确定失败，也不建立新的状态表。
+
 恢复判断使用当前阶段及其受控操作，不保留已删除任务的状态兼容表。工程失败、运输中断、产物损坏和外部结果未知分别记录；运输恢复不得改写工程失败或重复原生执行。门户、重跑授权、维护和后台对账读取同一平台权威及实际调度关联。
 
 共同程序 API 固定为
