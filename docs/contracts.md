@@ -414,6 +414,8 @@ authorization 事务提交之后，数据库锁不得跨 HTTP、CAD、Git 或 PR
 
 失败归属实际执行阶段。原生主装配打开或选择失败登记为 `discover` 失败，保留已完成的冻结收据。未执行后继由共同 projector 根据前置失败投影为 `blocked`，不补造后继执行或第二份阻断状态。对账保留已有 decision 和诊断，并核验尚未结算的真实 effect。
 
+Capture 的 `resource_settlement` 由原生会话边界按最终 `release()` 结果记录：进入原生会话前拒绝可直接结算；进入后仅实际释放成功才标记 `settled=true`，清理失败或缺少证明保持 UNKNOWN。领域读取失败不抹去成功释放凭据，也不因此获得成功产物。已收到的 UNKNOWN 响应登记为 response 与未决观察，运输超时另行记录。`native-operation-view/v4` 的 failure 保留结构化 detail，沿原有 StageFailure 与失败封套传至 GUI；原生错误内容与运行诊断分别保全，不覆盖对象或字段定位。
+
 Portal 不以静态 QC 清单重新裁决上述状态。Freeze/Discover 的实际 `checks.json` 须绑定同一 command、request digest 和结果中的 checks digest；Capture 的原生报告仅提供该阶段详细观察。失败结果若绑定原生 output，则从同阶段 `native-result.json` 核对 kind、state、failure code 并保留 exact message；不将缺失错误类型伪造为推断类型。来源 warning 从 Discover 自身密封输出读取，Capture 失败不影响已成功 Discover 的来源展示。证据读取损坏返回完整性错误，不改写已有业务决定，也不合成未执行检查。
 
 关闭准入阻止新请求与新运行；已准入运行的合法后继、同键重试、取消、对账和释放继续按原身份与前提执行。已知前提失败的 `blocked` 阶段不是活动操作。停止服务要求准入已关闭，且业务与实际调度均无活动、未决或未知；仅有业务终态或暂停 DAG 不满足此条件。
@@ -601,8 +603,9 @@ SourceSet archive，后者使用由同一 SourceSet 原件血缘派生的 prepar
 SourceSet 与 prepared 分别保存不同摘要。每个 operation 必须绑定原请求、上游
 artifacts、同版 native tool 和本次 archive；同一 operation 重试先观察原结果，
 UNKNOWN 不得触发第二次 CAD 执行或静默创建新 operation。Windows 继续只有一个 native
-operation runtime 和一个 CAD resource owner，workspace 是 operation-local 临时物化；
-本版不新增共享 source cache、兼容链或第二生命周期。未来内容复用只能是可丢弃字节
+operation runtime 和一个 CAD resource owner，临时 workspace 直接使用已登记的唯一
+claim 标识，不重复嵌套 operation 标识；原请求与执行身份仍由同一 claim 记录绑定，
+输入文件名、包内相对路径与原件字节保持不变。本版不新增共享 source cache、兼容链或第二生命周期。未来内容复用只能是可丢弃字节
 优化，不能改变工程资格或替代阶段独立 admission。
 
 ### 原生三角形事实

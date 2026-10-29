@@ -209,7 +209,7 @@ def capture_native_package(
     backend: Any,
     on_event=None,
     on_activity=None,
-    resource_boundary: dict[str, bool] | None = None,
+    resource_boundary: dict[str, Any] | None = None,
 ):
     """Inspect, archive and capture one complete prepared package."""
 
@@ -355,6 +355,7 @@ def capture_native_package(
         worker_version=__version__,
         expected_session_sources=expected_session_sources,
         on_activity=on_activity,
+        resource_settlement=resource_boundary,
     )
     checked(
         on_event,

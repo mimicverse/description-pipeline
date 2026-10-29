@@ -3469,8 +3469,10 @@ class SolidWorksBackend(CadBackend):
                 self._local.role = previous
 
     @contextmanager
-    def session(self):
-        """A job owns its COM references and process handles until its final step."""
+    def session(self, *, resource_settlement=None):
+        """Own the native lifetime and report only observed final cleanup."""
+        if resource_settlement is not None:
+            resource_settlement.update(settled=False, reason="native_session_active")
         if getattr(self._local, "depth", 0):
             yield self
             return
@@ -3486,9 +3488,20 @@ class SolidWorksBackend(CadBackend):
             try:
                 self.release()
             except Exception as error:
+                if resource_settlement is not None:
+                    resource_settlement.update(
+                        settled=False,
+                        reason="native_session_cleanup_failed",
+                        cleanup_error=_native_error_record(error),
+                    )
                 if pending is None:
                     raise
                 pending.add_note(f"CAD cleanup also failed: {error}")
+            else:
+                if resource_settlement is not None:
+                    resource_settlement.update(
+                        settled=True, reason="owned_native_sessions_released",
+                    )
             finally:
                 self._cancelled.clear()
                 self._local.depth = 0

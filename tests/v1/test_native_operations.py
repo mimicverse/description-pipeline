@@ -343,7 +343,7 @@ class NativeOperationRuntimeTests(unittest.TestCase):
         )
         _wait_for(
             lambda: not (
-                runtime.workspace_root / "operation-roundtrip" / claim_id
+                runtime.workspace_root / claim_id
             ).exists()
         )
 
@@ -358,6 +358,34 @@ class NativeOperationRuntimeTests(unittest.TestCase):
         self.assertEqual(downloaded.path, destination)
         self.assertEqual(destination.read_bytes(), b"sealed native artifact")
         self.assertEqual(downloaded.sha256, file_digest(destination))
+
+    def test_long_operation_identity_does_not_lengthen_native_workspace(self) -> None:
+        workspaces = []
+
+        def executor(request, source_archive, workspace, native_tool):
+            workspaces.append(Path(workspace))
+            return self.executor(request, source_archive, workspace, native_tool)
+
+        runtime = NativeOperationRuntime(
+            state_root=self.root / "state",
+            native_tool_factory=lambda: NATIVE_TOOL,
+            executors={CAPTURE_KIND: executor},
+        )
+        server = _Server(runtime)
+        self.addCleanup(server.close)
+        self.addCleanup(runtime.close)
+        client = server.client()
+        operation_id = "x" * 128
+        client.create_operation(_operation(operation_id, self.archive))
+        client.upload_input(operation_id, self.archive)
+        self.assertEqual(client.wait_for_terminal(operation_id).state, "satisfied")
+        claim_id = next(
+            event["payload"]["claim_id"]
+            for event in runtime._events(operation_id)
+            if event["type"] == "claimed"
+        )
+        self.assertEqual(workspaces, [runtime.workspace_root / claim_id])
+        self.assertFalse((runtime.workspace_root / operation_id).exists())
 
     def test_submit_operation_returns_the_current_state_without_polling_or_resend(self) -> None:
         entered = threading.Event()
@@ -1829,6 +1857,10 @@ class NativeOperationRuntimeTests(unittest.TestCase):
                 "state": "failed",
                 "error": "capture failed",
                 "error_code": "capture.native_failed",
+                "detail": {
+                    "body": "base_link", "component": "missing-occurrence",
+                    "diagnostic_path": "native-object-path", "resource_settlement": {"domain_value": True},
+                },
                 "diagnostic_path": str(diagnostic),
                 "resource_settlement": {"settled": True},
             }
@@ -1857,6 +1889,12 @@ class NativeOperationRuntimeTests(unittest.TestCase):
             failed = client.wait_for_terminal("operation-capture-failure")
         self.assertEqual(failed.state, "failed")
         self.assertEqual(failed.failure.code, "capture.native_failed")
+        self.assertEqual(failed.failure.detail["native_detail"], {
+            "body": "base_link", "component": "missing-occurrence",
+            "diagnostic_path": "native-object-path", "resource_settlement": {"domain_value": True},
+        })
+        self.assertNotEqual(failed.failure.detail["diagnostic_path"], "native-object-path")
+        self.assertEqual(failed.failure.detail["resource_settlement"], {"settled": True})
         self.assertTrue(failed.resource_terminated)
         claim_id = next(
             event["payload"]["claim_id"]
@@ -1865,7 +1903,6 @@ class NativeOperationRuntimeTests(unittest.TestCase):
         )
         evidence = (
             runtime.workspace_root
-            / "operation-capture-failure"
             / claim_id
             / "capture-output"
             / "raw-failure.bin"
@@ -2228,7 +2265,6 @@ class NativeOperationRuntimeTests(unittest.TestCase):
         )
         evidence = (
             runtime.workspace_root
-            / "operation-failed-evidence"
             / claim_id
             / "partial-native.bin"
         )
@@ -2274,7 +2310,6 @@ class NativeOperationRuntimeTests(unittest.TestCase):
         )
         evidence = (
             runtime.workspace_root
-            / "operation-seal-failure"
             / claim_id
             / "unsealed.bin"
         )

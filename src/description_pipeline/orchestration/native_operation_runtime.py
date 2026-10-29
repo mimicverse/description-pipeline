@@ -340,19 +340,26 @@ class NativeArtifactView:
 class NativeFailureView:
     code: str
     message: str
+    detail: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         _text(self.code, "failure.code")
         _text(self.message, "failure.message")
+        if self.detail is not None:
+            if not isinstance(self.detail, Mapping):
+                raise NativeOperationError("failure.detail must be an object or null")
+            detail = copy.deepcopy(dict(self.detail))
+            canonical(detail)
+            object.__setattr__(self, "detail", detail)
 
     def to_record(self) -> dict[str, object]:
-        return {"code": self.code, "message": self.message}
+        return {"code": self.code, "message": self.message, "detail": copy.deepcopy(self.detail)}
 
     @classmethod
     def from_record(cls, value: object) -> NativeFailureView:
-        if not isinstance(value, Mapping) or set(value) != {"code", "message"}:
+        if not isinstance(value, Mapping) or set(value) != {"code", "message", "detail"}:
             raise NativeOperationError("failure fields are invalid")
-        return cls(code=value["code"], message=value["message"])
+        return cls(code=value["code"], message=value["message"], detail=value["detail"])
 
 
 def _activity_record(value: object) -> dict[str, object]:
@@ -1138,21 +1145,23 @@ class CaptureOperationExecutor:
         )
         message = str(result.get("error") or "Native Capture failed")
         diagnostic = result.get("diagnostic_path")
+        detail = {
+            "native_detail": copy.deepcopy(result.get("detail")),
+            "diagnostic_path": diagnostic,
+            "resource_settlement": dict(settlement) if isinstance(settlement, Mapping) else None,
+        }
         if settled and result.get("state") == "failed" and isinstance(diagnostic, str):
             raise NativeOperationFailure(
                 reason,
                 message,
                 resource_terminated=True,
-                detail={"diagnostic_path": diagnostic},
+                detail=detail,
             )
         raise NativeOperationUnresolved(
             reason if not settled else "capture.native_unknown",
             message,
             resource_terminated=settled,
-            detail={
-                "state": result.get("state"),
-                "diagnostic_path": diagnostic,
-            },
+            detail={"state": result.get("state"), **detail},
         )
 
 
@@ -1980,7 +1989,9 @@ class NativeOperationRuntime:
         owner_sha256 = digest(
             {"claim_id": claim_id, "install_id": self.install_id}
         )
-        workspace = self.workspace_root / operation_id / claim_id
+        # The recorded claim already identifies this attempt uniquely. Repeating
+        # the operation id here can exceed native CAD path limits after staging.
+        workspace = self.workspace_root / claim_id
         workspace.mkdir(parents=True, exist_ok=False)
         if not self._claim_and_start(
             operation_id,
@@ -2288,6 +2299,7 @@ class NativeOperationRuntime:
                 )
                 if event["type"] in {"failed", "cancelled", "unknown"}:
                     failure = NativeFailureView(
+                        detail=payload.get("detail"),
                         code=_single_line(
                             payload.get("code")
                             or "native_operation_terminal",

@@ -2812,8 +2812,141 @@ class CaptureHandlerTests(unittest.TestCase):
             )
         self.assertEqual(operation.call_count, 1)
         self.assertEqual(effects.authorized[0][0], "capture-native")
-        self.assertEqual(effects.observed[0][0], "timeout")
+        self.assertEqual(effects.observed[0][0], "response")
         self.assertEqual(effects.observed[1][0], "unobservable")
+
+    def test_native_operation_wait_timeout_records_separate_timeout_evidence(self) -> None:
+        workspace = self.workspace(name="capture-native-wait-timeout")
+        effects = self.effects()
+        operation_id = native_capture_operation_id(
+            run_id=self.command.run_id,
+            command_id=self.command.command_id,
+            effect_key="capture-native",
+        )
+        created: list[dict] = []
+        now = datetime.now(UTC).isoformat()
+
+        class Response:
+            def __init__(self, body: dict) -> None:
+                self.headers = Message()
+                self.headers["Content-Type"] = (
+                    "application/json; charset=utf-8"
+                )
+                self.headers["X-Native-Target-ID"] = (
+                    CAPTURE_TARGET.target_id
+                )
+                self._body = io.BytesIO(
+                    (json.dumps(body, sort_keys=True) + "\n").encode()
+                )
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                self._body.close()
+                return False
+
+            def read(self, limit: int = -1):
+                return self._body.read(limit)
+
+        def operation_view(envelope: dict, state: str) -> dict:
+            return {
+                "schema_version": OPERATION_VIEW_SCHEMA,
+                "operation_id": operation_id,
+                "kind": CAPTURE_KIND,
+                "target_id": CAPTURE_TARGET.target_id,
+                "payload_sha256": envelope["payload_sha256"],
+                "state": state,
+                "request_sha256": envelope["request_sha256"],
+                "input_archive_sha256": envelope["input"]["archive_sha256"],
+                "native_tool_requirement_sha256": envelope["native_tool"][
+                    "requirement_sha256"
+                ],
+                "actual_native_tool_sha256": None,
+                "owner_sha256": None,
+                "executor_sha256": None,
+                "resource_terminated": False,
+                "artifact": None,
+                "failure": None,
+                "created_at": now,
+                "started_at": now if state == "running" else None,
+                "finished_at": None,
+            }
+
+        def opener(request, *, timeout):
+            del timeout
+            method = request.get_method()
+            path = request.full_url
+            if method == "GET" and path.endswith("/target"):
+                return Response(CAPTURE_TARGET.to_record())
+            if method == "GET" and path.endswith(
+                f"/operations/{operation_id}"
+            ):
+                if not created:
+                    raise urlerror.HTTPError(
+                        request.full_url,
+                        404,
+                        "Not Found",
+                        Message(),
+                        io.BytesIO(b'{"error":"missing"}\n'),
+                    )
+                return Response(operation_view(created[0], "running"))
+            if method == "POST" and path.endswith("/operations"):
+                envelope = json.loads(request.data.decode("utf-8"))
+                created.append(copy.deepcopy(envelope))
+                return Response(operation_view(envelope, "accepted"))
+            if method == "POST" and path.endswith(
+                f"/operations/{operation_id}/input"
+            ):
+                return Response(operation_view(created[0], "running"))
+            raise AssertionError(
+                f"unexpected native request: {method} {path}"
+            )
+
+        current = [0.0]
+        client = NativeOperationClient(
+            NativeOperationEndpoint(
+                "http://127.0.0.1:1",
+                "t" * 32,
+            ),
+            target_id=CAPTURE_TARGET.target_id,
+            opener=opener,
+            sleeper=lambda seconds: current.__setitem__(
+                0,
+                current[0] + seconds,
+            ),
+            clock=lambda: current[0],
+        )
+        with self.assertRaisesRegex(
+            CaptureUnresolved,
+            "native_operation_wait_timeout",
+        ):
+            CaptureHandler(
+                artifact_store=self.store,
+                native_operation=NativeOperationCapturePort(
+                    client,
+                    timeout=0.02,
+                    poll_interval=0.01,
+                ),
+                native_tool_factory=lambda: self.current_native_tool,
+            ).execute(
+                self.command,
+                self.claim,
+                workspace,
+                effects=effects,
+            )
+        self.assertEqual(len(created), 1)
+        self.assertEqual(
+            [kind for kind, _effect_id in effects.observed],
+            ["timeout", "unobservable"],
+        )
+        settlement = effects.effect_settlement_for_key("capture-native")
+        self.assertEqual(settlement.state, EffectState.UNKNOWN)
+        timeout = read_data(
+            workspace.root / "capture-effect-timeout" / "native-timeout.json"
+        )
+        self.assertEqual(timeout["reason_code"], "native_operation_wait_timeout")
+        self.assertEqual(timeout["detail"], {"last_state": "running"})
 
     def test_native_failure_without_resource_settlement_stays_unknown(self) -> None:
         workspace = self.workspace()
