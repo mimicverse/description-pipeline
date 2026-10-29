@@ -36,7 +36,9 @@ Windows 安装与生命周期脚本须在 Windows PowerShell 5.1 Desktop 上通�
 
 Linux 使用一份私有 `platform.json`。schema 拒绝未知键、不安全路径、不完整目标和冲突端口；租户与管理员列表的单项不得包含逗号或空白，避免环境变量序列化改变授权主体。秘密只按文件引用。安装将配置渲染为不可变快照并记录摘要；操作台、Airflow 和维护命令读取同一快照。Airflow Connection 只引用该配置身份，不能再维护一份路由或凭据副本。
 
-该快照的唯一派生环境固定包含 `PYTHONDONTWRITEBYTECODE=1`，由 Airflow 和 Portal 的 systemd 服务直接加载，防止 Python 导入在发行目录生成缓存。服务不能依赖调用方 shell 的环境继承；发行目录仍执行完整成员与摘要核验，不豁免缓存文件。
+环境派生统一产生 `repositories.json`、`targets.json`、`discovery.json` 和 `operator.env` 的精确内容；只有 emit 写入，安装态核验逐文件与快照派生字节比较，不修改文件，也不替换写入函数。三份 JSON 与 `resolved.env` 自洽不能替代对快照来源的核验。
+
+该快照的唯一派生环境固定包含 `PYTHONDONTWRITEBYTECODE=1`，由 Airflow 和 Portal 的 systemd 服务直接加载；维护环境库在加载时同样设置该变量，防止直接诊断调用在发行目录生成缓存。服务不能依赖调用方 shell 的环境继承；发行目录仍执行完整成员与摘要核验，不豁免缓存文件。
 
 `solidworks_windows` 连接的 `host`、`password` 为空，`port` 为 `null`，`extra` 恰含 `config_identity`；该引用只含快照的 `schema_version`、绝对 `path` 和 `sha256`。消费者按同一契约检查受控目录、普通非链接文件、`0600` 权限、快照格式及字节摘要。新接纳再核对当前安装记录；已冻结运行继续读取自己的配置身份，不能回退到当前连接的路由。
 

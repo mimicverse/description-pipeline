@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -117,15 +118,17 @@ class PlatformEnvTests(unittest.TestCase):
         self.snapshot_path = platform_config.write_snapshot(snapshot, self.root / "state" / "snapshots", owner)
         self.snapshot = snapshot
 
-    def derive(self, snapshot, *, install_id, tree_root=None, wheel=None):
-        return platform_env.derive(
-            json.dumps(snapshot).encode("utf-8"),
+    def emit(self, snapshot, *, install_id, tree_root=None, wheel=None):
+        result = platform_env.derive(
+            pipeline_io.canonical(snapshot),
             install_id=install_id,
             snapshot_path=self.snapshot_path,
             tree_root=tree_root or self.tree,
             release=self.release,
             wheel=wheel,
         )
+        platform_env.emit(result)
+        return result
 
     def _emit(self, snapshot: Path, *, env: dict | None = None) -> subprocess.CompletedProcess:
         return subprocess.run(
@@ -152,7 +155,7 @@ class PlatformEnvTests(unittest.TestCase):
         self._temporary.cleanup()
 
     def test_derives_the_internal_environment_and_derived_files(self):
-        result = self.derive(self.snapshot, install_id="gen-1", tree_root=self.tree)
+        result = self.emit(self.snapshot, install_id="gen-1", tree_root=self.tree)
         env = result["env"]
         self.assertEqual(env["OPERATOR_HOST"], "10.0.0.235")
         self.assertEqual(env["OPERATOR_HTTPS_PORT"], "9443")
@@ -197,8 +200,106 @@ class PlatformEnvTests(unittest.TestCase):
         }
         self.assertEqual(parsed, env)
 
+    def test_derivation_and_verification_do_not_write_installation_files(self):
+        state = self.root / "state"
+        before = tree_digest(state)
+        result = platform_env.derive(
+            json.dumps(self.snapshot).encode("utf-8"),
+            install_id="gen-1",
+            snapshot_path=self.snapshot_path,
+            tree_root=self.tree,
+            release=self.release,
+        )
+        self.assertEqual(tree_digest(state), before)
+        with self.assertRaisesRegex(SystemExit, "missing or a link"):
+            platform_env.verify(result)
+        self.assertEqual(tree_digest(state), before)
+        platform_env.emit(result)
+        before = tree_digest(state)
+        platform_env.verify(result)
+        self.assertEqual(tree_digest(state), before)
+        for path, payload in result["files"].items():
+            with self.subTest(path.name):
+                path.unlink()
+                target = self.root / ("linked-" + path.name)
+                target.write_bytes(payload)
+                path.symlink_to(target)
+                with self.assertRaisesRegex(SystemExit, "missing or a link"):
+                    platform_env.verify(result)
+                self.assertTrue(path.is_symlink())
+                path.unlink()
+                path.write_bytes(payload)
+
+    def test_shell_verifier_rejects_derived_files_even_with_matching_resolved_values(self):
+        result = self.emit(self.snapshot, install_id="gen-1")
+        helpers = self.tree / "deploy" / "operator"
+        helpers.mkdir(parents=True)
+        names = ("platform_env.py", "platform_config.py", "install_record.py", "render_operator.py", "systemd_units.py")
+        for name in names:
+            shutil.copyfile(OPERATOR / name, helpers / name)
+        release_file = self.root / "release.json"
+        release = json.loads(release_file.read_text())
+        release["deployment_files"] = {
+            f"deploy/operator/{name}": hashlib.sha256((helpers / name).read_bytes()).hexdigest()
+            for name in names
+        }
+        release_file.write_text(json.dumps(release))
+
+        def verify():
+            return subprocess.run(
+                [
+                    "bash", "-c",
+                    'set -euo pipefail; source "$1"; shift; verify_snapshot_derived_env "$@"',
+                    "boundary", str(OPERATOR / "environment.sh"),
+                    str(self.snapshot_path), "gen-1", str(result["env_path"]),
+                    str(self.tree), str(release_file),
+                ],
+                env={
+                    "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                    "CONTROL_PYTHON": sys.executable,
+                    "HERE": str(helpers),
+                },
+                capture_output=True, text=True, check=False,
+            )
+
+        completed = verify()
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        cases = (
+            ("MODEL_REPOSITORIES_FILE", "MODEL_REPOSITORIES_JSON", {"owner/model-repository": "/other/workspace"}),
+            (
+                "MODEL_TARGETS_FILE", "MODEL_TARGETS_JSON",
+                {"m3.0": {"repository_slug": "owner/model-repository", "base": "other"}},
+            ),
+            (
+                "DISCOVERY_SETTINGS_FILE", "DISCOVERY_SETTINGS_JSON",
+                {"record_roots": ["/other/specifications"]},
+            ),
+        )
+        resolved_file = self.root / "state" / "resolved.env"
+        for file_key, value_key, replacement in cases:
+            with self.subTest(file_key):
+                path = Path(result["env"][file_key])
+                original = path.read_bytes()
+                path.write_bytes(pipeline_io.canonical(replacement))
+                resolved_file.write_text(
+                    "\n".join(render_operator.encode_env_lines([(value_key, json.dumps(replacement))])) + "\n"
+                )
+                before = tree_digest(self.root / "state")
+                completed = verify()
+                self.assertNotEqual(completed.returncode, 0, completed.stdout)
+                self.assertIn("differs from its snapshot", completed.stderr)
+                self.assertEqual(tree_digest(self.root / "state"), before)
+                path.write_bytes(original)
+        path = result["env_path"]
+        path.write_bytes(path.read_bytes() + b"EXTRA=value\n")
+        before = tree_digest(self.root / "state")
+        completed = verify()
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("differs from its snapshot", completed.stderr)
+        self.assertEqual(tree_digest(self.root / "state"), before)
+
     def test_service_environment_prevents_imports_from_mutating_release(self) -> None:
-        result = self.derive(self.snapshot, install_id="gen-1")
+        result = self.emit(self.snapshot, install_id="gen-1")
         env = render_operator.read_env(result["env_path"])
         units_root = self.root / "systemd-config"
         rendered = subprocess.run(
@@ -295,27 +396,27 @@ class PlatformEnvTests(unittest.TestCase):
         second = self.tree / "another.whl"
         write_contract_wheel(second)
         with self.assertRaises(SystemExit) as raised:
-            self.derive(self.snapshot, install_id="gen-1")
+            self.emit(self.snapshot, install_id="gen-1")
         self.assertIn("exactly one", str(raised.exception))
         self.release = write_release(self.root, self.wheel, second)
-        result = self.derive(self.snapshot, install_id="gen-1", wheel=second)
+        result = self.emit(self.snapshot, install_id="gen-1", wheel=second)
         self.assertEqual(result["wheel"], second)
         rogue = self.tree / "rogue.whl"
         rogue.write_bytes(b"rogue")
         with self.assertRaises(SystemExit) as raised:
-            self.derive(self.snapshot, install_id="gen-1", wheel=rogue)
+            self.emit(self.snapshot, install_id="gen-1", wheel=rogue)
         self.assertIn("not a release artifact", str(raised.exception))
         rogue_same_name = self.root / "unrelated" / self.wheel.name
         rogue_same_name.parent.mkdir()
         rogue_same_name.write_bytes(b"UNINDEXED-ROGUE-WHEEL")
         with self.assertRaises(SystemExit) as raised:
-            self.derive(self.snapshot, install_id="gen-1", wheel=rogue_same_name)
+            self.emit(self.snapshot, install_id="gen-1", wheel=rogue_same_name)
         self.assertIn("does not match release.json", str(raised.exception))
         with self.assertRaises(SystemExit):
-            self.derive(self.snapshot, install_id="gen-1", wheel=self.tree / "missing.whl")
+            self.emit(self.snapshot, install_id="gen-1", wheel=self.tree / "missing.whl")
 
     def test_render_operator_consumes_the_derived_env(self):
-        result = self.derive(self.snapshot, install_id="gen-1", tree_root=self.tree)
+        result = self.emit(self.snapshot, install_id="gen-1", tree_root=self.tree)
         state = self.root / "state"
         secrets = state / "secrets"
         secrets.mkdir(parents=True, exist_ok=True)
@@ -369,7 +470,7 @@ class PlatformEnvTests(unittest.TestCase):
         self.assertEqual(Path(summary["wheel"]), self.wheel)
 
     def test_generations_are_independent_and_immutable(self):
-        first = self.derive(self.snapshot, install_id="gen-1", tree_root=self.tree)
+        first = self.emit(self.snapshot, install_id="gen-1", tree_root=self.tree)
         first_env_bytes = Path(first["env_path"]).read_bytes()
         first_targets_path = Path(first["env"]["MODEL_TARGETS_FILE"])
         first_targets_bytes = first_targets_path.read_bytes()
@@ -377,7 +478,7 @@ class PlatformEnvTests(unittest.TestCase):
         second_snapshot = json.loads(json.dumps(self.snapshot))
         second_snapshot["install_id"] = "gen-2"
         second_snapshot["resolved"]["targets"]["m3.0"]["base"] = "feature/review-next"
-        second = self.derive(second_snapshot, install_id="gen-2", tree_root=self.tree)
+        second = self.emit(second_snapshot, install_id="gen-2", tree_root=self.tree)
         self.assertNotEqual(first["env_path"], second["env_path"])
         self.assertEqual(Path(first["env_path"]).read_bytes(), first_env_bytes)
         self.assertEqual(first_targets_path.read_bytes(), first_targets_bytes)
@@ -390,7 +491,7 @@ class PlatformEnvTests(unittest.TestCase):
         conflicting = json.loads(json.dumps(self.snapshot))
         conflicting["resolved"]["targets"]["m3.0"]["base"] = "other"
         with self.assertRaises(SystemExit):
-            self.derive(conflicting, install_id="gen-1", tree_root=self.tree)
+            self.emit(conflicting, install_id="gen-1", tree_root=self.tree)
         self.assertEqual(first_targets_path.read_bytes(), first_targets_bytes)
         self.assertEqual(Path(first["env_path"]).read_bytes(), first_env_bytes)
 
@@ -429,7 +530,7 @@ class PlatformEnvTests(unittest.TestCase):
             with self.subTest(label):
                 before = tree_digest(state)
                 with self.assertRaises(SystemExit):
-                    self.derive(snapshot, install_id=install_id, tree_root=self.tree)
+                    self.emit(snapshot, install_id=install_id, tree_root=self.tree)
                 self.assertEqual(tree_digest(state), before, "a refused snapshot must not write state")
                 self.assertFalse((state / "derived").exists(), "no derived files may be written")
         before = tree_digest(state)
@@ -447,7 +548,7 @@ class PlatformEnvTests(unittest.TestCase):
     def test_a_valid_derivation_shows_detectable_writes(self):
         state = self.root / "state"
         before = tree_digest(state)
-        result = self.derive(self.snapshot, install_id="gen-1", tree_root=self.tree)
+        result = self.emit(self.snapshot, install_id="gen-1", tree_root=self.tree)
         self.assertNotEqual(tree_digest(state), before, "the zero-write detector must detect successful writes")
         written = {path.relative_to(state).as_posix() for path in state.rglob("*") if path.is_file()}
         self.assertTrue(
@@ -470,7 +571,7 @@ class PlatformEnvTests(unittest.TestCase):
         state = self.root / "state"
         before = tree_digest(state)
         with self.assertRaises(SystemExit) as raised:
-            self.derive(self.snapshot, install_id="gen-1", wheel=hollow)
+            self.emit(self.snapshot, install_id="gen-1", wheel=hollow)
         self.assertIn("contract closure", str(raised.exception))
         self.assertEqual(tree_digest(state), before, "a wheel without the closure must not write state")
         self.assertFalse((state / "derived").exists())

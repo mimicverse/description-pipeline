@@ -1,5 +1,7 @@
 # The one data-only environment authority for the installed Linux generation.
 
+export PYTHONDONTWRITEBYTECODE=1
+
 die() {
   echo "${OPERATOR_PROGRAM:-operatorctl}: $*" >&2
   exit 1
@@ -73,7 +75,6 @@ verify_snapshot_derived_env() {
   [ -f "$wheel_file" ] || die "the installed wheel is missing: $wheel_file"
   "$CONTROL_PYTHON" - \
     "$deployment_root/deploy/operator/platform_env.py" \
-    "$deployment_root/deploy/operator/render_operator.py" \
     "$deployment_root" "$snapshot_file" "$install_id" "$env_file" \
     "$release_file" "$wheel_file" <<'PY' \
     || die "the installed environment does not match its snapshot and release"
@@ -83,10 +84,10 @@ import json
 import sys
 from pathlib import Path
 
-platform_env_path, render_operator_path = map(Path, sys.argv[1:3])
-deployment_root, snapshot_file = map(Path, sys.argv[3:5])
-install_id = sys.argv[5]
-env_file, release_file, wheel_file = map(Path, sys.argv[6:9])
+platform_env_path = Path(sys.argv[1])
+deployment_root, snapshot_file = map(Path, sys.argv[2:4])
+install_id = sys.argv[4]
+env_file, release_file, wheel_file = map(Path, sys.argv[5:8])
 release_document = json.loads(release_file.read_text(encoding="utf-8"))
 files = release_document.get("deployment_files")
 if not isinstance(files, dict):
@@ -115,12 +116,10 @@ def load_module(name, path):
 
 sys.path.insert(0, str(platform_env_path.parent))
 platform_env = load_module("current_platform_env", platform_env_path)
-render_operator = load_module("current_render_operator", render_operator_path)
 install_record = load_module(
     "current_install_record", platform_env_path.with_name("install_record.py")
 )
 release = install_record.release_identity(release_document)
-platform_env.atomic_write_once = lambda path, payload: None
 result = platform_env.derive(
     snapshot_file.read_bytes(),
     install_id=install_id,
@@ -129,18 +128,9 @@ result = platform_env.derive(
     release=release,
     wheel=wheel_file,
 )
-actual = render_operator.read_env(env_file)
-expected = {key: value for key, value in result["env"].items() if value != ""}
-if actual != expected:
-    differing = sorted(
-        key
-        for key in actual.keys() | expected.keys()
-        if actual.get(key) != expected.get(key)
-    )
-    raise SystemExit(
-        "the installed environment differs from its source-owned derivation: "
-        + ",".join(differing)
-    )
+if result["env_path"] != env_file:
+    raise SystemExit("the installed environment path differs from its snapshot")
+platform_env.verify(result)
 PY
 }
 
