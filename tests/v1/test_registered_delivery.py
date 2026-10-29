@@ -19,9 +19,10 @@ from description_pipeline.orchestration import portal as portal_module
 from description_pipeline.orchestration.airflow_client import native_run_id
 from description_pipeline.orchestration.feishu_oauth import build_actor_name
 from description_pipeline.stages import STAGE_IDS
-from description_pipeline.io import read_data, write_json
+from description_pipeline.io import digest, read_data, write_json
+from description_pipeline.schemas import PUBLICATION_RECEIPT_SCHEMA
 
-from .portal_read_support import RegisteredPlatform
+from .portal_read_support import RegisteredPlatform, registered_check_fixture
 from .protocol_support import protocol_events
 
 RUN = "7c9b44b3-0b9c-5ffe-9f4f-4bbdafb4a865"
@@ -40,23 +41,27 @@ def _register_delivery(platform: RegisteredPlatform, *, run_id: str = RUN) -> No
         platform.tree(run_id, "verify") / "verification-certificate.json",
         {"passed": True, "decision": "PASS", "checks": [], "diagnostics": []},
     )
-    write_json(
-        platform.tree(run_id, "publish") / "publication-receipt.json",
-        {
-            "publication_subject_sha256": SUBJECT,
-            "base_ref": "feature/robot",
-            "repository": "example/robot",
-            "branch_ref": "work/description/robot/0123456789abcdef01234567",
-            "candidate_parents": ["d" * 40],
-            "pr_effect": {
-                "observation": {
-                    "number": 1,
-                    "head_oid": "c" * 40,
-                    "url": "https://github.com/example/robot/pull/1",
-                },
+    command, _checks = registered_check_fixture(run_id, "publish")
+    publication = {
+        "schema_version": PUBLICATION_RECEIPT_SCHEMA,
+        "run_id": run_id,
+        "command_id": command["command_id"],
+        "request_digest": command["request_digest"],
+        "publication_subject_sha256": SUBJECT,
+        "base_ref": "feature/robot",
+        "repository": "example/robot",
+        "branch_ref": "work/description/robot/0123456789abcdef01234567",
+        "candidate_parents": ["d" * 40],
+        "pr_effect": {
+            "observation": {
+                "number": 1,
+                "head_oid": "c" * 40,
+                "url": "https://github.com/example/robot/pull/1",
             },
         },
-    )
+    }
+    write_json(platform.tree(run_id, "publish") / "publication-receipt.json", publication)
+    platform.stage(run_id, "publish", receipt={"checks_sha256": digest(publication)})
     platform.events(run_id, protocol_events(subject=SUBJECT))
 
 
@@ -197,6 +202,7 @@ class RegisteredFailureReadoutTests(unittest.TestCase):
         payload = json.loads(body)
         self.assertEqual(status, 200)
         self.assertEqual(payload["job"]["status"], "passed")
+        self.assertTrue(all(stage["state"] == "completed" for stage in payload["stage_view"]["stages"]))
         self.assertIsNone(payload["job"]["error"])
         self.assertEqual(payload["pr"]["url"], "https://github.com/example/robot/pull/1")
 
@@ -211,6 +217,8 @@ class RegisteredStagePresentationTests(unittest.TestCase):
     def _platform(self, capture_state: str) -> RegisteredPlatform:
         platform = RegisteredPlatform(self.tmp / capture_state)
         platform.admit(WSGI_RUN)
+        if capture_state == "completed":
+            platform.register_capture(WSGI_RUN)
         states = {
             "freeze": "completed",
             "discover": "completed",
@@ -306,7 +314,7 @@ class RegisteredStagePresentationTests(unittest.TestCase):
         self.assertEqual(stages["verify"]["state"], "failed")
         self.assertEqual(payload["report"]["overall"]["state"], "unresolved")
 
-    def test_actual_run_api_keeps_failed_qc_above_a_completed_event(self) -> None:
+    def test_actual_run_api_keeps_canonical_decision_above_live_qc(self) -> None:
         platform = self._platform("completed")
         events = protocol_events(subject=SUBJECT)
         capture_checks = [
@@ -320,9 +328,12 @@ class RegisteredStagePresentationTests(unittest.TestCase):
 
         payload = self._get(platform)
         stages = {stage["id"]: stage for stage in payload["stage_view"]["stages"]}
-        self.assertEqual(stages["capture"]["state"], "failed")
-        self.assertEqual(payload["report"]["overall"]["state"], "failed")
-        self.assertEqual(payload["report"]["failure"]["stage"], "capture")
+        self.assertEqual(stages["capture"]["state"], "completed")
+        self.assertTrue(all(
+            check["state"] == "passed"
+            for check in stages["capture"]["input_qc"] + stages["capture"]["output_qc"]
+        ))
+        self.assertIsNone(payload["report"]["failure"])
 
 
 class _RetryAirflow(_PermissiveAirflow):

@@ -484,6 +484,15 @@ class RegisteredPlatform:
                 run_id=run_id,
             )
         )
+        artifacts = []
+        for path in capture.rglob("*"):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(capture).as_posix()
+            if relative.startswith(("input/", "evidence/", "reports/native-")) or relative == "transfer-manifest.json":
+                artifacts.append({"path": relative, "sha256": file_digest(path), "bytes": path.stat().st_size})
+            else:
+                path.unlink()
         source = read_data(capture / "input/source.json")
         self.stage(
             run_id,
@@ -558,6 +567,8 @@ class RegisteredPlatform:
                 command, checks = registered_check_fixture(run_id, stage)
                 selected["checks.json"] = json.dumps(checks).encode()
                 receipt = {**receipt, "checks_sha256": digest(checks)}
+            elif stage == "publish":
+                command, _checks = registered_check_fixture(source_run, stage)
             if stage == "discover" and "input/discovery/native-discovery.json" in selected:
                 selected["prepared/discovery/native-discovery.json"] = selected["input/discovery/native-discovery.json"]
             elif stage == "discover":
@@ -572,6 +583,16 @@ class RegisteredPlatform:
                     by_stage.get("capture"),
                 )
                 receipt = {**receipt, "checks_sha256": digest(json.loads(selected["verification-certificate.json"]))}
+                if not by_stage.get("generate") and any(
+                    item["stage"] == "generate" and item["state"] == "completed" for item in stage_rows
+                ):
+                    # This fixture producer creates the Generate artifact bound by its certificate.
+                    generate = json.loads(selected["verification-certificate.json"])["generate_artifact"]
+                    by_stage["generate"] = {
+                        name: {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(), "artifact": generate}
+                        for name, data in self.projection_artifacts.objects[generate["artifact_id"]].items()
+                    }
+                    members.update(by_stage["generate"])
             artifact = self.projection_artifacts.register(
                 run_id=run_id,
                 producer_run_id=source_run,
