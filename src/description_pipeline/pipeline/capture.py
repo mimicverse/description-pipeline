@@ -1732,19 +1732,50 @@ class CaptureHandler:
         )
         backend = self._backend_factory(inputs.package) if self._backend_factory is not None else None
         output = workspace.root / "capture-native"
-        native = self._native_operation(
-            inputs,
-            output,
-            backend=backend,
-            run_id=command.run_id,
-            request_digest=command.request_digest,
-            handoff_sha256=request.handoff_sha256,
-            upload_sha256=request.upload_sha256,
-            main_assembly=request.main_assembly,
-            upstream_artifacts=upstream,
-            native_tool=tool,
-            sealed_dispatch=dispatch,
-        )
+        from ..orchestration.native_operation_client import NativeOperationWaitTimeout
+
+        try:
+            native = self._native_operation(
+                inputs,
+                output,
+                backend=backend,
+                run_id=command.run_id,
+                request_digest=command.request_digest,
+                handoff_sha256=request.handoff_sha256,
+                upload_sha256=request.upload_sha256,
+                main_assembly=request.main_assembly,
+                upstream_artifacts=upstream,
+                native_tool=tool,
+                sealed_dispatch=dispatch,
+            )
+        except NativeOperationWaitTimeout as error:
+            timeout_root = workspace.root / "capture-effect-timeout"
+            timeout_root.mkdir(parents=True, exist_ok=False)
+            write_json(
+                timeout_root / "native-timeout.json",
+                {
+                    "schema_version": CAPTURE_EFFECT_FAILURE_SCHEMA,
+                    "operation_id": dispatch.operation["operation_id"],
+                    "reason_code": error.code or "native_operation_wait_timeout",
+                    "error_type": type(error).__name__,
+                    "message": str(error),
+                    "detail": dict(error.detail),
+                },
+            )
+            effects.record_timeout(
+                effect_id,
+                source="capture-handler",
+                detail_root=timeout_root,
+            )
+            effects.record_observation(
+                effect_id,
+                source="capture-handler",
+                state_class="unobservable",
+                observation_root=timeout_root,
+            )
+            raise CaptureUnresolved(
+                error.code or "native_operation_wait_timeout"
+            ) from error
         if native.outcome == "unknown":
             timeout_root = workspace.root / "capture-effect-unknown"
             timeout_root.mkdir(parents=True, exist_ok=False)
