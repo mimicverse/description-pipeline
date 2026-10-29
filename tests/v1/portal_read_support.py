@@ -560,6 +560,10 @@ class RegisteredPlatform:
                 receipt = {**receipt, "checks_sha256": digest(checks)}
             if stage == "discover" and "input/discovery/native-discovery.json" in selected:
                 selected["prepared/discovery/native-discovery.json"] = selected["input/discovery/native-discovery.json"]
+            elif stage == "discover":
+                selected["prepared/discovery/native-discovery.json"] = json.dumps(
+                    native_discovery_record(source_run),
+                ).encode()
             if stage == "verify" and selected:
                 selected = self._bind_projection_verify(
                     run_id,
@@ -567,6 +571,7 @@ class RegisteredPlatform:
                     receipt,
                     by_stage.get("capture"),
                 )
+                receipt = {**receipt, "checks_sha256": digest(json.loads(selected["verification-certificate.json"]))}
             artifact = self.projection_artifacts.register(
                 run_id=run_id,
                 producer_run_id=source_run,

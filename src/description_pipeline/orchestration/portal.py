@@ -2883,30 +2883,32 @@ class PortalApp:
         )
         scope_kind = qualification.get("scope_kind", verify_row.get("scope_kind"))
         certificate_member = (by_stage.get("verify") or {}).get(CERTIFICATE_FILENAME)
+        if verify_row.get("state") == "completed" and not isinstance(certificate_member, dict):
+            raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered completed Verify certificate is missing")
         certificate = None
         if isinstance(certificate_member, dict):
-            try:
-                certificate = _parse_registered_json(
-                    self._registered_member_bytes(CERTIFICATE_FILENAME, certificate_member)
-                )
-            except PortalError:
-                certificate = None
+            certificate = _parse_registered_json(
+                self._registered_member_bytes(CERTIFICATE_FILENAME, certificate_member)
+            )
         certificate = certificate if isinstance(certificate, dict) else {}
-        if certificate:
-            validate_certificate_diagnostics(certificate)
+        if isinstance(certificate_member, dict):
+            try:
+                validate_certificate_diagnostics(certificate)
+                self._bind_verification_certificate(projection, verify_row, certificate)
+            except PipelineError as error:
+                raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
         formal_eligible = (
             formal_eligible and certificate.get("decision") == "PASS"
             and certificate.get("passed") is True
         )
         publish_member = (by_stage.get("publish") or {}).get("publication-receipt.json")
+        if (stages.get("publish") or {}).get("state") == "completed" and not isinstance(publish_member, dict):
+            raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered completed Publish receipt is missing")
         publication = None
         if isinstance(publish_member, dict):
-            try:
-                publication = _parse_registered_json(
-                    self._registered_member_bytes("publication-receipt.json", publish_member)
-                )
-            except PortalError:
-                publication = None
+            publication = _parse_registered_json(
+                self._registered_member_bytes("publication-receipt.json", publish_member)
+            )
         publication = publication if isinstance(publication, dict) else {}
         pr_observation = (
             (publication.get("pr_effect") or {}).get("observation")
@@ -3069,6 +3071,8 @@ class PortalApp:
         path = "prepared/discovery/native-discovery.json"
         member = discover.get(path)
         if not isinstance(member, dict):
+            if ((projection.get("stages") or {}).get("discover") or {}).get("state") == "completed":
+                raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered completed Discover source evidence is missing")
             return None
         try:
             source = self._registered_stage_artifact(discover, stage="discover")
@@ -3352,6 +3356,8 @@ class PortalApp:
     ) -> tuple[ArtifactRef, ArtifactRef, str | None]:
         """Bind a certificate to this projection's exact Generate/Capture pair."""
 
+        if digest(certificate) != (verify_row.get("receipt") or {}).get("checks_sha256"):
+            raise PipelineError("The verification certificate differs from its stage result")
         by_stage = projection.get("by_stage")
         by_stage = by_stage if isinstance(by_stage, dict) else {}
         generate, capture = self._verification_input_pair(verify_row, by_stage)

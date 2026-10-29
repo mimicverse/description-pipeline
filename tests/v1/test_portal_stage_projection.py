@@ -7,10 +7,11 @@ import json
 import unittest
 
 from description_pipeline.orchestration.portal import PortalApp, PortalError, _automatic_summary
-from description_pipeline.io import PipelineError, digest
+from description_pipeline.io import digest
 from description_pipeline.orchestration.report_view import build_report
 from description_pipeline.stages import CONTRACT, stage_view
 from tests.v1.protocol_support import protocol_events
+from tests.v1.protocol_support import native_discovery_record
 from tests.v1.portal_read_support import RegisteredProjectionArtifacts
 
 RUN_ID = "7b7dbb68-b7ae-5545-859e-f351415e0fb9"
@@ -49,6 +50,8 @@ class RegisteredStageProjectionTests(unittest.TestCase):
                          "publish": {"publication-receipt.json": {}}},
         }
         app = PortalApp.__new__(PortalApp)
+        # Isolate stale display summaries; HTTP artifact tests cover real pair binding.
+        app._bind_verification_certificate = lambda *_args: (None, None, None)
         app._registered_member_bytes = lambda path, member: json.dumps(
             certificate if path.endswith("certificate.json") else publication).encode()
         job = app._fact_display_job(projection)
@@ -57,7 +60,7 @@ class RegisteredStageProjectionTests(unittest.TestCase):
         self.assertNotEqual(_automatic_summary(job)["state"], "passed")
         self.assertEqual(job["pr"]["url"], publication["pr_effect"]["observation"]["url"])
         certificate["diagnostics"] = [{"code": "unknown"}]
-        with self.assertRaisesRegex(PipelineError, "blocking"):
+        with self.assertRaisesRegex(PortalError, "blocking"):
             app._fact_display_job(projection)
 
     def setUp(self) -> None:
@@ -80,6 +83,8 @@ class RegisteredStageProjectionTests(unittest.TestCase):
             files = {"receipt.json": b"{}"}
             if stage in {"freeze", "discover"}:
                 files = {"checks.json": json.dumps(checks).encode()}
+            if stage == "discover":
+                files["prepared/discovery/native-discovery.json"] = json.dumps(native_discovery_record(RUN_ID)).encode()
             if stage == "capture" and state == "completed":
                 files = {"reports/native-stages.json": json.dumps(registered_report()).encode()}
             projection["by_stage"][stage] = self.stage_members(stage, files)
@@ -194,6 +199,34 @@ class RegisteredStageProjectionTests(unittest.TestCase):
         self.assertEqual(job["error_code"], "capture.native_failed")
         projection["stages"]["capture"]["decision"]["reason_code"] = "another_reason"
         with self.assertRaisesRegex(PortalError, "conflicts with its stage decision"):
+            self.application._fact_display_job(projection)
+
+    def test_completed_discover_cannot_silently_drop_its_source_findings(self) -> None:
+        projection = self.projection({"discover": "completed"})
+        checks = projection["by_stage"]["discover"]["checks.json"]
+        projection["by_stage"]["discover"] = {"checks.json": checks}
+        with self.assertRaisesRegex(PortalError, "Discover source evidence is missing"):
+            self.application._registered_stage_view({}, projection)
+        self.assertEqual(projection["stages"]["discover"]["state"], "completed")
+
+    def test_corrupt_verify_and_publish_members_are_not_empty_evidence(self) -> None:
+        for stage, path in (("verify", "verification-certificate.json"), ("publish", "publication-receipt.json")):
+            with self.subTest(stage=stage):
+                projection = self.projection({stage: "failed"})
+                members = self.stage_members(stage, {path: b"{}"})
+                projection["by_stage"][stage] = members
+                self.artifacts.objects[members[path]["artifact"]["artifact_id"]][path] = b'{"changed":true}'
+                with self.assertRaisesRegex(PortalError, "digest verification failed"):
+                    self.application._fact_display_job(projection)
+
+    def test_certificate_must_match_its_canonical_result_digest(self) -> None:
+        projection = self.projection({"verify": "failed"})
+        certificate = {"decision": "FAIL", "passed": False, "checks": [], "diagnostics": []}
+        projection["by_stage"]["verify"] = self.stage_members(
+            "verify", {"verification-certificate.json": json.dumps(certificate).encode()},
+        )
+        projection["stages"]["verify"]["receipt"]["checks_sha256"] = "0" * 64
+        with self.assertRaisesRegex(PortalError, "differs from its stage result"):
             self.application._fact_display_job(projection)
 
 

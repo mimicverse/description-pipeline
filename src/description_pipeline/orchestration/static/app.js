@@ -1392,7 +1392,7 @@ function renderStageDetail() {
   if (stage.reuse && stage.reuse.reused === true) {
     const reused = document.createElement("p");
     reused.className = "muted small";
-    reused.textContent = "Verified results were reused; the timestamp above is the original check time.";
+    reused.textContent = "Verified results were reused from the recorded source.";
     summary.append(reused);
     appendEvidence(summary, "Reuse source", stage.reuse);
   }

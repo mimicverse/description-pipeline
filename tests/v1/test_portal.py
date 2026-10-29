@@ -993,9 +993,13 @@ class FakeRunControl:
                 command, checks = registered_check_fixture(run_id, stage)
                 selected["checks.json"] = json.dumps(checks).encode()
                 checks_sha256 = digest(checks)
+            elif stage == "verify" and "verification-certificate.json" in selected:
+                checks_sha256 = digest(json.loads(selected["verification-certificate.json"]))
             discovery_path = "prepared/discovery/native-discovery.json"
             if stage == "discover" and "input/discovery/native-discovery.json" in current:
                 selected[discovery_path] = bytes(current["input/discovery/native-discovery.json"])
+            elif stage == "discover":
+                selected[discovery_path] = json.dumps(native_discovery_record(run_id)).encode()
             artifact = self.projection_artifacts.register(run_id, stage, selected)
             rows = {}
             artifacts = []
@@ -3469,6 +3473,10 @@ class PortalTests(unittest.TestCase):
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
 
         self.assertEqual(status, 409, body)
+        self.assertIn("another Generate/Capture pair", json.loads(body)["error"])
+
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
+        self.assertEqual(status, 502, body)
         self.assertIn("another Generate/Capture pair", json.loads(body)["error"])
 
     def test_conflicting_effect_rejects_current_formal_status_and_preview(self) -> None:
