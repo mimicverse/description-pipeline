@@ -1669,9 +1669,25 @@ def _expected_groups(_root: Path, row: Mapping, resolved: Mapping) -> list[dict]
             isinstance(span, Mapping)
             and span.get("triangle_start") == next_start
             and type(span.get("triangle_count")) is int
-            and span["triangle_count"] > 0,
+            and span["triangle_count"] >= 0,
             f"{component} face span {index} is not a contiguous partition",
         )
+        if span["triangle_count"] == 0:
+            evidence = span.get("zero_triangle_evidence")
+            _require(
+                type(span.get("body_type")) is int and span["body_type"] == 1
+                and isinstance(evidence, dict)
+                and set(evidence) == {
+                    "get_tess_triangles_return", "get_tess_triangle_count", "get_area_m2",
+                }
+                and evidence.get("get_tess_triangles_return") in ("null", "empty_array")
+                and type(evidence.get("get_tess_triangle_count")) is int
+                and evidence["get_tess_triangle_count"] == 0
+                and type(evidence.get("get_area_m2")) in (int, float)
+                and math.isfinite(evidence["get_area_m2"])
+                and evidence["get_area_m2"] >= 0,
+                f"{component} face span {index} has invalid empty-display evidence",
+            )
         key = _face_key(
             span.get("body_type"),
             span.get("body_index"),
@@ -1694,7 +1710,8 @@ def _expected_groups(_root: Path, row: Mapping, resolved: Mapping) -> list[dict]
             "rgba": tuple(float(value) for value in resolution["rgba"]),
             "source": resolution["source"],
         }
-        by_rgba.setdefault(item["rgba"], []).append(item)
+        if span["triangle_count"] > 0:
+            by_rgba.setdefault(item["rgba"], []).append(item)
         next_start += span["triangle_count"]
 
     source_bytes = row.get("source_bytes")

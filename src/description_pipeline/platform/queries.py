@@ -26,7 +26,7 @@ from ..pipeline.effects import (
     EffectIntent,
     EffectResumePhase,
     EffectState,
-    project_effect_state,
+    project_effect_settlement,
 )
 from ..pipeline.diagnostic import DIAGNOSTIC_ADMISSION_SCHEMA, DiagnosticAdmissionSpec
 from ..schemas import (
@@ -495,10 +495,12 @@ def read_run_projection(
     effect_states_by_command: dict[str, dict[str, EffectState]] = {}
     effect_state_rows: list[dict[str, Any]] = []
     for intent in effect_intents:
-        state = project_effect_state(
+        settlement = project_effect_settlement(
             intent,
             tuple(facts_by_effect.get(intent.effect_id, ())),
         )
+        state = settlement.state
+        decisive = settlement.decisive_fact
         effect_states_by_command.setdefault(intent.command_id, {})[
             intent.effect_id
         ] = state
@@ -509,6 +511,15 @@ def read_run_projection(
                 "effect_key": intent.effect_key,
                 "effect_kind": intent.effect_kind,
                 "state": state.value,
+                "decisive_fact": None
+                if decisive is None
+                else {
+                    "fact_id": decisive.fact_id,
+                    "fact_type": decisive.fact_type,
+                    "state_class": decisive.state_class,
+                    "claim_id": decisive.claim_id,
+                    "fence": decisive.fence,
+                },
             }
         )
 

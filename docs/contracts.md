@@ -399,6 +399,11 @@ repeatable-read snapshot 中的 `read_admitted_runs` 复算；该角色不得写
 | 警告 | 独立诊断，包含对象、事实、来源及资格影响；不改变必需检查的判定 |
 | 执行范围 | `executed / reused / out_of_scope`；复用只从原 decision/result artifact 与其完整祖先事实重建 |
 
+页面的自动检查摘要不得把尚未产生 Verify 结果解释为验证失败。匹配有效 claim 的已授权
+外部调用可显示等待结果；超时、无法观察、冲突或缺少有效 claim 的未知结果显示待对账。
+这些展示只解释既有事实，不改变 canonical `unresolved`、重试阻断或资格。取消、真实阶段
+失败、验证尚未开始和缺少正式资格分别表达；不能用 Airflow 的 running 状态覆盖业务未知。
+
 运行和阶段显示状态是只读投影，不能作为可写业务权威。无 decision 且存在当前 open
 claim 为 `active`；无 open claim 且前置完成但尚未创建/执行后继为 `waiting`；
 已登记 effect 为 UNKNOWN/CONFLICT 或未封存 candidate 保留为 `unresolved`；已证明
@@ -625,8 +630,17 @@ body、face 和三角形；每个 face 的直接返回按原始次序保留，�
 
 原始三角形每项为九个有限 `binary64` 数值，单位为米、坐标位于 component-local。
 封存字节保留原值与顺序，严格核验格式版本、数量和文件长度，拒绝截断、尾随字节、
-非有限值和无效三角形。body/face inventory 与连续、正数量的 face spans 必须完整
-覆盖同一 raw stream，不允许重叠、遗漏、未知归属或把读取失败转为空几何。
+非有限值和无效三角形。body/face inventory 与连续的 face spans 必须完整覆盖同一
+raw stream，不允许重叠、遗漏、未知归属或把读取失败转为空几何。通常每个 span 的
+三角形数量为正；原生 sheet 面可以保留零数量 span，但必须同时封存该面的直接
+`GetTessTriangles(True)` 空返回、成功读取的 `GetTessTriangleCount = 0` 和有限非负
+`GetArea`。调用异常、未知或非零数量、非法面积及 solid 面空返回仍是读取失败。
+
+上述零数量 span 只证明该面没有已保存的显示三角形，不证明该面退化或不存在。
+不能按名称、原生遍历编号或面积阈值排除它，也不切换几何来源补造三角形。完整面
+库存、原生面积和缺口身份贯穿封存、派生与独立验证；报告、URDF、预览和 PR 显示
+同一缺口 warning，明确对应曲面及完整 CAD 曲面覆盖资格未建立。独立验证复核
+零数量的全部原生依据和警告保真，其余几何、绑定、物性及来源检查继续执行。
 
 每份事实绑定 occurrence、配置、原始 placement、body/face、source scope 和冻结
 字节。由本次 source scope、实体类型及原生遍历索引派生的局部对象身份，必须保留

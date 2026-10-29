@@ -283,7 +283,7 @@ class RegisteredStagePresentationTests(unittest.TestCase):
                 self.assertEqual(report_stages["capture"]["state_label"], stage_label)
                 if canonical == "cancelled":
                     self.assertEqual(payload["job"]["status"], "cancelled")
-                    self.assertEqual(payload["automatic"]["state"], "unverified")
+                    self.assertEqual(payload["automatic"]["state"], "cancelled")
                     self.assertEqual(payload["activity"]["state"], "finished")
                 for downstream in ("generate", "verify", "publish"):
                     self.assertEqual(stages[downstream]["state"], "blocked")

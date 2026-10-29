@@ -145,6 +145,76 @@ class RunQueryTests(unittest.TestCase):
         summary = render_stage_summary(projection)
         self.assertEqual(summary[0]["state"], "unresolved")
 
+    def test_effect_readout_exposes_the_existing_decisive_fact_without_clearing_unknown(self):
+        connection = _Connection()
+        cursor = connection._cursor
+        now = datetime(2026, 10, 29, tzinfo=UTC)
+        cursor.effect_intent_result = [
+            (
+                "effect-1",
+                "freeze-command",
+                "airflow_dispatch",
+                "airflow_dispatch",
+                {"dag_id": "solidworks_to_urdf", "dag_run_id": "run-1"},
+                {"state": "pending"},
+                digest({"state": "pending"}),
+                "outbound-1",
+                "2" * 64,
+                now,
+            )
+        ]
+        cursor.effect_fact_result = [
+            (
+                "fact-send",
+                "effect-1",
+                1,
+                "claim-1",
+                1,
+                "dispatch_authorized",
+                "airflow-dispatch",
+                None,
+                None,
+                "3" * 64,
+                now,
+                None,
+                None,
+            )
+        ]
+        projection = read_run_projection(connection, "run-1")
+        effect = projection["technical"]["effects"][0]
+        self.assertEqual(effect["state"], "unknown")
+        self.assertEqual(projection["state"], "unresolved")
+        self.assertEqual(
+            effect["decisive_fact"],
+            {
+                "fact_id": "fact-send",
+                "fact_type": "dispatch_authorized",
+                "state_class": None,
+                "claim_id": "claim-1",
+                "fence": 1,
+            },
+        )
+        cursor.effect_fact_result.append(
+            (
+                "fact-timeout",
+                "effect-1",
+                2,
+                "claim-1",
+                1,
+                "timeout",
+                "airflow-dispatch",
+                None,
+                "payload-1",
+                "4" * 64,
+                now,
+                None,
+                None,
+            )
+        )
+        effect = read_run_projection(connection, "run-1")["technical"]["effects"][0]
+        self.assertEqual(effect["state"], "unknown")
+        self.assertEqual(effect["decisive_fact"]["fact_type"], "timeout")
+
     def test_effect_projection_keeps_reconciliation_metadata_and_resume_phase(self):
         connection = _Connection()
         cursor = connection._cursor

@@ -2409,6 +2409,22 @@ class PublicationWarningProjectionTests(unittest.TestCase):
         self.assertIn(warning, certificate["diagnostics"])
         self.assertIn('"hardware_qualified": false', body)
 
+    def test_warning_categories_get_a_record_before_repeated_details(self) -> None:
+        repeated = [
+            {"code": "source.first", "blocking": False, "object": f"part-{index}",
+             "detail": {"field": "identity", "source": "x" * 2000}}
+            for index in range(100)
+        ]
+        last = {"code": "source.last", "blocking": False, "object": "last-part",
+                "detail": {"field": "coverage", "qualified": False}}
+        text = publish_stage._publication_warning_text({"diagnostics": [*repeated, last]})
+        self.assertLess(len(text), 50000)
+        self.assertIn("`source.first`: 100 records", text)
+        self.assertIn("`source.last`: 1 records", text)
+        self.assertIn('"object": "last-part"', text)
+        self.assertIn('"qualified": false', text)
+        self.assertIn("additional warning records", text)
+
     def test_all_warning_kinds_keep_context_and_long_summaries_are_explicit(self) -> None:
         warning = {
             "code": "limits.default_policy", "blocking": False,

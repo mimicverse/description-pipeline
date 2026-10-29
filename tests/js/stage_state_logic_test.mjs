@@ -88,3 +88,16 @@ assert.equal(
 );
 
 console.log("stage_state_logic_test OK");
+
+// Unfinished or unqualified verification must never render as a failed check.
+const automaticStateKind = new Function(`return (${functionSource("automaticStateKind")});`)();
+const automaticLabels = new Function(`${source.match(/const AUTOMATIC_STATES = \{[\s\S]*?\n\};/)[0]}\nreturn AUTOMATIC_STATES;`)();
+for (const value of ["pending", "waiting", "running", "queued", "unresolved", "unverified", "cancelled"]) {
+  assert.equal(automaticStateKind(value), "pending");
+  assert.doesNotMatch(automaticLabels[value], /failed/i);
+}
+assert.equal(automaticStateKind("failed"), "bad");
+assert.equal(automaticStateKind("passed"), "ok");
+assert.match(automaticLabels.waiting, /Awaiting external result/);
+assert.match(automaticLabels.unresolved, /reconciliation/);
+console.log("verification readiness labels OK");
