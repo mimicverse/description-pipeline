@@ -1209,6 +1209,7 @@ def _resolved_faces(
             material_path = f"{owner_path}.materials[{index}]"
             _require(
                 isinstance(material, Mapping)
+                and type(material.get("material_index")) is int
                 and material.get("material_index") == index
                 and "entities" in material
                 and isinstance(material.get("read_errors"), Mapping)
@@ -1229,6 +1230,14 @@ def _resolved_faces(
                 ,
                 f"{material_path} is malformed",
             )
+            _require(
+                material["entities_state"] == "null_result"
+                or (
+                    "native_entity_count" not in material
+                    and "entity_count" not in material["read_errors"]
+                ),
+                f"{material_path} carries a count outside a null entity result",
+            )
             if material["entities_state"] == "null_result":
                 count = material.get("native_entity_count")
                 errors = material["read_errors"]
@@ -1247,9 +1256,18 @@ def _resolved_faces(
                 f"{material_path} has no readable entity inventory",
             )
             if material["entities_state"] == "empty":
+                _require(
+                    material["entities"] == []
+                    and not material["entity_records"]
+                    and "entities" not in material["read_errors"],
+                    f"{material_path} has a contradictory empty entity inventory",
+                )
                 continue
             _require(
-                bool(material["entity_records"]),
+                bool(material["entity_records"])
+                and len(material["entities"]) == len(material["entity_records"])
+                and all(value is not None for value in material["entities"])
+                and "entities" not in material["read_errors"],
                 f"{material_path} has no entity records",
             )
             faces_by_scope = {
@@ -1263,6 +1281,7 @@ def _resolved_faces(
                 entity_path = f"{material_path}.entities[{entity_index}]"
                 _require(
                     isinstance(entity, Mapping)
+                    and type(entity.get("entity_index")) is int
                     and entity.get("entity_index") == entity_index
                     and isinstance(entity.get("native_object_type"), str)
                     and isinstance(

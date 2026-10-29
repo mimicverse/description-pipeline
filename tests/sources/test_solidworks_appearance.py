@@ -546,7 +546,7 @@ class CaptureAppearanceBindingTests(unittest.TestCase):
 
 
 class AppearanceResolutionTests(unittest.TestCase):
-    def test_null_material_entities_require_an_observed_native_zero_count(self):
+    def test_material_entity_inventory_requires_consistent_native_facts(self):
         raw = _resolved_raw([[1.0, 0.0, 0.0, 1.0, 1.0, 0.5, 0.3125, 0.0, 0.0]])
         owner = raw["state_render_materials"][0]
         owner.update(call_state="observed", native_render_material_count=1)
@@ -610,6 +610,83 @@ class AppearanceResolutionTests(unittest.TestCase):
                 resolve(invalid)
             with self.subTest(missing=field), self.assertRaises(PipelineError):
                 independent(invalid)
+        empty = copy.deepcopy(raw)
+        empty_material = empty["state_render_materials"][0]["materials"][0]
+        empty_material.update(entities=[], entities_state="empty")
+        del empty_material["native_entity_count"]
+        self.assertEqual(resolve(empty).faces[0].rgba, (1.0, 0.0, 0.0, 1.0))
+        self.assertTrue(independent(empty))
+        for change in (
+            {"native_entity_count": 0},
+            {"native_entity_count": 1},
+            {"read_errors": {"entity_count": {"message": "read failed"}}},
+            {"entities": None},
+            {"entities": ["ghost"]},
+            {"entity_records": [{}]},
+            {"read_errors": {"entities": {"message": "read failed"}}},
+            {"entities_state": "observed"},
+        ):
+            invalid = copy.deepcopy(empty)
+            invalid["state_render_materials"][0]["materials"][0].update(change)
+            with self.subTest(empty_change=change), self.assertRaises(AppearanceError):
+                resolve(invalid)
+            with self.subTest(empty_change=change), self.assertRaises(PipelineError):
+                independent(invalid)
+        del empty_material["entities"]
+        with self.assertRaises(AppearanceError):
+            resolve(empty)
+        with self.assertRaises(PipelineError):
+            independent(empty)
+        observed = copy.deepcopy(raw)
+        observed_material = observed["state_render_materials"][0]["materials"][0]
+        del observed_material["native_entity_count"]
+        observed_material.update(
+            entities=["native-face"], entities_state="observed",
+            entity_records=[_state_entity_record(
+                kind="entity", reference=(1, 2, 3),
+                native_interface_kinds=["IFace2", "IEntity"],
+            )],
+            primary_color=0x00AABBCC, transparency=0.0, color_form=1,
+            texture_filename="", surface_finish_file="",
+        )
+        face = observed["bodies"][0]["faces"][0]["appearance"]
+        face.update(material_property_values=None, has_material_property_values=False)
+        self.assertEqual(resolve(observed).faces[0].rgba, (204 / 255, 187 / 255, 170 / 255, 1.0))
+        self.assertTrue(independent(observed))
+        for change in (
+            {"native_entity_count": 0},
+            {"native_entity_count": 1},
+            {"read_errors": {"entity_count": {"message": "read failed"}}},
+            {"read_errors": {"entities": {"message": "read failed"}}},
+            {"entities": None},
+            {"entities": []},
+            {"entities": [None]},
+            {"entities": ["native-face", None]},
+            {"entity_records": []},
+        ):
+            invalid = copy.deepcopy(observed)
+            invalid["state_render_materials"][0]["materials"][0].update(change)
+            with self.subTest(observed_change=change), self.assertRaises(AppearanceError):
+                resolve(invalid)
+            with self.subTest(observed_change=change), self.assertRaises(PipelineError):
+                independent(invalid)
+        for index in (None, True, False, 0.0, 1, -1, "0"):
+            invalid = copy.deepcopy(observed)
+            invalid["state_render_materials"][0]["materials"][0]["entity_records"][0][
+                "entity_index"
+            ] = index
+            with self.subTest(entity_index=index), self.assertRaises(AppearanceError):
+                resolve(invalid)
+            with self.subTest(entity_index=index), self.assertRaises(PipelineError):
+                independent(invalid)
+        for index in (None, True, False, 0.0, 1, -1, "0"):
+            for candidate in (raw, observed):
+                invalid = copy.deepcopy(candidate)
+                invalid["state_render_materials"][0]["materials"][0]["material_index"] = index
+                with self.subTest(material_index=index), self.assertRaises(AppearanceError):
+                    resolve(invalid)
+                with self.subTest(material_index=index), self.assertRaises(PipelineError):
+                    independent(invalid)
 
     def test_part_conversion_evidence_is_required_and_target_specific(self):
         case = json.loads(PART_FACE_OVERRIDE_FIXTURE.read_text(encoding="utf-8"))
