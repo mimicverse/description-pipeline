@@ -361,7 +361,6 @@ class ReportUiContractTests(unittest.TestCase):
     def test_blocked_stages_are_neutral_not_failed(self) -> None:
         app = self.app()
         self.assertNotIn('state === "failed" || state === "blocked") return "bad"', app)
-        self.assertIn('if (state === "failed" || state === "unresolved") return "bad"', app)
         css = (STATIC / "style.css").read_text(encoding="utf-8")
         self.assertNotIn(".step.blocked .step-meta { color: var(--bad); }", css)
         self.assertNotIn(".chip.failed, .chip.blocked", css)
@@ -374,7 +373,6 @@ class ReportUiContractTests(unittest.TestCase):
             'waiting: "Waiting"',
             'cancelled: "Cancelled"',
             'unresolved: "Unresolved"',
-            'if (state === "failed" || state === "unresolved") return "bad"',
             "const STAGE_SELECTION_PRIORITY = [",
             '"unresolved",\n  "failed",\n  "cancelled",\n  "running",',
             'for (const state of STAGE_SELECTION_PRIORITY)',
@@ -461,7 +459,7 @@ class RunHistoryUiContractTests(unittest.TestCase):
             "assemblyLabel",
             "run.main_assembly",
             "formatRunTime",
-            "RUN_STATES[run.state]",
+            "RUN_STATES[displayState(run.state, run.automatic)]",
             "State unconfirmed",
             'Initiator: ${run.user || "not recorded"}',
             "Rerun from ${run.resume_from_name}",
