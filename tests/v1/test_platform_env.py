@@ -272,7 +272,7 @@ class PlatformEnvTests(unittest.TestCase):
             ),
             (
                 "DISCOVERY_SETTINGS_FILE", "DISCOVERY_SETTINGS_JSON",
-                {"specifications": {"record_roots": ["/other/specifications"]}},
+                {"record_roots": ["/other/specifications"]},
             ),
         )
         resolved_file = self.root / "state" / "resolved.env"
