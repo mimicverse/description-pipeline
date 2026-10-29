@@ -510,6 +510,7 @@ class RegisteredPlatform:
         parent_run_id: str | None = None,
         target_hardware: str = "nd",
         main_assembly: str = "cad/robot.SLDASM",
+        principal: str = "fixture:local:reader",
     ) -> None:
         self.world.runs[run_id] = {
             "run_id": run_id,
@@ -517,6 +518,7 @@ class RegisteredPlatform:
             "parent_run_id": parent_run_id,
             "from_stage": from_stage,
             "request": {
+                "principal": principal,
                 "target_hardware": target_hardware,
                 "main_assembly": main_assembly,
                 "purpose": "engineering",

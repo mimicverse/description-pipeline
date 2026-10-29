@@ -533,7 +533,9 @@ class _HttpDispatchAdapter:
             payload = self._request("GET", command, conf)
         except urlerror.HTTPError as error:
             if error.code == 404:
-                return DispatchObservation("absent", {"error": "not_found"})
+                return DispatchObservation(
+                    "absent", {"dag_id": command.dag_id, "dag_run_id": command.dag_run_id}
+                )
             raise
         except Exception as error:
             return DispatchObservation(

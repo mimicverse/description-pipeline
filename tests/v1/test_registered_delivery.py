@@ -450,8 +450,8 @@ class RegisteredRetryAuthorityTests(unittest.TestCase):
         """Airflow and native facts never substitute for the platform admission."""
         platform = RegisteredPlatform(self.tmp / "not-admitted")
         status, payload, clears = self._post_retry(platform)
-        self.assertEqual(status, 409, payload)
-        self.assertEqual(payload.get("reason"), "registration_missing")
+        self.assertEqual(status, 404, payload)
+        self.assertEqual(payload.get("error"), "The run has no canonical admission")
         self.assertEqual(clears, [], "no dry-run and no clear without a platform registration")
         unknown = RegisteredPlatform(self.tmp / "unknown")
         unknown.admit(WSGI_RUN)
@@ -464,7 +464,7 @@ class RegisteredRetryAuthorityTests(unittest.TestCase):
     def test_the_displayed_retry_advice_matches_the_post_criterion(self) -> None:
         """The run page never offers an action the POST route would necessarily refuse."""
 
-        def get_retry(platform: RegisteredPlatform) -> dict:
+        def get_retry(platform: RegisteredPlatform, *, expected_status: int = 200) -> dict:
             airflow = _RetryAirflow()
             app = portal_module.PortalApp(
                 portal_module.PortalConfig(
@@ -490,13 +490,13 @@ class RegisteredRetryAuthorityTests(unittest.TestCase):
                     start,
                 )
             )
-            self.assertEqual(response["status"], 200)
-            return json.loads(body)["retry"]
+            self.assertEqual(response["status"], expected_status)
+            payload = json.loads(body)
+            return payload["retry"] if expected_status == 200 else payload
 
         unregistered = RegisteredPlatform(self.tmp / "advice-missing")
-        advice = get_retry(unregistered)
-        self.assertEqual(advice["eligible"], False, advice)
-        self.assertEqual(advice["reason"], "registration_missing")
+        advice = get_retry(unregistered, expected_status=404)
+        self.assertEqual(advice["error"], "The run has no canonical admission")
         running = RegisteredPlatform(self.tmp / "advice-running")
         running.admit(WSGI_RUN)
         advice = get_retry(running)
