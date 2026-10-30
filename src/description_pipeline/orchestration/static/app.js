@@ -23,7 +23,6 @@ import {
   stageEntersPreview,
   stageSummaryRows,
   summaryIdentity,
-  warningSourceRows,
 } from "/static/preview_logic.js";
 
 const state = {
@@ -1203,64 +1202,22 @@ function checkRow(parent, row) {
 //: (including authored zeros), the qualification/publication blocker kind, and no
 //: pass bookkeeping or per-item human confirmation.
 const WARNING_ROW_LIMIT = 8;
-const WARNING_VALUE_LIMIT = 8;
-
-function warningValueText(value) {
-  if (value === null) return "null";
-  if (value === undefined) return "";
-  if (typeof value === "number" || typeof value === "boolean") return String(value);
-  if (typeof value === "string") return value;
-  if (Array.isArray(value)) {
-    const shown = value.slice(0, WARNING_VALUE_LIMIT).map((item) => warningValueText(item));
-    return `${shown.join(", ")}${value.length > shown.length ? ` and ${value.length} items total` : ""}`;
-  }
-  if (typeof value === "object") {
-    const entries = Object.entries(value).slice(0, WARNING_VALUE_LIMIT);
-    const shown = entries.map(([key, item]) => `${key}=${warningValueText(item)}`);
-    return `${shown.join("; ")}${Object.keys(value).length > entries.length ? " ..." : ""}`;
-  }
-  return String(value);
-}
-
-
-function warningSourceText(value) {
-  return value === undefined ? "not recorded" : warningValueText(value);
-}
 
 function appendWarningSourceRows(parent, warning) {
-  const rows = warningSourceRows(warning);
-  if (!rows.length) return false;
-  const details = expandable(parent, `Source values (${rows.length})`);
-  details.className = "warning-sources";
-  for (const row of rows) {
-    const line = document.createElement("p");
-    line.className = "warning-source";
-    const parts = [
-      row.object_type ? `${row.object_type}:${row.object || "unknown"}` : row.object,
-      row.fields.length ? `field=${row.fields.join(",")}` : "",
-      `source=${warningSourceText(row.source)}`,
-      `rule_id=${warningSourceText(row.rule_id)}`,
-      `rule_version=${warningSourceText(row.rule_version)}`,
-      `original=${warningSourceText(row.original)}`,
-      `actual=${warningSourceText(row.actual)}`,
-      `reason=${warningSourceText(row.reason)}`,
-      row.file ? `file=${row.file}` : "",
-      row.sha256 ? `sha256=${row.sha256}` : "",
-      row.anchor ? `anchor=${row.anchor}` : "",
-      row.key ? `key=${row.key}` : "",
-      row.reference ? `reference=${row.reference}` : "",
-      row.native_observation_errors.length
-        ? `native_observation_errors=${warningSourceText(row.native_observation_errors)}`
-        : "",
-    ].filter(Boolean);
-    if (row.extra) {
-      parts.push(...Object.entries(row.extra).map(([key, value]) => `${key}=${warningValueText(value)}`));
-    }
-    line.textContent = parts.join("; ");
-    details.append(line);
-  }
-  return true;
+  const examples = Array.isArray(warning.objects) ? warning.objects.slice(0, WARNING_ROW_LIMIT) : [];
+  const details = expandable(parent, `Located source examples (${examples.length}/${warning.source_rows_total})`);
+  const excerpt = document.createElement("pre");
+  excerpt.className = "warning-source";
+  excerpt.textContent = JSON.stringify(examples, null, 2);
+  details.append(excerpt);
+  const note = document.createElement("p");
+  note.className = "muted small";
+  note.textContent = `${warning.records_total} recorded warnings; ${warning.records_omitted} records and ` +
+    `${warning.source_rows_omitted} source rows are not expanded. Complex values are explicit excerpts. ` +
+    `Complete source record: ${JSON.stringify(warning.record_location)}.`;
+  details.append(note);
 }
+
 
 function stageWarningRow(row) {
   const item = document.createElement("div");
@@ -1307,18 +1264,25 @@ function renderStageWarnings(root, stage, note) {
   const group = document.createElement("div");
   group.className = "check-group warning-group";
   const title = document.createElement("h4");
-  title.textContent = `Warnings (${rows.length})`;
+  title.textContent = `Warnings (${stage.counts.warnings} records in ${rows.length} categories)`;
   group.append(title);
   const hint = document.createElement("p");
   hint.className = "stage-note muted small";
   hint.textContent = note || "Recorded observations do not block capture or generation and are neither passes nor acceptance/publication evidence.";
   group.append(hint);
-  for (const row of rows.slice(0, WARNING_ROW_LIMIT)) group.append(stageWarningRow(row));
-  if (rows.length > WARNING_ROW_LIMIT) {
-    const more = document.createElement("p");
-    more.className = "muted small";
-    more.textContent = `${rows.length - WARNING_ROW_LIMIT} more warnings; see the report records.`;
-    group.append(more);
+  for (const row of rows) {
+    const category = expandable(group, `${row.code}: ${String(row.message || "").slice(0, 96)} (${row.records_total} records)`);
+    category.append(stageWarningRow(row));
+  }
+  const certificate = (state.lastRun?.verification_reports || [])
+    .find((record) => record.path === "verification-certificate.json");
+  if (stage.id === "verify" && certificate?.url) {
+    const link = document.createElement("a");
+    link.href = certificate.url;
+    link.target = "_blank";
+    link.rel = "noopener";
+    link.textContent = "Open complete verification certificate";
+    group.append(link);
   }
   root.append(group);
 }
@@ -2634,19 +2598,14 @@ function renderPreviewDiagnostic(preview) {
         message.textContent = warning.message;
         group.append(message);
       }
-      if (!appendWarningSourceRows(group, warning)) {
-        const recorded = document.createElement("p");
-        recorded.className = "warning-source muted small";
-        recorded.textContent = "No object-level source fields were recorded.";
-        group.append(recorded);
-      }
+      appendWarningSourceRows(group, warning);
       warningDetails.append(group);
     }
-    if (diagnostic.warnings_total > diagnostic.warnings.length) {
+    if (preview.warning_categories_total > diagnostic.warnings.length) {
       const more = document.createElement("p");
       more.className = "muted small";
       more.textContent =
-        `${diagnostic.warnings_total - diagnostic.warnings.length} more warning groups ` +
+        `${preview.warning_categories_total - diagnostic.warnings.length} more warning categories ` +
         "are available in the report.";
       warningDetails.append(more);
     }

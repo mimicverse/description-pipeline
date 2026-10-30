@@ -80,15 +80,100 @@ def verification_diagnostics(report: Mapping[str, Any]) -> list[dict]:
     return list(records.values())
 
 
-def validate_certificate_diagnostics(certificate: Mapping[str, Any]) -> None:
-    """Require nested observations to be present in the one complete diagnostic inventory."""
+_DIAGNOSTIC_INDICES = {"warnings": "warning_indices", "diagnostics": "diagnostic_indices"}
 
-    records = verification_diagnostics(certificate)
-    inventory = {canonical_json_value(item) for item in certificate["diagnostics"]}
-    if len(inventory) != len(certificate["diagnostics"]):
+
+def index_check_diagnostics(checks: list[dict], diagnostics: list[dict]) -> list[dict]:
+    """Store each check observation as an index into the one diagnostic inventory."""
+
+    positions = {canonical_json_value(item): index for index, item in enumerate(diagnostics)}
+    indexed = []
+    for check in checks:
+        details = check.get("details")
+        if not isinstance(details, dict):
+            raise PipelineError("Verification check details must be an object")
+        details = dict(details)
+        for field, index_field in _DIAGNOSTIC_INDICES.items():
+            if index_field in details:
+                raise PipelineError("Verifier report already contains diagnostic indices")
+            if field not in details:
+                continue
+            records = details.pop(field)
+            if not isinstance(records, list):
+                raise PipelineError("Verification check diagnostics must be a list")
+            try:
+                details[index_field] = list(dict.fromkeys(positions[canonical_json_value(item)] for item in records))
+            except KeyError as error:
+                raise PipelineError("Verification check observation is absent from the diagnostic inventory") from error
+        indexed.append({**check, "details": details})
+    return indexed
+
+
+def certificate_check_details(certificate: Mapping[str, Any], check: Mapping[str, Any]) -> dict:
+    """Resolve strictly typed check references without accepting embedded legacy records."""
+
+    details = check.get("details")
+    inventory = certificate.get("diagnostics")
+    if not isinstance(details, dict) or not isinstance(inventory, list):
+        raise PipelineError("Verification check details or diagnostic inventory is malformed")
+    resolved = dict(details)
+    for field, index_field in _DIAGNOSTIC_INDICES.items():
+        if field in details:
+            raise PipelineError("Verification certificate embeds diagnostic records in check details")
+        if index_field not in details:
+            continue
+        indices = resolved.pop(index_field)
+        if (
+            not isinstance(indices, list)
+            or any(type(index) is not int or index < 0 or index >= len(inventory) for index in indices)
+            or len(indices) != len(set(indices))
+        ):
+            raise PipelineError("Verification check diagnostic indices are invalid")
+        resolved[field] = [inventory[index] for index in indices]
+    return resolved
+
+
+def validate_certificate_diagnostics(certificate: Mapping[str, Any]) -> None:
+    """Validate the single inventory, check references and native scope completeness."""
+
+    from ..geometry.native_scope import (
+        NATIVE_GATE_WARNING_CODES, NATIVE_SCOPE_IDENTITY_WARNING_CODES,
+        native_gate_warning_details_match,
+    )
+
+    records = verification_diagnostics({
+        "diagnostics": certificate.get("diagnostics"), "checks": [],
+        "passed": certificate.get("passed"), "decision": certificate.get("decision"),
+    })
+    if len(records) != len(certificate["diagnostics"]):
         raise PipelineError("Verification certificate diagnostics contain duplicate records")
-    if any(canonical_json_value(item) not in inventory for item in records):
-        raise PipelineError("Verification certificate diagnostics omit a recorded check observation")
+    checks = certificate.get("checks", [])
+    if not isinstance(checks, list) or any(not isinstance(check, dict) for check in checks):
+        raise PipelineError("Verification certificate checks must be a list of objects")
+    native = [item for item in records if item["code"] in NATIVE_GATE_WARNING_CODES]
+    native_gate = None
+    for check in checks:
+        details = certificate_check_details(certificate, check)
+        if check.get("id") == "geometry.native_tessellation":
+            if native_gate is not None:
+                raise PipelineError("Verification certificate repeats the native tessellation gate")
+            native_gate = (check, details)
+    if native_gate is None:
+        if native:
+            raise PipelineError("Native gate diagnostics have no matching gate warnings")
+        return
+    check, details = native_gate
+    warnings = details.get("warnings")
+    passed = check.get("state") == "passed" or check.get("passed") is True
+    if passed and (
+        not isinstance(warnings, list)
+        or not any(item.get("code") in NATIVE_SCOPE_IDENTITY_WARNING_CODES for item in warnings)
+    ):
+        raise PipelineError("Passed native tessellation gate carries no scope identity warnings")
+    if (native or warnings) and (
+        not isinstance(warnings, list) or not native_gate_warning_details_match(native, warnings)
+    ):
+        raise PipelineError("Native gate warnings differ from quality diagnostics")
 
 
 __all__ = [
@@ -103,6 +188,8 @@ __all__ = [
     "RECEIPT_SCHEMA",
     "REQUEST_SCHEMA",
     "VERIFY_ARTIFACT_KIND",
+    "certificate_check_details",
+    "index_check_diagnostics",
     "validate_certificate_diagnostics",
     "verification_diagnostics",
 ]

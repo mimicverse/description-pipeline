@@ -15,7 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from description_pipeline.backends.urdf import generate_urdf
-from description_pipeline.geometry.native_scope import NATIVE_SHEET_DISPLAY_GAP
+from description_pipeline.geometry.native_scope import NATIVE_GATE_WARNING_CODES, NATIVE_SHEET_DISPLAY_GAP
 from description_pipeline.geometry.native_tessellation import (
     build_native_tessellation,
     materialize_native_stl,
@@ -26,7 +26,7 @@ from description_pipeline.geometry.native_tessellation import (
     summarize_native_topology,
     write_native_triangle_stream,
 )
-from description_pipeline.io import PipelineError, write_json
+from description_pipeline.io import PipelineError, digest, read_data, write_json
 from description_pipeline.sources.solidworks.appearance import (
     AppearanceError,
     appearance_groups,
@@ -51,6 +51,8 @@ from . import support, test_solidworks_native_reader as reader
 from tests.v1 import verification_fixture as hermetic, test_pipeline_verify as verify_fixtures
 from tests.v1 import test_generate_handler as generate_fixtures
 from description_pipeline.pipeline.stages.publish import _publication_warning_text
+from description_pipeline.pipeline.verify import validate_certificate_structure
+from description_pipeline.pipeline.verify_contract import certificate_check_details
 from description_pipeline.verification import consumer
 from . import test_native_triangles_contract as triangles
 
@@ -320,17 +322,21 @@ class NativeSheetDisplayGapTests(unittest.TestCase):
         self.assertEqual((gaps[0]["detail"]["body_type"], gaps[0]["detail"]["face_index"]), (1, 0))
         self.assertEqual(gaps[0]["detail"]["zero_triangle_evidence"], gap_evidence(area=1e-25))
         model = json.loads((fixture.generate_root / "model/robot.json").read_text())
-        self.assertEqual(len(native_display_gap_value_warnings(native["details"]["warnings"])[0]["objects"]), 1)
+        native_warnings = certificate_check_details(certificate, native)["warnings"]
+        self.assertEqual(len(native_display_gap_value_warnings(native_warnings)[0]["objects"]), 1)
         self.assertIn("WARNING " + NATIVE_SHEET_DISPLAY_GAP,
                       (fixture.generate_root / "urdf/robot.urdf").read_text())
         self.assertIn(NATIVE_SHEET_DISPLAY_GAP, _publication_warning_text(certificate))
         # The gap remains prominent even when ordinary provenance exceeds the PR limit.
         crowded = copy.deepcopy(certificate)
-        ordinary = next(row for row in crowded["diagnostics"] if row["code"] != NATIVE_SHEET_DISPLAY_GAP)
-        crowded["diagnostics"] = [
+        ordinary = next(row for row in crowded["diagnostics"] if row["code"] not in NATIVE_GATE_WARNING_CODES)
+        crowded["diagnostics"] += [
             {**copy.deepcopy(ordinary), "object": f"fixture-object-{index}"}
             for index in range(200)
-        ] + crowded["diagnostics"]
+        ]
+        crowded["verification_key"] = digest(
+            {key: value for key, value in crowded.items() if key != "verification_key"}
+        )
         self.assertIn("get_area_m2", _publication_warning_text(crowded))
         self.assertEqual(len([row for row in _quality_warnings(certificate)
                              if row["code"] == NATIVE_SHEET_DISPLAY_GAP]), 1)
@@ -345,12 +351,11 @@ class NativeSheetDisplayGapTests(unittest.TestCase):
         report, _generated = closure._evaluate_details()
         self.assertTrue(report["passed"])
         view = fixture.root / "independent-view-1"
+        facts = read_data(view / "evidence/raw/native_capture_facts.json.gz")
         independently_resolved = native_appearance._resolved_faces(
-            json.loads((view / "evidence/raw/native_capture_facts.json").read_text())
-            ["geometry_raw"]["base-1"]["appearance_raw"] | {
+            facts["geometry_raw"]["base-1"]["appearance_raw"] | {
                 "component": "base-1",
-                "source_document_path": json.loads((view / "evidence/raw/native_capture_facts.json").read_text())
-                ["source_scopes"]["base-1"]["source_document_path"],
+                "source_document_path": facts["source_scopes"]["base-1"]["source_document_path"],
                 "referenced_configuration": "Default",
             }, configuration="Default", where="empty sheet body",
         )
@@ -375,8 +380,8 @@ class NativeSheetDisplayGapTests(unittest.TestCase):
         for mutation in ("count", "area", "solid"):
             target = fixture.root / ("raw-gap-" + mutation)
             shutil.copytree(view, target)
-            raw_path = target / "evidence/raw/native_capture_facts.json"
-            facts = json.loads(raw_path.read_text())
+            raw_path = target / "evidence/raw/native_capture_facts.json.gz"
+            facts = read_data(raw_path)
             row = facts["geometry_raw"]["base-1"]["face_inventory"][-1]
             if mutation == "solid":
                 row["body_type"] = 0
@@ -435,23 +440,40 @@ class NativeSheetDisplayGapTests(unittest.TestCase):
                                   source_scope=fixture.source_scope, warnings=warnings)
         report = quality_report(warnings)
         view = recorded_warnings(report)
-        self.assertEqual(sum(item["code"] == NATIVE_SHEET_DISPLAY_GAP for item in view), 4)
+        summaries = [item for item in view if item["code"] == NATIVE_SHEET_DISPLAY_GAP]
+        self.assertEqual(sum(item["records_total"] for item in summaries), 4)
+        self.assertEqual(sum(item["source_rows_shown"] for item in summaries), 4)
+        self.assertEqual({item["object"] for group in summaries for item in group["objects"]},
+                         {item["object"] for item in report["diagnostics"] if item["code"] == NATIVE_SHEET_DISPLAY_GAP})
         self.assertEqual(sum(item["code"] == NATIVE_SHEET_DISPLAY_GAP
                              for item in _quality_warnings(report)), 4)
+        from tests.v1.test_pipeline_publish import PublishFixture
+
+        transport = PublishFixture(diagnostics=report["diagnostics"])
+        self.addCleanup(transport.close)
+        certificate = {**transport.certificate, "checks": report["checks"],
+                       "required_checks": [row["id"] for row in report["checks"]]}
+        certificate["verification_key"] = digest(
+            {key: value for key, value in certificate.items() if key != "verification_key"}
+        )
+        validate_certificate_structure(certificate)
         for mutation in ("drop", "field", "object"):
-            forged = copy.deepcopy(report)
+            forged = copy.deepcopy(certificate)
             index = next(index for index, item in enumerate(forged["diagnostics"])
                          if item["code"] == NATIVE_SHEET_DISPLAY_GAP)
             if mutation == "drop":
                 forged["diagnostics"].pop(index)
+                with self.assertRaises(PortalError):
+                    _quality_warnings(forged)
+                with self.assertRaises(PipelineError):
+                    recorded_warnings(forged)
             elif mutation == "field":
                 forged["diagnostics"][index]["detail"]["field"] = "unrelated"
             else:
                 forged["diagnostics"][index]["object"] = "unrelated"
-            with self.subTest(mutation=mutation), self.assertRaises(PortalError):
-                _quality_warnings(forged)
+            # The registered certificate consumer verifies its proof before rendering.
             with self.subTest(mutation=mutation), self.assertRaises(PipelineError):
-                recorded_warnings(forged)
+                validate_certificate_structure(forged)
         value_warnings = native_display_gap_value_warnings(warnings)
         model = {"name": "fixture", "provenance": {"value_warnings": value_warnings},
                  "links": [], "joints": [], "frames": []}
@@ -485,7 +507,7 @@ class NativeSheetDisplayGapTests(unittest.TestCase):
         root = qualification._root()
         self.addCleanup(qualification.doCleanups)
         (root / "evidence/raw").mkdir(parents=True)
-        write_json(root / "evidence/raw/native_capture_facts.json", {"faces": faces})
+        write_json(root / "evidence/raw/native_capture_facts.json.gz", {"faces": faces})
         definition = qualification._definition()
         checks = qualification._checks(definition)
         gate = next(item for item in checks if item["id"] == "geometry.native_tessellation")
@@ -494,4 +516,4 @@ class NativeSheetDisplayGapTests(unittest.TestCase):
                     if item["fact_id"] == "geometry.native_tessellation")
         self.assertEqual(item["status"], "unqualified")
         self.assertEqual([entry["record"] for entry in item["evidence"]],
-                         ["evidence/raw/native_capture_facts.json", "model/robot.json"])
+                         ["evidence/raw/native_capture_facts.json.gz", "model/robot.json"])

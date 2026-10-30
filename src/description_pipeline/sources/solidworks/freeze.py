@@ -26,6 +26,7 @@ from .jsonio import digest_json, sha256_file, write_json
 
 # The native adapter binds exported bytes; full mesh analysis runs on Linux.
 from ...io import _filesystem_path, _physical_path, confined, inventory
+from ...schemas import NATIVE_CAPTURE_FACTS
 
 #: Freeze/capture records use the current solidworks-to-urdf contract.
 FREEZE_SCHEMA = "solidworks-to-urdf.freeze/v1"
@@ -1028,7 +1029,7 @@ def _capture_prepared_local(
             },
         )
         write_json(
-            staging / "raw" / "native_capture_facts.json",
+            staging / NATIVE_CAPTURE_FACTS,
             observation,
         )
         write_json(staging / "native-runtime.json", environment)

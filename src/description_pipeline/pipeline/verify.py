@@ -57,6 +57,7 @@ from .verify_contract import (
     RECEIPT_SCHEMA,
     REQUEST_SCHEMA,
     validate_certificate_diagnostics,
+    index_check_diagnostics,
     verification_diagnostics,
 )
 _PURPOSES = frozenset({PURPOSE_ENGINEERING, PURPOSE_INSPECTION_PREVIEW})
@@ -110,8 +111,8 @@ def _actual_verifier(provider: IdentityProvider) -> tuple[dict[str, Any], str]:
     return record, checksum
 
 
-def _certificate_checks(checks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [
+def _certificate_checks(checks: list[dict[str, Any]], diagnostics: list[dict]) -> list[dict[str, Any]]:
+    return index_check_diagnostics([
         {
             **check,
             "details": {
@@ -120,7 +121,7 @@ def _certificate_checks(checks: list[dict[str, Any]]) -> list[dict[str, Any]]:
             },
         }
         for check in checks
-    ]
+    ], diagnostics)
 
 
 @dataclass(frozen=True, slots=True)
@@ -469,16 +470,17 @@ def _certificate(prepared: _PreparedInput, report: Mapping[str, Any]) -> dict[st
     evaluation_subject = _pair_subject_digest(prepared.generate, prepared.capture)
     if report.get("subject_sha256") != evaluation_subject:
         raise PipelineError("Verifier report is bound to another Generate/Capture view")
+    diagnostics = verification_diagnostics(report)
     proof = {
         "actual_verifier": prepared.verifier,
         "actual_verifier_sha256": prepared.verifier_sha256,
         "capture_artifact": prepared.capture.artifact.to_record(),
-        "checks": _certificate_checks(report.get("checks") or []),
+        "checks": _certificate_checks(report.get("checks") or [], diagnostics),
         "closure_sha256": prepared.closure_sha256,
         "config_snapshot_sha256": request.config_snapshot_sha256,
         "contract_sha256": request.contract_sha256,
         "decision": "PASS" if report.get("passed") is True else "FAIL",
-        "diagnostics": verification_diagnostics(report),
+        "diagnostics": diagnostics,
         "evaluation_subject_sha256": evaluation_subject,
         "generate_artifact": prepared.generate.artifact.to_record(),
         "generate_receipt_sha256": file_digest(prepared.generate.root / GENERATE_RECEIPT),

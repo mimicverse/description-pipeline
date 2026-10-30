@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..io import PipelineError, confined, inventory, read_data, write_json
+from ..schemas import NATIVE_CAPTURE_FACTS
 
 SCHEMA = "solidworks-to-urdf.source/v2"
 MANIFEST_KEYS = frozenset(
@@ -24,7 +25,7 @@ def write_manifest(root: Path, *, kind: str, identity: dict, evidence_class: str
         raise PipelineError(f"Unknown evidence class: {evidence_class}")
     if not kind or not identity:
         raise PipelineError("Snapshot requires source kind and identity")
-    scene = "raw/native_capture_facts.json" if kind == "solidworks" else "scene.json"
+    scene = NATIVE_CAPTURE_FACTS if kind == "solidworks" else "scene.json"
     confined(root, scene)
     manifest = {
         "schema_version": SCHEMA,
@@ -65,7 +66,7 @@ def verify_snapshot(root: Path) -> dict:
     if not isinstance(scene, str) or not scene or scene not in declared:
         raise PipelineError("Source scene is not bound by manifest")
     if manifest.get("kind") == "solidworks" and (
-        manifest.get("scene") != "raw/native_capture_facts.json"
+        manifest.get("scene") != NATIVE_CAPTURE_FACTS
         or "scene.json" in declared
     ):
         raise PipelineError("SolidWorks snapshots must bind the raw readings only")

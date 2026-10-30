@@ -27,7 +27,9 @@ from description_pipeline.geometry.native_tessellation import (
     native_triangle_relative_path,
     write_native_triangle_stream,
 )
-from description_pipeline.io import PipelineError, canonical, digest, file_digest, inventory, read_data, write_json
+from description_pipeline.io import (
+    PipelineError, canonical, digest, file_digest, inventory, parse_data, read_data, write_json,
+)
 from description_pipeline.orchestration import stage_transfer as transfer
 from description_pipeline.pipeline.contracts import ArtifactRef
 from description_pipeline.request_evidence import build_request_evidence
@@ -592,7 +594,7 @@ def capture_root(
         },
         "notes": {},
     }
-    write_json(evidence / "raw/native_capture_facts.json", native_facts)
+    write_json(evidence / "raw/native_capture_facts.json.gz", native_facts)
     write_json(
         root / "input/capture-plan.json",
         {
@@ -763,7 +765,7 @@ class StageTransferTests(unittest.TestCase):
         )["native_files"]
         handoff = digest(native_files)
         source_hashes = read_data(
-            root / "evidence/raw/native_capture_facts.json"
+            root / "evidence/raw/native_capture_facts.json.gz"
         )["input_stability"]["source_hashes"]
         self.assertEqual(
             set(source_hashes),
@@ -796,7 +798,7 @@ class StageTransferTests(unittest.TestCase):
                 "evidence/manifest.json",
                 "evidence/native-runtime.json",
                 "evidence/raw/dependency_closure.json",
-                "evidence/raw/native_capture_facts.json",
+                "evidence/raw/native_capture_facts.json.gz",
             }
             <= integrity_files
         )
@@ -863,7 +865,7 @@ class StageTransferTests(unittest.TestCase):
             handoff_sha256=handoff,
             upload_sha256=handoff,
         )
-        facts_path = root / "evidence/raw/native_capture_facts.json"
+        facts_path = root / "evidence/raw/native_capture_facts.json.gz"
         facts = read_data(facts_path)
         mutate(facts["input_stability"])
         write_json(facts_path, facts)
@@ -882,7 +884,7 @@ class StageTransferTests(unittest.TestCase):
             valid,
             forged,
             {
-                "evidence/raw/native_capture_facts.json": facts_path.read_bytes(),
+                "evidence/raw/native_capture_facts.json.gz": facts_path.read_bytes(),
                 "evidence/manifest.json": (
                     root / "evidence/manifest.json"
                 ).read_bytes(),
@@ -909,7 +911,7 @@ class StageTransferTests(unittest.TestCase):
             root / "input/discovery/native-discovery.json"
         )["native_files"]
         facts = read_data(
-            root / "evidence/raw/native_capture_facts.json"
+            root / "evidence/raw/native_capture_facts.json.gz"
         )
         self.assertEqual(len(native_files), 2)
         self.assertEqual(
@@ -1248,14 +1250,17 @@ class StageTransferTests(unittest.TestCase):
     def test_self_consistent_evidence_tamper_is_refused(self) -> None:
         seal(self.root, self.archive)
         with zipfile.ZipFile(self.archive) as source:
-            facts = json.loads(
-                source.read("evidence/raw/native_capture_facts.json")
+            facts = parse_data(
+                source.read("evidence/raw/native_capture_facts.json.gz"),
+                Path("evidence/raw/native_capture_facts.json.gz"),
             )
         facts["input_stability"]["originals_unchanged"] = False
-        payload = canonical(facts)
+        mutated_facts = self.base / "mutated-native-capture-facts.json.gz"
+        write_json(mutated_facts, facts)
+        payload = mutated_facts.read_bytes()
         with zipfile.ZipFile(self.archive) as source:
             evidence_manifest = json.loads(source.read("evidence/manifest.json"))
-        evidence_manifest["files"]["raw/native_capture_facts.json"] = hashlib.sha256(
+        evidence_manifest["files"]["raw/native_capture_facts.json.gz"] = hashlib.sha256(
             payload
         ).hexdigest()
         broken = self.base / "evidence.zip"
@@ -1263,7 +1268,7 @@ class StageTransferTests(unittest.TestCase):
             self.archive,
             broken,
             {
-                "evidence/raw/native_capture_facts.json": payload,
+                "evidence/raw/native_capture_facts.json.gz": payload,
                 "evidence/manifest.json": canonical(evidence_manifest),
             },
         )
@@ -1726,7 +1731,7 @@ class StageTransferTests(unittest.TestCase):
             }
             handoff_sha256 = digest(native_files)
             facts = read_data(
-                evidence / "raw/native_capture_facts.json"
+                evidence / "raw/native_capture_facts.json.gz"
             )
             discovery_path = (
                 capture / "input/discovery/native-discovery.json"
@@ -1818,7 +1823,7 @@ class StageTransferTests(unittest.TestCase):
                 main_assembly=assembly.name,
             )
             self.assertIn(
-                "evidence/raw/native_capture_facts.json",
+                "evidence/raw/native_capture_facts.json.gz",
                 manifest["files"],
             )
             self.assertNotIn(
@@ -2411,7 +2416,7 @@ class StageTransferTests(unittest.TestCase):
             if row.get("source") == old_source:
                 row["source"] = windows
         write_json(closure_path, closure)
-        facts_path = evidence / "raw/native_capture_facts.json"
+        facts_path = evidence / "raw/native_capture_facts.json.gz"
         facts = read_data(facts_path)
         facts["scene_raw"]["document"] = windows
         for phase in ("before", "after"):
@@ -2421,7 +2426,7 @@ class StageTransferTests(unittest.TestCase):
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest["identity"].update(assembly=windows, document_id=windows)
         manifest["files"]["raw/dependency_closure.json"] = file_digest(closure_path)
-        manifest["files"]["raw/native_capture_facts.json"] = file_digest(
+        manifest["files"]["raw/native_capture_facts.json.gz"] = file_digest(
             facts_path
         )
         manifest_path.write_bytes(canonical(manifest))

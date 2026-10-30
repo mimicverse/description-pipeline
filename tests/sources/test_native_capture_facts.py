@@ -358,7 +358,7 @@ class NativeCaptureFactsTests(unittest.TestCase):
             triangle_count=count,
         )
         write_json(
-            self.root / "evidence/raw/native_capture_facts.json",
+            self.root / "evidence/raw/native_capture_facts.json.gz",
             self.raw_facts,
         )
         write_manifest(
@@ -872,7 +872,7 @@ class NativeCaptureFactsTests(unittest.TestCase):
                     verify_native_capture_facts(self.root)
 
     def test_missing_sealed_native_facts_member_is_rejected(self):
-        (self.root / "evidence/raw/native_capture_facts.json").unlink()
+        (self.root / "evidence/raw/native_capture_facts.json.gz").unlink()
         with self.assertRaises(PipelineError):
             verify_native_capture_facts(self.root)
 
@@ -932,7 +932,7 @@ class NativeCaptureFactsTests(unittest.TestCase):
                     verify_native_capture_facts(self.root)
 
     def test_raw_member_tamper_breaks_the_source_manifest(self):
-        path = self.root / "evidence/raw/native_capture_facts.json"
+        path = self.root / "evidence/raw/native_capture_facts.json.gz"
         record = self.raw_facts
         record["assembly_mass_raw"]["native_raw"]["mass_kg"] = 2.01
         write_json(path, record)

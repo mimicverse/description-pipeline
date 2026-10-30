@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 import re
 import signal
 import shutil
+import subprocess
 import tempfile
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
@@ -19,7 +21,9 @@ from typing import Any
 from ...artifacts import ArtifactStore
 from ...delivery import subject_digest, write_delivery_manifest
 from ...interface_records import CHECK_POLICY_SCHEMA, validate_qualification
-from ...io import PipelineError, canonical, digest, file_digest, inventory, read_data, write_json
+from ...io import (
+    PipelineError, canonical, digest, file_digest, inventory, process_error_record, read_data, write_json,
+)
 from ...repository.publish import (
     CommitSpec,
     GitHubCliPullRequestClient,
@@ -656,6 +660,56 @@ def _require_satisfied(effects: StageEffectPort, *, key: str, effect_id: str) ->
         raise PublishIncomplete("publish.effect_unsettled", {"effect_key": key, "effect_id": effect_id})
 
 
+def _record_effect_error(
+    *,
+    effects: StageEffectPort,
+    effect_id: str,
+    source: str,
+    workspace: StageWorkspace,
+    phase: str,
+    operation_error: Exception | None = None,
+    observation_error: Exception | None = None,
+) -> None:
+    root = workspace.root / "effects" / f"{source.rsplit('.', 1)[-1]}-{phase}-error"
+    record = {
+        "phase": phase,
+        "operation_error": process_error_record(operation_error, operation=source)
+        if operation_error is not None else None,
+        "observation_error": process_error_record(observation_error, operation=f"{source}.observe")
+        if observation_error is not None else None,
+    }
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / "timeout.json"
+        write_json(path, record)
+        path.chmod(0o600)
+        effects.record_timeout(effect_id, source=source, detail_root=root)
+    except Exception as evidence_error:
+        raise PublicationError(
+            "publish.error_evidence_unavailable",
+            {**record, "evidence_error": process_error_record(evidence_error, operation="publish.error_evidence")},
+        ) from None
+
+
+def _local_publication_failure(error: PublicationError) -> StageFailure:
+    record = process_error_record(error, operation="publish.prepare")
+    detail = record.pop("detail", None)
+    return StageFailure(
+        "publish.local_contract_failed", error.code, error_type=type(error).__name__,
+        detail={**(detail if isinstance(detail, dict) else {"detail": detail}), "exception": record},
+    )
+
+
+def _unresolved_local_error(error: Exception, workspace: StageWorkspace, *, operation: str) -> None:
+    record = process_error_record(error, operation=operation)
+    root = workspace.root / "publish-process-errors"
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"{operation.rsplit('.', 1)[-1]}.json"
+    write_json(path, record)
+    path.chmod(0o600)
+    raise PublishIncomplete("publish.local_process_unresolved", record) from None
+
+
 def _observe_git_exact(
     repository: PublicationRepository,
     request: PublishDomainRequest,
@@ -681,8 +735,6 @@ class _SealedGit:
     candidate: _PublishedCandidate
     plan: dict[str, Any]
     plan_sha256: str
-    title: str
-    body: str
 
 
 def _read_sealed_git_outbound_root(
@@ -770,6 +822,30 @@ def _read_sealed_git_outbound_root(
         parents=tuple(parents),
     )
     certificate_raw = repository.read_blob(commit=commit, path=f"reports/{VERIFY_CERTIFICATE}")
+    if hashlib.sha256(certificate_raw).hexdigest() != plan["verification_certificate_sha256"]:
+        raise PublicationError("publish.git_recovery_certificate")
+    return _SealedGit(
+        outbound_root=Path(outbound_root),
+        candidate=_PublishedCandidate(
+            commit=commit,
+            tree=tree,
+            parents=tuple(parents),
+            subject_sha256=subject,
+        ),
+        plan=plan,
+        plan_sha256=file_digest(plan_path),
+    )
+
+
+def _sealed_publication_text(
+    *, repository: PublicationRepository, request: PublishDomainRequest, sealed: _SealedGit,
+) -> tuple[str, str]:
+    """Derive PR content only when resuming publication after the Git effect is known."""
+
+    commit = sealed.candidate.commit
+    subject = sealed.candidate.subject_sha256
+    plan = sealed.plan
+    certificate_raw = repository.read_blob(commit=commit, path=f"reports/{VERIFY_CERTIFICATE}")
     try:
         certificate = json.loads(certificate_raw)
     except ValueError as error:
@@ -788,19 +864,7 @@ def _read_sealed_git_outbound_root(
     )
     if plan["pr_title_sha256"] != digest({"title": title}) or plan["pr_body_sha256"] != digest({"body": body}):
         raise PublicationError("publish.git_recovery_pr_text")
-    return _SealedGit(
-        outbound_root=Path(outbound_root),
-        candidate=_PublishedCandidate(
-            commit=commit,
-            tree=tree,
-            parents=tuple(parents),
-            subject_sha256=subject,
-        ),
-        plan=plan,
-        plan_sha256=file_digest(plan_path),
-        title=title,
-        body=body,
-    )
+    return title, body
 
 
 def _read_sealed_git_outbound(
@@ -861,9 +925,40 @@ class PublishGitReconciliationAdapter:
             or request.expected_base_oid
         )
         exact = observed_head == sealed.candidate.commit and observed_base == request.expected_base_oid
+        constraint = None
+        commit_authority = None
+        terminal_absent = False
+        if not observed_head:
+            try:
+                repository.validate_candidate_objects(
+                    commit=sealed.candidate.commit, expected_base_oid=request.expected_base_oid,
+                )
+            except PublicationError as error:
+                if error.code != "publish.github_blob_too_large":
+                    raise
+                constraint = error.detail
+                commit_authority = repository.observe_github_commit(
+                    repository_slug=request.repository_slug, commit=sealed.candidate.commit,
+                )
+                if (
+                    commit_authority.get("candidate_commit") != sealed.candidate.commit
+                    or commit_authority.get("repository", {}).get("full_name") != request.repository_slug
+                    or commit_authority.get("resource")
+                    != f"repos/{request.repository_slug}/commits/{sealed.candidate.commit}"
+                ):
+                    raise PublicationError(
+                        "publish.github_commit_observation", {"reason": "sealed-target-binding"},
+                    ) from None
+                if commit_authority["state"] == "absent":
+                    observed_head = repository.observe(request.branch_ref)
+                    repository.fetch_expected(request.base_ref, request.expected_base_oid)
+                    exact = observed_head == sealed.candidate.commit
+                    terminal_absent = not observed_head
         state = "known" if exact else ("absent" if not observed_head else "unobservable")
+        if not exact and commit_authority is not None and commit_authority["state"] == "known":
+            state = "unobservable"
         observation = {
-            "state": "known" if exact else ("absent" if not observed_head else "conflict"),
+            "state": "known" if exact else ("absent" if state == "absent" else "unobservable"),
             "base_oid": observed_base,
             "head_oid": observed_head,
             "candidate_commit": sealed.candidate.commit,
@@ -873,13 +968,18 @@ class PublishGitReconciliationAdapter:
             "publication_plan_sha256": sealed.plan_sha256,
             "recovered": exact,
         }
+        if terminal_absent:
+            observation["absence_basis"] = "github_unacceptable_new_git_blobs_and_commit_absent"
         payload_root = Path(workspace_root) / "publish-evidence"
         payload_root.mkdir()
         write_json(payload_root / "observation.json", observation)
         shutil.copyfile(sealed.outbound_root / PUBLICATION_PLAN, payload_root / PUBLICATION_PLAN)
         shutil.copyfile(sealed.outbound_root / "request.json", payload_root / "request.json")
+        if constraint is not None:
+            write_json(payload_root / "github-blob-constraint.json", constraint)
+            write_json(payload_root / "github-commit-observation.json", commit_authority)
         return EffectReconciliationEvidence(
-            fact_type="reconciled" if exact else "observation",
+            fact_type="reconciled" if exact or terminal_absent else "observation",
             state_class=state,
             payload_root=payload_root,
             metadata={
@@ -963,52 +1063,43 @@ def _git_effect(
             expected_head_oid=request.expected_head_oid,
         )
     except Exception as error:
+        _record_effect_error(
+            effects=effects, effect_id=effect_id, source="publish.git", workspace=workspace,
+            phase="dispatch", operation_error=error,
+        )
         try:
-            observed = repository.observe(request.branch_ref)
+            observation = _observe_git_exact(repository, request, candidate)
         except Exception as observation_error:
-            detail = workspace.root / "effects/git-timeout"
-            detail.mkdir(parents=True, exist_ok=True)
-            write_json(
-                detail / "timeout.json",
-                {
-                    "error": type(error).__name__,
-                    "message": str(error),
-                    "observation_error": type(observation_error).__name__,
-                    "observation_message": str(observation_error),
-                },
+            _record_effect_error(
+                effects=effects, effect_id=effect_id, source="publish.git", workspace=workspace,
+                phase="readback", operation_error=error, observation_error=observation_error,
             )
-            effects.record_timeout(effect_id, source="publish.git", detail_root=detail)
             return StageDeferral(effect_id)
-        if observed == candidate.commit:
-            observation = {
-                "state": "known",
-                "base_oid": request.expected_base_oid,
-                "head_oid": observed,
-                "candidate_commit": candidate.commit,
-                "candidate_tree": candidate.tree,
-                "subject_sha256": candidate.subject_sha256,
-                "publication_plan_sha256": plan_sha256,
-                "response_lost": True,
-            }
-            root = workspace.root / "effects/git-observation"
-            root.mkdir(parents=True)
-            write_json(root / "observation.json", observation)
-            shutil.copyfile(plan_path, root / PUBLICATION_PLAN)
-            effects.record_observation(
-                effect_id,
-                source="publish.git",
-                state_class="known",
-                observation_root=root,
-            )
-            _require_satisfied(effects, key=GIT_EFFECT_KEY, effect_id=effect_id)
-            return effect_id, observation, False
-        detail = workspace.root / "effects/git-timeout"
-        detail.mkdir(parents=True, exist_ok=True)
-        write_json(detail / "timeout.json", {"error": type(error).__name__, "message": str(error)})
-        effects.record_timeout(effect_id, source="publish.git", detail_root=detail)
-        return StageDeferral(effect_id)
+        observation["publication_plan_sha256"] = plan_sha256
+        observation["response_lost"] = True
+        root = workspace.root / "effects/git-observation"
+        root.mkdir(parents=True)
+        write_json(root / "observation.json", observation)
+        shutil.copyfile(plan_path, root / PUBLICATION_PLAN)
+        exact = observation["state"] == "known"
+        effects.record_observation(
+            effect_id, source="publish.git",
+            state_class="known" if exact else ("absent" if not observation["head_oid"] else "unobservable"),
+            observation_root=root,
+        )
+        if not exact:
+            return StageDeferral(effect_id)
+        _require_satisfied(effects, key=GIT_EFFECT_KEY, effect_id=effect_id)
+        return effect_id, observation, False
 
-    observed = _observe_git_exact(repository, request, candidate)
+    try:
+        observed = _observe_git_exact(repository, request, candidate)
+    except Exception as observation_error:
+        _record_effect_error(
+            effects=effects, effect_id=effect_id, source="publish.git", workspace=workspace,
+            phase="readback", observation_error=observation_error,
+        )
+        return StageDeferral(effect_id)
     observed["publication_plan_sha256"] = plan_sha256
     response = workspace.root / "effects/git-response"
     response.mkdir(parents=True)
@@ -1319,7 +1410,14 @@ def _pr_effect(
     if settlement is not None and settlement.state is EffectState.DEFINITELY_FAILED:
         raise StageFailure("publish_pr_effect_failed", "The PR effect is definitively failed")
 
-    existing, _observations = _expected_pr(client, request, candidate)
+    try:
+        existing, _observations = _expected_pr(client, request, candidate)
+    except StageFailure:
+        raise
+    except PublicationError as error:
+        raise _local_publication_failure(error) from None
+    except Exception as error:
+        _unresolved_local_error(error, workspace, operation="publish.pr_observe")
     title_sha256 = digest({"title": title})
     body_sha256 = digest({"body": body})
     if settlement is None:
@@ -1382,6 +1480,10 @@ def _pr_effect(
                 body=body,
             )
     except Exception as error:
+        _record_effect_error(
+            effects=effects, effect_id=effect_id, source="publish.pr", workspace=workspace,
+            phase="dispatch", operation_error=error,
+        )
         try:
             observed = client.observe(
                 repository=request.repository_slug,
@@ -1390,18 +1492,10 @@ def _pr_effect(
                 candidate_commit=candidate.commit,
             )
         except Exception as observation_error:
-            detail = workspace.root / "effects/pr-timeout"
-            detail.mkdir(parents=True, exist_ok=True)
-            write_json(
-                detail / "timeout.json",
-                {
-                    "error": type(error).__name__,
-                    "message": str(error),
-                    "observation_error": type(observation_error).__name__,
-                    "observation_message": str(observation_error),
-                },
+            _record_effect_error(
+                effects=effects, effect_id=effect_id, source="publish.pr", workspace=workspace,
+                phase="readback", operation_error=error, observation_error=observation_error,
             )
-            effects.record_timeout(effect_id, source="publish.pr", detail_root=detail)
             return StageDeferral(effect_id)
         if len(observed) == 1:
             if not _pr_matches(
@@ -1429,10 +1523,6 @@ def _pr_effect(
                 reason="multiple-responses",
             )
         else:
-            detail = workspace.root / "effects/pr-timeout"
-            detail.mkdir(parents=True, exist_ok=True)
-            write_json(detail / "timeout.json", {"error": type(error).__name__, "message": str(error)})
-            effects.record_timeout(effect_id, source="publish.pr", detail_root=detail)
             return StageDeferral(effect_id)
     if not _pr_matches(
         observation,
@@ -1448,12 +1538,19 @@ def _pr_effect(
             observations=(observation,),
             reason="response-mismatch",
         )
-    observed_again = client.observe(
-        repository=request.repository_slug,
-        base_ref=request.base_ref,
-        head_ref=request.branch_ref,
-        candidate_commit=candidate.commit,
-    )
+    try:
+        observed_again = client.observe(
+            repository=request.repository_slug,
+            base_ref=request.base_ref,
+            head_ref=request.branch_ref,
+            candidate_commit=candidate.commit,
+        )
+    except Exception as observation_error:
+        _record_effect_error(
+            effects=effects, effect_id=effect_id, source="publish.pr", workspace=workspace,
+            phase="final-readback", observation_error=observation_error,
+        )
+        return StageDeferral(effect_id)
     if len(observed_again) != 1 or observed_again[0] != observation:
         return _defer_pull_request_observation(
             effects=effects,
@@ -2197,19 +2294,31 @@ class PublishHandler:
         ):
             raise ProtocolError("publish.command", {"command_id": command.command_id})
         request = _request(command, workspace)
+        git_settlement = effects.effect_settlement_for_key(GIT_EFFECT_KEY)
+        pr_settlement = effects.effect_settlement_for_key(PR_EFFECT_KEY)
+        for settlement in (git_settlement, pr_settlement):
+            if settlement is not None and settlement.state is EffectState.UNKNOWN:
+                return StageDeferral(settlement.effect_id)
+            if settlement is not None and settlement.state is EffectState.CONFLICT:
+                raise ProtocolError("publish.effect_conflict", {"effect_id": settlement.effect_id})
         self._verify_inputs(request)
         repository_root = workspace.root / "repository"
         workspace.root.mkdir(parents=True, exist_ok=True)
-        materialize_repository_snapshot(
-            workspace.inputs[request.repository_snapshot.artifact_id],
-            repository_root,
-            expected_repository=request.repository_slug,
-            expected_origin_url=request.origin_url,
-            expected_base_ref=request.base_ref,
-            expected_base_oid=request.expected_base_oid,
-            expected_branch_ref=request.branch_ref,
-            expected_head_oid=request.expected_head_oid,
-        )
+        try:
+            materialize_repository_snapshot(
+                workspace.inputs[request.repository_snapshot.artifact_id],
+                repository_root,
+                expected_repository=request.repository_slug,
+                expected_origin_url=request.origin_url,
+                expected_base_ref=request.base_ref,
+                expected_base_oid=request.expected_base_oid,
+                expected_branch_ref=request.branch_ref,
+                expected_head_oid=request.expected_head_oid,
+            )
+        except PublicationError as error:
+            raise _local_publication_failure(error) from None
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as error:
+            _unresolved_local_error(error, workspace, operation="publish.snapshot")
         pull_requests = (
             self.pull_requests
             if self.pull_requests is not None
@@ -2264,29 +2373,34 @@ class PublishHandler:
             plan_sha256 = sealed.plan_sha256
             publication_subject_sha256 = sealed.candidate.subject_sha256
             verification_certificate_sha256 = sealed.plan["verification_certificate_sha256"]
-            pr_title = sealed.title
-            pr_body = sealed.body
+            pr_title, pr_body = _sealed_publication_text(
+                repository=repository, request=request, sealed=sealed,
+            )
             publisher_tool, actual_executor = _executor_identity(command, claim)
             git_effect_id = git_settlement.effect_id
         elif git_settlement is None or git_settlement.state is EffectState.PREPARED:
-            inputs = self._prepare(
-                command,
-                claim,
-                workspace,
-                request=request,
-                verify_inputs=False,
-            )
+            try:
+                inputs = self._prepare(
+                    command, claim, workspace, request=request, verify_inputs=False,
+                )
+            except PublicationError as error:
+                raise _local_publication_failure(error) from None
             staging = workspace.root / "candidate"
             staging.mkdir()
-            candidate = repository.candidate(
-                publication_root=inputs.publication_root,
-                base_ref=request.base_ref,
-                expected_base_oid=request.expected_base_oid,
-                branch_ref=request.branch_ref,
-                expected_head_oid=request.expected_head_oid,
-                commit_spec=replace(request.commit, body=inputs.pr_body),
-                staging_root=staging,
-            )
+            try:
+                candidate = repository.candidate(
+                    publication_root=inputs.publication_root,
+                    base_ref=request.base_ref,
+                    expected_base_oid=request.expected_base_oid,
+                    branch_ref=request.branch_ref,
+                    expected_head_oid=request.expected_head_oid,
+                    commit_spec=replace(request.commit, body=inputs.pr_body),
+                    staging_root=staging,
+                )
+            except PublicationError as error:
+                raise _local_publication_failure(error) from None
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as error:
+                _unresolved_local_error(error, workspace, operation="publish.git_prepare")
             candidate_facts = _PublishedCandidate(
                 commit=candidate.commit,
                 tree=candidate.tree,
@@ -2339,9 +2453,16 @@ class PublishHandler:
             if isinstance(pr_result, StageDeferral):
                 return pr_result
             pr_effect_id, pr_observation, _ = pr_result
-            if repository.observe(request.branch_ref) != candidate_facts.commit:
-                raise StageFailure("publish_remote_drift", "Published branch changed before stage completion")
-            repository.fetch_expected(request.base_ref, request.expected_base_oid)
+            try:
+                if repository.observe(request.branch_ref) != candidate_facts.commit:
+                    raise StageFailure("publish_remote_drift", "Published branch changed before stage completion")
+                repository.fetch_expected(request.base_ref, request.expected_base_oid)
+            except StageFailure:
+                raise
+            except PublicationError as error:
+                raise _local_publication_failure(error) from None
+            except Exception as error:
+                _unresolved_local_error(error, workspace, operation="publish.final_readback")
             receipt = {
                 "schema_version": PUBLISH_RECEIPT_SCHEMA,
                 "command_id": command.command_id,

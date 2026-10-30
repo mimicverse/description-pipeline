@@ -129,7 +129,7 @@ class _CompletingHandler:
                 "actual_verifier": verifier,
                 "actual_verifier_sha256": verifier_sha256,
                 "capture_artifact": capture.to_record(),
-                "checks": [{"id": "fixture", "state": "passed", "passed": True}],
+                "checks": [{"id": "fixture", "state": "passed", "passed": True, "details": {}}],
                 "closure_sha256": digest(
                     {
                         "capture_artifact": capture.to_record(),

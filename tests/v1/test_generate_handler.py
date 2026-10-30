@@ -132,7 +132,7 @@ class GenerateHandlerTests(unittest.TestCase):
         target.mkdir()
         source = self.store.materialize(self.capture_ref, target / "capture")
         evidence = source / "evidence"
-        native_facts_path = evidence / "raw/native_capture_facts.json"
+        native_facts_path = evidence / "raw/native_capture_facts.json.gz"
         native_facts = read_data(native_facts_path)
         if all_false:
             geometry = dict(native_facts["geometry_raw"])

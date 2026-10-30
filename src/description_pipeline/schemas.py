@@ -16,6 +16,7 @@ LINK_GROUP_MASS_SCHEMA = "solidworks-to-urdf.link-group-mass-properties/v1"
 NATIVE_TESSELLATION_SCHEMA = "native-triangles/v1"
 NATIVE_TRIANGLE_STREAM_VERSION = 1
 NATIVE_TRIANGLE_STREAM_MAGIC = b"SWTESS64        "
+NATIVE_CAPTURE_FACTS = "raw/native_capture_facts.json.gz"
 NATIVE_CAPTURE_FACTS_KEYS = frozenset(
     {
         "scene_raw",
@@ -51,7 +52,7 @@ NATIVE_CAPTURE_OBSERVATION_KEYS = frozenset(
 )
 CAPTURE_EVIDENCE_REQUESTS = (
     "evidence/native-runtime.json",
-    "evidence/raw/native_capture_facts.json",
+    f"evidence/{NATIVE_CAPTURE_FACTS}",
     "evidence/raw/dependency_closure.json",
     "evidence/raw/triangles/",
 )

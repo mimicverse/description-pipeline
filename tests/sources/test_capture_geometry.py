@@ -192,7 +192,7 @@ class CaptureGeometryTests(unittest.TestCase):
             NATIVE_CAPTURE_OBSERVATION_SCHEMA,
         )
         write_json(
-            evidence_root / "raw/native_capture_facts.json",
+            evidence_root / "raw/native_capture_facts.json.gz",
             observation,
         )
 
@@ -500,7 +500,7 @@ class CaptureGeometryTests(unittest.TestCase):
                 malformed = copy.deepcopy(observation)
                 malformed["scene_raw"][field] = {}
                 write_json(
-                    evidence_root / "raw/native_capture_facts.json",
+                    evidence_root / "raw/native_capture_facts.json.gz",
                     malformed,
                 )
                 with self.assertRaisesRegex(

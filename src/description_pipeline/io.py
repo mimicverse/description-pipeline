@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import math
 import ntpath
 import os
+import re
+import subprocess
 import sys
 import tempfile
+import zlib
+from collections.abc import Mapping
 from pathlib import Path, PureWindowsPath
 from typing import Any
 
@@ -18,6 +23,92 @@ class PipelineError(ValueError):
 
     #: Set when the failure preserved diagnostics the operator should inspect.
     diagnostic_path: str | None = None
+
+
+_ERROR_OUTPUT_BYTES = 128 * 1024
+
+
+def _redact_process_text(value: str) -> str:
+    for key, secret in os.environ.items():
+        if secret and any(word in key.upper() for word in ("TOKEN", "PASSWORD", "SECRET", "AUTHORIZATION")):
+            value = value.replace(secret, "[REDACTED]")
+    value = re.sub(r"(?i)\b([a-z][a-z0-9+.-]{0,20}://)[^/\s@]+@", r"\1[REDACTED]@", value)
+    value = re.sub(r"(?i)\b(?:gh[pousr]_[a-z0-9_]+|github_pat_[a-z0-9_]+)\b", "[REDACTED]", value)
+    value = re.sub(r"(?im)(authorization\s*[:=]\s*)[^\r\n]+", r"\1[REDACTED]", value)
+    value = re.sub(
+        r"(?i)((?:token|password|passwd|secret|credential)[\"']?\s*[:=]\s*)"
+        r"(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)",
+        r"\1[REDACTED]",
+        value,
+    )
+    return value
+
+
+def safe_process_output(value: bytes | str | None) -> dict[str, Any]:
+    raw = value if isinstance(value, bytes) else (value or "").encode("utf-8", errors="replace")
+    safe = _redact_process_text(raw.decode("utf-8", errors="replace")).encode("utf-8")
+    truncated = len(safe) > _ERROR_OUTPUT_BYTES
+    if truncated:
+        half = _ERROR_OUTPUT_BYTES // 2
+        safe = safe[:half] + b"\n[OUTPUT TRUNCATED]\n" + safe[-half:]
+    return {
+        "text": safe.decode("utf-8", errors="replace"),
+        "original_bytes": len(raw),
+        "encoding": "utf-8-replace",
+        "truncated": truncated,
+    }
+
+
+def _safe_error_detail(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): "[REDACTED]" if any(word in str(key).upper() for word in ("TOKEN", "PASSWORD", "SECRET"))
+            else _safe_error_detail(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (tuple, list)):
+        return [_safe_error_detail(item) for item in value]
+    if isinstance(value, str):
+        return safe_process_output(value)["text"]
+    if value is None or isinstance(value, (int, float, bool)):
+        return value
+    return safe_process_output(str(value))["text"]
+
+
+def process_error_record(error: BaseException, *, operation: str) -> dict[str, Any]:
+    """Retain safe original process evidence without serializing argv, stdin, or environment."""
+
+    def record(item: BaseException) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "error_type": type(item).__name__,
+            "error_module": type(item).__module__,
+        }
+        if isinstance(item, subprocess.CalledProcessError):
+            message = f"External command exited with status {item.returncode}"
+            result.update(returncode=item.returncode, timeout_seconds=None, timed_out=False)
+        elif isinstance(item, subprocess.TimeoutExpired):
+            message = "External command timed out"
+            result.update(returncode=None, timeout_seconds=item.timeout, timed_out=True)
+        else:
+            message = str(item)
+        result["message"] = safe_process_output(message)["text"]
+        if isinstance(item, (subprocess.CalledProcessError, subprocess.TimeoutExpired)):
+            result["stdout"] = safe_process_output(item.stdout)
+            result["stderr"] = safe_process_output(item.stderr)
+        if isinstance(item, PipelineError):
+            for field in ("code", "detail"):
+                if hasattr(item, field):
+                    result[field] = _safe_error_detail(getattr(item, field))
+        return result
+
+    causes = []
+    seen = {id(error)}
+    cause = error.__cause__ or error.__context__
+    while cause is not None and id(cause) not in seen and len(causes) < 8:
+        seen.add(id(cause))
+        causes.append(record(cause))
+        cause = cause.__cause__ or cause.__context__
+    return {"operation": operation, **record(error), "causes": causes}
 
 
 def _lock_contention(error: OSError) -> bool:
@@ -263,6 +354,8 @@ def _parse_float(text: str) -> float:
 def parse_data(content: bytes, path: Path) -> Any:
     """Parse one captured byte sequence, retaining its filename for diagnostics."""
     try:
+        if path.name.endswith(".json.gz"):
+            content = gzip.decompress(content)
         # Windows PowerShell 5.1 writes a BOM for Set-Content -Encoding UTF8.
         text = content.decode("utf-8-sig")
         if path.suffix in {".yaml", ".yml"}:
@@ -273,7 +366,10 @@ def parse_data(content: bytes, path: Path) -> Any:
             parse_constant=_parse_constant,
             parse_float=_parse_float,
         )
-    except (PipelineError, json.JSONDecodeError, UnicodeDecodeError) as error:
+    except (
+        PipelineError, json.JSONDecodeError, UnicodeDecodeError,
+        gzip.BadGzipFile, EOFError, zlib.error,
+    ) as error:
         raise PipelineError(f"Invalid input {path}: {error}") from error
 
 
@@ -288,7 +384,15 @@ def write_json(path: Path, data: Any) -> None:
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(fd, "wb") as stream:
-            stream.write(canonical(data))
+            payload = canonical(data)
+            if path.name.endswith(".json.gz"):
+                with gzip.GzipFile(
+                    filename="", mode="wb", fileobj=stream,
+                    compresslevel=6, mtime=0,
+                ) as compressed:
+                    compressed.write(payload)
+            else:
+                stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)

@@ -1,4 +1,4 @@
-// Source warnings remain visible for verified previews and retain every object row.
+// Source warning summaries remain visible with their complete-certificate download.
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
@@ -7,14 +7,19 @@ const logicSource = readFileSync(new URL("preview_logic.js", staticDir), "utf8")
 const logic = await import(
   `data:text/javascript;base64,${Buffer.from(logicSource, "utf8").toString("base64")}`
 );
-const { previewDiagnosticState, registeredVerificationArtifact, warningSourceRows } = logic;
+const { previewDiagnosticState, registeredVerificationArtifact } = logic;
 const app = readFileSync(new URL("app.js", staticDir), "utf8");
 
 const warning = {
   code: "limits.default_policy",
   message: "Engineering position range remains unqualified.",
-  detail: {
-    objects: [
+  warning_summary: true,
+  records_total: 1,
+  records_omitted: 0,
+  source_rows_total: 2,
+  source_rows_omitted: 0,
+  record_location: { stage: "verify", record: "reports/verification-certificate.json" },
+  objects: [
       {
         object_type: "joint",
         object: "joint:left",
@@ -45,48 +50,14 @@ const warning = {
         hardware_qualified: false,
         engineering_position_range_qualified: false,
       },
-    ],
-  },
+  ],
 };
 
 assert.equal(previewDiagnosticState({ verified: true, warnings: [] }).visible, false);
 const state = previewDiagnosticState({ verified: true, warnings: [warning], warnings_total: 1 });
 assert.equal(state.visible, true);
 assert.equal(state.unverified, false);
-const rows = warningSourceRows(warning);
-assert.deepEqual(rows.map((row) => [row.object, row.fields]), [
-  ["joint:left", ["limits"]],
-  ["joint:right", ["limits"]],
-]);
-for (const row of rows) {
-  assert.equal(row.rule_id, "engineering_rotation_default_window/v1");
-  assert.equal(row.rule_version, "v1");
-}
-for (const row of rows) {
-  assert.equal(row.extra.native_cad_ranges, false);
-  assert.equal(row.extra.hardware_qualified, false);
-  assert.equal(row.extra.engineering_position_range_qualified, false);
-}
-const saved = warningSourceRows({
-  code: "source.saved_state_incomplete",
-  detail: {
-    missing_references: { items: [{ path: "missing.SLDPRT" }] },
-    actual_scope: { occurrence_count: 7 },
-    source_integrity_proven: false,
-  },
-});
-assert.equal(saved.length, 1);
-assert.deepEqual(saved[0].extra.missing_references.items, [{ path: "missing.SLDPRT" }]);
-assert.equal(saved[0].extra.actual_scope.occurrence_count, 7);
-assert.equal(saved[0].extra.source_integrity_proven, false);
-assert.deepEqual(rows[0].native_observation_errors, [
-  { mate: "native_limit", reason: "unreadable" },
-]);
-assert.equal(rows[0].file, "records/record.json");
-assert.equal(rows[0].sha256, "b".repeat(64));
-assert.equal(rows[0].anchor, '"limits"');
-assert.equal(rows[0].key, "limits");
-assert.equal(rows[0].reference, "joints/left.json#limits");
+assert.equal(state.warnings[0], warning);
 assert.deepEqual(
   registeredVerificationArtifact(
     { report_files: { "verification-certificate.json": "a".repeat(64) } },
@@ -145,7 +116,6 @@ for (const token of [
 ]) {
   assert.ok(renderer.includes(token), token);
 }
-assert.ok(app.includes("native_observation_errors"));
 assert.equal(renderer.includes("innerHTML"), false);
 assert.equal(renderer.includes("insertAdjacentHTML"), false);
 console.log("preview_source_warnings_test OK");

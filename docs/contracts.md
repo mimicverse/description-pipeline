@@ -659,8 +659,9 @@ Generate 在 Linux 对同一 raw 执行一次语义投影、惯量规范化与 S
 
 冻结原件只保留在 `input/cad/`；source scope 的逻辑引用绑定这份原件及其摘要，不另封存 `evidence/source/` 副本。virtual 文档保持独立会话、所属装配和原生对象依据，不用 owner 文件冒充。
 
-原生事实只在 `evidence/raw/native_capture_facts.json` 封存一份，由 source manifest 和
+原生事实只在 `evidence/raw/native_capture_facts.json.gz` 封存一份，由 source manifest 和
 Capture artifact 绑定其字节；不保存 `evidence/capture.json` 或其他等价投影副本。
+该成员使用标准 gzip 无损封装规范 JSON；压缩等级固定为 6，头部时间为 0，不保存文件名，保证同一规范字节的确定性。CAD 释放后由既有序列化边界写入，archive、快照、Generate 与独立 Verify 消费同一格式，校验压缩成员摘要后再解码；不保存或回退到未压缩原生事实副本，不改变工程值或三角流。
 原始三角形的 binary64 流是保真数值编码，不冒称 COM SAFEARRAY 的内存原字节。
 Generate 与独立 Verify 读取同一原始成员，各自执行匹配、派生与
 复算；原始事实缺失、被改写或与投影冲突时，按既有工程和完整性规则拒绝。
@@ -843,7 +844,9 @@ certificate 绑定 Generate/Capture pair、verifier、contract、policy 与 subj
 execution receipt 绑定该 certificate，仅以 `execution_details` 保全 `check.details` 直接层的原始进程输出与退出信息，不重复保存检查和 warning 全表。该分离不递归改写 warning、diagnostic 或资格中的来源扩展；完整记录按规范字节去重，证书拒绝重复的顶层 diagnostics。检查、warning 与资格的唯一交付依据为 certificate；URDF、PR 和浏览器引用实际登记的证书路径，展示保留对象、字段、来源、规则及未建立资格的原值。PR 摘要达到长度上限时明确给出未展开数量与完整证书位置，不生成另一份 quality 或 structural-team 报告。Publish receipt 再绑定 publication subject、
 publication plan、候选 commit/tree 与 Git/PR effect。
 
-证书的顶层 `diagnostics` 是完整诊断清单：Verify 从顶层及每项检查的 `details.warnings`、`details.diagnostics` 汇总完整记录并按规范字节去重。每条须有非空 code 和明确布尔 blocking；PASS 不得携带阻断诊断。消费边界核对嵌套记录没有遗漏于顶层清单，报告、预览与 PR 只按显式非阻断语义展示 warning，不把未知状态改为 false。运行详情只使用登记证书及 publication receipt，不从旧阶段回执补回检查成功或 PR 身份。
+证书的顶层 `diagnostics` 是唯一完整诊断库存：Verify 从独立报告及检查明细汇总原记录，按规范字节去重；封装后每项检查仅以 `details.warning_indices`、`details.diagnostic_indices` 的严格整数索引保留分类和归属，不再次序列化完整记录。共享读取边界拒绝布尔、负数、越界、重复索引及旧嵌套记录，核验全部引用和原生 scope 完整性；每条记录须有非空 code 和明确布尔 blocking，PASS 不得携带阻断诊断。来源记录的真实 detail 与全部对象保留，停止人为合成第二份 `detail.objects` 副本。报告、预览和 PR 复用同一库存，Verify 的诊断只用于 Verify 阶段，不能套用到 Freeze 等其他阶段，也不能把未知状态改为 false。运行详情只使用登记证书及 publication receipt，不从旧阶段回执补回检查成功或 PR 身份。
+
+GUI 状态与预览只派生有界展示：每个 code/message 类别均可见，记录总数与来源行总数准确，每类最多展开八个来源示例，分别明确未展开记录和来源行数。完整 warning 校验、分类及数值摘要先于展示截短；检查详情或复杂来源值的节选明确标记省略量，并定位真实所属阶段记录，Verify 使用完整证书。Discover findings 的原始身份、阻断状态和计数保留，大 detail 采用同一展示节选。完整证据不因页面摘要被删改；不新增摘要 API、缓存或业务状态，也不把展示节选重新用于资格判定。
 
 运行投影、活动、维护 reconciliation metadata 和 PR effect observation 保存在
 平台 facts/CAS 中，引用交付摘要，不进入模型主体。所有阶段的失败诊断由该阶段生产、
@@ -880,6 +883,8 @@ closure，执行验证并提交正式决定、verification certificate 与 execu
 
 发布在独立干净工作区执行，核验仓库身份及配置目标，完整重验交付；复制后再次重验。Git 属性必须保持交付字节，实际 staged 和 committed blobs 必须等于验证有效载荷。远端候选 head 更新同时要求已确认前置提交的条件写入与 fast-forward，禁止非 fast-forward 写入或覆盖人工提交。base 在写前和最终确认时重检；base 变化时，即使候选 commit 已推送也不能报告发布成功，须保留已发生结果并对账。仓库检出 refspec 不影响按明确远端 ref 获取基线。
 
+候选在创建 bundle、effect 或 dispatch 前，按固定 base 枚举真实新增可达 Git 对象并核其类型与解包大小；超过 GitHub 单 blob `100 MiB` 限制的普通 Git 对象明确拒绝，保存对象、路径、字节和约束来源。不能用 bundle 压缩大小替代该门。没有未决外部 effect 的快照物化、发布准备及候选构建若明确抛出 `PublicationError`，由可信 handler 通过既有 `StageFailure` 原子登记本地失败并关闭 claim；协议、身份和未知运行故障不能据此伪造业务结果。
+
 Publish 使用两个独立 effect：`publish.branch / git_ref_update` 与
 `publish.pull-request / pr_upsert`。每个 effect 在调用前封存完整 outbound、
 target、expected state 与 expected digest，取得当前 command/claim/fence 的 dispatch
@@ -893,6 +898,10 @@ base、commit、verified subject、certificate、title 与 body。全部确认�
 effect intent/outbound 和只读 Git/PR observer 完成，不重建 publication、不重新
 push、不重复 create/update。candidate bundle 与 publication plan 是原恢复证据，
 不得作为垃圾删除，也不得替换为从当前 scratch 重新生成的文件。
+
+外部调用和后续确认的错误分别保留安全诊断：异常与原因链、实际退出码、超时状态及可得 stdout/stderr；脱敏、编码替换和长度截断均明确标记，不保存 argv、stdin 或环境秘密。即使确认远端成功，也保留此前响应丢失的原错。普通缺席观察不证明已发送操作终止；只有同一密封候选的新增 blob 确实违反 GitHub 约束、同一认证仓库的精确 commit 查询确认缺席，且前后 base/ref 精确稳定时，正式 observer 才能记录确定未成功的 `reconciled/absent`。普通 404、认证或权限不足、限流、超时、解析失败、对象出现或基线漂移均不能按缺席终结。该规则复用原 command/effect/outbound 和既有事实，不重推、不改原候选，不设临时适配器。
+
+Git 对账只读取密封 request、plan、bundle 及候选 commit/tree/parent/subject，证书在此仅按候选内原始 blob 的真实摘要核身份，不重新派生 PR 文案。只有 Git 已确认成功、需要继续 PR 内容时，才解析当前证书契约并重算、核对原 PR 标题与正文摘要。两个职责共用原密封事实，不加入旧证书格式回退或为取消旧请求重建候选。
 
 已合并 PR 的后续交付从确认包含该候选的当前 base 建立新基线，沿受管理分支 fast-forward 并创建下一评审 PR。已关闭且未合并的候选禁止自动重新开启，由目标负责人处理撤回原因。
 

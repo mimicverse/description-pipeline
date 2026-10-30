@@ -105,7 +105,7 @@ StagePending -> EffectPollTrigger -> StageTaskOperator.execute_complete
 
 Discover result 表达原生选择、prepared 输入和证据绑定，不作为第二个完整机器人模型。Generate 持久化一个 `EngineeringModel`，URDF 是其交付编码。Verify 独立读取原始证据和实际输出，不借用生成器的期望值、成功标志或缓存。共享代码限于纯数学、格式解析和无领域推导的契约基础，并用解析解、已知答案和变异反例验证。发布重验完整 certificate、execution receipt 及被验证字节。
 
-Capture 在一次原生采集中保留已保存配置、几何、轴线、配合、物性和外观事实，不执行 CAD 重建，不保留重建图、恢复日志或强制清零资格。manifest 绑定的 raw 成员是唯一封存来源，不另存 capture 投影、重复环境或计划副本。外观复用同一几何遍历的对象与 face triangle spans；对象引用必须在已证明的同一文档与 occurrence 上下文中解释。Generate 在 Linux 完成坐标转换、惯量规范化、STL 物化、面材质分组和 URDF 生成。Verify 从原始事实与交付字节独立复算，不调用生成器投影作为答案。详细外观规则见[原生外观读数与交付](contracts.md#原生外观读数与交付)。
+Capture 在一次原生采集中保留已保存配置、几何、轴线、配合、物性和外观事实，不执行 CAD 重建，不保留重建图、恢复日志或强制清零资格。manifest 绑定的 raw 成员是唯一封存来源，原生事实使用确定性的标准 gzip JSON，无未压缩副本或旧格式回退，不另存 capture 投影、重复环境或计划副本。外观复用同一几何遍历的对象与 face triangle spans；对象引用必须在已证明的同一文档与 occurrence 上下文中解释。Generate 在 Linux 完成坐标转换、惯量规范化、STL 物化、面材质分组和 URDF 生成。Verify 从原始事实与交付字节独立复算，不调用生成器投影作为答案。详细外观规则见[原生外观读数与交付](contracts.md#原生外观读数与交付)。
 
 Windows 的既有 `native_operation_event` 经同一 operation view 与 poll 形成 `run_display_metadata.activity`，Portal 展示当前活动、时间与历史。原生 sequence 与事件时间用于识别重复观察；activity 是显示数据，不建立第二套阶段状态、成功资格或 CAD 控制权，不增加独立轮询链。
 

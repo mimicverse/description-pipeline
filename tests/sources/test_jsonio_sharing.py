@@ -6,6 +6,7 @@ makes both the replace and a concurrent ``open`` fail with a transient sharing v
 operations retry briefly; these tests pin that policy without needing a Windows host.
 """
 
+import gzip
 import json
 import os
 import unittest
@@ -81,6 +82,48 @@ class AtomicJsonSharingTests(unittest.TestCase):
                 self.assertRaises(PermissionError),
             ):
                 jsonio.read_json(path)
+
+
+class CompressedJsonTests(unittest.TestCase):
+    def test_canonical_gzip_roundtrip_is_independent_of_filename_and_time(self):
+        payload = {
+            "component": "\u90e8\u4ef6-1",
+            "values": [0, -0.0, 1.25, 1e-150],
+            "nested": {"enabled": True, "missing": None},
+        }
+        with TemporaryDirectory() as temporary:
+            first = Path(temporary) / "first.json.gz"
+            second = Path(temporary) / "second.json.gz"
+            with mock.patch("time.time", return_value=1):
+                io_module.write_json(first, payload)
+            with mock.patch("time.time", return_value=2):
+                io_module.write_json(second, payload)
+            compressed = first.read_bytes()
+            self.assertEqual(compressed, second.read_bytes())
+            self.assertEqual(gzip.decompress(compressed), io_module.canonical(payload))
+            self.assertEqual(io_module.read_data(first), payload)
+            self.assertEqual(io_module.parse_data(compressed, second), payload)
+            self.assertEqual(sorted(entry.name for entry in first.parent.iterdir()),
+                             ["first.json.gz", "second.json.gz"])
+
+    def test_corrupt_or_truncated_gzip_is_refused(self):
+        compressed = gzip.compress(b'{"value": 1}\n', mtime=0)
+        corrupt_crc = compressed[:-8] + bytes([compressed[-8] ^ 1]) + compressed[-7:]
+        for payload in (b"not gzip", compressed[:-1], corrupt_crc):
+            with self.subTest(payload=payload), self.assertRaises(PipelineError):
+                io_module.parse_data(payload, Path("record.json.gz"))
+
+    def test_gzip_suffix_requires_compressed_json(self):
+        with self.assertRaises(PipelineError):
+            io_module.parse_data(b'{"value": 1}\n', Path("record.json.gz"))
+        with self.assertRaises(PipelineError):
+            io_module.parse_data(gzip.compress(b'{"value": 1}\n'), Path("record.json"))
+
+    def test_compressed_json_preserves_strict_number_and_key_validation(self):
+        for payload in ('{"a": 1, "a": 2}', '{"a": NaN}', '{"a": Infinity}',
+                        '{"a": -Infinity}', '{"a": 1e999}'):
+            with self.subTest(payload=payload), self.assertRaises(PipelineError):
+                io_module.parse_data(gzip.compress(payload.encode("utf-8")), Path("record.json.gz"))
 
 
 if __name__ == "__main__":

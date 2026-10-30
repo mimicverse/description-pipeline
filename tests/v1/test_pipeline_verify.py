@@ -1939,7 +1939,7 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
         source = self.root / "native-all-false-capture"
         shutil.copytree(self.capture_root, source)
         evidence = source / "evidence"
-        facts_path = evidence / "raw/native_capture_facts.json"
+        facts_path = evidence / "raw/native_capture_facts.json.gz"
         facts = read_data(facts_path)
         geometry = facts["geometry_raw"]
         for occurrence in facts["scene_raw"]["occurrences"]:
@@ -2162,6 +2162,9 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
         self.assertEqual(first_certificate["actual_verifier"], hermetic._portable_tool())
         self.assertEqual(first[3]["actual_verifier"], hermetic._portable_tool())
         self.assertEqual(first[3]["actual_verifier_sha256"], first[6].executor_sha256)
+        object_diagnostics = [row for row in first_certificate["diagnostics"] if row.get("objects")]
+        self.assertTrue(object_diagnostics)
+        self.assertFalse(any(row.get("detail") == {"objects": row["objects"]} for row in object_diagnostics))
         self.assertEqual(first_certificate, second_certificate)
         self.assertEqual(first[4], second[4])
         self.assertNotEqual(first_receipt["execution_id"], second_receipt["execution_id"])
@@ -2306,7 +2309,9 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
     def test_nested_check_observation_reaches_certificate_preview_and_publication(self) -> None:
         from description_pipeline.orchestration.portal import _quality_warnings
         from description_pipeline.pipeline.stages.publish import _publication_warning_text
-        from description_pipeline.pipeline.verify_contract import validate_certificate_diagnostics
+        from description_pipeline.pipeline.verify_contract import (
+            certificate_check_details, validate_certificate_diagnostics,
+        )
 
         observation = {
             "code": "cad.instance_observation", "blocking": False, "component": "arm-1",
@@ -2332,7 +2337,7 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
         displayed = [row for row in _quality_warnings(certificate) if row["code"] == observation["code"]]
         self.assertEqual(len(displayed), len(recorded))
         for extension in extensions:
-            self.assertIn(extension, certificate["checks"][0]["details"]["warnings"])
+            self.assertIn(extension, certificate_check_details(certificate, certificate["checks"][0])["warnings"])
         body = _publication_warning_text(certificate)
         self.assertIn(f"Verification warnings ({len(certificate['diagnostics'])} recorded)", body)
         if observation["code"] not in body:
@@ -2343,10 +2348,10 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
         with self.assertRaisesRegex(PipelineError, "duplicate"):
             validate_certificate_diagnostics(duplicate)
         certificate["diagnostics"].remove(observation)
-        with self.assertRaisesRegex(PipelineError, "omit"):
+        with self.assertRaisesRegex(PipelineError, "indices"):
             validate_certificate_diagnostics(certificate)
         for flag in (True, None, "false"):
-            certificate["checks"][0]["details"]["warnings"][0]["blocking"] = flag
+            certificate["diagnostics"][certificate["checks"][0]["details"]["warning_indices"][0]]["blocking"] = flag
             with self.assertRaisesRegex(PipelineError, "diagnostic"):
                 validate_certificate_diagnostics(certificate)
 

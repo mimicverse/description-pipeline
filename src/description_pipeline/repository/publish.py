@@ -17,7 +17,7 @@ from urllib.parse import unquote, urlsplit
 
 from ..artifacts.store import path_has_link_ancestor
 from ..delivery import subject_digest
-from ..io import PipelineError, digest, inventory, read_data, write_json
+from ..io import PipelineError, digest, inventory, read_data, safe_process_output, write_json
 from ..schemas import REPOSITORY_SNAPSHOT_SCHEMA
 from .review_branch import is_review_branch
 
@@ -47,6 +47,11 @@ _SCP_REMOTE = re.compile(r"\A(?:[^/@:]+@)?([^/:]+):(.+)\Z")
 REPOSITORY_SNAPSHOT_FILE = "repository.bundle"
 REPOSITORY_SNAPSHOT_METADATA = "snapshot.json"
 PROTECTED_PUBLICATION_BRANCHES = frozenset({"main", "refs/heads/main"})
+GITHUB_MAX_BLOB_BYTES = 100 * 1024**2
+GITHUB_LARGE_FILE_DOCUMENTATION = (
+    "https://docs.github.com/en/repositories/working-with-files/"
+    "managing-large-files/about-large-files-on-github"
+)
 
 
 class PublicationError(PipelineError):
@@ -54,6 +59,7 @@ class PublicationError(PipelineError):
         super().__init__(code)
         self.code = code
         self.detail = detail
+
 
 
 def validate_publication_target(*, base_ref: str, branch_ref: str) -> None:
@@ -756,6 +762,77 @@ class PublicationRepository:
             raise PublicationError("publish.remote_oid", {"value": oid})
         return oid
 
+    def observe_github_commit(self, *, repository_slug: str, commit: str) -> dict[str, Any]:
+        """Observe one commit through the authenticated, exact GitHub repository authority."""
+
+        validate_git_remote(self.path, repository_slug)
+        if _OID.fullmatch(commit) is None:
+            raise PublicationError("publish.candidate_commit", {"value": commit})
+
+        def query(resource: str) -> tuple[int, dict[str, Any], dict[str, Any]]:
+            result = subprocess.run(
+                ["gh", "api", "--hostname", "github.com", "--include", resource],
+                cwd=self.path,
+                env={**os.environ, "GH_HOST": "github.com"},
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            process = {
+                "returncode": result.returncode,
+                "stdout": safe_process_output(result.stdout), "stderr": safe_process_output(result.stderr),
+            }
+            header, separator, payload = result.stdout.replace(b"\r\n", b"\n").partition(b"\n\n")
+            first = header.splitlines()[0] if header else b""
+            match = re.fullmatch(rb"HTTP/[12](?:\.\d+)? (\d{3})(?: .*)?", first)
+            try:
+                value = json.loads(payload)
+            except (ValueError, UnicodeDecodeError):
+                value = None
+            if not separator or match is None or not isinstance(value, dict):
+                raise PublicationError(
+                    "publish.github_commit_observation", {"reason": "response-shape", "process": process},
+                )
+            status = int(match[1])
+            if result.returncode != (0 if status == 200 else 1):
+                raise PublicationError(
+                    "publish.github_commit_observation", {"reason": "response-status", "process": process},
+                )
+            return status, value, process
+
+        def repository_identity() -> dict[str, Any]:
+            status, value, process = query(f"repos/{repository_slug}")
+            if (
+                status != 200 or value.get("full_name") != repository_slug
+                or type(value.get("id")) is not int or value["id"] <= 0
+                or value.get("permissions", {}).get("pull") is not True
+            ):
+                raise PublicationError(
+                    "publish.github_commit_observation", {"reason": "repository-authority", "process": process},
+                )
+            return {"id": value["id"], "full_name": value["full_name"], "pull": True}
+
+        before = repository_identity()
+        resource = f"repos/{repository_slug}/commits/{commit}"
+        status, value, process = query(resource)
+        if status == 200 and value.get("sha") == commit:
+            state = "known"
+        elif status == 422 and value.get("message") == f"No commit found for SHA: {commit}":
+            state = "absent"
+        else:
+            raise PublicationError(
+                "publish.github_commit_observation",
+                {"reason": "commit-authority", "status": status, "process": process},
+            )
+        after = repository_identity()
+        if before != after:
+            raise PublicationError("publish.github_commit_observation", {"reason": "repository-changed"})
+        return {
+            "state": state, "repository": before, "resource": resource,
+            "candidate_commit": commit, "http_status": status,
+            "response": {"sha": value["sha"]} if state == "known" else {"message": value["message"]},
+        }
+
     def verify_candidate_bundle(
         self,
         bundle: Path,
@@ -794,6 +871,66 @@ class PublicationRepository:
         """Read exact file bytes from an already verified candidate commit."""
 
         return _run(self.path, "cat-file", "blob", f"{commit}:{path}").stdout
+
+    def validate_candidate_objects(self, *, commit: str, expected_base_oid: str) -> None:
+        """Reject oversized ordinary Git blobs in the exact candidate upload closure."""
+
+        if _OID.fullmatch(commit) is None or _OID.fullmatch(expected_base_oid) is None:
+            raise PublicationError("publish.git_object_inventory", {"reason": "commit-identity"})
+        objects = _text_run(
+            self.path, "rev-list", "--objects", "--no-object-names", commit, "--not", expected_base_oid,
+        ).splitlines()
+        if not objects or len(set(objects)) != len(objects) or any(_OID.fullmatch(oid) is None for oid in objects):
+            raise PublicationError("publish.git_object_inventory", {"reason": "object-identities"})
+        result = subprocess.run(
+            ["git", "-C", str(self.path), "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"],
+            input=("\n".join(objects) + "\n").encode("ascii"),
+            check=True,
+            capture_output=True,
+        )
+        rows = result.stdout.decode("ascii").splitlines()
+        if len(rows) != len(objects):
+            raise PublicationError("publish.git_object_inventory", {"reason": "object-count"})
+        oversized: dict[str, dict[str, Any]] = {}
+        for expected_oid, row in zip(objects, rows, strict=True):
+            fields = row.split()
+            if (
+                len(fields) != 3 or fields[0] != expected_oid
+                or fields[1] not in {"blob", "tree", "commit", "tag"} or not fields[2].isdigit()
+            ):
+                raise PublicationError("publish.git_object_inventory", {"reason": "object-facts", "oid": expected_oid})
+            size = int(fields[2])
+            if fields[1] == "blob" and size > GITHUB_MAX_BLOB_BYTES:
+                oversized[expected_oid] = {"object_id": expected_oid, "bytes": size, "paths": []}
+        if not oversized:
+            return
+        commits = _text_run(self.path, "rev-list", commit, "--not", expected_base_oid).splitlines()
+        for reachable_commit in commits:
+            for entry in _run(self.path, "ls-tree", "-r", "-z", "--full-tree", reachable_commit).stdout.split(b"\0"):
+                if not entry:
+                    continue
+                metadata, separator, path = entry.partition(b"\t")
+                fields = metadata.split()
+                if not separator or len(fields) != 3:
+                    raise PublicationError("publish.git_object_inventory", {"reason": "tree-entry"})
+                oid = fields[2].decode("ascii")
+                if oid in oversized:
+                    location = {"commit": reachable_commit, "path": path.decode("utf-8", errors="replace")}
+                    if location not in oversized[oid]["paths"]:
+                        oversized[oid]["paths"].append(location)
+            if all(item["paths"] for item in oversized.values()):
+                break
+        raise PublicationError(
+            "publish.github_blob_too_large",
+            {
+                "provider": "github.com",
+                "limit_bytes": GITHUB_MAX_BLOB_BYTES,
+                "limit_source": GITHUB_LARGE_FILE_DOCUMENTATION,
+                "candidate_commit": commit,
+                "expected_base_oid": expected_base_oid,
+                "objects": [oversized[oid] for oid in sorted(oversized)],
+            },
+        )
 
     def candidate(
         self,
@@ -858,6 +995,7 @@ class PublicationRepository:
                     raise PublicationError("publish.ungoverned_change", {"path": path})
             subject_sha256 = self._verify_commit_tree(publication_root, worktree, commit)
             self._verify_attributes(worktree, publication_root)
+            self.validate_candidate_objects(commit=commit, expected_base_oid=expected_base_oid)
             bundle = staging_root / "candidate.bundle"
             _run(worktree, "bundle", "create", str(bundle), "HEAD", "--not", expected_base_oid)
             return PreparedCandidate(

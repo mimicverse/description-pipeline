@@ -216,7 +216,8 @@ class DiagnosticPreviewTests(unittest.TestCase):
         self.assertEqual(preview["warnings"][0]["source"], "verification")
         self.assertEqual(preview["warnings"][0]["code"], "limits.preview_policy")
         self.assertEqual(preview["warnings"][0]["object"], "joint:r_elbow")
-        self.assertEqual(preview["warnings"][0]["detail"], PREVIEW_LIMIT_WARNING["detail"])
+        expected = PREVIEW_LIMIT_WARNING["detail"]["objects"][0]
+        self.assertEqual({key: preview["warnings"][0]["objects"][0][key] for key in expected}, expected)
 
     def test_verified_preview_includes_engineering_default_policy_warning(self) -> None:
         platform = self._registered_failed_verify(
@@ -236,7 +237,8 @@ class DiagnosticPreviewTests(unittest.TestCase):
         self.assertIs(preview["verified"], True)
         self.assertEqual(preview["warnings_total"], 1)
         self.assertEqual(preview["warnings"][0]["code"], "limits.default_policy")
-        self.assertEqual(preview["warnings"][0]["detail"], ENGINEERING_DEFAULT_POLICY_WARNING["detail"])
+        expected = ENGINEERING_DEFAULT_POLICY_WARNING["detail"]["objects"][0]
+        self.assertEqual({key: preview["warnings"][0]["objects"][0][key] for key in expected}, expected)
 
     def test_failed_preview_merges_and_deduplicates_quality_warnings(self) -> None:
         duplicate = {
@@ -324,7 +326,7 @@ class DiagnosticPreviewTests(unittest.TestCase):
             for row in preview["warnings"]
             if row["code"] == "source.saved_state_incomplete"
         )
-        self.assertEqual(warning["detail"], diagnostic["detail"])
+        self.assertEqual({key: warning[key] for key in diagnostic["detail"]}, diagnostic["detail"])
         self.assertIs(warning["blocking"], False)
 
     def test_certificate_diagnostic_without_explicit_blocking_flag_is_refused(self) -> None:
@@ -367,12 +369,12 @@ class DiagnosticPreviewTests(unittest.TestCase):
         session = app.sessions.create("user", "token")
         preview = app._preview_payload(session, DAG_RUN_ID)
 
-        self.assertEqual(len(preview["warnings"]), portal_module._PREVIEW_LIMIT)
+        self.assertEqual(len(preview["warnings"]), portal_module._PREVIEW_LIMIT + 1)
         self.assertEqual(preview["warnings_total"], portal_module._PREVIEW_LIMIT + 1)
         self.assertEqual(preview["warnings"][0]["code"], "quality.warning_00")
         self.assertEqual(
             preview["warnings"][-1]["code"],
-            f"quality.warning_{portal_module._PREVIEW_LIMIT - 1:02d}",
+            f"quality.warning_{portal_module._PREVIEW_LIMIT:02d}",
         )
 
     def test_portal_serves_the_retained_diagnostic_through_the_single_interface(self) -> None:

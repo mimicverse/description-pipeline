@@ -84,20 +84,21 @@ class RawCaptureFreezeTests(unittest.TestCase):
         manifest = self.capture()
         self.assertEqual(
             manifest["scene"],
-            "raw/native_capture_facts.json",
+            "raw/native_capture_facts.json.gz",
         )
         self.assertEqual(
             set(manifest["files"]),
             {
                 "native-runtime.json",
                 "raw/dependency_closure.json",
-                "raw/native_capture_facts.json",
+                "raw/native_capture_facts.json.gz",
                 "raw/triangles/f56f6426f638a44dc1da3320e7d1c79c149af69c01ae6e0f147733f8a5dbeff5.triangles",
             },
         )
         for retired in (
             "capture.json",
             "geometry",
+            "raw/native_capture_facts.json",
             "raw/scene_raw.json",
             "raw/mass_properties.json",
             "raw/coordinate_systems.json",
@@ -113,7 +114,7 @@ class RawCaptureFreezeTests(unittest.TestCase):
             self.assertFalse((self.destination / retired).exists(), retired)
 
         facts = read_data(
-            self.destination / "raw/native_capture_facts.json"
+            self.destination / "raw/native_capture_facts.json.gz"
         )
         self.assertEqual(
             set(facts),

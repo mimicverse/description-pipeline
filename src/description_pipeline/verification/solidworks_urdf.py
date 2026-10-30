@@ -34,7 +34,8 @@ from ..geometry.native_scope import (
 from ..io import PipelineError, confined, digest, file_digest, inventory, read_data
 from ..runtime import python_version_is_supported
 from ..schemas import (
-    EFFECTIVE_INSTANCES_SCHEMA, TOOL_SCHEMA, exporter_declaration_present, saved_native_reference_present,
+    EFFECTIVE_INSTANCES_SCHEMA, NATIVE_CAPTURE_FACTS, TOOL_SCHEMA,
+    exporter_declaration_present, saved_native_reference_present,
 )
 from ..sources.solidworks.naming import fixed_joint_name
 from ..sources.solidworks.native_limits import (
@@ -652,14 +653,7 @@ def _native_discovery(package, diagnostics=None):
         raise error
     for item in report.get("diagnostics") or []:
         if isinstance(item, dict) and item.get("code"):
-            diagnostics.append(
-                {
-                    "code": item.get("code"),
-                    "blocking": False,
-                    "message": str(item.get("message") or ""),
-                    "detail": item.get("detail"),
-                }
-            )
+            diagnostics.append(dict(item))
     return {
         "contract": report.get("contract"),
         "discovery_sha256": report.get("discovery_sha256"),
@@ -2031,11 +2025,7 @@ def evaluate_bundle(
                         ),
                         "message": str(warning.get("message") or "non-native derived value"),
                         "objects": warning_objects,
-                        "detail": (
-                            warning_detail
-                            if isinstance(warning_detail, dict)
-                            else {"objects": warning_objects}
-                        ),
+                        **({"detail": warning_detail} if isinstance(warning_detail, dict) else {}),
                     }
                 )
     required = required_checks(definition)
@@ -2170,7 +2160,7 @@ def qualifications(root, definition, checks):
             for warning in (rows.get(fact["check"], {}).get("details") or {}).get("warnings", [])
         ):
             status = "unqualified"
-            records = ("evidence/raw/native_capture_facts.json", "model/robot.json")
+            records = (f"evidence/{NATIVE_CAPTURE_FACTS}", "model/robot.json")
         evidence = []
         if all((root / record).is_file() for record in records):
             evidence = [{"record": record, "sha256": file_digest(root / record)} for record in records]
@@ -2251,7 +2241,7 @@ def _verify_model(
     native_geometry_rows = evidence.geometry(root)
     source_manifest = verify_snapshot(root / "evidence")
     native_appearance = source_manifest.get("evidence_class") != "fixture"
-    if "raw/native_capture_facts.json" in (source_manifest.get("files") or {}):
+    if NATIVE_CAPTURE_FACTS in (source_manifest.get("files") or {}):
         from .native_appearance import verify_native_appearance
 
         gates.add(

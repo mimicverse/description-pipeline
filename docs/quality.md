@@ -159,7 +159,7 @@ Capture 在一个自有只读会话中读取已保存 CAD 的原生事实，随�
 
 独立消费者从原始三角流、face span、来源 scope 和 SW16 重新核对实际 STL 的三角形数量、顺序、坐标、法向、归属及摘要，并核对场景 placement。原生读取失败、缺失必要几何、非法数值、错误归属或交付字节不对应原始事实均失败。拓扑审计记录实际观察，不把显示三角形天然宣称为闭合流形或精度证明；当前 CAD 的独立工程检查保持，`50 µm` 曲面等价仅用于下文声明适用输入的独立参考回归，不是生产或正式发布前置。
 
-原始证据统一封存在不可变 `evidence/raw/native_capture_facts.json`，其中 `source_scopes` 保存来源身份，`scene_raw` 保存原生场景观察，`geometry_raw` 绑定原生三角形流。Windows 只负责原生读取、序列化和封包；Linux Generate 单次投影工程模型并物化 STL。file source 分开保存原文件与冻结 copy 的 hash/path；virtual source 保存 path-derived identity、owner hash、session document/root 和 PID。包级验证将原始 scope 与 canonical Discovery、raw scene/geometry、dependency closure 和实际冻结字节交叉核对。Discovery 与 Capture 可使用不同的虚拟 session、root 和 PID；owner、实例、配置及相对身份必须一致，各自 session 的文档路径、root 与 PID 须内部绑定自洽。不另建几何或状态权威。
+原始证据统一封存在不可变 `evidence/raw/native_capture_facts.json.gz`，以确定性的标准 gzip 无损保存完整规范 JSON；manifest 校验压缩字节，读取后仍逐项核验原始事实。其中 `source_scopes` 保存来源身份，`scene_raw` 保存原生场景观察，`geometry_raw` 绑定原生三角形流。Windows 只负责原生读取、序列化和封包；Linux Generate 单次投影工程模型并物化 STL。file source 分开保存原文件与冻结 copy 的 hash/path；virtual source 保存 path-derived identity、owner hash、session document/root 和 PID。包级验证将原始 scope 与 canonical Discovery、raw scene/geometry、dependency closure 和实际冻结字节交叉核对。Discovery 与 Capture 可使用不同的虚拟 session、root 和 PID；owner、实例、配置及相对身份必须一致，各自 session 的文档路径、root 与 PID 须内部绑定自洽。不另建几何或状态权威。
 
 <a id="qualification"></a>
 ## 警告与资格
