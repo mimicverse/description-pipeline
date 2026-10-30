@@ -21,6 +21,18 @@ class ConsumerError(RuntimeError):
         self.details = details
 
 
+def _loading_warning() -> dict:
+    return {
+        "code": "consumer.surface_mesh_loading",
+        "blocking": False,
+        "message": (
+            "The loading check uses shell integration for mesh assets and the explicit URDF inertials. "
+            "This consumer policy does not classify CAD solids as shells or establish simulation qualification."
+        ),
+        "detail": {"inertiafromgeom": False, "mesh_inertia": "shell"},
+    }
+
+
 def _inputs(root):
     paths = [root / "urdf/robot.urdf", *(root / "meshes").rglob("*")]
     result = {}
@@ -76,8 +88,9 @@ def load(root: Path) -> dict:
         or report["joints"] != len(joints)
         or report.get("body_names") != bodies
         or report.get("joint_names") != joints
+        or report.get("warnings") != [_loading_warning()]
     ):
-        raise ConsumerError("Consumer loaded another link or joint set")
+        raise ConsumerError("Consumer loaded another link or joint set or used another loading policy")
     return report
 
 
@@ -106,10 +119,15 @@ def _read(root):
         shutil.copytree(root / "meshes", temporary / "meshes")
         (temporary / "urdf").mkdir()
         compiler = ET.SubElement(ET.SubElement(document, "mujoco"), "compiler")
-        compiler.attrib.update(discardvisual="false", fusestatic="false", strippath="false")
+        compiler.attrib.update(
+            discardvisual="false", fusestatic="false", strippath="false", inertiafromgeom="false",
+        )
         path = temporary / "urdf/robot.urdf"
         ET.ElementTree(document).write(path, encoding="utf-8", xml_declaration=True)
-        model = mujoco.MjModel.from_xml_path(str(path))
+        specification = mujoco.MjSpec.from_file(str(path))
+        for mesh in specification.meshes:
+            mesh.inertia = mujoco.mjtMeshInertia.mjMESH_INERTIA_SHELL
+        model = specification.compile()
         return {
             "reader": "mujoco",
             "version": mujoco.__version__,
@@ -119,6 +137,7 @@ def _read(root):
             "body_names": sorted(model.body(i).name for i in range(1, model.nbody)),
             "joint_names": sorted(model.joint(i).name for i in range(model.njnt)),
             "scope": "URDF loading only; no simulation qualification",
+            "warnings": [_loading_warning()],
         }
 
 

@@ -6,6 +6,7 @@ import copy
 import json
 import os
 import subprocess
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -69,6 +70,28 @@ class ConsumerTests(unittest.TestCase):
         self.assertEqual(report["joint_names"], ["shoulder"])
         self.assertEqual((report["bodies"], report["joints"]), (3, 1))
 
+    def test_small_mesh_surfaces_load_with_explicit_inertials_and_unchanged_inputs(self):
+        vertices = [(0.0, 0.0, 0.0), (1e-6, 0.0, 0.0), (0.0, 1e-6, 0.0), (0.0, 0.0, 1e-6)]
+        faces = [(0, 2, 1), (0, 1, 3), (1, 2, 3), (2, 0, 3)]
+        raw = bytes(80) + struct.pack("<I", len(faces)) + b"".join(
+            struct.pack("<12fH", 0.0, 0.0, 0.0, *[value for index in face for value in vertices[index]], 0)
+            for face in faces
+        )
+        mesh = self.root / "meshes/small.stl"
+        mesh.write_bytes(raw)
+        geometry = '<geometry><mesh filename="../meshes/small.stl"/></geometry>'
+        document = URDF.replace("</link>", f"<visual>{geometry}</visual><collision>{geometry}</collision></link>")
+        (self.root / "urdf/robot.urdf").write_text(document)
+        original_inputs = consumer._inputs(self.root)
+        report = consumer.load(self.root)
+        self.assertEqual(report["body_names"], ["base_link"])
+        self.assertEqual(report["inputs"], original_inputs)
+        self.assertEqual(consumer._inputs(self.root), original_inputs)
+        self.assertEqual(report["warnings"][0]["detail"], {"inertiafromgeom": False, "mesh_inertia": "shell"})
+        mesh.write_bytes(b"invalid native mesh")
+        with self.assertRaises(consumer.ConsumerError):
+            consumer.load(self.root)
+
     def test_timeout_kills_and_reaps_the_actual_child(self):
         script = self.root / "slow.py"
         script.write_text("import os,sys,time\nprint(os.getpid(),file=sys.stderr,flush=True)\ntime.sleep(10)\n")
@@ -105,6 +128,7 @@ class ConsumerTests(unittest.TestCase):
             ("body_names", ["another_link"]),
             ("joint_names", ["extra_joint"]),
             ("version", "unknown"),
+            ("warnings", []),
         ):
             with self.subTest(key=key, value=value):
                 report = {**self.report, key: value}
