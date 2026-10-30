@@ -98,7 +98,7 @@ CAD 有值时先读取、保留和检查，再按有据规则修正。规则不�
 Airflow DAG -> StageTaskOperator -> StageApplication.run_stage
             -> execute_stage -> StageHandler -> StageResult / StagePending
 StagePending -> EffectPollTrigger -> StageTaskOperator.execute_complete
-             -> StageApplication.resume_effect -> execute_stage
+             -> StageApplication.resume_stage -> execute_stage
 ```
 
 等待器每轮先读取原命令的 canonical decision 和 effect settlement；已有结果、冲突或已批准的恢复阶段时，直接唤醒同一不可变 wait，由执行器重新核验。只有仍待观察时才读取原生端、Git 或 PR，不能要求远端再次变化才能响应已登记的对账或取消。唤醒不建立成功资格，不取得执行权，不重发外部请求。
