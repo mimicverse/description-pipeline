@@ -879,14 +879,16 @@ class EffectReconciliationPostgresTests(unittest.TestCase):
             wait_digest=pending.wait.digest, observed_at=self.now, changed=False,
         ))
 
-        def reconcile_during_wait(_delay):
-            if self.facts.effect_settlement(intent.effect_id).state is not EffectState.UNKNOWN:
-                return
-            result = reconciliation.reconcile(
-                command_id=command.command_id, effect_key=intent.effect_key,
-                adapter=_AbsentAdapter("reconciled"),
-            )
-            self.assertEqual(result.settlement.state, EffectState.DEFINITELY_FAILED)
+        real_sleep = asyncio.sleep
+
+        async def reconcile_during_wait(_delay):
+            if self.facts.effect_settlement(intent.effect_id).state is EffectState.UNKNOWN:
+                result = reconciliation.reconcile(
+                    command_id=command.command_id, effect_key=intent.effect_key,
+                    adapter=_AbsentAdapter("reconciled"),
+                )
+                self.assertEqual(result.settlement.state, EffectState.DEFINITELY_FAILED)
+            await real_sleep(0)
 
         async def run_trigger():
             return await asyncio.wait_for(
