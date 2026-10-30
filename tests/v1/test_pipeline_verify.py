@@ -30,6 +30,8 @@ import description_pipeline.pipeline.verify as pipeline_verify
 from description_pipeline.pipeline.contracts import (
     DiagnosticReplayScope,
     ExecutionClaim,
+    FailureEnvelope,
+    ProtocolError,
     StageCandidate,
     StageCommand,
     StageResult,
@@ -2292,7 +2294,7 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
             with self.subTest(name=name):
                 command, claim, workspace = self._verify_request()
                 records = iter((initial, final))
-                with self.assertRaisesRegex(PipelineError, "identity changed during Verify"):
+                with self.assertRaisesRegex(ProtocolError, "verify.executor_changed"):
                     VerifyHandler(identity_provider=lambda records=records: next(records)).execute(
                         command,
                         claim,
@@ -2422,7 +2424,7 @@ class PipelineVerifyHandlerTests(unittest.TestCase):
                 "evaluate_bundle",
                 side_effect=AssertionError("evaluation must not start"),
             ),
-            self.assertRaisesRegex(PipelineError, "different Capture artifact"),
+            self.assertRaisesRegex(StageFailure, "different Capture artifact"),
         ):
             VerifyHandler(identity_provider=hermetic._portable_tool).execute(
                 command,
@@ -2614,10 +2616,40 @@ class VerifyIdentityPostgresTests(unittest.TestCase):
             self.assertEqual(value["actual_verifier_sha256"], self.executor)
         self.assertIsNotNone(self.facts.decision_for(self.command))
 
+    def test_local_pair_validation_failure_commits_one_failure_and_closes_claim(self) -> None:
+        with patch.object(
+            pipeline_verify, "_generate_receipt", side_effect=PipelineError("Generate receipt names another pair"),
+        ):
+            failure = self._execute(lambda: self.identity)
+        self.assertIsInstance(failure, FailureEnvelope)
+        self.assertEqual(failure.reason_code, "verify.local_contract_failed")
+        self.assertEqual(failure.error_message, "Generate receipt names another pair")
+        self.assertEqual(failure.effect_states, ())
+        self.assertEqual(self.facts.decision_for(self.command).outcome, "failed")
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT closed_at, closure_code FROM execution_claim WHERE command_id = %s",
+                (self.command.command_id,),
+            )
+            [(closed_at, code)] = cursor.fetchall()
+        self.assertIsNotNone(closed_at)
+        self.assertEqual(code, "definite_failure")
+
+    def test_unavailable_actual_identity_precedes_local_input_rejection(self) -> None:
+        with (
+            patch.object(
+                pipeline_verify, "_generate_receipt", side_effect=PipelineError("Invalid local input"),
+            ) as local,
+            self.assertRaisesRegex(ProtocolError, "verify.executor_unavailable"),
+        ):
+            self._execute(dict)
+        local.assert_not_called()
+        self.assertIsNone(self.facts.decision_for(self.command))
+
     def test_source_drift_is_rejected_after_initial_source_match(self) -> None:
         changed = {**self.identity, "source_sha256": "0" * 64}
         records = iter((self.identity, changed))
-        with self.assertRaisesRegex(PipelineError, "identity changed during Verify"):
+        with self.assertRaisesRegex(ProtocolError, "verify.executor_changed"):
             self._execute(lambda: next(records))
         self.assertIsNone(self.facts.decision_for(self.command))
 
@@ -2627,7 +2659,7 @@ class VerifyIdentityPostgresTests(unittest.TestCase):
             "release": {"schema_version": "drifted-runtime/v1", "version": "9"},
         }
         records = iter((self.identity, changed))
-        with self.assertRaisesRegex(PipelineError, "identity changed during Verify"):
+        with self.assertRaisesRegex(ProtocolError, "verify.executor_changed"):
             self._execute(lambda: next(records))
         self.assertIsNone(self.facts.decision_for(self.command))
 

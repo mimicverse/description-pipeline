@@ -876,27 +876,26 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
         entry["resolved_edges"] = sorted(entry["resolved_edges"], key=lambda item: str(item.get("instance")))
         documents_out[name] = entry
     excluded = sorted(set(files) - set(graph))
-    if saved_state_incomplete:
-        occurrences_out = []
-        for record in occurrences:
-            if not isinstance(record, Mapping):
-                continue
-            occurrences_out.append(
-                {
-                    "instance": record.get("instance") or record.get("name"),
-                    "defining": record.get("defining"),
-                    "configuration": record.get("configuration"),
-                    "suppression_state": record.get("suppression_state"),
-                    "resolved_path": record.get("resolved_path"),
-                }
-            )
-        occurrences_out.sort(
-            key=lambda item: (
-                str(item.get("instance")),
-                str(item.get("resolved_path")),
-                str(item.get("configuration")),
-            )
+    occurrences_out = []
+    for record in occurrences:
+        if not isinstance(record, Mapping):
+            continue
+        occurrences_out.append(
+            {
+                "instance": record.get("instance") or record.get("name"),
+                "defining": record.get("defining"),
+                "configuration": record.get("configuration"),
+                "suppression_state": record.get("suppression_state"),
+                "resolved_path": record.get("resolved_path"),
+            }
         )
+    occurrences_out.sort(
+        key=lambda item: (
+            str(item.get("instance")),
+            str(item.get("resolved_path")),
+            str(item.get("configuration")),
+        )
+    )
     preverify["closure_ok"] = True
     return {
         "schema_version": CLOSURE_SCHEMA,
@@ -907,7 +906,7 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
         "stored_references_phase": readings.get("stored_references_phase"),
         "search_configuration": readings.get("search") or {},
         "open_status": open_status,
-        **({"observed_occurrences": occurrences_out} if saved_state_incomplete else {}),
+        "observed_occurrences": occurrences_out,
         "saved_configuration": readings.get("saved_configuration"),
         "document_state": readings.get("document_state"),
         "preverify": preverify,

@@ -160,7 +160,7 @@ class InPlaceConsumerTests(unittest.TestCase):
         self.assertFalse(warning[0]["objects"][0]["constraint_rows_used"])
         comments = _warning_comments({"provenance": {"value_warnings": warning}})
         self.assertIn("source.inplace_observations", comments[0])
-        self.assertIn('"value": null', comments[0])
+        self.assertIn('"value":null', comments[0])
         self.assertIn("cad_member_missing", comments[0])
         model = {"links": [], "joints": [], "frames": [], "provenance": {"value_warnings": warning}}
         with tempfile.TemporaryDirectory() as directory:

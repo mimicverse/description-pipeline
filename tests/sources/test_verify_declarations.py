@@ -1849,6 +1849,9 @@ class NativeDeclarationsTests(unittest.TestCase):
                 native_files,
                 "robot.SLDASM",
             )
+            from .selection_support import seal_fixture_open_observation
+
+            seal_fixture_open_observation(raw)
             raw = support.local_native_record_payload(
                 raw,
                 default_mate_scope=True,

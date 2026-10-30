@@ -7,6 +7,7 @@ import unittest
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 try:
     import pgserver
@@ -15,12 +16,12 @@ except ImportError:
     pgserver = None
     psycopg2 = None
 
-from description_pipeline.io import digest, read_data
+from description_pipeline.io import PipelineError, digest, read_data
 from description_pipeline.artifacts import ArtifactStore
 from description_pipeline.pipeline.contracts import qualify_stage
 from description_pipeline.pipeline.diagnostic import DiagnosticAdmissionSpec, build_diagnostic_command
 from description_pipeline.pipeline.engine import execute_stage
-from description_pipeline.pipeline.contracts import ExecutionClaim, ProtocolError, StageCommand
+from description_pipeline.pipeline.contracts import ExecutionClaim, FailureEnvelope, ProtocolError, StageCommand
 from description_pipeline.pipeline.engine import StageWorkspace
 from description_pipeline.pipeline.services import CanonicalStageServices, ClaimPolicy
 from description_pipeline.pipeline.stages.generate import GenerateHandler
@@ -205,6 +206,45 @@ class GeneratePublishDiagnosticPostgresTests(unittest.TestCase):
             result=result,
         )
         self.assertFalse(qualification.formal_eligible)
+        self._assert_only_target_committed(command)
+
+    def test_generate_local_contract_failure_closes_claim_and_is_replayed_without_work(self) -> None:
+        from description_pipeline.pipeline.stages import generate
+
+        source = generate_fixtures.GenerateHandlerTests(methodName="runTest")
+        source.setUp()
+        self.addCleanup(source.doCleanups)
+        inputs = tuple(self.artifacts.import_object(source.store, item) for item in source.command.input_artifacts)
+        spec = self._spec(source_command=source.command, imported_inputs=inputs, expected_executor=source.executor)
+        command = build_diagnostic_command(spec)
+        self.facts.admit_diagnostic(spec, command)
+        services = self._services(command, source.executor)
+        with patch.object(
+            generate, "_compile_capture", side_effect=PipelineError("Native open diagnostics are not continuable"),
+        ):
+            failure = execute_stage(
+                command_id=command.command_id, handler=GenerateHandler(self.artifacts), services=services,
+            )
+        self.assertIsInstance(failure, FailureEnvelope)
+        self.assertEqual(failure.reason_code, "generate.local_contract_failed")
+        self.assertEqual(failure.error_type, "PipelineError")
+        self.assertEqual(failure.error_message, "Native open diagnostics are not continuable")
+        self.assertEqual(failure.effect_states, ())
+        self.assertEqual(self.facts.decision_for(command).outcome, "failed")
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT closed_at, closure_code FROM execution_claim WHERE command_id = %s", (command.command_id,),
+            )
+            [(closed_at, code)] = cursor.fetchall()
+        self.assertIsNotNone(closed_at)
+        self.assertEqual(code, "definite_failure")
+        with patch.object(
+            generate, "_compile_capture", side_effect=AssertionError("Failed command must not execute again"),
+        ):
+            repeated = execute_stage(
+                command_id=command.command_id, handler=GenerateHandler(self.artifacts), services=services,
+            )
+        self.assertEqual(repeated, failure)
         self._assert_only_target_committed(command)
 
     def test_publish_runs_one_scoped_diagnostic_stage_without_predecessor(self) -> None:

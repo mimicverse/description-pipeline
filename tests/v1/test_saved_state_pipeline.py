@@ -7,8 +7,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from description_pipeline.io import read_data
-from description_pipeline.sources.solidworks.saved_state import capture_open_matches, warning_from_selection
+from description_pipeline.io import PipelineError, read_data
+from description_pipeline.sources.solidworks.saved_state import (
+    normalize_open_status,
+    same_open_observation,
+    warning_from_capture,
+    warning_from_selection,
+)
 from description_pipeline.verification.native_discovery import _require_saved_state_open
 from description_pipeline.sources.solidworks.captured import derive_engineering_input
 
@@ -42,7 +47,7 @@ class SavedStatePipelineTests(unittest.TestCase):
         )
 
         self.assertIs(warning["blocking"], False)
-        self.assertEqual(warning["detail"]["open_errors"], 2)
+        self.assertEqual(warning["detail"]["open_observations"]["capture"]["status"]["errors"], 2)
         self.assertFalse(warning["detail"]["source_integrity_proven"])
         self.assertFalse(warning["detail"]["rebuilt"])
         self.assertFalse(warning["detail"]["mechanical_qualification_complete"])
@@ -57,23 +62,85 @@ class SavedStatePipelineTests(unittest.TestCase):
         from tests.v1.test_pipeline_verify import PipelineVerifyHandlerTests
 
         prepare = fixture.HermeticNativeFixture._prepare_and_capture
+        open_document = fixture.MissingReferenceFixtureBackend.open_document
 
         def incomplete_capture(instance):
             return prepare(instance, incomplete_saved_state=True)
 
+        def additional_capture_diagnostic(instance, path):
+            opened = open_document(instance, path)
+            opened["missing_references"]["items"].append({
+                "name": "another_missing_part",
+                "last_known_path": "C:/missing/another_part.SLDPRT",
+            })
+            return normalize_open_status(opened)
+
         handler_fixture = PipelineVerifyHandlerTests(methodName="runTest")
         self.addCleanup(handler_fixture.doCleanups)
-        with patch.object(fixture.HermeticNativeFixture, "_prepare_and_capture", incomplete_capture):
+        with (
+            patch.object(fixture.HermeticNativeFixture, "_prepare_and_capture", incomplete_capture),
+            patch.object(fixture.MissingReferenceFixtureBackend, "open_document", additional_capture_diagnostic),
+        ):
             handler_fixture.setUp()
         report = handler_fixture._bundle_report(handler_fixture.generate_ref)
         self.assertTrue(report["passed"], report)
         warning = next(item for item in report["diagnostics"] if item["code"] == "source.saved_state_incomplete")
-        self.assertEqual(warning["detail"]["open_errors"], 2)
+        observations = warning["detail"]["open_observations"]
+        self.assertEqual(observations["discover"]["status"]["errors"], 2)
+        self.assertEqual(observations["capture"]["status"]["errors"], 2)
+        self.assertEqual(len(observations["capture"]["status"]["missing_references"]["items"]), 2)
+        self.assertEqual(len(observations["discover"]["status"]["missing_references"]["items"]), 1)
         result = handler_fixture._run_verify()
         self.assertEqual(result[1].outcome, "completed")
         urdf = next(handler_fixture.generate_root.rglob("*.urdf")).read_text()
         self.assertIn("WARNING source.saved_state_incomplete", urdf)
         self.assertIn("hidden_or_auto_suppressed_objects_unknown", urdf)
+        self.assertIn("another_missing_part", urdf)
+
+    def test_independent_openings_preserve_each_diagnostic_and_clean_observation(self) -> None:
+        selection = fixture.incomplete_saved_state_record()["source_selection"]
+        missing = selection["closure"]["open_status"]
+        clean = normalize_open_status({"errors": 0, "warnings": 0})
+        warning_only = normalize_open_status({"errors": 0, "warnings": 64})
+        for selected, captured in ((missing, clean), (clean, missing), (warning_only, clean), (clean, warning_only)):
+            with self.subTest(selection=selected["classification"], capture=captured["classification"]):
+                source = copy.deepcopy(selection)
+                source["closure"]["open_status"] = selected
+                warning = warning_from_capture(source, captured)
+                observations = warning["detail"]["open_observations"]
+                self.assertEqual(observations["discover"]["status"], selected)
+                self.assertEqual(observations["capture"]["status"], captured)
+        source["closure"]["open_status"] = clean
+        self.assertIsNone(warning_from_capture(source, clean))
+
+    def test_capture_cannot_borrow_selection_missing_paths_or_hide_severe_errors(self) -> None:
+        selection = fixture.incomplete_saved_state_record()["source_selection"]
+        for captured in (
+            {"errors": 1, "warnings": 0},
+            {"errors": 3, "warnings": 0},
+            {"errors": 2, "warnings": 0},
+            {"errors": 2, "warnings": 0, "missing_references": {"state": "observed", "items": []}},
+            {**selection["closure"]["open_status"], "classification": "clean_open"},
+        ):
+            with self.subTest(captured=captured), self.assertRaises(PipelineError):
+                warning_from_capture(selection, captured)
+
+    def test_clean_selection_scope_is_independently_bound_to_raw_occurrences(self) -> None:
+        raw = fixture.incomplete_saved_state_record()
+        clean = normalize_open_status({"errors": 0, "warnings": 0})
+        raw["open_status"] = clean
+        raw["source_selection"]["closure"]["open_status"] = clean
+        _require_saved_state_open({"raw": raw})
+        raw["source_selection"]["closure"]["observed_occurrences"][0]["configuration"] = "other"
+        with self.assertRaisesRegex(Exception, "occurrence scope differs"):
+            _require_saved_state_open({"raw": raw})
+
+    def test_clean_scope_requires_exact_native_field_types(self) -> None:
+        for state in (2.0, True, "2", None, -1, 5):
+            raw = fixture.capture_record()
+            raw["source_selection"]["closure"]["observed_occurrences"][0]["suppression_state"] = state
+            with self.subTest(state=state), self.assertRaisesRegex(Exception, "malformed native fields"):
+                _require_saved_state_open({"raw": raw})
 
     def test_saved_state_discovery_findings_are_readable_by_the_registered_report(self) -> None:
         from description_pipeline.orchestration.report_view import registered_discovery_record
@@ -171,13 +238,13 @@ class SavedStatePipelineTests(unittest.TestCase):
         status = fixture.incomplete_saved_state_record()["open_status"]
         different = copy.deepcopy(status)
         different["missing_references"]["items"][0]["last_known_path"] = "C:/other/missing.SLDPRT"
-        self.assertFalse(capture_open_matches(status, different))
+        self.assertFalse(same_open_observation(status, different))
 
     def test_capture_cannot_forge_derived_open_classification(self) -> None:
         status = fixture.incomplete_saved_state_record()["open_status"]
         forged = {**status, "classification": "clean_open"}
         with self.assertRaises(ValueError):
-            capture_open_matches(status, forged)
+            same_open_observation(status, forged)
 
 
 if __name__ == "__main__":

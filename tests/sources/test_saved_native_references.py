@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from description_pipeline.sources.solidworks.discovery import DiscoverySettings, _saved_native_carriers
 from description_pipeline.sources.solidworks.saved_native_references import (
@@ -64,6 +65,21 @@ def inspection_record():
 
 
 class SavedNativeReferencesTests(unittest.TestCase):
+    def test_independent_inspection_diagnostics_satisfy_the_certificate_contract(self):
+        from description_pipeline.pipeline.verify_contract import verification_diagnostics
+        from description_pipeline.verification import saved_native_references as verifier
+
+        view = inspection_record()
+        view["mates"].append({**copy.deepcopy(view["mates"][0]), "name": "saved_pose", "type": "parallel"})
+        with patch.object(verifier, "project_native_verification_record", return_value=view):
+            result = verifier.rebuild_saved_native_references(view, purpose="inspection_preview")
+        records = verification_diagnostics({"diagnostics": result["diagnostics"], "checks": [], "passed": True})
+        self.assertEqual({row["code"] for row in records}, {
+            "saved_native.inspection_scope", "saved_native.pose_mates",
+            "saved_native.direction", "saved_native.preview_range",
+        })
+        self.assertTrue(all(row["blocking"] is False for row in records))
+
     def test_unrelated_native_names_bind_by_the_current_interface_geometry(self):
         raw = inspection_record()
         original = copy.deepcopy(raw)

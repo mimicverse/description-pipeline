@@ -22,7 +22,8 @@ from description_pipeline.sources.solidworks.naming import (
     visual_name,
 )
 from description_pipeline.sources.solidworks.saved_state import (
-    warning_from_selection,
+    normalize_open_status,
+    warning_from_capture,
 )
 from description_pipeline.sources.solidworks.scene import _value_warnings
 from description_pipeline.verification.solidworks_urdf import (
@@ -502,12 +503,18 @@ class ValueWarningTests(unittest.TestCase):
         source = copy.deepcopy(self.source)
         source["configuration"] = "Default"
         source["saved_state_selection"] = selection
-        warning = warning_from_selection(selection)
+        captured = copy.deepcopy(selection["closure"]["open_status"])
+        captured["missing_references"]["items"].append({
+            "name": "capture_only_missing",
+            "last_known_path": "C:/missing/capture_only.SLDPRT",
+        })
+        captured = normalize_open_status(captured)
+        warning = warning_from_capture(selection, captured)
         model = copy.deepcopy(self.model)
         model["provenance"]["value_warnings"].append(copy.deepcopy(warning))
         write_json(
             self.root / "evidence/native-runtime.json",
-            {"prepared_capture": {"opened": selection["closure"]["open_status"]}},
+            {"prepared_capture": {"opened": captured}},
         )
 
         result = _value_warning_gate(self.root, source, model)
@@ -528,9 +535,18 @@ class ValueWarningTests(unittest.TestCase):
             for item in forged["provenance"]["value_warnings"]
             if item["code"] == "source.saved_state_incomplete"
         )
-        forged_warning["detail"]["open_errors"] = 0
+        forged_warning["detail"]["open_observations"]["capture"]["status"]["errors"] = 0
         with self.assertRaisesRegex(PipelineError, "Saved-state source warning"):
             _value_warning_gate(self.root, source, forged)
+
+        omitted_capture = copy.deepcopy(model)
+        warning = next(
+            item for item in omitted_capture["provenance"]["value_warnings"]
+            if item["code"] == "source.saved_state_incomplete"
+        )
+        del warning["detail"]["open_observations"]["capture"]
+        with self.assertRaisesRegex(PipelineError, "Saved-state source warning"):
+            _value_warning_gate(self.root, source, omitted_capture)
 
     def test_missing_spoofed_or_wrong_field_warnings_are_rejected(self):
         mutations = (

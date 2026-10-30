@@ -139,7 +139,8 @@ class UnifiedDiscoverObservationTests(unittest.TestCase):
         self.assertFalse((self.root / "workspace/staged/excluded.SLDPRT").exists())
         self.assertEqual(observation.record["open_status"]["errors"], 2)
         self.assertEqual(observation.record["open_status"], observation.selection["closure"]["open_status"])
-        self.assertEqual(warning_from_selection(observation.selection)["detail"]["open_errors"], 2)
+        warning = warning_from_selection(observation.selection)
+        self.assertEqual(warning["detail"]["open_observations"]["discover"]["status"]["errors"], 2)
         self.assertEqual(set(observation.selection["files"]), {"robot.SLDASM", "arm.SLDPRT"})
 
     def test_search_restore_failure_closes_then_refuses_without_pruning(self):

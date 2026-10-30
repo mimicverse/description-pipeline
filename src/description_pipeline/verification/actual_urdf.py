@@ -10,14 +10,13 @@ have an explicit model and provenance contract.
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 import posixpath
 import re
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
-from ..io import PipelineError, confined
+from ..io import PipelineError, canonical_json_value, confined
 from ..sources.solidworks.naming import fixed_joint_name
 
 _NAME = re.compile(r"\A[a-z][a-z0-9_]*\Z")
@@ -351,7 +350,7 @@ def _warning_comments(model: dict) -> list[str]:
             if item.get("detail") is not None:
                 detail["detail"] = item["detail"]
             detail["provenance"] = subject
-            payload = json.dumps(detail, ensure_ascii=True, sort_keys=True).replace("--", r"\u002d\u002d")
+            payload = canonical_json_value(detail, ensure_ascii=True).replace("--", r"\u002d\u002d")
             code = str(item["code"]).replace("--", "- -")
             expected.append(f"WARNING {code}: {payload} See reports/verification-certificate.json.")
     return expected

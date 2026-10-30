@@ -6499,13 +6499,13 @@ def derive_native_package(
     upload_digest = source_selection.get("upload_sha256")
     upload_handoff_digest = upload_digest if _SHA256_HEX.fullmatch(str(upload_digest or "")) else None
     findings: list[dict] = []
-    from .saved_state import capture_open_matches, warning_from_selection
+    from .saved_state import same_open_observation, warning_from_selection
 
     try:
         saved_state_warning = warning_from_selection(source_selection)
+        if not same_open_observation(source_selection["closure"]["open_status"], record.get("open_status")):
+            raise PipelineError("Discover open status differs from selection")
         if saved_state_warning is not None:
-            if not capture_open_matches(source_selection["closure"]["open_status"], record.get("open_status")):
-                raise ValueError("Discover open status differs from selection")
             findings.append(_finding(
                 saved_state_warning["code"], saved_state_warning["objects"][0]["object"],
                 saved_state_warning["message"], saved_state_warning["detail"], blocking=False,

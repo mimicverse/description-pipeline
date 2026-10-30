@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import json
 import struct
 import shutil
 import tempfile
@@ -10,7 +11,7 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 from description_pipeline.backends.urdf import MESH_PART_TRIANGLE_LIMIT, generate_urdf
-from description_pipeline.io import PipelineError, file_digest, read_data
+from description_pipeline.io import PipelineError, file_digest, read_data, write_json
 from description_pipeline.model import EngineeringModel
 from description_pipeline.sources.solidworks.naming import material_name, mesh_path, visual_name
 from description_pipeline.verification.solidworks_urdf import _xml
@@ -61,6 +62,31 @@ def _staged_source(root: Path, raw: bytes, name: str = "geometry/big.stl") -> Pa
 
 class UrdfNumericContractTests(unittest.TestCase):
     """R17 owner contract: the real writer emits io.format_number tokens on its artifacts."""
+
+    def test_warning_comments_match_the_persisted_model_numeric_and_xml_contract(self) -> None:
+        from description_pipeline.verification.actual_urdf import read_and_validate_actual_urdf
+
+        source = Path(__file__).resolve().parents[1] / "fixtures/v1/mesh-source"
+        scene = read_data(source / "scene.json")
+        scene["provenance"]["value_warnings"] = [{
+            "code": "source.numeric_rule",
+            "message": "Native--source values are preserved.",
+            "objects": [{"object": "axis", "actual": [0.0, -0.0, 1.0], "source": "CAD--axis"}],
+        }]
+        model = EngineeringModel.from_dict(scene)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = generate_urdf(model, source, root)
+            write_json(root / "model.json", model.to_dict())
+            persisted = read_data(root / "model.json")
+            _document, counts = read_and_validate_actual_urdf(
+                root, {"source": {"robot_name": model.name}}, persisted,
+            )
+            text = output.read_text()
+        self.assertNotIn("-0.0", text)
+        self.assertNotIn("CAD--axis", text)
+        self.assertIn(r"CAD\u002d\u002daxis", text)
+        self.assertGreater(counts["links"], 0)
 
     def test_real_artifact_uses_the_single_numeric_rule(self) -> None:
         source = Path(__file__).resolve().parents[1] / "fixtures/v1/mesh-source"
@@ -193,8 +219,10 @@ class UrdfWriterTests(unittest.TestCase):
         )
         comments = [child.text or "" for child in document if child.tag is ET.Comment]
         self.assertTrue(any("WARNING limits.default_policy:" in text for text in comments))
+        payloads = [json.loads(text.split(": ", 1)[1].removesuffix(" See reports/verification-certificate.json."))
+                    for text in comments]
         self.assertTrue(any(
-            f'"object": "{joint["name"]}"' in text and '"field": "limits"' in text for text in comments
+            row["provenance"] == {"object": joint["name"], "field": "limits"} for row in payloads
         ))
 
     def test_warning_comments_keep_every_object_and_escape_xml_terminators(self):
@@ -213,11 +241,13 @@ class UrdfWriterTests(unittest.TestCase):
             document = ET.fromstring(output.read_bytes(), parser=parser)
         comments = [child.text or "" for child in document if child.tag is ET.Comment]
         self.assertEqual(len(comments), 2)
-        self.assertIn('"object": "joint:left"', comments[0])
-        self.assertIn(r'"object": "joint:right\u002d\u002dspecial"', comments[1])
-        for text in comments:
-            self.assertIn('"field": "limits"', text)
-            self.assertIn('"native_cad_ranges": false', text)
+        payloads = [json.loads(text.split(": ", 1)[1].removesuffix(" See reports/verification-certificate.json."))
+                    for text in comments]
+        self.assertEqual([row["provenance"]["object"] for row in payloads], ["joint:left", "joint:right--special"])
+        for text, payload in zip(comments, payloads, strict=True):
+            self.assertNotIn("--", text)
+            self.assertEqual(payload["provenance"]["field"], "limits")
+            self.assertIs(payload["provenance"]["native_cad_ranges"], False)
 
     def test_independent_xml_gate_rejects_changed_warning_scope_or_qualification(self):
         source = Path(__file__).resolve().parents[1] / "fixtures/v1/mesh-source"
@@ -235,11 +265,12 @@ class UrdfWriterTests(unittest.TestCase):
             definition = {"source": {"robot_name": "warning_test"}}
             _xml(Path(temp), definition, model.to_dict())
             for old, new in (
-                (b'"object": "joint:left"', b'"object": "joint:wrong"'),
-                (b'"field": "limits"', b'"field": "mass"'),
-                (b'"hardware_qualified": false', b'"hardware_qualified": true'),
+                (b'"object":"joint:left"', b'"object":"joint:wrong"'),
+                (b'"field":"limits"', b'"field":"mass"'),
+                (b'"hardware_qualified":false', b'"hardware_qualified":true'),
             ):
                 with self.subTest(change=new):
+                    self.assertIn(old, original)
                     output.write_bytes(original.replace(old, new, 1))
                     with self.assertRaisesRegex(PipelineError, "value-provenance warnings differ"):
                         _xml(Path(temp), definition, model.to_dict())

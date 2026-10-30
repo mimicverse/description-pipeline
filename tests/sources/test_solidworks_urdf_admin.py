@@ -167,11 +167,13 @@ class UrdfRobotLabelTests(unittest.TestCase):
             "provenance": {"value_warnings": [warning]},
         }
         definition = {"hardware_id": None, "source": {"robot_name": "robot"}}
+        payload = json.dumps(
+            {"message": warning["message"], "provenance": warning["objects"][0]},
+            sort_keys=True, ensure_ascii=True, separators=(",", ":"),
+        )
         exact = (
             '<robot name="robot">'
-            "<!--WARNING units.si_conversion: "
-            '{"message": "Delivered values use SI units.", '
-            '"provenance": {"field": "units", "object": "robot", "source": "native_derived"}} '
+            f"<!--WARNING units.si_conversion: {payload} "
             "See reports/verification-certificate.json.-->"
             '<link name="base"/></robot>'
         )
@@ -229,6 +231,7 @@ class UrdfRobotLabelTests(unittest.TestCase):
             },
             ensure_ascii=True,
             sort_keys=True,
+            separators=(",", ":"),
         )
         exact = (
             '<robot name="robot">'

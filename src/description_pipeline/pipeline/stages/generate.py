@@ -143,6 +143,14 @@ def _write_output(
     ) as directory:
         try:
             model = _compile_capture(capture, Path(directory))
+            if destination.exists():
+                raise PipelineError(f"Generate output already exists: {destination}")
+            destination.mkdir(parents=True)
+            emission = emit(
+                model,
+                mesh_source_root=Path(directory),
+                destination=destination,
+            )
         except AppearanceError as error:
             raise StageFailure(
                 "generate.appearance_unrepresentable",
@@ -150,16 +158,15 @@ def _write_output(
                 error_type=type(error).__name__,
                 detail=error.details,
             ) from error
-        if destination.exists():
-            raise PipelineError(
-                f"Generate output already exists: {destination}"
-            )
-        destination.mkdir(parents=True)
-        emission = emit(
-            model,
-            mesh_source_root=Path(directory),
-            destination=destination,
-        )
+        except ProtocolError:
+            raise
+        except PipelineError as error:
+            raise StageFailure(
+                "generate.local_contract_failed",
+                str(error),
+                error_type=type(error).__name__,
+                detail=getattr(error, "details", None),
+            ) from error
     write_json(destination / "tool.json", tool)
     receipt = _receipt(
         command=command,
