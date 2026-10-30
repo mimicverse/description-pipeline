@@ -20,7 +20,7 @@ from ..pipeline.contracts import (
     StageEffectWait,
     StagePending,
 )
-from ..pipeline.effects import EffectIntent, EffectSettlement
+from ..pipeline.effects import EffectIntent, EffectSettlement, EffectState
 from ..platform.facts import FactStore
 
 if TYPE_CHECKING:
@@ -274,12 +274,12 @@ def _native_expectation(
 
 def _native_probe_from_environment(
     wait: StageEffectWait,
+    evidence: _EffectEvidence,
 ) -> tuple[Any, NativeOperationStatusExpectation, FactStore | None]:
     """Load one small immutable native identity without materializing its archive."""
 
     from ..pipeline.application import _native_client_from_environment
 
-    evidence = _load_effect_evidence(wait)
     if evidence.intent.effect_kind != "native_operation":
         raise ValueError("The pending effect is not a native operation")
     _kind, expected = _native_expectation(evidence)
@@ -342,12 +342,14 @@ def _wakeup(wait: StageEffectWait, changed: bool) -> EffectWakeupHint:
 
 async def _prepare_native_effect_probe(
     wait: StageEffectWait,
+    evidence: _EffectEvidence,
 ) -> EffectWaitProbe:
     from .native_operation_client import NativeOperationClientError
 
     client, expected, facts = await asyncio.to_thread(
         _native_probe_from_environment,
         wait,
+        evidence,
     )
 
     async def probe(value: StageEffectWait) -> EffectWakeupHint:
@@ -380,6 +382,7 @@ async def _prepare_native_effect_probe(
 
 async def _prepare_publish_effect_probe(
     wait: StageEffectWait,
+    evidence: _EffectEvidence,
 ) -> EffectWaitProbe:
     from ..pipeline.stages.publish import (
         PUBLICATION_PLAN,
@@ -388,7 +391,6 @@ async def _prepare_publish_effect_probe(
     )
     from .native_operation_client import MAX_OPERATION_JSON_BYTES
 
-    evidence = await asyncio.to_thread(_load_effect_evidence, wait)
     outbound = evidence.settlement.outbound_artifact
     if outbound is None:
         raise ValueError("The pending Publish effect has no outbound artifact")
@@ -432,14 +434,45 @@ async def _prepare_publish_effect_probe(
     return probe
 
 
-async def _prepare_effect_probe(wait: StageEffectWait) -> EffectWaitProbe:
-    if wait.effect_kind == "native_operation":
-        return await _prepare_native_effect_probe(wait)
-    if wait.effect_kind in {"git_ref_update", "pr_upsert"}:
-        return await _prepare_publish_effect_probe(wait)
-    raise ValueError(
-        "The pending effect kind has no read-only wake-up observer"
+def _canonical_wakeable(evidence: _EffectEvidence, wait: StageEffectWait) -> bool:
+    """A canonical result can resume the executor without another remote change."""
+
+    facts = evidence.facts
+    if facts is None:
+        raise ValueError("The pending effect has no canonical fact reader")
+    if facts.decision_for(evidence.command) is not None:
+        return True
+    settlement = facts.effect_settlement(
+        wait.effect_id, expected_command_id=wait.command_id
     )
+    return settlement.state in {
+        EffectState.SATISFIED,
+        EffectState.DEFINITELY_FAILED,
+        EffectState.CONFLICT,
+    } or settlement.resume_phase is not None
+
+
+async def _prepare_effect_probe(wait: StageEffectWait) -> EffectWaitProbe:
+    if wait.effect_kind not in {"native_operation", "git_ref_update", "pr_upsert"}:
+        raise ValueError("The pending effect kind has no read-only wake-up observer")
+    evidence = await asyncio.to_thread(_load_effect_evidence, wait)
+    remote_probe: EffectWaitProbe | None = None
+
+    async def probe(value: StageEffectWait) -> EffectWakeupHint:
+        nonlocal remote_probe
+        if value != wait:
+            raise ValueError("effect status probe names a different wait")
+        if await asyncio.to_thread(_canonical_wakeable, evidence, wait):
+            return _wakeup(wait, True)
+        if remote_probe is None:
+            remote_probe = (
+                await _prepare_native_effect_probe(wait, evidence)
+                if wait.effect_kind == "native_operation"
+                else await _prepare_publish_effect_probe(wait, evidence)
+            )
+        return await remote_probe(wait)
+
+    return probe
 
 
 async def probe_effect_wait(wait: StageEffectWait) -> EffectWakeupHint:
