@@ -245,13 +245,13 @@ export function jointRows(records) {
     .filter((record) => record && typeof record.name === "string")
     .map((record) => ({
       name: record.name,
-      type: record.type || "fixed",
+      type: typeof record.type === "string" && record.type ? record.type : "not recorded",
       lower: Number.isFinite(record.lower) ? record.lower : null,
       upper: Number.isFinite(record.upper) ? record.upper : null,
       effort: Number.isFinite(record.effort) ? record.effort : null,
       velocity: Number.isFinite(record.velocity) ? record.velocity : null,
       axis: Array.isArray(record.axis)
-        ? record.axis.map((value) => (Number.isFinite(Number(value)) ? Number(value) : null))
+        ? record.axis.map((value) => (Number.isFinite(value) ? value : null))
         : null,
     }));
 }
@@ -263,7 +263,7 @@ export function linkRows(records) {
       name: record.name,
       mass_kg: Number.isFinite(record.mass_kg) ? record.mass_kg : null,
       com_m: Array.isArray(record.com_m)
-        ? record.com_m.map((value) => (Number.isFinite(Number(value)) ? Number(value) : null))
+        ? record.com_m.map((value) => (Number.isFinite(value) ? value : null))
         : null,
       inertia_kg_m2: record.inertia_kg_m2 && typeof record.inertia_kg_m2 === "object" ? record.inertia_kg_m2 : null,
     }));
@@ -276,10 +276,10 @@ export function frameRows(frames) {
       name: frame.name,
       parent: typeof frame.parent === "string" ? frame.parent : null,
       xyz: Array.isArray(frame.xyz)
-        ? frame.xyz.map((value) => (Number.isFinite(Number(value)) ? Number(value) : null))
+        ? frame.xyz.map((value) => (Number.isFinite(value) ? value : null))
         : null,
       rpy: Array.isArray(frame.rpy)
-        ? frame.rpy.map((value) => (Number.isFinite(Number(value)) ? Number(value) : null))
+        ? frame.rpy.map((value) => (Number.isFinite(value) ? value : null))
         : null,
     }));
 }

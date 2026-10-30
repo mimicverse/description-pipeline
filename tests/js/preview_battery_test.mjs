@@ -190,6 +190,14 @@ const {
   ]);
   assert.equal(joints[0].axis[2], 1);
   assert.equal(joints[0].effort, 6);
+  const missingJoint = jointRows([{ name: "missing", axis: [null, "", false] }])[0];
+  assert.equal(missingJoint.type, "not recorded");
+  assert.deepEqual(missingJoint.axis, [null, null, null]);
+  assert.deepEqual(jointRows([{ name: "zero", type: "fixed", axis: [0, 1, -1] }])[0].axis, [0, 1, -1]);
+  assert.deepEqual(linkRows([{ name: "missing", com_m: [null, "", false] }])[0].com_m, [null, null, null]);
+  assert.deepEqual(frameRows([{ name: "missing", xyz: [null, "", false], rpy: [0, 0, 0] }])[0], {
+    name: "missing", parent: null, xyz: [null, null, null], rpy: [0, 0, 0],
+  });
   const links = linkRows([
     { name: "base_link", mass_kg: 1.25, com_m: [0, 0, 0.1], inertia_kg_m2: { ixx: 1, iyy: 1, izz: 1 } },
   ]);
