@@ -32,6 +32,7 @@ from description_pipeline.pipeline.contracts import (
     ProtocolError,
     StageEffectWait,
 )
+from description_pipeline.pipeline.effects import EffectResumePhase, EffectState
 from description_pipeline.schemas import STAGE_EFFECT_WAIT_SCHEMA
 import description_pipeline.pipeline.stages.publish as publish_stage
 
@@ -72,6 +73,17 @@ def _operation() -> dict[str, object]:
 
 
 class EffectPollTriggerTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.facts = Mock()
+        self.facts.decision_for.return_value = None
+        self.facts.effect_settlement.return_value = SimpleNamespace(
+            state=EffectState.UNKNOWN, resume_phase=None,
+        )
+        self.evidence = SimpleNamespace(facts=self.facts, command=Mock())
+        self.enterContext(patch.object(
+            airflow_effect_trigger, "_load_effect_evidence", return_value=self.evidence,
+        ))
+
     async def test_changed_observation_emits_only_the_revalidated_wait(self) -> None:
         wait = _wait()
         calls = 0
@@ -220,7 +232,7 @@ class EffectPollTriggerTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(event.payload, {"wait": wait.to_record()})
-        loader.assert_called_once_with(wait)
+        loader.assert_called_once_with(wait, self.evidence)
         self.assertEqual(client.get_operation.call_count, 2)
         sleep.assert_awaited_once_with(0.1)
 
@@ -466,6 +478,82 @@ class EffectPollTriggerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(hint.changed)
                 dispatcher.assert_awaited_once_with(wait)
 
+    async def test_canonical_results_wake_every_kind_without_a_remote_change(self) -> None:
+        for kind in ("native_operation", "git_ref_update", "pr_upsert"):
+            for state in (
+                EffectState.SATISFIED, EffectState.DEFINITELY_FAILED,
+                EffectState.CONFLICT,
+            ):
+                with self.subTest(kind=kind, state=state):
+                    wait = _wait(kind=kind)
+                    self.facts.effect_settlement.return_value = SimpleNamespace(
+                        state=state, resume_phase=None,
+                    )
+                    with (
+                        patch.object(airflow_effect_trigger, "_prepare_native_effect_probe", new=AsyncMock()) as native,
+                        patch.object(
+                            airflow_effect_trigger, "_prepare_publish_effect_probe", new=AsyncMock(),
+                        ) as publish,
+                    ):
+                        event = await anext(EffectPollTrigger(wait=wait.to_record()).run())
+                    self.assertEqual(event.payload, {"wait": wait.to_record()})
+                    native.assert_not_awaited()
+                    publish.assert_not_awaited()
+
+    async def test_canonical_decision_and_transfer_resume_wake_without_remote_access(self) -> None:
+        for decision in ("completed", "failed", "cancelled", None):
+            with self.subTest(decision=decision):
+                wait = _wait()
+                self.facts.decision_for.return_value = (
+                    SimpleNamespace(outcome=decision) if decision else None
+                )
+                self.facts.effect_settlement.return_value = SimpleNamespace(
+                    state=EffectState.UNKNOWN,
+                    resume_phase=EffectResumePhase.INPUT_TRANSFER_PENDING if decision is None else None,
+                )
+                with patch.object(
+                    airflow_effect_trigger, "_prepare_native_effect_probe", new=AsyncMock(),
+                ) as remote:
+                    hint = await probe_effect_wait(wait)
+                self.assertTrue(hint.changed)
+                remote.assert_not_awaited()
+
+    async def test_running_trigger_rereads_canonical_settlement_on_each_poll(self) -> None:
+        for kind in ("native_operation", "git_ref_update", "pr_upsert"):
+            with self.subTest(kind=kind):
+                wait = _wait(kind=kind)
+                self.facts.effect_settlement.side_effect = [
+                    SimpleNamespace(state=EffectState.UNKNOWN, resume_phase=None),
+                    SimpleNamespace(state=EffectState.DEFINITELY_FAILED, resume_phase=None),
+                ]
+                remote = AsyncMock(return_value=EffectWakeupHint(
+                    wait_digest=wait.digest, observed_at=datetime.now(UTC), changed=False,
+                ))
+                with (
+                    patch.object(
+                        airflow_effect_trigger, "_prepare_native_effect_probe", new=AsyncMock(return_value=remote),
+                    ),
+                    patch.object(
+                        airflow_effect_trigger, "_prepare_publish_effect_probe", new=AsyncMock(return_value=remote),
+                    ),
+                    patch.object(airflow_effect_trigger.asyncio, "sleep", new=AsyncMock()),
+                ):
+                    event = await anext(EffectPollTrigger(wait=wait.to_record()).run())
+                self.assertEqual(event.payload, {"wait": wait.to_record()})
+                remote.assert_awaited_once_with(wait)
+                self.facts.effect_settlement.assert_called_with(
+                    wait.effect_id, expected_command_id=wait.command_id,
+                )
+
+    async def test_canonical_read_failure_aborts_without_remote_guessing(self) -> None:
+        self.facts.decision_for.side_effect = RuntimeError("canonical reader unavailable")
+        with (
+            patch.object(airflow_effect_trigger, "_prepare_native_effect_probe", new=AsyncMock()) as remote,
+            self.assertRaisesRegex(RuntimeError, "canonical reader unavailable"),
+        ):
+            await probe_effect_wait(_wait())
+        remote.assert_not_awaited()
+
     async def test_publish_probes_use_direct_cas_root_without_materializing(self) -> None:
         for kind, probe_name in (
             ("git_ref_update", "PublishGitStatusProbe"),
@@ -505,6 +593,8 @@ class EffectPollTriggerTests(unittest.IsolatedAsyncioTestCase):
                 evidence = SimpleNamespace(
                     artifacts=artifacts,
                     settlement=SimpleNamespace(outbound_artifact=outbound),
+                    facts=self.facts,
+                    command=self.evidence.command,
                 )
                 status_probe = SimpleNamespace(
                     observe=AsyncMock(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
@@ -10,6 +11,7 @@ import tempfile
 import threading
 import unittest
 import uuid
+from unittest.mock import AsyncMock, patch
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -23,6 +25,8 @@ except ImportError:
 
 from description_pipeline.artifacts import ArtifactStore
 from description_pipeline.io import digest, write_json
+from description_pipeline.orchestration.airflow_effect_trigger import EffectPollTrigger
+from description_pipeline.pipeline.application import EffectWakeupHint
 from description_pipeline.pipeline.contracts import ArtifactRef, ExecutionClaim, ProtocolError
 from description_pipeline.pipeline.diagnostic import DiagnosticAdmissionSpec, build_diagnostic_command
 from description_pipeline.pipeline.effects import EffectState
@@ -858,6 +862,58 @@ class EffectReconciliationPostgresTests(unittest.TestCase):
         )
         self.assertEqual(replacement.fence, 2)
         self.assertEqual(self.http.trigger_count, 0)
+
+    def test_running_trigger_wakes_after_real_absence_reconciliation_without_remote_change(self) -> None:
+        command, _services, _workspace, effects, intent = self._authorize_unknown_effect("trigger-absence")
+        pending = self.facts.yield_claim_for_effect(
+            command=command, claim=effects.claim, effect_id=intent.effect_id,
+            yielded_at=self.now + timedelta(seconds=1),
+        )
+        reconciliation = EffectReconciliationService(
+            facts=self.facts, artifacts=self.artifacts,
+            work_root=self.work_root / "trigger-reconcile",
+            observer_tool_sha256=self.observer_tool,
+            clock=lambda: self.now + timedelta(seconds=2),
+        )
+        remote = AsyncMock(return_value=EffectWakeupHint(
+            wait_digest=pending.wait.digest, observed_at=self.now, changed=False,
+        ))
+
+        def reconcile_during_wait(_delay):
+            if self.facts.effect_settlement(intent.effect_id).state is not EffectState.UNKNOWN:
+                return
+            result = reconciliation.reconcile(
+                command_id=command.command_id, effect_key=intent.effect_key,
+                adapter=_AbsentAdapter("reconciled"),
+            )
+            self.assertEqual(result.settlement.state, EffectState.DEFINITELY_FAILED)
+
+        async def run_trigger():
+            return await asyncio.wait_for(
+                anext(EffectPollTrigger(wait=pending.wait.to_record(), poll_interval=0.1).run()),
+                timeout=5,
+            )
+
+        with (
+            patch.object(ArtifactStore, "from_environment", return_value=self.artifacts),
+            patch.object(FactStore, "from_environment", return_value=self.facts),
+            patch(
+                "description_pipeline.orchestration.airflow_effect_trigger._prepare_native_effect_probe",
+                new=AsyncMock(return_value=remote),
+            ),
+            patch(
+                "description_pipeline.orchestration.airflow_effect_trigger.asyncio.sleep",
+                new=AsyncMock(side_effect=reconcile_during_wait),
+            ) as sleep,
+        ):
+            event = asyncio.run(run_trigger())
+        self.assertEqual(event.payload, {"wait": pending.wait.to_record()})
+        remote.assert_awaited_once_with(pending.wait)
+        sleep.assert_awaited_once_with(0.1)
+        self.assertEqual(self._query("SELECT count(*) FROM execution_claim"), [(1,)])
+        self.assertEqual(self._query("SELECT count(*) FROM stage_decision"), [(0,)])
+        self.assertEqual(self.http.trigger_count, 0)
+        self.assertEqual(self.facts.effect_intent(intent.effect_id), intent)
 
     def test_adapter_failure_retains_unsealed_domain_evidence(self) -> None:
         command, _services, _workspace, _effects, _intent = self._authorize_unknown_effect("retained")

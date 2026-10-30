@@ -101,6 +101,8 @@ StagePending -> EffectPollTrigger -> StageTaskOperator.execute_complete
              -> StageApplication.resume_stage -> execute_stage
 ```
 
+等待器每轮先读取原命令的 canonical decision 和 effect settlement；已有结果、冲突或已批准的恢复阶段时，直接唤醒同一不可变 wait，由执行器重新核验。只有仍待观察时才读取原生端、Git 或 PR，不能要求远端再次变化才能响应已登记的对账或取消。唤醒不建立成功资格，不取得执行权，不重发外部请求。
+
 共同引擎不包含 CAD、URDF 或发布算法。各 handler 只持有所需 artifact 和 effect 端口，不能直接提交平台成功。生产组合必须完整安装六阶段、native/Git/PR 对账及 native 取消能力；测试可显式注入端口，缺失生产组件不得被当作可选功能静默忽略。
 
 Discover result 表达原生选择、prepared 输入和证据绑定，不作为第二个完整机器人模型。Generate 持久化一个 `EngineeringModel`，URDF 是其交付编码。Verify 独立读取原始证据和实际输出，不借用生成器的期望值、成功标志或缓存。共享代码限于纯数学、格式解析和无领域推导的契约基础，并用解析解、已知答案和变异反例验证。发布重验完整 certificate、execution receipt 及被验证字节。
