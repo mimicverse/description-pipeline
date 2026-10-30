@@ -581,11 +581,16 @@ class NativeCaptureFactsTests(unittest.TestCase):
             },
             "read_errors": {},
         }
+        raw["effective"]["part_measurement_raw"] = copy.deepcopy(self.raw_facts["part_mass_raw"]["base"])
         self.write_capture()
         result = verify_native_capture_facts(self.root)
         self.assertTrue(result["native_capture_facts"])
         effective = capture_evidence.effective_instances(self.root)
         self.assertEqual(set(effective["readings"]), {"base"})
+        closure = capture_evidence.mass_closure(self.root)
+        self.assertEqual(closure["component_context"]["instances"][0]["effective"], effective["readings"]["base"])
+        self.assertEqual(effective["readings"]["base"]["mass"], 1.0)
+        self.assertEqual(effective["readings"]["base"]["part_measurement"]["mass_kg"], 2.0)
         self.assertEqual(
             [row["code"] for row in effective["warnings"]],
             ["cad_instance_override_effective"],

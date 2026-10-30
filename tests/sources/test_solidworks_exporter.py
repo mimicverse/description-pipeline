@@ -121,7 +121,7 @@ def raw_record() -> dict:
         name: hashlib.sha256(b"native-file-test").hexdigest()
         for name in ("robot.SLDASM", "base.SLDPRT", "arm.SLDPRT")
     }
-    return {
+    result = {
         "schema_version": DISCOVERY_SCHEMA,
         "identity": {
             "hardware_id": "wire_test",
@@ -192,6 +192,11 @@ def raw_record() -> dict:
         ],
     }
 
+    from .selection_support import seal_fixture_open_observation
+
+    seal_fixture_open_observation(result)
+    return result
+
 
 def native_limit_mate(lower: float, upper: float) -> dict:
     return {
@@ -223,6 +228,7 @@ def native_limit_mate(lower: float, upper: float) -> dict:
         ],
         "limits": {"unit": "rad", "lower": lower, "upper": upper},
     }
+
 
 
 class ExporterWireTests(unittest.TestCase):

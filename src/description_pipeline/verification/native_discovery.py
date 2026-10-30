@@ -1153,6 +1153,15 @@ def _require_saved_state_open(payload: dict) -> dict:
     scoped = closure.get("observed_occurrences")
     if not isinstance(scoped, list):
         raise _Failure("discovery.saved_state", "the saved-state occurrence scope is missing")
+    if any(
+        not isinstance(row, dict)
+        or not isinstance(row.get("instance"), str) or not row["instance"]
+        or not isinstance(row.get("configuration"), str) or not row["configuration"]
+        or type(row.get("suppression_state")) is not int
+        or row["suppression_state"] not in {0, 1, 2, 3, 4}
+        for row in scoped
+    ):
+        raise _Failure("discovery.saved_state", "the saved-state occurrence scope has malformed native fields")
     expected = {
         row.get("instance"): (row.get("configuration"), row.get("suppression_state"))
         for row in scoped if isinstance(row, dict)

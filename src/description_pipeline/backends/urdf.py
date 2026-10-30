@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import shutil
 import struct
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
-from ..io import PipelineError, confined, file_digest, format_number
+from ..io import PipelineError, canonical_json_value, confined, file_digest, format_number
 from ..geometry.native_tessellation import native_stl_subset
 from ..geometry.stl import MESH_PART_TRIANGLES_MAX
 from ..model import EngineeringModel
@@ -116,7 +115,7 @@ def generate_urdf(model: EngineeringModel, source: Path, destination: Path) -> P
                 detail["provenance"] = subject
                 # JSON escapes retain exact source names without admitting an
                 # XML comment terminator from an authored name or message.
-                payload = json.dumps(detail, ensure_ascii=True, sort_keys=True).replace("--", r"\u002d\u002d")
+                payload = canonical_json_value(detail, ensure_ascii=True).replace("--", r"\u002d\u002d")
                 code = str(warning["code"]).replace("--", "- -")
                 document.append(ET.Comment(f"WARNING {code}: {payload} See reports/verification-certificate.json."))
     for link in data["links"]:

@@ -135,6 +135,13 @@ class SavedStatePipelineTests(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "occurrence scope differs"):
             _require_saved_state_open({"raw": raw})
 
+    def test_clean_scope_requires_exact_native_field_types(self) -> None:
+        for state in (2.0, True, "2", None, -1, 5):
+            raw = fixture.capture_record()
+            raw["source_selection"]["closure"]["observed_occurrences"][0]["suppression_state"] = state
+            with self.subTest(state=state), self.assertRaisesRegex(Exception, "malformed native fields"):
+                _require_saved_state_open({"raw": raw})
+
     def test_saved_state_discovery_findings_are_readable_by_the_registered_report(self) -> None:
         from description_pipeline.orchestration.report_view import registered_discovery_record
         from description_pipeline.schemas import NATIVE_DISCOVERY_FINDING_SCHEMA

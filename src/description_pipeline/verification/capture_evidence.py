@@ -279,6 +279,36 @@ def _raw_geometry(root: Path, observation: dict) -> dict[str, dict]:
     return result
 
 
+def _effective_measurement(raw: dict, *, positive_products: bool, label: str) -> dict:
+    """Retain the effective reading and its independently measured part comparison."""
+
+    reading = _raw_measurement(raw, positive_products=positive_products, label=label)
+    part_raw = raw.get("part_measurement_raw")
+    if isinstance(part_raw, dict):
+        part = _raw_measurement(
+            part_raw,
+            positive_products=positive_products,
+            label=f"{label} part measurement",
+        )
+        part_reference = part.get("reference") or {}
+        reading["part_measurement"] = {
+            "mass_kg": part["mass"],
+            "center_of_mass_m": part["com"],
+            "inertia_kg_m2": part["inertia"],
+            "scope": part_reference.get("scope"),
+            "used_api": part_reference.get("used_api"),
+            "product_convention": part_reference.get(
+                "product_convention"
+            ),
+            **{
+                key: part_reference.get(key)
+                for key in ("volume_m3", "density_kg_m3")
+                if key in part_reference
+            },
+        }
+    return reading
+
+
 def _effective_readings(
     observation: dict,
     positive_products: bool,
@@ -294,37 +324,11 @@ def _effective_readings(
                 raise PipelineError("raw component mass context has no identity")
             effective = raw.get("effective")
             if isinstance(effective, dict):
-                reading = _raw_measurement(
+                reading = _effective_measurement(
                     effective,
                     positive_products=positive_products,
                     label=f"effective instance {raw['name']}",
                 )
-                part_raw = effective.get("part_measurement_raw")
-                if isinstance(part_raw, dict):
-                    part = _raw_measurement(
-                        part_raw,
-                        positive_products=positive_products,
-                        label=(
-                            f"effective instance {raw['name']} "
-                            "part measurement"
-                        ),
-                    )
-                    part_reference = part.get("reference") or {}
-                    reading["part_measurement"] = {
-                        "mass_kg": part["mass"],
-                        "center_of_mass_m": part["com"],
-                        "inertia_kg_m2": part["inertia"],
-                        "scope": part_reference.get("scope"),
-                        "used_api": part_reference.get("used_api"),
-                        "product_convention": part_reference.get(
-                            "product_convention"
-                        ),
-                        **{
-                            key: part_reference.get(key)
-                            for key in ("volume_m3", "density_kg_m3")
-                            if key in part_reference
-                        },
-                    }
                 readings[raw["name"]] = reading
     parts = observation.get("part_mass_raw")
     if not isinstance(parts, dict):
@@ -332,7 +336,7 @@ def _effective_readings(
     for name, raw in sorted(parts.items()):
         if not isinstance(raw, dict) or raw.get("mode") != "effective_instance":
             continue
-        reading = _raw_measurement(
+        reading = _effective_measurement(
             raw,
             positive_products=positive_products,
             label=f"effective part {name}",
@@ -541,7 +545,7 @@ def mass_closure(root) -> dict:
                     None if volume is None else float(volume)
                 ),
                 "effective": (
-                    _raw_measurement(
+                    _effective_measurement(
                         effective,
                         positive_products=positive_products,
                         label=f"effective instance {raw['name']}",

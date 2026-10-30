@@ -119,10 +119,13 @@ def _canonical_value(value: Any) -> Any:
     return value
 
 
-def canonical_json_value(value: object) -> str:
+def canonical_json_value(value: object, *, ensure_ascii: bool = False) -> str:
     """One stable JSON text form for warning identity, ordering, and display."""
 
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return json.dumps(
+        _canonical_value(value), ensure_ascii=ensure_ascii, sort_keys=True,
+        separators=(",", ":"), allow_nan=False, default=str,
+    )
 
 
 def canonical(data: Any) -> bytes:
