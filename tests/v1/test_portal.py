@@ -3670,7 +3670,7 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(run["findings"][0]["id"], "native.observation")
         self.assertIs(run["findings"][0]["blocking"], False)
         warning_codes = {
-            item["code"] for item in run["report"]["warnings"]["items"]
+            item["code"] for stage in run["report"]["stages"] for item in stage.get("warnings", [])
         }
         self.assertEqual(
             warning_codes,
@@ -3688,6 +3688,36 @@ class PortalTests(unittest.TestCase):
             {item["code"] for item in preview["warnings"]},
             {"input.name", "native.observation"},
         )
+
+    def test_native_certificate_inventory_reaches_all_stages_and_preview(self) -> None:
+        from description_pipeline.verification.solidworks_urdf import native_gate_warning_diagnostics
+        from tests.v1.test_native_scope_warning_projection import raw_warnings
+
+        run_id, discovery = self._seed_registered_warning_run()
+        observations = native_gate_warning_diagnostics({"warnings": raw_warnings()})
+        report = {"passed": False, "diagnostics": observations, "checks": [{
+            "id": "geometry.native_tessellation", "state": "passed", "passed": True,
+            "details": {"warnings": observations},
+        }]}
+        self._register_attempt(run_id, {
+            "urdf/robot.urdf": b"<robot name='fixture'/>",
+            "reports/diagnostic.json": json.dumps(report).encode(),
+            "input/handoff.json": b'{"warnings":[]}',
+            "input/discovery/native-discovery.json": json.dumps(discovery).encode(),
+        }, verified=False)
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
+        self.assertEqual(status, 200, body)
+        stages = json.loads(body)["report"]["stages"]
+        self.assertEqual(len(stages), 6)
+        code = observations[0]["code"]
+        for stage in stages:
+            native = [row for row in stage.get("warnings", []) if row["code"] == code]
+            self.assertEqual(len(native), 1 if stage["id"] == "verify" else 0)
+        status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}/preview")
+        self.assertEqual(status, 200, body)
+        warnings = json.loads(body)["warnings"]
+        native = next(row for row in warnings if row["code"] == code)
+        self.assertEqual({key: native[key] for key in observations[0]["detail"]}, observations[0]["detail"])
 
     def test_registered_discovery_defects_refuse_run_and_preview(self) -> None:
         self.client.login()
@@ -4195,7 +4225,6 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(status, 404)
         viewer = (self.static_dir / "viewer.js").read_text(encoding="utf-8")
         self.assertIn('from "/static/vendor/three.module.min.js"', viewer)
-        self.assertIn('querySelector("limit")', viewer)
         self.assertIn("<!doctype", viewer.lower())
         for name in ("index.html", "app.js", "viewer.js", "style.css"):
             source = (self.static_dir / name).read_text(encoding="utf-8")

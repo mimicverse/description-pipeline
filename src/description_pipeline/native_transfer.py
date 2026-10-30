@@ -31,7 +31,7 @@ from .io import (
 )
 from .request_evidence import read_request_evidence
 from .runtime import RUNTIME_HOSTS, RUNTIME_VERSIONS, python_version_is_supported, required_packages
-from .schemas import TOOL_SCHEMA, NATIVE_DISCOVERY_SCHEMA
+from .schemas import TOOL_SCHEMA, NATIVE_DISCOVERY_SCHEMA, NATIVE_CAPTURE_FACTS
 from .sources.snapshot import verify_snapshot
 from .sources.solidworks.capture_projection import (
     load_native_capture_observation,
@@ -85,7 +85,7 @@ _CANONICAL_EVIDENCE = frozenset(
         "evidence/manifest.json",
         "evidence/native-runtime.json",
         "evidence/raw/dependency_closure.json",
-        "evidence/raw/native_capture_facts.json",
+        f"evidence/{NATIVE_CAPTURE_FACTS}",
     }
 )
 

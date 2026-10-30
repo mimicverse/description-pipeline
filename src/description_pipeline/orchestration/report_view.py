@@ -14,11 +14,10 @@ from __future__ import annotations
 from pathlib import PureWindowsPath
 
 from ..geometry.native_scope import (
-    NATIVE_GATE_WARNING_CODES,
     NATIVE_SCOPE_IDENTITY_WARNING_CODES,
-    native_gate_warning_details_match,
 )
 from ..io import PipelineError, canonical_json_value
+from ..pipeline.verify_contract import validate_certificate_diagnostics
 from ..schemas import (
     NATIVE_DISCOVERY_BUDGET_KEYS,
     NATIVE_DISCOVERY_CONTROL_KEYS,
@@ -1053,110 +1052,183 @@ def _warning_row(stage: dict, item: dict) -> dict:
     return row
 
 
+WARNING_SOURCE_LIMIT = 8
+_DISPLAY_EXCERPT_LIMIT = 256
+
+
+def _display_value(value, location):
+    """Bound a display example explicitly; complete values stay in the certificate."""
+
+    text = canonical_json_value(value)
+    if len(text) <= _DISPLAY_EXCERPT_LIMIT:
+        return value
+    return {
+        "excerpt": text[:_DISPLAY_EXCERPT_LIMIT],
+        "omitted_characters": len(text) - _DISPLAY_EXCERPT_LIMIT,
+        "complete_record": location,
+    }
+
+
+def _display_check_details(details: dict, location: dict) -> dict:
+    text = canonical_json_value(details)
+    if len(text) <= 2048:
+        return details
+    return {
+        "excerpt": text[:1024],
+        "omitted_characters": len(text) - 1024,
+        "complete_record": location,
+    }
+
+
+def warning_summaries(
+    records: list[dict], stage: dict | None = None, *,
+    location: dict | None = None, certificate: dict | None = None,
+) -> list[dict]:
+    """Show every code/message category with counted, located source examples."""
+
+    def identity_without_display_source(item):
+        identity = dict(item)
+        if identity.get("source") in ("input", "discovery", "verification"):
+            identity.pop("source")
+        return canonical_json_value(identity)
+
+    certified = {
+        identity_without_display_source(item)
+        for item in (certificate or {}).get("diagnostics", [])
+    }
+    groups = {}
+    locations = {}
+    for item in records:
+        origin = location
+        if origin is None and identity_without_display_source(item) in certified:
+            origin = {"stage": "verify", "record": "reports/verification-certificate.json"}
+        if origin is None:
+            origin = {
+                "input": {"stage": "capture", "record": "input/handoff.json"},
+                "discovery": {"stage": "discover", "record": "input/discovery/native-discovery.json"},
+            }.get(item.get("source"), {"record": "registered source record"})
+        identity = (item["code"], str(item.get("message") or ""), canonical_json_value(origin))
+        locations[identity] = origin
+        groups.setdefault(identity, []).append(item)
+    summaries = []
+    for identity, items in sorted(groups.items()):
+        origin = locations[identity]
+        first = _warning_row(stage or {}, items[0])
+        summary = {
+            key: _display_value(value, origin) for key, value in first.items()
+            if key not in {"objects", "detail", "message"}
+        }
+        message = identity[1]
+        summary["message"] = message if len(message) <= 1024 else message[:1024] + " [excerpt; see certificate]"
+        examples = []
+        records_shown = 0
+        source_rows_total = 0
+        for item in items:
+            detail = item.get("detail") if isinstance(item.get("detail"), dict) else {}
+            objects = item.get("objects", detail.get("objects"))
+            sources = objects if isinstance(objects, list) and objects else [None]
+            source_rows_total += len(sources)
+            if len(examples) >= WARNING_SOURCE_LIMIT:
+                continue
+            context = _warning_row(stage or {}, item)
+            shown = False
+            for subject in sources:
+                if len(examples) >= WARNING_SOURCE_LIMIT:
+                    break
+                located = {**context, **(subject if isinstance(subject, dict) else {})}
+                examples.append({
+                    key: _display_value(value, origin) for key, value in located.items()
+                    if key not in {"objects", "detail", "stage", "stage_name", "label", "state_label"}
+                })
+                shown = True
+            records_shown += int(shown)
+        summary.update(
+            warning_summary=True, record_location=origin, records_total=len(items), records_shown=records_shown,
+            records_omitted=len(items) - records_shown, source_rows_total=source_rows_total,
+            source_rows_shown=len(examples), source_rows_omitted=source_rows_total - len(examples),
+            objects=examples,
+        )
+        summaries.append(summary)
+    return summaries
+
+
 def _recorded_warnings(
     stage: dict,
     findings: list,
     rows: list[dict],
-    quality_diagnostics: list[dict] | None = None,
+    quality: dict | None = None,
 ) -> list[dict]:
-    """Warnings from recorded evidence only: non-blocking findings and check diagnostics."""
+    """Render stage observations, using the certificate inventory only for Verify."""
 
     warnings: list[dict] = []
+    if stage.get("id") == "verify" and quality is not None:
+        if not isinstance(quality, dict):
+            raise PipelineError("Quality certificate is malformed")
+        validate_certificate_diagnostics(quality)
+        diagnostics = quality["diagnostics"]
+        for code in {METADATA_WARNING_CODE, SAVED_STATE_WARNING_CODE}:
+            if sum(item["code"] == code for item in diagnostics) > 1:
+                raise PipelineError(f"{code} diagnostics are duplicated")
+        return warning_summaries(
+            [item for item in diagnostics if item["blocking"] is False], stage,
+            location={"stage": "verify", "record": "reports/verification-certificate.json"},
+        )
+    summaries = []
     if stage.get("id") == "discover":
         findings = _validated_discovery_findings(findings)
-    if quality_diagnostics is not None and not isinstance(
-        quality_diagnostics,
-        list,
-    ):
-        raise PipelineError("Quality diagnostics are malformed")
-    native_diagnostics = [
-        item
-        for item in quality_diagnostics or []
-        if isinstance(item, dict)
-        and item.get("code") in NATIVE_GATE_WARNING_CODES
-    ]
-    projection_compared = False
-    native_gate_seen = False
-    if stage.get("id") == "discover":
-        warnings.extend(
-            _warning_row(stage, item)
-            for item in findings
-            if isinstance(item, dict) and item.get("blocking") is False and item.get("code")
-        )
+        summaries.extend(warning_summaries(
+            [item for item in findings if item["blocking"] is False], stage,
+            location={"stage": "discover", "record": "input/discovery/native-discovery.json"},
+        ))
     for row in rows:
         details = row.get("raw_details")
-        row_passed = (
-            row.get("state") == "passed" or row.get("passed") is True
-        )
-        if row.get("id") == "geometry.native_tessellation" and row_passed:
-            native_gate_seen = True
-        recorded = details.get("warnings") if isinstance(details, dict) else None
-        if stage.get("id") == "capture" and row.get("id") == "input.valid":
-            warnings.extend(
-                _warning_row(stage, item)
-                for item in registered_handoff_warnings(recorded)
-            )
+        if not isinstance(details, dict):
             continue
-        if isinstance(recorded, list):
-            raw_native = [
-                item
-                for item in recorded
-                if isinstance(item, dict)
-                and item.get("code") in NATIVE_GATE_WARNING_CODES
-            ]
-            if row.get("id") == "geometry.native_tessellation" and row_passed and not any(
-                item.get("code") in NATIVE_SCOPE_IDENTITY_WARNING_CODES for item in raw_native
-            ):
-                raise PipelineError(
-                    "Passed native tessellation gate carries no scope identity warnings"
+        recorded = details.get("warnings")
+        if stage.get("id") == "capture" and row.get("id") == "input.valid":
+            recorded = registered_handoff_warnings(recorded)
+        warnings = []
+        for group in (recorded, details.get("diagnostics")):
+            if isinstance(group, list):
+                warnings.extend(
+                    _warning_row(stage, item) for item in group
+                    if isinstance(item, dict) and item.get("code") and item.get("blocking") is False
                 )
-            if raw_native:
-                if not native_gate_warning_details_match(
-                    native_diagnostics,
-                    recorded,
-                ):
-                    raise PipelineError(
-                        "Native gate warnings differ from quality diagnostics"
-                    )
-                projection_compared = True
-                recorded = native_diagnostics
-            warnings.extend(
-                _warning_row(stage, item) for item in recorded
-                if isinstance(item, dict) and item.get("code") and item.get("blocking") is False
-            )
-        elif row.get("id") == "geometry.native_tessellation" and row_passed:
-            raise PipelineError(
-                "Passed native tessellation gate carries no warning list"
-            )
-        diagnostics = details.get("diagnostics") if isinstance(details, dict) else None
-        if isinstance(diagnostics, list):
-            warnings.extend(
-                _warning_row(stage, item) for item in diagnostics
-                if isinstance(item, dict) and item.get("code") and item.get("blocking") is False
-            )
-    if native_diagnostics and (
-        not projection_compared or not native_gate_seen
-    ):
-        raise PipelineError(
-            "Native gate diagnostics have no matching gate warnings"
-        )
-    if stage.get("id") == "verify":
-        standalone_diagnostics = [
-            item
-            for item in quality_diagnostics or []
-            if isinstance(item, dict)
-            and item.get("code")
-            and item.get("blocking") is False
-        ]
-        for code in {METADATA_WARNING_CODE, SAVED_STATE_WARNING_CODE}:
-            matching = [item for item in standalone_diagnostics if item.get("code") == code]
-            if len(matching) > 1:
-                raise PipelineError(f"{code} diagnostics are duplicated")
-        for item in standalone_diagnostics:
-            warning = _warning_row(stage, item)
-            if warning not in warnings:
-                warnings.append(warning)
-    return merge_warnings(warnings)
+        origin = _stage_check_location(stage.get("id"), row.get("id"))
+        if stage.get("id") == "capture" and row.get("id") == "input.valid":
+            origin = {"stage": "capture", "record": "input/handoff.json", "check": "input.valid"}
+        summaries.extend(warning_summaries(merge_warnings(warnings), stage, location=origin))
+    return summaries
+
+
+def _stage_check_location(stage_id, identifier, *, independent=False):
+    if independent:
+        record = "reports/verification-certificate.json"
+    elif stage_id == "capture":
+        record = "reports/native-stages.json"
+    else:
+        record = "checks.json"
+    location = {"stage": stage_id, "record": record, "check": identifier}
+    if stage_id == "capture" and identifier == "input.valid":
+        location["warning_record"] = "input/handoff.json"
+    return location
+
+
+def display_stage_view(view: dict) -> dict:
+    """Bound outgoing QC details after their complete observations were consumed."""
+
+    stages = []
+    for stage in view.get("stages", []):
+        displayed = dict(stage)
+        for boundary in ("input", "output"):
+            displayed[f"{boundary}_qc"] = [
+                {**check, "details": _display_check_details(
+                    check.get("details") or {}, _stage_check_location(stage.get("id"), check.get("id")),
+                )}
+                for check in stage.get(f"{boundary}_qc", [])
+            ]
+        stages.append(displayed)
+    return {**view, "stages": stages}
 
 
 def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
@@ -1241,8 +1313,12 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
             stage,
             discovery_findings,
             [*boundary_rows, *independent_rows],
-            quality.get("diagnostics"),
+            quality if stage.get("id") == "verify" and quality else None,
         )
+        for rows, independent in ((boundary_rows, False), (independent_rows, True)):
+            for row in rows:
+                location = _stage_check_location(stage.get("id"), row.get("id"), independent=independent)
+                row["raw_details"] = _display_check_details(row["raw_details"], location)
         stage_out = {
             "id": stage.get("id"),
             "name": stage.get("name"),
@@ -1255,7 +1331,7 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
             "counts": {
                 "boundary": _counts(boundary_rows),
                 "independent": _counts(independent_rows) if independent_rows else None,
-                "warnings": len(warning_rows),
+                "warnings": sum(item["records_total"] for item in warning_rows),
             },
             "boundary": boundary_rows,
             "files": [
@@ -1371,11 +1447,13 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
             "mass_closure": measured_closure,
         },
         "warnings": {
-            "total": len(warning_items),
-            "items": warning_items,
+            "total": sum(item["records_total"] for item in warning_items),
+            "categories": len(warning_items),
             "note": (
                 "Warnings are recorded, non-blocking observations. They are neither passes nor "
-                "acceptance conclusions; review them through the corresponding stage checklist."
+                "acceptance conclusions. Every code/message category is shown with at most eight located "
+                "source examples and explicit omitted counts. Complete values remain in the located "
+                "registered source records."
             ),
         },
         "stages": stages_out,

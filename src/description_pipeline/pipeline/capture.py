@@ -44,6 +44,7 @@ from ..sources.solidworks.revision import package_inventory
 from ..sources.solidworks.selection import selection_bindings
 from ..schemas import (
     CAPTURE_EFFECT_FAILURE_SCHEMA,
+    NATIVE_CAPTURE_FACTS,
     NATIVE_CAPTURE_EFFECT_SCHEMA,
     NATIVE_CAPTURE_OPERATION_SCHEMA,
     NATIVE_TOOL_REQUIREMENT_KIND,
@@ -1556,7 +1557,7 @@ class CaptureHandler:
                 "manifest": manifest,
                 "native_capture_facts": file_digest(
                     admitted
-                    / "evidence/raw/native_capture_facts.json"
+                    / "evidence" / NATIVE_CAPTURE_FACTS
                 ),
                 "object_set_sha256": digest(list(inputs.object_names)),
                 "upstream_artifacts": _upstream_records(inputs),

@@ -43,6 +43,7 @@ from urllib import parse as urlparse
 from urllib import request as urlrequest
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
+from ..pipeline.verify_contract import validate_certificate_diagnostics
 from ..stages import (
     CONTRACT,
     CONTRACT_FILE_SHA256,
@@ -52,11 +53,7 @@ from ..stages import (
     stage_display_state,
     stage_view,
 )
-from ..geometry.native_scope import (
-    NATIVE_GATE_WARNING_CODES,
-    NATIVE_SCOPE_IDENTITY_WARNING_CODES,
-    native_gate_warning_details_match,
-)
+
 from ..artifacts import ArtifactStore
 from .airflow_client import (
     EndpointProtocolError,
@@ -102,6 +99,8 @@ from .run_ownership import (
     recorded_actor_principal,
 )
 from .report_view import (
+    _display_check_details, _display_value, display_stage_view,
+    warning_summaries,
     build_report,
     merge_warnings,
     registered_discovery_record,
@@ -300,57 +299,10 @@ def _quality_warnings(report: dict | None) -> list[dict]:
         "diagnostics",
         code_required=True,
     )
-    native_warnings = [
-        item
-        for item in diagnostics
-        if str(item["code"]) in NATIVE_GATE_WARNING_CODES
-    ]
-    native_gate_warnings = None
-    native_gate_passed = False
-    for check in (report or {}).get("checks") or []:
-        if (
-            isinstance(check, dict)
-            and check.get("id") == "geometry.native_tessellation"
-        ):
-            native_gate_passed = (
-                check.get("state") == "passed"
-                or check.get("passed") is True
-            )
-            details = check.get("details")
-            gate_warning_rows = (
-                details.get("warnings")
-                if isinstance(details, dict)
-                else None
-            )
-            if isinstance(gate_warning_rows, list):
-                native_gate_warnings = gate_warning_rows
-            break
-    raw_native = [
-        item
-        for item in native_gate_warnings or []
-        if isinstance(item, dict)
-        and str(item.get("code")) in NATIVE_GATE_WARNING_CODES
-    ]
-    if (
-        native_gate_passed
-        and not any(
-            item.get("code") in NATIVE_SCOPE_IDENTITY_WARNING_CODES
-            for item in raw_native
-        )
-    ) or (
-        (native_warnings or raw_native)
-        and (
-            native_gate_warnings is None
-            or not native_gate_warning_details_match(
-                native_warnings,
-                native_gate_warnings,
-            )
-        )
-    ):
-        raise PortalError(
-            HTTPStatus.BAD_GATEWAY,
-            "Registered native identity warning projection is incomplete or forged",
-        )
+    try:
+        validate_certificate_diagnostics(report or {})
+    except PipelineError as error:
+        raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
     for item in diagnostics:
         if item.get("blocking") is not False:
             # Only an explicit non-blocking diagnostic is a warning.  A
@@ -1003,7 +955,11 @@ def _discovery_evidence(detail: object, digest: str) -> dict:
     """One finding's diagnostic payload, always bound to the raw discovery record digest."""
     evidence: dict = {}
     if detail not in (None, "", [], {}):
-        evidence["detail"] = detail
+        location = {"stage": "discover", "record": "input/discovery/native-discovery.json"}
+        evidence["detail"] = (
+            _display_check_details(detail, location) if isinstance(detail, dict)
+            else _display_value(detail, location)
+        )
     if digest:
         evidence["discovery_sha256"] = digest
     return evidence
@@ -1024,7 +980,7 @@ def _registered_error_stage(job: dict) -> str:
 
 
 def _findings(job: dict | None) -> list[dict]:
-    """Native findings with object/message/evidence, exactly as the endpoint persists them.
+    """Native finding identities and explicit evidence excerpts over sealed source records.
 
     The endpoint's ``discovery.findings`` entries are
     ``{schema_version, code, object, message, detail, blocking}``; ``detail`` is the diagnostic
@@ -1171,7 +1127,12 @@ def _automatic_summary(
     result = job.get("result") if isinstance(job.get("result"), dict) else {}
     discovery = job.get("discovery") if isinstance(job.get("discovery"), dict) else {}
     quality = result.get("quality") if isinstance(result.get("quality"), dict) else {}
-    checks = [check for check in quality.get("checks") or [] if isinstance(check, dict)]
+    checks = [
+        {**check, "details": _display_check_details(check.get("details") or {}, {
+            "stage": "verify", "record": "reports/verification-certificate.json", "check": check.get("id"),
+        })}
+        for check in quality.get("checks") or [] if isinstance(check, dict)
+    ]
     if status == "unresolved":
         waiting = _waiting_for_effect_results(projection, now or datetime.now(UTC))
         message = (
@@ -2378,7 +2339,7 @@ class PortalApp:
                 "revision": display_job["discovery"].get("revision"),
                 "discovery_sha256": display_job["discovery"].get("discovery_sha256"),
             },
-            "stage_view": stage_view_payload,
+            "stage_view": display_stage_view(stage_view_payload),
             "report": report,
             "verification_reports": self._verification_report_links(dag_run_id, projection),
             "findings": _findings(display_job),
@@ -3687,10 +3648,12 @@ class PortalApp:
         }
         if verified:
             warnings = _preview_warnings(_quality_warnings(certificate))
+            warning_groups = warning_summaries(warnings, certificate=certificate)
             payload.update(
                 {
-                    "warnings": warnings[:_PREVIEW_LIMIT],
+                    "warnings": warning_groups,
                     "warnings_total": len(warnings),
+                    "warning_categories_total": len(warning_groups),
                 }
             )
         else:
@@ -3716,6 +3679,7 @@ class PortalApp:
                     }
                 ),
             )
+            warning_groups = warning_summaries(warnings, certificate=certificate)
             payload.update(
                 {
                     "reason": (
@@ -3743,8 +3707,9 @@ class PortalApp:
                     ),
                     "failing_checks": failing[:_PREVIEW_LIMIT],
                     "failing_checks_total": len(failing),
-                    "warnings": warnings[:_PREVIEW_LIMIT],
+                    "warnings": warning_groups,
                     "warnings_total": len(warnings),
+                    "warning_categories_total": len(warning_groups),
                 }
             )
         return payload

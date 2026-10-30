@@ -69,6 +69,7 @@ def quality_rows() -> dict:
         "passed": True,
         "subject_sha256": SHA,
         "checks": rows,
+        "diagnostics": [],
         "required_checks": [row["id"] for row in rows],
     }
 
@@ -232,7 +233,7 @@ class ReportViewTests(unittest.TestCase):
             for value in (True, None, "false"):
                 diagnostic = {"code": "recorded.failure", "blocking": value}
                 rows = [{"id": "check", "state": "failed", "raw_details": {field: [diagnostic]}}]
-                self.assertEqual(_recorded_warnings({"id": "verify"}, [], rows, []), [])
+                self.assertEqual(_recorded_warnings({"id": "verify"}, [], rows, None), [])
                 with self.assertRaises(PipelineError):
                     _warning_row({"id": "verify"}, diagnostic)
 
@@ -253,11 +254,16 @@ class ReportViewTests(unittest.TestCase):
         ]
         delivered = _delivery_warnings({"input/handoff.json": json.dumps({"warnings": rows}).encode()})
         preview = _preview_warnings(rows, delivered)
-        report = _recorded_warnings({"id": "verify", "name": "Verify"}, [], [], rows)
+        report = _recorded_warnings({"id": "verify", "name": "Verify"}, [], [], {"diagnostics": rows, "checks": []})
         self.assertEqual(len(preview), 2)
-        self.assertEqual(len(report), 2)
+        self.assertEqual(len(report), 1)
+        self.assertEqual(report[0]["records_total"], 2)
+        self.assertEqual(len(report[0]["objects"]), 2)
         for expected in rows:
-            for projected in (delivered, preview, report):
+            example = next(row for row in report[0]["objects"] if row["component"] == expected["component"])
+            self.assertEqual({key: example[key] for key in expected if key != "objects"},
+                             {key: value for key, value in expected.items() if key != "objects"})
+            for projected in (delivered, preview):
                 actual = next(row for row in projected if row["component"] == expected["component"])
                 self.assertEqual({key: actual[key] for key in expected}, expected)
         other_source = {**rows[0], "source": "independent_native_observation"}
@@ -942,7 +948,7 @@ class ReportViewTests(unittest.TestCase):
         self.assertEqual(report["overall"]["engineering_state"], "external_review")
         self.assertEqual(report["warnings"]["total"], 3)
         self.assertEqual(
-            {row["code"] for row in report["warnings"]["items"]},
+            {row["code"] for row in [row for stage in report["stages"] for row in stage.get("warnings", [])]},
             {
                 "discovery.exporter_membership_uncovered",
                 "discovery.joint_limits_degenerate",
@@ -950,25 +956,26 @@ class ReportViewTests(unittest.TestCase):
             },
         )
         stages = {stage["id"]: stage for stage in report["stages"]}
+        warnings = [row for stage in report["stages"] for row in stage.get("warnings", [])]
         self.assertEqual(stages["discover"]["counts"]["warnings"], 3)
         uncovered = next(
-            row for row in report["warnings"]["items"] if row["code"] == "discovery.exporter_membership_uncovered"
+            row for row in warnings if row["code"] == "discovery.exporter_membership_uncovered"
         )
         self.assertEqual(uncovered["label"], "Unassigned instances remain (geometry and mass retained)")
         self.assertEqual(uncovered["components"], ["unowned-1", "unowned-2"])
         self.assertEqual(uncovered["mass_kg"], 0.42)
         degenerate = next(
-            row for row in report["warnings"]["items"] if row["code"] == "discovery.joint_limits_degenerate"
+            row for row in warnings if row["code"] == "discovery.joint_limits_degenerate"
         )
         self.assertEqual(degenerate["object"], "joint:r_knee")
         self.assertEqual(degenerate["limits"], {"lower": 0.0, "upper": 0.0})
         self.assertEqual(degenerate["state_label"], "Warning")
-        for row in report["warnings"]["items"]:
+        for row in warnings:
             with self.subTest(code=row["code"]):
                 self.assertEqual(row["state_label"], "Warning")
                 self.assertIs(row["blocking"], False)
                 self.assertNotIn("Passed", row["state_label"])
-        self.assertNotIn("link_name_missing", {row["code"] for row in report["warnings"]["items"]})
+        self.assertNotIn("link_name_missing", {row["code"] for row in warnings})
         self.assertNotIn(
             "Unassigned instances remain (geometry and mass retained)",
             stages["discover"]["automatic"]["passed_labels"],
@@ -1011,6 +1018,10 @@ class ReportViewTests(unittest.TestCase):
                 },
             }
         )
+        from description_pipeline.pipeline.verify_contract import index_check_diagnostics, verification_diagnostics
+        quality = job["result"]["quality"]
+        quality["diagnostics"] = verification_diagnostics(quality)
+        quality["checks"] = index_check_diagnostics(quality["checks"], quality["diagnostics"])
         report = build_report(job)
         self.assertEqual(report["overall"]["state"], "passed")
         self.assertEqual(report["overall"]["engineering_state"], "external_review")
@@ -1026,7 +1037,7 @@ class ReportViewTests(unittest.TestCase):
         self.assertEqual(warning["components"], ["hip-1", "thigh_link-1"])
         self.assertEqual(warning["links"], ["r_thigh_yaw", "r_thigh_roll"])
         for key, value in {"max_abs_residual": 1.0, "max_normalized_residual": 1.0, "threshold": 1e-6}.items():
-            self.assertEqual(warning["detail"][key], value)
+            self.assertEqual(warning[key], value)
         check = next(row for row in verify["independent"] if row["id"] == "discovery.declarations")
         self.assertEqual(check["state"], "passed")
 
@@ -1036,12 +1047,12 @@ class ReportViewTests(unittest.TestCase):
             {"code": code, "blocking": False, "object": "joint:left", "detail": {"hardware_qualified": False}}
             for code in ("limits.default_policy", "input.cad_revision_absent", "urdf.motion_unqualified")
         ]
-        job["result"]["quality"]["diagnostics"] = [*diagnostics, diagnostics[0]]
+        job["result"]["quality"]["diagnostics"] = diagnostics
         report = build_report(job)
         verify = next(stage for stage in report["stages"] if stage["id"] == "verify")
         warnings = [row for row in verify["warnings"] if row["code"] in {d["code"] for d in diagnostics}]
         self.assertEqual(len(warnings), 3)
-        self.assertTrue(all(row["detail"]["hardware_qualified"] is False for row in warnings))
+        self.assertTrue(all(row["hardware_qualified"] is False for row in warnings))
 
     def test_metadata_quality_diagnostic_survives_the_verify_report_projection(self) -> None:
         job = passed_job()
@@ -1076,7 +1087,7 @@ class ReportViewTests(unittest.TestCase):
             warning["label"],
             "Platform metadata provenance (not direct CAD readings)",
         )
-        self.assertEqual(warning["objects"], [metadata_object])
+        self.assertEqual({key: warning["objects"][0][key] for key in metadata_object}, metadata_object)
         self.assertIs(warning["blocking"], False)
 
     def test_saved_state_quality_diagnostic_survives_the_verify_report_projection(self) -> None:
@@ -1130,7 +1141,7 @@ class ReportViewTests(unittest.TestCase):
             "Saved-state export has native diagnostics (not source-qualified)",
         )
         self.assertEqual(warning["object"], "cad/robot.SLDASM")
-        self.assertEqual(warning["detail"], detail)
+        self.assertEqual({key: warning[key] for key in detail}, detail)
         self.assertIs(warning["blocking"], False)
 
 

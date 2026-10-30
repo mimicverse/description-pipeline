@@ -159,7 +159,7 @@ Capture 在一个自有只读会话中读取已保存 CAD 的原生事实，随�
 
 独立消费者从原始三角流、face span、来源 scope 和 SW16 重新核对实际 STL 的三角形数量、顺序、坐标、法向、归属及摘要，并核对场景 placement。原生读取失败、缺失必要几何、非法数值、错误归属或交付字节不对应原始事实均失败。拓扑审计记录实际观察，不把显示三角形天然宣称为闭合流形或精度证明；当前 CAD 的独立工程检查保持，`50 µm` 曲面等价仅用于下文声明适用输入的独立参考回归，不是生产或正式发布前置。
 
-原始证据统一封存在不可变 `evidence/raw/native_capture_facts.json`，其中 `source_scopes` 保存来源身份，`scene_raw` 保存原生场景观察，`geometry_raw` 绑定原生三角形流。Windows 只负责原生读取、序列化和封包；Linux Generate 单次投影工程模型并物化 STL。file source 分开保存原文件与冻结 copy 的 hash/path；virtual source 保存 path-derived identity、owner hash、session document/root 和 PID。包级验证将原始 scope 与 canonical Discovery、raw scene/geometry、dependency closure 和实际冻结字节交叉核对。Discovery 与 Capture 可使用不同的虚拟 session、root 和 PID；owner、实例、配置及相对身份必须一致，各自 session 的文档路径、root 与 PID 须内部绑定自洽。不另建几何或状态权威。
+原始证据统一封存在不可变 `evidence/raw/native_capture_facts.json.gz`，以确定性的标准 gzip 无损保存完整规范 JSON；manifest 校验压缩字节，读取后仍逐项核验原始事实。其中 `source_scopes` 保存来源身份，`scene_raw` 保存原生场景观察，`geometry_raw` 绑定原生三角形流。Windows 只负责原生读取、序列化和封包；Linux Generate 单次投影工程模型并物化 STL。file source 分开保存原文件与冻结 copy 的 hash/path；virtual source 保存 path-derived identity、owner hash、session document/root 和 PID。包级验证将原始 scope 与 canonical Discovery、raw scene/geometry、dependency closure 和实际冻结字节交叉核对。Discovery 与 Capture 可使用不同的虚拟 session、root 和 PID；owner、实例、配置及相对身份必须一致，各自 session 的文档路径、root 与 PID 须内部绑定自洽。不另建几何或状态权威。
 
 <a id="qualification"></a>
 ## 警告与资格
@@ -197,11 +197,17 @@ CAD 原名的格式、词根、缩写或重名违规只产生命名 warning，�
 
 通过的预览加载绑定主体的实际 URDF 与网格，显示报告与资格。验证失败后仅允许显著标注“未验证”的诊断预览，附失败检查；缺乏可安全解析的模型时只展示诊断。预览控件不能产生验证结论。报告、页面、预览与 PR 显示同一用途、范围来源、参数缺失与资格；缺失驱动显示原始缺项、零占位与“平台默认占位，未建立驱动能力”；界面范围不得回写成模型限位或充当验证真值。
 
+预览读取完整有限十进制数；只有 URDF 规范明确允许的真正省略才使用默认值：origin 的 xyz/rpy 为零、mesh.scale 为单位比例、运动 axis 整段省略为 +X、已声明 limit 的 lower/upper 省略为零。显式空值、非法数值、缺少图元尺寸、残缺 inertial、缺少 limit 的 effort/velocity、负驱动值、重名、断链、多根及循环均明确拒绝。当前预览支持 fixed、revolute、continuous、prismatic，不支持 planar、floating、mimic、纹理、fixed 的 axis/limit 或 continuous 的位置界限声明；这些输入报告支持边界，不改写为另一种语义。网格按实际 URDF 所在目录精确解析到登记库存，不按 basename 猜测；没有包映射时明确拒绝 package URI。缩放原值保真，负比例通过对象变换保留镜像及正确面朝向。未声明材质时使用明确标注的中性显示外观，不写入工程记录。
+
+连续关节的单圈滑杆仅是显示控件，源位置界限保持无界。加载和重置保持参考姿态零值；零不在位置界限内时明确标注，不能读取浏览器夹取后的滑杆值来自动移动模型。相机、灯光、图元绘制分段及中性显示风格属于显示参数，不作为 CAD 几何、物性或驱动值。
+
 固定手工版只作为隔离的参考单元测试和回归测试 fixture，不进入生产采集、Generate、Verify 真值、必需检查策略、正式端到端或发布必经链。参考测试仅在 fixture 明确绑定相同或明确兼容的 CAD 原件、配置和修订时执行；输入版本不同不得硬匹配旧 URDF，应声明不适用或建立新的版本化 fixture。生产结果仍以当前 CAD 原值和明确、可复用的规则独立生成，不读取参考名称表、轴值、限位值或网格。
 
 参考测试报告保留逐对象语义差异，并说明 fixture 的适用 CAD 身份、规则、实际自动输出和独立 CAD 验证证据。测试不得锁死 XML 排版、元素顺序、来源 warning 文本顺序、STL 字节、三角形顺序或合法三角化差异；命名与引用须先按语义分类，拓扑、限位、轴线、零位、非零运动和几何按有依据的语义容差比较。方向符号、符合 CAD 来源规则的模型名以及 visual／material 名称与参考不同，仅在适用 fixture 中单独分类，不能据此豁免颜色、纹理、对象绑定、引用完整性、几何或运动检查，也不能倒填生产规则或逐对象答案。
 
 参考差异分类只说明 test fixture 中的表示或版本差异，不构成生产放行门。测试中的未知或未解释差异保持失败／未决，须修正测试绑定、补充适用容差，或明确新 fixture；不能把失败改成生产 warning，也不能因参考测试通过而替代当前 CAD 独立工程验证。
+
+当逐对象独立归因证明参考仅保留低层级材质、简化多材质或使用不同的原生三角化表达时，保留比较器原始 FAIL／UNRESOLVED、参考覆盖限制及归因证据。生产验收仍逐项要求当前原生事实到实际产物的身份、完整几何、归属、颜色、纹理与转换检查通过；不能整体豁免外观或拓扑，也不能由显示三角形一致性宣称 BRep、机械或硬件资格。此时参考测试失败不单独增加生产门，不允许为消除参考差异而改生产值、参考值或阈值。正式发布仍须满足其余固定 CI、审查、部署及完整 GUI 验收要求。
 
 方向的独立 CAD 验证与参考 fixture 比较采用不同判定：前者仍检查有向轴读取、对象绑定、有效坐标转换、轴线及原生非零运动；后者只报告同向／反向、适用坐标系和 fixture 版本，不因纯符号差异把测试误判为生产回归。实际驱动／编码器正向未绑定时记录未验证资格及 warning；参考测试结果不能建立或否定该资格。
 

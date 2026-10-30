@@ -302,10 +302,13 @@ class ReportUiContractTests(unittest.TestCase):
             "stage.counts.warnings",
             "Qualification blocker: ",
             "Publication blocker: ",
-            "Source values",
-            "warningValueText",
-            "rows.slice(0, WARNING_ROW_LIMIT)",
-            "WARNING_VALUE_LIMIT",
+            "Located source examples",
+            "JSON.stringify(examples, null, 2)",
+            "warning.objects.slice(0, WARNING_ROW_LIMIT)",
+            "for (const row of rows)",
+            "records_total",
+            "source_rows_omitted",
+            "Open complete verification certificate",
         ):
             self.assertIn(token, app)
         self.assertIn(".warning-row", css)

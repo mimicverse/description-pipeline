@@ -24,7 +24,11 @@ from .naming import (
     visual_name,
 )
 from .native_limits import ENGINEERING_DEFAULT_POLICY_ID, PREVIEW_POLICY_ID
-from ...schemas import ENGINEERING_MODEL_SCHEMA, LINK_GROUP_MASS_SCHEMA as LINK_GROUP_SCHEMA
+from ...schemas import (
+    ENGINEERING_MODEL_SCHEMA,
+    LINK_GROUP_MASS_SCHEMA as LINK_GROUP_SCHEMA,
+    NATIVE_CAPTURE_FACTS,
+)
 
 
 Matrix3 = tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]
@@ -390,7 +394,7 @@ def _direct_link_reads(
         raise ConfigError(
             "the capture carries no direct link group mass properties record",
             {
-                "required": "raw/native_capture_facts.json#link_group_mass_raw",
+                "required": f"{NATIVE_CAPTURE_FACTS}#link_group_mass_raw",
                 "schema": LINK_GROUP_SCHEMA,
             },
         )
@@ -682,7 +686,7 @@ def build_scene(
                 "collisions": [],
                 "provenance": {
                     "source_entities": components,
-                    "mass": "raw/native_capture_facts.json#part_mass_raw",
+                    "mass": f"{NATIVE_CAPTURE_FACTS}#part_mass_raw",
                     "parts": [
                         {
                             "id": reading.name,
@@ -701,7 +705,7 @@ def build_scene(
                             "selection": direct["selection"],
                             "selection_rule": direct_meta["selection_rule"],
                             "used_api": direct_meta["used_api"],
-                            "source": "raw/native_capture_facts.json#link_group_mass_raw",
+                            "source": f"{NATIVE_CAPTURE_FACTS}#link_group_mass_raw",
                         },
                         "recombination": {
                             "mass_kg": float(combined["mass"]),
@@ -732,7 +736,7 @@ def build_scene(
         if effective_names:
             links[-1]["provenance"]["effective_instances"] = sorted(effective_names)
             links[-1]["provenance"]["instance_measurements"] = (
-                "raw/native_capture_facts.json#component_mass_raw"
+                f"{NATIVE_CAPTURE_FACTS}#component_mass_raw"
             )
             links[-1]["provenance"]["combination"] = "parallel_axis_from_cad_part_and_instance_readings"
 

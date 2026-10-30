@@ -322,7 +322,7 @@ class EffectiveInstanceSceneTests(unittest.TestCase):
         self.assertEqual(audit["direct"]["selection"], [DEV, EASYEDA])
         self.assertEqual(
             audit["direct"]["source"],
-            "raw/native_capture_facts.json#link_group_mass_raw",
+            "raw/native_capture_facts.json.gz#link_group_mass_raw",
         )
         self.assertAlmostEqual(audit["recombination"]["mass_kg"], 0.061, places=12)
         self.assertAlmostEqual(audit["direct_vs_recombination"]["mass_delta_kg"], 0.061 - 0.099, places=12)

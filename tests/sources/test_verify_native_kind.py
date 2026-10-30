@@ -43,10 +43,7 @@ class NativeEvidenceKindTests(unittest.TestCase):
         write_json(root / "input/source.json", source)
         del collection_kind, collection_class
         write_json(root / "evidence/native-runtime.json", environment)
-        (root / "evidence/raw/native_capture_facts.json").write_text(
-            "{}\n",
-            encoding="utf-8",
-        )
+        write_json(root / "evidence/raw/native_capture_facts.json.gz", {})
         write_json(
             root / "evidence/manifest.json",
             {
@@ -54,7 +51,7 @@ class NativeEvidenceKindTests(unittest.TestCase):
                 "kind": manifest_kind,
                 "evidence_class": manifest_class,
                 "identity": identity,
-                "scene": "raw/native_capture_facts.json",
+                "scene": "raw/native_capture_facts.json.gz",
                 "files": inventory(root / "evidence", exclude=("manifest.json",)),
             },
         )

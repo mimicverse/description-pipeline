@@ -173,7 +173,7 @@ class SourceScopeTests(unittest.TestCase):
             "notes": {},
         }
         write_json(
-            self.root / "evidence/raw/native_capture_facts.json",
+            self.root / "evidence/raw/native_capture_facts.json.gz",
             observation,
         )
         write_json(
@@ -285,7 +285,7 @@ class SourceScopeTests(unittest.TestCase):
             "virtual_native_api_pid": 21040,
         }
         facts_path = (
-            self.root / "evidence/raw/native_capture_facts.json"
+            self.root / "evidence/raw/native_capture_facts.json.gz"
         )
         observation = read_data(facts_path)
         observation["source_scopes"]["part-1"] = scope
@@ -378,7 +378,7 @@ class SourceScopeTests(unittest.TestCase):
             "virtual_native_api_pid": None,
             "session_source": session,
         }
-        facts_path = self.root / "evidence/raw/native_capture_facts.json"
+        facts_path = self.root / "evidence/raw/native_capture_facts.json.gz"
         observation = read_data(facts_path)
         observation["source_scopes"]["part-1"] = scope
         observation["geometry_raw"]["part-1"][
@@ -448,7 +448,7 @@ class SourceScopeTests(unittest.TestCase):
             source_scopes(self.root)
 
     def test_invalid_scope_is_refused(self) -> None:
-        path = self.root / "evidence/raw/native_capture_facts.json"
+        path = self.root / "evidence/raw/native_capture_facts.json.gz"
         observation = read_data(path)
         observation["source_scopes"]["part-1"]["component"] = "other"
         write_json(path, observation)
@@ -549,7 +549,7 @@ class SourceScopeTests(unittest.TestCase):
 
     def test_cached_source_cannot_downgrade_to_file_identity_to_remove_its_warning(self) -> None:
         self._use_cached_source()
-        facts_path = self.root / "evidence/raw/native_capture_facts.json"
+        facts_path = self.root / "evidence/raw/native_capture_facts.json.gz"
         observation = read_data(facts_path)
         observation["source_scopes"]["part-1"] = dict(self.scope)
         observation["geometry_raw"]["part-1"]["source_scope_sha256"] = native_scope_identity_sha256(self.scope)
@@ -570,7 +570,7 @@ class SourceScopeTests(unittest.TestCase):
 
     def test_cached_source_preserves_each_sessions_author_error_in_warning(self) -> None:
         self._use_cached_source()
-        facts_path = self.root / "evidence/raw/native_capture_facts.json"
+        facts_path = self.root / "evidence/raw/native_capture_facts.json.gz"
         discovery_path = self.root / "input/discovery/native-discovery.json"
         facts, discovery = read_data(facts_path), read_data(discovery_path)
         capture_error = "RuntimeError: capture author read failed"
@@ -601,7 +601,7 @@ class SourceScopeTests(unittest.TestCase):
 
     def test_cached_scope_distinguishes_missing_and_existing_external_author(self) -> None:
         self._use_cached_source()
-        facts_path = self.root / "evidence/raw/native_capture_facts.json"
+        facts_path = self.root / "evidence/raw/native_capture_facts.json.gz"
         discovery_path = self.root / "input/discovery/native-discovery.json"
         facts = read_data(facts_path)
         discovery = read_data(discovery_path)
@@ -645,7 +645,7 @@ class SourceScopeTests(unittest.TestCase):
         from description_pipeline.sources.solidworks.session_artifacts import SESSION_SOURCE_IDENTITY_FIELDS
 
         self._use_cached_source()
-        observation = read_data(self.root / "evidence/raw/native_capture_facts.json")
+        observation = read_data(self.root / "evidence/raw/native_capture_facts.json.gz")
         scope = observation["source_scopes"]["part-1"]
         scope["component"] = scope["occurrence_scope"] = "module-1/\u90e8\u4ef6-1"
         scope["session_source"].update(

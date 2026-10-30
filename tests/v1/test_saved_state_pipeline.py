@@ -169,7 +169,7 @@ class SavedStatePipelineTests(unittest.TestCase):
         report = handler_fixture._bundle_report(handler_fixture.generate_ref)
         self.assertTrue(report["passed"], [item for item in report["checks"] if not item["passed"]])
         defaults = next(item for item in report["diagnostics"] if item["code"] == "drive.default_zero")
-        fields = defaults["detail"]["objects"]
+        fields = defaults["objects"]
         self.assertEqual({item["field"] for item in fields}, {"effort", "velocity"})
         self.assertTrue(all(item["actual"] == 0 and item["drive_qualified"] is False for item in fields))
         self.assertEqual(handler_fixture._run_verify()[1].outcome, "completed")

@@ -212,7 +212,7 @@ def build_sealed_delivery(
         {"runtime": "fixture"},
     )
     write_json(
-        root / "evidence" / "raw" / "native_capture_facts.json",
+        root / "evidence" / "raw" / "native_capture_facts.json.gz",
         {},
     )
     write_json(root / "model" / "robot.json", {"model": "fixture"})

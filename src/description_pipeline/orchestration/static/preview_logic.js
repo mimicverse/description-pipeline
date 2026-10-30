@@ -9,108 +9,6 @@ export function purposeLabel(value) {
   return value === "engineering" || value === "inspection_preview" ? value : "not recorded";
 }
 
-function warningString(value) {
-  return typeof value === "string" && value ? value : "";
-}
-
-function warningFields(row, fallback) {
-  if (Array.isArray(row?.fields)) {
-    return row.fields.filter((value) => typeof value === "string" && value);
-  }
-  if (typeof row?.fields === "string" && row.fields) return [row.fields];
-  if (typeof row?.field === "string" && row.field) return [row.field];
-  if (Array.isArray(fallback?.fields)) {
-    return fallback.fields.filter((value) => typeof value === "string" && value);
-  }
-  const field = warningString(fallback?.fields) || warningString(fallback?.field);
-  return field ? [field] : [];
-}
-
-function copyWarningValue(row, fallback, key) {
-  if (row && Object.prototype.hasOwnProperty.call(row, key)) return row[key];
-  if (fallback && Object.prototype.hasOwnProperty.call(fallback, key)) return fallback[key];
-  return undefined;
-}
-
-function warningSortKey(row) {
-  return [
-    row.object_type,
-    row.object,
-    row.fields.join(","),
-    row.source,
-    row.rule_id,
-    row.rule_version,
-    row.reason,
-    JSON.stringify(row.original),
-    JSON.stringify(row.actual),
-    JSON.stringify(row.native_observation_errors),
-  ]
-    .map((value) => (value === undefined || value === null ? "" : String(value)))
-    .join("\u0000");
-}
-
-// Preserve recorded provenance and qualification fields in the display projection.
-export function warningSourceRows(warning) {
-  if (!warning || typeof warning !== "object") return [];
-  const detail = {
-    ...warning,
-    ...(warning.detail && typeof warning.detail === "object" ? warning.detail : {}),
-  };
-  for (const key of ["detail", "code", "message", "blocking", "stage", "stage_name", "label", "state_label"]) delete detail[key];
-  const candidates = Array.isArray(detail.objects)
-    ? detail.objects
-    : Array.isArray(warning.objects)
-      ? warning.objects
-      : [];
-  const rows = candidates.filter((item) => item && typeof item === "object");
-  if (!rows.length) {
-    if (!warning.object && !detail.object && !warning.field && !detail.field && !warning.fields && !detail.fields && !Object.keys(detail).length) {
-      return [];
-    }
-    rows.push({});
-  }
-  const seen = new Set();
-  return rows
-    .map((row) => {
-      const fields = warningFields(row, { ...warning, ...detail });
-      const normalized = {
-        code: warningString(warning.code),
-        object_type: warningString(row.object_type) || warningString(detail.object_type),
-        object: warningString(row.object) || warningString(detail.object) || warningString(warning.object),
-        fields,
-        original: copyWarningValue(row, detail, "original"),
-        actual: copyWarningValue(row, detail, "actual"),
-        source: warningString(row.source) || warningString(detail.source) || warningString(warning.source),
-        rule_id: warningString(row.rule_id) || warningString(detail.rule_id) || warningString(warning.rule_id),
-        rule_version:
-          warningString(row.rule_version) || warningString(detail.rule_version) || warningString(warning.rule_version),
-        reason: warningString(row.reason) || warningString(detail.reason) || warningString(warning.reason),
-        file: warningString(row.file) || warningString(detail.file),
-        sha256: warningString(row.sha256) || warningString(detail.sha256),
-        anchor: warningString(row.anchor) || warningString(detail.anchor),
-        key: warningString(row.key) || warningString(detail.key),
-        reference: warningString(row.reference) || warningString(detail.reference),
-        native_observation_errors: Array.isArray(
-          copyWarningValue(row, detail, "native_observation_errors"),
-        )
-          ? copyWarningValue(row, detail, "native_observation_errors")
-          : [],
-      };
-      const extra = Object.fromEntries(
-        Object.entries({ ...detail, ...row }).filter(
-          ([key]) => !Object.hasOwn(normalized, key) && !["objects", "field"].includes(key),
-        ),
-      );
-      if (Object.keys(extra).length) normalized.extra = extra;
-      const key = warningSortKey(normalized) + JSON.stringify(extra);
-      if (seen.has(key)) return null;
-      seen.add(key);
-      return normalized;
-    })
-    .filter(Boolean)
-    .sort((left, right) => warningSortKey(left).localeCompare(warningSortKey(right), "en"));
-}
-
 export function registeredVerificationArtifact(preview, runId) {
   const digest = preview?.report_files?.["verification-certificate.json"];
   if (!runId || typeof digest !== "string" || !/^[0-9a-f]{64}$/.test(digest)) return null;
@@ -119,6 +17,72 @@ export function registeredVerificationArtifact(preview, runId) {
     sha256: digest,
     href: `/api/runs/${encodeURIComponent(runId)}/artifacts/verification-certificate.json`,
   };
+}
+
+// URDF parsing defaults are limited to fields the format defines as optional.
+// An explicitly empty or malformed value is evidence corruption, not absence.
+export function parseUrdfVector(text, fallback, label) {
+  if (text === undefined || text === null) {
+    if (fallback === undefined) throw new Error(`${label} is missing`);
+    return fallback.slice();
+  }
+  const parts = String(text).trim().split(/\s+/);
+  if (parts.length !== 3 || parts.some((part) => part === "")) {
+    throw new Error(`${label} must contain three finite numbers: ${text}`);
+  }
+  return parts.map((part) => parseUrdfNumber(part, label));
+}
+
+export function parseUrdfNumber(text, label) {
+  if (text === undefined || text === null || String(text).trim() === "") {
+    throw new Error(`${label} is missing`);
+  }
+  const decimal = String(text).trim();
+  const value = Number(decimal);
+  if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(decimal) || !Number.isFinite(value)) {
+    throw new Error(`${label} must be a finite decimal number: ${text}`);
+  }
+  return value;
+}
+
+export function parseUrdfRgba(text, label) {
+  if (text === undefined || text === null) throw new Error(`${label} is missing`);
+  const parts = String(text).trim().split(/\s+/);
+  if (parts.length !== 4 || parts.some((part) => part === "")) {
+    throw new Error(`${label} must contain four finite numbers in [0, 1]: ${text}`);
+  }
+  const values = parts.map((part) => parseUrdfNumber(part, label));
+  if (values.some((value) => value < 0 || value > 1)) {
+    throw new Error(`${label} must contain four finite numbers in [0, 1]: ${text}`);
+  }
+  return values;
+}
+
+export function parseUrdfAxis(text, label) {
+  const vector = parseUrdfVector(text, [1, 0, 0], label);
+  const length = Math.hypot(...vector);
+  if (!(length > 0) || !Number.isFinite(length)) throw new Error(`${label} must be a non-zero finite vector`);
+  return vector.map((value) => value / length);
+}
+
+export function resolveUrdfMesh(files, urdfPath, filename) {
+  if (typeof filename !== "string" || !filename || /[\\\u0000-\u001f?#]/.test(filename) || /^(?:[a-z][a-z0-9+.-]*:|\/)/i.test(filename)) {
+    throw new Error(`Mesh must use a delivery-relative path; package and external URIs are unsupported: ${filename}`);
+  }
+  if (typeof urdfPath !== "string" || !Object.hasOwn(files, urdfPath)) {
+    throw new Error("URDF path is not in the verified delivery inventory");
+  }
+  const parts = urdfPath.split("/").slice(0, -1);
+  for (const part of filename.split("/")) {
+    if (part === "." || part === "") continue;
+    if (part === "..") {
+      if (!parts.length) throw new Error(`Mesh path escapes the delivery: ${filename}`);
+      parts.pop();
+    } else parts.push(part);
+  }
+  const resolved = parts.join("/");
+  if (!Object.hasOwn(files, resolved)) throw new Error(`Mesh is not in the verified delivery inventory: ${filename}`);
+  return resolved;
 }
 
 // A verified delivery remains visible when it carries source warnings.
@@ -281,13 +245,13 @@ export function jointRows(records) {
     .filter((record) => record && typeof record.name === "string")
     .map((record) => ({
       name: record.name,
-      type: record.type || "fixed",
+      type: typeof record.type === "string" && record.type ? record.type : "not recorded",
       lower: Number.isFinite(record.lower) ? record.lower : null,
       upper: Number.isFinite(record.upper) ? record.upper : null,
       effort: Number.isFinite(record.effort) ? record.effort : null,
       velocity: Number.isFinite(record.velocity) ? record.velocity : null,
       axis: Array.isArray(record.axis)
-        ? record.axis.map((value) => (Number.isFinite(Number(value)) ? Number(value) : null))
+        ? record.axis.map((value) => (Number.isFinite(value) ? value : null))
         : null,
     }));
 }
@@ -299,7 +263,7 @@ export function linkRows(records) {
       name: record.name,
       mass_kg: Number.isFinite(record.mass_kg) ? record.mass_kg : null,
       com_m: Array.isArray(record.com_m)
-        ? record.com_m.map((value) => (Number.isFinite(Number(value)) ? Number(value) : null))
+        ? record.com_m.map((value) => (Number.isFinite(value) ? value : null))
         : null,
       inertia_kg_m2: record.inertia_kg_m2 && typeof record.inertia_kg_m2 === "object" ? record.inertia_kg_m2 : null,
     }));
@@ -312,10 +276,10 @@ export function frameRows(frames) {
       name: frame.name,
       parent: typeof frame.parent === "string" ? frame.parent : null,
       xyz: Array.isArray(frame.xyz)
-        ? frame.xyz.map((value) => (Number.isFinite(Number(value)) ? Number(value) : null))
+        ? frame.xyz.map((value) => (Number.isFinite(value) ? value : null))
         : null,
       rpy: Array.isArray(frame.rpy)
-        ? frame.rpy.map((value) => (Number.isFinite(Number(value)) ? Number(value) : null))
+        ? frame.rpy.map((value) => (Number.isFinite(value) ? value : null))
         : null,
     }));
 }

@@ -56,7 +56,7 @@ def quality_report(raw: list[dict], rows: list[dict] | None = None) -> dict:
             "id": "geometry.native_tessellation",
             "state": "passed",
             "passed": True,
-            "details": {"warnings": raw},
+            "details": {"warning_indices": list(range(len(raw)))},
         }],
         "diagnostics": (
             native_gate_warning_diagnostics({"warnings": raw})
@@ -78,7 +78,7 @@ def recorded_warnings(quality: dict) -> list[dict]:
             "state": check["state"],
             "raw_details": check["details"],
         }],
-        quality.get("diagnostics"),
+        quality,
     )
 
 
@@ -158,7 +158,7 @@ class NativeScopeWarningProjectionTests(unittest.TestCase):
         for detail in (None, "invalid", []):
             with self.subTest(detail=detail):
                 quality = quality_report(raw_warnings())
-                quality["checks"][0]["details"]["warnings"][0]["detail"] = detail
+                quality["diagnostics"][0]["detail"] = detail
                 self.assert_rejected_by_reports(quality)
 
     def test_reports_reject_omitted_or_forged_non_scope_native_warnings(self):
@@ -176,7 +176,7 @@ class NativeScopeWarningProjectionTests(unittest.TestCase):
                 omitted["diagnostics"].pop()
                 self.assert_rejected_by_reports(omitted)
                 forged = copy.deepcopy(quality)
-                forged["diagnostics"][-1]["detail"]["field"] = "another_field"
+                forged["checks"][0]["details"]["warning_indices"] = [0]
                 self.assert_rejected_by_reports(forged)
 
     def test_reports_reject_an_omitted_warning_group(self):

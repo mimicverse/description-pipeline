@@ -1,7 +1,14 @@
 // Actual-URDF viewer: three.js is bundled under /static/vendor and every mesh request goes back
 // through the portal's digest-verified artifact route. No external resources are fetched.
 import * as THREE from "/static/vendor/three.module.min.js";
-import { applyInteraction } from "/static/preview_logic.js";
+import {
+  applyInteraction,
+  parseUrdfAxis,
+  parseUrdfNumber,
+  parseUrdfRgba,
+  parseUrdfVector,
+  resolveUrdfMesh,
+} from "/static/preview_logic.js";
 
 export function createViewer(container) {
   const scene = new THREE.Scene();
@@ -145,39 +152,48 @@ export function disposeRobot(viewer) {
   root.clear();
 }
 
-function parseVector(text, fallback) {
-  if (text === undefined || text === null || text === "") return fallback.slice();
-  const parts = String(text).trim().split(/\s+/).map(Number);
-  if (parts.length !== 3 || parts.some((value) => !Number.isFinite(value))) {
-    throw new Error(`Cannot parse URDF vector: ${text}`);
+function child(node, tag, required = false) {
+  const matches = node ? [...node.children].filter((item) => item.tagName === tag) : [];
+  if (matches.length > 1 || (required && matches.length !== 1)) {
+    throw new Error(`${node?.tagName || "URDF"} must contain ${required ? "exactly" : "at most"} one ${tag}`);
   }
-  return parts;
+  return matches[0] || null;
 }
 
-function parseNumber(text, fallback) {
-  const value = Number(text);
-  return Number.isFinite(value) ? value : fallback;
+function requiredName(node, attribute = "name") {
+  const value = node?.getAttribute(attribute);
+  if (!value || value.trim() !== value || /\s/.test(value)) throw new Error(`${node?.tagName || "URDF"} ${attribute} is missing or invalid`);
+  return value;
 }
 
-function originOf(node) {
-  const origin = node ? node.querySelector("origin") : null;
-  const xyz = parseVector(origin && origin.getAttribute("xyz"), [0, 0, 0]);
-  const rpy = parseVector(origin && origin.getAttribute("rpy"), [0, 0, 0]);
+function originOf(node, label) {
+  const origin = child(node, "origin");
+  const xyz = parseUrdfVector(origin?.getAttribute("xyz"), [0, 0, 0], `${label} origin xyz`);
+  const rpy = parseUrdfVector(origin?.getAttribute("rpy"), [0, 0, 0], `${label} origin rpy`);
   // URDF rpy is a fixed-axis roll/pitch/yaw rotation: R = Rz(yaw) * Ry(pitch) * Rx(roll).
   const quaternion = new THREE.Quaternion().setFromEuler(new THREE.Euler(rpy[0], rpy[1], rpy[2], "ZYX"));
   return { position: new THREE.Vector3(xyz[0], xyz[1], xyz[2]), quaternion };
 }
 
-function materialStyle(materialNode) {
-  const color = materialNode ? materialNode.querySelector("color") : null;
-  const values = color ? String(color.getAttribute("rgba") || "").trim().split(/\s+/).map(Number) : [];
-  if (values.length < 3 || values.slice(0, 3).some((value) => !Number.isFinite(value))) {
+function materialStyle(materials, materialNode, label) {
+  if (!materialNode) {
     return { color: 0x8fa8bf, opacity: 1 };
   }
-  const rawOpacity = Number.isFinite(values[3]) ? values[3] : 1;
+  if (child(materialNode, "texture")) throw new Error(`${label} texture rendering is unsupported`);
+  let color = child(materialNode, "color");
+  if (!color) {
+    const name = materialNode.getAttribute("name");
+    if (!name) throw new Error(`${label} has neither a color nor a material name`);
+    const definition = materials.get(name);
+    if (!definition) throw new Error(`${label} references an unknown material: ${name}`);
+    if (child(definition, "texture")) throw new Error(`${label} texture rendering is unsupported`);
+    color = child(definition, "color");
+  }
+  if (!color) throw new Error(`${label} has no renderable color`);
+  const values = parseUrdfRgba(color.getAttribute("rgba"), `${label} rgba`);
   return {
     color: new THREE.Color(values[0], values[1], values[2]).getHex(),
-    opacity: Math.min(1, Math.max(0, rawOpacity)),
+    opacity: values[3],
   };
 }
 
@@ -229,37 +245,34 @@ function asciiStl(text) {
   return geometry;
 }
 
-function primitiveGeometry(geometryNode) {
-  const box = geometryNode.querySelector("box");
+function requiredPositiveNumber(node, attribute, label) {
+  const value = parseUrdfNumber(node.getAttribute(attribute), label);
+  if (!(value > 0)) throw new Error(`${label} must be positive`);
+  return value;
+}
+
+function primitiveGeometry(geometryNode, label) {
+  const recognized = ["box", "cylinder", "sphere"].map((name) => geometryNode.querySelector(`:scope > ${name}`));
+  if (recognized.filter(Boolean).length !== 1) {
+    throw new Error(`${label} must contain exactly one box, cylinder, sphere or mesh`);
+  }
+  const [box, cylinder, sphere] = recognized;
   if (box) {
-    const size = parseVector(box.getAttribute("size"), [1, 1, 1]);
+    const size = parseUrdfVector(box.getAttribute("size"), undefined, `${label} size`);
+    if (size.some((value) => !(value > 0))) throw new Error(`${label} size must contain three positive numbers`);
     return new THREE.BoxGeometry(size[0], size[1], size[2]);
   }
-  const cylinder = geometryNode.querySelector("cylinder");
   if (cylinder) {
-    const radius = parseNumber(cylinder.getAttribute("radius"), 0.05);
-    const length = parseNumber(cylinder.getAttribute("length"), 0.1);
+    const radius = requiredPositiveNumber(cylinder, "radius", `${label} radius`);
+    const length = requiredPositiveNumber(cylinder, "length", `${label} length`);
     const geometry = new THREE.CylinderGeometry(radius, radius, length, 32);
     geometry.rotateX(Math.PI / 2); // URDF cylinders run along the local +Z axis
     return geometry;
   }
-  const sphere = geometryNode.querySelector("sphere");
   if (sphere) {
-    return new THREE.SphereGeometry(parseNumber(sphere.getAttribute("radius"), 0.05), 24, 16);
+    return new THREE.SphereGeometry(requiredPositiveNumber(sphere, "radius", `${label} radius`), 24, 16);
   }
   return null;
-}
-
-function resolveMesh(files, filename) {
-  if (!filename) return null;
-  const clean = String(filename)
-    .replace(/^package:\/\/[^/]+\//, "")
-    .replace(/^\.\//, "");
-  const keys = Object.keys(files);
-  if (Object.prototype.hasOwnProperty.call(files, clean)) return clean;
-  const base = clean.split("/").pop();
-  const matches = keys.filter((key) => key === base || key.endsWith(`/${base}`));
-  return matches.length ? matches[0] : null;
 }
 
 async function loadMesh(viewer, url, cache, signal) {
@@ -274,47 +287,89 @@ async function loadMesh(viewer, url, cache, signal) {
   return pending;
 }
 
-export async function loadRobot(viewer, { urdfUrl, files, artifactUrl, onWarning, signal }) {
+export async function loadRobot(viewer, { urdfUrl, urdfPath, files, artifactUrl, onWarning, signal }) {
   const response = await fetch(urdfUrl, { credentials: "same-origin", signal });
   if (!response.ok) throw new Error(`URDF load failed (HTTP ${response.status})`);
   const xml = await response.text();
   signal?.throwIfAborted();
-  if (/<!doctype/i.test(xml)) {
-    throw new Error("URDF must not contain a document type declaration");
-  }
+  if (/<!doctype/i.test(xml)) throw new Error("URDF must not contain a document type declaration");
   const document = new DOMParser().parseFromString(xml, "application/xml");
   if (document.querySelector("parsererror")) throw new Error("URDF XML parsing failed");
-  const robot = document.querySelector("robot");
-  if (!robot) throw new Error("URDF has no robot element");
+  const robot = document.documentElement;
+  if (robot?.tagName !== "robot") throw new Error("URDF has no robot root element");
+  requiredName(robot);
 
   disposeRobot(viewer);
   const meshCache = new Map();
   const warnings = [];
   const links = new Map();
   const joints = [];
-
+  const linkRecords = [];
+  const materials = new Map();
+  for (const node of robot.querySelectorAll(":scope > material")) {
+    const name = requiredName(node);
+    if (materials.has(name)) throw new Error(`URDF material name is duplicated: ${name}`);
+    materials.set(name, node);
+  }
   for (const node of robot.querySelectorAll(":scope > link")) {
-    const name = node.getAttribute("name");
-    if (!name || links.has(name)) throw new Error(`URDF link name is missing or duplicated: ${name}`);
+    const name = requiredName(node);
+    if (links.has(name)) throw new Error(`URDF link name is duplicated: ${name}`);
     const group = new THREE.Group();
     group.name = name;
     links.set(name, { node, group });
+    const inertial = child(node, "inertial");
+    const mass = inertial ? child(inertial, "mass", true) : null;
+    const tensor = inertial ? child(inertial, "inertia", true) : null;
+    const origin = inertial ? originOf(inertial, `Inertial for link ${name}`) : null;
+    linkRecords.push({
+      name,
+      mass_kg: mass ? parseUrdfNumber(mass.getAttribute("value"), `Link ${name} mass`) : null,
+      com_m: origin ? [origin.position.x, origin.position.y, origin.position.z] : null,
+      inertia_kg_m2: tensor ? Object.fromEntries(
+        ["ixx", "ixy", "ixz", "iyy", "iyz", "izz"].map((key) => [
+          key, parseUrdfNumber(tensor.getAttribute(key), `Link ${name} inertia ${key}`),
+        ]),
+      ) : null,
+    });
   }
 
+  const jointNames = new Set();
+  const parents = new Map();
   for (const node of robot.querySelectorAll(":scope > joint")) {
-    const name = node.getAttribute("name") || "(unnamed joint)";
-    const type = (node.getAttribute("type") || "fixed").toLowerCase();
-    const parent = node.querySelector("parent")?.getAttribute("link");
-    const child = node.querySelector("child")?.getAttribute("link");
-    if (!links.has(parent) || !links.has(child)) {
-      warnings.push(`Joint ${name} references a missing link`);
-      continue;
+    const name = requiredName(node);
+    if (jointNames.has(name)) throw new Error(`URDF joint name is duplicated: ${name}`);
+    jointNames.add(name);
+    const type = requiredName(node, "type");
+    if (!["fixed", "revolute", "continuous", "prismatic"].includes(type)) {
+      throw new Error(`Joint ${name} type is unsupported: ${type}`);
     }
-    const { position, quaternion } = originOf(node);
-    const axis = parseVector(node.querySelector("axis")?.getAttribute("xyz"), [1, 0, 0]);
-    const axisVector = new THREE.Vector3(axis[0], axis[1], axis[2]);
-    if (axisVector.length() === 0) axisVector.set(1, 0, 0);
-    axisVector.normalize();
+    if (child(node, "mimic")) throw new Error(`Joint ${name} mimic motion is unsupported`);
+    const parent = requiredName(child(node, "parent", true), "link");
+    const childName = requiredName(child(node, "child", true), "link");
+    if (!links.has(parent) || !links.has(childName) || parent === childName || parents.has(childName)) {
+      throw new Error(`Joint ${name} has invalid or ambiguous link bindings`);
+    }
+    parents.set(childName, parent);
+    const { position, quaternion } = originOf(node, `Joint ${name}`);
+    const axisNode = child(node, "axis");
+    if (type === "fixed" && axisNode) throw new Error(`Joint ${name} fixed axis is unsupported`);
+    const sourceAxis = axisNode
+      ? parseUrdfVector(axisNode.getAttribute("xyz"), undefined, `Joint ${name} axis`)
+      : type === "fixed" ? null : [1, 0, 0];
+    const direction = sourceAxis ? parseUrdfAxis(sourceAxis.join(" "), `Joint ${name} axis`) : null;
+    const axisVector = direction ? new THREE.Vector3(...direction) : null;
+    const limit = child(node, "limit");
+    if (type === "fixed" && limit) throw new Error(`Joint ${name} fixed limits are unsupported`);
+    if (type === "continuous" && limit && (limit.hasAttribute("lower") || limit.hasAttribute("upper"))) {
+      throw new Error(`Joint ${name} continuous position limits are unsupported`);
+    }
+    if ((type === "revolute" || type === "prismatic") && !limit) throw new Error(`Joint ${name} limit is missing`);
+    const lower = limit ? (limit.hasAttribute("lower") ? parseUrdfNumber(limit.getAttribute("lower"), `Joint ${name} lower limit`) : 0) : null;
+    const upper = limit ? (limit.hasAttribute("upper") ? parseUrdfNumber(limit.getAttribute("upper"), `Joint ${name} upper limit`) : 0) : null;
+    if (limit && lower > upper) throw new Error(`Joint ${name} lower limit exceeds upper limit`);
+    const effort = limit ? parseUrdfNumber(limit.getAttribute("effort"), `Joint ${name} effort limit`) : null;
+    const velocity = limit ? parseUrdfNumber(limit.getAttribute("velocity"), `Joint ${name} velocity limit`) : null;
+    if (effort < 0 || velocity < 0) throw new Error(`Joint ${name} effort and velocity must be non-negative`);
 
     const pivot = new THREE.Group();
     pivot.position.copy(position);
@@ -322,97 +377,73 @@ export async function loadRobot(viewer, { urdfUrl, files, artifactUrl, onWarning
     links.get(parent).group.add(pivot);
     const motion = new THREE.Group();
     pivot.add(motion);
-    motion.add(links.get(child).group);
-    links.get(parent).group.remove(links.get(child).group);
-
-    const limit = node.querySelector("limit");
-    if ((type === "revolute" || type === "prismatic") && !limit) {
-      warnings.push(`Joint ${name} has no limit; no control was created`);
-    }
-    const lower = limit ? parseNumber(limit.getAttribute("lower"), 0) : 0;
-    const upper = limit ? parseNumber(limit.getAttribute("upper"), 0) : 0;
-    const joint = {
-      name,
-      type,
-      motion,
-      axis: axisVector,
-      lower: type === "continuous" ? -Math.PI : lower,
-      upper: type === "continuous" ? Math.PI : upper,
-      effort:
-        limit && limit.getAttribute("effort") !== null ? parseNumber(limit.getAttribute("effort"), null) : null,
-      velocity:
-        limit && limit.getAttribute("velocity") !== null ? parseNumber(limit.getAttribute("velocity"), null) : null,
-      value: 0,
+    motion.add(links.get(childName).group);
+    joints.push({
+      name, type, motion, axis: axisVector, sourceAxis,
+      lower: type === "continuous" ? null : lower,
+      upper: type === "continuous" ? null : upper,
+      effort, velocity, value: 0,
       set(value) {
         this.value = value;
-        if (type === "revolute" || type === "continuous") {
-          motion.quaternion.setFromAxisAngle(axisVector, value);
-        } else if (type === "prismatic") {
-          motion.position.copy(axisVector).multiplyScalar(value);
-        }
+        if (type === "revolute" || type === "continuous") motion.quaternion.setFromAxisAngle(axisVector, value);
+        else if (type === "prismatic") motion.position.copy(axisVector).multiplyScalar(value);
       },
-      reset() {
-        this.set(0);
-      },
-    };
-    if (type === "continuous" || limit) joints.push(joint);
+      reset() { this.set(0); },
+    });
+  }
+  const roots = [...links.keys()].filter((name) => !parents.has(name));
+  if (roots.length !== 1) throw new Error("URDF must have exactly one root link");
+  for (const name of links.keys()) {
+    const seen = new Set();
+    let current = name;
+    while (parents.has(current)) {
+      if (seen.has(current)) throw new Error("URDF link graph contains a cycle");
+      seen.add(current);
+      current = parents.get(current);
+    }
+    if (current !== roots[0]) throw new Error("URDF link graph is disconnected");
   }
 
-  const rootName = [...links.keys()].find(
-    (name) => ![...robot.querySelectorAll(":scope > joint > child")].some((child) => child.getAttribute("link") === name),
-  );
-  if (!rootName) throw new Error("URDF has no root link");
-  viewer.robotRoot.add(links.get(rootName).group);
-
+  // Attach only after every visual is readable; failed loads never display a partial robot.
   for (const [name, entry] of links) {
     for (const visual of entry.node.querySelectorAll(":scope > visual")) {
-      const geometryNode = visual.querySelector("geometry");
-      if (!geometryNode) continue;
-      const { position, quaternion } = originOf(visual);
-      const style = materialStyle(visual.querySelector("material"));
-      const material = new THREE.MeshStandardMaterial({
-        color: style.color,
-        opacity: style.opacity,
-        transparent: style.opacity < 1,
-        depthWrite: style.opacity >= 1,
-        metalness: 0.12,
-        roughness: 0.68,
-      });
-      const meshNode = geometryNode.querySelector("mesh");
-      let geometry = null;
-      if (meshNode) {
-        const filename = meshNode.getAttribute("filename");
-        const resolved = resolveMesh(files, filename);
-        if (!resolved) {
-          warnings.push(`Mesh for link ${name} is not in the verified delivery inventory: ${filename}`);
-          continue;
-        }
-        try {
-          geometry = (await loadMesh(viewer, artifactUrl(resolved), meshCache, signal)).clone();
-          signal?.throwIfAborted();
-        } catch (error) {
-          if (signal?.aborted) throw error;
-          warnings.push(`Mesh load failed for link ${name}: ${error.message}`);
-          continue;
-        }
-        const scale = parseVector(meshNode.getAttribute("scale"), [1, 1, 1]);
-        geometry.scale(scale[0], scale[1], scale[2]);
-      } else {
-        geometry = primitiveGeometry(geometryNode);
-        if (!geometry) continue;
+      const geometryNode = child(visual, "geometry", true);
+      if (geometryNode.children.length !== 1 || !["mesh", "box", "cylinder", "sphere"].includes(geometryNode.children[0].tagName)) {
+        throw new Error(`Visual for link ${name} must contain exactly one supported geometry`);
       }
+      const label = `Visual for link ${name}`;
+      const { position, quaternion } = originOf(visual, label);
+      const materialNode = child(visual, "material");
+      const style = materialStyle(materials, materialNode, `${label} material`);
+      if (!materialNode) warnings.push(`${label} has no material; a neutral preview appearance is used`);
+      const meshNode = child(geometryNode, "mesh");
+      let geometry;
+      let meshScale;
+      if (meshNode) {
+        const resolved = resolveUrdfMesh(files, urdfPath, meshNode.getAttribute("filename"));
+        meshScale = parseUrdfVector(meshNode.getAttribute("scale"), [1, 1, 1], `${label} mesh scale`);
+        geometry = (await loadMesh(viewer, artifactUrl(resolved), meshCache, signal)).clone();
+        signal?.throwIfAborted();
+      } else geometry = primitiveGeometry(geometryNode, `${label} geometry`);
+      const material = new THREE.MeshStandardMaterial({
+        color: style.color, opacity: style.opacity,
+        transparent: style.opacity < 1, depthWrite: style.opacity >= 1,
+        metalness: 0.12, roughness: 0.68,
+      });
       const mesh = new THREE.Mesh(geometry, material);
+      // Keep reflections on the object transform so Three also reverses face culling.
+      if (meshScale) mesh.scale.set(...meshScale);
       mesh.position.copy(position);
       mesh.quaternion.copy(quaternion);
       entry.group.add(mesh);
     }
   }
 
+  viewer.robotRoot.add(links.get(roots[0]).group);
   viewer.robotRoot.updateMatrixWorld(true);
   const box = new THREE.Box3().setFromObject(viewer.robotRoot);
-  if (box.isEmpty()) {
-    warnings.push("URDF contains no displayable geometry");
-  } else {
+  if (box.isEmpty()) warnings.push("URDF contains no displayable geometry");
+  else {
     const center = box.getCenter(new THREE.Vector3());
     const size = box.getSize(new THREE.Vector3());
     const span = Math.max(size.x, size.y, size.z, 0.05);
@@ -426,39 +457,11 @@ export async function loadRobot(viewer, { urdfUrl, files, artifactUrl, onWarning
   }
   viewer.frame();
   if (onWarning) onWarning(warnings);
-  const linkRecords = [];
-  for (const [name, entry] of links) {
-    const inertial = entry.node.querySelector(":scope > inertial");
-    const massNode = inertial ? inertial.querySelector(":scope > mass") : null;
-    const inertiaNode = inertial ? inertial.querySelector(":scope > inertia") : null;
-    const origin = inertial ? originOf(inertial) : null;
-    linkRecords.push({
-      name,
-      mass_kg:
-        massNode && massNode.getAttribute("value") !== null ? parseNumber(massNode.getAttribute("value"), null) : null,
-      com_m: origin ? [origin.position.x, origin.position.y, origin.position.z] : null,
-      inertia_kg_m2: inertiaNode
-        ? {
-            ixx: inertiaNode.getAttribute("ixx") !== null ? parseNumber(inertiaNode.getAttribute("ixx"), null) : null,
-            ixy: inertiaNode.getAttribute("ixy") !== null ? parseNumber(inertiaNode.getAttribute("ixy"), null) : null,
-            ixz: inertiaNode.getAttribute("ixz") !== null ? parseNumber(inertiaNode.getAttribute("ixz"), null) : null,
-            iyy: inertiaNode.getAttribute("iyy") !== null ? parseNumber(inertiaNode.getAttribute("iyy"), null) : null,
-            iyz: inertiaNode.getAttribute("iyz") !== null ? parseNumber(inertiaNode.getAttribute("iyz"), null) : null,
-            izz: inertiaNode.getAttribute("izz") !== null ? parseNumber(inertiaNode.getAttribute("izz"), null) : null,
-          }
-        : null,
-    });
-  }
   const jointRecords = joints.map((joint) => ({
-    name: joint.name,
-    type: joint.type,
-    lower: joint.lower,
-    upper: joint.upper,
-    effort: joint.effort,
-    velocity: joint.velocity,
-    axis: [joint.axis.x, joint.axis.y, joint.axis.z],
+    name: joint.name, type: joint.type, lower: joint.lower, upper: joint.upper,
+    effort: joint.effort, velocity: joint.velocity, axis: joint.sourceAxis,
   }));
-  return { links, joints, warnings, records: { links: linkRecords, joints: jointRecords } };
+  return { links, joints: joints.filter((joint) => joint.type !== "fixed"), warnings, records: { links: linkRecords, joints: jointRecords } };
 }
 
 export function buildJointControls(container, joints, { onInput } = {}) {
@@ -475,31 +478,39 @@ export function buildJointControls(container, joints, { onInput } = {}) {
     range.step = "any";
     const angular = joint.type === "revolute" || joint.type === "continuous";
     if (angular) {
-      range.min = String((joint.lower * 180) / Math.PI);
-      range.max = String((joint.upper * 180) / Math.PI);
+      range.min = String(((joint.type === "continuous" ? -Math.PI : joint.lower) * 180) / Math.PI);
+      range.max = String(((joint.type === "continuous" ? Math.PI : joint.upper) * 180) / Math.PI);
     } else {
       range.min = String(joint.lower);
       range.max = String(joint.upper);
     }
-    range.value = "0";
+    const display = () => {
+      const value = angular ? (joint.value * 180) / Math.PI : joint.value;
+      range.value = String(value);
+      readout.textContent = angular ? `${value.toFixed(1)}°` : `${value.toFixed(4)} m`;
+      if (value < Number(range.min) || value > Number(range.max)) {
+        readout.textContent += " (reference pose outside position limits)";
+      }
+    };
     const update = () => {
       const raw = Number(range.value);
       const value = angular ? (raw * Math.PI) / 180 : raw;
       joint.set(value);
-      readout.textContent = angular ? `${raw.toFixed(1)}°` : `${raw.toFixed(4)} m`;
+      display();
       if (onInput) onInput(joint);
     };
     range.addEventListener("input", update);
-    update();
+    display();
     row.append(label, readout, range);
     container.append(row);
-    rows.push({ joint, range, update });
+    rows.push({ joint, display });
   }
   return {
     reset() {
       for (const row of rows) {
-        row.range.value = "0";
-        row.update();
+        row.joint.reset();
+        row.display();
+        if (onInput) onInput(row.joint);
       }
     },
   };

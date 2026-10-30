@@ -974,7 +974,7 @@ class AdmissionProjectionTests(unittest.TestCase):
             },
             "actual_verifier_sha256": self.harness.spec.executors.verify,
             "capture_artifact": capture.result.output_artifact.to_record(),
-            "checks": [{"id": "fixture", "state": "passed", "passed": True}],
+            "checks": [{"id": "fixture", "state": "passed", "passed": True, "details": {}}],
             "closure_sha256": digest(
                 {
                     "capture_artifact": capture.result.output_artifact.to_record(),

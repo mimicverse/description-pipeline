@@ -597,7 +597,7 @@ class PublishFixture:
             "actual_verifier": VERIFY_IDENTITY,
             "actual_verifier_sha256": VERIFY_SHA256,
             "capture_artifact": self.capture_ref.to_record(),
-            "checks": [{"id": "fixture", "state": "passed", "passed": True}],
+            "checks": [{"id": "fixture", "state": "passed", "passed": True, "details": {}}],
             "closure_sha256": digest(
                 {
                     "capture_artifact": self.capture_ref.to_record(),
@@ -1421,6 +1421,7 @@ else:
 
     def test_completed_effect_replay_rechecks_the_live_base(self) -> None:
         self._run()
+        before = (dict(self.fixture.effects.intents), self.fixture.effects.authorizations)
         seed = self.fixture.root / "seed"
         (seed / "README.md").write_text("moved after effects completed\n", encoding="utf-8")
         git(seed, "add", "README.md")
@@ -1441,9 +1442,13 @@ else:
             patch.object(PublicationRepository, "push", side_effect=AssertionError("must not resend")),
             patch.object(self.fixture.pr, "create", side_effect=AssertionError("must not recreate PR")),
             patch.object(self.fixture.pr, "update", side_effect=AssertionError("must not update PR")),
-            self.assertRaisesRegex(PipelineError, "publish.base_moved"),
+            self.assertRaises(StageFailure) as raised,
         ):
             self._run(workspace=second_workspace, claim=second_claim)
+        self.assertEqual(raised.exception.outcome, "failed")
+        self.assertEqual(raised.exception.reason_code, "publish.local_contract_failed")
+        self.assertEqual(raised.exception.detail["exception"]["code"], "publish.base_moved")
+        self.assertEqual((self.fixture.effects.intents, self.fixture.effects.authorizations), before)
 
     def test_pull_request_reconciliation_reuses_original_outbound_without_writes(self) -> None:
         first, effect_id, intent, outbound = self._pr_recovery_inputs()
@@ -1695,8 +1700,12 @@ else:
         git(seed, "add", "README.md")
         git(seed, "commit", "-m", "move base")
         git(seed, "push", "origin", "main")
-        with self.assertRaisesRegex(PipelineError, "publish.base_moved"):
+        with self.assertRaises(StageFailure) as raised:
             self._run()
+        self.assertEqual(raised.exception.outcome, "failed")
+        self.assertEqual(raised.exception.reason_code, "publish.local_contract_failed")
+        self.assertEqual(raised.exception.detail["exception"]["code"], "publish.base_moved")
+        self.assertEqual(self.fixture.effects.authorizations, 0)
         self.assertEqual(self.fixture.effects.intents, {})
         branch_ref = self.fixture.command.request["branch_ref"]
         branch = git(self.fixture.repo, "ls-remote", "origin", f"refs/heads/{branch_ref}")
@@ -1730,8 +1739,12 @@ else:
         git(seed, "add", "other.txt")
         git(seed, "commit", "-m", "existing review head")
         git(seed, "push", "origin", branch_ref)
-        with self.assertRaisesRegex(PipelineError, "publish.head_moved"):
+        with self.assertRaises(StageFailure) as raised:
             self._run()
+        self.assertEqual(raised.exception.outcome, "failed")
+        self.assertEqual(raised.exception.reason_code, "publish.local_contract_failed")
+        self.assertEqual(raised.exception.detail["exception"]["code"], "publish.head_moved")
+        self.assertEqual(self.fixture.effects.authorizations, 0)
         self.assertEqual(self.fixture.effects.intents, {})
         self.assertEqual(self.fixture.pr.create_calls, 0)
 
@@ -1785,9 +1798,15 @@ else:
                 "materialize_repository_snapshot",
                 materialize_with_hook,
             ),
-            self.assertRaisesRegex(PipelineError, "publish.blob_mismatch"),
+            self.assertRaises(StageFailure) as raised,
         ):
             self._run()
+        self.assertEqual(raised.exception.outcome, "failed")
+        self.assertEqual(raised.exception.reason_code, "publish.local_contract_failed")
+        self.assertEqual(raised.exception.detail["exception"]["code"], "publish.blob_mismatch")
+        self.assertEqual(self.fixture.effects.intents, {})
+        self.assertEqual(self.fixture.effects.authorizations, 0)
+        self.assertEqual(self.fixture.pr.create_calls, 0)
         branch_ref = self.fixture.command.request["branch_ref"]
         branch = git(self.fixture.repo, "ls-remote", "origin", f"refs/heads/{branch_ref}")
         self.assertEqual(branch.stdout, "")
@@ -1950,8 +1969,7 @@ else:
         original_request = read_data(request_path)
         for field, changed, code in (
             ("verification_certificate_sha256", "f" * 64, "publish.git_recovery_certificate"),
-            ("candidate_tree", "f" * 40, "publish.candidate_bundle_facts"),
-            ("pr_body_sha256", "f" * 64, "publish.git_recovery_pr_text"),
+            ("candidate_tree", "f" * 40, "publish.git_recovery_intent"),
         ):
             with self.subTest(field=field):
                 write_json(plan_path, {**original, field: changed})
@@ -1973,6 +1991,20 @@ else:
                         workspace_root=workspace,
                     )
                 self.assertFalse((workspace / "publish-evidence").exists())
+        write_json(plan_path, {**original, "pr_body_sha256": "f" * 64})
+        write_json(request_path, original_request)
+        request = publish_stage._request_contract(self.fixture.command)
+        repository = publish_stage.clone_publication_repository(
+            request.origin_url, self.fixture.root / "pr-text-consumer-repository",
+        )
+        with patch.object(
+            publish_stage, "_publication_text", side_effect=AssertionError("Git reader must not derive PR content")
+        ):
+            sealed = publish_stage._read_sealed_git_outbound_root(
+                repository=repository, request=request, outbound_root=outbound,
+            )
+        with self.assertRaisesRegex(PipelineError, "publish.git_recovery_pr_text"):
+            publish_stage._sealed_publication_text(repository=repository, request=request, sealed=sealed)
 
     def test_resume_reuses_settled_effects_without_external_writes(self) -> None:
         first = self._run()

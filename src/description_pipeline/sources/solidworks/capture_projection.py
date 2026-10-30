@@ -24,6 +24,7 @@ from ...io import PipelineError, confined, read_data
 from ...schemas import (
     EFFECTIVE_INSTANCES_SCHEMA,
     LINK_GROUP_MASS_SCHEMA,
+    NATIVE_CAPTURE_FACTS,
     NATIVE_CAPTURE_FACTS_KEYS,
     NATIVE_CAPTURE_OBSERVATION_KEYS,
     NATIVE_CAPTURE_OBSERVATION_SCHEMA,
@@ -37,7 +38,6 @@ from .inertia_convention import POSITIVE, STANDARD, detect_family
 from .protocol import Matrix, RawComponent, RawScene
 
 
-NATIVE_CAPTURE_FACTS = "raw/native_capture_facts.json"
 LINK_GROUP_USED_API = "IMassProperty2 (SelectedItems = component set)"
 LINK_GROUP_SELECTION_RULE = "top_most_providers+uncovered_leaves"
 

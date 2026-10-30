@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
-from ..io import canonical, read_data, write_json
+from ..io import canonical, process_error_record, read_data, write_json
 from ..schemas import (
     EFFECT_RECONCILIATION_FAILURE_SCHEMA,
     EFFECT_RECONCILIATION_SCHEMA,
@@ -231,11 +231,12 @@ class EffectReconciliationFailure(ProtocolError):
     """A failed read-only reconciliation retained its complete working tree."""
 
     def __init__(self, cause: Exception, retained_workspace: Path) -> None:
+        diagnostic = process_error_record(cause, operation="effect.reconciliation")
         super().__init__(
             "reconciliation.failed",
             {
                 "error_type": type(cause).__name__,
-                "error_message": str(cause)[:4096],
+                "error_message": diagnostic["message"],
                 "retained_workspace": str(retained_workspace),
             },
         )
@@ -412,7 +413,7 @@ class EffectReconciliationService:
         except Exception as error:
             if not persisted:
                 self._retain_failure(workspace, error)
-                raise EffectReconciliationFailure(error, workspace) from error
+                raise EffectReconciliationFailure(error, workspace) from None
             raise
         finally:
             if persisted:
@@ -429,12 +430,14 @@ class EffectReconciliationService:
     @staticmethod
     def _retain_failure(workspace: Path, error: Exception) -> None:
         with contextlib.suppress(Exception):
+            diagnostic = process_error_record(error, operation="effect.reconciliation")
             write_json(
                 workspace / "reconciliation-failure.json",
                 {
                     "schema_version": EFFECT_RECONCILIATION_FAILURE_SCHEMA,
                     "error_type": type(error).__name__,
-                    "error_message": str(error)[:4096],
+                    "error_message": diagnostic["message"],
+                    "error_detail": diagnostic,
                     "workspace": str(workspace),
                 },
             )
