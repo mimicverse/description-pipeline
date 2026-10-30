@@ -18,6 +18,30 @@ STAGE_ROOT = "C:\\stage"
 DEFAULT_MAIN = "cad/robot.SLDASM"
 
 
+def seal_fixture_open_observation(record: dict, *, configuration: str = "Default") -> None:
+    """Seal an explicitly constructed scenario's native opening and occurrence scope."""
+
+    import copy
+
+    selection = record["source_selection"]
+    closure = copy.deepcopy(selection["closure"])
+    closure["saved_configuration"] = configuration
+    closure["observed_occurrences"] = [
+        {
+            "instance": row.get("instance_id") or row["name2"],
+            "configuration": row["configuration"],
+            "suppression_state": row["suppression_state"],
+        }
+        for row in record["components"]
+    ]
+    record["open_status"] = copy.deepcopy(closure["open_status"])
+    record.setdefault("unresolved_components", [])
+    record["source_selection"] = seal_closure_selection(
+        {**selection["files"], **selection["excluded_files"]},
+        selection["main_assembly"], closure, reader_sha256=selection["reader_sha256"],
+    )
+
+
 def closure_evidence(
     upload_files: Mapping[str, str],
     main_assembly: str = DEFAULT_MAIN,

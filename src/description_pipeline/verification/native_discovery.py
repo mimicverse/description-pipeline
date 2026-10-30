@@ -69,7 +69,7 @@ from ..sources.solidworks.native_limits import (
     validate_native_limit,
 )
 from ..sources.solidworks.saved_state import (
-    capture_open_matches,
+    same_open_observation,
     validate_open_status,
 )
 from ..sources.solidworks.session_artifacts import (
@@ -1123,22 +1123,14 @@ def _require_saved_state_open(payload: dict) -> dict:
             "discovery.saved_state",
             "the sealed selection carries no coherent native open status",
         ) from error
-    observed = raw.get("open_status")
-    if observed is None:
-        if (sealed["errors"] != 0 or sealed["warnings"] != 0):
-            raise _Failure(
-                "discovery.saved_state",
-                "an incomplete saved-state export carries no Discover open observation",
-            )
-    else:
-        try:
-            if not capture_open_matches(sealed, observed):
-                raise ValueError("status differs")
-        except ValueError as error:
-            raise _Failure(
-                "discovery.saved_state",
-                "Discover OpenDoc6 status differs from the sealed selection",
-            ) from error
+    try:
+        if not same_open_observation(sealed, raw.get("open_status")):
+            raise ValueError("status differs")
+    except ValueError as error:
+        raise _Failure(
+            "discovery.saved_state",
+            "Discover OpenDoc6 status differs from the sealed selection",
+        ) from error
     unresolved = raw.get("unresolved_components")
     if (sealed["errors"] != 0 or sealed["warnings"] != 0) and (
         not isinstance(unresolved, list)
@@ -1158,38 +1150,37 @@ def _require_saved_state_open(payload: dict) -> dict:
             "discovery.saved_state",
             "an active unresolved occurrence has unreadable required engineering facts",
         )
-    if (sealed["errors"] != 0 or sealed["warnings"] != 0):
-        scoped = closure.get("observed_occurrences")
-        if not isinstance(scoped, list):
-            raise _Failure("discovery.saved_state", "the saved-state occurrence scope is missing")
-        expected = {
-            row.get("instance"): (row.get("configuration"), row.get("suppression_state"))
-            for row in scoped if isinstance(row, dict)
-        }
-        observed_rows = [
-            (row.get("instance_id") or row.get("name2"), row.get("configuration"), row.get("suppression_state"))
-            for row in raw.get("components") or [] if isinstance(row, dict)
-        ] + [
-            (row.get("instance"), row.get("configuration"), row.get("suppression_state"))
-            for row in unresolved or []
-        ]
-        expected_unresolved = {row.get("instance") for row in closure.get("unresolved", [])}
-        observed_unresolved = {row.get("instance") for row in unresolved}
-        if expected_unresolved != observed_unresolved:
-            raise _Failure(
-                "discovery.saved_state",
-                "Discover unresolved occurrence scope differs from the sealed selection",
-            )
-        observed_scope = {name: (configuration, suppression) for name, configuration, suppression in observed_rows}
-        if len(observed_scope) != len(observed_rows) or observed_scope != expected:
-            raise _Failure(
-                "discovery.saved_state",
-                "Discover occurrence scope differs from the sealed selection",
-                {
-                    "expected": sorted(str(name) for name in expected),
-                    "observed": sorted(str(name) for name in observed_scope),
-                },
-            )
+    scoped = closure.get("observed_occurrences")
+    if not isinstance(scoped, list):
+        raise _Failure("discovery.saved_state", "the saved-state occurrence scope is missing")
+    expected = {
+        row.get("instance"): (row.get("configuration"), row.get("suppression_state"))
+        for row in scoped if isinstance(row, dict)
+    }
+    observed_rows = [
+        (row.get("instance_id") or row.get("name2"), row.get("configuration"), row.get("suppression_state"))
+        for row in raw.get("components") or [] if isinstance(row, dict)
+    ] + [
+        (row.get("instance"), row.get("configuration"), row.get("suppression_state"))
+        for row in unresolved or []
+    ]
+    expected_unresolved = {row.get("instance") for row in closure.get("unresolved", [])}
+    observed_unresolved = {row.get("instance") for row in unresolved or []}
+    if expected_unresolved != observed_unresolved:
+        raise _Failure(
+            "discovery.saved_state",
+            "Discover unresolved occurrence scope differs from the sealed selection",
+        )
+    observed_scope = {name: (configuration, suppression) for name, configuration, suppression in observed_rows}
+    if len(expected) != len(scoped) or len(observed_scope) != len(observed_rows) or observed_scope != expected:
+        raise _Failure(
+            "discovery.saved_state",
+            "Discover occurrence scope differs from the sealed selection",
+            {
+                "expected": sorted(str(name) for name in expected),
+                "observed": sorted(str(name) for name in observed_scope),
+            },
+        )
     return {
         "classification": sealed["classification"],
         "open_errors": sealed["errors"],

@@ -115,7 +115,7 @@ def native_record() -> dict:
             "cad/arm.SLDPRT": [],
         },
     )
-    return {
+    result = {
         "schema_version": DISCOVERY_SCHEMA,
         "contract": CONTRACT,
         "namespace": "dp",
@@ -262,6 +262,11 @@ def native_record() -> dict:
         "files": files,
         "source_selection": source_selection,
     }
+
+    from .selection_support import seal_fixture_open_observation
+
+    seal_fixture_open_observation(result)
+    return result
 
 
 def frame_ground_mates(component: str = "base-1") -> list[dict]:
@@ -812,6 +817,10 @@ class OracleSemanticsTests(unittest.TestCase):
                 }
             )
 
+            from .selection_support import seal_fixture_open_observation
+
+            seal_fixture_open_observation(raw)
+
         package = self.baseline()
         self._native(package, mutate)
         passed, errors, _checks = self.check(package)
@@ -872,6 +881,10 @@ class OracleSemanticsTests(unittest.TestCase):
                     ],
                 }
             )
+
+            from .selection_support import seal_fixture_open_observation
+
+            seal_fixture_open_observation(raw)
 
         from description_pipeline.verification.native_discovery import _cluster_bindings
 

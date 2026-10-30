@@ -96,6 +96,20 @@ def _json_object(value: Mapping[str, Any], label: str) -> dict[str, Any]:
         raise PipelineError(f"{label} is not canonical JSON") from error
 
 
+def _actual_verifier(provider: IdentityProvider) -> tuple[dict[str, Any], str]:
+    """Keep executor observation failures outside trusted input rejection."""
+
+    try:
+        record = _json_object(provider(), "verifier identity")
+        checksum = current_verifier_sha256(record)
+    except Exception as error:
+        raise ProtocolError(
+            "verify.executor_unavailable",
+            {"error_type": type(error).__name__, "message": str(error)},
+        ) from error
+    return record, checksum
+
+
 def _certificate_checks(checks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         {
@@ -398,6 +412,13 @@ def _prepare(
     command: StageCommand,
     identity_provider: IdentityProvider,
 ) -> _PreparedInput:
+    verifier, verifier_sha256 = _actual_verifier(identity_provider)
+    if verifier_sha256 != request.expected_verifier_sha256:
+        raise ProtocolError(
+            "verify.executor_mismatch",
+            {"actual": verifier_sha256, "expected": request.expected_verifier_sha256},
+        )
+    verifier_record_sha256 = digest(verifier)
     generate_root = workspace.inputs.get(request.generate_artifact.artifact_id)
     capture_root = workspace.inputs.get(request.capture_artifact.artifact_id)
     if (
@@ -425,11 +446,6 @@ def _prepare(
         raise PipelineError("Verify configuration closure differs from the frozen request")
     if request.contract_sha256 != CONTRACT_SHA256 or request.policy_sha256 != check_policy_digest():
         raise PipelineError("Verify contract or policy differs from the current verifier")
-    verifier = _json_object(identity_provider(), "verifier identity")
-    verifier_sha256 = current_verifier_sha256(verifier)
-    verifier_record_sha256 = digest(verifier)
-    if verifier_sha256 != request.expected_verifier_sha256:
-        raise PipelineError("Actual verifier differs from the requested Verify executor")
     closure = digest(
         {
             "capture_artifact": capture.artifact.to_record(),
@@ -597,9 +613,9 @@ class VerifyHandler:
         )
         if current_closure != prepared.closure_sha256 or receipt_again != prepared.generate_receipt:
             raise PipelineError("Generate/Capture artifact pair changed during Verify")
-        final_verifier_record = _json_object(self.identity_provider(), "verifier identity")
+        final_verifier_record, _final_sha256 = _actual_verifier(self.identity_provider)
         if digest(final_verifier_record) != prepared.verifier_record_sha256:
-            raise PipelineError("Verifier identity changed during Verify")
+            raise ProtocolError("verify.executor_changed")
 
         certificate = _certificate(prepared, report)
         finished = self.clock()
@@ -661,15 +677,25 @@ class VerifyHandler:
         request, roots = self.request_from_command(command, workspace)
         if claim.executor_sha256 != request.expected_verifier_sha256:
             raise ProtocolError("verify.executor_mismatch", {"claim_executor": claim.executor_sha256})
-        result = self.evaluate(
-            request,
-            generate_root=roots[request.generate_artifact.artifact_id],
-            capture_root=roots[request.capture_artifact.artifact_id],
-            candidate_root=workspace.root / "output",
-            evaluation_root=workspace.root / "evaluation",
-            command=command,
-            claim=claim,
-        )
+        try:
+            result = self.evaluate(
+                request,
+                generate_root=roots[request.generate_artifact.artifact_id],
+                capture_root=roots[request.capture_artifact.artifact_id],
+                candidate_root=workspace.root / "output",
+                evaluation_root=workspace.root / "evaluation",
+                command=command,
+                claim=claim,
+            )
+        except ProtocolError:
+            raise
+        except PipelineError as error:
+            raise StageFailure(
+                "verify.local_contract_failed",
+                str(error),
+                error_type=type(error).__name__,
+                detail=getattr(error, "details", None),
+            ) from error
         if result.passed:
             return StageExecution(
                 outcome="completed",

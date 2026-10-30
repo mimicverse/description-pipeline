@@ -551,6 +551,7 @@ def verify_urdf_mass_equality(bundle_root: Path, source: dict | None = None) -> 
         details["warnings"] = [
             {
                 "code": "urdf.unassigned_native_mass",
+                "blocking": False,
                 "component": item["component"],
                 "mass_kg": item["mass_kg"],
                 "message": (

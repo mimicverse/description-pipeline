@@ -44,6 +44,17 @@ from description_pipeline.pipeline.stages import generate as generate_stage
 
 
 class GenerateHandlerTests(unittest.TestCase):
+    def test_only_trusted_local_contract_errors_become_definite_failures(self) -> None:
+        for error in (
+            PipelineError("Invalid captured facts"), ProtocolError("claim.invalid"),
+            ValueError("unexpected value"), OSError("local IO unavailable"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                workspace, claim = self._workspace("error-" + type(error).__name__, 1)
+                expected = StageFailure if type(error) is PipelineError else type(error)
+                with patch.object(generate_stage, "_compile_capture", side_effect=error), self.assertRaises(expected):
+                    self.handler.execute(self.command, claim, workspace, effects=object())
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="generate-handler-")
         self.addCleanup(self.temporary.cleanup)
@@ -381,7 +392,7 @@ class GenerateHandlerTests(unittest.TestCase):
     def test_missing_capture_input_fails_before_output(self) -> None:
         workspace, claim = self._workspace("attempt", 1)
         (workspace.inputs[self.capture_ref.artifact_id] / "input/request.json").unlink()
-        with self.assertRaises(PipelineError):
+        with self.assertRaises(StageFailure):
             self.handler.execute(self.command, claim, workspace, effects=object())
         self.assertFalse((workspace.root / "output").exists())
 
@@ -427,7 +438,7 @@ class GenerateHandlerTests(unittest.TestCase):
                 side_effect=AssertionError("Discover was rerun"),
             ),
             self.assertRaisesRegex(
-                PipelineError,
+                StageFailure,
                 "discovery.suppression_state_incoherent",
             ),
         ):

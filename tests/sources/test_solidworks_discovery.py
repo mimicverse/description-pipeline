@@ -195,7 +195,7 @@ def record() -> dict:
             "cad/arm.SLDPRT": [],
         },
     )
-    return {
+    result = {
         "schema_version": DISCOVERY_SCHEMA,
         "contract": CONTRACT,
         "namespace": "dp",
@@ -300,6 +300,11 @@ def record() -> dict:
         "files": files,
         "source_selection": source_selection,
     }
+
+    from .selection_support import seal_fixture_open_observation
+
+    seal_fixture_open_observation(result)
+    return result
 
 
 class FakeBackend:
@@ -1077,6 +1082,9 @@ class DiscoveryTests(unittest.TestCase):
             accessory = copy.deepcopy(payload["components"][0])
             accessory.update({"name2": "a_mount-1", "instance_id": "a_mount-1"})
             payload["components"].append(accessory)
+            from .selection_support import seal_fixture_open_observation
+
+            seal_fixture_open_observation(payload)
             payload["mates"].append(
                 {
                     "name": "base_mount_lock",
@@ -1517,6 +1525,9 @@ class DiscoveryTests(unittest.TestCase):
                 container = copy.deepcopy(payload["components"][0])
                 container.update({"name2": "sub-1", "instance_id": "sub-1", "document": "cad/sub.SLDASM"})
                 payload["components"].append(container)
+                from .selection_support import seal_fixture_open_observation
+
+                seal_fixture_open_observation(payload)
                 payload["datums"][0]["owner"] = "sub-1"
                 if connected:
                     payload["mates"].append(
@@ -3874,6 +3885,9 @@ class DiscoveryTests(unittest.TestCase):
                 "cad/arm.SLDPRT": [],
             },
         )
+        from .selection_support import seal_fixture_open_observation
+
+        seal_fixture_open_observation(raw)
         result, output = self._derive_pure(raw)
         self.assertTrue(result.passed, result.findings)
         delivery = self._deliver(output)

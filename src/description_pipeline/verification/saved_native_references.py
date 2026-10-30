@@ -705,6 +705,7 @@ def rebuild_saved_native_references(raw, *, purpose, payload=None, package=None)
         {
             "code": "saved_native.inspection_scope",
             "severity": "warning",
+            "blocking": False,
             "rule_id": SAVED_NATIVE_REFERENCE_RULE,
             "message": "Saved-state preview does not prove solver rank, source completeness or hardware qualification.",
             "saved_fixed_occurrence": root_occurrence,
@@ -717,6 +718,7 @@ def rebuild_saved_native_references(raw, *, purpose, payload=None, package=None)
             {
                 "code": "saved_native.pose_mates",
                 "severity": "warning",
+                "blocking": False,
                 "message": "Additional native pose mates are preserved without a mechanical rank claim.",
                 "mates": [
                     {
@@ -818,6 +820,7 @@ def rebuild_saved_native_references(raw, *, purpose, payload=None, package=None)
             {
                 "code": "saved_native.direction",
                 "severity": "warning",
+                "blocking": False,
                 "joint": axis_name,
                 "message": "Native axis sign is preserved; positive motion and hardware direction remain unqualified."
                 if declared_direction
@@ -833,6 +836,7 @@ def rebuild_saved_native_references(raw, *, purpose, payload=None, package=None)
                 {
                     "code": "saved_native.preview_range",
                     "severity": "warning",
+                    "blocking": False,
                     "joint": axis_name,
                     "message": "The inspection rotation window is a display policy, not a native or hardware range.",
                     **policy,

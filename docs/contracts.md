@@ -904,4 +904,8 @@ push、不重复 create/update。candidate bundle 与 publication plan 是原恢
 
 warning 绑定本次输入摘要与配置，保留原始错误／警告值、全部已枚举的缺失引用名称与路径、可获得的原生对象定位、实际读取范围和原件未改动证据。范围由唯一封存 closure 与选择清单派生，不在打开状态中重复保存文件清单或计数。明确未证明源完整性，隐藏或自动压制对象状态未知；干净打开也不自动证明完整性。无法取得的定位字段保持未知，不以名称猜测、默认值或历史参考补齐。
 
+Discover 与 Capture 是两次独立打开，各自校验当次原生状态；缺失引用枚举、错误或 warning 不要求跨次完全相同。同次 Discover 原始状态必须与封存 selection 一致，所有打开状态下的 occurrence 范围均须与同次原始记录一致。只要任一次打开有诊断，既有 `source.saved_state_incomplete` warning 的 `open_observations` 就分别保存 Discover 与 Capture 的来源位置和完整状态，包括另一阶段的干净观察；不合并位掩码、不覆盖前次诊断、不借前次缺失路径使本次未知错误通过。Capture 的固定输入、配置、计划对象和实际读取范围仍由原有独立门核验。
+
 已有来源 warning 通道承载这些事实；报告、模型来源、URDF、预览和交付 PR 从同一证据生成一致结论，不创建第二份质量状态。独立验证从封存原始观察复核 warning 与实际产物，仍验证纳入对象的几何、轴线、绑定、物性及适用检查。导出成功不建立总体机械或硬件资格；不修改、保存或重建 CAD，不自动搜索并采用包外同名文件。
+
+Generate 的本地转换、输出表示及 Verify 的本地评估若明确抛出 `PipelineError`，可信 handler 将其转成既有 `StageFailure`，通过同一事务登记失败封套、决定并关闭 claim；不把 Airflow task 退出作为业务事实。执行器身份不可用、错配、漂移及其他 `ProtocolError` 不纳入此转换。普通异常、持久化结果不明和外部 UNKNOWN／CONFLICT 继续保留原件并按既有协议对账；报告尚未形成时不伪造 Verify 证书。

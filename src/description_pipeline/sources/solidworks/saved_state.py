@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from ...io import PipelineError
+
 SAVED_STATE_WARNING_CODE = "source.saved_state_incomplete"
 SAVED_STATE_WARNING_MESSAGE = (
     "The assembly was exported from its saved state with native opening diagnostics. "
@@ -37,7 +39,7 @@ _STATUS_FIELDS = (
 
 def _integer(value: object, field: str) -> int:
     if type(value) is not int or value < 0:
-        raise ValueError(f"{field} must be a non-negative integer bitmask")
+        raise PipelineError(f"{field} must be a non-negative integer bitmask")
     return value
 
 
@@ -61,13 +63,13 @@ def _missing_references(value: object) -> dict[str, Any]:
     if value is None:
         return {"state": "unavailable", "items": []}
     if not isinstance(value, Mapping):
-        raise ValueError("missing reference evidence must be an object")
+        raise PipelineError("missing reference evidence must be an object")
     state = value.get("state")
     items = value.get("items")
     if state not in {"observed", "unavailable"} or not isinstance(items, list):
-        raise ValueError("missing reference evidence is malformed")
+        raise PipelineError("missing reference evidence is malformed")
     if state == "unavailable" and items:
-        raise ValueError("unavailable missing-reference evidence cannot claim items")
+        raise PipelineError("unavailable missing-reference evidence cannot claim items")
     normalized = []
     for item in items:
         if (
@@ -76,7 +78,7 @@ def _missing_references(value: object) -> dict[str, Any]:
             or not item["name"]
             or not isinstance(item.get("last_known_path"), str)
         ):
-            raise ValueError("missing reference evidence contains a malformed item")
+            raise PipelineError("missing reference evidence contains a malformed item")
         normalized.append(
             {
                 "name": item["name"],
@@ -91,7 +93,7 @@ def normalize_open_status(value: object) -> dict[str, Any]:
     """Return the canonical interpretation of one ``OpenDoc6`` status pair."""
 
     if not isinstance(value, Mapping):
-        raise ValueError("open status must be an object")
+        raise PipelineError("open status must be an object")
     errors = _integer(value.get("errors"), "open errors")
     warnings = _integer(value.get("warnings"), "open warnings")
     missing = _missing_references(value.get("missing_references"))
@@ -130,18 +132,18 @@ def validate_open_status(value: object) -> dict[str, Any]:
     actual = dict(value) if isinstance(value, Mapping) else value
     expected = normalize_open_status(actual)
     if not isinstance(actual, Mapping):
-        raise ValueError("open status must be an object")
+        raise PipelineError("open status must be an object")
     for field in _STATUS_FIELDS:
         if field in actual and actual.get(field) != expected[field]:
-            raise ValueError(f"open status derived field {field} is inconsistent")
+            raise PipelineError(f"open status derived field {field} is inconsistent")
     return expected
 
 
-def capture_open_matches(selection_status: object, captured_status: object) -> bool:
-    """Require Capture to retain the same native OpenDoc6 result as selection."""
+def same_open_observation(selection_status: object, observed_status: object) -> bool:
+    """Bind two records of one native open, not separate document openings."""
 
     left = validate_open_status(selection_status)
-    right = validate_open_status(captured_status)
+    right = validate_open_status(observed_status)
     fields = (
         "errors",
         "warnings",
@@ -162,7 +164,7 @@ def _scope(selection: Mapping[str, Any]) -> dict[str, Any]:
     selected = selection.get("files")
     excluded = selection.get("excluded_files")
     if not isinstance(selected, Mapping) or not isinstance(excluded, Mapping):
-        raise ValueError("saved-state selection inventory is missing")
+        raise PipelineError("saved-state selection inventory is missing")
     if (
         not isinstance(occurrences, list)
         or any(
@@ -175,12 +177,12 @@ def _scope(selection: Mapping[str, Any]) -> dict[str, Any]:
         )
         or len({item["instance"] for item in occurrences}) != len(occurrences)
     ):
-        raise ValueError("saved-state occurrence observations are incoherent")
+        raise PipelineError("saved-state occurrence observations are incoherent")
     unresolved = closure.get("unresolved", [])
     if not isinstance(unresolved, list) or any(
         not isinstance(item, Mapping) or item.get("suppression_state") != 0 for item in unresolved
     ):
-        raise ValueError("an unresolved occurrence lacks native suppression evidence")
+        raise PipelineError("an unresolved occurrence lacks native suppression evidence")
     return {
         "main_assembly": selection["main_assembly"],
         "selected_files": sorted(selected),
@@ -192,30 +194,36 @@ def _scope(selection: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def warning_from_selection(selection: object) -> dict[str, Any] | None:
-    """Derive the one saved-state warning from a sealed selection manifest."""
-
+def _selection_status(selection: object) -> dict[str, Any]:
     if not isinstance(selection, Mapping):
-        raise ValueError("saved-state selection must be an object")
+        raise PipelineError("saved-state selection must be an object")
     closure = selection.get("closure")
     if not isinstance(closure, Mapping):
-        raise ValueError("saved-state selection carries no closure")
-    status = validate_open_status(closure.get("open_status"))
-    if not status["continuable"]:
-        raise ValueError("native open errors have no located, continuable missing-reference evidence")
-    if status["errors"] == 0 and status["warnings"] == 0:
+        raise PipelineError("saved-state selection carries no closure")
+    return validate_open_status(closure.get("open_status"))
+
+
+def _warning(selection: Mapping[str, Any], observations: dict[str, dict]) -> dict[str, Any] | None:
+    if any(not status["continuable"] for status in observations.values()):
+        raise PipelineError("native open errors have no located, continuable missing-reference evidence")
+    if all(status["errors"] == 0 and status["warnings"] == 0 for status in observations.values()):
         return None
+    closure = selection["closure"]
     main = selection.get("main_assembly")
     configuration = closure.get("saved_configuration")
     if not isinstance(main, str) or not main:
-        raise ValueError("saved-state selection carries no main assembly")
+        raise PipelineError("saved-state selection carries no main assembly")
     if not isinstance(configuration, str) or not configuration:
-        raise ValueError("saved-state selection carries no current configuration")
+        raise PipelineError("saved-state selection carries no current configuration")
     scope = _scope(selection)
-    message = (
-        f"{SAVED_STATE_WARNING_MESSAGE} OpenDoc6 reported errors="
-        f"{status['errors']} and warnings={status['warnings']}."
+    message = SAVED_STATE_WARNING_MESSAGE + " " + " ".join(
+        f"{stage.capitalize()} OpenDoc6 reported errors={status['errors']} and warnings={status['warnings']}."
+        for stage, status in observations.items()
     )
+    sources = {
+        "discover": "input/discovery/native-discovery.json#/raw/source_selection/closure/open_status",
+        "capture": "evidence/native-runtime.json#/prepared_capture/opened",
+    }
     return {
         "code": SAVED_STATE_WARNING_CODE,
         "severity": "warning",
@@ -224,18 +232,16 @@ def warning_from_selection(selection: object) -> dict[str, Any] | None:
             {
                 "object_type": "assembly",
                 "object": main,
-                "state": status["classification"],
+                "state": "saved_state_incomplete",
             }
         ],
         "message": message,
         "detail": {
-            "classification": status["classification"],
-            "open_errors": status["errors"],
-            "open_error_bits": status["error_bits"],
-            "open_warnings": status["warnings"],
-            "open_warning_bits": status["warning_bits"],
+            "open_observations": {
+                stage: {"source": sources[stage], "status": status}
+                for stage, status in observations.items()
+            },
             "configuration": configuration,
-            "missing_references": status["missing_references"],
             "missing_reference_enumeration_complete": False,
             "actual_scope": scope,
             "source_integrity_proven": False,
@@ -247,22 +253,22 @@ def warning_from_selection(selection: object) -> dict[str, Any] | None:
     }
 
 
+def warning_from_selection(selection: object) -> dict[str, Any] | None:
+    """Retain the selection's own OpenDoc6 observation."""
+
+    status = _selection_status(selection)
+    return _warning(selection, {"discover": status})
+
+
 def warning_from_capture(
     selection: object,
     captured_open: object,
 ) -> dict[str, Any] | None:
-    """Derive the warning only after selection and Capture agree on the raw open."""
+    """Validate each independent opening and preserve both native observations."""
 
-    if not isinstance(selection, Mapping):
-        raise ValueError("saved-state selection must be an object")
-    closure = selection.get("closure")
-    if not isinstance(closure, Mapping):
-        raise ValueError("saved-state selection carries no closure")
-    selection_status = validate_open_status(closure.get("open_status"))
+    selection_status = _selection_status(selection)
     captured_status = validate_open_status(captured_open)
-    if not capture_open_matches(selection_status, captured_status):
-        raise ValueError("Capture OpenDoc6 status differs from the sealed selection")
-    return warning_from_selection(selection)
+    return _warning(selection, {"discover": selection_status, "capture": captured_status})
 
 
 __all__ = [
@@ -271,8 +277,8 @@ __all__ = [
     "MISSING_EXTERNAL_REFERENCES_WARNING",
     "SAVED_STATE_WARNING_CODE",
     "SAVED_STATE_WARNING_MESSAGE",
-    "capture_open_matches",
     "normalize_open_status",
+    "same_open_observation",
     "validate_open_status",
     "warning_from_capture",
     "warning_from_selection",
