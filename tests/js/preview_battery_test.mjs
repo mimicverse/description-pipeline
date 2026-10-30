@@ -22,6 +22,10 @@ const {
   infoPanelRows,
   interactionEffect,
   jointRows,
+  parseUrdfAxis,
+  parseUrdfNumber,
+  parseUrdfRgba,
+  parseUrdfVector,
   qualificationRows,
   linkRows,
   previewExpansion,
@@ -31,6 +35,25 @@ const {
   stageSummaryRows,
   summaryIdentity,
 } = logic;
+
+// URDF parsing accepts only the format's omitted-field defaults. Explicit
+// emptiness, malformed numbers and ambiguous axes fail closed.
+{
+  assert.deepEqual(parseUrdfVector(undefined, [0, 0, 0], "origin"), [0, 0, 0]);
+  assert.deepEqual(parseUrdfVector("1 -2 3.5", [0, 0, 0], "origin"), [1, -2, 3.5]);
+  assert.throws(() => parseUrdfVector(undefined, undefined, "size"), /missing/);
+  assert.throws(() => parseUrdfVector("", [0, 0, 0], "origin"), /three finite numbers/);
+  assert.throws(() => parseUrdfVector("1 2 x", [0, 0, 0], "origin"), /finite decimal/);
+  assert.equal(parseUrdfNumber("0.25", "radius"), 0.25);
+  assert.throws(() => parseUrdfNumber("", "radius"), /missing/);
+  assert.throws(() => parseUrdfNumber("NaN", "radius"), /finite/);
+  assert.deepEqual(parseUrdfAxis(undefined, "axis"), [1, 0, 0]);
+  assert.deepEqual(parseUrdfAxis("0 0 2", "axis"), [0, 0, 1]);
+  assert.throws(() => parseUrdfAxis("0 0 0", "axis"), /non-zero/);
+  assert.deepEqual(parseUrdfRgba("0.1 0.2 0.3 1", "rgba"), [0.1, 0.2, 0.3, 1]);
+  assert.throws(() => parseUrdfRgba("0.1 0.2 0.3", "rgba"), /four finite/);
+  assert.throws(() => parseUrdfRgba("0.1 0.2 1.3 1", "rgba"), /\[0, 1\]/);
+}
 
 // P1 interaction.responds (fixture case-01-interaction-responds.json):
 // orbit/zoom/pan each visibly change the camera, the distance or the target.
@@ -114,7 +137,6 @@ const {
   assert.ok(viewer.includes("transparent: style.opacity < 1"));
   assert.ok(viewer.includes("opacity: style.opacity"));
   const app = readFileSync(path.join(staticDir, "app.js"), "utf8");
-  assert.ok(viewer.includes('parseNumber(limit.getAttribute("effort"), null)'));
   assert.ok(!viewer.includes('parseNumber(limit.getAttribute("effort"), 0)'));
   assert.ok(app.includes("not provided (drive capability not established)"));
   assert.ok(!app.includes("policy_preview_window"));
@@ -183,3 +205,5 @@ const {
 }
 
 console.log("preview battery: P1-P5 OK");
+
+await import("./viewer_parser_test.mjs");

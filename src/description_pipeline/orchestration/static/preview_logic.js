@@ -19,6 +19,72 @@ export function registeredVerificationArtifact(preview, runId) {
   };
 }
 
+// URDF parsing defaults are limited to fields the format defines as optional.
+// An explicitly empty or malformed value is evidence corruption, not absence.
+export function parseUrdfVector(text, fallback, label) {
+  if (text === undefined || text === null) {
+    if (fallback === undefined) throw new Error(`${label} is missing`);
+    return fallback.slice();
+  }
+  const parts = String(text).trim().split(/\s+/);
+  if (parts.length !== 3 || parts.some((part) => part === "")) {
+    throw new Error(`${label} must contain three finite numbers: ${text}`);
+  }
+  return parts.map((part) => parseUrdfNumber(part, label));
+}
+
+export function parseUrdfNumber(text, label) {
+  if (text === undefined || text === null || String(text).trim() === "") {
+    throw new Error(`${label} is missing`);
+  }
+  const decimal = String(text).trim();
+  const value = Number(decimal);
+  if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(decimal) || !Number.isFinite(value)) {
+    throw new Error(`${label} must be a finite decimal number: ${text}`);
+  }
+  return value;
+}
+
+export function parseUrdfRgba(text, label) {
+  if (text === undefined || text === null) throw new Error(`${label} is missing`);
+  const parts = String(text).trim().split(/\s+/);
+  if (parts.length !== 4 || parts.some((part) => part === "")) {
+    throw new Error(`${label} must contain four finite numbers in [0, 1]: ${text}`);
+  }
+  const values = parts.map((part) => parseUrdfNumber(part, label));
+  if (values.some((value) => value < 0 || value > 1)) {
+    throw new Error(`${label} must contain four finite numbers in [0, 1]: ${text}`);
+  }
+  return values;
+}
+
+export function parseUrdfAxis(text, label) {
+  const vector = parseUrdfVector(text, [1, 0, 0], label);
+  const length = Math.hypot(...vector);
+  if (!(length > 0) || !Number.isFinite(length)) throw new Error(`${label} must be a non-zero finite vector`);
+  return vector.map((value) => value / length);
+}
+
+export function resolveUrdfMesh(files, urdfPath, filename) {
+  if (typeof filename !== "string" || !filename || /[\\\u0000-\u001f?#]/.test(filename) || /^(?:[a-z][a-z0-9+.-]*:|\/)/i.test(filename)) {
+    throw new Error(`Mesh must use a delivery-relative path; package and external URIs are unsupported: ${filename}`);
+  }
+  if (typeof urdfPath !== "string" || !Object.hasOwn(files, urdfPath)) {
+    throw new Error("URDF path is not in the verified delivery inventory");
+  }
+  const parts = urdfPath.split("/").slice(0, -1);
+  for (const part of filename.split("/")) {
+    if (part === "." || part === "") continue;
+    if (part === "..") {
+      if (!parts.length) throw new Error(`Mesh path escapes the delivery: ${filename}`);
+      parts.pop();
+    } else parts.push(part);
+  }
+  const resolved = parts.join("/");
+  if (!Object.hasOwn(files, resolved)) throw new Error(`Mesh is not in the verified delivery inventory: ${filename}`);
+  return resolved;
+}
+
 // A verified delivery remains visible when it carries source warnings.
 export function previewDiagnosticState(preview) {
   const warnings = Array.isArray(preview?.warnings)

@@ -2633,6 +2633,7 @@ async function loadPreview(dagRunId) {
         .join("/")}`;
     const loaded = await loadRobot(state.viewer, {
       urdfUrl: artifactUrl(preview.urdf),
+      urdfPath: preview.urdf,
       files: preview.files,
       artifactUrl,
       signal: request.signal,

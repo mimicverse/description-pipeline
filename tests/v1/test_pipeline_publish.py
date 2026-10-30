@@ -1969,7 +1969,7 @@ else:
         original_request = read_data(request_path)
         for field, changed, code in (
             ("verification_certificate_sha256", "f" * 64, "publish.git_recovery_certificate"),
-            ("candidate_tree", "f" * 40, "publish.candidate_bundle_facts"),
+            ("candidate_tree", "f" * 40, "publish.git_recovery_intent"),
         ):
             with self.subTest(field=field):
                 write_json(plan_path, {**original, field: changed})

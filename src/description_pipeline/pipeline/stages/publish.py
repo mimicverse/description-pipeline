@@ -910,6 +910,15 @@ class PublishGitReconciliationAdapter:
                 {"effect_id": intent.effect_id, "effect_key": intent.effect_key},
             )
         request = _request_contract(command)
+        sealed_request = _require_object(read_data(Path(outbound_root) / "request.json"), "sealed Git effect request")
+        expected_state = {key: value for key, value in sealed_request.items() if key != "parents"}
+        if (
+            intent.command_id != command.command_id
+            or dict(intent.expected_state) != expected_state
+            or intent.expected_state_digest != digest(expected_state)
+            or dict(intent.target) != {"repository": request.repository_slug, "branch_ref": request.branch_ref}
+        ):
+            raise PublicationError("publish.git_recovery_intent")
         repository = clone_publication_repository(
             request.origin_url,
             Path(workspace_root) / "repository",
@@ -1538,6 +1547,14 @@ def _pr_effect(
             observations=(observation,),
             reason="response-mismatch",
         )
+    payload = {
+        "action": action,
+        "pull_request": observation.to_record(),
+    }
+    response = workspace.root / "effects/pr-response"
+    response.mkdir(parents=True)
+    write_json(response / "observation.json", payload)
+    effects.record_response(effect_id, source="publish.pr", response_root=response)
     try:
         observed_again = client.observe(
             repository=request.repository_slug,
@@ -1559,14 +1576,6 @@ def _pr_effect(
             observations=observed_again,
             reason="readback-changed",
         )
-    payload = {
-        "action": action,
-        "pull_request": observation.to_record(),
-    }
-    response = workspace.root / "effects/pr-response"
-    response.mkdir(parents=True)
-    write_json(response / "observation.json", payload)
-    effects.record_response(effect_id, source="publish.pr", response_root=response)
     observation_root = workspace.root / "effects/pr-observation"
     observation_root.mkdir(parents=True)
     write_json(observation_root / "observation.json", payload)

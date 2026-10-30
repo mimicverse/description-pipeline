@@ -26,11 +26,12 @@ class PipelineError(ValueError):
 
 
 _ERROR_OUTPUT_BYTES = 128 * 1024
+_SECRET_FIELD_WORDS = ("TOKEN", "PASSWORD", "PASSWD", "SECRET", "AUTHORIZATION", "CREDENTIAL")
 
 
 def _redact_process_text(value: str) -> str:
     for key, secret in os.environ.items():
-        if secret and any(word in key.upper() for word in ("TOKEN", "PASSWORD", "SECRET", "AUTHORIZATION")):
+        if secret and any(word in key.upper() for word in _SECRET_FIELD_WORDS):
             value = value.replace(secret, "[REDACTED]")
     value = re.sub(r"(?i)\b([a-z][a-z0-9+.-]{0,20}://)[^/\s@]+@", r"\1[REDACTED]@", value)
     value = re.sub(r"(?i)\b(?:gh[pousr]_[a-z0-9_]+|github_pat_[a-z0-9_]+)\b", "[REDACTED]", value)
@@ -62,7 +63,7 @@ def safe_process_output(value: bytes | str | None) -> dict[str, Any]:
 def _safe_error_detail(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {
-            str(key): "[REDACTED]" if any(word in str(key).upper() for word in ("TOKEN", "PASSWORD", "SECRET"))
+            str(key): "[REDACTED]" if any(word in str(key).upper() for word in _SECRET_FIELD_WORDS)
             else _safe_error_detail(item)
             for key, item in value.items()
         }

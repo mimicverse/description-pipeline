@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -33,6 +34,21 @@ from tests.v1 import test_pipeline_publish_recovery_postgres as recovery_tests
 
 
 class ProcessDiagnosticTests(unittest.TestCase):
+    def test_structured_details_and_environment_credentials_are_redacted(self) -> None:
+        error = PublicationError("publish.sensitive_detail")
+        error.detail = {
+            "authorization": "Bearer private-auth-value",
+            "nested": [{"credential": "private-cli-value", "passwd": "private-password-value"}],
+            "message": "private-env-credential",
+            "reason": "remote rejection",
+        }
+        with patch.dict(os.environ, {"CLI_CREDENTIAL": "private-env-credential"}):
+            record = process_error_record(error, operation="publish.git")
+        self.assertNotIn("private-", json.dumps(record))
+        self.assertEqual(record["detail"]["authorization"], "[REDACTED]")
+        self.assertEqual(record["detail"]["nested"][0]["credential"], "[REDACTED]")
+        self.assertEqual(record["detail"]["reason"], "remote rejection")
+
     def test_real_nonzero_process_output_and_cause_are_retained_without_secrets(self) -> None:
         secret = "private-process-secret-4930"
         with patch.dict(os.environ, {"GH_TOKEN": secret}):
@@ -308,6 +324,15 @@ class PublishFailureBoundaryTests(unittest.TestCase):
         self.assertIsInstance(result, StageDeferral)
         self.assertEqual(self.fixture.pr.create_calls, 1)
         self.assertEqual(self.diagnostic_records()[0]["observation_error"]["returncode"], 3)
+        self.assertIs(self.fixture.effects.states[result.effect_id], EffectState.UNKNOWN)
+        response = self.fixture.store.materialize(
+            self.fixture.effects.payloads[result.effect_id], self.fixture.root / "retained-pr-response",
+        )
+        recorded = read_data(response / "observation.json")
+        self.assertEqual(recorded["action"], "created")
+        self.assertEqual(recorded["pull_request"], self.fixture.pr.rows[0].to_record())
+        self.assertIsInstance(self.run_publish(), StageDeferral)
+        self.assertEqual(self.fixture.pr.create_calls, 1)
 
     def reconciliation_inputs(self):
         hook = self.fixture.remote / "hooks/pre-receive"
@@ -318,6 +343,32 @@ class PublishFailureBoundaryTests(unittest.TestCase):
         artifact = self.fixture.effects.outbound[result.effect_id]
         outbound = self.fixture.store.materialize(artifact, self.fixture.root / "reconciliation-outbound")
         return intent, outbound
+
+    def test_recomputed_intent_tampering_is_rejected_before_any_remote_probe(self) -> None:
+        intent, outbound = self.reconciliation_inputs()
+        for field in ("command_id", "candidate_commit", "candidate_tree", "repository"):
+            with self.subTest(field=field):
+                expected = dict(intent.expected_state)
+                target = dict(intent.target)
+                command_id = intent.command_id
+                if field == "command_id":
+                    command_id = "other-command"
+                elif field == "repository":
+                    expected[field] = target[field] = "other/repository"
+                else:
+                    expected[field] = "f" * 40
+                forged = replace(
+                    intent, command_id=command_id, expected_state=expected,
+                    expected_state_digest=digest(expected), target=target,
+                )
+                with (
+                    patch.object(stage, "clone_publication_repository", side_effect=AssertionError("unexpected probe")),
+                    self.assertRaisesRegex(PublicationError, "publish.git_recovery_intent"),
+                ):
+                    stage.PublishGitReconciliationAdapter().observe(
+                        command=self.fixture.command, intent=forged, outbound_root=outbound,
+                        workspace_root=self.fixture.root / f"forged-intent-{field}",
+                    )
 
     def test_only_proven_oversize_and_authoritative_commit_absence_can_settle_absent(self) -> None:
         intent, outbound = self.reconciliation_inputs()
