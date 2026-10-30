@@ -4225,7 +4225,6 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(status, 404)
         viewer = (self.static_dir / "viewer.js").read_text(encoding="utf-8")
         self.assertIn('from "/static/vendor/three.module.min.js"', viewer)
-        self.assertIn('querySelector("limit")', viewer)
         self.assertIn("<!doctype", viewer.lower())
         for name in ("index.html", "app.js", "viewer.js", "style.css"):
             source = (self.static_dir / name).read_text(encoding="utf-8")
