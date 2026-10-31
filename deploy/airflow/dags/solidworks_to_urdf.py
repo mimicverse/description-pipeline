@@ -29,6 +29,7 @@ def solidworks_to_urdf():
     stages = [
         StageTaskOperator(
             task_id=stage, stage=stage, retries=0,
+            trigger_rule="none_failed" if stage == "mjcf" else "all_success",
             pool="windows_native" if stage in WINDOWS_STAGES else "default_pool",
         )
         for stage in STAGE_IDS

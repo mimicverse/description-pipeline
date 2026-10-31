@@ -1409,6 +1409,15 @@ class StageApplication:
                 },
             )
 
+    def execution_scope(self, run_id: str) -> tuple[str, ...]:
+        """Read the admitted range without executing or rebuilding its source stages."""
+        policy = getattr(self.services, "claim_policy", None)
+        task_id = getattr(policy, "task_id", None)
+        if task_id is not None:
+            self._validate_airflow_task_binding(run_id, task_id)
+        spec, _admission = self._load_spec(run_id)
+        return execution_stage_ids(spec.from_stage)
+
     def execute_run(self, run_id: str, *, through: StageId = "publish") -> ApplicationOutcome:
         """Run stages one at a time from one admission; no downstream work is hidden in a handler."""
 
@@ -1447,27 +1456,28 @@ class StageApplication:
 
 def _runtime_stage_ids(facts, *, command_id, run_id, through, binding):
     """Select capabilities from registered facts or an actual Airflow task binding."""
-    if sum(value is not None for value in (command_id, run_id, binding)) > 1:
+    if command_id is not None and (run_id is not None or binding is not None):
         raise ApplicationError("application.runtime_target_invalid", "Runtime targets are mutually exclusive")
     if command_id is not None:
         command = facts.load_command(command_id)
         if command.kind != "stage" or command.stage not in STAGE_IDS:
             raise ApplicationError("application.command_not_stage", "Only registered stage commands can execute")
         return (command.stage,)
+    selected = STAGE_IDS
     if run_id is not None:
         admission = facts.load_admission(run_id)
         if admission is None:
             raise ApplicationError("application.run_not_admitted", "The runtime run is not admitted")
         spec = AdmissionSpec.from_record(admission.request)
         validate_run_admission(spec, admission)
-        return execution_stage_ids(spec.from_stage, through=through)
+        selected = execution_stage_ids(spec.from_stage, through=through)
     if binding is not None:
         if not isinstance(binding, AirflowTaskBinding) or binding.task_id not in STAGE_IDS:
             raise ApplicationError(
                 "application.airflow_binding_invalid", "The runtime binding has no engineering stage",
             )
-        return (binding.task_id,)
-    return STAGE_IDS
+        return (binding.task_id,) if binding.task_id in selected else ()
+    return selected
 
 
 def application_from_environment(
