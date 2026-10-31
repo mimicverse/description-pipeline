@@ -97,8 +97,10 @@ CHECK_IDS = (
     "geometry.instances",
     "collision.hulls",
     "joints.config",
+    "joints.restoring",
     "model.configuration",
     "scene.scene",
+    "contacts.supports",
     "runtime.steps",
     "provenance.warnings",
 )
@@ -150,6 +152,8 @@ OPTION_ATOL = 1e-12
 FK_FRACTIONS = (3 / 8, 5 / 8)
 CONTINUOUS_SAMPLE_RAD = 0.75
 RUNTIME_STEPS = 100
+LIMIT_PROBE_OFFSET = 0.02
+CONTACT_PROBE_DEPTH_M = 0.0001
 
 UNIT_SCALE = (1.0, 1.0, 1.0)
 

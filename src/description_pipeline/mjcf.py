@@ -13,7 +13,11 @@ from __future__ import annotations
 
 import hashlib
 import math
+import json
+import os
 import struct
+import subprocess
+import sys
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
@@ -1185,3 +1189,46 @@ def project(root: Path, simulation: bytes = contract.EMPTY_CONFIG) -> dict[str, 
     if metadata is not None and confined(root, contract.COMPONENT_SOURCE).read_bytes() != metadata:
         raise PipelineError("Component provenance changed during MJCF projection")
     return {name: hashlib.sha256(content).hexdigest() for name, content in files.items()}
+
+
+def project_isolated(root: Path, simulation: bytes = contract.EMPTY_CONFIG) -> dict[str, str]:
+    """Run native hull construction in one bounded process over a private view."""
+    from .io import inventory
+
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "description_pipeline.mjcf", str(Path(root).resolve())],
+            input=simulation, capture_output=True, timeout=contract.VERIFIER_TIMEOUT_SECONDS,
+            env={**os.environ, "OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"},
+        )
+    except subprocess.TimeoutExpired as error:
+        raise PipelineError("The MJCF projection process timed out") from error
+    if result.returncode != 0:
+        raise PipelineError(f"The MJCF projection process exited with status {result.returncode}: "
+                            f"{result.stderr.decode('utf-8', errors='replace')[-2000:]}")
+    try:
+        outputs = json.loads(result.stdout)
+    except ValueError as error:
+        raise PipelineError("The MJCF projection process returned invalid JSON") from error
+    actual = {"mjcf/" + name: sha for name, sha in inventory(root / "mjcf").items()}
+    if not isinstance(outputs, dict) or not outputs or actual != outputs:
+        raise PipelineError("The MJCF projection process output differs from the written files")
+    return outputs
+
+
+def _projection_main() -> int:
+    import resource
+
+    resource.setrlimit(resource.RLIMIT_CPU, (contract.VERIFIER_CPU_SECONDS, contract.VERIFIER_CPU_SECONDS + 5))
+    resource.setrlimit(resource.RLIMIT_AS, (contract.VERIFIER_MEMORY_BYTES, contract.VERIFIER_MEMORY_BYTES))
+    try:
+        outputs = project(Path(sys.argv[1]), sys.stdin.buffer.read())
+    except Exception as error:  # noqa: BLE001 (the parent preserves process failure)
+        print(f"{type(error).__name__}: {error}", file=sys.stderr)
+        return 1
+    print(json.dumps(outputs, allow_nan=False))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_projection_main())

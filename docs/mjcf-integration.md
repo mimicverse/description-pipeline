@@ -271,3 +271,9 @@ M1 的实际数值和性能结果目前尚未完成；本文确定其选择方�
 已按已验证 `model/robot.json` 的 visual 名称与 `provenance.native_component` 组合材质分区；只读取身份，位置、几何和物性仍由 URDF 提供。多分区组件生成 link 坐标下的独立凸包 OBJ，检查器从原始绑定输入另行重建分组并核验几何，加载前拒绝 OBJ 外部指令。输入绑定升至 v2，纳入实际组件来源文件。
 
 新增重复资产反例发现：按 mesh ID 去重会漏检共享资产的第二个碰撞体位姿。已移除实例层去重；原失败样本用新工具身份重新绑定后，在 `collision.hulls` 拒绝约 `0.481040539 m` 偏移。同链路没有其他跳过实例的资产缓存；同时将颜色验证移到碰撞分支返回前，避免漏核派生显示值。原件、修复前后报告位于 `.dev/m2/repeated-mesh-case/`。26项定向回归及完整参考转换通过，证据为 `.dev/m2/COMPONENT-GROUP-TESTS.log`、`.dev/m2/REFERENCE-COMPONENT-VERIFICATION.log`；这些证据不替代阶段接纳、正式发行或 CAD 验收。
+
+### 参考接触与限位行为补充（2026-11-01）
+
+已将参考的两类行为检查泛化：逐个有限位关节隔离接触和重力，在源上下界外各偏移0.02 rad或m，要求实际约束力方向恢复；对声明的最低支撑 link，在私有运行数据内将地面上移碰撞误差预算加0.1mm及平面容差，要求实际碰撞响应。没有写入参考脚名、数量或坐标，也不推断控制器或 actuator。
+
+中性回归发现编译后修改静态 `model.geom_pos` 不会移动地面实际位置，故不能以该操作声称接触探针通过。已改为私有 `MjData.geom_xpos` 位移后调用 `mj_collision`，核验实际位移及接触；原失败输入和修复前后报告在 `.dev/m2/contact-probe-case/`。完整参考重新通过，证据 `.dev/m2/REFERENCE-CONTACT-LIMIT-VERIFICATION-v2.log`。本机29项定向回归通过，包含真实子进程凸包生成、错误退出、文件不覆盖和接触/限位负例；日志 `.dev/m2/CONTACT-LIMIT-TESTS.log`。生产调用入口将使用有CPU、内存和时限的 `project_isolated`，禁止在应用主进程无界执行原生凸包构建。

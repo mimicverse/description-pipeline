@@ -1971,6 +1971,46 @@ def _gate_joints_config(state: dict) -> dict:
     return {"max_range_residual": worst_range, "max_dynamics_residual": worst_dynamics}
 
 
+def _gate_joint_restoring(state: dict) -> dict:
+    """Exercise actual limit constraints independently of contact and gravity."""
+    import mujoco
+
+    model, document = _need(state, "robot_model"), _need(state, "document")
+    gravity, flags = model.opt.gravity.copy(), int(model.opt.disableflags)
+    rows = []
+    try:
+        model.opt.gravity[:] = 0
+        model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
+        neutral = model.qpos0.copy()
+        for joint in document["joints"]:
+            if joint["type"] not in ("revolute", "prismatic"):
+                continue
+            index = int(model.joint(joint["name"]).id)
+            bounds = joint["limit"]
+            neutral[int(model.jnt_qposadr[index])] = (bounds["lower"] + bounds["upper"]) / 2
+        for joint in document["joints"]:
+            if joint["type"] not in ("revolute", "prismatic"):
+                continue
+            index = int(model.joint(joint["name"]).id)
+            address, dof = int(model.jnt_qposadr[index]), int(model.jnt_dofadr[index])
+            forces = []
+            for field, sign in (("lower", 1), ("upper", -1)):
+                data = mujoco.MjData(model)
+                data.qpos[:] = neutral
+                data.qpos[address] = joint["limit"][field] - sign * state["policy"]["limit_probe_offset"]
+                mujoco.mj_forward(model, data)
+                force = float(data.qfrc_constraint[dof])
+                if not math.isfinite(force) or sign * force <= 0:
+                    raise CheckError(f"joint {joint['name']!r} has no restoring {field} limit force")
+                forces.append(force)
+            rows.append({"joint": joint["name"], "lower_force": forces[0], "upper_force": forces[1]})
+    finally:
+        model.opt.gravity[:] = gravity
+        model.opt.disableflags = flags
+    return {"joints": rows, "offset": state["policy"]["limit_probe_offset"],
+            "scope": "Isolated numerical limit response; no hardware or full-travel qualification"}
+
+
 def _gate_model_configuration(state: dict) -> dict:
     policy = state["policy"]
     config = _need(state, "config")
@@ -2126,6 +2166,57 @@ def _gate_scene(state: dict) -> dict:
         "max_position_residual_m": worst_position,
         "max_rotation_residual": worst_rotation,
     }
+
+
+def _gate_support_contacts(state: dict) -> dict:
+    """Probe declared lowest supports with an equivalent upward floor displacement."""
+    import mujoco
+
+    config = _need(state, "config")
+    if config["floor"] is None or not config["floor"]["supports"]:
+        return {"applicable": False, "reason": "No source-derived support floor was requested"}
+    model = _need(state, "scene_model")
+    policy, document = state["policy"], _need(state, "document")
+    poses = _fk_pose(document, {})
+    directory = "/".join(state["urdf_relative"].split("/")[:-1])
+    floor_height = _support_expectations(state)["height"]
+    tolerance = policy["tolerances"]["support_plane_atol_m"]
+    expected = set()
+    support_links = {item["link"] for item in config["support_sites"]}
+    for link in document["links"]:
+        if link["name"] not in support_links:
+            continue
+        surfaces = (link["collisions"] if link["collision_role"] == "urdf" else link["visuals"])
+        minimum = min(_support_minimum_height(_support_geometry(
+            surface, poses[link["name"]], state["meshes"], directory, link["name"]
+        )) for surface in surfaces)
+        if abs(minimum - floor_height) <= tolerance:
+            expected.add(link["name"])
+    floor_id = int(model.geom(policy["floor_geom_name"]).id)
+    depth = config["collision"]["max_error_m"] + policy["contact_probe_depth_m"] + tolerance
+    observed, contacts = set(), []
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+    # World geoms are compiled as static: editing model.geom_pos after compile
+    # does not move their runtime pose. Probe a private data pose explicitly.
+    data.geom_xpos[floor_id, 2] += depth
+    mujoco.mj_collision(model, data)
+    _close(data.geom_xpos[floor_id], [0., 0., floor_height + depth],
+           policy["tolerances"]["position_atol_m"])
+    for contact in data.contact:
+        pair = (int(contact.geom1), int(contact.geom2))
+        if floor_id not in pair or float(contact.dist) >= 0:
+            continue
+        geom = pair[1] if pair[0] == floor_id else pair[0]
+        body = model.body(int(model.geom_bodyid[geom])).name
+        observed.add(body)
+        contacts.append({"geom": model.geom(geom).name, "link": body, "distance_m": float(contact.dist)})
+    if not expected or not expected <= observed:
+        raise CheckError(f"declared lowest supports have no ground response: {sorted(expected - observed)}")
+    return {"applicable": True, "expected_support_links": sorted(expected),
+            "observed_links": sorted(observed), "contacts": contacts, "floor_displacement_m": depth,
+            "probe_floor_height_m": float(data.geom_xpos[floor_id, 2]),
+            "scope": "Local contact probe at the source-derived support floor; no standing qualification"}
 
 
 def _runtime_of(model, steps: int, time_tolerance: float) -> dict:
@@ -2425,8 +2516,10 @@ _GATES_BY_ID = {
     "geometry.instances": _gate_geometry_instances,
     "collision.hulls": _gate_collision_hulls,
     "joints.config": _gate_joints_config,
+    "joints.restoring": _gate_joint_restoring,
     "model.configuration": _gate_model_configuration,
     "scene.scene": _gate_scene,
+    "contacts.supports": _gate_support_contacts,
     "runtime.steps": _gate_runtime,
     "provenance.warnings": _gate_provenance_warnings,
 }
@@ -2577,6 +2670,8 @@ def _policy() -> dict:
         "fk_fractions": list(contract.FK_FRACTIONS),
         "continuous_sample_rad": contract.CONTINUOUS_SAMPLE_RAD,
         "runtime_steps": contract.RUNTIME_STEPS,
+        "limit_probe_offset": contract.LIMIT_PROBE_OFFSET,
+        "contact_probe_depth_m": contract.CONTACT_PROBE_DEPTH_M,
         "engine": contract.engine_identity(),
         "tool": contract.tool_identity(),
     }

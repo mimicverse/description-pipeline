@@ -184,6 +184,43 @@ class ProjectionTests(unittest.TestCase):
         gate = next(row for row in report['checks'] if row['id'] == 'geometry.instances')
         self.assertFalse(gate['passed'])
 
+    def test_actual_support_contacts_and_limit_forces_are_checked(self):
+        self.colored_component()
+        report = self.build({'support_sites': [{'name': 'sole', 'link': 'base'}], 'floor': {}})
+        self.assertTrue(report['passed'], report['checks'])
+        gates = {row['id']: row for row in report['checks']}
+        self.assertEqual(['base'], gates['contacts.supports']['details']['expected_support_links'])
+        self.assertGreater(gates['contacts.supports']['details']['probe_floor_height_m'], 0)
+        self.assertLess(min(row['distance_m'] for row in gates['contacts.supports']['details']['contacts']), -0.0001)
+        forces = gates['joints.restoring']['details']['joints'][0]
+        self.assertGreater(forces['lower_force'], 0)
+        self.assertLess(forces['upper_force'], 0)
+        tree = ET.parse(self.root/contract.SCENE_NAME)
+        floor = tree.find('.//geom[@name="floor"]')
+        floor.set('contype', '0')
+        floor.set('conaffinity', '0')
+        tree.write(self.root/contract.SCENE_NAME)
+        report = evaluate_projection(self.root, self.binding())
+        gate = next(row for row in report['checks'] if row['id'] == 'contacts.supports')
+        self.assertFalse(gate['passed'])
+
+    def test_missing_actual_limit_constraint_fails_restoring_probe(self):
+        self.assertTrue(self.build()['passed'])
+        report = self.mutate('.//joint[@name="motion"]', 'limited', 'false')
+        gate = next(row for row in report['checks'] if row['id'] == 'joints.restoring')
+        self.assertFalse(gate['passed'])
+
+    def test_bounded_projection_process_handles_native_work_and_errors(self):
+        self.colored_component()
+        outputs = mjcf.project_isolated(self.root)
+        self.assertIn(contract.ROBOT_NAME, outputs)
+        report = evaluate_projection(self.root, self.binding())
+        self.assertTrue(report['passed'], report['checks'])
+        before = inventory(self.root)
+        with self.assertRaisesRegex(PipelineError, 'process exited'):
+            mjcf.project_isolated(self.root)
+        self.assertEqual(before, inventory(self.root))
+
     def test_component_obj_directives_are_rejected_before_native_loading(self):
         self.colored_component()
         self.assertTrue(self.build()['passed'])
