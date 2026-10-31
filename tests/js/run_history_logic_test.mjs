@@ -64,7 +64,7 @@ let refreshes = 0;
 let previewLoads = 0;
 const poll = new Function("state", "api", "$", "setError", "clearPreview", "renderRun", "loadPreview", "stopActivityTimer", "shouldRefreshRunList", "refreshRuns", "window", "responseRunId", "displayState", "hasPreviewEvidence", "startActivityTimer", `return (${pollSource});`)(
   browserState, async () => nextRun, () => ({}), () => {}, () => {}, () => {}, async () => { previewLoads++; }, () => {},
-  shouldRefreshRunList, async () => { refreshes++; displayedList[0].state = nextRun.state; },
+  shouldRefreshRunList, async () => { refreshes++; Object.assign(displayedList[0], nextRun); },
   { clearTimeout() {}, setTimeout: () => 17 },
   (payload) => payload.dag_run_id, displayState, hasPreviewEvidence, () => {},
 );
@@ -76,14 +76,24 @@ await poll();
 assert.equal(displayedList[0].state, "unresolved");
 assert.equal(refreshes, 1);
 assert.equal(previewLoads, 2);
+// Authorization can expire while canonical UNKNOWN remains unchanged.
+nextRun = { ...nextRun, automatic: { state: "waiting" } };
+await poll();
+assert.equal(refreshes, 2);
+assert.equal(displayState(displayedList[0].state, displayedList[0].automatic), "waiting");
+nextRun = { ...nextRun, automatic: { state: "unresolved" } };
+await poll();
+assert.equal(refreshes, 3);
+assert.equal(displayState(displayedList[0].state, displayedList[0].automatic), "unresolved");
 nextRun = { dag_run_id: "run-3", state: "cancelled" };
 await poll();
 assert.equal(displayedList[0].state, "cancelled");
-assert.equal(refreshes, 2);
+assert.equal(refreshes, 4);
 const deleteSource = appSource.match(/function deleteBlockedReason\(run\) \{[\s\S]*?\n\}/)[0];
 const blockedReason = new Function(`return (${deleteSource});`)();
 assert.equal(blockedReason(nextRun), "");
 assert.notEqual(blockedReason({state: "unresolved"}), "");
+assert.notEqual(blockedReason({state: "unresolved", automatic: {state: "waiting"}}), "");
 console.log("canonical polling consumer OK");
 
 // Immutable geometry can stay loaded while current qualification changes.

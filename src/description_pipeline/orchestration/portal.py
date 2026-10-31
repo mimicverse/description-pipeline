@@ -1724,6 +1724,10 @@ class PortalApp:
                 "user": display_name,
                 "principal": owner,
                 "state": _run_state(projection),
+                "automatic": {"state": "waiting"} if (
+                    projection.get("state") == "unresolved"
+                    and _waiting_for_effect_results(projection, datetime.now(UTC))
+                ) else None,
                 "started_at": airflow_run.get("start_date") or item.created_at.isoformat(),
                 "parent_dag_run_id": (
                     self._dag_run_id_from_request_id(parent.get("request_id"))
