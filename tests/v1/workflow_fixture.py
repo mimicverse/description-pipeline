@@ -113,9 +113,9 @@ def discover_structure(
 ):
     """Derive native semantics and bind them to the frozen handoff."""
 
+    from tests.sources.preparation_support import prepare_native_package
     from description_pipeline.sources.solidworks.discovery import (
         DiscoverySettings,
-        prepare_native_package,
     )
 
     _state(on_event, "discover", "running")

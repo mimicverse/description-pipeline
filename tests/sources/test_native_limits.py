@@ -31,17 +31,26 @@ class NativeLimitValidationTests(unittest.TestCase):
         engineering = rotation_window_policy(
             ENGINEERING_DEFAULT_POLICY_ID,
             author_limits=author_limits,
-            native_absence="native_limit_observation_unreadable",
-            native_errors=[{"mate": "limit", "reason": "unreadable"}],
+            native_absence="complete_mate_inventory_no_enabled_limit",
+            native_errors=[],
         )
         self.assertEqual(preview["window_rad"], [-math.pi, math.pi])
         self.assertEqual(engineering["window_rad"], preview["window_rad"])
         self.assertNotEqual(preview["rule_id"], engineering["rule_id"])
         self.assertIs(engineering["engineering_position_range_qualified"], False)
-        self.assertEqual(
-            engineering["native_observation_errors"],
-            [{"mate": "limit", "reason": "unreadable"}],
-        )
+        self.assertEqual(engineering["native_observation_errors"], [])
+        for absence, errors in (
+            ("native_limit_observation_unreadable", []),
+            ("complete_mate_inventory_no_enabled_limit", [{"mate": "limit", "reason": "unreadable"}]),
+            ("complete_mate_inventory_no_enabled_limit", None),
+        ):
+            with self.subTest(absence=absence, errors=errors), self.assertRaises(ValueError):
+                rotation_window_policy(
+                    ENGINEERING_DEFAULT_POLICY_ID,
+                    author_limits=author_limits,
+                    native_absence=absence,
+                    native_errors=errors,
+                )
 
     def test_complete_nonzero_nominal_observation(self) -> None:
         mate = support.native_limit_mate("base-1", "arm-1", lower=-0.01, upper=0.02)

@@ -3630,7 +3630,7 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
                 },
                 "native_observation_errors": list(native_read_errors),
             }
-        if native_read_errors and (validated_native or isinstance(native_limits, dict)):
+        if native_read_errors:
             raise _Failure(
                 "discovery.joint_limits_unreadable",
                 "native position-limit evidence is incomplete or unreadable",
@@ -3677,24 +3677,20 @@ def rebuild_joint_facts(record: dict, package: Path, *, purpose: str) -> list[di
             limit_source = "declared_author"
             limit_evidence = author_evidence
         elif purpose == "engineering" and joint_type == "revolute":
+            _require(
+                native_limit_inventory_complete(raw.get("mates")),
+                "discovery.joint_limits_unreadable",
+                "the complete native inventory does not prove absence of enabled position limits",
+                {"pair": [left, right]},
+            )
             default_policy = rotation_window_policy(
                 ENGINEERING_DEFAULT_POLICY_ID,
                 author_limits=None,
-                native_absence=(
-                    "complete_mate_inventory_no_enabled_limit"
-                    if native_limit_inventory_complete(raw_mates) and not native_read_errors
-                    else "native_limit_observation_unreadable"
-                ),
-                native_errors=native_read_errors,
+                native_absence="complete_mate_inventory_no_enabled_limit",
+                native_errors=[],
             )
             limits = {"lower": -ROTATION_WINDOW_RAD, "upper": ROTATION_WINDOW_RAD}
             limit_source = "default_policy"
-        elif native_read_errors:
-            raise _Failure(
-                "discovery.joint_limits_unreadable",
-                "native position-limit evidence is incomplete or unreadable",
-                {"pair": [left, right], "errors": native_read_errors},
-            )
         else:
             raise _Failure(
                 "discovery.joint_rebuild",
@@ -5458,6 +5454,9 @@ def verify_discovery(package: Path) -> dict:
                     and policy.get("native_cad_ranges") is False
                     and policy.get("hardware_qualified") is False
                     and policy.get("engineering_position_range_qualified") is False
+                    and policy.get("native_absence") == "complete_mate_inventory_no_enabled_limit"
+                    and policy.get("native_observation_errors") == []
+                    and native_limit_inventory_complete(raw.get("mates"))
                     and _close(
                         [limits.get("lower"), limits.get("upper")],
                         [-ROTATION_WINDOW_RAD, ROTATION_WINDOW_RAD],
