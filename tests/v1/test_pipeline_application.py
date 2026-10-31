@@ -506,6 +506,7 @@ class StageApplicationTests(unittest.TestCase):
             outbound_digest=digest({"outbound": "freeze"}),
             expected_state_digest=digest({"expected": "freeze"}),
         )
+        self.application.admit(self.harness.spec)
         with patch.object(
             self.application,
             "run_stage",

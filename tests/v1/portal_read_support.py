@@ -14,7 +14,7 @@ from description_pipeline.delivery import (
     read_delivery_manifest,
     write_delivery_manifest,
 )
-from description_pipeline.io import digest, file_digest, read_data, write_json
+from description_pipeline.io import PipelineError, digest, file_digest, read_data, write_json
 from description_pipeline.interface_records import (
     CHECK_POLICY_SCHEMA,
     check_policy_digest,
@@ -365,6 +365,15 @@ class RegisteredProjectionArtifacts:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(data)
         return root
+
+    def read_metadata_member(self, artifact: ArtifactRef, member: str, *, max_bytes: int):
+        files = self.objects.get(artifact.artifact_id)
+        if files is None or member not in files:
+            raise PipelineError("Registered artifact member is unavailable")
+        content = files[member]
+        if len(content) > max_bytes:
+            raise PipelineError("Registered artifact member exceeds its declared size")
+        return content, {"path": member, "bytes": len(content), "sha256": hashlib.sha256(content).hexdigest()}, {}
 
 
 class _RegisteredWorld:

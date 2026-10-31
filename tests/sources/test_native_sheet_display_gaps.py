@@ -451,7 +451,7 @@ class NativeSheetDisplayGapTests(unittest.TestCase):
 
         transport = PublishFixture(diagnostics=report["diagnostics"])
         self.addCleanup(transport.close)
-        certificate = {**transport.certificate, "checks": report["checks"],
+        certificate = {**transport.certificate, "diagnostics": report["diagnostics"], "checks": report["checks"],
                        "required_checks": [row["id"] for row in report["checks"]]}
         certificate["verification_key"] = digest(
             {key: value for key, value in certificate.items() if key != "verification_key"}

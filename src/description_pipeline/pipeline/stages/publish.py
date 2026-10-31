@@ -2301,7 +2301,10 @@ class PublishHandler:
         mjcf_command = StageCommand.from_record(mjcf_record["command"])
         if (mjcf_command.command_id != request.mjcf_command_id
                 or mjcf_command.request_digest != request.mjcf_request_digest
-                or mjcf_command.run_id != command.run_id
+                or mjcf_command.run_id != request.mjcf_artifact.producer_run_id
+                or (command.diagnostic_scope is None and (
+                    mjcf_command.run_id != command.run_id or mjcf_command.diagnostic_scope is not None
+                ))
                 or mjcf_command.expected_executor_sha256 != request.mjcf_artifact.producer_tool_sha256
                 or file_digest(mjcf_root / mjcf_contract.REPORT_PATH) != request.mjcf_certificate_sha256):
             raise PipelineError("Publish MJCF certificate differs from its completed predecessor")

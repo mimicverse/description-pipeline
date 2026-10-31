@@ -1,7 +1,7 @@
 # URDF pipeline 集成 MJCF：设计方案与执行计划
 
 更新日期：2026-10-31。
-状态：用户已于 2026-10-31 授权按 Goal 执行；当前进入 M1 隔离技术验证，尚未完成产品实现或开发部署。本文替代本目录此前将 MJCF 放入 Generate 的草稿。
+状态：用户已于 2026-10-31 授权按 Goal 执行；转换、独立验证、第七阶段和组合交付已实现，当前完成开发门户与本地 Airflow 验收，正在收口回归和可评审候选。本文替代本目录此前将 MJCF 放入 Generate 的草稿。
 
 ## 一、已经确定的需求
 
@@ -86,7 +86,6 @@ mjcf/simulation.json
 mjcf/collision/*.obj
 mjcf/scene.xml                   # only when requested by the sealed policy
 reports/mjcf-certificate.json
-reports/mjcf-execution.json
 ```
 
 视觉资源继续引用同一最终交付中的 `../meshes/`。原 URDF 和视觉网格不在 MJCF artifact 内重复封存；运行时由 ArtifactStore 物化完整的受控输入视图。接触代理是必要的新几何，具有源对象、输入摘要、算法和误差记录，不冒称原生直读值。
@@ -295,3 +294,29 @@ MJCF successor 必须直接引用原始完整运行的通过 Verify 产物，保
 - 当前网络无法读取 PyPI；135项 Airflow 依赖从已安装目录只读复制到本 worktree 的私有虚拟环境，版本与锁文件一致，逐文件核验安装 RECORD。证据 `.dev/m2/AIRFLOW-OFFLINE-DEPENDENCIES.json`。没有调用源环境解释器或控制服务；这不是新鲜 wheel 哈希安装证据。
 
 这些是离线采集夹具和隔离应用证据，没有操作真实 CAD、生产数据库、现有 Airflow 服务或真实 Git/PR 目标。尚需完成开发门户、实际 Airflow 调度、下载资格、独立预览、适用回归与固定候选审查。权威三份架构文档仍由项目负责人维护；当前六阶段文档与七阶段代码的契约一致性测试因此仍有明确差量，不以改测试掩盖，需在正式集成时同步。
+
+
+### 门户与开发运行补充（2026-11-01）
+
+门户已接入受限 MJCF 重跑、原始来源引用、独立证书及双格式预览。预览清单从已登记的阶段产物和证书构造；每次资源请求重新授权并逐文件复核字节，浏览器再次核验摘要。MJCF 失败明确阻止组合成功，已通过的 URDF 仍可单独查看。重跑的上游明确标为复用，不把它们列为新运行实际执行的阶段。
+
+官方 npm `@mujoco/mujoco@3.13.0` 的绑定在运行时生成函数包装，单独允许 WASM 编译仍不足以加载。主页面保留禁止 JavaScript 动态执行的策略；只有固定 `mjcf_worker.js` 响应允许绑定所需的动态执行。引擎在可终止的专用 Worker 中运行，不要求共享内存、跨源隔离或更改现有生产 SSO。页面只绘制引擎返回的几何与位姿；碰撞面来自实际 `mesh_graph` 凸包。资源、实例、Worker、原生模型和 GPU 对象随切换释放。
+
+该版本官方绑定不能读取 `jnt_limited` 的布尔内存视图。关节 UI 的启用标志因此从已核验的交付 `robot.xml` 显式 `limited` 属性读取，缺失或歧义直接拒绝；范围和实际位姿仍来自编译模型与运行数据。没有从数值范围猜测是否启用，也不改源限制。真实 Worker 数值探针已覆盖网格凸包、平面接触、步进及非零关节姿态，见 `.dev/m2/WASM-WORKER-MESH-CONTACT-PROBE.json`。
+
+真实门户与 PostgreSQL 测试暴露了两项同链路缺陷：运行详情遗漏 technical dispatch effect，使未结算来源可能被显示为可重跑；授权比较直接比较带时区的时间字符串，可能拒绝同一时刻的等价表示。已在共同状态投影与授权边界修复，原失败日志、定位轨迹保留在 `.dev/m2/REAL-MJCF-PORTAL-v2.log`、`.dev/m2/REAL-MJCF-PORTAL-AUTH-TRACE.log`。复核同时覆盖实际读取的来源、结果记录引用和证书，未增加第二份运行状态。
+
+开发入口为 `http://127.0.0.1:8878/_development`，使用本 worktree 的独立 PostgreSQL、Airflow metadata、产物、日志和 cookie。开发身份包装与离线 CAD 夹具只存在 `.dev/dev_runtime.py`，不进入发行包，不连接生产 CAD、认证或真实 Git/PR 目标。真实 Airflow 3.3.2 本地 `DAG.test` 已执行受限重跑；上游五个执行器和 native provider 均设为调用即失败，数据库只新增 MJCF、Publish 两个阶段决定，结果成功。证据 `.dev/m2/AIRFLOW-DEVELOPMENT-LAST.json` 与 `.dev/m2/DEVELOPMENT-PORTAL-v3.log`。这证明本地调度适配与实际应用组合，不代表生产调度器服务或正式 CAD E2E 已验收。
+
+首轮开发启动器在后台线程运行 `DAG.test`，被 Airflow 的主线程信号要求拒绝；已将测试运行器移到主线程，HTTP 服务在独立线程运行。原失败记录 `.dev/m2/AIRFLOW-THREAD-FAILURE-RUN.json`、`.dev/m2/AIRFLOW-THREAD-FAILURE-TASKS.json` 和日志保留，不复用失败的 Airflow 运行。
+
+
+### 证书与完整回归收口补充（2026-11-01）
+
+源头审查发现失败报告专用的 `engine.process` 清单曾也能被重签为通过报告。已保全同一原始证书的变异输入和修复前接受结果，收紧为通过证书必须完整包含 19 项必需检查；进程失败报告仍能保全与展示。真实处理器的反例与相邻失败边界已经加入回归，不用“引擎加载成功”替代转换资格。证据 `.dev/m2/ENGINE-ONLY-PASSING-CERTIFICATE-BEFORE.json`、`BEFORE-RESULT.json`、`AFTER-RESULT.json`。
+
+部署安装记录仍有一处冻结的六任务常量，现已同步为七任务；其余实际任务词汇与安装消费链已排查，精确六维刚体/轴端点常量没有改动。原失败 `.dev/m2/FULL-DEVELOPMENT-FAILFAST-v3.log`。独立 Publish 诊断重放保持原 MJCF 产物的生产者身份，正式 Publish 仍要求本次 MJCF 前驱且拒绝诊断来源；四项真实 PostgreSQL 诊断回归通过，见 `.dev/m2/DIAGNOSTIC-PUBLISH-MJCF-AFTER.log`。
+
+门户只向原始发起人开放保持来源所有者的 MJCF 重跑。MJCF successor 的 Freeze 操作明确指引回原始来源运行，不对不存在的新 Freeze 决定给出可用按钮；上游阶段的步骤摘要显示 `Reused`。切换格式先释放旧模型和 Worker，再展示新产物，避免短暂使用上一份仿真状态。高级策略编辑默认折叠，编辑焦点不被轮询替换；可直接下载经授权校验的 robot/scene XML，完整资源仍由同一交付仓库提供。
+
+本地分段回归脚本漏了 `__main__` 保护，引起多进程测试子进程重复执行整段测试。原日志 `.dev/m2/REMAINING-DEVELOPMENT-REGRESSION.log` 保留；该次并发与时限结果不能作为产品结论。已修正启动器，正式收口使用标准 `python -m unittest` 入口复核。105 项相关门、原失败样本和 UI 测试已经通过 `.dev/m2/REVIEW-GAPS-FOCUSED.log`，其范围不替代最终完整标准入口回归。

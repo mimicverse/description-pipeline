@@ -20,7 +20,7 @@ import argparse
 
 DEFAULT_NAME = "windows_native"
 DEFAULT_SLOTS = 1
-DEFAULT_DESCRIPTION = "SolidWorks native stage; capacity 1 (six-stage contract)"
+DEFAULT_DESCRIPTION = "SolidWorks native stage; capacity 1 (seven-stage contract)"
 
 
 def ensure_pool(name, slots, description, *, session_factory=None, pool_class=None):

@@ -114,7 +114,7 @@ class RunQueryTests(unittest.TestCase):
         self.assertNotIn("DELETE ", statements)
         self.assertEqual(
             [row["stage"] for row in projection["stages"]],
-            ["freeze", "discover", "capture", "generate", "verify", "publish"],
+            ["freeze", "discover", "capture", "generate", "verify", "mjcf", "publish"],
         )
         summary = render_stage_summary(projection)
         self.assertEqual(summary[0]["state"], "waiting")
@@ -124,6 +124,7 @@ class RunQueryTests(unittest.TestCase):
             "capture",
             "generate",
             "verify",
+            "mjcf",
             "publish",
         ])
 

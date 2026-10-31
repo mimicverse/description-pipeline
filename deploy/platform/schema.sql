@@ -20,7 +20,7 @@ INSERT INTO :"platform_schema".admission (id, state, reason, actor)
 VALUES (1, 'closed', 'install', 'apply')
 ON CONFLICT (id) DO NOTHING;
 
--- Canonical six-stage facts. Product state is projected from immutable commands,
+-- Canonical seven-stage facts. Product state is projected from immutable commands,
 -- claims, decisions, candidates, effects and artifacts.
 
 CREATE TABLE IF NOT EXISTS :"platform_schema".run_admission (

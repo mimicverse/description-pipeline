@@ -603,7 +603,7 @@ class PlatformSchemaPostgresTests(unittest.TestCase):
             contradiction_command,
             fact_type="reconciled",
         )
-        for stage in ("discover", "capture", "generate", "verify", "publish"):
+        for stage in ("discover", "capture", "generate", "verify", "mjcf", "publish"):
             command_id = self._insert_stage_command(contradiction_run, stage)
             self._insert_decision(contradiction_run, stage, command_id, outcome="completed")
 
@@ -1012,7 +1012,7 @@ class PlatformSchemaPostgresTests(unittest.TestCase):
         run_id = "run-reconciled-effect"
         self._insert_run(run_id)
         commands = {}
-        for stage in ("freeze", "discover", "capture", "generate", "verify", "publish"):
+        for stage in ("freeze", "discover", "capture", "generate", "verify", "mjcf", "publish"):
             command_id = self._insert_stage_command(run_id, stage)
             commands[stage] = command_id
             self._insert_decision(run_id, stage, command_id, outcome="completed")

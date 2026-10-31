@@ -111,7 +111,9 @@ class RegisteredStageProjectionTests(unittest.TestCase):
         view = self.application._registered_stage_view({}, projection)
         self.assertEqual(view["execution_scope"], ["capture"])
         self.assertEqual(view["stages"][-1]["state"], "waiting")
-        self.assertEqual([stage["in_scope"] for stage in view["stages"]], [False, False, True, False, False, False])
+        self.assertEqual(
+            [stage["in_scope"] for stage in view["stages"]], [False, False, True, False, False, False, False],
+        )
 
     def test_actual_stage_checks_keep_completed_predecessors_and_exact_failed_stage(self) -> None:
         projection = self.projection({"freeze": "completed", "discover": "completed", "capture": "failed"})
@@ -119,7 +121,7 @@ class RegisteredStageProjectionTests(unittest.TestCase):
                "error_code": "capture.native_failed", "error": "FileNotFoundError: a long CAD path"}
         view = self.application._registered_stage_view(job, projection)
         self.assertEqual([stage["state"] for stage in view["stages"]],
-                         ["completed", "completed", "failed", "blocked", "blocked", "blocked"])
+                         ["completed", "completed", "failed", "blocked", "blocked", "blocked", "blocked"])
         self.assertEqual(view["stages"][0]["checks_passed"], 1)
         self.assertEqual(view["stages"][0]["input_inventory_count"], 1)
         report = build_report(job, view=view)
@@ -128,10 +130,10 @@ class RegisteredStageProjectionTests(unittest.TestCase):
         self.assertEqual(report["failure"]["raw_error"], job["error"])
         self.assertEqual(report["stages"][0]["boundary"][0]["boundary"], "stage")
 
-    def test_all_six_completed_decisions_do_not_require_a_legacy_qc_inventory(self) -> None:
+    def test_all_seven_completed_decisions_do_not_require_a_legacy_qc_inventory(self) -> None:
         projection = self.projection({item["id"]: "completed" for item in CONTRACT["stages"]})
         view = self.application._registered_stage_view({"result": {"subject_sha256": SUBJECT}}, projection)
-        self.assertEqual([stage["state"] for stage in view["stages"]], ["completed"] * 6)
+        self.assertEqual([stage["state"] for stage in view["stages"]], ["completed"] * 7)
         self.assertEqual(view["subject_sha256"], SUBJECT)
         self.assertEqual(view["stages"][2]["checks_passed"], 3)
         self.assertTrue(all(item["state"] == "external_review"

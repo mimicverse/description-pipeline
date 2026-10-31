@@ -88,11 +88,11 @@ console.log("canonical polling consumer OK");
 
 // Immutable geometry can stay loaded while current qualification changes.
 const loadPreviewSource = appSource.match(/async function loadPreview\(dagRunId\) \{[\s\S]*?\n\}/)[0];
-const sameGeometry = { dagRunId: "run-3", previewSubject: "same-subject", previewRequest: null };
+const sameGeometry = { dagRunId: "run-3", previewSubject: "same-subject", previewKey: "same-subject::urdf", previewFormat: "urdf", previewRequest: null };
 let diagnosticShown;
 const loadPreview = new Function("state", "api", "$", "renderPreviewDiagnostic", `return (${loadPreviewSource});`)(
-  sameGeometry, async () => ({ subject_sha256: "same-subject", verified: false, reason: "run_unresolved" }),
-  () => ({}), (preview) => { diagnosticShown = preview; },
+  sameGeometry, async () => ({ subject_sha256: "same-subject", urdf: "urdf/robot.urdf", verified: false, reason: "run_unresolved" }),
+  () => ({querySelector: () => ({disabled: false})}), (preview) => { diagnosticShown = preview; },
 );
 await loadPreview("run-3");
 assert.equal(diagnosticShown.verified, false);

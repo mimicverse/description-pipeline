@@ -153,7 +153,7 @@ def install_record_fixture(state: Path, install_id: str, snapshot: Path) -> dict
         "release": {**triple, "artifacts": [{"name": "runtime.whl", "sha256": "c" * 64}]},
         "services": ["description.service"],
         "paths": {"state_root": str(state)},
-        "dag": {"id": "solidworks_to_urdf", "path": str(state / "dag.py"), "digest": "d" * 64, "tasks": 6},
+        "dag": {"id": "solidworks_to_urdf", "path": str(state / "dag.py"), "digest": "d" * 64, "tasks": 7},
         "ends": {
             "linux": {
                 "install_id": install_id,

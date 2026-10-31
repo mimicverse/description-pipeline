@@ -125,6 +125,8 @@ export function createViewer(container) {
   })();
 
   return {
+    modelDispose: null,
+    grid,
     scene,
     camera,
     renderer,
@@ -140,6 +142,8 @@ export function createViewer(container) {
 }
 
 export function disposeRobot(viewer) {
+  viewer.modelDispose?.();
+  viewer.modelDispose = null;
   const root = viewer.robotRoot;
   root.traverse((node) => {
     if (node.geometry) node.geometry.dispose();
@@ -300,6 +304,7 @@ export async function loadRobot(viewer, { urdfUrl, urdfPath, files, artifactUrl,
   requiredName(robot);
 
   disposeRobot(viewer);
+  viewer.grid.visible = true;
   const meshCache = new Map();
   const warnings = [];
   const links = new Map();
@@ -506,6 +511,7 @@ export function buildJointControls(container, joints, { onInput } = {}) {
     rows.push({ joint, display });
   }
   return {
+    refresh() { for (const row of rows) row.display(); },
     reset() {
       for (const row of rows) {
         row.joint.reset();

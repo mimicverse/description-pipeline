@@ -114,7 +114,7 @@ NATIVE_DISCOVERY_BUDGET_KEYS = frozenset(
 NATIVE_DISCOVERY_FINDING_SCHEMA = "solidworks-to-urdf.discovery-finding/v1"
 NATIVE_IDENTITY_RESOLUTION_SCHEMA = "solidworks-to-urdf.identity-resolution/v1"
 
-#: Canonical six-stage records and external-effect envelopes.  These ids cross
+#: Canonical seven-stage records and external-effect envelopes.  These ids cross
 #: process and persistence boundaries and therefore have one owner here.
 ADMISSION_SPEC_SCHEMA = "solidworks-to-urdf.admission-spec/v4"
 AIRFLOW_DISPATCH_CONF_SCHEMA = "solidworks-to-urdf.airflow-dispatch-conf/v2"

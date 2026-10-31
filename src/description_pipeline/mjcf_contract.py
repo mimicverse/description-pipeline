@@ -573,6 +573,11 @@ def binding_for_projection(root: Path) -> dict:
     if components is not None:
         content = confined(root, components).read_bytes()
         files[components] = {"bytes": len(content), "sha256": hashlib.sha256(content).hexdigest()}
+    return binding_for_files(files, components=components)
+
+
+def binding_for_files(files: dict, *, components: str | None) -> dict:
+    """Use the same binding format for stage views and registered serving inventories."""
     return {"schema_version": INPUT_BINDING_SCHEMA,
             "source": {"urdf": URDF_NAME, "meshes": sorted(p for p in files if p.startswith("meshes/")),
                        "components": components},

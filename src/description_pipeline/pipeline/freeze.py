@@ -1,4 +1,4 @@
-"""Freeze domain handler over the canonical six-stage protocol."""
+"""Freeze domain handler over the canonical seven-stage protocol."""
 
 from __future__ import annotations
 

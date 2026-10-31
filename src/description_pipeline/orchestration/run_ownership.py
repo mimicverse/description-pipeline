@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from .feishu_oauth import (
@@ -50,7 +51,7 @@ DAG_RUN_ROUTES_MODULE = "airflow.api_fastapi.core_api.routes.public.dag_run"
 MANUAL_CREATE_ENDPOINT = "trigger_dag_run"
 SINGLE_RUN_CLEAR_ENDPOINT = "clear_dag_run"
 
-#: The one task vocabulary of the workflow DAG (six stages), grouped by the operation model:
+#: The one task vocabulary of the workflow DAG (seven stages), grouped by the operation model:
 #: admission resolves the frozen intake (idempotent, no side effects), the native
 #: boundary submits and imports the endpoint's capture (the native job is created
 #: once for the run UUID and only poked afterwards, so a retry never replays CAD),
@@ -60,7 +61,7 @@ SINGLE_RUN_CLEAR_ENDPOINT = "clear_dag_run"
 #: compatibility rows.
 ADMISSION_TASKS = frozenset({"freeze"})
 NATIVE_TASKS = frozenset({"discover", "capture"})
-PORTABLE_TASKS = frozenset({"generate", "verify"})
+PORTABLE_TASKS = frozenset({"generate", "verify", "mjcf"})
 PUBLICATION_TASKS = frozenset({"publish"})
 KNOWN_TASKS = ADMISSION_TASKS | NATIVE_TASKS | PORTABLE_TASKS | PUBLICATION_TASKS
 FAILED_STATES = frozenset({"failed", "upstream_failed"})
@@ -384,6 +385,8 @@ def validated_canonical_projection(
     dag_id: str,
     dag_run_id: str,
     canonical_run_id: str,
+    mjcf_source: dict | None = None,
+    artifacts: Any | None = None,
 ) -> dict | None:
     """Authenticate one registered run from the existing admission and command contracts."""
 
@@ -407,7 +410,7 @@ def validated_canonical_projection(
             or projection.get("from_stage") != admission.from_stage
             or request != spec.to_record()
             or projection.get("request_digest") != admission.request_digest
-            or projection.get("created_at") != admission.created_at.isoformat()
+            or datetime.fromisoformat(projection.get("created_at")) != admission.created_at
         ):
             return None
 
@@ -425,20 +428,69 @@ def validated_canonical_projection(
         dispatch_rows = [
             command for command in commands if command.get("kind") == "dispatch"
         ]
+        entry_stage = "mjcf" if spec.from_stage == "mjcf" else "freeze"
         freeze_rows = [
             command
             for command in commands
-            if command.get("kind") == "stage" and command.get("stage") == "freeze"
+            if command.get("kind") == "stage" and command.get("stage") == entry_stage
         ]
-        freeze_stages = [stage for stage in stages if stage.get("stage") == "freeze"]
+        freeze_stages = [stage for stage in stages if stage.get("stage") == entry_stage]
         if len(dispatch_rows) != 1 or len(freeze_rows) != 1 or len(freeze_stages) != 1:
             return None
 
         dispatch_row = dispatch_rows[0]
         dispatch = DispatchCommand.from_record(dispatch_row.get("request"))
         freeze = StageCommand.from_record(freeze_stages[0].get("command"))
+        if spec.from_stage == "mjcf":
+            from ..pipeline.admission import (
+                VerifiedPredecessor, VerifiedVerifyResult, VerifiedArtifact,
+                validate_mjcf_successor, build_mjcf_command,
+            )
+            from ..pipeline.contracts import StageResult, StageDecision, ArtifactRef
+            from ..pipeline.verify import CERTIFICATE_FILENAME
+
+            if not isinstance(mjcf_source, dict) or artifacts is None:
+                return None
+            source_spec = AdmissionSpec.from_record(mjcf_source["request"])
+            validate_mjcf_successor(spec, source_spec)
+            if (mjcf_source.get("state") not in {"succeeded", "failed", "cancelled"}
+                    or (mjcf_source.get("scope") or {}).get("kind") != "formal"):
+                return None
+            source_rows = {row["stage"]: row for row in mjcf_source["stages"]}
+            for name in ("freeze", "discover", "capture", "generate", "verify"):
+                if source_rows[name].get("formal_eligible") is not True:
+                    return None
+            verify_row = source_rows["verify"]
+            source_decision = verify_row["decision"]
+            decision = StageDecision(
+                decision_id=source_decision["decision_id"], run_id=source_spec.run_id, stage="verify",
+                command_id=source_decision["command_id"], outcome=source_decision["outcome"],
+                result_record_artifact=ArtifactRef.from_record(verify_row["receipt"]["result_record_artifact"]),
+                result_digest=source_decision["result_digest"],
+                actual_executor_sha256=source_decision["actual_executor_sha256"],
+                reason_code=source_decision["reason_code"], failure_envelope=None,
+                original_producer_decision_id=None, decided_at=datetime.fromisoformat(source_decision["decided_at"]),
+            )
+            predecessor = VerifiedPredecessor(
+                stage="verify", command=StageCommand.from_record(verify_row["command"]),
+                result=StageResult.from_record(verify_row["receipt"]["result"]),
+                decision=decision,
+            )
+            ref = predecessor.result.output_artifact
+            artifact = VerifiedArtifact.from_store_record(ref, artifacts.verify(ref))
+            certificate, _member, _manifest = artifacts.read_metadata_member(
+                ref, CERTIFICATE_FILENAME, max_bytes=16 * 1024 * 1024,
+            )
+            expected_entry = build_mjcf_command(
+                spec, VerifiedVerifyResult.from_artifact_bytes(predecessor, artifact, certificate),
+            )
+            if any(row.get("command") for row in stages
+                   if row.get("stage") in {"freeze", "discover", "capture", "generate", "verify"}):
+                return None
+        else:
+            expected_entry = build_freeze_command(spec)
         if (
-            freeze != build_freeze_command(spec)
+            freeze != expected_entry
             or dispatch.run_id != canonical_run_id
             or dispatch.dag_id != dag_id
             or dispatch.dag_run_id != dag_run_id
@@ -516,6 +568,18 @@ def recorded_canonical_projection(dag_id: str, dag_run_id: str) -> dict | None:
         ) as connection:
             connection.set_session(readonly=True)
             projection = read_run_projection(connection, canonical_run_id)
+            request = (projection or {}).get("request") or {}
+            source = artifacts = None
+            if request.get("from_stage") == "mjcf":
+                from pathlib import Path
+                from ..artifacts import ArtifactStore
+
+                artifact_root = os.environ.get("PLATFORM_ARTIFACT_ROOT")
+                if not artifact_root or not Path(artifact_root).is_dir():
+                    return None
+                artifacts = ArtifactStore(Path(artifact_root))
+                projection = read_run_projection(connection, canonical_run_id, artifacts=artifacts)
+                source = read_run_projection(connection, request["parent_run_id"], artifacts=artifacts)
     except Exception:  # noqa: BLE001 - authorization fails closed on unavailable authority
         return None
     return validated_canonical_projection(
@@ -523,6 +587,7 @@ def recorded_canonical_projection(dag_id: str, dag_run_id: str) -> dict | None:
         dag_id=dag_id,
         dag_run_id=dag_run_id,
         canonical_run_id=canonical_run_id,
+        mjcf_source=source, artifacts=artifacts,
     )
 
 

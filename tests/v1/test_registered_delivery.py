@@ -28,19 +28,20 @@ from .protocol_support import protocol_events
 RUN = "7c9b44b3-0b9c-5ffe-9f4f-4bbdafb4a865"
 SUBJECT = "a" * 64
 def _register_delivery(platform: RegisteredPlatform, *, run_id: str = RUN) -> None:
-    """Register six stages with their sealed certificate and publication receipt."""
+    """Register seven read-model stages with their sealed certificate and publication receipt."""
     platform.admit(run_id)
     capture = platform.register_capture(run_id)
     write_json(
         platform.tree(run_id, "discover") / "prepared/discovery/native-discovery.json",
         read_data(capture / "input/discovery/native-discovery.json"),
     )
-    for stage in ("freeze", "discover", "generate", "verify", "publish"):
+    for stage in ("freeze", "discover", "generate", "verify", "mjcf", "publish"):
         platform.stage(run_id, stage)
     write_json(
         platform.tree(run_id, "verify") / "verification-certificate.json",
         {"passed": True, "decision": "PASS", "checks": [], "diagnostics": []},
     )
+    write_json(platform.tree(run_id, "mjcf") / "receipt.json", {})
     command, _checks = registered_check_fixture(run_id, "publish")
     publication = {
         "schema_version": PUBLICATION_RECEIPT_SCHEMA,
@@ -91,7 +92,7 @@ class _PermissiveAirflow:
     def task_instances(self, token, dag_id, dag_run_id):
         return [
             {"task_id": stage, "state": "failed" if stage in {"freeze", "capture"} else "upstream_failed"}
-            for stage in ("freeze", "discover", "capture", "generate", "verify", "publish")
+            for stage in ("freeze", "discover", "capture", "generate", "verify", "mjcf", "publish")
         ]
 
 
@@ -225,6 +226,7 @@ class RegisteredStagePresentationTests(unittest.TestCase):
             "capture": capture_state,
             "generate": "blocked",
             "verify": "blocked",
+            "mjcf": "blocked",
             "publish": "blocked",
         }
         for stage, state in states.items():
@@ -362,7 +364,7 @@ class _RetryAirflow(_PermissiveAirflow):
                     else "success"
                 ),
             }
-            for stage in ("freeze", "discover", "capture", "generate", "verify", "publish")
+            for stage in ("freeze", "discover", "capture", "generate", "verify", "mjcf", "publish")
         ]
 
     def clear_dag_run(self, token, dag_id, dag_run_id, *, dry_run):

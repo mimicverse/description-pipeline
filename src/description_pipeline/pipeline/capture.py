@@ -1,4 +1,4 @@
-"""Capture domain handler for the shared six-stage engine."""
+"""Capture domain handler for the shared seven-stage engine."""
 
 from __future__ import annotations
 

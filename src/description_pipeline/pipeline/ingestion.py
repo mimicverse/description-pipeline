@@ -1618,6 +1618,15 @@ def load_production_freeze_successor(
     ).admit_from_frozen_freeze(application, request)
 
 
+def load_production_mjcf_successor(
+    application: AdmissionApplication,
+    request: ProductionMJCFSuccessorRequest,
+    **factory_options,
+) -> AdmissionOutcomePort:
+    """Admit the restricted MJCF entry through the canonical production factory."""
+    return ProductionAdmissionFactory(**factory_options).admit_mjcf(application, request)
+
+
 __all__ = [
     "AdmissionApplication",
     "AdmissionOutcomePort",
@@ -1625,7 +1634,9 @@ __all__ = [
     "ProductionAdmissionFactory",
     "ProductionAdmissionRequest",
     "ProductionFreezeSuccessorRequest",
+    "ProductionMJCFSuccessorRequest",
     "ReceivedUploadReceipt",
     "load_production_admission",
     "load_production_freeze_successor",
+    "load_production_mjcf_successor",
 ]

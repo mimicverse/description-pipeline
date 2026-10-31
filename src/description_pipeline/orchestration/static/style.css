@@ -423,3 +423,8 @@ details pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 #viewer-card.preview-collapsed #preview-info { display: none; }
 .stage-quick-summary { border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 8px 10px; margin: 8px 0; background: #fbfcfe; }
 .stage-quick-summary h4 { margin: 0 0 4px; font-size: 13px; }
+
+.viewer-toolbar { display: flex; flex-wrap: wrap; gap: 0.6rem; padding: 0.6rem 0; align-items: center; }
+#mjcf-tools { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; }
+#mjcf-tools[hidden] { display: none; }
+#mjcf-policy { display: block; width: 100%; min-height: 5rem; font-family: monospace; }

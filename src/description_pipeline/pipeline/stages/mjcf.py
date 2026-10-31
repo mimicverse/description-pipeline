@@ -8,7 +8,7 @@ from pathlib import Path
 
 from ... import mjcf, mjcf_contract as contract
 from ...artifacts import ArtifactStore
-from ...io import PipelineError, canonical, confined, digest, file_digest, inventory, read_data, write_json
+from ...io import PipelineError, canonical, confined, digest, file_digest, inventory, write_json
 from ...verification.mjcf import evaluate_projection
 from ..contracts import (
     ArtifactRef,
@@ -115,14 +115,15 @@ _CERTIFICATE_FIELDS = {
 }
 
 
-def read_certificate(root: Path, command: StageCommand, *, require_pass: bool = True) -> dict:
-    """Validate the certificate shape and exact stage output before consuming it."""
-    path = confined(root, contract.REPORT_PATH)
-    certificate = read_data(path)
+def certificate_from_bytes(content: bytes, command: StageCommand, *, require_pass: bool = True) -> dict:
+    """Validate one canonically encoded certificate and its admitted command."""
+    from ...io import parse_data
+
+    certificate = parse_data(content, Path(contract.REPORT_PATH))
     if (
         not isinstance(certificate, dict)
         or set(certificate) != _CERTIFICATE_FIELDS
-        or path.read_bytes() != canonical(certificate)
+        or content != canonical(certificate)
     ):
         raise PipelineError("MJCF certificate has an invalid shape or encoding")
     proof = {key: value for key, value in certificate.items() if key != "certificate_key"}
@@ -147,6 +148,8 @@ def read_certificate(root: Path, command: StageCommand, *, require_pass: bool = 
     checks = report.get("checks")
     if (
         not isinstance(checks, list)
+        or any(not isinstance(row, dict) for row in checks)
+        or (report["passed"] and [row.get("id") for row in checks] != [*contract.CHECK_IDS, "identity.stability"])
         or [row.get("id") for row in checks] not in ([*contract.CHECK_IDS, "identity.stability"], ["engine.process"])
         or any(
             type(row.get("passed")) is not bool
@@ -160,6 +163,14 @@ def read_certificate(root: Path, command: StageCommand, *, require_pass: bool = 
     files = binding.get("files")
     if not isinstance(files, dict):
         raise PipelineError("MJCF certificate has no bound file inventory")
+    return certificate
+
+
+def read_certificate(root: Path, command: StageCommand, *, require_pass: bool = True) -> dict:
+    """Validate the certificate shape and exact stage output before consuming it."""
+    path = confined(root, contract.REPORT_PATH)
+    certificate = certificate_from_bytes(path.read_bytes(), command, require_pass=require_pass)
+    files = certificate["input_binding"]["files"]
     projected = {path: row for path, row in files.items() if path.startswith("mjcf/")}
     actual = inventory(root, exclude=("manifest.json",))
     if (

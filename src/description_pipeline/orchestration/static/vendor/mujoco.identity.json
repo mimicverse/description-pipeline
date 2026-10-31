@@ -1,0 +1,13 @@
+{
+  "package": "@mujoco/mujoco",
+  "version": "3.13.0",
+  "repository": "https://github.com/google-deepmind/mujoco",
+  "files": {
+    "mujoco.js": "cb6752b9eab4f4cf9eac57911b58fea48cb808f323a563674f051935794fccdb",
+    "mujoco.wasm": "41dce8820addd75f9d4f6cbb11ff136ecdbaaa29541db4c323ce2d9e4c8a7661"
+  },
+  "npm_integrity": "sha512-9OAp3i2pR9U8SnJfr+/UcmxpbIOcUUSBjNGY79XS4NYcyYjztqHmx1kl/83yoEpxDd40WBcDOKZqNhEmhN1+Sg==",
+  "license": "Apache-2.0",
+  "license_source": "https://github.com/google-deepmind/mujoco/blob/3.13.0/LICENSE",
+  "license_sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+}

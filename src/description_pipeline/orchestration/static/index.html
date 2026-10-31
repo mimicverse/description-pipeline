@@ -51,7 +51,7 @@
       <div class="content">
         <section id="upload-view" class="card upload-card">
           <h2>New delivery run</h2>
-          <p class="muted small">Select a complete local SolidWorks engineering folder. It is frozen after upload and then runs the six engineering stages.</p>
+          <p class="muted small">Select a complete local SolidWorks engineering folder. It is frozen after upload and then runs the seven engineering stages.</p>
           <form id="run-form">
             <input id="folder-input" type="file" webkitdirectory directory multiple class="hidden-input">
             <label class="dropzone" for="folder-input">
@@ -128,9 +128,22 @@
             <div class="pane pane-preview">
               <div id="viewer-card" hidden>
                 <div class="viewer-head">
-                  <span class="viewer-title">Interactive URDF preview</span>
+                  <span class="viewer-title">Interactive model preview</span>
                   <button id="preview-collapse" type="button" class="ghost" aria-expanded="true" hidden>Collapse preview</button>
                 </div>
+                <div class="viewer-toolbar">
+                  <label>Format <select id="preview-format"><option value="urdf">URDF</option><option value="mjcf" disabled>MJCF</option></select></label>
+                  <span id="mjcf-tools" hidden>
+                    <label>Geometry <select id="mjcf-mode"><option value="visual">Visual</option><option value="collision">Collision</option><option value="overlay">Overlay</option></select></label>
+                    <label>Link <select id="mjcf-link"><option value="">All links</option></select></label>
+                    <label><input id="mjcf-markers" type="checkbox"> Frames, COM and contacts</label>
+                    <button id="mjcf-play" type="button">Play</button>
+                    <button id="mjcf-step" type="button">Step</button>
+                    <button id="mjcf-reset" type="button">Reset simulation</button>
+                  </span>
+                </div>
+                <p id="mjcf-status" class="muted small" hidden></p>
+                <details id="mjcf-evidence" hidden><summary>Collision approximation and source warnings</summary><div id="mjcf-collision-info"></div><ul id="mjcf-warnings"></ul></details>
                 <div id="viewer" class="viewer"></div>
                 <p class="muted small" id="preview-meta"></p>
                 <dl class="meta preview-info" id="preview-info"></dl>

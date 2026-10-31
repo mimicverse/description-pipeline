@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+import copy
 import tempfile
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -15,13 +16,13 @@ except ImportError:
     pgserver = psycopg2 = None
 
 from description_pipeline import mjcf_contract as contract
-from description_pipeline.io import PipelineError, digest, file_digest, inventory, read_data
+from description_pipeline.io import PipelineError, canonical, digest, file_digest, inventory, read_data
 from description_pipeline.pipeline.contracts import StageCandidate, StageCommand, StageResult
 from description_pipeline.pipeline.engine import StageWorkspace, execute_stage
 from description_pipeline.pipeline.diagnostic import DiagnosticAdmissionSpec, build_diagnostic_command
 from description_pipeline.pipeline.services import CanonicalStageServices, ClaimPolicy
 from description_pipeline.platform.facts import FactStore
-from description_pipeline.pipeline.stages.mjcf import MJCFHandler, validate_certificate
+from description_pipeline.pipeline.stages.mjcf import MJCFHandler, validate_certificate, certificate_from_bytes
 from description_pipeline.pipeline.verify import NoExternalEffects
 from description_pipeline.schemas import STAGE_RESULT_SCHEMA, DIAGNOSTIC_ADMISSION_SCHEMA
 from tests.v1 import test_pipeline_verify as pair_fixtures
@@ -129,6 +130,22 @@ class MJCFHandlerTests(unittest.TestCase):
         path.write_bytes(path.read_bytes() + b"\n")
         with self.assertRaisesRegex(PipelineError, "differs from its certificate"):
             validate_certificate(output, command, source_roots=self.roots)
+
+    def test_engine_only_report_cannot_claim_passing_qualification(self):
+        command, claim, workspace = self.request("mjcf-engine-only")
+        execution = self.handler.execute(command, claim, workspace, effects=NoExternalEffects())
+        self.assertEqual("completed", execution.outcome)
+        certificate = read_data(Path(execution.candidate_root) / contract.REPORT_PATH)
+        forged = copy.deepcopy(certificate)
+        forged["report"]["checks"] = [{"id": "engine.process", "state": "passed", "passed": True, "details": {}}]
+        forged["certificate_key"] = digest({key: value for key, value in forged.items() if key != "certificate_key"})
+        for require_pass in (True, False):
+            with self.subTest(require_pass=require_pass), self.assertRaisesRegex(PipelineError, "every required check"):
+                certificate_from_bytes(canonical(forged), command, require_pass=require_pass)
+        forged["report"]["passed"] = False
+        forged["report"]["checks"][0].update(passed=False, state="failed")
+        forged["certificate_key"] = digest({key: value for key, value in forged.items() if key != "certificate_key"})
+        self.assertFalse(certificate_from_bytes(canonical(forged), command, require_pass=False)["report"]["passed"])
 
     def test_failed_collision_approximation_retains_candidate_and_independent_report(self):
         command, claim, workspace = self.request(
