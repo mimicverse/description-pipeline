@@ -44,6 +44,7 @@ from ..pipeline.contracts import (
     RunAdmission,
     RunStatus,
     StageCandidate,
+    StageCancellationRequested,
     StageCommand,
     StageDecision,
     StageEffectWait,
@@ -3434,8 +3435,9 @@ class FactStore(RunControlStore):
                 raise FactConflict("The decision command differs from its registered command")
             self._verify_completed_predecessor_chain_cursor(cursor, command)
             self._lock_effect_ledger_cursor(cursor, command.command_id)
-            if self._cancel_command_cursor(cursor, command.command_id, lock=True) is not None:
-                raise FactConflict("Cancellation was requested; commit the cancelled result instead")
+            cancellation = self._cancel_command_cursor(cursor, command.command_id, lock=True)
+            if cancellation is not None:
+                raise StageCancellationRequested(cancellation)
             existing_row = self._decision_row(cursor, run_id=command.run_id, stage=command.stage)
             if existing_row is not None:
                 existing = self._decision_from_row(cursor, existing_row)
@@ -3578,11 +3580,10 @@ class FactStore(RunControlStore):
                 raise FactStoreError("The command disappeared before failure commit")
             self._verify_completed_predecessor_chain_cursor(cursor, command)
             self._lock_effect_ledger_cursor(cursor, command.command_id)
-            if (
-                failure.outcome != "cancelled"
-                and self._cancel_command_cursor(cursor, command.command_id, lock=True) is not None
-            ):
-                raise FactConflict("Cancellation was requested; commit the cancelled result instead")
+            if failure.outcome != "cancelled":
+                cancellation = self._cancel_command_cursor(cursor, command.command_id, lock=True)
+                if cancellation is not None:
+                    raise StageCancellationRequested(cancellation)
             existing_row = self._decision_row(cursor, run_id=command.run_id, stage=command.stage)
             if existing_row is not None:
                 existing = self._decision_from_row(cursor, existing_row)

@@ -27,8 +27,10 @@ from description_pipeline.pipeline.contracts import (
     DispatchConf,
     FailureEnvelope,
     StageCommand,
+    StageCancellationRequested,
     StageDecision,
     StageResult,
+    StageFailure,
 )
 from description_pipeline.pipeline.effects import EffectState
 from description_pipeline.pipeline.engine import (
@@ -332,6 +334,57 @@ class CancellationPostgresTests(unittest.TestCase):
             ),
             [(0,)],
         )
+
+    def _assert_finished_attempt_cancels_with_its_original_claim(self, mode):
+        owner = self
+
+        class Handler:
+            def execute(self, command, claim, workspace, *, effects):
+                if mode == "unsealed_failure":
+                    owner._request_cancel()
+                    raise StageFailure("local_failed", "Original local failure", detail={"source": "original"})
+                root = workspace.root / "output"
+                root.mkdir()
+                (root / "result.json").write_text('{"preserved":true}\n', encoding="utf-8")
+                return StageExecution(
+                    outcome=mode, candidate_root=str(root), checks_sha256=digest({"mode": mode}),
+                    resources_settled=True,
+                    failure=StageFailure("local_failed", "Original candidate failure") if mode == "failed" else None,
+                )
+
+            def validate_candidate(self, command, claim, candidate, *, effects):
+                owner._request_cancel()
+                return candidate
+
+        services = self._services("running-cancel")
+        result = execute_stage(command_id=self.command.command_id, handler=Handler(), services=services)
+        self.assertIsInstance(result, FailureEnvelope)
+        self.assertEqual("cancelled", result.outcome)
+        self.assertEqual("operator_cancelled", result.reason_code)
+        self.assertEqual([(1, 1)], self._query(
+            "SELECT count(*),count(closed_at) FROM execution_claim WHERE command_id = %s",
+            (self.command.command_id,),
+        ))
+        self.assertEqual([("cancelled",)], self._query(
+            "SELECT outcome FROM stage_decision WHERE command_id = %s", (self.command.command_id,),
+        ))
+        if mode == "unsealed_failure":
+            self.assertEqual("local_failed", result.error_detail["original_failure"]["reason_code"])
+        else:
+            self.assertEqual({"stage_output:freeze", "stage_result"}, {a.kind for a in result.evidence_artifacts})
+            for artifact in result.evidence_artifacts:
+                self.artifacts.verify(artifact)
+        repeated = execute_stage(command_id=self.command.command_id, handler=_ForbiddenHandler(), services=services)
+        self.assertEqual(result, repeated)
+
+    def test_cancel_during_successful_execution_preserves_candidate_and_closes_claim(self):
+        self._assert_finished_attempt_cancels_with_its_original_claim("completed")
+
+    def test_cancel_during_failed_execution_preserves_candidate_and_closes_claim(self):
+        self._assert_finished_attempt_cancels_with_its_original_claim("failed")
+
+    def test_cancel_during_unsealed_failure_preserves_original_failure_and_closes_claim(self):
+        self._assert_finished_attempt_cancels_with_its_original_claim("unsealed_failure")
 
     def test_sent_unknown_is_not_cancelled_until_reconciled_absent(self) -> None:
         services = self._services("unknown")
@@ -726,7 +779,7 @@ class CancellationPostgresTests(unittest.TestCase):
         self._request_cancel()
         with self.assertRaisesRegex(FactConflict, "Cancellation was requested"):
             effects.authorize_dispatch(pr_intent.effect_id, source="publish-executor")
-        with self.assertRaisesRegex(FactConflict, "Cancellation was requested"):
+        with self.assertRaises(StageCancellationRequested):
             self.facts.commit_decision(
                 decision_id="must-not-win-" + self.command.command_id,
                 command=self.command,

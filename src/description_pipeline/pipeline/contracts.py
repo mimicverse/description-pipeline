@@ -50,6 +50,15 @@ class ProtocolError(PipelineError):
         self.detail = detail or {}
 
 
+class StageCancellationRequested(ProtocolError):
+    """The serialized commit boundary requires the owner to settle cancellation."""
+
+    def __init__(self, cancel_command: StageCommand) -> None:
+        CancellationRequest.from_command(cancel_command)
+        self.cancel_command = cancel_command
+        super().__init__("cancel.requested", {"cancel_command_id": cancel_command.command_id})
+
+
 @dataclass(frozen=True, slots=True)
 class AdmissionControl:
     """The single administrative admission gate row."""

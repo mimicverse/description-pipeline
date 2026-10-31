@@ -18,6 +18,7 @@ from .contracts import (
     FailureEnvelope,
     ProtocolError,
     StageCandidate,
+    StageCancellationRequested,
     StageCommand,
     StageDecision,
     StageAttemptResult,
@@ -340,16 +341,50 @@ def _execute_requested_cancellation(
                 "after": {effect_id: state.value for effect_id, state in sorted(after.items())},
             },
         )
+    return _commit_owned_cancellation(command, cancel_command, claim, workspace, candidate, services)
+
+
+def _commit_owned_cancellation(
+    command: StageCommand,
+    cancel_command: StageCommand,
+    claim: ExecutionClaim,
+    workspace: StageWorkspace,
+    candidate: StageCandidate | None,
+    services: StageServices,
+    original_failure: StageFailure | None = None,
+) -> FailureEnvelope:
+    """Settle a finished attempt with its existing fence and preserve its evidence."""
+    request = CancellationRequest.from_command(cancel_command)
+    if request.target_command_id != command.command_id:
+        raise ProtocolError("cancel.target_mismatch", {"command_id": command.command_id})
+    evidence = list(original_failure.evidence_artifacts if original_failure is not None else ())
+    detail = {
+        "cancel_command_id": cancel_command.command_id,
+        "requested_by": request.requested_by,
+        "target_command_id": command.command_id,
+    }
+    if candidate is not None:
+        evidence.append(candidate.result.output_artifact)
+        if candidate.result_record_artifact is not None:
+            evidence.append(candidate.result_record_artifact)
+        detail["candidate_result_digest"] = candidate.result.digest
+        detail["candidate_outcome"] = candidate.result.outcome
+    if original_failure is not None:
+        detail["original_failure"] = {
+            "reason_code": original_failure.reason_code,
+            "error_type": original_failure.error_type,
+            "message": str(original_failure),
+            "detail": original_failure.detail,
+        }
     failure = StageFailure(
         request.reason_code,
         request.reason,
         outcome="cancelled",
         error_type="StageCancelled",
-        detail={
-            "cancel_command_id": cancel_command.command_id,
-            "requested_by": request.requested_by,
-            "target_command_id": command.command_id,
-        },
+        detail=detail,
+        evidence_artifacts=tuple({item.artifact_id: item for item in evidence}.values()),
+        retained_locations=original_failure.retained_locations if original_failure is not None else (),
+        unavailable_reason=original_failure.unavailable_reason if original_failure is not None else None,
     )
     return services.commit_failure(
         command,
@@ -497,6 +532,7 @@ def execute_stage(
     candidate = None if transfer_resume else services.candidate_for(command, claim)
     workspace = services.materialize(command, claim, candidate=candidate)
     cleanup_workspace = False
+    original_failure = None
     try:
         try:
             if transfer_resume:
@@ -565,6 +601,7 @@ def execute_stage(
                             str(Path(execution.candidate_root).resolve()),
                         ),
                     )
+                    original_failure = failure
                     try:
                         return services.commit_failure(
                             command,
@@ -572,11 +609,14 @@ def execute_stage(
                             failure,
                             workspace_root=workspace.root,
                         )
+                    except StageCancellationRequested:
+                        raise
                     except Exception as envelope_error:
                         raise failure from envelope_error
             candidate = handler.validate_candidate(command, claim, candidate, effects=effects)
             candidate = services.verify_candidate(command, claim, candidate)
         except StageFailure as failure:
+            original_failure = failure
             try:
                 return services.commit_failure(
                     command,
@@ -584,6 +624,8 @@ def execute_stage(
                     failure,
                     workspace_root=workspace.root,
                 )
+            except StageCancellationRequested:
+                raise
             except Exception as error:
                 raise failure from error
         _validate_result_identity(command, candidate.result)
@@ -599,6 +641,10 @@ def execute_stage(
             raise ProtocolError("decision.command_mismatch", {"command_id": command.command_id})
         cleanup_workspace = candidate.result.outcome == "completed" and candidate.result.resources_settled is True
         return candidate.result
+    except StageCancellationRequested as cancellation:
+        return _commit_owned_cancellation(
+            command, cancellation.cancel_command, claim, workspace, candidate, services, original_failure,
+        )
     except Exception as error:
         failure_record = {
             "schema_version": UNHANDLED_STAGE_FAILURE_SCHEMA,
