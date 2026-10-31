@@ -55,7 +55,6 @@ from ..stages import (
 
 from ..artifacts import ArtifactStore
 from .. import mjcf_contract
-from ..pipeline.admission import AdmissionSpec, validate_mjcf_successor
 from ..pipeline.stages.mjcf import (
     source_refs as mjcf_source_refs, certificate_from_bytes as mjcf_certificate_from_bytes,
 )
@@ -3009,7 +3008,8 @@ class PortalApp:
         if not isinstance(projection, dict):
             return None
         stages = {
-            row["stage"]: row
+            row["stage"]: ({**row["source"], "in_scope": row["in_scope"], "reuse": row["reuse"]}
+                           if row.get("reuse") else row)
             for row in projection.get("stages", ())
             if isinstance(row, dict) and isinstance(row.get("stage"), str)
         }
@@ -3027,9 +3027,9 @@ class PortalApp:
             "stages": stages,
             "purpose": projection.get("purpose"),
         }
-        return self._mjcf_input_projection(result)
+        return self._mjcf_input_members(result)
 
-    def _mjcf_input_projection(self, projection: dict) -> dict:
+    def _mjcf_input_members(self, projection: dict) -> dict:
         """Expose only the registered MJCF command's exact source closure."""
         stages = projection["stages"]
         row = stages.get("mjcf") or {}
@@ -3066,28 +3066,6 @@ class PortalApp:
                 members.update(source_members)
             if command.request["verify_certificate_sha256"] != by_stage["verify"][CERTIFICATE_FILENAME]["sha256"]:
                 raise PipelineError("MJCF command names another URDF verification certificate")
-            if request.get("from_stage") == "mjcf":
-                spec = AdmissionSpec.from_record(request)
-                parent = self._read_projection(spec.parent_run_id)
-                if parent is None or parent.get("state") == "unresolved":
-                    raise PipelineError("The original MJCF source run is unavailable or unresolved")
-                validate_mjcf_successor(spec, AdmissionSpec.from_record(parent["request"]))
-                verify = parent["stages"]["verify"]
-                if command.predecessor_decision_id != verify["decision"]["decision_id"]:
-                    raise PipelineError("MJCF successor names another original Verify decision")
-                for stage, ref in refs.items():
-                    if ref != self._stage_artifact_ref(parent["by_stage"][stage], stage=stage):
-                        raise PipelineError("MJCF successor names another original source artifact")
-                for stage in _STAGE_IDS[:_STAGE_IDS.index("mjcf")]:
-                    original = parent["stages"][stage]
-                    if original.get("state") != "completed" or (stages.get(stage) or {}).get("command") is not None:
-                        raise PipelineError("MJCF successor carries new or incomplete upstream work")
-                    stages[stage] = {**original, "reused_from": {
-                        "run_id": spec.parent_run_id, "command_id": original["command"]["command_id"],
-                        "result_digest": original["receipt"]["result_digest"],
-                    }}
-                    by_stage[stage] = parent["by_stage"][stage]
-                    members.update(parent["by_stage"][stage])
             return {**projection, "stages": stages, "by_stage": by_stage, "members": members}
         except (PipelineError, KeyError, TypeError, ValueError) as error:
             raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered MJCF source binding is invalid") from error
@@ -3434,6 +3412,8 @@ class PortalApp:
                 state=state, at=at, in_scope=row.get("in_scope") is not False,
                 input_qc=[], output_qc=[], inputs=[], outputs=[], findings=[],
             )
+            if row.get("reuse"):
+                stage["reuse"] = row["reuse"]
             command = row.get("command") or {}
             stage["inputs"] = [{
                 "path": artifact["locator"], "label": artifact["kind"], "availability": "recorded",
@@ -3445,7 +3425,6 @@ class PortalApp:
                     parent = projection.get("parent_run_id")
                     if not parent or artifact.producer_run_id != parent:
                         raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered stage artifact has no proven parent run")
-                    stage["reuse"] = {"parent_run": parent, "source_run": parent, "reused": True}
                 stage["outputs"] = [{
                     "path": ".", "label": "Sealed stage output", "availability": "recorded",
                     "files": {name: member["sha256"] for name, member in members.items()},
@@ -3520,8 +3499,6 @@ class PortalApp:
                 stage["output_qc"] = [{
                     **item, "boundary": "stage", "state": "passed" if item["passed"] else "failed",
                 } for item in certificate["report"]["checks"]]
-            if row.get("reused_from"):
-                stage["in_scope"] = False
             checks = stage["input_qc"] + stage["output_qc"]
             stage.update(checks_total=len(checks), checks_passed=sum(item.get("state") == "passed" for item in checks))
             if state == "failed":

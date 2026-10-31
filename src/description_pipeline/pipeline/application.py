@@ -1240,18 +1240,16 @@ class StageApplication:
         predecessors: dict[StageId, VerifiedPredecessor] = {}
         discover_result: VerifiedDiscoverResult | None = None
         verify_result: VerifiedVerifyResult | None = None
-        start = 0
+        planned = execution_stage_ids(spec.from_stage)
         if spec.from_stage == "mjcf":
-            start = STAGE_IDS.index("mjcf")
             predecessors, discover_result, verify_result = self._mjcf_source_context(spec)
-            if STAGE_IDS.index(stage) < start:
+            if stage not in planned:
                 source = predecessors[stage]
                 return ReusedStage(
                     run_id, stage, source.command.run_id, source.command.command_id, source.result.digest,
                 )
         self._require_handler(stage)
-        target_index = STAGE_IDS.index(stage)
-        for current_stage in STAGE_IDS[start: target_index + 1]:
+        for current_stage in planned[:planned.index(stage) + 1]:
             command = self._build_command(
                 spec,
                 current_stage,
@@ -1259,7 +1257,7 @@ class StageApplication:
                 discover_result,
                 verify_result,
             )
-            if current_stage == STAGE_IDS[start]:
+            if current_stage == planned[0]:
                 stored = self.facts.load_command(command.command_id)
                 if stored != command:
                     raise ApplicationError(
@@ -1419,10 +1417,9 @@ class StageApplication:
         last: StageAttemptResult | None = None
         completed_stage: StageId | None = None
         spec, _admission = self._load_spec(run_id)
-        start = STAGE_IDS.index("mjcf") if spec.from_stage == "mjcf" else 0
-        if STAGE_IDS.index(through) < start:
+        if through not in execution_stage_ids(spec.from_stage):
             raise ApplicationError("application.reused_stage", "Target stage belongs to the original source run")
-        for stage in STAGE_IDS[start: STAGE_IDS.index(through) + 1]:
+        for stage in execution_stage_ids(spec.from_stage, through=through):
             last = self.run_stage(run_id, stage)
             outcome, payload = _stage_attempt_record(last)
             if outcome != "completed":

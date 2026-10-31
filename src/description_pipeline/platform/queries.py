@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
 
-from ..stages import STAGE_IDS
+from ..stages import STAGE_IDS, execution_stage_ids
 from ..artifacts import ArtifactStore
 from ..io import PipelineError
 from .facts import RunNotAdmittedError
@@ -567,6 +567,8 @@ def read_run_projection(
         ):
             raise PipelineError("The diagnostic run does not carry one scoped target command")
 
+    execution_scope = ((diagnostic_target,) if diagnostic_target is not None
+                       else execution_stage_ids(admission_record.from_stage))
     stage_rows: list[dict[str, Any]] = []
     by_stage: dict[str, dict[str, dict[str, Any]]] = {}
     members: dict[str, dict[str, Any]] = {}
@@ -710,7 +712,7 @@ def read_run_projection(
         row["qualification"] = (
             qualification.to_record() if qualification is not None else None
         )
-        row["in_scope"] = diagnostic_target is None or stage == diagnostic_target
+        row["in_scope"] = stage in execution_scope
         stage_rows.append(row)
         by_stage[stage] = stage_members
         for path, member in stage_members.items():
@@ -751,7 +753,7 @@ def read_run_projection(
             "formal_eligible": run_state == "succeeded",
         }
     )
-    return {
+    projection = {
         "run_id": run_id,
         "request_id": admission[0],
         "parent_run_id": admission[1],
@@ -764,6 +766,7 @@ def read_run_projection(
         "formal_eligible": run_scope["formal_eligible"],
         "state": run_state,
         "stages": stage_rows,
+        "execution_scope": list(execution_scope),
         "by_stage": by_stage,
         "members": members,
         "activity": activity,
@@ -773,6 +776,55 @@ def read_run_projection(
             "effects": effect_state_rows,
         },
     }
+    return _reused_mjcf_prefix(connection, projection, artifacts=artifacts)
+
+
+def _reused_mjcf_prefix(connection, projection, *, artifacts):
+    """Attach original evidence without creating current-run commands or decisions."""
+    if projection["from_stage"] != "mjcf":
+        return projection
+    from ..pipeline.admission import AdmissionSpec, validate_mjcf_successor
+    from ..pipeline.stages.mjcf import source_refs
+    from ..pipeline.verify_contract import CERTIFICATE_FILENAME
+
+    parent_id = projection["parent_run_id"]
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT from_stage FROM run_admission WHERE run_id = %s", (parent_id,))
+        parent_entry = cursor.fetchone()
+    if parent_entry is None or parent_entry[0] not in {None, "freeze"}:
+        raise PipelineError("MJCF reuse requires one original source run")
+    parent = read_run_projection(connection, parent_id, artifacts=artifacts)
+    validate_mjcf_successor(
+        AdmissionSpec.from_record(projection["request"]), AdmissionSpec.from_record(parent["request"]),
+    )
+    if parent["state"] not in {"succeeded", "failed", "cancelled"}:
+        raise PipelineError("The original MJCF source run has no settled terminal outcome")
+    rows = {row["stage"]: row for row in projection["stages"]}
+    original = {row["stage"]: row for row in parent["stages"]}
+    command = StageCommand.from_record(rows["mjcf"]["command"])
+    refs = source_refs(command)
+    if command.predecessor_decision_id != original["verify"]["decision"]["decision_id"]:
+        raise PipelineError("MJCF successor names another original Verify decision")
+    if artifacts is not None:
+        for stage, ref in refs.items():
+            members = parent["by_stage"][stage]
+            if not members or any(ArtifactRef.from_record(item["artifact"]) != ref for item in members.values()):
+                raise PipelineError("MJCF successor names another original source artifact")
+        if command.request["verify_certificate_sha256"] != parent["by_stage"]["verify"][CERTIFICATE_FILENAME]["sha256"]:
+            raise PipelineError("MJCF command names another URDF verification certificate")
+    for stage in (row["stage"] for row in projection["stages"] if not row["in_scope"]):
+        row, source = rows[stage], original[stage]
+        if source["state"] != "completed" or row.get("command") is not None or row.get("decision") is not None:
+            raise PipelineError("MJCF successor carries new or incomplete upstream work")
+        row.update(
+            state="reused", source=source,
+            reuse={"reused": True, "source_run": parent_id,
+                   "source_command_id": source["command"]["command_id"],
+                   "source_result_digest": source["decision"]["result_digest"]},
+        )
+        projection["by_stage"][stage] = parent["by_stage"][stage]
+        projection["members"].update(parent["by_stage"][stage])
+    return projection
 
 
 def render_stage_summary(projection: Mapping[str, Any]) -> list[dict[str, Any]]:

@@ -16,7 +16,7 @@ from types import MappingProxyType
 from typing import Any, Literal
 
 from ..io import PipelineError, canonical, digest
-from ..stages import STAGE_IDS
+from ..stages import STAGE_IDS, execution_stage_ids
 from ..schemas import (
     AIRFLOW_DISPATCH_CONF_SCHEMA,
     CANCEL_REQUEST_SCHEMA,
@@ -1729,11 +1729,12 @@ def project_run_status(
         raise ProtocolError("run_status.invalid", {"reason": "complete-stage-outcome-vector-required"})
     if from_stage not in {None, "freeze", "mjcf"}:
         raise ProtocolError("run_status.invalid", {"where": "from_stage"})
-    if from_stage == "mjcf":
-        start = STAGE_IDS.index("mjcf")
-        if any(outcome is not None for outcome in stage_outcomes[:start]):
-            raise ProtocolError("run_status.invalid", {"reason": "reused-upstream-has-new-decisions"})
-        stage_outcomes = stage_outcomes[start:]
+    selected = execution_stage_ids(from_stage)
+    if any(outcome is not None for stage, outcome in zip(STAGE_IDS, stage_outcomes, strict=True)
+           if stage not in selected):
+        raise ProtocolError("run_status.invalid", {"reason": "reused-upstream-has-new-decisions"})
+    stage_outcomes = tuple(outcome for stage, outcome in zip(STAGE_IDS, stage_outcomes, strict=True)
+                           if stage in selected)
     unresolved_effect_states = list(effect_states)
     for state in pending_effect_states:
         if state != "unknown" or "unknown" not in unresolved_effect_states:

@@ -218,7 +218,16 @@ class MJCFPortalTests(unittest.TestCase):
             self.assertEqual(200, status, body)
             self.assertTrue(json.loads(body)["mjcf"]["verified"])
             expanded = portal._read_projection(successor_id)
-            self.assertEqual(source_id, expanded["stages"]["generate"]["reused_from"]["run_id"])
+            self.assertEqual(source_id, expanded["stages"]["generate"]["reuse"]["source_run"])
+            self.assertEqual(["mjcf", "publish"], current["execution_scope"])
+            self.assertEqual(current["execution_scope"], portal._registered_stage_view(
+                portal._fact_display_job(expanded), expanded,
+            )["execution_scope"])
+            for row in current["stages"][:5]:
+                self.assertFalse(row["in_scope"])
+                self.assertEqual("reused", row["state"])
+                self.assertIsNone(row["command"])
+                self.assertIsNone(row["decision"])
             self.assertEqual(source_decisions, [row["decision"] for row in projection(source_id)["stages"]])
             self.assertEqual({"mjcf", "publish"}, {row["stage"] for row in current["stages"] if row["decision"]})
             corrupted = copy.deepcopy(expanded)
