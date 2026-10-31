@@ -23,6 +23,7 @@ except ImportError:
     pgserver = None
     psycopg2 = None
 
+from description_pipeline import __version__
 from description_pipeline.artifacts import ArtifactStore
 from description_pipeline.interface_records import config_snapshot_digest
 from description_pipeline.io import digest, read_data, write_json
@@ -237,7 +238,7 @@ class RealSixStageChainTests(unittest.TestCase):
         release = {
             "schema_version": "solidworks-to-urdf.release/v1",
             "pipeline_id": "solidworks-to-urdf",
-            "version": "1.5.0",
+            "version": __version__,
             "source_commit": "a" * 40,
             "source_tree": "b" * 40,
             "source_sha256": digest(
