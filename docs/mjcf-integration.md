@@ -335,3 +335,13 @@ MJCF successor 必须直接引用原始完整运行的通过 Verify 产物，保
 `90837964` 的浏览器 MJCF-only 运行 `portal-mjcf-2c45ec10-e7fa-4b26-b300-133b129af08b` 经真实本地 Airflow 成功，数据库仅新增 MJCF、Publish 两阶段决定，上游执行器和原生提供者仍设为调用即失败。碰撞显示、0.4 rad 调姿、播放、暂停、单步与复位实测通过，截图 `.dev/m2/FIXED-90837964-MJCF-COLLISION.png`。最终展示修正后仅重启本 worktree 的开发实例重新核验；旧实例、失败运行及原始证据保留。闲置的本会话旧开发数据库已核对进程与目录后停止，没有删除数据，见 `.dev/m2/RETIRED-DEVELOPMENT-DATABASE-STOP.json`。
 
 可评审入口为 [Draft PR #184](https://github.com/mimicverse/description-pipeline/pull/184)，开发入口为 `http://127.0.0.1:8878/_development`。M0 至 M4 的开发工作及 M5 的候选实现、验证资料已交付；权威文档一致性、独立固定候选审查和适用 CI 仍是合并前的明确门。正式 main 合并、发行构建、生产部署、正式 CAD GUI E2E 和清场属于 M6，仍由既有唯一执行者负责；开发记录不授予正式上线资格。
+
+### 跨运行加锁顺序修复（2026-11-01）
+
+最终开发复测在 `55a2b414` 触发真实 PostgreSQL 死锁，失败运行 `portal-mjcf-0d38751f-7a45-4db4-a8e0-4c48fdc52b36` 的来源事实、当前请求、CAS 原件、数据库原始错误和 Airflow task 状态保留在 `.dev/m2/mjcf-source-lock-deadlock/`。该次 Airflow 失败不能沿用前一次成功记录，也没有修改或删除原决定以强制重跑。
+
+根因是原锁协议只有同一运行：`_lock_command_chain_cursor` 先取当前 run，再取来源 command，核验来源 effect 时才取来源 run。并发来源决定读取先持来源 run，再等来源 command，形成反向等待。既有同 run 并发测试没有覆盖新增的跨 run Verify→MJCF 引用边，因此未捕获该问题。
+
+修复统一落在 FactStore 的共同锁协议：从实际不可变前驱链按原始来源到当前运行取得全部 run 锁，再取得从根到叶的 command 锁，最后取得 effect ledger、effect 和 mutable claim 锁。同步移除 command scope、后继命令接纳、取消、claim 及外部 effect 授权中提前取得当前 run 的同源顺序错误；技术 dispatch 和没有前驱的原始 Freeze 保留各自单 run 协议。候选登记、成功提交、失败提交及 reconciliation 均使用该共同边界，没有添加自动重试、模型特判或第二状态模型。
+
+新增真实双连接并发反例，交错来源决定读取和 MJCF 后继提交所用的链路锁及前驱复核。事件只约束交错时机，不替代数据库锁或验证。原代码稳定出现 PostgreSQL `DeadlockDetected`，日志 `.dev/m2/DEADLOCK-REGRESSION-BEFORE.log`；修复后覆盖 FactStore、取消、effect reconciliation、真实门户及七阶段组合的 64 项回归通过，见 `.dev/m2/DEADLOCK-REGRESSION-AFTER.log`。随后在新开发实例复测真实 Airflow MJCF-only 提交与门户并发读取；失败原实例已在证据保全后停止，生产进程和目录未变。

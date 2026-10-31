@@ -80,8 +80,9 @@ from ..schemas import (
 from ..stages import ACTIVITY_HISTORY_LIMIT, merge_activity, normalize_activity
 
 # Transaction locks are keyed by (namespace, hashtext(identity)). A hash collision can
-# only serialize unrelated operations, never permit two owners. Callers acquire command
-# locks before effect-ledger locks and effect-ledger locks before individual effect locks;
+# only serialize unrelated operations, never permit two owners. Callers acquire all run
+# scopes from the original source to the current run before command-chain locks, then
+# effect-ledger locks and individual effect locks;
 # mutable execution-claim rows are locked only after those immutable scopes.
 _ADVISORY_RUN = 1
 _ADVISORY_COMMAND = 2
@@ -850,8 +851,10 @@ class FactStore(RunControlStore):
         self._lock_advisory_cursor(cursor, _ADVISORY_COMMAND, command_id)
 
     def _lock_command_chain_cursor(self, cursor, command: StageCommand) -> None:
-        self._lock_run_cursor(cursor, command.run_id)
         predecessors = self._completed_predecessor_chain_cursor(cursor, command)
+        runs = dict.fromkeys([item.run_id for item in reversed(predecessors)] + [command.run_id])
+        for run_id in runs:
+            self._lock_run_cursor(cursor, run_id)
         for predecessor in reversed(predecessors):
             self._lock_command_cursor(cursor, predecessor.command_id)
         self._lock_command_cursor(cursor, command.command_id)
@@ -864,13 +867,13 @@ class FactStore(RunControlStore):
         row = cursor.fetchone()
         if row is None:
             raise FactStoreError(f"The command {command_id!r} is not registered")
-        self._lock_run_cursor(cursor, row[0])
         if row[1] == "stage":
             command = self._load_command_cursor(cursor, command_id)
             if command is None:
                 raise FactStoreError(f"The command {command_id!r} disappeared")
             self._lock_command_chain_cursor(cursor, command)
         else:
+            self._lock_run_cursor(cursor, row[0])
             self._lock_command_cursor(cursor, command_id)
         return row
 
@@ -1431,7 +1434,6 @@ class FactStore(RunControlStore):
                 raise FactStoreError("A sealed predecessor StageResult differs from its verified fact")
         with self._transaction() as connection:
             cursor = connection.cursor()
-            self._lock_run_cursor(cursor, command.run_id)
             self._lock_command_chain_cursor(cursor, command)
             cursor.execute("SELECT run_id FROM run_admission WHERE run_id = %s", (command.run_id,))
             if cursor.fetchone() is None:
@@ -1680,8 +1682,8 @@ class FactStore(RunControlStore):
             target_row = cursor.fetchone()
             if target_row is None:
                 return None
-            self._lock_run_cursor(cursor, target_row[0])
             if target_row[1] != "stage":
+                self._lock_run_cursor(cursor, target_row[0])
                 self._lock_command_cursor(cursor, target_command_id)
                 return None
             target = self._load_command_cursor(cursor, target_command_id)
@@ -1865,7 +1867,6 @@ class FactStore(RunControlStore):
             command = cursor.fetchone()
             if command is None:
                 raise FactStoreError(f"The command {command_id!r} is not registered")
-            self._lock_run_cursor(cursor, command[1])
             stored_command = None
             if command[2] == "stage":
                 if command[5] is not None:
@@ -1874,8 +1875,10 @@ class FactStore(RunControlStore):
                         raise FactStoreError(f"The command {command_id!r} is not registered")
                     self._lock_command_chain_cursor(cursor, stored_command)
                 else:
+                    self._lock_run_cursor(cursor, command[1])
                     self._lock_command_cursor(cursor, command_id)
             else:
+                self._lock_run_cursor(cursor, command[1])
                 self._lock_command_cursor(cursor, command_id)
             if stored_command is not None:
                 self._verify_completed_predecessor_chain_cursor(cursor, stored_command)
@@ -2768,7 +2771,6 @@ class FactStore(RunControlStore):
             stored = cursor.fetchone()
             if stored is None:
                 raise FactStoreError("The effect dispatch command disappeared")
-            self._lock_run_cursor(cursor, stored[1])
             if stored[2] == "stage":
                 stored_command = self._load_command_cursor(cursor, claim.command_id)
                 if stored_command is None:
@@ -2779,6 +2781,7 @@ class FactStore(RunControlStore):
                 if self._cancel_command_cursor(cursor, claim.command_id) is not None:
                     raise FactConflict("Cancellation was requested before effect dispatch")
             else:
+                self._lock_run_cursor(cursor, stored[1])
                 self._lock_command_cursor(cursor, claim.command_id)
                 if (
                     stored[2] == "dispatch"

@@ -1930,6 +1930,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         ))
         self.assertEqual(command, self.facts.load_command(command.command_id))
         self.assertEqual(source.run_id, command.input_artifacts[0].producer_run_id)
+        self._assert_reused_source_read_and_successor_lock_order(command, verify_result.predecessor.command)
         facts = self.facts
         facts.request_cancel(
             target_command_id=command.command_id, cancel_executor_sha256=command.expected_executor_sha256,
@@ -1948,6 +1949,45 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         self.assertEqual(before, self._query(
             "SELECT decision_id, result_digest FROM stage_decision WHERE run_id = %s ORDER BY stage", (source.run_id,),
         ))
+
+    def _assert_reused_source_read_and_successor_lock_order(self, successor, source):
+        source_held = threading.Event()
+        successor_attempting_source = threading.Event()
+        identities = {}
+        lock_run = self.facts._lock_run_cursor
+
+        def synchronized_run_lock(cursor, run_id):
+            identity = threading.get_ident()
+            if identity == identities.get("writer") and run_id == source.run_id:
+                successor_attempting_source.set()
+            lock_run(cursor, run_id)
+            if identity == identities.get("reader") and run_id == source.run_id and not source_held.is_set():
+                source_held.set()
+                if not successor_attempting_source.wait(5):
+                    raise AssertionError("Successor did not request its source run lock")
+
+        def reader():
+            identities["reader"] = threading.get_ident()
+            return self.facts.decision_for(source)
+
+        def writer():
+            identities["writer"] = threading.get_ident()
+            if not source_held.wait(5):
+                raise AssertionError("Source reader did not acquire its run lock")
+            with self.facts._transaction() as connection:
+                cursor = connection.cursor()
+                cursor.execute("SET LOCAL lock_timeout = '5s'")
+                self.facts._lock_command_chain_cursor(cursor, successor)
+                self.facts._verify_completed_predecessor_chain_cursor(cursor, successor)
+
+        with (
+            mock.patch.object(self.facts, "_lock_run_cursor", side_effect=synchronized_run_lock),
+            ThreadPoolExecutor(max_workers=2) as pool,
+        ):
+            read = pool.submit(reader)
+            write = pool.submit(writer)
+            self.assertEqual("completed", read.result(timeout=12).outcome)
+            write.result(timeout=12)
 
     def test_technical_dispatch_uses_its_own_claim_and_creates_no_stage_decision(self) -> None:
         result = self.dispatch_service.dispatch(self.dispatch_command.command_id)
