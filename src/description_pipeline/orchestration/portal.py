@@ -2294,7 +2294,7 @@ class PortalApp:
             "operator": operator,
             "principal": principal,
             "can_manage": can_manage,
-            # Linked rerun lineage from the child run's own conf, same fields as the list rows.
+            # Linked rerun lineage from canonical admission, same fields as the list rows.
             "parent_dag_run_id": parent_dag_run_id,
             "resume_from": _optional_str(
                 request.get("from_stage") or (projection or {}).get("from_stage")

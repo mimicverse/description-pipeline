@@ -807,11 +807,11 @@ function buildRunItem(run) {
   const heading = document.createElement("span");
   heading.className = "run-heading";
   heading.textContent = runDisplayTitle(run);
-  if (run.resume_from_name) {
+  if (run.parent_dag_run_id) {
     const chip = document.createElement("span");
     chip.className = "run-chip";
-    chip.textContent = `Rerun from ${run.resume_from_name}`;
-    chip.title = `Rerun source: ${run.parent_dag_run_id || "not recorded"}`;
+    chip.textContent = `Rerun from ${run.resume_from_name || "upstream stage"}`;
+    chip.title = `Rerun source: ${run.parent_dag_run_id}`;
     heading.append(chip);
   }
   const meta = document.createElement("span");
@@ -2197,11 +2197,10 @@ function renderRun(run) {
   }
   const origin = $("run-origin");
   origin.textContent = "";
-  // Parent lineage prefers the detail payload; the cached row is only a fallback, so a parent
-  // link never depends on that row being on a loaded page.
-  const parentId = run.parent_dag_run_id || (listEntry && listEntry.parent_dag_run_id) || null;
+  // The detail payload carries immutable lineage independently of cached list rows.
+  const parentId = run.parent_dag_run_id;
   if (parentId) {
-    const parentStage = run.resume_from_name || (listEntry && listEntry.resume_from_name) || "upstream stage";
+    const parentStage = run.resume_from_name || "upstream stage";
     origin.append(`Rerun from ${parentStage} · source `);
     const link = document.createElement("button");
     link.type = "button";

@@ -465,7 +465,7 @@ class RunHistoryUiContractTests(unittest.TestCase):
             "RUN_STATES[displayState(run.state, run.automatic)]",
             "State unconfirmed",
             'Initiator: ${run.user || "not recorded"}',
-            "Rerun from ${run.resume_from_name}",
+            'Rerun from ${run.resume_from_name || "upstream stage"}',
             "Rerun source: ",
             "open.title",
             "formatTime(run.started_at)",
@@ -535,7 +535,6 @@ class RunHistoryUiContractTests(unittest.TestCase):
             "overlayRun(state.runsList, run,",
             "deleted: payload.deleted !== false,",
             'deleted_by: typeof payload.deleted_by === "string" ? payload.deleted_by : null',
-            "run.parent_dag_run_id || (listEntry && listEntry.parent_dag_run_id)",
             "runActionsFor: null,",
         ):
             self.assertIn(token, app)
