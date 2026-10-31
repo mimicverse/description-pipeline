@@ -1,6 +1,7 @@
 // Operator page logic. All Airflow and Windows endpoint credentials stay on the server; this
 // module only talks to the portal's own JSON API and the digest-verified artifact routes.
 import { buildJointControls, createViewer, disposeRobot, loadRobot } from "/static/viewer.js";
+import { createInspection } from "/static/inspection.js";
 import {
   menuAction,
   overlayRun,
@@ -1749,7 +1750,7 @@ async function renderPreviewPanels(preview, records, artifactUrl, signal) {
       row.mass_kg === null ? "not provided" : row.mass_kg.toFixed(6),
       row.com_m ? row.com_m.map((value) => fmt(value, 4)).join(", ") : null,
       row.inertia_kg_m2
-        ? `ixx ${fmt(row.inertia_kg_m2.ixx, 6)} · iyy ${fmt(row.inertia_kg_m2.iyy, 6)} · izz ${fmt(row.inertia_kg_m2.izz, 6)}`
+        ? Object.entries(row.inertia_kg_m2).map(([key, value]) => `${key} ${fmt(value, 6)}`).join(" · ")
         : null,
     ]),
   );
@@ -2644,7 +2645,12 @@ async function loadPreview(dagRunId) {
       },
     });
     if (request.signal.aborted || state.dagRunId !== dagRunId) return;
-    state.controls = buildJointControls($("joint-controls"), loaded.joints, {});
+    createInspection(state.viewer, loaded, $("inspection-controls"), {
+      onPoseChange: () => state.controls?.refresh(),
+    });
+    state.controls = buildJointControls($("joint-controls"), loaded.joints, {
+      onInput: () => state.viewer.inspection?.update(),
+    });
     $("joints-title").textContent = `Joint controls (${loaded.joints.length})`;
     state.previewSubject = preview.subject_sha256;
     state.previewFiles = preview.files || {};

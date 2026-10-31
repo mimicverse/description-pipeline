@@ -231,8 +231,18 @@ input, select, textarea { font: inherit; }
 .run-workspace.no-preview { grid-template-columns: minmax(0, 1fr); }
 .run-workspace.no-preview .pane-preview { display: none; }
 .pane { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px; min-width: 0; }
-.viewer { height: 450px; border: 1px solid var(--line); border-radius: var(--radius-sm); overflow: hidden; background: #edf1f7; }
-.viewer canvas { display: block; width: 100%; height: 100%; }
+.viewer { position: relative; height: 450px; border: 1px solid var(--line); border-radius: var(--radius-sm); overflow: hidden; background: #edf1f7; }
+.joint-badge { position: absolute; pointer-events: none; color: #f4b400; background: #18202be6; padding: 3px 6px; border-radius: 4px; font-size: 12px; }
+.viewer canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+.inspection-controls { display: grid; gap: 8px; margin-top: 8px; }
+.inspection-toolbar { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; }
+.inspection-toolbar label { display: inline-flex; gap: 6px; align-items: center; font-size: 13px; }
+.inspection-controls select { max-width: 100%; }
+.inspection-toolbar input[type="checkbox"] { width: auto; margin: 0; }
+.inspection-toolbar input[type="number"] { width: 100px; }
+.inspection-toolbar input[type="color"] { width: 36px; padding: 2px; }
+.inspection-toolbar input[type="range"] { width: 100px; }
+.inspection-controls output { display: block; overflow-wrap: anywhere; font-size: 13px; }
 .viewer-placeholder { margin: 12px 4px 2px; }
 .viewer-footer { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: start; margin-top: 10px; }
 .joint-controls { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 6px 16px; }
@@ -418,6 +428,7 @@ details pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 .panel-grid th, .panel-grid td { text-align: left; padding: 3px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
 .panel-grid th { color: var(--muted); font-weight: 600; }
 #viewer-card.preview-collapsed #viewer,
+#viewer-card.preview-collapsed #inspection-controls,
 #viewer-card.preview-collapsed .viewer-footer,
 #viewer-card.preview-collapsed .preview-panels,
 #viewer-card.preview-collapsed #preview-info { display: none; }
