@@ -4563,7 +4563,7 @@ class PortalTests(unittest.TestCase):
     def test_attempt_endpoint_rejects_old_downstream_resume(self) -> None:
         self._seed_retryable_run()
         self.client.login()
-        for stage_id in ("discover", "capture", "generate", "verify", "mjcf", "publish"):
+        for stage_id in ("discover", "capture", "generate", "verify", "publish"):
             with self.subTest(stage=stage_id):
                 status, _, body = self.client.request(
                     "POST",
@@ -4572,6 +4572,14 @@ class PortalTests(unittest.TestCase):
                 )
                 self.assertEqual(status, 400, body)
                 self.assertIn("start from Freeze", json.loads(body)["error"])
+        status, _, body = self.client.request(
+            "POST",
+            f"/api/runs/{DAG_RUN_ID}/attempts",
+            {"stage": "mjcf"},
+        )
+        self.assertEqual(status, 409, body)
+        self.assertEqual(json.loads(body)["reason"], "verified_source_unavailable")
+        self.assertEqual(json.loads(body)["earliest_required"], "freeze")
         self.assertEqual(self.airflow.trigger_payloads, [])
         self.assertEqual(self.platform.admits, [])
         self.assertEqual(

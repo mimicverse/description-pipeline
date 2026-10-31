@@ -1918,7 +1918,8 @@ function renderStepper() {
     label.textContent = stage.name || stage.id;
     const meta = document.createElement("span");
     meta.className = "step-meta";
-    if (stage.reuse?.reused === true) {
+    const reused = stage.reuse?.reused === true;
+    if (reused) {
       meta.textContent = "Reused";
     } else if (!Number.isFinite(stage.total) || stage.total <= 0) {
       // No recorded checks: a short neutral state word instead of a failed percentage.
@@ -1927,11 +1928,11 @@ function renderStepper() {
       meta.textContent = `${Number.isFinite(stage.passed) ? stage.passed : 0}/${stage.total} passed`;
     }
     const warningCount = Number.isFinite(stage.counts.warnings) ? stage.counts.warnings : 0;
-    const tooltip = `${stage.name} · ${stage.stateLabel}${warningCount > 0 ? ` · warnings ${warningCount}` : ""}${
+    const tooltip = `${stage.name} · ${reused ? "Reused" : stage.stateLabel}${warningCount > 0 ? ` · warnings ${warningCount}` : ""}${
       Number.isFinite(stage.total) && stage.total > 0
-        ? ` · passed ${Number.isFinite(stage.passed) ? stage.passed : 0}/${stage.total} · executed ${
-            Number.isFinite(stage.executed) ? stage.executed : 0
-          }/${stage.total}`
+        ? ` · ${reused ? "source checks passed" : "passed"} ${Number.isFinite(stage.passed) ? stage.passed : 0}/${stage.total}${
+            reused ? "" : ` · executed ${Number.isFinite(stage.executed) ? stage.executed : 0}/${stage.total}`
+          }`
         : ""
     }`;
     step.title = tooltip;
