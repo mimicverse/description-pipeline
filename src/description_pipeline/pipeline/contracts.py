@@ -1677,6 +1677,7 @@ def project_stage_status(
     predecessor_completed: bool,
     open_claim: bool,
     pending_effect_states: tuple[str, ...] = (),
+    expired_claim: bool = False,
 ) -> StageStatus:
     """Derive the stage status; unknown external effects have precedence."""
 
@@ -1696,6 +1697,8 @@ def project_stage_status(
         if decision_outcome == "completed" and any(state != "satisfied" for state in effect_states):
             return StageStatus.UNRESOLVED
         return StageStatus(decision_outcome)
+    if expired_claim:
+        return StageStatus.UNRESOLVED
     if not predecessor_completed:
         return StageStatus.BLOCKED
     if open_claim:
@@ -1708,6 +1711,7 @@ def project_run_status(
     stage_outcomes: tuple[str | None, ...],
     effect_states: tuple[str, ...],
     pending_effect_states: tuple[str, ...] = (),
+    expired_claim: bool = False,
 ) -> RunStatus:
     """Derive a run status from ordered stage decisions and effect facts."""
 
@@ -1722,6 +1726,8 @@ def project_run_status(
             )
         unresolved_effect_states.remove("unknown")
     if "unknown" in unresolved_effect_states or "conflict" in unresolved_effect_states:
+        return RunStatus.UNRESOLVED
+    if expired_claim:
         return RunStatus.UNRESOLVED
     for outcome in stage_outcomes:
         if outcome is None:

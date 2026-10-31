@@ -648,12 +648,15 @@ def _effect_observation(
     settlement: EffectSettlement,
     root: Path,
 ) -> tuple[dict, Path]:
-    if settlement.payload_artifact is None:
-        raise PublicationError("publish.effect_observation", {"effect_id": settlement.effect_id})
-    materialized = artifacts.materialize(settlement.payload_artifact, root / settlement.effect_id)
-    observation = read_data(Path(materialized) / "observation.json")
-    if not isinstance(observation, dict):
-        raise PublicationError("publish.effect_observation", {"effect_id": settlement.effect_id})
+    try:
+        if settlement.payload_artifact is None:
+            raise PublicationError("publish.effect_observation", {"effect_id": settlement.effect_id})
+        materialized = artifacts.materialize(settlement.payload_artifact, root / settlement.effect_id)
+        observation = read_data(Path(materialized) / "observation.json")
+        if not isinstance(observation, dict):
+            raise PublicationError("publish.effect_observation", {"effect_id": settlement.effect_id})
+    except (PipelineError, OSError) as error:
+        raise _local_publication_failure(error, operation="publish.effect_readback") from None
     return observation, Path(materialized)
 
 
@@ -695,15 +698,28 @@ def _record_effect_error(
 
 
 def _local_publication_failure(error: Exception, *, operation: str = "publish.prepare") -> StageFailure:
+    if isinstance(error, ProtocolError):
+        raise error
     record = process_error_record(error, operation=operation)
     detail = record.pop("detail", None)
-    contract_failed = isinstance(error, PublicationError)
+    contract_failed = isinstance(error, PipelineError)
     return StageFailure(
         "publish.local_contract_failed" if contract_failed else "publish.local_process_failed",
-        error.code if contract_failed else f"{operation} failed",
+        error.code if isinstance(error, PublicationError) else f"{operation} failed",
         error_type=type(error).__name__,
         detail={**(detail if isinstance(detail, dict) else {"detail": detail}), "exception": record},
     )
+
+
+def _cleanup_candidate(candidate: PreparedCandidate, effects: StageEffectPort) -> None:
+    try:
+        candidate.cleanup()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as error:
+        for key in (GIT_EFFECT_KEY, PR_EFFECT_KEY):
+            settlement = effects.effect_settlement_for_key(key)
+            if settlement is not None and settlement.state in {EffectState.UNKNOWN, EffectState.CONFLICT}:
+                raise
+        raise _local_publication_failure(error, operation="publish.cleanup") from None
 
 
 def _observe_git_exact(
@@ -2306,10 +2322,13 @@ class PublishHandler:
                 return StageDeferral(settlement.effect_id)
             if settlement is not None and settlement.state is EffectState.CONFLICT:
                 raise ProtocolError("publish.effect_conflict", {"effect_id": settlement.effect_id})
-        self._verify_inputs(request)
-        repository_root = workspace.root / "repository"
-        workspace.root.mkdir(parents=True, exist_ok=True)
         try:
+            self._verify_inputs(request)
+        except (PipelineError, OSError) as error:
+            raise _local_publication_failure(error, operation="publish.verify_inputs") from None
+        repository_root = workspace.root / "repository"
+        try:
+            workspace.root.mkdir(parents=True, exist_ok=True)
             materialize_repository_snapshot(
                 workspace.inputs[request.repository_snapshot.artifact_id],
                 repository_root,
@@ -2320,7 +2339,7 @@ class PublishHandler:
                 expected_branch_ref=request.branch_ref,
                 expected_head_oid=request.expected_head_oid,
             )
-        except (PublicationError, subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as error:
+        except (PipelineError, subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as error:
             raise _local_publication_failure(error, operation="publish.snapshot") from None
         pull_requests = (
             self.pull_requests
@@ -2332,53 +2351,59 @@ class PublishHandler:
             expected_origin=request.origin_url,
         )
         if resume is not None:
-            _verify_resume_wait(
-                command=command,
-                wait=resume,
-                request=request,
-                effects=effects,
-                artifacts=self.artifacts,
-                repository=repository,
-                workspace=workspace,
-            )
+            try:
+                _verify_resume_wait(
+                    command=command,
+                    wait=resume,
+                    request=request,
+                    effects=effects,
+                    artifacts=self.artifacts,
+                    repository=repository,
+                    workspace=workspace,
+                )
+            except (PipelineError, subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as error:
+                raise _local_publication_failure(error, operation="publish.resume_validate") from None
         git_settlement = effects.effect_settlement_for_key(GIT_EFFECT_KEY)
         candidate: PreparedCandidate | None = None
         if git_settlement is not None and git_settlement.state is EffectState.UNKNOWN:
             return StageDeferral(git_settlement.effect_id)
         elif git_settlement is not None and git_settlement.state is EffectState.SATISFIED:
-            sealed = _read_sealed_git_outbound(
-                artifacts=self.artifacts,
-                repository=repository,
-                request=request,
-                workspace=workspace,
-                settlement=git_settlement,
-            )
-            git_observation, observation_root = _effect_observation(
-                artifacts=self.artifacts,
-                settlement=git_settlement,
-                root=workspace.root / "effect-readback-git",
-            )
-            plan_path = Path(observation_root) / PUBLICATION_PLAN
-            if (
-                not plan_path.is_file()
-                or file_digest(plan_path) != sealed.plan_sha256
-                or git_observation.get("state") != "known"
-                or git_observation.get("base_oid") != request.expected_base_oid
-                or git_observation.get("head_oid") != sealed.candidate.commit
-                or git_observation.get("candidate_commit") != sealed.candidate.commit
-                or git_observation.get("candidate_tree") != sealed.candidate.tree
-                or git_observation.get("candidate_parents") != list(sealed.candidate.parents)
-                or git_observation.get("subject_sha256") != sealed.candidate.subject_sha256
-                or git_observation.get("publication_plan_sha256") != sealed.plan_sha256
-            ):
-                raise PublicationError("publish.git_effect_mismatch")
+            try:
+                sealed = _read_sealed_git_outbound(
+                    artifacts=self.artifacts,
+                    repository=repository,
+                    request=request,
+                    workspace=workspace,
+                    settlement=git_settlement,
+                )
+                git_observation, observation_root = _effect_observation(
+                    artifacts=self.artifacts,
+                    settlement=git_settlement,
+                    root=workspace.root / "effect-readback-git",
+                )
+                plan_path = Path(observation_root) / PUBLICATION_PLAN
+                if (
+                    not plan_path.is_file()
+                    or file_digest(plan_path) != sealed.plan_sha256
+                    or git_observation.get("state") != "known"
+                    or git_observation.get("base_oid") != request.expected_base_oid
+                    or git_observation.get("head_oid") != sealed.candidate.commit
+                    or git_observation.get("candidate_commit") != sealed.candidate.commit
+                    or git_observation.get("candidate_tree") != sealed.candidate.tree
+                    or git_observation.get("candidate_parents") != list(sealed.candidate.parents)
+                    or git_observation.get("subject_sha256") != sealed.candidate.subject_sha256
+                    or git_observation.get("publication_plan_sha256") != sealed.plan_sha256
+                ):
+                    raise PublicationError("publish.git_effect_mismatch")
+                pr_title, pr_body = _sealed_publication_text(
+                    repository=repository, request=request, sealed=sealed,
+                )
+            except (PipelineError, subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as error:
+                raise _local_publication_failure(error, operation="publish.git_readback") from None
             candidate_facts = sealed.candidate
             plan_sha256 = sealed.plan_sha256
             publication_subject_sha256 = sealed.candidate.subject_sha256
             verification_certificate_sha256 = sealed.plan["verification_certificate_sha256"]
-            pr_title, pr_body = _sealed_publication_text(
-                repository=repository, request=request, sealed=sealed,
-            )
             publisher_tool, actual_executor = _executor_identity(command, claim)
             git_effect_id = git_settlement.effect_id
         elif git_settlement is None or git_settlement.state is EffectState.PREPARED:
@@ -2403,7 +2428,7 @@ class PublishHandler:
                     candidate=candidate,
                 )
                 plan_sha256 = file_digest(plan_path)
-            except (PublicationError, subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as error:
+            except (PipelineError, subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as error:
                 raise _local_publication_failure(error, operation="publish.git_prepare") from None
             candidate_facts = _PublishedCandidate(
                 commit=candidate.commit,
@@ -2430,7 +2455,7 @@ class PublishHandler:
             )
             if isinstance(git_result, StageDeferral):
                 if candidate is not None:
-                    candidate.cleanup()
+                    _cleanup_candidate(candidate, effects)
                 return git_result
             git_effect_id, git_observation, _ = git_result
         elif git_settlement.state is EffectState.CONFLICT:
@@ -2493,18 +2518,21 @@ class PublishHandler:
                 "actual_executor_sha256": actual_executor,
                 "required_executor_sha256": command.expected_executor_sha256,
             }
-            output = workspace.root / "output"
-            output.mkdir()
-            write_json(output / PUBLICATION_RECEIPT, receipt)
-            return StageExecution(
-                outcome="completed",
-                candidate_root=str(output),
-                checks_sha256=digest(receipt),
-                resources_settled=True,
-            )
+            try:
+                output = workspace.root / "output"
+                output.mkdir()
+                write_json(output / PUBLICATION_RECEIPT, receipt)
+                return StageExecution(
+                    outcome="completed",
+                    candidate_root=str(output),
+                    checks_sha256=digest(receipt),
+                    resources_settled=True,
+                )
+            except OSError as error:
+                raise _local_publication_failure(error, operation="publish.receipt") from None
         finally:
             if candidate is not None:
-                candidate.cleanup()
+                _cleanup_candidate(candidate, effects)
 
     def validate_candidate(
         self,

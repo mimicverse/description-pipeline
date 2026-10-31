@@ -53,6 +53,7 @@ def _run_state(
     stages: list[dict[str, Any]],
     *,
     diagnostic_target: str | None = None,
+    expired_claim: bool = False,
 ) -> str:
     effect_states = tuple(
         row["state"]
@@ -105,6 +106,7 @@ def _run_state(
         stage_outcomes=outcomes,
         effect_states=effect_states,
         pending_effect_states=pending_effect_states,
+        expired_claim=expired_claim,
     )
     return "running" if projected is RunStatus.INCOMPLETE else projected.value
 
@@ -426,7 +428,8 @@ def read_run_projection(
             SELECT claim.claim_id, claim.command_id, claim.fence, claim.owner_sha256,
                    claim.executor_sha256, claim.lane_key, claim.dag_id, claim.dag_run_id,
                    claim.task_id, claim.map_index, claim.issued_at, claim.expires_at,
-                   claim.closed_at, claim.closure_code, claim.yield_effect_id
+                   claim.closed_at, claim.closure_code, claim.yield_effect_id,
+                   claim.expires_at <= CURRENT_TIMESTAMP
             FROM execution_claim AS claim
             JOIN command AS stage_command ON stage_command.command_id = claim.command_id
             WHERE stage_command.run_id = %s
@@ -434,6 +437,10 @@ def read_run_projection(
             """,
             (run_id,),
         )
+        claim_rows = cursor.fetchall()
+        expired_claim_commands = {
+            row[1] for row in claim_rows if row[12] is None and row[15]
+        }
         technical_claims = [
             {
                 "claim_id": row[0],
@@ -452,7 +459,7 @@ def read_run_projection(
                 "closure_code": row[13],
                 "yield_effect_id": row[14],
             }
-            for row in cursor.fetchall()
+            for row in claim_rows
         ]
         cursor.execute(
             """
@@ -661,6 +668,7 @@ def read_run_projection(
             predecessor_completed=predecessor_completed,
             open_claim=command_id in open_claim_commands,
             pending_effect_states=pending_effect_states,
+            expired_claim=command_id in expired_claim_commands,
         )
         row["state"] = status.value
         receipt = row.get("receipt")
@@ -703,7 +711,15 @@ def read_run_projection(
         if isinstance(admission[3], Mapping)
         else None
     )
-    run_state = _run_state(stage_rows, diagnostic_target=diagnostic_target)
+    run_state = _run_state(
+        stage_rows,
+        diagnostic_target=diagnostic_target,
+        expired_claim=any(
+            (row.get("command") or {}).get("command_id") in expired_claim_commands
+            and row.get("decision") is None
+            for row in stage_rows
+        ),
+    )
     run_scope = (
         {
             "kind": "diagnostic",
