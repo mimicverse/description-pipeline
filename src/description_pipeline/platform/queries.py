@@ -54,6 +54,7 @@ def _run_state(
     *,
     diagnostic_target: str | None = None,
     expired_claim: bool = False,
+    from_stage: str | None = None,
 ) -> str:
     effect_states = tuple(
         row["state"]
@@ -104,6 +105,7 @@ def _run_state(
     )
     projected = project_run_status(
         stage_outcomes=outcomes,
+        from_stage=from_stage,
         effect_states=effect_states,
         pending_effect_states=pending_effect_states,
         expired_claim=expired_claim,
@@ -654,6 +656,7 @@ def read_run_projection(
         stage_index = STAGE_IDS.index(stage)
         predecessor_completed = (
             stage_index == 0
+            or (admission_record.from_stage == "mjcf" and stage == "mjcf")
             or diagnostic_target == stage
             or (
                 stage_index > 0
@@ -713,6 +716,7 @@ def read_run_projection(
     )
     run_state = _run_state(
         stage_rows,
+        from_stage=admission_record.from_stage if diagnostic_target is None else None,
         diagnostic_target=diagnostic_target,
         expired_claim=any(
             (row.get("command") or {}).get("command_id") in expired_claim_commands

@@ -1,4 +1,4 @@
-"""PostgreSQL persistence for the canonical six-stage facts.
+"""PostgreSQL persistence for the canonical engineering-stage facts.
 
 Every public mutation is one short transaction. Artifact bytes and external
 effects are produced outside these methods; this module only commits the
@@ -25,6 +25,7 @@ from ..pipeline.admission import (
     VerifiedVerifyResult,
     validate_run_admission,
     validate_store_command,
+    validate_mjcf_successor,
 )
 from ..pipeline.diagnostic import (
     DiagnosticAdmissionSpec,
@@ -167,6 +168,7 @@ def _run_state_from_canonical_facts(
         outcomes = tuple(decisions.get(stage) for stage in STAGE_IDS)
         return project_run_status(
             stage_outcomes=outcomes,
+            from_stage=request.get("from_stage"),
             effect_states=effect_states,
             pending_effect_states=pending_effect_states,
             expired_claim=expired_claim,
@@ -1025,42 +1027,61 @@ class FactStore(RunControlStore):
         command: StageCommand,
         dispatch_command: DispatchCommand,
         dispatch_outbound_artifact: ArtifactRef,
+        *, verify_result: VerifiedVerifyResult | None = None,
     ) -> tuple[StageCommand, DispatchCommand, EffectIntent]:
-        """Atomically admit the run, Freeze command and technical dispatch."""
+        """Atomically admit the run, entry command and technical dispatch."""
 
         if not isinstance(admission, RunAdmission):
             raise FactStoreError("A canonical RunAdmission is required")
         if not isinstance(command, StageCommand) or not isinstance(dispatch_command, DispatchCommand):
             raise FactStoreError("Canonical Freeze and dispatch commands are required")
-        if command.run_id != admission.run_id or command.stage != "freeze" or command.kind != "stage":
-            raise FactStoreError("Admission must create the initial Freeze stage command")
-        if command.predecessor_decision_id is not None:
+        entry_stage = "mjcf" if admission.from_stage == "mjcf" else "freeze"
+        if command.run_id != admission.run_id or command.stage != entry_stage or command.kind != "stage":
+            raise FactStoreError("Admission must create its declared entry stage command")
+        if entry_stage == "mjcf":
+            if not isinstance(verify_result, VerifiedVerifyResult):
+                raise FactStoreError("MJCF admission requires a passing source Verify result")
+        elif command.predecessor_decision_id is not None or verify_result is not None:
             raise FactStoreError("The initial Freeze command cannot have a predecessor decision")
         if (
             dispatch_command.run_id != admission.run_id
-            or dispatch_command.freeze_command_id != command.command_id
+            or dispatch_command.entry_command_id != command.command_id
             or dispatch_outbound_artifact != dispatch_command.conf_artifact
         ):
-            raise FactStoreError("The technical dispatch is not bound to this admission and Freeze command")
+            raise FactStoreError("The technical dispatch is not bound to this admission and entry command")
         try:
             spec = AdmissionSpec.from_record(admission.request)
-            validate_store_command(spec, admission, command)
+            validate_store_command(
+                spec, admission, command,
+                predecessor=verify_result.predecessor if verify_result is not None else None,
+                verify_result=verify_result,
+            )
         except ProtocolError as error:
-            raise FactStoreError("The admission and Freeze command fail typed semantic validation") from error
+            raise FactStoreError("The admission and entry command fail typed semantic validation") from error
         conf = self._read_dispatch_conf(dispatch_command.conf_artifact)
-        if conf.run_id != admission.run_id or conf.freeze_command_id != command.command_id:
-            raise FactStoreError("The Airflow dispatch conf names another run or Freeze command")
+        if conf.run_id != admission.run_id or conf.entry_command_id != command.command_id:
+            raise FactStoreError("The Airflow dispatch conf names another run or entry command")
         dispatch_intent = self._dispatch_effect_intent(admission, dispatch_command)
         with self._transaction() as connection:
             cursor = connection.cursor()
             _require_open(cursor)
+            if verify_result is not None:
+                self._lock_run_cursor(cursor, admission.parent_run_id)
+                source_admission = self._load_admission_cursor(cursor, admission.parent_run_id)
+                if source_admission is None:
+                    raise FactStoreError("The MJCF source run is not admitted")
+                validate_mjcf_successor(spec, AdmissionSpec.from_record(source_admission.request))
+                summaries = read_admitted_runs(connection, run_id=source_admission.run_id)
+                if len(summaries) != 1 or summaries[0].state not in {"succeeded", "failed", "cancelled"}:
+                    raise FactStoreError("The MJCF source run has no settled terminal outcome")
+                self._verify_registered_predecessor_cursor(cursor, source_admission, verify_result.predecessor)
             existing = self._load_admission_cursor(cursor, admission.run_id)
             if existing is not None:
                 if existing != admission:
                     raise FactConflict(f"The run {admission.run_id!r} is already admitted with different facts")
                 stored_command = self._load_command_cursor(cursor, command.command_id)
                 if stored_command != command:
-                    raise FactConflict(f"The run {admission.run_id!r} carries a different Freeze command")
+                    raise FactConflict(f"The run {admission.run_id!r} carries a different entry command")
                 stored_dispatch = self._load_dispatch_command_cursor(cursor, dispatch_command.command_id)
                 stored_intent, _ = self._effect_cursor(cursor, dispatch_intent.effect_id)
                 if (
@@ -1105,7 +1126,7 @@ class FactStore(RunControlStore):
             self._insert_dispatch_command_cursor(
                 cursor,
                 dispatch_command,
-                freeze_command=command,
+                entry_command=command,
                 admission=admission,
             )
             self._insert_effect_intent_cursor(
@@ -1132,7 +1153,7 @@ class FactStore(RunControlStore):
             "conf_set_sha256": command.conf_artifact.set_sha256,
             "dag_id": command.dag_id,
             "dag_run_id": command.dag_run_id,
-            "freeze_command_id": command.freeze_command_id,
+            "entry_command_id": command.entry_command_id,
             "request_digest": command.request_digest,
             "run_id": command.run_id,
         }
@@ -1323,15 +1344,15 @@ class FactStore(RunControlStore):
         cursor,
         command: DispatchCommand,
         *,
-        freeze_command: StageCommand,
+        entry_command: StageCommand,
         admission: RunAdmission,
     ) -> None:
         if (
             command.run_id != admission.run_id
-            or command.freeze_command_id != freeze_command.command_id
-            or freeze_command.run_id != admission.run_id
+            or command.entry_command_id != entry_command.command_id
+            or entry_command.run_id != admission.run_id
         ):
-            raise FactStoreError("The technical dispatch is not bound to the admission Freeze command")
+            raise FactStoreError("The technical dispatch is not bound to the admission entry command")
         self._insert_artifact(cursor, command.conf_artifact)
         cursor.execute(
             """
@@ -1347,9 +1368,9 @@ class FactStore(RunControlStore):
                 command.idempotency_key,
                 _json(command.to_record()),
                 command.request_digest,
-                freeze_command.config_snapshot_sha256,
-                freeze_command.contract_sha256,
-                freeze_command.policy_sha256,
+                entry_command.config_snapshot_sha256,
+                entry_command.contract_sha256,
+                entry_command.policy_sha256,
                 command.expected_executor_sha256,
             ),
         )
@@ -1419,7 +1440,13 @@ class FactStore(RunControlStore):
             if stored_admission != admission:
                 raise FactConflict("The supplied admission differs from the registered admission")
             for verified in predecessors:
-                self._verify_registered_predecessor_cursor(cursor, admission, verified)
+                owner_admission = admission
+                if verified.command.run_id != admission.run_id:
+                    owner_admission = self._load_admission_cursor(cursor, verified.command.run_id)
+                    if owner_admission is None:
+                        raise FactStoreError("The reused predecessor has no source admission")
+                    validate_mjcf_successor(spec, AdmissionSpec.from_record(owner_admission.request))
+                self._verify_registered_predecessor_cursor(cursor, owner_admission, verified)
             if discover_result is not None:
                 for artifact in (
                     discover_result.source_set_artifact,
@@ -1578,9 +1605,15 @@ class FactStore(RunControlStore):
             predecessor = self._load_command_cursor(cursor, decision.command_id)
             if predecessor is None or predecessor.kind != "stage" or predecessor.stage is None:
                 raise FactConflict("The predecessor decision has no canonical stage command")
+            if predecessor.run_id != current.run_id:
+                admission = self._load_admission_cursor(cursor, current.run_id)
+                source = self._load_admission_cursor(cursor, predecessor.run_id)
+                if (admission is None or source is None or current.stage != "mjcf" or predecessor.stage != "verify"):
+                    raise FactConflict("Only the declared MJCF-to-Verify source edge may cross runs")
+                validate_mjcf_successor(AdmissionSpec.from_record(admission.request),
+                                        AdmissionSpec.from_record(source.request))
             if (
                 decision.outcome != "completed"
-                or predecessor.run_id != command.run_id
                 or STAGE_IDS.index(predecessor.stage) >= STAGE_IDS.index(current.stage)
             ):
                 raise FactConflict("The predecessor decision is not an earlier completed stage of this run")

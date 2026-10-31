@@ -86,7 +86,7 @@ def artifact_row(value: ArtifactRef) -> tuple:
     )
 
 
-def freeze_command() -> StageCommand:
+def entry_command() -> StageCommand:
     return StageCommand.create(
         command_id="command-freeze",
         run_id="run-1",
@@ -130,7 +130,7 @@ class ArtifactRegistrationTests(unittest.TestCase):
 
 class ClaimTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.command = freeze_command()
+        self.command = entry_command()
         self.owner = digest({"process": "claim-owner"})
         self.executor = self.command.expected_executor_sha256
         self.now = datetime(2026, 10, 25, tzinfo=UTC)

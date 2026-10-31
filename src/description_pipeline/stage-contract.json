@@ -264,18 +264,43 @@
       ]
     },
     {
+      "id": "mjcf",
+      "hosts": ["linux"],
+      "host_text": "Linux",
+      "name": "Convert and verify MJCF",
+      "doc": {
+        "input": "Passing Verify certificate and exact Generate/Capture artifacts, immutable simulation configuration and component provenance",
+        "output": "Robot MJCF, optional scene, bounded component collision proxies and an independent certificate bound to source and delivered bytes"
+      },
+      "inputs": [
+        {"label": "Verified URDF source and simulation policy", "path": "stage_output:generate + stage_output:capture + stage_output:verify + simulation configuration", "class": "verified"}
+      ],
+      "input_qc": [
+        {"id": "mjcf.inputs", "label": "Passing source qualification and immutable input closure"}
+      ],
+      "outputs": [
+        {"label": "MJCF and component collision assets", "path": "mjcf/", "class": "derived"},
+        {"label": "Independent MJCF certificate", "path": "reports/mjcf-certificate.json", "class": "derived"}
+      ],
+      "output_qc": [
+        {"id": "mjcf.projection", "label": "Independent geometry, physics, contact, limits and warning checks"},
+        {"id": "mjcf.binding", "label": "Exact delivered bytes and verified source lineage"}
+      ],
+      "evidence": ["mjcf/", "reports/mjcf-certificate.json"]
+    },
+    {
       "id": "publish",
       "hosts": ["linux"],
       "host_text": "Linux",
       "name": "Publish review PR",
       "doc": {
-        "input": "Verified Generate/Capture/Verify artifacts and sealed repository snapshot; reverification, configured target, predecessor baseline and clean workspace are valid",
-        "output": "Publication receipt plus fenced Git/PR effects; copied bytes, committed tree, remote head/base, pull request and verified subject agree"
+        "input": "Verified Generate/Capture/Verify artifacts, passing MJCF output and sealed repository snapshot; both certificates, configured target, predecessor baseline and clean workspace are valid",
+        "output": "Combined URDF/MJCF delivery and publication receipt plus fenced Git/PR effects; copied bytes, both certificates, committed tree, remote head/base and pull request agree"
       },
       "inputs": [
         {
-          "label": "Verified pair, certificate and sealed repository target",
-          "path": "stage_output:generate + stage_output:capture + stage_output:verify + repository_snapshot",
+          "label": "Verified URDF pair, MJCF projection, certificates and sealed repository target",
+          "path": "stage_output:generate + stage_output:capture + stage_output:verify + stage_output:mjcf + repository_snapshot",
           "class": "verified"
         }
       ],

@@ -177,7 +177,7 @@ class CanonicalReconcileRealPostgresTests(unittest.TestCase):
         conf = DispatchConf(
             schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
             run_id=self.run_id,
-            freeze_command_id=self.command.command_id,
+            entry_command_id=self.command.command_id,
         )
         conf_artifact = self.artifacts.seal_dispatch_conf(
             conf,
@@ -187,7 +187,7 @@ class CanonicalReconcileRealPostgresTests(unittest.TestCase):
         dispatch = DispatchCommand.create(
             command_id=f"dispatch-{suffix}",
             run_id=self.run_id,
-            freeze_command_id=self.command.command_id,
+            entry_command_id=self.command.command_id,
             idempotency_key=f"{self.run_id}/dispatch",
             dag_id=DAG_ID,
             dag_run_id=self.dag_run_id,

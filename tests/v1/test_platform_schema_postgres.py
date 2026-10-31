@@ -549,9 +549,9 @@ class PlatformSchemaPostgresTests(unittest.TestCase):
         expired_run = "run-expired"
         for run_id, expired in ((running_run, False), (expired_run, True)):
             self._insert_run(run_id)
-            freeze_command = self._insert_stage_command(run_id, "freeze")
+            entry_command = self._insert_stage_command(run_id, "freeze")
             freeze_decision = self._insert_decision(
-                run_id, "freeze", freeze_command, outcome="completed",
+                run_id, "freeze", entry_command, outcome="completed",
             )
             discover_command = self._insert_stage_command(
                 run_id, "discover", predecessor_decision_id=freeze_decision,
@@ -563,11 +563,11 @@ class PlatformSchemaPostgresTests(unittest.TestCase):
             ("run-effect-conflict", "conflict"),
         ):
             self._insert_run(run_id)
-            freeze_command = self._insert_stage_command(run_id, "freeze")
+            entry_command = self._insert_stage_command(run_id, "freeze")
             freeze_decision = self._insert_decision(
                 run_id,
                 "freeze",
-                freeze_command,
+                entry_command,
                 outcome="completed",
             )
             discover_command = self._insert_stage_command(
@@ -687,7 +687,7 @@ class PlatformSchemaPostgresTests(unittest.TestCase):
             dispatch_conf = DispatchConf(
                 schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
                 run_id=admission.run_id,
-                freeze_command_id=command.command_id,
+                entry_command_id=command.command_id,
             )
             dispatch_artifact = harness.store.seal_dispatch_conf(
                 dispatch_conf,
@@ -697,7 +697,7 @@ class PlatformSchemaPostgresTests(unittest.TestCase):
             dispatch = DispatchCommand.create(
                 command_id="dispatch-" + admission.run_id,
                 run_id=admission.run_id,
-                freeze_command_id=command.command_id,
+                entry_command_id=command.command_id,
                 idempotency_key=f"{admission.run_id}/dispatch",
                 dag_id="solidworks_to_urdf",
                 dag_run_id=f"portal-{admission.run_id}",
@@ -996,11 +996,11 @@ class PlatformSchemaPostgresTests(unittest.TestCase):
         self._install_canonical_schema()
 
         self._insert_run("run-freeze-only")
-        freeze_command = self._insert_stage_command("run-freeze-only", "freeze")
+        entry_command = self._insert_stage_command("run-freeze-only", "freeze")
         self._insert_decision(
             "run-freeze-only",
             "freeze",
-            freeze_command,
+            entry_command,
             outcome="completed",
         )
         store = RunControlStore(self._connect)

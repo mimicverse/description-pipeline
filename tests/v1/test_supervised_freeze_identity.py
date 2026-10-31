@@ -422,7 +422,7 @@ class SupervisedFreezeIdentityTests(unittest.TestCase):
         request, dag_run_id = cls._request(label)
         work = cls.root / "admission-work" / f"{label}-{uuid.uuid4().hex}"
         outcome = cls._factory(work_root=work).admit(cls.application, request)
-        if outcome.freeze_command.request["native_target_identity"] != (
+        if outcome.entry_command.request["native_target_identity"] != (
             cls.install_record["ends"]["windows"]["target_identity"]
         ):
             raise AssertionError("the Freeze command differs from the registered native target")
@@ -431,17 +431,17 @@ class SupervisedFreezeIdentityTests(unittest.TestCase):
             outcome.dispatch_command.dag_id != DAG_ID
             or outcome.dispatch_command.dag_run_id != dag_run_id
             or conf.run_id != request.run_id
-            or conf.freeze_command_id != outcome.freeze_command.command_id
+            or conf.entry_command_id != outcome.entry_command.command_id
         ):
             raise AssertionError("the admission dispatch identity is not internally bound")
         cls.runs[label] = {
             "dag_run_id": dag_run_id,
             "run_id": request.run_id,
-            "freeze_command_id": outcome.freeze_command.command_id,
+            "entry_command_id": outcome.entry_command.command_id,
             "dispatch_dag_id": outcome.dispatch_command.dag_id,
             "dispatch_dag_run_id": outcome.dispatch_command.dag_run_id,
             "dispatch_conf_run_id": conf.run_id,
-            "dispatch_conf_freeze_command_id": conf.freeze_command_id,
+            "dispatch_conf_entry_command_id": conf.entry_command_id,
             "task_id": "freeze",
             "map_index": -1,
         }
@@ -470,17 +470,17 @@ class SupervisedFreezeIdentityTests(unittest.TestCase):
             outcome.dispatch_command.dag_id != DAG_ID
             or outcome.dispatch_command.dag_run_id != dag_run_id
             or conf.run_id != request.run_id
-            or conf.freeze_command_id != outcome.freeze_command.command_id
+            or conf.entry_command_id != outcome.entry_command.command_id
         ):
             raise AssertionError("the successor dispatch identity is not internally bound")
         cls.runs[label] = {
             "dag_run_id": dag_run_id,
             "run_id": request.run_id,
-            "freeze_command_id": outcome.freeze_command.command_id,
+            "entry_command_id": outcome.entry_command.command_id,
             "dispatch_dag_id": outcome.dispatch_command.dag_id,
             "dispatch_dag_run_id": outcome.dispatch_command.dag_run_id,
             "dispatch_conf_run_id": conf.run_id,
-            "dispatch_conf_freeze_command_id": conf.freeze_command_id,
+            "dispatch_conf_entry_command_id": conf.entry_command_id,
             "task_id": "freeze",
             "map_index": -1,
         }
@@ -1042,7 +1042,7 @@ class SupervisedFreezeIdentityTests(unittest.TestCase):
                 WHERE command_id = %s
                 ORDER BY fence
                 """,
-                (expected["freeze_command_id"],),
+                (expected["entry_command_id"],),
             )
             rows = cursor.fetchall()
         self.assertEqual(len(rows), 1)
@@ -1057,8 +1057,8 @@ class SupervisedFreezeIdentityTests(unittest.TestCase):
             expected["run_id"],
         )
         self.assertEqual(
-            expected["dispatch_conf_freeze_command_id"],
-            expected["freeze_command_id"],
+            expected["dispatch_conf_entry_command_id"],
+            expected["entry_command_id"],
         )
 
     def _trigger_missing_run_id(self, label: str) -> tuple[str, dict]:

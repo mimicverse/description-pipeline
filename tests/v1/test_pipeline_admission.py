@@ -27,6 +27,7 @@ from description_pipeline.pipeline.admission import (
     build_discover_command,
     build_freeze_command,
     build_generate_command,
+    build_mjcf_command,
     build_publish_command,
     build_run_admission,
     build_verify_command,
@@ -40,6 +41,7 @@ from description_pipeline.pipeline.admission import (
     validate_stage_command,
     validate_verify_command,
     validate_store_command,
+    validate_mjcf_successor,
 )
 from description_pipeline.pipeline.admission import ADMISSION_SPEC_SCHEMA
 from description_pipeline.pipeline.contracts import (
@@ -183,6 +185,7 @@ class AdmissionHarness:
                 capture=digest({"executor": "capture-linux"}),
                 generate=digest({"executor": "generate"}),
                 verify=digest({"executor": "verify"}),
+                mjcf=digest({"executor": "mjcf"}),
                 publish=digest({"executor": "publish"}),
             ),
             dispatch_executor_sha256=digest(
@@ -305,8 +308,8 @@ class AdmissionHarness:
             ),
         )
 
-    def freeze_result(self, freeze_command: StageCommand) -> VerifiedPredecessor:
-        return self.predecessor("freeze", freeze_command, {"stage": "freeze"})
+    def freeze_result(self, entry_command: StageCommand) -> VerifiedPredecessor:
+        return self.predecessor("freeze", entry_command, {"stage": "freeze"})
 
     def predecessor(self, stage: str, command: StageCommand, payload: dict) -> VerifiedPredecessor:
         return self._predecessor(stage, command, payload)
@@ -371,6 +374,22 @@ class AdmissionHarness:
 
 
 class AdmissionProjectionTests(unittest.TestCase):
+    def test_mjcf_successor_preserves_sources_and_rejects_chains(self):
+        source = self.harness.spec
+        successor = replace(
+            source, run_id="mjcf-rerun", request_id="mjcf-rerun-request", parent_run_id=source.run_id,
+            from_stage="mjcf", simulation='{"collision":{"max_vertices":128}}',
+        )
+        validate_mjcf_successor(successor, source)
+        for field, value in (("purpose", "inspection_preview" if source.purpose != "inspection_preview" else "release"),
+                             ("platform_config_sha256", "1" * 64), ("principal", "another-owner")):
+            with self.subTest(field=field), self.assertRaises(ProtocolError):
+                validate_mjcf_successor(replace(successor, **{field: value}), source)
+        with self.assertRaises(ProtocolError):
+            validate_mjcf_successor(
+                replace(successor, run_id="another-rerun", parent_run_id=successor.run_id), successor,
+            )
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="admission-projection-")
         self.addCleanup(self.temporary.cleanup)
@@ -1045,13 +1064,16 @@ class AdmissionProjectionTests(unittest.TestCase):
                 b"{}\n",
             )
         publish_intent = self.harness.publish_intent
+        mjcf_command = build_mjcf_command(self.harness.spec, verify_result)
+        mjcf = self.harness.predecessor("mjcf", mjcf_command, {"stage": "mjcf"})
         publish = build_publish_command(
             self.harness.spec,
             verify_result,
             publish_intent,
+            mjcf,
         )
         self.assertEqual(publish.stage, "publish")
-        self.assertEqual(publish.predecessor_decision_id, verify.decision.decision_id)
+        self.assertEqual(publish.predecessor_decision_id, mjcf.decision.decision_id)
         self.assertEqual(publish.expected_executor_sha256, self.harness.spec.executors.publish)
         self.assertEqual(
             set(publish.request),
@@ -1070,6 +1092,10 @@ class AdmissionProjectionTests(unittest.TestCase):
                 "schema_version",
                 "verified_subject_sha256",
                 "verify_artifact_id",
+                "mjcf_artifact_id",
+                "mjcf_command_id",
+                "mjcf_request_digest",
+                "mjcf_certificate_sha256",
             },
         )
         self.assertEqual(publish.request["schema_version"], PUBLISH_REQUEST_SCHEMA)
@@ -1081,6 +1107,7 @@ class AdmissionProjectionTests(unittest.TestCase):
                 capture.result.output_artifact,
                 verify.result.output_artifact,
                 snapshot_ref,
+                mjcf.result.output_artifact,
             ),
         )
         self.assertEqual(
@@ -1089,6 +1116,7 @@ class AdmissionProjectionTests(unittest.TestCase):
                 verify_result,
                 publish_intent,
                 publish,
+                mjcf,
             ),
             publish,
         )
@@ -1096,7 +1124,8 @@ class AdmissionProjectionTests(unittest.TestCase):
             validate_stage_command(
                 self.harness.spec,
                 publish,
-                predecessor=verify,
+                predecessor=mjcf,
+                supporting_predecessors=(verify,),
                 verify_result=verify_result,
                 publish_intent=publish_intent,
             ),
@@ -1112,6 +1141,7 @@ class AdmissionProjectionTests(unittest.TestCase):
                 verify_result,
                 publish_intent,
                 forged,
+                mjcf,
             )
         self.assertIn("request.expected_base_oid", raised.exception.detail["fields"])
 

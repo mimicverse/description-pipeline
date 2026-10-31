@@ -115,7 +115,7 @@ class CreateDispatchBinding:
     parent_dag_run_id: str | None
     dag_id: str
     dag_run_id: str
-    freeze_command_id: str
+    entry_command_id: str
 
 
 def recorded_create_binding(
@@ -140,7 +140,7 @@ def recorded_create_binding(
                        admission.parent_run_id,
                        dispatch.request->>'dag_id',
                        dispatch.request->>'dag_run_id',
-                       dispatch.request->>'freeze_command_id',
+                       dispatch.request->>'entry_command_id',
                        parent_dispatch.request->>'dag_id',
                        parent_dispatch.request->>'dag_run_id'
                 FROM run_admission AS admission
@@ -152,9 +152,9 @@ def recorded_create_binding(
                  AND parent_dispatch.kind = 'dispatch'
                 WHERE admission.run_id = %s
                   AND dispatch.request->>'dag_run_id' = %s
-                  AND dispatch.request->>'freeze_command_id' = %s
+                  AND dispatch.request->>'entry_command_id' = %s
                 """,
-                (conf.run_id, dag_run_id, conf.freeze_command_id),
+                (conf.run_id, dag_run_id, conf.entry_command_id),
             )
             rows = cursor.fetchall()
     except Exception:
@@ -167,7 +167,7 @@ def recorded_create_binding(
         parent_run_id,
         dag_id,
         stored_run_id,
-        freeze_command_id,
+        entry_command_id,
         parent_dag_id,
         parent_dag_run_id,
     ) = rows[0]
@@ -177,7 +177,7 @@ def recorded_create_binding(
         or (parent_run_id is not None and not isinstance(parent_run_id, str))
         or run_id != conf.run_id
         or dag_run_id != stored_run_id
-        or freeze_command_id != conf.freeze_command_id
+        or entry_command_id != conf.entry_command_id
         or not isinstance(dag_id, str)
         or not dag_id
         or (
@@ -201,7 +201,7 @@ def recorded_create_binding(
         parent_dag_run_id=parent_dag_run_id,
         dag_id=dag_id,
         dag_run_id=stored_run_id,
-        freeze_command_id=freeze_command_id,
+        entry_command_id=entry_command_id,
     )
 
 
@@ -442,7 +442,7 @@ def validated_canonical_projection(
             or dispatch.run_id != canonical_run_id
             or dispatch.dag_id != dag_id
             or dispatch.dag_run_id != dag_run_id
-            or dispatch.freeze_command_id != freeze.command_id
+            or dispatch.entry_command_id != freeze.command_id
             or dispatch.expected_executor_sha256 != spec.dispatch_executor_sha256
         ):
             return None
@@ -452,7 +452,7 @@ def validated_canonical_projection(
                 "admission_sha256": spec.admission_sha256,
                 "dag_id": dag_id,
                 "dag_run_id": dag_run_id,
-                "freeze_command_id": freeze.command_id,
+                "entry_command_id": freeze.command_id,
                 "run_id": canonical_run_id,
             }
         )
@@ -575,7 +575,7 @@ def owner_create_allowed(user: Any, dag_id: str) -> bool:
         or binding.dag_id != dag_id
         or binding.run_id != conf.run_id
         or binding.dag_run_id != candidate.get("dag_run_id")
-        or binding.freeze_command_id != conf.freeze_command_id
+        or binding.entry_command_id != conf.entry_command_id
         or binding.principal != user.get_id()
     ):
         return False

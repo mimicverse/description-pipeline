@@ -9,7 +9,6 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -23,6 +22,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from description_pipeline.artifacts import ArtifactStore
+from description_pipeline import mjcf_contract
 from description_pipeline.io import PipelineError, digest, file_digest, inventory, read_data, write_json
 from description_pipeline.interface_records import check_policy_digest
 from description_pipeline.pipeline.contracts import (
@@ -38,9 +38,10 @@ from description_pipeline.pipeline.contracts import (
 from description_pipeline.pipeline.effects import EffectIntent, EffectSettlement, EffectState
 from description_pipeline.pipeline.engine import StageWorkspace
 from description_pipeline.pipeline.stages import publish as publish_stage
+from description_pipeline.pipeline.stages.mjcf import MJCFHandler
+from description_pipeline.pipeline.verify import NoExternalEffects
+from description_pipeline.pipeline.verify_contract import validate_certificate_diagnostics
 from description_pipeline.pipeline.stages.publish import (
-    CAPTURE_ARTIFACT_KIND,
-    GENERATE_ARTIFACT_KIND,
     PUBLISH_OUTPUT_CONTRACT,
     PUBLISH_REQUEST_SCHEMA,
     VERIFY_ARTIFACT_KIND,
@@ -57,24 +58,14 @@ from description_pipeline.repository.publish import (
 )
 from description_pipeline.runtime import tool_record
 from description_pipeline.schemas import (
-    ENGINEERING_MODEL_SCHEMA,
     STAGE_EFFECT_WAIT_SCHEMA,
     STAGE_RESULT_SCHEMA,
-    VERIFICATION_CERTIFICATE_SCHEMA,
-    VERIFICATION_EXECUTION_SCHEMA,
-    VERIFY_REQUEST_SCHEMA,
 )
 from description_pipeline.stages import CONTRACT_SHA256
+from tests.v1 import test_pipeline_verify as pair_fixtures
 
-VERIFY_SHA256 = "a" * 64
-VERIFY_IDENTITY = {
-    "role": "verify-fixture",
-    "source_sha256": VERIFY_SHA256,
-    "version": "1",
-}
 POLICY_SHA = check_policy_digest()
 CONTRACT_SHA = CONTRACT_SHA256
-CONFIG_SHA = digest({"config": "fixture"})
 REVIEW_BRANCH = "work/description/robot/0123456789abcdef01234567"
 OTHER_REVIEW_BRANCH = (
     "work/description/robot2/89abcdef0123456789abcdef"
@@ -418,52 +409,30 @@ class _HttpPullRequests:
 
 class PublishFixture:
     def __init__(self, *, diagnostics: list[dict] | None = None) -> None:
-        self.temporary = tempfile.TemporaryDirectory(prefix="publish-fixture-")
-        self.root = Path(self.temporary.name)
-        self.store = ArtifactStore(self.root / "cas")
+        self.pair = pair_fixtures.PipelineVerifyHandlerTests(methodName="runTest")
+        self.pair.setUp()
+        self.root = self.pair.root
+        self.store = self.pair.store
         self.tool = tool_record(role="portable")
         self.executor = self.tool["source_sha256"]
         self._make_repository()
-        capture_root = self.root / "capture"
-        write_json(capture_root / "input/request.json", {"purpose": "engineering"})
-        write_json(capture_root / "input/source.json", {"selection": {"hardware_id": "robot"}})
-        write_json(capture_root / "evidence/raw/proof.json", {"proof": 1})
-        self.capture_ref = self.store.seal_tree(
-            capture_root,
-            kind=CAPTURE_ARTIFACT_KIND,
-            producer_run_id="capture-run",
-            producer_stage="capture",
-            producer_tool_sha256=digest({"tool": "capture"}),
-        )
-        generate_root = self.root / "generate"
-        write_json(
-            generate_root / "model/robot.json",
-            {
-                "schema_version": ENGINEERING_MODEL_SCHEMA,
-                "name": "robot",
-            },
-        )
-        (generate_root / "urdf").mkdir(parents=True)
-        (generate_root / "urdf/robot.urdf").write_text('<robot name="robot"/>\n', encoding="utf-8")
-        (generate_root / "meshes").mkdir()
-        (generate_root / "meshes/part.stl").write_bytes(b"solid fixture\n")
-        write_json(generate_root / "reports/generate.json", {"generated": True})
-        write_json(generate_root / "tool.json", self.tool)
-        self.generate_ref = self.store.seal_tree(
-            generate_root,
-            kind=GENERATE_ARTIFACT_KIND,
-            producer_run_id="generate-run",
-            producer_stage="generate",
-            producer_tool_sha256=self.executor,
-        )
+        capture_root, generate_root = self.pair.capture_root, self.pair.generate_root
+        self.capture_ref, self.generate_ref = self.pair.capture_ref, self.pair.generate_ref
         verify_root, self.certificate = self._make_verify(capture_root, generate_root, diagnostics=diagnostics)
         self.verify_ref = self.store.seal_tree(
             verify_root,
             kind=VERIFY_ARTIFACT_KIND,
             producer_run_id="verify-run",
             producer_stage="verify",
-            producer_tool_sha256=VERIFY_SHA256,
+            producer_tool_sha256=self.certificate["actual_verifier_sha256"],
         )
+        self._make_mjcf(verify_root)
+        if self.deferred_diagnostics is not None:
+            self._write_certificate_diagnostics(verify_root, self.deferred_diagnostics)
+            self.verify_ref = self.store.seal_tree(
+                verify_root, kind=VERIFY_ARTIFACT_KIND, producer_run_id="verify-run", producer_stage="verify",
+                producer_tool_sha256=self.certificate["actual_verifier_sha256"],
+            )
         snapshot_root = self.root / "repository-snapshot"
         self.snapshot = seal_repository_snapshot(
             self.repo,
@@ -493,6 +462,10 @@ class PublishFixture:
                 "generate_artifact_id": self.generate_ref.artifact_id,
                 "capture_artifact_id": self.capture_ref.artifact_id,
                 "verify_artifact_id": self.verify_ref.artifact_id,
+                "mjcf_artifact_id": self.mjcf_ref.artifact_id,
+                "mjcf_command_id": self.mjcf_command.command_id,
+                "mjcf_request_digest": self.mjcf_command.request_digest,
+                "mjcf_certificate_sha256": self.mjcf_checks_sha256,
                 "repository_snapshot_artifact_id": self.snapshot_ref.artifact_id,
                 "verified_subject_sha256": self.generate_ref.set_sha256,
                 "repository_slug": "example/robot",
@@ -512,12 +485,12 @@ class PublishFixture:
                     "body": "verified offline publication fixture",
                 },
             },
-            input_artifacts=(self.capture_ref, self.generate_ref, self.verify_ref, self.snapshot_ref),
-            config_snapshot_sha256=CONFIG_SHA,
+            input_artifacts=(self.capture_ref, self.generate_ref, self.verify_ref, self.snapshot_ref, self.mjcf_ref),
+            config_snapshot_sha256=self.certificate["config_snapshot_sha256"],
             contract_sha256=CONTRACT_SHA,
             policy_sha256=POLICY_SHA,
             expected_executor_sha256=self.executor,
-            predecessor_decision_id="verify-decision",
+            predecessor_decision_id="mjcf-decision",
         )
         self.claim = ExecutionClaim(
             claim_id="publish-claim",
@@ -540,6 +513,7 @@ class PublishFixture:
                 self.verify_ref.artifact_id: self.store.materialize(
                     self.verify_ref, self.root / "workspace/inputs/verify"
                 ),
+                self.mjcf_ref.artifact_id: self.store.materialize(self.mjcf_ref, self.root / "workspace/inputs/mjcf"),
                 self.snapshot_ref.artifact_id: self.store.materialize(
                     self.snapshot_ref, self.root / "workspace/inputs/repository-snapshot"
                 ),
@@ -572,85 +546,59 @@ class PublishFixture:
     def _make_verify(
         self, capture_root: Path, generate_root: Path, *, diagnostics: list[dict] | None = None
     ) -> tuple[Path, dict]:
-        pair_subject = tree_digest(
-            {
-                **{"input/" + path: checksum for path, checksum in inventory(capture_root / "input").items()},
-                **{"evidence/" + path: checksum for path, checksum in inventory(capture_root / "evidence").items()},
-                **{"model/" + path: checksum for path, checksum in inventory(generate_root / "model").items()},
-                **{"urdf/" + path: checksum for path, checksum in inventory(generate_root / "urdf").items()},
-                **{"meshes/" + path: checksum for path, checksum in inventory(generate_root / "meshes").items()},
-                "tool.json": file_digest(generate_root / "tool.json"),
-            }
+        self.deferred_diagnostics = None
+        _command, execution, certificate, *_ = self.pair._run_verify()
+        assert execution.outcome == "completed", execution
+        root = Path(execution.candidate_root)
+        self.certificate = certificate
+        if diagnostics is not None:
+            try:
+                validate_certificate_diagnostics({
+                    **certificate, "diagnostics": [*certificate["diagnostics"], *diagnostics],
+                })
+            except PipelineError:
+                self.deferred_diagnostics = diagnostics
+            else:
+                self._write_certificate_diagnostics(root, diagnostics)
+        return root, self.certificate
+
+    def _write_certificate_diagnostics(self, root, diagnostics):
+        self.certificate["diagnostics"].extend(diagnostics)
+        self.certificate.pop("verification_key")
+        self.certificate["verification_key"] = digest(self.certificate)
+        write_json(root / "verification-certificate.json", self.certificate)
+        receipt = read_data(root / "verification-execution.json")
+        receipt["certificate_sha256"] = digest(self.certificate)
+        write_json(root / "verification-execution.json", receipt)
+
+    def _make_mjcf(self, verify_root):
+        command = StageCommand.create(
+            command_id="mjcf-command", run_id="publish-run", stage="mjcf", idempotency_key="publish-run/mjcf",
+            request={
+                "schema_version": mjcf_contract.STAGE_REQUEST_SCHEMA, "output_contract": mjcf_contract.OUTPUT_CONTRACT,
+                "generate_artifact_id": self.generate_ref.artifact_id,
+                "capture_artifact_id": self.capture_ref.artifact_id, "verify_artifact_id": self.verify_ref.artifact_id,
+                "verify_certificate_sha256": file_digest(verify_root / "verification-certificate.json"),
+                "simulation": "{}\n",
+            }, input_artifacts=(self.generate_ref, self.capture_ref, self.verify_ref),
+            config_snapshot_sha256=self.certificate["config_snapshot_sha256"],
+            contract_sha256=CONTRACT_SHA, policy_sha256=POLICY_SHA,
+            expected_executor_sha256=self.executor, predecessor_decision_id="verify-decision",
         )
-        verify_request = {
-            "capture_artifact": self.capture_ref.to_record(),
-            "generate_artifact": self.generate_ref.to_record(),
-            "expected_verifier_sha256": VERIFY_SHA256,
-            "contract_sha256": CONTRACT_SHA,
-            "policy_sha256": POLICY_SHA,
-            "config_snapshot_sha256": CONFIG_SHA,
-            "purpose": "engineering",
-            "schema_version": VERIFY_REQUEST_SCHEMA,
-            "output_contract": "solidworks-to-urdf.verification-artifact/v1",
-        }
-        proof = {
-            "actual_verifier": VERIFY_IDENTITY,
-            "actual_verifier_sha256": VERIFY_SHA256,
-            "capture_artifact": self.capture_ref.to_record(),
-            "checks": [{"id": "fixture", "state": "passed", "passed": True, "details": {}}],
-            "closure_sha256": digest(
-                {
-                    "capture_artifact": self.capture_ref.to_record(),
-                    "generate_artifact": self.generate_ref.to_record(),
-                }
-            ),
-            "config_snapshot_sha256": CONFIG_SHA,
-            "contract_sha256": CONTRACT_SHA,
-            "decision": "PASS",
-            "diagnostics": diagnostics or [],
-            "evaluation_subject_sha256": pair_subject,
-            "generate_artifact": self.generate_ref.to_record(),
-            "generate_receipt_sha256": file_digest(generate_root / "reports/generate.json"),
-            "passed": True,
-            "pipeline_id": "solidworks-to-urdf",
-            "policy_sha256": POLICY_SHA,
-            "purpose": "engineering",
-            "qualifications": [],
-            "request": verify_request,
-            "request_sha256": digest(verify_request),
-            "required_checks": ["fixture"],
-            "schema_version": VERIFICATION_CERTIFICATE_SCHEMA,
-            "subject_sha256": self.generate_ref.set_sha256,
-            "subject_status": "bound",
-        }
-        certificate = {**proof, "verification_key": digest(proof)}
-        verify_root = self.root / "verify"
-        write_json(verify_root / "verification-certificate.json", certificate)
-        write_json(
-            verify_root / "verification-execution.json",
-            {
-                "actual_verifier": VERIFY_IDENTITY,
-                "actual_verifier_sha256": VERIFY_SHA256,
-                "certificate_sha256": digest(certificate),
-                "claim_id": "verify-claim",
-                "closure_sha256": proof["closure_sha256"],
-                "command_id": "verify-command",
-                "fence": 1,
-                "execution_details": {},
-                "finished_at": "2026-10-25T00:00:01+00:00",
-                "request": verify_request,
-                "request_sha256": digest(verify_request),
-                "run_id": "verify-run",
-                "schema_version": VERIFICATION_EXECUTION_SCHEMA,
-                "stage": "verify",
-                "started_at": "2026-10-25T00:00:00+00:00",
-                "execution_id": "verify-execution",
-            },
+        claim = self.pair._claim(command, owner=digest({"worker": "mjcf"}), executor=self.executor)
+        execution = MJCFHandler(self.store).execute(command, claim, StageWorkspace(
+            root=self.root / "mjcf-attempt", inputs={self.generate_ref.artifact_id:self.pair.generate_root,
+            self.capture_ref.artifact_id:self.pair.capture_root, self.verify_ref.artifact_id:verify_root},
+        ), effects=NoExternalEffects())
+        assert execution.outcome == "completed", execution
+        self.mjcf_command, self.mjcf_checks_sha256 = command, execution.checks_sha256
+        self.mjcf_ref = self.store.seal_tree(
+            Path(execution.candidate_root), kind=mjcf_contract.ARTIFACT_KIND, producer_run_id=command.run_id,
+            producer_stage="mjcf", producer_tool_sha256=self.executor,
         )
-        return verify_root, certificate
 
     def close(self) -> None:
-        self.temporary.cleanup()
+        self.pair.doCleanups()
 
 
 class PublishHandlerTests(unittest.TestCase):

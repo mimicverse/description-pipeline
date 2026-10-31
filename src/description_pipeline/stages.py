@@ -1,6 +1,6 @@
 """One engineering-stage contract and its evidence-driven run view.
 
-Airflow coordinates native acquisition and Linux verification. These six stages
+Airflow coordinates native acquisition and Linux verification. These stages
 describe the engineering work; reading this view never executes that work.
 """
 

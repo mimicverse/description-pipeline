@@ -6,7 +6,7 @@ The portal is a dependency-free WSGI application:
   cookie that Airflow issues is validated server-side through ``/auth/feishu/profile`` and its
   value is kept in a portal session, never echoed to the browser;
 * the portal triggers the ``solidworks_to_urdf`` DAG with the canonical
-  ``DispatchConf(run_id, freeze_command_id)`` and reports the Airflow stage progress, native
+  ``DispatchConf(run_id, entry_command_id)`` and reports the Airflow stage progress, native
   findings and the published pull request;
 * every submission is admitted in the platform store first (request, run and the initial
   dispatch intent in one short transaction) and is refused while the admission window is

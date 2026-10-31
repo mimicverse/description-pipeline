@@ -69,7 +69,7 @@ CREATE_DAG_RUN_ID = "portal-20261028T120000-1234abcd"
 CREATE_CONF = {
     "schema_version": AIRFLOW_DISPATCH_CONF_SCHEMA,
     "run_id": CREATE_RUN_ID,
-    "freeze_command_id": CREATE_FREEZE_COMMAND_ID,
+    "entry_command_id": CREATE_FREEZE_COMMAND_ID,
 }
 
 
@@ -167,7 +167,7 @@ class FeishuAuthManagerTests(unittest.TestCase):
             parent_dag_run_id=None,
             dag_id=auth.ALLOWED_DAG_ID,
             dag_run_id=CREATE_DAG_RUN_ID,
-            freeze_command_id=CREATE_FREEZE_COMMAND_ID,
+            entry_command_id=CREATE_FREEZE_COMMAND_ID,
         )
         create_binding = mock.patch.object(
             run_ownership,

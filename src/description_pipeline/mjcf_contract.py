@@ -15,8 +15,13 @@ from typing import Any
 
 from .io import PipelineError, parse_data, digest, inventory, confined
 from .runtime import RUNTIME_VERSIONS, tool_record
+from .schemas import MJCF_REQUEST_SCHEMA, MJCF_CERTIFICATE_SCHEMA
 
 REPORT_SCHEMA = "urdf-mjcf.quality/v1"
+STAGE_REQUEST_SCHEMA = MJCF_REQUEST_SCHEMA
+STAGE_CERTIFICATE_SCHEMA = MJCF_CERTIFICATE_SCHEMA
+OUTPUT_CONTRACT = "solidworks-to-urdf.mjcf-artifact/v1"
+ARTIFACT_KIND = "stage_output:mjcf"
 
 INPUT_BINDING_SCHEMA = "urdf-mjcf.input-binding/v2"
 COMPONENT_SOURCE = "model/robot.json"
@@ -57,6 +62,20 @@ def collision_warning(payload: dict) -> str:
     return COLLISION_WARNING_PREFIX + json.dumps(
         payload, sort_keys=True, ensure_ascii=True, allow_nan=False, separators=(",", ":")
     ).replace("--", r"\u002d\u002d")
+
+
+def projection_warnings(certificate: dict) -> list[str]:
+    """Read the one checked warning inventory for delivery consumers."""
+    report = certificate.get("report")
+    checks = report.get("checks") if isinstance(report, dict) else None
+    rows = [row for row in checks if isinstance(row, dict) and row.get("id") == "provenance.warnings"] \
+        if isinstance(checks, list) else []
+    details = rows[0].get("details") if len(rows) == 1 else None
+    comments = details.get("warning_comments") if isinstance(details, dict) else None
+    if (not isinstance(comments, list) or any(not isinstance(value, str) for value in comments)
+            or digest(comments) != details.get("warning_sha256")):
+        raise PipelineError("MJCF certificate has no valid warning inventory")
+    return comments
 
 
 BASE_MODES = ("fixed", "floating")

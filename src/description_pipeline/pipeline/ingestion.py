@@ -9,12 +9,13 @@ import stat
 import subprocess
 import tempfile
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
 from ..artifacts import ArtifactStore, ArtifactStoreError
+from .. import mjcf_contract
 from ..artifacts.store import path_has_link_ancestor
 from ..interface_records import (
     REQUEST_PURPOSES,
@@ -49,7 +50,9 @@ from .admission import (
     VerifiedRepositorySnapshot,
     VerifiedRuleset,
     build_freeze_command,
+    build_mjcf_command,
     build_run_admission,
+    VerifiedVerifyResult,
 )
 from .contracts import DispatchCommand, ProtocolError, RunAdmission, StageCommand
 from .discover import CONFIGURATION_KIND, RULESET_KIND, SOURCE_SET_KIND
@@ -539,11 +542,45 @@ class ProductionFreezeSuccessorRequest:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class ProductionMJCFSuccessorRequest:
+    """One direct MJCF rerun over an original verified URDF run."""
+
+    run_id: str
+    request_id: str
+    parent_run_id: str
+    principal: str
+    change_summary: str
+    simulation: str = mjcf_contract.EMPTY_CONFIG.decode("utf-8")
+
+    def __post_init__(self) -> None:
+        for name in ("run_id", "request_id", "parent_run_id"):
+            _identifier(getattr(self, name), name)
+        if self.run_id == self.parent_run_id or not valid_actor_principal(self.principal):
+            raise ProtocolError("admission_ingestion.mjcf_request_invalid")
+        object.__setattr__(self, "change_summary", _multiline(self.change_summary, "change_summary"))
+        if not isinstance(self.simulation, str):
+            raise ProtocolError("admission_ingestion.invalid", {"where": "simulation"})
+        mjcf_contract.load_simulation(self.simulation.encode("utf-8"))
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> ProductionMJCFSuccessorRequest:
+        fields = {"run_id", "request_id", "parent_run_id", "principal", "change_summary", "simulation"}
+        if not isinstance(record, Mapping) or set(record) != fields:
+            raise ProtocolError("admission_ingestion.mjcf_request_invalid", {"reason": "fields"})
+        return cls(**dict(record))
+
+    def to_record(self) -> dict:
+        return {name: getattr(self, name) for name in (
+            "run_id", "request_id", "parent_run_id", "principal", "change_summary", "simulation",
+        )}
+
+
 class AdmissionOutcomePort(Protocol):
     """The immutable receipt returned by the real StageApplication."""
 
     admission: RunAdmission
-    freeze_command: StageCommand
+    entry_command: StageCommand
     dispatch_command: DispatchCommand
 
 
@@ -675,6 +712,8 @@ class AdmissionApplication(Protocol):
         run_id: str,
     ) -> VerifiedArtifact: ...
 
+    def mjcf_source_result(self, spec: AdmissionSpec) -> VerifiedVerifyResult: ...
+
 
 @dataclass(frozen=True, slots=True)
 class PreparedAdmission:
@@ -682,6 +721,7 @@ class PreparedAdmission:
 
     spec: AdmissionSpec
     run_admission: RunAdmission
+    verify_result: VerifiedVerifyResult | None = None
 
     def validate_outcome(
         self,
@@ -689,7 +729,7 @@ class PreparedAdmission:
     ) -> AdmissionSpec:
         if not all(
             hasattr(outcome, field)
-            for field in ("admission", "freeze_command", "dispatch_command")
+            for field in ("admission", "entry_command", "dispatch_command")
         ):
             raise ProtocolError(
                 "admission_ingestion.outcome_invalid",
@@ -739,30 +779,31 @@ class PreparedAdmission:
                 "admission_ingestion.outcome_invalid",
                 {"run_id": self.spec.run_id, "reason": "admission-bindings"},
             )
-        expected_freeze = build_freeze_command(outcome_spec)
+        expected_entry = (build_mjcf_command(outcome_spec, self.verify_result)
+                           if outcome_spec.from_stage == "mjcf" else build_freeze_command(outcome_spec))
         dispatch = outcome.dispatch_command
         expected_dispatch_id = "dispatch:" + digest(
             {
                 "admission_sha256": outcome_spec.admission_sha256,
                 "dag_id": "solidworks_to_urdf",
                 "dag_run_id": outcome_spec.request_id,
-                "freeze_command_id": expected_freeze.command_id,
+                "entry_command_id": expected_entry.command_id,
                 "run_id": outcome_spec.run_id,
             }
         )
         if (
-            not isinstance(outcome.freeze_command, StageCommand)
-            or outcome.freeze_command != expected_freeze
+            not isinstance(outcome.entry_command, StageCommand)
+            or outcome.entry_command != expected_entry
         ):
             raise ProtocolError(
                 "admission_ingestion.outcome_mismatch",
-                {"where": "freeze_command", "run_id": self.spec.run_id},
+                {"where": "entry_command", "run_id": self.spec.run_id},
             )
         if (
             not isinstance(dispatch, DispatchCommand)
             or dispatch.command_id != expected_dispatch_id
             or dispatch.run_id != outcome_spec.run_id
-            or dispatch.freeze_command_id != expected_freeze.command_id
+            or dispatch.entry_command_id != expected_entry.command_id
             or dispatch.idempotency_key != f"{outcome_spec.run_id}/dispatch"
             or dispatch.dag_id != "solidworks_to_urdf"
             or dispatch.dag_run_id != outcome_spec.request_id
@@ -880,6 +921,7 @@ class ProductionAdmissionFactory:
             capture=source,
             generate=source,
             verify=source,
+            mjcf=source,
             publish=source,
         )
         dispatch = scoped_executor_sha256(
@@ -1240,7 +1282,7 @@ class ProductionAdmissionFactory:
             committer_name=actor_name,
             committer_email=actor_email,
             committed_at=timestamp,
-            subject=f"feat({request.target_hardware}): publish URDF delivery",
+            subject=f"feat({request.target_hardware}): publish URDF and MJCF delivery",
             body=request.change_summary,
         )
         return VerifiedPublishIntent(repository=repository, commit=commit)
@@ -1420,6 +1462,50 @@ class ProductionAdmissionFactory:
             ).validate_outcome(existing)
             return existing
         return self.prepare(request).register(application)
+
+    def admit_mjcf(
+        self, application: AdmissionApplication, request: ProductionMJCFSuccessorRequest,
+    ) -> AdmissionOutcomePort:
+        """Reuse the source qualification without loading or contacting a CAD endpoint."""
+        if not isinstance(request, ProductionMJCFSuccessorRequest):
+            raise TypeError("request must be a ProductionMJCFSuccessorRequest")
+        existing = application.load_admission_outcome(request.run_id)
+        if existing is not None:
+            spec = AdmissionSpec.from_record(existing.admission.request)
+            if (spec.from_stage != "mjcf" or any(getattr(spec, name) != value
+                                                for name, value in request.to_record().items())):
+                raise ProtocolError("admission_ingestion.intent_conflict", {"run_id": request.run_id})
+            prepared = PreparedAdmission(spec, build_run_admission(spec), application.mjcf_source_result(spec))
+            prepared.validate_outcome(existing)
+            return existing
+        source_outcome = application.load_admission_outcome(request.parent_run_id)
+        if source_outcome is None:
+            raise ProtocolError("admission_ingestion.mjcf_source_missing")
+        source = AdmissionSpec.from_record(source_outcome.admission.request)
+        if source.from_stage not in {None, "freeze"} or source.principal != request.principal:
+            raise ProtocolError("admission_ingestion.mjcf_source_invalid")
+        resolved, config_sha, _snapshot_bytes = self._load_platform()
+        if (config_sha != source.platform_config_sha256 or source.contract_sha256 != CONTRACT_SHA256
+                or source.policy_sha256 != check_policy_digest()):
+            raise ProtocolError("admission_ingestion.mjcf_source_release_mismatch")
+        executors, ingestion_sha, dispatch_sha, _portable = self._installed()
+        now = self._now()
+        # Only repository intent is newly sealed; every native identity and
+        # upstream artifact remains the original admission's immutable fact.
+        publication_request = ProductionFreezeSuccessorRequest(
+            run_id=request.run_id, request_id=request.request_id, parent_run_id=request.parent_run_id,
+            principal=request.principal, change_summary=request.change_summary,
+            main_assembly=source.main_assembly, target_hardware=source.target_hardware, purpose=source.purpose,
+        )
+        spec = replace(
+            source, run_id=request.run_id, request_id=request.request_id, parent_run_id=source.run_id,
+            from_stage="mjcf", change_summary=request.change_summary, simulation=request.simulation, created_at=now,
+            executors=replace(source.executors, mjcf=executors.mjcf, publish=executors.publish),
+            dispatch_executor_sha256=dispatch_sha,
+        )
+        verified = application.mjcf_source_result(spec)
+        spec = replace(spec, publish_intent=self._publication(publication_request, resolved, now, ingestion_sha))
+        return PreparedAdmission(spec, build_run_admission(spec), verified).register(application)
 
     def admit_from_frozen_freeze(
         self,

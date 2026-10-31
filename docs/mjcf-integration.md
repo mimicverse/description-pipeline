@@ -249,7 +249,7 @@ M1 的实际数值和性能结果目前尚未完成；本文确定其选择方�
 - 参考模型的逐组件凸包最多含 1378 个顶点；后续顶点简化必须与该基线实际比较误差和收益，不能仅用中性小样本确定默认预算。
 - 转换边界新增了实际子进程退出状态核验、warning 保真和结束后字节复核。邻近的既有 `verification/consumer.py` 已核验非零退出，无同源修改需要。边界回归真实运行临时子进程，验证有效 JSON 不能掩盖进程失败、子进程报告后字节变化不能获得通过。
 
-仍未完成：碰撞自动策略的完整数值基准与简化实现、七阶段接纳和重跑集成、门户正式集成、Publish 组合及完整发行验收。当前 8878 是只读参考技术验证页，不是已经完成的 pipeline 开发部署。
+后续进度见下方补充。当前 8878 仍是只读参考技术验证页，不是已经完成的 pipeline 开发部署；正式门户接入和正式发行验收尚未完成。
 
 ## 十三、参考与规则维护
 
@@ -277,3 +277,21 @@ M1 的实际数值和性能结果目前尚未完成；本文确定其选择方�
 已将参考的两类行为检查泛化：逐个有限位关节隔离接触和重力，在源上下界外各偏移0.02 rad或m，要求实际约束力方向恢复；对声明的最低支撑 link，在私有运行数据内将地面上移碰撞误差预算加0.1mm及平面容差，要求实际碰撞响应。没有写入参考脚名、数量或坐标，也不推断控制器或 actuator。
 
 中性回归发现编译后修改静态 `model.geom_pos` 不会移动地面实际位置，故不能以该操作声称接触探针通过。已改为私有 `MjData.geom_xpos` 位移后调用 `mj_collision`，核验实际位移及接触；原失败输入和修复前后报告在 `.dev/m2/contact-probe-case/`。完整参考重新通过，证据 `.dev/m2/REFERENCE-CONTACT-LIMIT-VERIFICATION-v2.log`。本机29项定向回归通过，包含真实子进程凸包生成、错误退出、文件不覆盖和接触/限位负例；日志 `.dev/m2/CONTACT-LIMIT-TESTS.log`。生产调用入口将使用有CPU、内存和时限的 `project_isolated`，禁止在应用主进程无界执行原生凸包构建。
+
+### 阶段、重跑与组合交付补充（2026-11-01）
+
+已加入 Linux MJCF 阶段、独立阶段处理器、封存证书和受限接纳。正式完整成功必须经过 MJCF；Publish 接收五个固定产物，核验两个证书，将 `mjcf/` 与 URDF 放入同一受控 Git 提交，并将两者及警告绑定到发布计划、PR 和回执。Generate/Capture 的 URDF 验证 subject 保持其阶段职责；最终 publication subject 纳入实际 MJCF 文件。Publish 请求、计划、回执与输出契约升至 v2。
+
+MJCF successor 必须直接引用原始完整运行的通过 Verify 产物，保持原始输入、规则、平台配置、用途、所有者、原生身份和上游执行者一致；来源须有已结算的终态，拒绝未决结果与 successor 链。新运行仅产生 MJCF/Publish 命令及决定。调度数据使用 `entry_command_id`，不再把 MJCF 命令称为 Freeze。Airflow 上游任务读取已固定来源时返回明确的 `reused` 引用，不产生新的上游命令、claim、决定或外部 effect；实际调度实例验证仍需后续完成。
+
+原生碰撞转换和独立检查分别在有时限、CPU 和内存上限的子进程中执行。成功与失败候选均可经共同引擎封存、验证和重放；阶段失败报告不晋升为可发布资格。证书记录逐对象/字段的源位置与派生规则；URDF 是机械值权威，组件 JSON 只提供身份。模型警告、证书和 PR 使用同一检查所得 warning inventory。
+
+已实际验证的开发证据：
+
+- `.dev/m2/MJCF-ENGINE-RERUN-POSTGRES.log`：真实处理器成功、碰撞近似失败与重放；隔离 PostgreSQL 下并发重复接纳仅形成一个入口，正式重跑在执行前取消后无上游改写。
+- `.dev/m2/REAL-SEVEN-STAGE-COMBINATION.log`：七个真实阶段处理器、ArtifactStore、隔离 PostgreSQL、本地 Git 与受控 PR 客户端的组合通过。
+- `.dev/m2/REAL-MJCF-ONLY-APPLICATION.log`：原运行停在 MJCF 质量失败，新运行只执行 MJCF/Publish 后交付；上游五处理器及原生工具提供者设为调用即失败，未被调用，原始决定不变。
+- `.dev/m2/COMBINED-PUBLICATION-INITIAL.log`：组合提交、warning 链接和畸形诊断拒绝通过。Publish 测试改用真实 Generate/Verify/MJCF 产物，删除仅含占位 URDF 的假输入。
+- 当前网络无法读取 PyPI；135项 Airflow 依赖从已安装目录只读复制到本 worktree 的私有虚拟环境，版本与锁文件一致，逐文件核验安装 RECORD。证据 `.dev/m2/AIRFLOW-OFFLINE-DEPENDENCIES.json`。没有调用源环境解释器或控制服务；这不是新鲜 wheel 哈希安装证据。
+
+这些是离线采集夹具和隔离应用证据，没有操作真实 CAD、生产数据库、现有 Airflow 服务或真实 Git/PR 目标。尚需完成开发门户、实际 Airflow 调度、下载资格、独立预览、适用回归与固定候选审查。权威三份架构文档仍由项目负责人维护；当前六阶段文档与七阶段代码的契约一致性测试因此仍有明确差量，不以改测试掩盖，需在正式集成时同步。

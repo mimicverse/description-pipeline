@@ -1611,7 +1611,7 @@ class PortalTests(unittest.TestCase):
         conf = DispatchConf(
             schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
             run_id=request.run_id,
-            freeze_command_id="freeze:" + digest(request.run_id),
+            entry_command_id="freeze:" + digest(request.run_id),
         )
         outcome = SimpleNamespace(
             admission=SimpleNamespace(
@@ -1645,7 +1645,7 @@ class PortalTests(unittest.TestCase):
         conf = DispatchConf(
             schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
             run_id=request.run_id,
-            freeze_command_id="freeze:" + digest(request.run_id),
+            entry_command_id="freeze:" + digest(request.run_id),
         )
         outcome = SimpleNamespace(
             admission=SimpleNamespace(
@@ -1666,7 +1666,7 @@ class PortalTests(unittest.TestCase):
         conf = DispatchConf(
             schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
             run_id=RUN_ID,
-            freeze_command_id="freeze:" + digest(RUN_ID),
+            entry_command_id="freeze:" + digest(RUN_ID),
         )
         adapter = AirflowDispatchAdapter(
             AirflowApi(self.airflow.url),
@@ -1683,7 +1683,7 @@ class PortalTests(unittest.TestCase):
 
         self.airflow.dag_runs[DAG_RUN_ID]["conf"] = {
             **conf.to_record(),
-            "freeze_command_id": "freeze:another-command",
+            "entry_command_id": "freeze:another-command",
         }
         with self.assertRaisesRegex(
             AirflowApiError,
@@ -2363,9 +2363,9 @@ class PortalTests(unittest.TestCase):
         expected_conf = {
             "schema_version": AIRFLOW_DISPATCH_CONF_SCHEMA,
             "run_id": native_run_id(dag_run_id),
-            "freeze_command_id": next(
+            "entry_command_id": next(
                 iter(self.production_application.dispatch_records.values())
-            )[1].freeze_command_id,
+            )[1].entry_command_id,
         }
         self.assertEqual(self.airflow.conf, expected_conf)
         self.assertEqual(
@@ -2455,8 +2455,8 @@ class PortalTests(unittest.TestCase):
             iter(self.production_application.dispatch_records.values())
         )[1]
         self.assertEqual(
-            self.airflow.trigger_payloads[0]["conf"]["freeze_command_id"],
-            recorded_conf.freeze_command_id,
+            self.airflow.trigger_payloads[0]["conf"]["entry_command_id"],
+            recorded_conf.entry_command_id,
         )
 
     def test_production_admission_reuses_one_idempotent_dispatch(self) -> None:
@@ -2483,7 +2483,7 @@ class PortalTests(unittest.TestCase):
                         DispatchConf(
                             schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
                             run_id=command.run_id,
-                            freeze_command_id="freeze:" + command.run_id,
+                            entry_command_id="freeze:" + command.run_id,
                         ),
                     )
                     self.dispatched.add(command_id)

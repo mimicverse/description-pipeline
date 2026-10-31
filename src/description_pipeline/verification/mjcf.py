@@ -2472,6 +2472,97 @@ def _gate_collision_hulls(state: dict) -> dict:
             "scope": "Convex-solid distance relative to source component hulls; no concave-surface equivalence claim"}
 
 
+def _derivation_records(state: dict) -> list[dict]:
+    """Locate every encoded object and field in its source or explicit policy."""
+    policy, document = state["policy"], state["document"]
+    geoms = {row["name"]: row for row in _expected_geoms(document, state["config"], policy)}
+    links = {row["name"]: row for row in document["links"]}
+    incoming = {row["child"]: row for row in document["joints"]}
+    urdf, records = state["urdf_relative"], []
+    config_source = {"record": policy["config_name"], "fields": ["/base", "/collision", "/simulation", "/sites",
+                                                                  "/support_sites", "/floor"]}
+    policy_source = {"tool_sha256": state["manifest"]["tool"]["source_sha256"],
+                     "module": "description_pipeline.mjcf_contract",
+                     "fields": ["DEFAULT_POLICY", "ROLE_GROUPS", "CONTACT_CONDIM", "ROBOT_XML_SYNTAX",
+                                "SCENE_XML_SYNTAX", "VISUAL_GEOM_TEMPLATE", "COLLISION_GEOM_TEMPLATE",
+                                "CONVEX_GEOM_TEMPLATE", "FLOOR_RENDER_SIZE", "LIGHT_POS", "LIGHT_DIR"],
+                     "default_policy_schema": policy["defaults"]["schema_version"]}
+
+    def source(entity, name, fields):
+        return {"record": urdf, "entity": entity, "name": name, "fields": fields}
+
+    def visit(node, file, path, link=None):
+        if not isinstance(node.tag, str):
+            return
+        if node.tag == "body":
+            link = node.get("name")
+        name = node.get("name")
+        sources = [policy_source]
+        rule = "versioned XML representation"
+        if node.tag == "mujoco" and file == policy["robot_name"]:
+            sources.append(source("robot", document["name"], ["name"]))
+        elif node.tag == "body":
+            sources.append(source("link", link, ["name"]))
+            if link in incoming:
+                sources.append(source("joint", incoming[link]["name"], ["origin", "parent", "child"]))
+            rule = "URDF link tree and fixed origin encoding"
+        elif node.tag == "inertial":
+            sources.append(source("link", link, ["inertial.origin", "inertial.mass", "inertial.inertia"]))
+            rule = "URDF tensor rotation and right-handed principal inertia encoding"
+        elif node.tag == "joint":
+            sources.append(source("joint", name, ["name", "type", "axis", "limit", "dynamics"]))
+            rule = "URDF joint, directed axis, limits and authored dynamics encoding"
+        elif node.tag == "geom" and name in geoms:
+            row = geoms[name]
+            native_role = "collisions" if row["role"] == "collision" and links[link]["collision_role"] == "urdf" \
+                else "visuals"
+            selected = row.get("source_surfaces", [row["surface"]])
+            indices = [links[link][native_role].index(surface) for surface in selected]
+            fields = ("origin", "geometry", "material") if native_role == "visuals" else ("origin", "geometry")
+            sources.append(source("link", link, ["name", *[f"{native_role}[{index}].{field}" for index in indices
+                                                           for field in fields]]))
+            sources.append(config_source)
+            if row["role"] == "collision" and native_role == "visuals" and state["manifest"]["source"]["components"]:
+                sources.append({"record": state["manifest"]["source"]["components"], "entity": "link", "name": link,
+                                "fields": [f"visuals.{surface['name']}.provenance.native_component"
+                                           for surface in selected]})
+            rule = "URDF surface encoding and declared convex contact approximation"
+        elif node.tag == "mesh":
+            filename = _canonical_mesh_path("/".join(file.split("/")[:-1]), node.get("file"), name)
+            sources.extend([{"record": filename, "fields": ["vertices", "faces"]}, config_source])
+            directory = "/".join(urdf.split("/")[:-1])
+            originals = set()
+            for row in geoms.values():
+                geometry = row["surface"]["geometry"]
+                if (geometry["kind"] != "mesh"
+                        or _canonical_mesh_path(directory, geometry["filename"], name) != filename):
+                    continue
+                for surface in row.get("source_surfaces", [row["surface"]]):
+                    originals.add(_canonical_mesh_path(directory, surface["geometry"]["filename"], name))
+            sources.extend({"record": original, "fields": ["vertices"]} for original in sorted(originals))
+            rule = "Mesh asset reference, scale and bounded convex preprocessing"
+        elif node.tag in {"freejoint", "option", "site", "geom", "light"}:
+            sources.append(config_source)
+            for support in state["config"]["support_sites"]:
+                role = "collisions" if links[support["link"]]["collision_role"] == "urdf" else "visuals"
+                sources.append(source("link", support["link"], [f"{role}.geometry", f"{role}.origin"]))
+            rule = "Explicit simulation settings, policy constants or source-derived support frame"
+        elif node.tag == "include":
+            sources.append({"record": policy["robot_name"], "fields": ["document"]})
+        records.append({"code": "mjcf.derived_fields", "blocking": False,
+                        "target": {"file": file, "path": path, "tag": node.tag, "name": name, "link": link,
+                                   "fields": sorted(node.attrib) or ["element"]},
+                        "sources": sources, "rule": rule,
+                        "scope": "Derived encoding and policy values, not direct native CAD measurements"})
+        for index, child in enumerate(node):
+            visit(child, file, [*path, index], link)
+
+    for file in (policy["robot_name"], policy["scene_name"]):
+        if file in state["manifest"]["files"]:
+            visit(ET.fromstring(_confined(state["root"], file).read_bytes()), file, [])
+    return records
+
+
 def _gate_provenance_warnings(state: dict) -> dict:
     """Compare the actual source warning comments with the delivered encoding."""
     _need(state, "document")
@@ -2500,7 +2591,8 @@ def _gate_provenance_warnings(state: dict) -> dict:
         expected.append(policy["collision_warning_prefix"] + encoded.replace("--", r"\u002d\u002d"))
     if delivered != expected:
         raise CheckError("MJCF warning comments differ from the source and simulation policy")
-    return {"source_warning_count": len(source), "warning_sha256": _canonical_digest(expected)}
+    return {"source_warning_count": len(source), "warning_sha256": _canonical_digest(expected),
+            "warning_comments": expected, "derivations": _derivation_records(state)}
 
 
 _GATES_BY_ID = {

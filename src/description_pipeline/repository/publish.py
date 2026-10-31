@@ -16,7 +16,7 @@ from typing import Any, Protocol
 from urllib.parse import unquote, urlsplit
 
 from ..artifacts.store import path_has_link_ancestor
-from ..delivery import subject_digest
+from ..delivery import subject_digest, SUBJECT_DIRECTORIES, PROJECTION_DIRECTORIES, SUBJECT_FILES
 from ..io import PipelineError, digest, inventory, read_data, safe_process_output, write_json
 from ..schemas import REPOSITORY_SNAPSHOT_SCHEMA
 from .review_branch import is_review_branch
@@ -28,6 +28,7 @@ GOVERNED_PATHS = (
     "model",
     "urdf",
     "meshes",
+    "mjcf",
     "tool.json",
     "reports",
     ".gitattributes",
@@ -35,7 +36,7 @@ GOVERNED_PATHS = (
 GIT_ATTRIBUTES = (
     "# Preserve published delivery bytes and verification receipts.\n"
     + "".join(
-        f"/{name}{'/**' if name in {'input', 'evidence', 'model', 'urdf', 'meshes', 'reports'} else ''} "
+        f"/{name}{'/**' if name in {*SUBJECT_DIRECTORIES, *PROJECTION_DIRECTORIES, 'reports'} else ''} "
         "-text -filter -working-tree-encoding\n"
         for name in GOVERNED_PATHS
     )
@@ -1074,8 +1075,8 @@ class PublicationRepository:
             {
                 path: checksum
                 for path, checksum in expected.items()
-                if path == "tool.json"
-                or path.startswith(("input/", "evidence/", "model/", "urdf/", "meshes/"))
+                if path in SUBJECT_FILES
+                or path.startswith(tuple(name + "/" for name in (*SUBJECT_DIRECTORIES, *PROJECTION_DIRECTORIES)))
             }
         ):
             raise PublicationError("publish.subject")

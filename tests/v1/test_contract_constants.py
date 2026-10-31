@@ -85,7 +85,7 @@ class ContractConvergenceTests(unittest.TestCase):
         self.assertIn("shafts.waist_pitch", identifiers)
 
     def test_portable_stages_derive_from_the_contract_hosts(self) -> None:
-        self.assertEqual(PORTABLE_STAGES, ("freeze", "generate", "verify", "publish"))
+        self.assertEqual(PORTABLE_STAGES, ("freeze", "generate", "verify", "mjcf", "publish"))
         self.assertEqual(tuple(stage for stage, hosts in HOST_BY_STAGE.items() if hosts == ("linux",)), PORTABLE_STAGES)
 
     def test_owned_schema_ids_are_never_retyped_as_literals(self) -> None:

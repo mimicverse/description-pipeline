@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS :"platform_schema".run_admission (
     parent_run_id text REFERENCES :"platform_schema".run_admission (run_id),
     from_stage text CHECK (
         from_stage IS NULL
-        OR from_stage IN ('freeze', 'discover', 'capture', 'generate', 'verify', 'publish')
+        OR from_stage IN ('freeze', 'discover', 'capture', 'generate', 'verify', 'mjcf', 'publish')
     ),
     request jsonb NOT NULL,
     request_digest char(64) NOT NULL CHECK (request_digest ~ '^[0-9a-f]{64}$'),
@@ -46,7 +46,7 @@ CREATE TABLE IF NOT EXISTS :"platform_schema".artifact (
     producer_run_id text,
     producer_stage text CHECK (
         producer_stage IS NULL
-        OR producer_stage IN ('freeze', 'discover', 'capture', 'generate', 'verify', 'publish')
+        OR producer_stage IN ('freeze', 'discover', 'capture', 'generate', 'verify', 'mjcf', 'publish')
     ),
     producer_tool_sha256 char(64) NOT NULL CHECK (producer_tool_sha256 ~ '^[0-9a-f]{64}$'),
     created_at timestamptz NOT NULL DEFAULT now()
@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS :"platform_schema".command (
     kind text NOT NULL CHECK (kind IN ('stage', 'dispatch', 'cancel', 'reconcile')),
     stage text CHECK (
         stage IS NULL
-        OR stage IN ('freeze', 'discover', 'capture', 'generate', 'verify', 'publish')
+        OR stage IN ('freeze', 'discover', 'capture', 'generate', 'verify', 'mjcf', 'publish')
     ),
     idempotency_key text NOT NULL UNIQUE,
     request jsonb NOT NULL,
@@ -160,7 +160,7 @@ CREATE TABLE IF NOT EXISTS :"platform_schema".stage_decision (
     decision_id text PRIMARY KEY,
     run_id text NOT NULL REFERENCES :"platform_schema".run_admission (run_id),
     stage text NOT NULL CHECK (
-        stage IN ('freeze', 'discover', 'capture', 'generate', 'verify', 'publish')
+        stage IN ('freeze', 'discover', 'capture', 'generate', 'verify', 'mjcf', 'publish')
     ),
     command_id text NOT NULL UNIQUE REFERENCES :"platform_schema".command (command_id),
     outcome text NOT NULL CHECK (outcome IN ('completed', 'failed', 'cancelled')),

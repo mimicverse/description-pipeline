@@ -228,7 +228,7 @@ class NativeCancellationAdapterTests(unittest.TestCase):
         conf = DispatchConf(
             schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
             run_id=admission.run_id,
-            freeze_command_id=freeze.command_id,
+            entry_command_id=freeze.command_id,
         )
         conf_artifact = self.artifacts.seal_dispatch_conf(
             conf,
@@ -238,7 +238,7 @@ class NativeCancellationAdapterTests(unittest.TestCase):
         dispatch = DispatchCommand.create(
             command_id="dispatch-" + admission.run_id,
             run_id=admission.run_id,
-            freeze_command_id=freeze.command_id,
+            entry_command_id=freeze.command_id,
             idempotency_key=f"{admission.run_id}/dispatch",
             dag_id="solidworks_to_urdf",
             dag_run_id=admission.request_id,

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from ..interface_records import REQUEST_PURPOSES
+from .. import mjcf_contract
 from ..stages import STAGE_IDS
 from ..io import PipelineError, artifact_path_parts, digest, parse_data
 from ..repository.publish import CommitSpec
@@ -91,6 +92,7 @@ _ADMISSION_FIELDS = frozenset(
         "target_hardware",
         "change_summary",
         "configuration",
+        "simulation",
     }
 )
 
@@ -249,6 +251,7 @@ class StageExecutors:
     capture: str
     generate: str
     verify: str
+    mjcf: str
     publish: str
 
     def __post_init__(self) -> None:
@@ -268,6 +271,7 @@ class StageExecutors:
             "generate": self.generate,
             "publish": self.publish,
             "verify": self.verify,
+            "mjcf": self.mjcf,
         }
 
     @classmethod
@@ -389,6 +393,7 @@ class AdmissionSpec:
     platform_config_sha256: str
     publish_intent: VerifiedPublishIntent
     created_at: datetime
+    simulation: str = mjcf_contract.EMPTY_CONFIG.decode("utf-8")
     native_target_identity: NativeTargetIdentity | None = None
 
     def __post_init__(self) -> None:
@@ -402,6 +407,14 @@ class AdmissionSpec:
                 raise ProtocolError("admission.invalid", {"where": "parent_run_id", "reason": "self-reference"})
         if self.from_stage is not None and self.from_stage not in STAGE_IDS:
             raise ProtocolError("admission.invalid", {"where": "from_stage", "value": self.from_stage})
+        if not isinstance(self.simulation, str):
+            raise ProtocolError("admission.invalid", {"where": "simulation"})
+        try:
+            mjcf_contract.load_simulation(self.simulation.encode("utf-8"))
+        except PipelineError as error:
+            raise ProtocolError("admission.invalid", {"where": "simulation", "reason": str(error)}) from error
+        if self.from_stage == "mjcf" and self.parent_run_id is None:
+            raise ProtocolError("admission.invalid", {"where": "parent_run_id", "reason": "mjcf-source-required"})
         if self.purpose not in REQUEST_PURPOSES:
             raise ProtocolError("admission.invalid", {"where": "purpose"})
         _require_safe_multiline(self.change_summary, "admission.invalid", "change_summary")
@@ -482,6 +495,7 @@ class AdmissionSpec:
             "dispatch_executor_sha256": self.dispatch_executor_sha256,
             "executors": self.executors.to_record(),
             "from_stage": self.from_stage,
+            "simulation": self.simulation,
             "main_assembly": self.main_assembly,
             "native_tool_source_sha256": self.native_tool_source_sha256,
             "native_tool_record_sha256": self.native_tool_record_sha256,
@@ -532,6 +546,7 @@ class AdmissionSpec:
             request_id=record["request_id"],
             parent_run_id=record["parent_run_id"],
             from_stage=record["from_stage"],
+            simulation=record["simulation"],
             principal=record["principal"],
             target_hardware=record["target_hardware"],
             purpose=record["purpose"],
@@ -1321,10 +1336,52 @@ def build_verify_command(
     )
 
 
+def build_mjcf_command(spec: AdmissionSpec, verify_result: VerifiedVerifyResult) -> StageCommand:
+    """Bind conversion to one passing URDF result and immutable simulation bytes."""
+    if not isinstance(verify_result, VerifiedVerifyResult):
+        raise ProtocolError("admission.verify_result_invalid", {"stage": "mjcf"})
+    source_run_id = spec.parent_run_id if spec.from_stage == "mjcf" else spec.run_id
+    verify = _require_predecessor(verify_result.predecessor, stage="verify", run_id=source_run_id)
+    request = {
+        "schema_version": mjcf_contract.STAGE_REQUEST_SCHEMA,
+        "output_contract": mjcf_contract.OUTPUT_CONTRACT,
+        "generate_artifact_id": verify_result.generate_artifact.artifact_id,
+        "capture_artifact_id": verify_result.capture_artifact.artifact_id,
+        "verify_artifact_id": verify.result.output_artifact.artifact_id,
+        "verify_certificate_sha256": verify_result.certificate_sha256,
+        "simulation": spec.simulation,
+    }
+    return _base_command(
+        spec, stage="mjcf", request=request,
+        input_artifacts=(verify_result.generate_artifact, verify_result.capture_artifact,
+                         verify.result.output_artifact),
+        predecessor_decision_id=verify.decision.decision_id,
+    )
+
+
+def validate_mjcf_successor(spec: AdmissionSpec, source: AdmissionSpec) -> None:
+    """Permit one direct MJCF successor while preserving every upstream fact."""
+    if (spec.from_stage != "mjcf" or spec.parent_run_id != source.run_id
+            or source.from_stage not in {None, "freeze"}):
+        raise ProtocolError("admission.mjcf_source_invalid")
+    fields = (
+        "principal", "target_hardware", "purpose", "main_assembly", "originals", "ruleset", "configuration",
+        "native_tool_source_sha256", "native_tool_record_sha256", "native_tool_requirement", "native_target_identity",
+        "contract_sha256", "policy_sha256", "platform_config_sha256",
+    )
+    for field in fields:
+        if getattr(spec, field) != getattr(source, field):
+            raise ProtocolError("admission.mjcf_source_mismatch", {"field": field})
+    for stage in ("freeze", "discover", "capture", "generate", "verify"):
+        if spec.executors.for_stage(stage) != source.executors.for_stage(stage):
+            raise ProtocolError("admission.mjcf_source_mismatch", {"field": f"executors.{stage}"})
+
+
 def build_publish_command(
     spec: AdmissionSpec,
     verify_result: VerifiedVerifyResult,
     publish_intent: VerifiedPublishIntent,
+    mjcf: VerifiedPredecessor,
 ) -> StageCommand:
     """Project Publish from one verified certificate and sealed repository target."""
 
@@ -1334,7 +1391,11 @@ def build_publish_command(
         raise ProtocolError("admission.publish_intent_invalid", {"stage": "publish"})
     if publish_intent != spec.publish_intent:
         raise ProtocolError("admission.publish_intent_invalid", {"where": "admission-binding"})
-    verify = _require_predecessor(verify_result.predecessor, stage="verify", run_id=spec.run_id)
+    source_run_id = spec.parent_run_id if spec.from_stage == "mjcf" else spec.run_id
+    _require_predecessor(verify_result.predecessor, stage="verify", run_id=source_run_id)
+    mjcf = _require_predecessor(mjcf, stage="mjcf", run_id=spec.run_id)
+    if mjcf.command != build_mjcf_command(spec, verify_result):
+        raise ProtocolError("admission.mjcf_result_invalid", {"where": "source-command"})
     repository = publish_intent.repository
     verified = verify_result.predecessor.result.output_artifact
     input_artifacts = (
@@ -1342,6 +1403,7 @@ def build_publish_command(
         verify_result.capture_artifact,
         verified,
         repository.artifact.ref,
+        mjcf.result.output_artifact,
     )
     if len({item.artifact_id for item in input_artifacts}) != len(input_artifacts):
         raise ProtocolError("admission.publish_intent_invalid", {"where": "duplicate-artifact"})
@@ -1360,13 +1422,17 @@ def build_publish_command(
         "schema_version": PUBLISH_REQUEST_SCHEMA,
         "verified_subject_sha256": verify_result.verified_subject_sha256,
         "verify_artifact_id": verified.artifact_id,
+        "mjcf_artifact_id": mjcf.result.output_artifact.artifact_id,
+        "mjcf_command_id": mjcf.command.command_id,
+        "mjcf_request_digest": mjcf.command.request_digest,
+        "mjcf_certificate_sha256": mjcf.result.checks_sha256,
     }
     return _base_command(
         spec,
         stage="publish",
         request=request,
         input_artifacts=input_artifacts,
-        predecessor_decision_id=verify.decision.decision_id,
+        predecessor_decision_id=mjcf.decision.decision_id,
     )
 
 
@@ -1457,9 +1523,10 @@ def validate_publish_command(
     verify_result: VerifiedVerifyResult,
     publish_intent: VerifiedPublishIntent,
     command: StageCommand,
+    mjcf: VerifiedPredecessor,
 ) -> StageCommand:
     return _validate(
-        build_publish_command(spec, verify_result, publish_intent),
+        build_publish_command(spec, verify_result, publish_intent, mjcf),
         command,
     )
 
@@ -1532,17 +1599,21 @@ def validate_stage_command(
         ):
             raise ProtocolError("admission.predecessor_required", {"stage": "verify"})
         return validate_verify_command(spec, predecessor, supporting_predecessors[0], command)
+    if command.stage == "mjcf":
+        if (predecessor is None or verify_result is None or predecessor != verify_result.predecessor
+                or supporting_predecessors or discover_result is not None or publish_intent is not None):
+            raise ProtocolError("admission.predecessor_required", {"stage": "mjcf"})
+        return _validate(build_mjcf_command(spec, verify_result), command)
     if command.stage == "publish":
         if (
             predecessor is None
             or verify_result is None
-            or predecessor != verify_result.predecessor
-            or supporting_predecessors
+            or supporting_predecessors != (verify_result.predecessor,)
             or discover_result is not None
             or publish_intent is None
         ):
             raise ProtocolError("admission.predecessor_required", {"stage": "publish"})
-        return validate_publish_command(spec, verify_result, publish_intent, command)
+        return validate_publish_command(spec, verify_result, publish_intent, command, predecessor)
     raise ProtocolError("admission.stage_not_supported", {"stage": command.stage})
 
 

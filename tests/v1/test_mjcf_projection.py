@@ -134,6 +134,17 @@ class ProjectionTests(unittest.TestCase):
         self.assertEqual(1, len(proxies))
         row = next(item for item in report['checks'] if item['id'] == 'collision.hulls')
         self.assertEqual(2, len(row['details']['mesh_proxies'][0]['source_meshes']))
+        provenance = next(item for item in report['checks'] if item['id'] == 'provenance.warnings')
+        traces = provenance['details']['derivations']
+        inertial = next(item for item in traces
+                        if item['target']['tag'] == 'inertial' and item['target']['link'] == 'base')
+        self.assertTrue(any(source.get('record') == contract.URDF_NAME for source in inertial['sources']))
+        self.assertFalse(any(source.get('record') == contract.COMPONENT_SOURCE for source in inertial['sources']))
+        proxy = next(item for item in traces if item['target']['name'] == 'base__convex_0')
+        identities = [source for source in proxy['sources'] if source.get('record') == contract.COMPONENT_SOURCE]
+        self.assertTrue(identities)
+        self.assertTrue(all(field.endswith('provenance.native_component')
+                            for source in identities for field in source['fields']))
 
     def test_component_metadata_never_overrides_urdf_mechanics(self):
         metadata = self.colored_component()
