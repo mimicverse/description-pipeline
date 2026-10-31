@@ -630,12 +630,15 @@ def _seal_effect_outbound(
     bundle: Path | None = None,
     plan: Path | None = None,
 ) -> Path:
-    root.mkdir(parents=True)
-    write_json(root / "request.json", payload)
-    if bundle is not None:
-        shutil.copyfile(bundle, root / "candidate.bundle")
-    if plan is not None:
-        shutil.copyfile(plan, root / PUBLICATION_PLAN)
+    try:
+        root.mkdir(parents=True)
+        write_json(root / "request.json", payload)
+        if bundle is not None:
+            shutil.copyfile(bundle, root / "candidate.bundle")
+        if plan is not None:
+            shutil.copyfile(plan, root / PUBLICATION_PLAN)
+    except OSError as error:
+        raise _local_publication_failure(error, operation="publish.outbound_prepare") from None
     return root
 
 
@@ -691,23 +694,16 @@ def _record_effect_error(
         ) from None
 
 
-def _local_publication_failure(error: PublicationError) -> StageFailure:
-    record = process_error_record(error, operation="publish.prepare")
+def _local_publication_failure(error: Exception, *, operation: str = "publish.prepare") -> StageFailure:
+    record = process_error_record(error, operation=operation)
     detail = record.pop("detail", None)
+    contract_failed = isinstance(error, PublicationError)
     return StageFailure(
-        "publish.local_contract_failed", error.code, error_type=type(error).__name__,
+        "publish.local_contract_failed" if contract_failed else "publish.local_process_failed",
+        error.code if contract_failed else f"{operation} failed",
+        error_type=type(error).__name__,
         detail={**(detail if isinstance(detail, dict) else {"detail": detail}), "exception": record},
     )
-
-
-def _unresolved_local_error(error: Exception, workspace: StageWorkspace, *, operation: str) -> None:
-    record = process_error_record(error, operation=operation)
-    root = workspace.root / "publish-process-errors"
-    root.mkdir(parents=True, exist_ok=True)
-    path = root / f"{operation.rsplit('.', 1)[-1]}.json"
-    write_json(path, record)
-    path.chmod(0o600)
-    raise PublishIncomplete("publish.local_process_unresolved", record) from None
 
 
 def _observe_git_exact(
@@ -1426,7 +1422,7 @@ def _pr_effect(
     except PublicationError as error:
         raise _local_publication_failure(error) from None
     except Exception as error:
-        _unresolved_local_error(error, workspace, operation="publish.pr_observe")
+        raise _local_publication_failure(error, operation="publish.pr_observe") from None
     title_sha256 = digest({"title": title})
     body_sha256 = digest({"body": body})
     if settlement is None:
@@ -2324,10 +2320,8 @@ class PublishHandler:
                 expected_branch_ref=request.branch_ref,
                 expected_head_oid=request.expected_head_oid,
             )
-        except PublicationError as error:
-            raise _local_publication_failure(error) from None
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as error:
-            _unresolved_local_error(error, workspace, operation="publish.snapshot")
+        except (PublicationError, subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as error:
+            raise _local_publication_failure(error, operation="publish.snapshot") from None
         pull_requests = (
             self.pull_requests
             if self.pull_requests is not None
@@ -2392,11 +2386,8 @@ class PublishHandler:
                 inputs = self._prepare(
                     command, claim, workspace, request=request, verify_inputs=False,
                 )
-            except PublicationError as error:
-                raise _local_publication_failure(error) from None
-            staging = workspace.root / "candidate"
-            staging.mkdir()
-            try:
+                staging = workspace.root / "candidate"
+                staging.mkdir()
                 candidate = repository.candidate(
                     publication_root=inputs.publication_root,
                     base_ref=request.base_ref,
@@ -2406,22 +2397,20 @@ class PublishHandler:
                     commit_spec=replace(request.commit, body=inputs.pr_body),
                     staging_root=staging,
                 )
-            except PublicationError as error:
-                raise _local_publication_failure(error) from None
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as error:
-                _unresolved_local_error(error, workspace, operation="publish.git_prepare")
+                plan_path, _plan = _write_publication_plan(
+                    root=workspace.root,
+                    inputs=inputs,
+                    candidate=candidate,
+                )
+                plan_sha256 = file_digest(plan_path)
+            except (PublicationError, subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as error:
+                raise _local_publication_failure(error, operation="publish.git_prepare") from None
             candidate_facts = _PublishedCandidate(
                 commit=candidate.commit,
                 tree=candidate.tree,
                 parents=candidate.parents,
                 subject_sha256=candidate.subject_sha256,
             )
-            plan_path, _plan = _write_publication_plan(
-                root=workspace.root,
-                inputs=inputs,
-                candidate=candidate,
-            )
-            plan_sha256 = file_digest(plan_path)
             publication_subject_sha256 = inputs.publication_subject_sha256
             verification_certificate_sha256 = digest(inputs.certificate)
             pr_title = inputs.pr_title
@@ -2471,7 +2460,7 @@ class PublishHandler:
             except PublicationError as error:
                 raise _local_publication_failure(error) from None
             except Exception as error:
-                _unresolved_local_error(error, workspace, operation="publish.final_readback")
+                raise _local_publication_failure(error, operation="publish.final_readback") from None
             receipt = {
                 "schema_version": PUBLISH_RECEIPT_SCHEMA,
                 "command_id": command.command_id,

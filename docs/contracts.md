@@ -411,6 +411,12 @@ claim 为 `active`；无 open claim 且前置完成但尚未创建/执行后继�
 `StageResult`、满足的完整 effect ledger 与相同 executor；failed/cancelled decision
 必须保留 failure/result 原件，未知 effect 不得被隐藏为确定失败。终态不复写。
 
+Publish 的快照物化、本地候选与发布计划构建、外发文件准备，以及尚未发送 PR 的
+只读查询和已结算后的最终只读核验，发生确定的进程或 I/O 失败时，复用
+`StageFailure` 封存原始退出码、超时与脱敏输出，并由共同 engine 提交失败决策、
+关闭 claim。已经满足的 effect 原件保持不变；已授权发送但结果未知的 Git/PR
+仍保持 UNKNOWN 并只读对账，不能套用本地失败结论或重发。
+
 裁决提交在同一短事务内重读 command、cancellation、claim/fence、完整 effect ledger、
 candidate 与所有祖先资格。completed decision 要求 ledger 与 result 声明完全相等且
 全部 SAT；failed/cancelled decision 拒绝 UNKNOWN/CONFLICT。迟到的 response/timeout
