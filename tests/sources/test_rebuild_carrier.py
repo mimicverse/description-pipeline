@@ -13,7 +13,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from description_pipeline.sources.solidworks.discovery import DiscoverySettings, prepare_native_package
+from tests.sources.preparation_support import prepare_native_package
+from description_pipeline.sources.solidworks.discovery import (
+    DiscoverySettings,
+)
 from description_pipeline.verification.native_discovery import (
     _Failure,
     rebuild_interface_frames,

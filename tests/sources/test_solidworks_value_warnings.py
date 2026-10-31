@@ -1770,6 +1770,7 @@ class ValueWarningTests(unittest.TestCase):
             **authored,
             "xyz": [0.0, 0.0, 0.0],
             "rpy": [0.0, 0.0, 0.0],
+            "provenance": {"default_policy": copy.deepcopy(policy)},
         }
         body_datums = {"base": np.eye(4), "tool": np.eye(4)}
         self.assertEqual(
@@ -1784,6 +1785,21 @@ class ValueWarningTests(unittest.TestCase):
         forged_canonical["default_policy"] = forged["default_policy"]
         with self.assertRaises(PipelineError):
             _joint(node, forged, forged_canonical, {}, body_datums, [], preview=False)
+        for field, value in (
+            ("native_absence", "native_limit_observation_unreadable"),
+            ("native_observation_errors", [{"mate": "limit", "reason": "unreadable"}]),
+        ):
+            with self.subTest(field=field):
+                forged_source = copy.deepcopy(authored)
+                forged_model = copy.deepcopy(canonical)
+                forged_source["default_policy"][field] = value
+                forged_model["provenance"]["default_policy"][field] = value
+                with self.assertRaises(PipelineError):
+                    _joint(node, forged_source, forged_model, {}, body_datums, [], preview=False)
+        forged_model = copy.deepcopy(canonical)
+        forged_model["provenance"]["default_policy"]["author_limits"] = {"lower": -1.0, "upper": 1.0}
+        with self.assertRaises(PipelineError):
+            _joint(node, authored, forged_model, {}, body_datums, [], preview=False)
 
 
 if __name__ == "__main__":

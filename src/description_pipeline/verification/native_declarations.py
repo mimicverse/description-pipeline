@@ -995,15 +995,15 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                     "native position-limit evidence is readable but invalid",
                     {"joint": name, "errors": native_invalid_errors},
                 )
+            _require(
+                native_complete,
+                "v14.native_limits_unreadable",
+                "the native range observation is incomplete or unreadable",
+                joint=name,
+                native=native_limits,
+                errors=native_read_errors,
+            )
             if ranges:
-                _require(
-                    native_complete,
-                    "v14.native_limits_unreadable",
-                    "the native range observation is incomplete or unreadable",
-                    joint=name,
-                    native=native_limits,
-                    errors=native_read_errors,
-                )
                 lower, upper = next(iter(ranges))
                 author_bounds_usable = all(_number(limits.get(key)) for key in ("lower", "upper"))
                 author_range = (float(limits["lower"]), float(limits["upper"])) if author_bounds_usable else None
@@ -1060,6 +1060,12 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                     }
                 )
             elif joint["type"] == "revolute" and purpose == PURPOSE_ENGINEERING:
+                _require(
+                    native_limit_inventory_complete(raw.get("mates")),
+                    "v14.native_limits_unreadable",
+                    "the complete native inventory does not prove absence of enabled position limits",
+                    joint=name,
+                )
                 default_limits = {"lower": -ROTATION_WINDOW_RAD, "upper": ROTATION_WINDOW_RAD}
                 for key in ("effort", "velocity"):
                     if _number(raw_limits.get(key)) and raw_limits[key] >= 0:
@@ -1070,12 +1076,8 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                 state.setdefault("default_policies", {})[name] = rotation_window_policy(
                     ENGINEERING_DEFAULT_POLICY_ID,
                     author_limits=raw_limits,
-                    native_absence=(
-                        "complete_mate_inventory_no_enabled_limit"
-                        if native_complete and native_limit_inventory_complete(raw.get("mates"))
-                        else "native_limit_observation_unreadable"
-                    ),
-                    native_errors=native_read_errors,
+                    native_absence="complete_mate_inventory_no_enabled_limit",
+                    native_errors=[],
                 )
                 diagnostics.append(
                     {
@@ -1087,12 +1089,6 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                         ),
                         "detail": {"joint": name, **state["default_policies"][name]},
                     }
-                )
-            elif not native_complete:
-                raise DeclarationError(
-                    "v14.native_limits_unreadable",
-                    "the native range observation is incomplete or unreadable",
-                    {"joint": name, "native": native_limits, "errors": native_read_errors},
                 )
             elif _all_zero_limits(raw_limits):
                 raise DeclarationError(

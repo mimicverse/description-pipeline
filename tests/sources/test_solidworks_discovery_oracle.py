@@ -18,11 +18,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from tests.sources.preparation_support import prepare_native_package
 from description_pipeline.sources.solidworks.discovery import (
     CONTRACT,
     DISCOVERY_SCHEMA,
     DiscoverySettings,
-    prepare_native_package,
 )
 from description_pipeline.verification import native_discovery
 from description_pipeline.verification.native_discovery import (

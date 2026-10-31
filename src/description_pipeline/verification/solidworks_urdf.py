@@ -969,6 +969,7 @@ def _joint(node, authored, canonical, datums, body_datums, diagnostics, *, previ
         _require(limits["lower"] <= limits["upper"], "Unordered position limits")
     else:
         _require("lower" not in limits and "upper" not in limits, "Continuous joint has position limits")
+    provenance = canonical.get("provenance") if isinstance(canonical.get("provenance"), dict) else {}
     limit_source = authored.get("limit_source")
     _require(
         limit_source in {"native", "declared_author", "preview_policy", "default_policy"},
@@ -1006,19 +1007,21 @@ def _joint(node, authored, canonical, datums, body_datums, diagnostics, *, previ
             "The engineering default window has another rule or qualification",
         )
         _require(
-            policy.get("native_absence")
-            in {"complete_mate_inventory_no_enabled_limit", "native_limit_observation_unreadable"},
+            policy.get("native_absence") == "complete_mate_inventory_no_enabled_limit",
             "The engineering default window has no native-absence evidence",
         )
         _require(
-            isinstance(policy.get("native_observation_errors"), list),
-            "The engineering default window hid native observation errors",
+            policy.get("native_observation_errors") == [],
+            "The engineering default window must have no native observation errors",
         )
         _require(
             limits.get("lower") == -PREVIEW_WINDOW_RAD and limits.get("upper") == PREVIEW_WINDOW_RAD,
             "The engineering default window does not equal the frozen full-turn radius",
         )
-    provenance = canonical.get("provenance") if isinstance(canonical.get("provenance"), dict) else {}
+        _require(
+            provenance.get("default_policy") == policy,
+            "The engineering default window provenance differs from the independent source policy",
+        )
 
     def require_record_binding(source_key, model_key, fields, *, selected):
         source_evidence = authored.get(source_key)

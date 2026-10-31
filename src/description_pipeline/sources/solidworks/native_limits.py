@@ -84,6 +84,12 @@ def rotation_window_policy(
 
     if rule_id not in {INSPECTION_PREVIEW_POLICY_ID, ENGINEERING_DEFAULT_POLICY_ID}:
         raise ValueError("unknown rotation-window policy")
+    if native_absence != "complete_mate_inventory_no_enabled_limit":
+        raise ValueError("rotation windows require proven absence of enabled native limits")
+    if rule_id == ENGINEERING_DEFAULT_POLICY_ID and native_errors != []:
+        raise ValueError("engineering rotation windows require an explicit empty native-error list")
+    if native_errors is not None and (not isinstance(native_errors, list) or native_errors):
+        raise ValueError("rotation windows cannot replace native observation errors")
     policy = {
         "rule_id": rule_id,
         "rule_version": "v1",

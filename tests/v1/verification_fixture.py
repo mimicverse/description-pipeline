@@ -23,7 +23,7 @@ from description_pipeline.io import digest
 from description_pipeline.pipeline.contracts import ArtifactRef
 from description_pipeline.request_evidence import build_request_evidence
 from description_pipeline.runtime import tool_record
-from description_pipeline.sources.solidworks.discovery import prepare_native_package
+from tests.sources.preparation_support import prepare_native_package
 from description_pipeline.sources.solidworks.revision import package_inventory
 from description_pipeline.sources.solidworks.saved_state import normalize_open_status
 from description_pipeline.sources.solidworks.selection import seal_closure_selection

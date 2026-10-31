@@ -554,6 +554,10 @@ def lock(left, right, *, error=0, kind="lock"):
         "suppressed": False,
         "error_code": error,
         "limits": None,
+        "native_limit": None,
+        "is_advanced_mate": None,
+        "is_advanced_mate_error": None,
+        "is_advanced_mate_api": None,
         "entities": [{"component": left, "point": [0, 0, 0]}, {"component": right, "point": [0, 0, 0]}],
     }
 
@@ -1334,7 +1338,7 @@ class NativeDeclarationsTests(unittest.TestCase):
             {item["code"] for item in report["errors"]},
         )
 
-    def test_engineering_unreadable_native_limit_defaults_and_retains_errors(self) -> None:
+    def test_engineering_unreadable_native_limit_blocks_without_a_default(self) -> None:
         raw = zero_limit_values(fixture())
         raw["mates"] = [
             {
@@ -1347,19 +1351,9 @@ class NativeDeclarationsTests(unittest.TestCase):
             }
         ]
         report = verify_declarations(raw, purpose=PURPOSE_ENGINEERING)
-        self.assertTrue(report["passed"], report["errors"])
-        joint = report["carrier"]["joints"][0]
-        self.assertEqual(joint["limit_source"], "default_policy")
-        self.assertEqual(
-            joint["limits"],
-            {"lower": -math.pi, "upper": math.pi, "effort": 0.0, "velocity": 0.0},
-        )
-        policy = joint["default_policy"]
-        self.assertEqual(policy["native_absence"], "native_limit_observation_unreadable")
-        self.assertEqual(
-            policy["native_observation_errors"],
-            [{"mate": "native_lock", "reason": "IsAdvancedMate is missing or unreadable"}],
-        )
+        self.assertFalse(report["passed"])
+        self.assertIn("v14.native_limits_unreadable", {item["code"] for item in report["errors"]})
+        self.assertNotIn("v14.default_policy", {item["code"] for item in report["diagnostics"]})
 
     def test_engineering_invalid_native_limit_evidence_blocks_instead_of_defaulting(self) -> None:
         raw = zero_limit_values(fixture())
