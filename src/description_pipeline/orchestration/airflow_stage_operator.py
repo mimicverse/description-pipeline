@@ -13,6 +13,7 @@ from ..pipeline.application import (
     AirflowTaskBinding,
     ApplicationError,
     StageApplication,
+    ReusedStage,
     application_from_environment,
 )
 from ..pipeline.contracts import (
@@ -199,6 +200,9 @@ class StageTaskOperator(BaseOperator):
 
     def _handle_result(self, result: object) -> dict[str, Any]:
         from ..pipeline.contracts import StagePending
+
+        if isinstance(result, ReusedStage):
+            return result.to_record()
 
         if isinstance(result, StagePending):
             wait_record = result.wait.to_record()

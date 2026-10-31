@@ -351,7 +351,7 @@ def _validate_stage_receipts(
         and all(isinstance(stage, dict) for stage in stages)
         and len(stages) == len(STAGE_IDS)
         and [stage.get("id") for stage in stages] == list(STAGE_IDS),
-        "Stage receipts must list the six engineering stages once in contract order",
+        "Stage receipts must list the seven engineering stages once in contract order",
     )
     by_id = {stage["id"]: stage for stage in stages}
     for stage_id in NATIVE_CAPTURE_SCOPE:

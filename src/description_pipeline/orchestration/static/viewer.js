@@ -142,6 +142,7 @@ export function createViewer(container) {
   })();
 
   viewer = {
+    modelDispose: null,
     scene,
     camera,
     renderer,
@@ -159,6 +160,8 @@ export function createViewer(container) {
 }
 
 export function disposeRobot(viewer) {
+  viewer.modelDispose?.();
+  viewer.modelDispose = null;
   viewer.inspection?.dispose();
   viewer.inspection = null;
   const root = viewer.robotRoot;
@@ -325,6 +328,7 @@ export async function loadRobot(viewer, { urdfUrl, urdfPath, files, artifactUrl,
   requiredName(robot);
 
   disposeRobot(viewer);
+  viewer.grid.visible = true;
   const meshCache = new Map();
   const warnings = [];
   const links = new Map();

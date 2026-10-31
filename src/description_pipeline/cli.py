@@ -23,7 +23,7 @@ CLI_VERSION_PREFIX = "description-pipeline"
 def parser() -> argparse.ArgumentParser:
     commands = argparse.ArgumentParser(
         prog="description",
-        description="Run the canonical six-stage description pipeline.",
+        description="Run the canonical seven-stage description pipeline.",
     )
     commands.add_argument("--version", action="version", version=f"{CLI_VERSION_PREFIX} {__version__}")
     operations = commands.add_subparsers(dest="operation", required=True)

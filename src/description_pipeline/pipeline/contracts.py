@@ -1,4 +1,4 @@
-"""Canonical types shared by the six stages.
+"""Canonical types shared by the engineering stages.
 
 The business outcome is a single immutable decision per stage. Execution rights,
 scheduler activity and external effects are separate facts owned by dedicated
@@ -31,7 +31,7 @@ from ..schemas import (
     STAGE_RESULT_SCHEMA,
 )
 
-StageId = Literal["freeze", "discover", "capture", "generate", "verify", "publish"]
+StageId = Literal["freeze", "discover", "capture", "generate", "verify", "mjcf", "publish"]
 Outcome = Literal["completed", "failed", "cancelled"]
 EffectKind = Literal["airflow_dispatch", "native_operation", "git_ref_update", "pr_upsert"]
 QUALIFICATION_SCHEMA = STAGE_QUALIFICATION_SCHEMA
@@ -732,26 +732,26 @@ class DispatchConf:
 
     schema_version: str
     run_id: str
-    freeze_command_id: str
+    entry_command_id: str
 
     def __post_init__(self) -> None:
         if self.schema_version != AIRFLOW_DISPATCH_CONF_SCHEMA:
             raise ProtocolError("dispatch_conf.schema_unsupported", {"value": self.schema_version})
         _require_identifier(self.run_id, "dispatch_conf.invalid", "run_id")
-        _require_identifier(self.freeze_command_id, "dispatch_conf.invalid", "freeze_command_id")
+        _require_identifier(self.entry_command_id, "dispatch_conf.invalid", "entry_command_id")
 
     def to_record(self) -> dict[str, str]:
         return {
             "schema_version": self.schema_version,
             "run_id": self.run_id,
-            "freeze_command_id": self.freeze_command_id,
+            "entry_command_id": self.entry_command_id,
         }
 
     @classmethod
     def from_record(cls, record: Mapping[str, Any]) -> DispatchConf:
         if not isinstance(record, Mapping):
             raise ProtocolError("dispatch_conf.invalid", {"reason": "not-an-object"})
-        expected = {"schema_version", "run_id", "freeze_command_id"}
+        expected = {"schema_version", "run_id", "entry_command_id"}
         if set(record) != expected:
             raise ProtocolError(
                 "dispatch_conf.invalid",
@@ -767,7 +767,7 @@ class DispatchCommand:
     schema_version: str
     command_id: str
     run_id: str
-    freeze_command_id: str
+    entry_command_id: str
     idempotency_key: str
     dag_id: str
     dag_run_id: str
@@ -780,7 +780,7 @@ class DispatchCommand:
             raise ProtocolError("dispatch.schema_unsupported", {"value": self.schema_version})
         _require_identifier(self.command_id, "dispatch.invalid", "command_id")
         _require_identifier(self.run_id, "dispatch.invalid", "run_id")
-        _require_identifier(self.freeze_command_id, "dispatch.invalid", "freeze_command_id")
+        _require_identifier(self.entry_command_id, "dispatch.invalid", "entry_command_id")
         _require_text(self.idempotency_key, "dispatch.invalid", "idempotency_key")
         _require_identifier(self.dag_id, "dispatch.invalid", "dag_id")
         _require_identifier(self.dag_run_id, "dispatch.invalid", "dag_run_id")
@@ -809,7 +809,7 @@ class DispatchCommand:
             "dag_id": self.dag_id,
             "dag_run_id": self.dag_run_id,
             "expected_executor_sha256": self.expected_executor_sha256,
-            "freeze_command_id": self.freeze_command_id,
+            "entry_command_id": self.entry_command_id,
             "idempotency_key": self.idempotency_key,
             "run_id": self.run_id,
             "schema_version": self.schema_version,
@@ -821,7 +821,7 @@ class DispatchCommand:
         *,
         command_id: str,
         run_id: str,
-        freeze_command_id: str,
+        entry_command_id: str,
         idempotency_key: str,
         dag_id: str,
         dag_run_id: str,
@@ -832,7 +832,7 @@ class DispatchCommand:
             "schema_version": DISPATCH_COMMAND_SCHEMA,
             "command_id": command_id,
             "run_id": run_id,
-            "freeze_command_id": freeze_command_id,
+            "entry_command_id": entry_command_id,
             "idempotency_key": idempotency_key,
             "dag_id": dag_id,
             "dag_run_id": dag_run_id,
@@ -855,7 +855,7 @@ class DispatchCommand:
             "dag_id",
             "dag_run_id",
             "expected_executor_sha256",
-            "freeze_command_id",
+            "entry_command_id",
             "idempotency_key",
             "request_digest",
             "run_id",
@@ -870,7 +870,7 @@ class DispatchCommand:
             schema_version=record["schema_version"],
             command_id=record["command_id"],
             run_id=record["run_id"],
-            freeze_command_id=record["freeze_command_id"],
+            entry_command_id=record["entry_command_id"],
             idempotency_key=record["idempotency_key"],
             dag_id=record["dag_id"],
             dag_run_id=record["dag_run_id"],
@@ -1712,11 +1712,19 @@ def project_run_status(
     effect_states: tuple[str, ...],
     pending_effect_states: tuple[str, ...] = (),
     expired_claim: bool = False,
+    from_stage: StageId | None = None,
 ) -> RunStatus:
     """Derive a run status from ordered stage decisions and effect facts."""
 
     if len(stage_outcomes) != len(STAGE_IDS):
-        raise ProtocolError("run_status.invalid", {"reason": "six-stage-outcomes-required"})
+        raise ProtocolError("run_status.invalid", {"reason": "complete-stage-outcome-vector-required"})
+    if from_stage not in {None, "freeze", "mjcf"}:
+        raise ProtocolError("run_status.invalid", {"where": "from_stage"})
+    if from_stage == "mjcf":
+        start = STAGE_IDS.index("mjcf")
+        if any(outcome is not None for outcome in stage_outcomes[:start]):
+            raise ProtocolError("run_status.invalid", {"reason": "reused-upstream-has-new-decisions"})
+        stage_outcomes = stage_outcomes[start:]
     unresolved_effect_states = list(effect_states)
     for state in pending_effect_states:
         if state != "unknown" or "unknown" not in unresolved_effect_states:

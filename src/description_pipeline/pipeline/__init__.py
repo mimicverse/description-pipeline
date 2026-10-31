@@ -1,4 +1,4 @@
-"""Shared six-stage pipeline primitives.
+"""Shared seven-stage pipeline primitives.
 
 Import concrete submodules directly. This package intentionally has no eager
 compatibility exports so native-only consumers do not load the stage graph.

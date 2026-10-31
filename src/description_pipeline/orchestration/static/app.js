@@ -31,6 +31,9 @@ const state = {
   user: null,
   dagRunId: null,
   previewSubject: null,
+  previewKey: null,
+  previewFormat: "urdf",
+  mjcfView: null,
   previewRequest: null,
   previewFiles: null,
   previewData: null,
@@ -96,6 +99,7 @@ const TASK_LABELS = {
   capture: "Capture evidence",
   generate: "Generate URDF",
   verify: "Independent verification",
+  mjcf: "Convert and verify MJCF",
   publish: "Publish review PR",
 };
 const CHECK_STATES = { passed: "Passed", failed: "Failed", not_run: "Not run", unsupported: "Unsupported" };
@@ -601,12 +605,18 @@ function clearPreview() {
   if (state.previewRequest) state.previewRequest.abort();
   state.previewRequest = null;
   state.previewSubject = null;
+  state.previewKey = null;
   state.previewFiles = null;
   state.previewData = null;
   state.previewCollapsed = false;
   state.previewCollapseFor = null;
   state.controls = null;
   if (state.viewer) disposeRobot(state.viewer);
+  state.mjcfView = null;
+  state.previewFormat = "urdf";
+  $("preview-format").value = "urdf";
+  $("mjcf-tools").hidden = true;
+  $("mjcf-status").hidden = true;
   $("viewer-card").hidden = true;
   $("viewer-placeholder").hidden = false;
   $("preview-meta").textContent = "";
@@ -1908,18 +1918,21 @@ function renderStepper() {
     label.textContent = stage.name || stage.id;
     const meta = document.createElement("span");
     meta.className = "step-meta";
-    if (!Number.isFinite(stage.total) || stage.total <= 0) {
+    const reused = stage.reuse?.reused === true;
+    if (reused) {
+      meta.textContent = "Reused";
+    } else if (!Number.isFinite(stage.total) || stage.total <= 0) {
       // No recorded checks: a short neutral state word instead of a failed percentage.
       meta.textContent = STEP_STATE_SHORT[shownState] || stage.stateLabel;
     } else {
       meta.textContent = `${Number.isFinite(stage.passed) ? stage.passed : 0}/${stage.total} passed`;
     }
     const warningCount = Number.isFinite(stage.counts.warnings) ? stage.counts.warnings : 0;
-    const tooltip = `${stage.name} · ${stage.stateLabel}${warningCount > 0 ? ` · warnings ${warningCount}` : ""}${
+    const tooltip = `${stage.name} · ${reused ? "Reused" : stage.stateLabel}${warningCount > 0 ? ` · warnings ${warningCount}` : ""}${
       Number.isFinite(stage.total) && stage.total > 0
-        ? ` · passed ${Number.isFinite(stage.passed) ? stage.passed : 0}/${stage.total} · executed ${
-            Number.isFinite(stage.executed) ? stage.executed : 0
-          }/${stage.total}`
+        ? ` · ${reused ? "source checks passed" : "passed"} ${Number.isFinite(stage.passed) ? stage.passed : 0}/${stage.total}${
+            reused ? "" : ` · executed ${Number.isFinite(stage.executed) ? stage.executed : 0}/${stage.total}`
+          }`
         : ""
     }`;
     step.title = tooltip;
@@ -1954,6 +1967,10 @@ function renderStepper() {
 function renderRerunPanel(run) {
   const host = $("stage-rerun");
   if (!host) return;
+  const policyInput = host.querySelector("textarea");
+  if (policyInput && document.activeElement === policyInput && host.dataset.runId === run.dag_run_id) return;
+  const policyOpen = host.querySelector("details")?.open === true;
+  host.dataset.runId = run.dag_run_id;
   host.textContent = "";
   const rows = Array.isArray(run.stage_reruns) ? run.stage_reruns : null;
   const stage = state.stages[state.selectedStage];
@@ -1961,7 +1978,7 @@ function renderRerunPanel(run) {
     host.hidden = true;
     return;
   }
-  if (stage.id !== "freeze") {
+  if (!["freeze", "mjcf"].includes(stage.id)) {
     host.hidden = true;
     return;
   }
@@ -1975,6 +1992,36 @@ function renderRerunPanel(run) {
   const options = row && Array.isArray(row.main_assembly_options)
     ? row.main_assembly_options.filter((value) => typeof value === "string" && value)
     : [];
+  if (stage.id === "mjcf") {
+    const button = document.createElement("button"); button.type = "button";
+    button.textContent = busy ? "Creating MJCF request..." : "Rerun MJCF";
+    button.disabled = busy || !canManage || !eligible || deleted;
+    button.onclick = () => { void rerunFromStage("mjcf"); };
+    const note = document.createElement("p"); note.className = "muted small";
+    note.textContent = deleted ? "This run is deleted; restore it before rerunning." : !canManage
+      ? "Only the initiator or a platform administrator can rerun." : row?.message || "Source verification is unavailable.";
+    const label = document.createElement("label"); label.textContent = "Simulation policy (JSON)";
+    const policy = document.createElement("textarea"); policy.id = "mjcf-policy";
+    policy.value = state.rerunMainByRun[`${runId}:mjcf`] || row?.simulation || "{}";
+    policy.disabled = busy || !canManage || deleted;
+    policy.oninput = () => {
+      state.rerunMainByRun[`${runId}:mjcf`] = policy.value;
+      delete state.rerunKeyByRun[`${runId}:mjcf`];
+    };
+    label.append(policy);
+    const advanced = document.createElement("details"); advanced.open = policyOpen;
+    const advancedTitle = document.createElement("summary"); advancedTitle.textContent = "Advanced simulation settings";
+    advanced.append(advancedTitle, label); host.append(button, note, advanced);
+    if (row?.source_dag_run_id) {
+      const source = document.createElement("a");
+      source.href = `/?run=${encodeURIComponent(row.source_dag_run_id)}`;
+      source.textContent = `Verified input source: ${row.source_dag_run_id}`;
+      source.onclick = (event) => { event.preventDefault(); void selectRun(row.source_dag_run_id); };
+      host.append(source);
+    }
+    if (state.rerunError) { const error = document.createElement("p"); error.className = "error"; error.textContent = state.rerunError; host.append(error); }
+    return;
+  }
   const savedMain = typeof state.rerunMainByRun[runId] === "string" ? state.rerunMainByRun[runId] : "";
   const originalMain = typeof run.main_assembly === "string" ? run.main_assembly : "";
   const selectedMain = options.includes(savedMain)
@@ -2099,9 +2146,10 @@ function renderRerunPanel(run) {
 async function rerunFromStage(stageId) {
   const run = state.lastRun;
   const runId = state.dagRunId;
-  if (stageId !== "freeze") return;
+  if (!["freeze", "mjcf"].includes(stageId)) return;
   if (!run || !runId || state.rerunningRunId !== null || run.can_manage !== true || !stageId) return;
   const body = { stage: stageId };
+  if (stageId === "freeze") {
   let selectedMain = "";
   const row = (Array.isArray(run.stage_reruns) ? run.stage_reruns : [])
     .find((item) => item && item.stage === "freeze");
@@ -2118,8 +2166,13 @@ async function rerunFromStage(stageId) {
     return;
   }
   body.main_assembly = selectedMain;
-  state.rerunKeyByRun[runId] ||= requestKey();
-  const idempotencyKey = state.rerunKeyByRun[runId];
+  } else {
+    body.simulation = document.getElementById("mjcf-policy").value;
+    try { JSON.parse(body.simulation); } catch { state.rerunError = "Simulation policy must be valid JSON."; renderRerunPanel(run); return; }
+  }
+  const requestSlot = stageId === "freeze" ? runId : `${runId}:mjcf`;
+  state.rerunKeyByRun[requestSlot] ||= requestKey();
+  const idempotencyKey = state.rerunKeyByRun[requestSlot];
   state.rerunningRunId = runId;
   state.rerunNotice = "";
   state.rerunError = "";
@@ -2130,8 +2183,8 @@ async function rerunFromStage(stageId) {
       body,
       idempotencyKey,
     });
-    const nextRunId = responseRunId(payload, `portal-freeze-${idempotencyKey}`);
-    if (state.rerunKeyByRun[runId] === idempotencyKey) delete state.rerunKeyByRun[runId];
+    const nextRunId = responseRunId(payload, `portal-${stageId}-${idempotencyKey}`);
+    if (state.rerunKeyByRun[requestSlot] === idempotencyKey) delete state.rerunKeyByRun[requestSlot];
     const stageToShow = String(payload.resume_from || stageId);
     await refreshRuns();
     if (state.dagRunId !== runId) return; // the operator moved on; the list is refreshed
@@ -2621,17 +2674,79 @@ async function loadPreview(dagRunId) {
     const preview = await api(`/api/runs/${encodeURIComponent(dagRunId)}/preview`, { signal: request.signal });
     if (request.signal.aborted || state.dagRunId !== dagRunId) return;
     renderPreviewDiagnostic(preview);
-    if (state.previewSubject === preview.subject_sha256) return;
+    const selector = $("preview-format");
+    selector.querySelector('[value="mjcf"]').disabled = !preview.mjcf;
+    selector.querySelector('[value="urdf"]').disabled = !preview.urdf;
+    if (!preview.urdf) state.previewFormat = "mjcf";
+    if (!preview.mjcf && state.previewFormat === "mjcf") state.previewFormat = "urdf";
+    selector.value = state.previewFormat;
+    const previewKey = `${preview.subject_sha256}:${preview.mjcf?.certificate?.sha256 || ""}:${state.previewFormat}`;
+    if (state.previewKey === previewKey) return;
     $("preview-meta").textContent = `Delivery subject ${String(preview.subject_sha256).slice(0, 12)}... · URDF ${preview.urdf}`;
     note.hidden = true;
     setError($("preview-note"), "");
     state.viewer = ensureSingleViewer(state, () => createViewer($("viewer"))).viewer;
+    disposeRobot(state.viewer);
+    state.mjcfView = null;
+    state.controls = null;
+    $("joint-controls").replaceChildren();
+    note.textContent = "Loading the selected model format...";
+    note.hidden = false;
     const artifactUrl = (name) =>
       `/api/runs/${encodeURIComponent(dagRunId)}/artifacts/${String(name)
         .split("/")
         .map(encodeURIComponent)
         .join("/")}`;
-    const loaded = await loadRobot(state.viewer, {
+    const isMJCF = state.previewFormat === "mjcf";
+    $("mjcf-tools").hidden = !isMJCF;
+    $("mjcf-status").hidden = !isMJCF;
+    $("mjcf-evidence").hidden = !isMJCF;
+    $("preview-panels").hidden = isMJCF;
+    let loaded;
+    if (isMJCF) {
+      const { loadMJCF } = await import("/static/mjcf_viewer.js");
+      loaded = await loadMJCF(state.viewer, { descriptor: preview.mjcf, artifactUrl, signal: request.signal,
+        onStatus: (status) => {
+          if (status.error) { setError($("preview-note"), status.error); return; }
+          state.controls?.refresh();
+          $("mjcf-play").textContent = status.playing ? "Pause" : "Play";
+          $("mjcf-status").textContent = `MuJoCo ${preview.mjcf.engine.mujoco} · ${status.time.toFixed(3)} s · ${status.contacts} contacts · ${status.bodies} bodies · ${status.geoms} geoms. No controller qualification.`;
+        },
+      });
+      state.mjcfView = loaded;
+      const collision = preview.mjcf.collision || {};
+      const proxies = collision.mesh_proxies || [];
+      const linkSelect = $("mjcf-link"); linkSelect.replaceChildren();
+      for (const name of ["", ...new Set([...(loaded.links || []), ...proxies.map((proxy) => proxy.link)])]) {
+        const option = document.createElement("option"); option.value = name; option.textContent = name || "All links"; linkSelect.append(option);
+      }
+      const showCollision = () => {
+        const selected = proxies.filter((proxy) => !linkSelect.value || proxy.link === linkSelect.value);
+        loaded.selectLink(linkSelect.value);
+        const text = `Collision source: ${preview.mjcf.facts.collision_source} · ${selected.length} mesh proxies · vertex budget ${collision.vertex_budget ?? "n/a"} · error budget ${collision.max_error_m ?? "n/a"} m. ${collision.scope || ""}`;
+        $("mjcf-collision-info").textContent = text;
+        for (const proxy of selected) {
+          const row = document.createElement("p"); row.className = "muted small";
+          row.textContent = `${proxy.link} · ${proxy.geom} · ${proxy.actual_vertices} vertices · convex distance ${proxy.complete_convex_vertex_distance_m} m · ${(proxy.source_meshes || []).join(", ")}`;
+          $("mjcf-collision-info").append(row);
+        }
+      };
+      linkSelect.onchange = showCollision; showCollision();
+      $("mjcf-warnings").replaceChildren();
+      for (const warning of preview.mjcf.warnings || []) { const item = document.createElement("li"); item.textContent = warning; $("mjcf-warnings").append(item); }
+      loaded.setMode($("mjcf-mode").value); loaded.setMarkers($("mjcf-markers").checked);
+      $("preview-meta").textContent = `MJCF ${preview.mjcf.entry} · ${preview.mjcf.verified ? "Verified" : "Diagnostic"} · ${preview.mjcf.subject_sha256.slice(0, 12)}...`;
+      const evidence = document.createElement("a"); evidence.href = artifactUrl(preview.mjcf.certificate.path);
+      evidence.textContent = "Collision approximation and source warnings"; evidence.target = "_blank"; evidence.rel = "noopener";
+      $("preview-meta").append(" · ", evidence);
+      for (const name of ["mjcf/robot.xml", ...(preview.mjcf.files["mjcf/scene.xml"] ? ["mjcf/scene.xml"] : [])]) {
+        const download = document.createElement("a"); download.href = artifactUrl(name);
+        download.download = name.split("/").pop(); download.textContent = `Download ${download.download}`;
+        $("preview-meta").append(" · ", download);
+      }
+    } else {
+      state.mjcfView = null;
+      loaded = await loadRobot(state.viewer, {
       urdfUrl: artifactUrl(preview.urdf),
       urdfPath: preview.urdf,
       files: preview.files,
@@ -2644,15 +2759,21 @@ async function loadPreview(dagRunId) {
         }
       },
     });
+    }
     if (request.signal.aborted || state.dagRunId !== dagRunId) return;
-    createInspection(state.viewer, loaded, $("inspection-controls"), {
-      onPoseChange: () => state.controls?.refresh(),
-    });
+    note.hidden = true;
+    $("inspection-controls").hidden = isMJCF;
+    if (!isMJCF) {
+      createInspection(state.viewer, loaded, $("inspection-controls"), {
+        onPoseChange: () => state.controls?.refresh(),
+      });
+    }
     state.controls = buildJointControls($("joint-controls"), loaded.joints, {
       onInput: () => state.viewer.inspection?.update(),
     });
     $("joints-title").textContent = `Joint controls (${loaded.joints.length})`;
-    state.previewSubject = preview.subject_sha256;
+    state.previewKey = previewKey;
+    state.previewSubject = isMJCF ? preview.mjcf.subject_sha256 : preview.subject_sha256;
     state.previewFiles = preview.files || {};
     if (state.previewCollapseFor !== dagRunId) {
       state.previewCollapseFor = dagRunId;
@@ -2662,7 +2783,8 @@ async function loadPreview(dagRunId) {
         state.previewCollapsed = false;
       }
     }
-    await renderPreviewPanels(preview, loaded.records, artifactUrl, request.signal);
+    if (!isMJCF) await renderPreviewPanels(preview, loaded.records, artifactUrl, request.signal);
+    else $("preview-info").textContent = "";
     if (request.signal.aborted || state.dagRunId !== dagRunId) return;
     if (state.lastRun) renderRun(state.lastRun);
     $("viewer-card").hidden = false;
@@ -2675,6 +2797,7 @@ async function loadPreview(dagRunId) {
     if (state.viewer) disposeRobot(state.viewer);
     state.controls = null;
     state.previewSubject = null;
+  state.previewKey = null;
     state.previewFiles = null;
     state.previewData = null;
     if (state.lastRun) renderRun(state.lastRun);
@@ -2939,6 +3062,16 @@ function wire() {
     if (state.controls) state.controls.reset();
   });
   $("preview-collapse").addEventListener("click", togglePreviewCollapse);
+  $("preview-format").addEventListener("change", () => {
+    state.previewFormat = $("preview-format").value;
+    state.previewRequest?.abort(); state.previewRequest = null;
+    void loadPreview(state.dagRunId);
+  });
+  $("mjcf-mode").onchange = () => state.mjcfView?.setMode($("mjcf-mode").value);
+  $("mjcf-markers").onchange = () => state.mjcfView?.setMarkers($("mjcf-markers").checked);
+  $("mjcf-play").onclick = () => state.mjcfView?.togglePlay();
+  $("mjcf-step").onclick = () => state.mjcfView?.step();
+  $("mjcf-reset").onclick = () => { state.mjcfView?.reset(); state.controls?.refresh(); };
 }
 
 async function boot() {

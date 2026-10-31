@@ -151,7 +151,7 @@ class CancellationPostgresTests(unittest.TestCase):
         conf = DispatchConf(
             schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
             run_id=admission.run_id,
-            freeze_command_id=command.command_id,
+            entry_command_id=command.command_id,
         )
         conf_artifact = self.artifacts.seal_dispatch_conf(
             conf,
@@ -161,7 +161,7 @@ class CancellationPostgresTests(unittest.TestCase):
         dispatch = DispatchCommand.create(
             command_id="dispatch-" + admission.run_id,
             run_id=admission.run_id,
-            freeze_command_id=command.command_id,
+            entry_command_id=command.command_id,
             idempotency_key=f"{admission.run_id}/dispatch",
             dag_id="solidworks_to_urdf",
             dag_run_id=f"portal-{admission.run_id}",

@@ -9,7 +9,7 @@ from ..repository.publish import (
 )
 from ..schemas import PUBLISH_REQUEST_SCHEMA
 
-PUBLISH_OUTPUT_CONTRACT = "solidworks-to-urdf.publication-artifact/v1"
+PUBLISH_OUTPUT_CONTRACT = "solidworks-to-urdf.publication-artifact/v2"
 REPOSITORY_SNAPSHOT_KIND = "repository_snapshot"
 
 __all__ = [

@@ -55,7 +55,7 @@ globalThis.fetch = async (url) => {
   return { ok: true, text: async () => "fixture", arrayBuffer: async () => mesh };
 };
 function viewer() {
-  return { robotRoot: new THREE.Group(), orbit: { target: new THREE.Vector3() }, camera: new THREE.PerspectiveCamera(), updateCamera() {}, frame() {} };
+  return { grid: {visible:true}, robotRoot: new THREE.Group(), orbit: { target: new THREE.Vector3() }, camera: new THREE.PerspectiveCamera(), updateCamera() {}, frame() {} };
 }
 const files = { "urdf/robot.urdf": "registered", "meshes/exact.stl": "registered", "other/exact.stl": "registered" };
 async function load(root = model()) {

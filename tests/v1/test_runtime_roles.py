@@ -212,7 +212,7 @@ class RuntimeRoleTests(unittest.TestCase):
         self.assertEqual(support["hosts"]["windows"], ["discover", "capture"])
         self.assertEqual(
             support["hosts"]["linux"],
-            ["freeze", "discover", "capture", "generate", "verify", "publish"],
+            ["freeze", "discover", "capture", "generate", "verify", "mjcf", "publish"],
         )
 
     def test_the_schema_digest_covers_the_actual_definitions(self):

@@ -22,12 +22,13 @@ const response = (status, payload, raw = false) => ({
 });
 function element(id = "") {
   const node = {
-    id, hidden: false, disabled: false, value: "", textContent: "", children: [], handlers: {}, style: {},
+    id, hidden: false, disabled: false, value: "", textContent: "", children: [], handlers: {}, style: {}, dataset: {},
     classList: { toggle() {}, add() {}, remove() {} },
     addEventListener(name, handler) { this.handlers[name] = handler; },
     append(...children) { this.children.push(...children); },
     replaceChildren(...children) { this.children = children; },
     querySelectorAll() { return []; },
+    querySelector() { return null; },
     setAttribute() {}, focus() {}, select() {},
   };
   let text = "";

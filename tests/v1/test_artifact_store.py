@@ -226,7 +226,7 @@ class ArtifactStoreTests(unittest.TestCase):
         conf = DispatchConf(
             schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
             run_id="run-1",
-            freeze_command_id="command-freeze",
+            entry_command_id="command-freeze",
         )
         artifact = self.store.seal_dispatch_conf(
             conf,
@@ -237,7 +237,7 @@ class ArtifactStoreTests(unittest.TestCase):
         self.assertIsNone(artifact.producer_stage)
         self.assertEqual(self.store.read_dispatch_conf(artifact), conf)
         records = json.loads((self.store.objects / artifact.artifact_id / "conf.json").read_text(encoding="utf-8"))
-        self.assertEqual(set(records), {"schema_version", "run_id", "freeze_command_id"})
+        self.assertEqual(set(records), {"schema_version", "run_id", "entry_command_id"})
 
     def test_import_object_preserves_manifest_bytes_and_historical_producer(self) -> None:
         artifact = self.seal(self.source("historical-source"))

@@ -12,6 +12,8 @@ import threading
 import time
 import unittest
 import uuid
+from contextlib import ExitStack
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -57,6 +59,8 @@ from description_pipeline.pipeline.freeze import (
 )
 from description_pipeline.pipeline.ingestion import (
     ProductionAdmissionRequest,
+    ProductionAdmissionFactory,
+    ProductionMJCFSuccessorRequest,
     ProductionFreezeSuccessorRequest,
     ReceivedUploadReceipt,
     load_production_admission,
@@ -68,6 +72,7 @@ from description_pipeline.pipeline.services import (
 )
 from description_pipeline.pipeline.reconciliation import EffectReconciliationService
 from description_pipeline.pipeline.stages.generate import GenerateHandler
+from description_pipeline.pipeline.stages.mjcf import MJCFHandler
 from description_pipeline.pipeline.stages.publish import (
     PR_EFFECT_KEY,
     PublishHandler,
@@ -221,7 +226,7 @@ class RealSixStageChainTests(unittest.TestCase):
             )
 
         self.publish = PublishFixture()
-        self.addCleanup(self.publish.temporary.cleanup)
+        self.addCleanup(self.publish.close)
         git_target = patch(
             "description_pipeline.pipeline.ingestion.validate_git_remote",
             return_value=str(self.publish.remote),
@@ -261,6 +266,10 @@ class RealSixStageChainTests(unittest.TestCase):
         self.native["release"] = copy.deepcopy(release)
         self.portable["source_sha256"] = release["source_sha256"]
         self.native["source_sha256"] = release["source_sha256"]
+        mjcf_identity = patch("description_pipeline.mjcf_contract.tool_record",
+                              side_effect=lambda **_kwargs: copy.deepcopy(self.portable))
+        mjcf_identity.start()
+        self.addCleanup(mjcf_identity.stop)
 
         self.handoff_root = self.root / "handoff"
         self.upload_root = self.handoff_root / "run-produced"
@@ -468,7 +477,7 @@ class RealSixStageChainTests(unittest.TestCase):
                 "id": "solidworks_to_urdf",
                 "path": "/srv/description/dags/solidworks_to_urdf.py",
                 "digest": digest({"dag": "fixture"}),
-                "tasks": 6,
+                "tasks": 7,
             },
             "ends": {
                 "linux": {
@@ -577,6 +586,7 @@ class RealSixStageChainTests(unittest.TestCase):
                         self.portable
                     )
                 ),
+                "mjcf": MJCFHandler(self.store),
                 "publish": PublishHandler(
                     self.store,
                     pull_requests=self.pull_requests,
@@ -662,7 +672,7 @@ class RealSixStageChainTests(unittest.TestCase):
                 "SELECT stage, outcome FROM stage_decision "
                 "WHERE run_id = %s "
                 "ORDER BY array_position("
-                "ARRAY['freeze','discover','capture','generate','verify','publish'],"
+                "ARRAY['freeze','discover','capture','generate','verify','mjcf','publish'],"
                 " stage)",
                 (RUN_ID,),
             )
@@ -675,9 +685,65 @@ class RealSixStageChainTests(unittest.TestCase):
                 ("capture", "completed"),
                 ("generate", "completed"),
                 ("verify", "completed"),
+                ("mjcf", "completed"),
                 ("publish", "completed"),
             ],
         )
+
+    def test_mjcf_only_successor_uses_real_qualified_inputs_without_upstream_execution(self) -> None:
+        application = self._application()
+        work = self.root / "mjcf-successor-factory"
+        work.mkdir()
+        snapshot = self._platform_snapshot()
+        factory = ProductionAdmissionFactory(
+            artifacts=self.store, platform_snapshot=snapshot, native_tool_provider=lambda: copy.deepcopy(self.native),
+            portable_tool_provider=lambda: copy.deepcopy(self.portable), work_root=work,
+            clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
+        )
+        with (
+            patch("description_pipeline.runtime.tool_record", return_value=copy.deepcopy(self.native)),
+            patch("description_pipeline.pipeline.stages.generate.tool_record",
+                  return_value=copy.deepcopy(self.portable)),
+            patch("description_pipeline.pipeline.stages.publish.tool_record",
+                  return_value=copy.deepcopy(self.portable)),
+        ):
+            prepared = factory.prepare(self._production_request())
+            source = replace(prepared.spec,
+                             simulation='{"collision":{"source":"visual_convex","max_vertices":4,"max_error_m":1e-12}}')
+            application.admit(source)
+            failed = application.execute_run(source.run_id)
+            self.assertEqual(("mjcf", "failed"), (failed.stage, failed.outcome))
+            with self._connect() as connection, connection.cursor() as cursor:
+                cursor.execute("SELECT stage, result_digest FROM stage_decision WHERE run_id = %s ORDER BY stage",
+                               (source.run_id,))
+                before = cursor.fetchall()
+            def forbidden_native():
+                raise AssertionError("MJCF rerun contacted the native endpoint")
+            factory.native_tool_provider = forbidden_native
+            rerun = ProductionMJCFSuccessorRequest(
+                run_id="mjcf-only-run", request_id="mjcf-only-request", parent_run_id=source.run_id,
+                principal=source.principal, change_summary="Use a qualified collision budget",
+                simulation='{"collision":{"max_vertices":128}}',
+            )
+            with ExitStack() as stack:
+                for stage in ("freeze", "discover", "capture", "generate", "verify"):
+                    stack.enter_context(patch.object(application.handlers[stage], "execute",
+                                                     side_effect=AssertionError("Upstream execution was repeated")))
+                admitted = factory.admit_mjcf(application, rerun)
+                self.assertEqual("mjcf", admitted.entry_command.stage)
+                self.assertEqual(admitted, factory.admit_mjcf(application, rerun))
+                for stage in ("freeze", "discover", "capture", "generate", "verify"):
+                    reuse = application.run_stage(rerun.run_id, stage).to_record()
+                    self.assertEqual(("reused", source.run_id), (reuse["outcome"], reuse["source_run_id"]))
+                completed = application.execute_run(rerun.run_id)
+                self.assertEqual(("publish", "completed"), (completed.stage, completed.outcome), completed)
+            with self._connect() as connection, connection.cursor() as cursor:
+                cursor.execute("SELECT stage, outcome FROM stage_decision WHERE run_id = %s ORDER BY stage",
+                               (rerun.run_id,))
+                self.assertEqual([("mjcf", "completed"), ("publish", "completed")], cursor.fetchall())
+                cursor.execute("SELECT stage, result_digest FROM stage_decision WHERE run_id = %s ORDER BY stage",
+                               (source.run_id,))
+                self.assertEqual(before, cursor.fetchall())
 
     def _assert_published_change_summary(self, spec: AdmissionSpec, summary: str) -> None:
         branch = spec.publish_intent.repository.branch_ref
@@ -925,7 +991,7 @@ class RealSixStageChainTests(unittest.TestCase):
                 portable_tool_provider=lambda: copy.deepcopy(self.portable),
             )
             freeze = parent_application.execute_registered_command(
-                parent.freeze_command.command_id
+                parent.entry_command.command_id
             )
         self.assertEqual(freeze.outcome, "completed")
         parent_spec = AdmissionSpec.from_record(parent.admission.request)
@@ -1040,7 +1106,7 @@ class RealSixStageChainTests(unittest.TestCase):
                 "SELECT stage, outcome FROM stage_decision "
                 "WHERE run_id = %s "
                 "ORDER BY array_position("
-                "ARRAY['freeze','discover','capture','generate','verify','publish'],"
+                "ARRAY['freeze','discover','capture','generate','verify','mjcf','publish'],"
                 " stage)",
                 (SUCCESSOR_RUN_ID,),
             )
@@ -1053,6 +1119,7 @@ class RealSixStageChainTests(unittest.TestCase):
                 ("capture", "completed"),
                 ("generate", "completed"),
                 ("verify", "completed"),
+                ("mjcf", "completed"),
                 ("publish", "completed"),
             ],
         )
@@ -1106,7 +1173,7 @@ class RealSixStageChainTests(unittest.TestCase):
                 "SELECT stage, outcome FROM stage_decision "
                 "WHERE run_id = %s "
                 "ORDER BY array_position("
-                "ARRAY['freeze','discover','capture','generate','verify','publish'],"
+                "ARRAY['freeze','discover','capture','generate','verify','mjcf','publish'],"
                 " stage)",
                 (RUN_ID,),
             )
@@ -1178,7 +1245,7 @@ class RealSixStageChainTests(unittest.TestCase):
                 "SELECT stage, outcome FROM stage_decision "
                 "WHERE run_id = %s "
                 "ORDER BY array_position("
-                "ARRAY['freeze','discover','capture','generate','verify','publish'],"
+                "ARRAY['freeze','discover','capture','generate','verify','mjcf','publish'],"
                 " stage)",
                 (RUN_ID,),
             )
@@ -1190,6 +1257,7 @@ class RealSixStageChainTests(unittest.TestCase):
                     ("capture", "completed"),
                     ("generate", "completed"),
                     ("verify", "completed"),
+                ("mjcf", "completed"),
                 ],
             )
 
@@ -1252,7 +1320,7 @@ class RealSixStageChainTests(unittest.TestCase):
                 "SELECT stage, outcome FROM stage_decision "
                 "WHERE run_id = %s "
                 "ORDER BY array_position("
-                "ARRAY['freeze','discover','capture','generate','verify','publish'],"
+                "ARRAY['freeze','discover','capture','generate','verify','mjcf','publish'],"
                 " stage)",
                 (RUN_ID,),
             )
@@ -1264,6 +1332,7 @@ class RealSixStageChainTests(unittest.TestCase):
                     ("capture", "completed"),
                     ("generate", "completed"),
                     ("verify", "completed"),
+                ("mjcf", "completed"),
                     ("publish", "completed"),
                 ],
             )
@@ -1353,7 +1422,7 @@ class RealSixStageChainTests(unittest.TestCase):
                 "SELECT stage, outcome FROM stage_decision "
                 "WHERE run_id = %s "
                 "ORDER BY array_position("
-                "ARRAY['freeze','discover','capture','generate','verify','publish'],"
+                "ARRAY['freeze','discover','capture','generate','verify','mjcf','publish'],"
                 " stage)",
                 (RUN_ID,),
             )

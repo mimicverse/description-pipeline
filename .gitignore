@@ -9,3 +9,5 @@ __pycache__/
 .ruff_cache/
 .coverage
 /src/description_pipeline/tool-release.json
+
+/.dev/

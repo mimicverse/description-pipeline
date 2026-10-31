@@ -345,13 +345,20 @@ class DerivedStateTests(unittest.TestCase):
         )
         self.assertEqual(
             project_run_status(
-                stage_outcomes=("completed", "failed", None, None, None, None),
+                stage_outcomes=("completed", "failed", None, None, None, None, None),
                 effect_states=("conflict",),
             ),
             RunStatus.UNRESOLVED,
         )
 
     def test_stage_and_run_status_are_derived(self) -> None:
+        self.assertEqual(
+            project_run_status(stage_outcomes=(None,) * 5 + ("completed", "completed"),
+                               effect_states=(), from_stage="mjcf"),
+            RunStatus.SUCCEEDED,
+        )
+        with self.assertRaises(ProtocolError):
+            project_run_status(stage_outcomes=("completed",) * 7, effect_states=(), from_stage="mjcf")
         self.assertEqual(
             project_stage_status(
                 decision_outcome=None,
@@ -371,12 +378,12 @@ class DerivedStateTests(unittest.TestCase):
             StageStatus.ACTIVE,
         )
         self.assertEqual(
-            project_run_status(stage_outcomes=("completed",) * 6, effect_states=("satisfied",)),
+            project_run_status(stage_outcomes=("completed",) * 7, effect_states=("satisfied",)),
             RunStatus.SUCCEEDED,
         )
         self.assertEqual(
             project_run_status(
-                stage_outcomes=("completed", "cancelled", None, None, None, None),
+                stage_outcomes=("completed", "cancelled", None, None, None, None, None),
                 effect_states=(),
             ),
             RunStatus.CANCELLED,
@@ -394,7 +401,7 @@ class DerivedStateTests(unittest.TestCase):
         )
         self.assertEqual(
             project_run_status(
-                stage_outcomes=("completed",) * 6,
+                stage_outcomes=("completed",) * 7,
                 effect_states=("definitely_failed",),
             ),
             RunStatus.UNRESOLVED,
@@ -413,7 +420,7 @@ class DerivedStateTests(unittest.TestCase):
         )
         self.assertEqual(
             project_run_status(
-                stage_outcomes=("completed", None, None, None, None, None),
+                stage_outcomes=("completed", None, None, None, None, None, None),
                 effect_states=("unknown",),
                 pending_effect_states=("unknown",),
             ),
@@ -640,7 +647,7 @@ class CommandIdentityTests(unittest.TestCase):
         command = DispatchCommand.create(
             command_id="command-dispatch",
             run_id="run-1",
-            freeze_command_id="command-freeze",
+            entry_command_id="command-freeze",
             idempotency_key="run-1/dispatch",
             dag_id="solidworks_to_urdf",
             dag_run_id="portal-run-1",
@@ -651,7 +658,7 @@ class CommandIdentityTests(unittest.TestCase):
         conf = DispatchConf(
             schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
             run_id="run-1",
-            freeze_command_id="command-freeze",
+            entry_command_id="command-freeze",
         )
         self.assertEqual(DispatchConf.from_record(conf.to_record()), conf)
         forged = command.to_record()

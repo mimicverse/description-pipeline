@@ -35,6 +35,7 @@ class StageTests(unittest.TestCase):
             "capture": ("windows", "linux"),
             "generate": ("linux",),
             "verify": ("linux",),
+            "mjcf": ("linux",),
             "publish": ("linux",),
         }
         self.assertEqual(HOST_IDS, ("linux", "windows"))
@@ -284,7 +285,7 @@ class StageTests(unittest.TestCase):
             "subject_sha256": "a" * 64,
         }
         view = stage_view(job)
-        self.assertEqual(len(view["stages"]), 6)
+        self.assertEqual(len(view["stages"]), 7)
         self.assertNotIn("wait_for_job", STAGE_IDS)
         for stage in view["stages"]:
             self.assertEqual(stage["state"], "not_run")
@@ -324,7 +325,7 @@ class StageTests(unittest.TestCase):
         before = copy.deepcopy(job)
         view = stage_view(job)
         self.assertEqual(job, before)
-        self.assertEqual(len(view["stages"]), 6)
+        self.assertEqual(len(view["stages"]), 7)
 
 
 if __name__ == "__main__":

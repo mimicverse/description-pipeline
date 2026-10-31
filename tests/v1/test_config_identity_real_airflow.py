@@ -159,13 +159,13 @@ class RealAirflowConfigIdentityTests(unittest.TestCase):
         self.assertEqual(dag.dag_id, "solidworks_to_urdf")
         self.assertEqual(
             set(dag.task_ids),
-            {"freeze", "discover", "capture", "generate", "verify", "publish"},
+            {"freeze", "discover", "capture", "generate", "verify", "mjcf", "publish"},
         )
         for task in dag.tasks:
             self.assertIsInstance(task, StageTaskOperator)
             self.assertEqual(task.stage, task.task_id)
             self.assertEqual(task.pool, "windows_native" if task.stage in {"discover", "capture"} else "default_pool")
-        chain = ("freeze", "discover", "capture", "generate", "verify", "publish")
+        chain = ("freeze", "discover", "capture", "generate", "verify", "mjcf", "publish")
         for upstream, downstream in pairwise(chain):
             self.assertEqual(dag.get_task(downstream).upstream_task_ids, {upstream})
         self.assertFalse(hasattr(dag_module, "_work_paths"))

@@ -72,14 +72,14 @@ class CertificateDiagnosticIndexTests(unittest.TestCase):
                 with self.assertRaises(PipelineError):
                     validate_certificate_diagnostics(certificate)
 
-    def test_full_six_stage_report_attributes_native_warnings_only_to_verify(self):
+    def test_full_seven_stage_report_attributes_native_warnings_only_to_verify(self):
         certificate = quality_report(raw_warnings())
         certificate["passed"] = True
         view = stage_view()
         for stage in view["stages"]:
             stage.update(state="completed", in_scope=True, input_qc=[], output_qc=[])
         report = build_report({"result": {"quality": certificate}}, view=view)
-        self.assertEqual(len(report["stages"]), 6)
+        self.assertEqual(len(report["stages"]), 7)
         self.assertNotIn("items", report["warnings"])
         for stage in report["stages"]:
             self.assertEqual(stage["counts"]["warnings"], 1 if stage["id"] == "verify" else 0)

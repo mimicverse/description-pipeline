@@ -54,6 +54,9 @@ def _run_state(
     *,
     diagnostic_target: str | None = None,
     expired_claim: bool = False,
+    from_stage: str | None = None,
+    technical_effect_states: tuple[str, ...] = (),
+    technical_pending_states: tuple[str, ...] = (),
 ) -> str:
     effect_states = tuple(
         row["state"]
@@ -70,6 +73,8 @@ def _run_state(
         )
         if isinstance(row, Mapping) and isinstance(row.get("state"), str)
     )
+    effect_states += technical_effect_states
+    pending_effect_states += technical_pending_states
     if diagnostic_target is not None:
         target = next((row for row in stages if row.get("stage") == diagnostic_target), None)
         unresolved = list(effect_states)
@@ -104,6 +109,7 @@ def _run_state(
     )
     projected = project_run_status(
         stage_outcomes=outcomes,
+        from_stage=from_stage,
         effect_states=effect_states,
         pending_effect_states=pending_effect_states,
         expired_claim=expired_claim,
@@ -634,6 +640,8 @@ def read_run_projection(
             result=result,
             output_record=output_record,
         )
+        if result is not None:
+            row["receipt"]["result_record_artifact"] = result_artifact.to_record()
         command_id = (
             command_model.command_id if command_model is not None else None
         )
@@ -654,6 +662,7 @@ def read_run_projection(
         stage_index = STAGE_IDS.index(stage)
         predecessor_completed = (
             stage_index == 0
+            or (admission_record.from_stage == "mjcf" and stage == "mjcf")
             or diagnostic_target == stage
             or (
                 stage_index > 0
@@ -711,8 +720,17 @@ def read_run_projection(
         if isinstance(admission[3], Mapping)
         else None
     )
+    technical_commands = {key for key, command in commands.items() if command["kind"] != "stage"}
+    technical_effects = tuple(item for item in effect_state_rows if item["command_id"] in technical_commands)
     run_state = _run_state(
         stage_rows,
+        technical_effect_states=tuple(item["state"] for item in technical_effects),
+        technical_pending_states=tuple(
+            "unknown" for item in technical_effects
+            if item["state"] == "unknown"
+            and item["effect_id"] == (yielded_effect_by_command.get(item["command_id"]) or (None, None))[1]
+        ),
+        from_stage=admission_record.from_stage if diagnostic_target is None else None,
         diagnostic_target=diagnostic_target,
         expired_claim=any(
             (row.get("command") or {}).get("command_id") in expired_claim_commands

@@ -1420,11 +1420,11 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
     elif "blocked" in states:
         overall_state, headline = "blocked", "Stages are blocked by an incomplete predecessor"
     elif stages_out and states == {"completed"} and verification_completed:
-        overall_state, headline = "passed", "All six stages completed and independent verification passed"
+        overall_state, headline = "passed", "All stages completed and independent verification passed"
     elif stages_out and states == {"completed"}:
         overall_state, headline = (
             "failed",
-            "All six stages completed, but independent verification did not pass",
+            "All stages completed, but independent verification did not pass",
         )
     else:
         overall_state, headline = "not_run", "No stage records yet"

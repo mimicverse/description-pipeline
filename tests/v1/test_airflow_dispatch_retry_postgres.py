@@ -249,7 +249,7 @@ class AirflowDispatchRetryPostgresTests(unittest.TestCase):
     def test_stage_command_cannot_use_airflow_retry_exception(self):
         result = self.unknown()
         self.elapsed()
-        freeze = self.outcome.freeze_command
+        freeze = self.outcome.entry_command
         with self.assertRaises(FactStoreError):
             self.facts.acquire_claim(freeze.command_id, claim_id=airflow_retry_claim_id(result.observation_fact_id),
                                      owner_sha256=self.policy.owner_sha256,
@@ -259,7 +259,7 @@ class AirflowDispatchRetryPostgresTests(unittest.TestCase):
 
     def test_non_airflow_effect_kind_cannot_use_the_retry_exception(self):
         result = self.unknown()
-        freeze = self.outcome.freeze_command
+        freeze = self.outcome.entry_command
         claim = self.facts.acquire_claim(
             freeze.command_id, claim_id="stage-claim", owner_sha256=self.policy.owner_sha256,
             executor_sha256=freeze.expected_executor_sha256,
