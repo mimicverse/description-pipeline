@@ -195,12 +195,14 @@ def _read_binding(data: dict, policy: dict) -> dict:
     if set(data) != {"schema_version", "source", "files", "tool", "engine"}:
         _fail("manifest", "unexpected key set")
     source = data["source"]
-    if not isinstance(source, dict) or set(source) != {"urdf", "meshes"}:
+    if not isinstance(source, dict) or set(source) != {"urdf", "meshes", "components"}:
         _fail("manifest", "source must hold 'urdf' and 'meshes'")
     if not isinstance(source["urdf"], str) or not source["urdf"]:
         _fail("manifest", "source.urdf must be a relative path")
     if not isinstance(source["meshes"], list) or any(not isinstance(item, str) for item in source["meshes"]):
         _fail("manifest", "source.meshes must be a list of relative paths")
+    if source["components"] not in (None, policy["component_source"]):
+        _fail("input binding", "source.components names an unsupported provenance file")
     files = data["files"]
     if not isinstance(files, dict) or not files:
         _fail("manifest", "files must be a non-empty mapping")
@@ -521,7 +523,8 @@ def _surface_of(element: ET.Element, where: str, materials: dict, *, allow_mater
     allowed = frozenset({"origin", "geometry", "material"}) if allow_material else frozenset({"origin", "geometry"})
     _checked_attributes(element, frozenset({"name"}), where)
     _checked_children(element, allowed, where)
-    surface = {"origin": _origin_of(element, where), "geometry": _geometry_of(element, where)}
+    surface = {"name": element.get("name"), "origin": _origin_of(element, where),
+               "geometry": _geometry_of(element, where)}
     if allow_material:
         surface["color"] = _color_of(_one(element, "material", where), f"{where}/material", materials)
     return surface
@@ -838,6 +841,56 @@ def _fk_samples(document: dict, policy: dict) -> tuple[list[dict], list[tuple[in
     return requests, singles
 
 
+def _expected_collisions(state: dict) -> set[str]:
+    """Rebuild grouping from the bound provenance, never from emitted proxies."""
+    component_path = state["manifest"]["source"]["components"]
+    lookup = {}
+    if component_path is not None:
+        model = _parse_json(_confined(state["root"], component_path).read_bytes(), component_path)
+        if not isinstance(model, dict) or not isinstance(model.get("links"), list):
+            raise CheckError("component provenance has no link list")
+        for link in model["links"]:
+            for visual in link.get("visuals", []):
+                name, component = visual.get("name"), visual.get("provenance", {}).get("native_component")
+                if not isinstance(name, str) or not isinstance(component, str) or not component:
+                    raise CheckError("native visual component provenance is missing")
+                identity = (link["name"], name)
+                if identity in lookup and lookup[identity] != component:
+                    raise CheckError("native visual identity conflicts across component records")
+                lookup[identity] = component
+    proxies = set()
+    for link in state["document"]["links"]:
+        source = state["config"]["collision"]["source"]
+        if source == "auto":
+            source = "urdf" if link["collisions"] else "visual_convex"
+        projected = []
+        if source == "urdf":
+            projected = [{**surface, "source_surfaces": [surface]} for surface in link["collisions"]]
+        elif source == "visual_convex":
+            groups = {}
+            for index, visual in enumerate(link["visuals"]):
+                component = f"authored-visual:{index}"
+                if component_path is not None:
+                    component = lookup.get((link["name"], visual["name"]))
+                    if component is None:
+                        raise CheckError(f"visual {visual['name']!r} has no native component binding")
+                groups.setdefault(component, []).append(visual)
+            for component, surfaces in groups.items():
+                if len(surfaces) == 1:
+                    projected.append({**surfaces[0], "source_surfaces": surfaces})
+                    continue
+                if any(surface["geometry"]["kind"] != "mesh" for surface in surfaces):
+                    raise CheckError("native component aggregation requires mesh surfaces")
+                path = "mjcf/collision/" + _canonical_digest({"link": link["name"], "component": component}) + ".obj"
+                proxies.add(path)
+                projected.append({"origin": {"xyz": (0., 0., 0.), "rpy": (0., 0., 0.)},
+                                  "geometry": {"kind": "mesh", "filename": "../" + path, "scale": (1., 1., 1.)},
+                                  "source_surfaces": surfaces})
+        link["projection_collisions"] = projected
+        link["collision_role"] = source
+    return proxies
+
+
 def _expected_geoms(document: dict, config: dict, policy: dict) -> list[dict]:
     result = []
     for link in document["links"]:
@@ -850,29 +903,12 @@ def _expected_geoms(document: dict, config: dict, policy: dict) -> list[dict]:
                     "link": link["name"],
                 }
             )
-        source = config["collision"]["source"]
-        if source == "auto":
-            source = "urdf" if link["collisions"] else "visual_convex"
-        if source == "urdf":
-            for index, collision in enumerate(link["collisions"]):
-                result.append(
-                    {
-                        "name": policy["names"]["collision"].format(link=link["name"], index=index),
-                        "role": "collision",
-                        "surface": collision,
-                        "link": link["name"],
-                    }
-                )
-        elif source == "visual_convex":
-            for index, visual in enumerate(link["visuals"]):
-                result.append(
-                    {
-                        "name": policy["names"]["convex"].format(link=link["name"], index=index),
-                        "role": "collision",
-                        "surface": visual,
-                        "link": link["name"],
-                    }
-                )
+        source = link["collision_role"]
+        family = "collision" if source == "urdf" else "convex"
+        for index, surface in enumerate(link["projection_collisions"]):
+            result.append({"name": policy["names"][family].format(link=link["name"], index=index),
+                           "role": "collision", "surface": surface, "link": link["name"],
+                           "source_surfaces": surface["source_surfaces"]})
     return result
 
 
@@ -1174,7 +1210,8 @@ def _gate_identity_closure(state: dict) -> dict:
     if manifest["engine"] != policy["engine"]:
         raise CheckError("the manifest names a different engine revision; rebuild the delivery")
 
-    actual = {path for path in _inventory(root) if path.startswith(("urdf/", "meshes/", "mjcf/"))}
+    actual = {path for path in _inventory(root)
+              if path.startswith(("urdf/", "meshes/", "mjcf/")) or path == policy["component_source"]}
     allowed = required = set(manifest["files"])
     unregistered = sorted(actual - allowed)
     if unregistered:
@@ -1210,7 +1247,11 @@ def _gate_identity_closure(state: dict) -> dict:
         raise CheckError("the sealed input closure differs from the references of the frozen URDF")
     if sorted(manifest["source"]["meshes"]) != mesh_relative:
         raise CheckError("the manifest source list differs from the references of the frozen URDF")
-    expected_files = set(expected_inputs) | {policy["config_name"], policy["robot_name"]}
+    components = manifest["source"]["components"]
+    proxies = _expected_collisions(state)
+    expected_files = set(expected_inputs) | {policy["config_name"], policy["robot_name"]} | proxies
+    if components is not None:
+        expected_files.add(components)
     if config["floor"] is not None:
         expected_files.add(policy["scene_name"])
     if set(manifest["files"]) != expected_files:
@@ -1248,7 +1289,7 @@ def _gate_engine(state: dict) -> dict:
             f"the loaded engine version {mujoco.__version__!r} differs from the locked "
             f"{policy['engine']['mujoco']!r}"
         )
-    sealed = {key for key in manifest["files"] if key.startswith("meshes/")}
+    sealed = {key for key in manifest["files"] if key.startswith(("meshes/", "mjcf/collision/"))}
     robot_xml = _xml_document(_confined(state["root"], policy["robot_name"]).read_bytes(), policy["robot_name"])
     _checked_syntax(robot_xml, policy, "robot", policy["robot_name"])
     _checked_asset_paths(robot_xml, policy["robot_name"], policy, sealed, state["root"])
@@ -1684,7 +1725,29 @@ def _checked_asset_paths(document: ET.Element, label: str, policy: dict, sealed:
         canonical = "/".join(parts)
         if canonical not in sealed:
             _fail(f"{label}: <mesh>", f"mesh file {file!r} is not a sealed delivery input")
-        _confined(root, canonical)
+        asset_path = _confined(root, canonical)
+        if canonical.startswith("mjcf/collision/"):
+            _checked_proxy_obj(asset_path.read_bytes(), canonical)
+
+
+def _checked_proxy_obj(content: bytes, label: str) -> None:
+    """Reject resource directives before the engine can interpret an OBJ file."""
+    vertices, faces = 0, []
+    for line in content.decode("ascii").splitlines():
+        fields = line.split()
+        if not fields or fields[0].startswith("#"):
+            continue
+        if fields[0] == "v" and len(fields) == 4:
+            values = [float(value) for value in fields[1:]]
+            if not all(math.isfinite(value) for value in values):
+                raise CheckError(f"{label}: non-finite proxy vertex")
+            vertices += 1
+        elif fields[0] == "f" and len(fields) == 4:
+            faces.append(tuple(int(value) for value in fields[1:]))
+        else:
+            raise CheckError(f"{label}: unsupported OBJ directive")
+    if vertices < 4 or not faces or any(index < 1 or index > vertices for face in faces for index in face):
+        raise CheckError(f"{label}: empty or invalid proxy topology")
 
 
 def _gate_geometry_instances(state: dict) -> dict:
@@ -1728,6 +1791,8 @@ def _geometry_instance(item, model, data, assets, meshes, directory, poses, refe
     origin[:3, 3] = surface["origin"]["xyz"]
     world = poses[item["link"]] @ origin
     kind = surface["geometry"]["kind"]
+    expected_color = surface.get("color") or (0.5, 0.5, 0.5, 1.0)
+    _close(model.geom_rgba[index], expected_color, policy["tolerances"]["rgba_atol"])
     if kind == "mesh":
         mesh_id = int(model.geom_dataid[index])
         asset_name = model.mesh(mesh_id).name
@@ -1760,6 +1825,8 @@ def _geometry_instance(item, model, data, assets, meshes, directory, poses, refe
         stored = np.asarray(model.mesh_vert[start : start + count], dtype=float)
         rotation = np.asarray(data.geom_xmat[index]).reshape(3, 3)
         engine_world = stored @ rotation.T + np.asarray(data.geom_xpos[index])
+        if item["role"] == "collision":
+            return worst_mesh
         source_vertices = meshes[reference] * np.asarray(surface["geometry"]["scale"], dtype=float)
         expected_world = source_vertices @ world[:3, :3].T + world[:3, 3]
         worst_mesh = max(worst_mesh, _compare_vertex_sets(engine_world, expected_world, policy))
@@ -1785,8 +1852,6 @@ def _geometry_instance(item, model, data, assets, meshes, directory, poses, refe
             world[:3, :3],
             policy["tolerances"]["rotation_atol"],
         )
-    expected_color = surface.get("color") or (0.5, 0.5, 0.5, 1.0)
-    _close(model.geom_rgba[index], expected_color, policy["tolerances"]["rgba_atol"])
     return worst_mesh
 
 
@@ -2186,7 +2251,7 @@ def _facts(state: dict) -> dict:
         facts["support_sites"] = len(config["support_sites"])
         facts["floor"] = config["floor"] is not None
         facts["effective_simulation"] = _effective_projection(config, policy)
-        if document is not None:
+        if document is not None and all("projection_collisions" in link for link in document["links"]):
             facts["collision_geoms"] = sum(
                 1 for item in _expected_geoms(document, config, policy) if item["role"] == "collision"
             )
@@ -2273,22 +2338,34 @@ def _gate_collision_hulls(state: dict) -> dict:
     model = _need(state, "robot_model")
     document = _need(state, "document")
     config, policy = state["config"], state["policy"]
+    _zero_pose(state)
+    data = state["robot_data"]
+    poses = _fk_pose(document, {})
     budget = config["collision"]["max_vertices"]
     limit = config["collision"]["max_error_m"]
     directory = "/".join(state["urdf_relative"].split("/")[:-1])
-    seen, rows = set(), []
+    rows = []
     for item in _expected_geoms(document, config, policy):
-        geometry = item["surface"]["geometry"]
-        if item["role"] != "collision" or geometry["kind"] != "mesh":
+        if item["role"] != "collision" or item["surface"]["geometry"]["kind"] != "mesh":
             continue
-        mesh_id = int(model.geom(item["name"]).dataid[0])
-        if mesh_id in seen:
-            continue
-        seen.add(mesh_id)
-        reference = _canonical_mesh_path(directory, geometry["filename"], item["name"])
-        expected = state["meshes"][reference] * np.asarray(geometry["scale"], dtype=float)
-        source, source_faces = _source_convex_hull(expected)
-        actual, actual_faces = _compiled_hull(model, mesh_id)
+        geom_id = int(model.geom(item["name"]).id)
+        mesh_id = int(model.geom_dataid[geom_id])
+        expected, references = [], []
+        for surface in item["source_surfaces"]:
+            geometry = surface["geometry"]
+            reference = _canonical_mesh_path(directory, geometry["filename"], item["name"])
+            references.append(reference)
+            points = state["meshes"][reference] * np.asarray(geometry["scale"], dtype=float)
+            transform = _rpy_matrix(surface["origin"]["rpy"])
+            expected.append(points @ transform.T + np.asarray(surface["origin"]["xyz"]))
+        source, source_faces = _source_convex_hull(np.concatenate(expected))
+        _, actual_faces = _compiled_hull(model, mesh_id)
+        begin = int(model.mesh_vertadr[mesh_id])
+        end = begin + int(model.mesh_vertnum[mesh_id])
+        vertices = np.asarray(model.mesh_vert[begin:end], dtype=float)
+        actual = vertices @ np.asarray(data.geom_xmat[geom_id]).reshape(3, 3).T + data.geom_xpos[geom_id]
+        frame = poses[item["link"]]
+        actual = (actual - frame[:3, 3]) @ frame[:3, :3]
         source_points, actual_points = source[np.unique(source_faces)], actual[np.unique(actual_faces)]
         if len(actual_points) > budget:
             raise CheckError(f"collision {item['name']!r} exceeds the declared convex vertex budget")
@@ -2296,10 +2373,10 @@ def _gate_collision_hulls(state: dict) -> dict:
                        _directed_convex_distance(actual_points, source, source_faces))
         if distance > limit + policy["tolerances"]["collision_distance_atol_m"]:
             raise CheckError(f"collision {item['name']!r} approximation distance {distance:.17g} m "
-                             f"exceeds {limit:.17g} m for source {reference!r}")
-        rows.append({"source_mesh": reference, "scale": list(geometry["scale"]),
-                     "source_convex_vertices": len(source_points), "actual_vertices": len(actual_points),
-                     "complete_convex_vertex_distance_m": distance})
+                             f"exceeds {limit:.17g} m for sources {references!r}")
+        rows.append({"geom": item["name"], "link": item["link"],
+                     "source_meshes": references, "source_convex_vertices": len(source_points),
+                     "actual_vertices": len(actual_points), "complete_convex_vertex_distance_m": distance})
     return {"mesh_proxies": rows, "vertex_budget": budget, "max_error_m": limit,
             "scope": "Convex-solid distance relative to source component hulls; no concave-surface equivalence claim"}
 
@@ -2433,6 +2510,7 @@ def _policy() -> dict:
         "process_limits": {"cpu_seconds": contract.VERIFIER_CPU_SECONDS,
                            "memory_bytes": contract.VERIFIER_MEMORY_BYTES},
         "input_binding_schema": contract.INPUT_BINDING_SCHEMA,
+        "component_source": contract.COMPONENT_SOURCE,
         "config_name": contract.CONFIG_NAME,
         "robot_name": contract.ROBOT_NAME,
         "scene_name": contract.SCENE_NAME,
@@ -2572,7 +2650,7 @@ def evaluate_projection(root: Path, input_binding: dict) -> dict:
         report = _run_child(root, input_binding)
         expected = input_binding["files"]
         actual = {name: sha for name, sha in inventory(root).items()
-                  if name.startswith(("urdf/", "meshes/", "mjcf/"))}
+                  if name.startswith(("urdf/", "meshes/", "mjcf/")) or name == input_binding["source"]["components"]}
         stable = actual == {name: row["sha256"] for name, row in expected.items()}
         stable = stable and all(confined(root, name).stat().st_size == row["bytes"]
                                 for name, row in expected.items())

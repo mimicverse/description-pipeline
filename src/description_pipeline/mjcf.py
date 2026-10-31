@@ -20,7 +20,7 @@ from xml.etree import ElementTree as ET
 import numpy as np
 
 from . import mjcf_contract as contract
-from .io import PipelineError, artifact_path_parts, confined, format_number
+from .io import PipelineError, artifact_path_parts, confined, format_number, parse_data
 
 _STL_RECORD = np.dtype([("normal", "<f4", (3,)), ("vertices", "<f4", (3, 3)), ("attribute", "<u2")])
 _JOINT_TYPES = ("fixed", "revolute", "continuous", "prismatic")
@@ -160,7 +160,7 @@ def _visual_surface(element: ET.Element, where: str, materials: dict) -> dict:
             if reference is None or reference not in materials:
                 raise PipelineError(f"{where}/material: unknown material reference {reference!r}")
             color = materials[reference]
-    return {"origin": origin, "geometry": geometry, "color": color}
+    return {"name": element.get("name"), "origin": origin, "geometry": geometry, "color": color}
 
 
 def _collision_surface(element: ET.Element, where: str) -> dict:
@@ -506,6 +506,98 @@ def _resolve_meshes(
 # --------------------------------------------------------------------------
 # Projection
 # --------------------------------------------------------------------------
+
+
+def _component_groups(document: dict, metadata: bytes | None) -> None:
+    """Read source identities only; URDF retains all mechanical and geometric values."""
+    names = {}
+    if metadata is not None:
+        model = parse_data(metadata, Path(contract.COMPONENT_SOURCE))
+        if not isinstance(model, dict) or not isinstance(model.get("links"), list):
+            raise PipelineError("Component provenance has no link inventory")
+        for link in model["links"]:
+            for visual in link.get("visuals", []):
+                name = visual.get("name")
+                component = visual.get("provenance", {}).get("native_component")
+                if not isinstance(name, str) or not isinstance(component, str) or not component:
+                    raise PipelineError("A native visual lacks its component provenance")
+                key = (link["name"], name)
+                if key in names and names[key] != component:
+                    raise PipelineError("A visual name has conflicting native component identities")
+                names[key] = component
+    for link in document["links"]:
+        groups = {}
+        for index, visual in enumerate(link["visuals"]):
+            if metadata is None:
+                component = f"authored-visual:{index}"
+            else:
+                component = names.get((link["name"], visual["name"]))
+                if component is None:
+                    raise PipelineError(f"Visual {visual['name']!r} has no verified component binding")
+            groups.setdefault(component, []).append(index)
+        link["visual_groups"] = list(groups.items())
+
+
+def _proxy_obj(points: np.ndarray, budget: int) -> bytes:
+    """Use the locked engine to construct a bounded convex proxy in link coordinates."""
+    import mujoco
+
+    if mujoco.__version__ != contract.engine_identity()["mujoco"]:
+        raise PipelineError("Collision projection requires the locked MuJoCo engine")
+    xml = ET.Element("mujoco")
+    ET.SubElement(xml, "compiler", inertiafromgeom="false")
+    values = " ".join(_fmt(value) for value in np.unique(points, axis=0).flat)
+    ET.SubElement(ET.SubElement(xml, "asset"), "mesh", name="component", vertex=values,
+                  inertia="shell", maxhullvert=str(budget))
+    ET.SubElement(ET.SubElement(xml, "worldbody"), "geom", type="mesh", mesh="component")
+    model = mujoco.MjModel.from_xml_string(ET.tostring(xml, encoding="unicode"))
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+    address = int(model.mesh_graphadr[0])
+    if address < 0:
+        raise PipelineError("The component has no valid convex collision hull")
+    count, faces = map(int, model.mesh_graph[address:address + 2])
+    start = address + 2 + 3 * count + 3 * faces
+    triangles = np.asarray(model.mesh_graph[start:start + 3 * faces], dtype=int).reshape(-1, 3)
+    cloud = np.asarray(model.mesh_vert, dtype=float) @ data.geom_xmat[0].reshape(3, 3).T + data.geom_xpos[0]
+    selected = np.unique(triangles)
+    remap = {int(old): index + 1 for index, old in enumerate(selected)}
+    lines = ["# Derived convex component proxy; source bindings are in the MJCF certificate."]
+    lines.extend("v " + _fmt3(cloud[index]) for index in selected)
+    lines.extend("f " + " ".join(str(remap[int(index)]) for index in face) for face in triangles)
+    return ("\n".join(lines) + "\n").encode("ascii")
+
+
+def _prepare_collisions(document: dict, config: dict, meshes: dict) -> dict[str, bytes]:
+    outputs = {}
+    for link in document["links"]:
+        role = config["collision"]["source"]
+        if role == "auto":
+            role = "urdf" if link["collisions"] else "visual_convex"
+        projected = []
+        if role == "urdf":
+            projected = list(link["collisions"])
+        elif role == "visual_convex":
+            for component, indices in link["visual_groups"]:
+                if len(indices) == 1:
+                    projected.append(link["visuals"][indices[0]])
+                    continue
+                cloud = []
+                for index in indices:
+                    surface = link["visuals"][index]
+                    geometry = surface["geometry"]
+                    if geometry["kind"] != "mesh":
+                        raise PipelineError("Native component aggregation requires mesh surfaces")
+                    transform = _origin_matrix(surface["origin"])
+                    points = meshes[geometry["path"]] * np.asarray(geometry["scale"])
+                    cloud.append(points @ transform[:3, :3].T + transform[:3, 3])
+                path = contract.component_proxy_path(link["name"], component)
+                outputs[path] = _proxy_obj(np.concatenate(cloud), config["collision"]["max_vertices"])
+                projected.append({"origin": {"xyz": (0., 0., 0.), "rpy": (0., 0., 0.)},
+                                  "geometry": {"kind": "mesh", "path": path, "scale": (1., 1., 1.)}})
+        link["projection_collisions"] = projected
+        link["collision_role"] = role
+    return outputs
 
 
 def _fmt(value: float) -> str:
@@ -923,28 +1015,11 @@ def _add_body(
             contact=None,
             friction=None,
         )
-    if source == "urdf":
-        for index, collision in enumerate(link["collisions"]):
-            _add_geom(
-                body,
-                name=contract.collision_geom_name(link["name"], index),
-                surface=collision,
-                role="collision",
-                assets=assets,
-                contact=contact,
-                friction=friction,
-            )
-    elif source == "visual_convex":
-        for index, visual in enumerate(link["visuals"]):
-            _add_geom(
-                body,
-                name=contract.convex_geom_name(link["name"], index),
-                surface=visual,
-                role="collision",
-                assets=assets,
-                contact=contact,
-                friction=friction,
-            )
+    for index, surface in enumerate(link["projection_collisions"]):
+        name = (contract.collision_geom_name(link["name"], index) if source == "urdf"
+                else contract.convex_geom_name(link["name"], index))
+        _add_geom(body, name=name, surface=surface, role="collision", assets=assets,
+                  contact=contact, friction=friction)
     for site in config["sites"]:
         if site["link"] != link["name"]:
             continue
@@ -984,11 +1059,7 @@ def _project_robot(document: dict, config: dict, derived_sites: list[dict]) -> b
 
     assets = _MeshAssets()
     for link in document["links"]:
-        # Only surfaces that actually become geoms are registered: visuals always;
-        # collisions only for the urdf source (visual_convex copies the visuals).
-        used = list(link["visuals"])
-        if config["collision"]["source"] in ("urdf", "auto"):
-            used += link["collisions"]
+        used = [*link["visuals"], *link["projection_collisions"]]
         for surface in used:
             geometry = surface["geometry"]
             if geometry["kind"] == "mesh":
@@ -1068,6 +1139,10 @@ def project(root: Path, simulation: bytes = contract.EMPTY_CONFIG) -> dict[str, 
     for site in (*config["sites"], *config["support_sites"]):
         if site["link"] not in known:
             raise PipelineError(f"Simulation site {site['name']!r} references unknown link {site['link']!r}")
+    metadata = (confined(root, contract.COMPONENT_SOURCE).read_bytes()
+                if (root / contract.COMPONENT_SOURCE).exists() else None)
+    _component_groups(document, metadata)
+    proxies = _prepare_collisions(document, config, meshes)
     derived = _derive_support_sites(document, config, meshes)
     robot_bytes = _project_robot(document, config, derived["sites"])
     # Preserve the exact upstream warning comments in both delivered encodings.
@@ -1093,16 +1168,20 @@ def project(root: Path, simulation: bytes = contract.EMPTY_CONFIG) -> dict[str, 
     for index, warning in enumerate(derived_warnings, len(comments)):
         robot.insert(index, ET.Comment(warning))
     robot_bytes = _xml_bytes(robot)
-    files = {contract.CONFIG_NAME: simulation, contract.ROBOT_NAME: robot_bytes}
+    files = {contract.CONFIG_NAME: simulation, contract.ROBOT_NAME: robot_bytes, **proxies}
     if config["floor"] is not None:
         height = derived["height"] if config["floor"]["supports"] else config["floor"]["height"]
         files[contract.SCENE_NAME] = _project_scene(config, height)
     destination = root / "mjcf"
     destination.mkdir(exist_ok=False)
     for name, content in files.items():
-        confined(root, name, exists=False).write_bytes(content)
+        target = confined(root, name, exists=False)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
     # Recheck actual source bytes before returning the stage candidate.
     for name, content in {contract.URDF_NAME: urdf_bytes, **mesh_bytes}.items():
         if confined(root, name).read_bytes() != content:
             raise PipelineError(f"The source {name} changed during MJCF projection")
+    if metadata is not None and confined(root, contract.COMPONENT_SOURCE).read_bytes() != metadata:
+        raise PipelineError("Component provenance changed during MJCF projection")
     return {name: hashlib.sha256(content).hexdigest() for name, content in files.items()}

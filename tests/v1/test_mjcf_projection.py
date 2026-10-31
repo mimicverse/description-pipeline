@@ -79,15 +79,7 @@ class ProjectionTests(unittest.TestCase):
         (self.root/'meshes/part.stl').write_bytes(tetrahedron())
 
     def binding(self):
-        files = {}
-        for directory in ('urdf', 'meshes', 'mjcf'):
-            for name in inventory(self.root/directory):
-                path = self.root/directory/name
-                raw = path.read_bytes()
-                files[f'{directory}/{name}'] = {'bytes': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}
-        return {'schema_version': contract.INPUT_BINDING_SCHEMA,
-                'source': {'urdf': contract.URDF_NAME, 'meshes': ['meshes/part.stl']},
-                'files': files, 'tool': contract.tool_identity(), 'engine': contract.engine_identity()}
+        return contract.binding_for_projection(self.root)
 
     def build(self, config=None):
         mjcf.project(self.root, json.dumps(config or {}).encode())
@@ -99,6 +91,117 @@ class ProjectionTests(unittest.TestCase):
         tree.find(path).set(attribute, value)
         tree.write(self.root/contract.ROBOT_NAME)
         return evaluate_projection(self.root, self.binding())
+
+    def colored_component(self):
+        vertices = np.array([(x, y, z) for x in (0., .02) for y in (0., .03) for z in (0., .04)])
+        faces = [(0, 1, 3), (0, 3, 2), (4, 6, 7), (4, 7, 5),
+                 (0, 4, 5), (0, 5, 1), (2, 3, 7), (2, 7, 6),
+                 (0, 2, 6), (0, 6, 4), (1, 5, 7), (1, 7, 3)]
+        parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
+        tree = ET.fromstring(SOURCE, parser=parser)
+        base = tree.find('./link[@name="base"]')
+        for item in [*base.findall('visual'), *base.findall('collision')]:
+            base.remove(item)
+        for name, file, triangles, rgba in (
+            ('red', 'part.stl', faces[:6], '0.8 0.1 0.1 1'),
+            ('blue', 'blue.stl', faces[6:], '0.1 0.1 0.8 1'),
+        ):
+            visual = ET.SubElement(base, 'visual', name=name)
+            ET.SubElement(ET.SubElement(visual, 'geometry'), 'mesh', filename='../meshes/'+file)
+            ET.SubElement(ET.SubElement(visual, 'material', name=name), 'color', rgba=rgba)
+            payload = bytearray(80) + struct.pack('<I', len(triangles))
+            for triangle in triangles:
+                payload += struct.pack('<12fH', 0, 0, 0,
+                                       *(value for index in triangle for value in vertices[index]), 0)
+            (self.root/'meshes'/file).write_bytes(payload)
+        tree.find('./link[@name="arm"]/visual').set('name', 'arm_surface')
+        (self.root/contract.URDF_NAME).write_bytes(ET.tostring(tree))
+        metadata = {'links': [
+            {'name': 'base', 'visuals': [{'name': name, 'provenance': {'native_component': 'native-part'}}
+                                       for name in ('red', 'blue')]},
+            {'name': 'arm', 'visuals': [{'name': 'arm_surface', 'provenance': {'native_component': 'native-arm'}}]},
+        ]}
+        (self.root/'model').mkdir()
+        (self.root/contract.COMPONENT_SOURCE).write_text(json.dumps(metadata))
+        return metadata
+
+    def test_material_partitions_share_one_native_component_proxy(self):
+        self.colored_component()
+        report = self.build()
+        self.assertTrue(report['passed'], report['checks'])
+        self.assertEqual(2, report['facts']['collision_geoms'])
+        proxies = list((self.root/'mjcf/collision').glob('*.obj'))
+        self.assertEqual(1, len(proxies))
+        row = next(item for item in report['checks'] if item['id'] == 'collision.hulls')
+        self.assertEqual(2, len(row['details']['mesh_proxies'][0]['source_meshes']))
+
+    def test_component_metadata_never_overrides_urdf_mechanics(self):
+        metadata = self.colored_component()
+        other = self.root/'other'
+        for name in ('urdf', 'meshes', 'model'):
+            shutil.copytree(self.root/name, other/name)
+        metadata['links'][0]['inertial'] = {'mass': 9999}
+        metadata['links'][0]['visuals'][0]['xyz'] = [900, 800, 700]
+        (other/contract.COMPONENT_SOURCE).write_text(json.dumps(metadata))
+        mjcf.project(self.root)
+        mjcf.project(other)
+        self.assertEqual(inventory(self.root/'mjcf'), inventory(other/'mjcf'))
+
+    def test_conflicting_component_identity_is_rejected_without_output(self):
+        metadata = self.colored_component()
+        metadata['links'][0]['visuals'].append({'name': 'red', 'provenance': {'native_component': 'conflict'}})
+        (self.root/contract.COMPONENT_SOURCE).write_text(json.dumps(metadata))
+        with self.assertRaisesRegex(PipelineError, 'conflicting native component'):
+            mjcf.project(self.root)
+        self.assertFalse((self.root/'mjcf').exists())
+
+    def test_component_proxy_transform_is_independently_checked(self):
+        self.colored_component()
+        self.assertTrue(self.build()['passed'])
+        report = self.mutate('.//geom[@name="base__convex_0"]', 'pos', '0.01 0 0')
+        self.assertFalse(report['passed'])
+        self.assertIn('collision.hulls', {row['id'] for row in report['checks'] if not row['passed']})
+
+    def test_repeated_mesh_collision_instances_have_independent_pose_checks(self):
+        path = self.root/contract.URDF_NAME
+        path.write_text(SOURCE.replace('scale="1.2 0.8 1.1"', 'scale="1 1 1"'))
+        report = self.build({'collision': {'source': 'visual_convex'}})
+        self.assertTrue(report['passed'], report['checks'])
+        model = mujoco.MjModel.from_xml_path(str(self.root/contract.ROBOT_NAME))
+        geoms = [int(model.geom(name).id) for name in ('base__convex_0', 'base__convex_1')]
+        self.assertEqual(int(model.geom_dataid[geoms[0]]), int(model.geom_dataid[geoms[1]]))
+        gate = next(row for row in report['checks'] if row['id'] == 'collision.hulls')
+        self.assertEqual(2, len(gate['details']['mesh_proxies']))
+        report = self.mutate('.//geom[@name="base__convex_1"]', 'pos', '0.5 0 0')
+        self.assertFalse(report['passed'])
+        gate = next(row for row in report['checks'] if row['id'] == 'collision.hulls')
+        self.assertFalse(gate['passed'])
+        self.assertIn('base__convex_1', gate['details']['error'])
+
+    def test_mesh_collision_display_color_is_independently_checked(self):
+        self.assertTrue(self.build({'collision': {'source': 'visual_convex'}})['passed'])
+        report = self.mutate('.//geom[@name="base__convex_0"]', 'rgba', '1 0 0 1')
+        gate = next(row for row in report['checks'] if row['id'] == 'geometry.instances')
+        self.assertFalse(gate['passed'])
+
+    def test_component_obj_directives_are_rejected_before_native_loading(self):
+        self.colored_component()
+        self.assertTrue(self.build()['passed'])
+        proxy = next((self.root/'mjcf/collision').glob('*.obj'))
+        proxy.write_bytes(proxy.read_bytes()+b'mtllib ../../outside.mtl\n')
+        report = evaluate_projection(self.root, self.binding())
+        self.assertFalse(report['passed'])
+        engine = next(row for row in report['checks'] if row['id'] == 'engine.load')
+        self.assertIn('unsupported OBJ directive', engine['details']['error'])
+
+    def test_changed_component_group_cannot_reuse_a_proxy(self):
+        metadata = self.colored_component()
+        self.assertTrue(self.build()['passed'])
+        metadata['links'][0]['visuals'][1]['provenance']['native_component'] = 'another-part'
+        (self.root/contract.COMPONENT_SOURCE).write_text(json.dumps(metadata))
+        report = evaluate_projection(self.root, self.binding())
+        self.assertFalse(report['passed'])
+        self.assertIn('identity.closure', {row['id'] for row in report['checks'] if not row['passed']})
 
     def test_complete_independent_projection_and_source_stability(self):
         before = inventory(self.root)

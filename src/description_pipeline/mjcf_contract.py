@@ -8,16 +8,18 @@ the independent checker applies.  It derives no mechanical fact from a robot.
 from __future__ import annotations
 
 import math
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
 
-from .io import PipelineError, parse_data
+from .io import PipelineError, parse_data, digest, inventory, confined
 from .runtime import RUNTIME_VERSIONS, tool_record
 
 REPORT_SCHEMA = "urdf-mjcf.quality/v1"
 
-INPUT_BINDING_SCHEMA = "urdf-mjcf.input-binding/v1"
+INPUT_BINDING_SCHEMA = "urdf-mjcf.input-binding/v2"
+COMPONENT_SOURCE = "model/robot.json"
 REPORT_PATH = "reports/mjcf-certificate.json"
 VERIFIER_TIMEOUT_SECONDS = 120
 VERIFIER_CPU_SECONDS = 90
@@ -530,3 +532,25 @@ def tool_identity() -> dict:
     record = tool_record(role="portable")
     return {"name": "mimicverse-description", "version": record["version"],
             "source_sha256": record["source_sha256"]}
+
+
+def component_proxy_path(link: str, component: str) -> str:
+    """Name a derived proxy from source identity, without using display names as paths."""
+    return "mjcf/collision/" + digest({"link": link, "component": component}) + ".obj"
+
+
+def binding_for_projection(root: Path) -> dict:
+    """Bind checker input bytes; the stage caller separately verifies their ArtifactRefs."""
+    files = {}
+    for directory in ("urdf", "meshes", "mjcf"):
+        for relative, sha in inventory(root / directory).items():
+            path = f"{directory}/{relative}"
+            files[path] = {"bytes": confined(root, path).stat().st_size, "sha256": sha}
+    components = COMPONENT_SOURCE if (root / COMPONENT_SOURCE).exists() else None
+    if components is not None:
+        content = confined(root, components).read_bytes()
+        files[components] = {"bytes": len(content), "sha256": hashlib.sha256(content).hexdigest()}
+    return {"schema_version": INPUT_BINDING_SCHEMA,
+            "source": {"urdf": URDF_NAME, "meshes": sorted(p for p in files if p.startswith("meshes/")),
+                       "components": components},
+            "files": files, "tool": tool_identity(), "engine": engine_identity()}
