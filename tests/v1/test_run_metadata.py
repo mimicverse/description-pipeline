@@ -286,7 +286,9 @@ class RunMetadataTests(unittest.TestCase):
                 projection["stages"] = waiting["stages"]
                 projection["technical"] = waiting["technical"]
                 claim = projection["technical"]["claims"][0]
-                claim["expires_at"] = (datetime.now(UTC) + timedelta(hours=1 if reason != "expired" else -1)).isoformat()
+                claim["expires_at"] = (
+                    datetime.now(UTC) + timedelta(hours=1 if reason != "expired" else -1)
+                ).isoformat()
                 if reason == "conflict":
                     projection["technical"]["effects"][0]["state"] = "conflict"
                 with mock.patch.object(PortalApp, "_read_projection", return_value=projection):
