@@ -8,7 +8,7 @@ import tempfile
 import threading
 import unittest
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -28,6 +28,7 @@ from tests.v1.test_portal import (
     _QuietHandler,
     _ThreadingWSGIServer,
 )
+from tests.v1.test_portal_verification_status import pending_projection
 
 from description_pipeline.orchestration.airflow_client import native_run_id
 from description_pipeline.orchestration.portal import AirflowApi, PortalApp, PortalConfig
@@ -276,6 +277,33 @@ class RunMetadataTests(unittest.TestCase):
         return status, json.loads(body)
 
     # ------------------------------------------------------------------ tests
+    def test_list_and_detail_share_authorized_wait_without_changing_canonical_state(self) -> None:
+        run_id = self._seed(self._uuid(), state="unresolved", tasks=("running",))
+        for reason in ("authorized", "expired", "conflict"):
+            with self.subTest(reason=reason):
+                projection = self._projection(native_run_id(run_id))
+                waiting = pending_projection()
+                projection["stages"] = waiting["stages"]
+                projection["technical"] = waiting["technical"]
+                claim = projection["technical"]["claims"][0]
+                claim["expires_at"] = (
+                    datetime.now(UTC) + timedelta(hours=1 if reason != "expired" else -1)
+                ).isoformat()
+                if reason == "conflict":
+                    projection["technical"]["effects"][0]["state"] = "conflict"
+                with mock.patch.object(PortalApp, "_read_projection", return_value=projection):
+                    status, payload = self._list(self.client)
+                    self.assertEqual(status, 200, payload)
+                    row = payload["runs"][0]
+                    status, _, body = self.client.request("GET", f"/api/runs/{run_id}")
+                    self.assertEqual(status, 200, body)
+                    detail = json.loads(body)
+                self.assertEqual(row["state"], "unresolved")
+                self.assertEqual(detail["state"], "unresolved")
+                expected = "waiting" if reason == "authorized" else "unresolved"
+                self.assertEqual((row.get("automatic") or {}).get("state", "unresolved"), expected)
+                self.assertEqual(detail["automatic"]["state"], expected)
+
     def test_rename_delete_restore_round_trip_and_shared_visibility(self) -> None:
         run_id = self._seed(self._uuid())
         status, _, body = self.client.request("PATCH", f"/api/runs/{run_id}", {"title": "装配线 A"})
