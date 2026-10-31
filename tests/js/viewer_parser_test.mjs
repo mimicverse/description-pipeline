@@ -1,6 +1,7 @@
 // Exercise the production loader with actual Three geometry and test-only DOM/network seams.
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { setMaxListeners } from "node:events";
 const staticDir = new URL("../../src/description_pipeline/orchestration/static/", import.meta.url);
 const THREE = await import(new URL("vendor/three.module.min.js", staticDir));
 const logic = await import(new URL("preview_logic.js", staticDir));
@@ -8,14 +9,24 @@ const source = readFileSync(new URL("viewer.js", staticDir), "utf8")
   .replace('"/static/vendor/three.module.min.js"', JSON.stringify(new URL("vendor/three.module.min.js", staticDir).href))
   .replace('"/static/preview_logic.js"', JSON.stringify(new URL("preview_logic.js", staticDir).href));
 const { loadRobot, buildJointControls, parseStl } = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
+const inspectionSource = readFileSync(new URL("inspection.js", staticDir), "utf8")
+  .replace('"/static/vendor/three.module.min.js"', JSON.stringify(new URL("vendor/three.module.min.js", staticDir).href));
+const { inertiaEllipsoid, createInspection } = await import(`data:text/javascript;base64,${Buffer.from(inspectionSource).toString("base64")}`);
 class Element {
-  constructor(tagName, attributes = {}, children = []) { Object.assign(this, { tagName, attributes, children, textContent: "", listeners: {} }); }
+  constructor(tagName, attributes = {}, children = []) { Object.assign(this, { tagName, attributes, children, textContent: "", listeners: {}, style: {} }); }
   getAttribute(name) { return Object.hasOwn(this.attributes, name) ? this.attributes[name] : null; }
   hasAttribute(name) { return Object.hasOwn(this.attributes, name); }
   querySelectorAll(selector) { return this.children.filter((node) => node.tagName === selector.replace(":scope > ", "")); }
   querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
-  append(...items) { this.children.push(...items); }
-  addEventListener(name, callback) { this.listeners[name] = callback; }
+  append(...items) { this.children.push(...items); for (const item of items) item.parentElement = this; }
+  setAttribute(name, value) { this.attributes[name] = value; }
+  remove() { this.parentElement.children = this.parentElement.children.filter((item) => item !== this); }
+  addEventListener(name, callback, options) {
+    this.listeners[name] = callback;
+    if (options?.signal) setMaxListeners(0, options.signal);
+    options?.signal?.addEventListener("abort", () => { delete this.listeners[name]; });
+  }
+  getBoundingClientRect() { return { left: 0, top: 0, width: 800, height: 600 }; }
   set value(value) { this._value = this.type === "range" ? String(Math.max(Number(this.min), Math.min(Number(this.max), Number(value)))) : value; }
   get value() { return this._value; }
 }
@@ -153,6 +164,93 @@ try {
     assert.equal(label.textContent, "axis_joint"); assert.match(readout.textContent, /reference pose outside/);
     range.value = "90"; range.listeners.input(); assert.equal(events, 1); assert.equal(result.joints[0].value, Math.PI / 2);
     controls.reset(); assert.equal(result.joints[0].value, 0); assert.equal(events, 2);
+    const numeric = container.children[0].children[3], unit = container.children[0].children[4];
+    unit.value = "rad"; unit.listeners.change(); assert.equal(range.min, "1");
+    numeric.value = "1.25"; numeric.listeners.change(); assert.equal(result.joints[0].value, 1.25);
+    numeric.value = "99"; numeric.listeners.change(); assert.equal(result.joints[0].value, 2);
+    numeric.value = ""; numeric.listeners.change(); assert.equal(result.joints[0].value, 2);
+  }
+  {
+    const tensor = { ixx: 3, iyy: 2, izz: 2, ixy: 0.2, ixz: 0.1, iyz: -0.15 };
+    const { radii, axes, moments } = inertiaEllipsoid(2, tensor);
+    const expected = [[3, 0.2, 0.1], [0.2, 2, -0.15], [0.1, -0.15, 2]];
+    for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) {
+      assert.ok(Math.abs(axes.reduce((sum, axis, k) => sum + axis[i] * moments[k] * axis[j], 0) - expected[i][j]) < 1e-12);
+    }
+    for (let i = 0; i < 3; i++) assert.ok(Math.abs(2 * (radii[(i + 1) % 3] ** 2 + radii[(i + 2) % 3] ** 2) / 5 - moments[i]) < 1e-12);
+    assert.throws(() => inertiaEllipsoid(0, tensor), /positive mass/);
+    assert.throws(() => inertiaEllipsoid(1, { ...tensor, ixx: -1 }), /negative/);
+    assert.throws(() => inertiaEllipsoid(1, { ixx: 8, iyy: 1, izz: 1, ixy: 0, ixz: 0, iyz: 0 }), /triangle/);
+    const root = model();
+    find(root, "link").children.push(e("inertial", {}, e("origin", { xyz: "0.1 0.2 0.3", rpy: "0.2 -0.3 0.4" }), e("mass", { value: "2" }), e("inertia", Object.fromEntries(Object.entries(tensor).map(([key, value]) => [key, String(value)])))));
+    Object.assign(find(joint(root), "limit").attributes, { lower: "-2", upper: "2" });
+    joint(root).children.push(e("origin", { xyz: "2 0 0" }));
+    root.children[1].children.push(e("visual", {}, e("geometry", {}, e("box", { size: "0.2 0.2 0.2" }))));
+    const { result, view } = await load(root);
+    view.scene = new THREE.Scene(); view.scene.add(view.robotRoot);
+    view.grid = new THREE.GridHelper(); view.scene.add(view.grid); view.scene.background = new THREE.Color();
+    const canvas = e("canvas"), host = e("div"); host.append(canvas); view.renderer = { domElement: canvas };
+    view.camera.position.set(4, -6, 4); view.camera.up.set(0, 0, 1); view.camera.lookAt(0, 0, 0); view.camera.updateMatrixWorld();
+    const container = e("div"); const inspect = createInspection(view, result, container);
+    const nodes = (node) => [node, ...node.children.flatMap(nodes)];
+    const byLabel = (text) => nodes(container).find((node) => node.tagName === "label" && (node.textContent === text || node.children.some((part) => part.tagName === "span" && part.textContent === text))).children.find((node) => ["select", "input"].includes(node.tagName));
+    const set = (text, value, event = "change") => { const node = byLabel(text); node[node.type === "checkbox" ? "checked" : "value"] = value; node.listeners[event](); };
+    set("Link tree ", "base"); set("Visible", false);
+    assert.equal(result.links.get("base").visuals.visible, false); assert.equal(result.links.get("moving").group.visible, true);
+    set("Visible", true); set("Opacity multiplier", "0.25", "input"); set("Preview color", "#ff0000", "input");
+    const mesh = result.links.get("base").visuals.children[0]; assert.equal(mesh.material.opacity, 0.25); assert.equal(mesh.material.color.getHexString(), "ff0000");
+    nodes(container).find((node) => node.textContent === "Reset selected appearance").listeners.click();
+    assert.equal(mesh.material.opacity, 1); assert.ok(mesh.material.color.equals(mesh.userData.sourceStyle.color));
+    set("Joint frames / motion axes", true); set("Axis size (m)", "0.2");
+    const helpers = result.allJoints[0].pivot.children.filter((node) => node.type === "AxesHelper"); assert.equal(helpers[0].scale.x, 0.2);
+    set("Inertia ellipsoids", true); set("Centers of mass", true);
+    const ellipsoid = result.links.get("base").group.children.find((node) => node.material?.wireframe);
+    const inertialRotation = new THREE.Quaternion().fromArray(result.records.links[0].inertial_quaternion);
+    const basis = new THREE.Matrix4().makeBasis(...axes.map((axis) => new THREE.Vector3(...axis)));
+    assert.ok(ellipsoid.quaternion.angleTo(inertialRotation.multiply(new THREE.Quaternion().setFromRotationMatrix(basis))) < 1e-7);
+    assert.deepEqual(ellipsoid.position.toArray(), [0.1, 0.2, 0.3]);
+    set("Inspect joint ", "axis_joint"); set("Drag joint in view", true);
+    const screen = (xyz) => { const point = new THREE.Vector3(...xyz).project(view.camera); return { clientX: (point.x + 1) * 400, clientY: (1 - point.y) * 300 }; };
+    // Default URDF axis is +X: drag in the joint's YZ plane through a known 90-degree turn.
+    assert.equal(inspect.beginDrag(screen([2, 1, 0])), true);
+    assert.equal(inspect.drag(screen([2, 0, 1])), true); inspect.endDrag();
+    assert.ok(Math.abs(result.joints[0].value - Math.PI / 2) < 1e-8);
+    set("From ", "axis_joint"); set("To ", "axis_joint");
+    assert.match(nodes(container).find((node) => node.tagName === "output").textContent, /0.000000 m/);
+    const material = ellipsoid.material; let disposed = false; material.addEventListener("dispose", () => { disposed = true; });
+    inspect.dispose(); assert.equal(disposed, true); assert.equal(byLabel("Wireframe").listeners.change, undefined);
+  }
+  {
+    const root = model(); joint(root).attributes.type = "prismatic";
+    Object.assign(find(joint(root), "limit").attributes, { lower: "0", upper: "1" });
+    const { result, view } = await load(root);
+    view.scene = new THREE.Scene(); view.scene.add(view.robotRoot); view.scene.background = new THREE.Color();
+    view.grid = new THREE.GridHelper();
+    const canvas = e("canvas"), host = e("div"); host.append(canvas); view.renderer = { domElement: canvas };
+    view.camera.position.set(0, -5, 2); view.camera.up.set(0, 0, 1); view.camera.lookAt(0, 0, 0); view.camera.updateMatrixWorld();
+    const container = e("div"), inspect = createInspection(view, result, container);
+    const traverse = (node) => [node, ...node.children.flatMap(traverse)];
+    const select = traverse(container).find((node) => node.attributes["aria-label"] === "Inspect joint");
+    select.value = "axis_joint";
+    const drag = traverse(container).find((node) => node.tagName === "span" && node.textContent === "Drag joint in view").parentElement.children[0]; drag.checked = true;
+    const screen = (x) => { const point = new THREE.Vector3(x, 0, 0).project(view.camera); return { clientX: (point.x + 1) * 400, clientY: (1 - point.y) * 300 }; };
+    assert.equal(inspect.beginDrag(screen(0)), true); inspect.drag(screen(0.4)); inspect.endDrag();
+    assert.ok(Math.abs(result.joints[0].value - 0.4) < 1e-8);
+    inspect.dispose();
+  }
+  {
+    const root = model(); geometry(root).children = [e("mesh", { filename: "../meshes/exact.stl" })];
+    current = root;
+    const controller = new AbortController();
+    const previousFetch = globalThis.fetch, previousDispose = THREE.BufferGeometry.prototype.dispose;
+    let disposed = 0;
+    THREE.BufferGeometry.prototype.dispose = function () { disposed++; previousDispose.call(this); };
+    globalThis.fetch = async (url) => ({ ok: true, text: async () => "fixture", arrayBuffer: async () => { controller.abort(); return mesh; } });
+    const view = viewer();
+    try {
+      await assert.rejects(() => loadRobot(view, { urdfUrl: "/robot", urdfPath: "urdf/robot.urdf", files, artifactUrl: (name) => `/artifact/${name}`, signal: controller.signal }), /abort/i);
+      assert.equal(view.robotRoot.children.length, 0); assert.equal(disposed, 1);
+    } finally { globalThis.fetch = previousFetch; THREE.BufferGeometry.prototype.dispose = previousDispose; }
   }
   assert.ok(parseStl(mesh).getAttribute("position"));
   console.log(`viewer parser: production load/geometry/records/controls passed; ${cases} invalid declarations rejected`);
