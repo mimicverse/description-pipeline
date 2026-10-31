@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import shutil
 import subprocess
 import tempfile
@@ -101,7 +102,7 @@ from tests.v1.test_pipeline_discover import (
     NativeObservationFixture,
     CountingBackend,
 )
-from tests.v1.test_pipeline_publish import PublishFixture, _PullRequests
+from tests.v1.test_pipeline_publish import PublishFixture, _PullRequests, git
 
 PG_AVAILABLE = pgserver is not None and psycopg2 is not None
 PLATFORM_SCHEMA = (
@@ -316,6 +317,7 @@ class RealSixStageChainTests(unittest.TestCase):
         run_id: str = RUN_ID,
         request_id: str = "real-six-stage-request",
         principal: str = "cli:tenant:ou_chain",
+        change_summary: str = "Exercise production intake through six real handlers",
     ) -> ProductionAdmissionRequest:
         identity = describe_handoff(self.source_root)
         receipt = ReceivedUploadReceipt(
@@ -328,7 +330,7 @@ class RealSixStageChainTests(unittest.TestCase):
             handoff_sha256=identity["handoff_sha256"],
             main_assembly=MAIN_ASSEMBLY,
             target_hardware="nd_fixture",
-            change_summary="Exercise production intake through six real handlers",
+            change_summary=change_summary,
             purpose="engineering",
         )
         return ProductionAdmissionRequest(
@@ -594,7 +596,9 @@ class RealSixStageChainTests(unittest.TestCase):
         application = self._application()
         factory_work = self.root / "factory-work"
         factory_work.mkdir()
-        request = self._production_request()
+        request = self._production_request(
+            change_summary="Align the camera bracket\r\nRetain measured joint limits\rReview the full assembly",
+        )
         platform_snapshot = self._platform_snapshot()
         with (
             patch(
@@ -646,6 +650,10 @@ class RealSixStageChainTests(unittest.TestCase):
             self.pull_requests.rows[0].head_ref,
             spec.publish_intent.repository.branch_ref,
         )
+        self._assert_published_change_summary(
+            spec,
+            "Align the camera bracket\nRetain measured joint limits\nReview the full assembly",
+        )
         with (
             self._connect() as connection,
             connection.cursor() as cursor,
@@ -670,6 +678,22 @@ class RealSixStageChainTests(unittest.TestCase):
                 ("publish", "completed"),
             ],
         )
+
+    def _assert_published_change_summary(self, spec: AdmissionSpec, summary: str) -> None:
+        branch = spec.publish_intent.repository.branch_ref
+
+        def published_record(relative: str) -> dict:
+            return json.loads(
+                git(None, "--git-dir", str(self.publish.remote), "show", f"refs/heads/{branch}:{relative}").stdout
+            )
+
+        self.assertEqual(spec.publish_intent.commit.body, summary)
+        self.assertEqual(published_record("input/request.json")["change_summary"], summary)
+        source = published_record("input/source.json")["metadata"]
+        self.assertEqual(source["change_summary_source"], "cad")
+        self.assertEqual(source["change_summary"], capture_record()["identity"]["change_summary"])
+        self.assertNotEqual(source["change_summary"], summary)
+        self.assertTrue(self.pull_requests.rows[0].body.startswith(summary + "\nVerification warnings ("))
 
     def test_default_environment_factory_runs_native_loopback_chain(self) -> None:
         snapshot = self._platform_snapshot()
@@ -943,7 +967,7 @@ class RealSixStageChainTests(unittest.TestCase):
             main_assembly=MAIN_ASSEMBLY,
             target_hardware="nd_fixture",
             purpose="engineering",
-            change_summary="Reuse sealed CAD bytes under current production inputs",
+            change_summary="Reuse sealed CAD bytes under current production inputs\nReview this successor separately",
             principal="cli:tenant:ou_successor",
         )
         successor_work = self.root / "successor-factory-work"
@@ -1006,6 +1030,8 @@ class RealSixStageChainTests(unittest.TestCase):
             self.pull_requests.rows[0].head_ref,
             child_spec.publish_intent.repository.branch_ref,
         )
+        self._assert_published_change_summary(child_spec, successor.change_summary)
+        self.assertNotEqual(successor.change_summary, parent_request.change_summary)
         with (
             self._connect() as connection,
             connection.cursor() as cursor,
@@ -1115,7 +1141,7 @@ class RealSixStageChainTests(unittest.TestCase):
                 return_value=copy.deepcopy(self.portable),
             ),
         ):
-            load_production_admission(
+            admitted = load_production_admission(
                 application,
                 self._production_request(),
                 artifacts=self.store,
@@ -1136,6 +1162,7 @@ class RealSixStageChainTests(unittest.TestCase):
 
         self.assertEqual(pull_requests.create_calls, 1)
         self.assertEqual(len(pull_requests.rows), 1)
+        original_body = pull_requests.rows[0].body
         command = self.facts.load_stage_command(RUN_ID, "publish")
         unknown = self.facts.effect_settlement_for_key(
             command.command_id,
@@ -1212,6 +1239,11 @@ class RealSixStageChainTests(unittest.TestCase):
         self.assertEqual(outcome.stage, "publish")
         self.assertEqual(pull_requests.create_calls, 1)
         self.assertEqual(len(pull_requests.rows), 1)
+        self.assertEqual(pull_requests.rows[0].body, original_body)
+        self._assert_published_change_summary(
+            AdmissionSpec.from_record(admitted.admission.request),
+            "Exercise production intake through six real handlers",
+        )
         with (
             self._connect() as connection,
             connection.cursor() as cursor,
