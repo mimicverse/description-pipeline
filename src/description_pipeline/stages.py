@@ -43,6 +43,17 @@ WINDOWS_STAGES = tuple(stage for stage, hosts in HOST_BY_STAGE.items() if "windo
 PORTABLE_STAGES = tuple(stage for stage, hosts in HOST_BY_STAGE.items() if hosts == ("linux",))
 
 
+def execution_stage_ids(from_stage: str | None = None, *, through: str = "publish") -> tuple[str, ...]:
+    """Derive the execution range from the immutable admission and stage contract."""
+    if from_stage not in {None, "freeze", "mjcf"} or through not in STAGE_IDS:
+        raise PipelineError("The admitted execution range is invalid")
+    start = STAGE_IDS.index(from_stage or "freeze")
+    end = STAGE_IDS.index(through)
+    if end < start:
+        raise PipelineError("The target stage precedes the admitted entry stage")
+    return STAGE_IDS[start:end + 1]
+
+
 def canonical_freeze_timestamp(value) -> str:
     """Normalize one timezone-aware platform instant to canonical UTC text."""
 

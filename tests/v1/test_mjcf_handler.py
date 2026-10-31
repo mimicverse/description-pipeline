@@ -6,6 +6,9 @@ import unittest
 import copy
 import tempfile
 import uuid
+import os
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -203,6 +206,21 @@ class MJCFEnginePostgresTests(unittest.TestCase):
                 )
                 command = build_diagnostic_command(spec)
                 facts.admit_diagnostic(spec, command)
+                if name == "pass":
+                    completed = subprocess.run(
+                        [sys.executable, "-B", "-m", "description_pipeline.cli", "stage", command.command_id],
+                        env={
+                            "PATH": os.environ["PATH"],
+                            "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src"),
+                            "PLATFORM_SERVICE_DSN": psycopg2.extensions.make_dsn(
+                                server.get_uri(), options=f"-c search_path={schema},public",
+                            ),
+                            "PLATFORM_ARTIFACT_ROOT": str(fixture.store.root),
+                            "PIPELINE_WORK_ROOT": str(Path(directory) / "cold-cli"),
+                        },
+                        capture_output=True, text=True, timeout=45,
+                    )
+                    self.assertEqual(0, completed.returncode, completed.stderr)
                 services = CanonicalStageServices(
                     facts=facts,
                     artifacts=fixture.store,

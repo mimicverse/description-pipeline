@@ -21,6 +21,7 @@ from description_pipeline.artifacts import ArtifactStore
 from description_pipeline.io import PipelineError, digest, write_json
 from description_pipeline.pipeline.admission import build_run_admission
 from description_pipeline.pipeline.application import (
+    AirflowTaskBinding,
     ApplicationError,
     ApplicationPortMissing,
     EffectWakeupHint,
@@ -880,6 +881,32 @@ class StageApplicationTests(unittest.TestCase):
             self.assertRaises(ModuleNotFoundError),
         ):
             application_from_environment(environment)
+
+    def test_portable_stage_composition_needs_no_native_or_publication_ports(self):
+        environment, executor, _native_target = self._environment_composition()
+        for key in ("SOLIDWORKS_ENDPOINT_URL", "ENDPOINT_TOKEN_FILE", "PLATFORM_CONFIG_SNAPSHOT"):
+            environment.pop(key)
+        for stage in ("generate", "verify", "mjcf"):
+            with (
+                self.subTest(stage=stage),
+                patch("description_pipeline.pipeline.application.tool_record",
+                      return_value={"source_sha256": executor}),
+                patch("description_pipeline.pipeline.application._registered_native_target_from_environment",
+                      side_effect=AssertionError("A portable stage loaded native identity")),
+                patch("description_pipeline.pipeline.application._native_client_from_environment",
+                      side_effect=AssertionError("A portable stage loaded native credentials")),
+                patch("description_pipeline.repository.publish.GitHubCliPullRequestClient",
+                      side_effect=AssertionError("A portable stage constructed a publication client")),
+            ):
+                application = application_from_environment(
+                    environment,
+                    airflow_task_binding=AirflowTaskBinding("solidworks_to_urdf", "isolated-run", stage, -1),
+                )
+                self.assertEqual([stage], list(application.handlers))
+                self.assertIsNone(application.native_target_identity)
+                self.assertFalse(application.reconciliation_adapters)
+                self.assertFalse(application.cancellation_controllers)
+                self.assertFalse((application.services.work_root / "publish-pr-observer").exists())
 
     def test_environment_composition_rejects_missing_native_cancellation(self):
         environment, executor, native_target = self._environment_composition()

@@ -30,7 +30,7 @@ from ..orchestration.native_operation_client import (
 )
 from ..repository.publish import REPOSITORY_SNAPSHOT_METADATA
 from ..runtime import tool_record
-from ..stages import STAGE_IDS
+from ..stages import STAGE_IDS, execution_stage_ids
 from ..schemas import AIRFLOW_DISPATCH_CONF_SCHEMA
 from .admission import (
     AdmissionSpec,
@@ -1448,6 +1448,31 @@ class StageApplication:
         )
 
 
+def _runtime_stage_ids(facts, *, command_id, run_id, through, binding):
+    """Select capabilities from registered facts or an actual Airflow task binding."""
+    if sum(value is not None for value in (command_id, run_id, binding)) > 1:
+        raise ApplicationError("application.runtime_target_invalid", "Runtime targets are mutually exclusive")
+    if command_id is not None:
+        command = facts.load_command(command_id)
+        if command.kind != "stage" or command.stage not in STAGE_IDS:
+            raise ApplicationError("application.command_not_stage", "Only registered stage commands can execute")
+        return (command.stage,)
+    if run_id is not None:
+        admission = facts.load_admission(run_id)
+        if admission is None:
+            raise ApplicationError("application.run_not_admitted", "The runtime run is not admitted")
+        spec = AdmissionSpec.from_record(admission.request)
+        validate_run_admission(spec, admission)
+        return execution_stage_ids(spec.from_stage, through=through)
+    if binding is not None:
+        if not isinstance(binding, AirflowTaskBinding) or binding.task_id not in STAGE_IDS:
+            raise ApplicationError(
+                "application.airflow_binding_invalid", "The runtime binding has no engineering stage",
+            )
+        return (binding.task_id,)
+    return STAGE_IDS
+
+
 def application_from_environment(
     environ: Mapping[str, str] | None = None,
     *,
@@ -1461,18 +1486,19 @@ def application_from_environment(
     reconciliation_adapters: Mapping[str, EffectReconciliationAdapter] | None = None,
     cancellation_controllers: Mapping[str, CancellationControlPort] | None = None,
     airflow_task_binding: AirflowTaskBinding | None = None,
+    command_id: str | None = None,
+    run_id: str | None = None,
+    through: StageId = "publish",
     clock: Callable[[], datetime] = _utc_now,
 ) -> StageApplication:
     """Compose implemented handlers; missing runtime capabilities remain explicit."""
 
-    from .stages.publish import (
-        PublishGitReconciliationAdapter,
-        PublishPullRequestReconciliationAdapter,
-    )
-
     source = os.environ if environ is None else environ
     artifacts = ArtifactStore.from_environment(source)
     facts = FactStore.from_environment(source, result_reader=artifacts)
+    selected = _runtime_stage_ids(
+        facts, command_id=command_id, run_id=run_id, through=through, binding=airflow_task_binding,
+    )
     work_root = source.get("PIPELINE_WORK_ROOT")
     if not work_root:
         raise ApplicationError("application.work_root_missing", "PIPELINE_WORK_ROOT is not configured")
@@ -1481,14 +1507,16 @@ def application_from_environment(
         native_target_identity
         if native_target_identity is not None
         else _registered_native_target_from_environment(source)
+        if any(stage in selected for stage in ("freeze", "discover", "capture")) else None
     )
-    if not isinstance(registered_target, NativeTargetIdentity):
+    if registered_target is not None and not isinstance(registered_target, NativeTargetIdentity):
         raise ApplicationError(
             "application.native_target_invalid",
             "native_target_identity must be a NativeTargetIdentity",
         )
     if (
         native_operation_client is not None
+        and registered_target is not None
         and getattr(native_operation_client, "target_id", None)
         != registered_target.target_id
     ):
@@ -1534,7 +1562,7 @@ def application_from_environment(
         clock=clock,
         transfer_resume_gate=_transfer_resume_gate_from_environment(source),
     )
-    client = native_operation_client
+    client = native_operation_client if any(stage in selected for stage in ("discover", "capture")) else None
 
     def record_native_activity(run_id: str, view) -> None:
         if getattr(view, "activity", None) is not None:
@@ -1547,7 +1575,8 @@ def application_from_environment(
                     in {"satisfied", "failed", "cancelled", "unknown"},
                 )
 
-    if discover_adapter is None or capture_handler is None:
+    if (("discover" in selected and discover_adapter is None)
+            or ("capture" in selected and capture_handler is None)):
         client = (
             native_operation_client
             if native_operation_client is not None
@@ -1557,7 +1586,7 @@ def application_from_environment(
             )
         )
         tool_provider = NativeOperationToolProvider(client)
-        if discover_adapter is None:
+        if "discover" in selected and discover_adapter is None:
             discover_adapter = NativeRemoteDiscoverAdapter(
                 port=NativeOperationDiscoverPort(
                     client,
@@ -1567,7 +1596,7 @@ def application_from_environment(
                 ),
                 artifacts=artifacts,
             )
-        if capture_handler is None:
+        if "capture" in selected and capture_handler is None:
             capture_handler = capture_handler_from_native_operation(
                 client,
                 artifact_store=artifacts,
@@ -1580,17 +1609,18 @@ def application_from_environment(
             "native_operation",
             NativeOperationEffectObserver(client),
         )
-    adapters.setdefault("git_ref_update", PublishGitReconciliationAdapter())
-    from ..repository.publish import GitHubCliPullRequestClient
+    if "publish" in selected:
+        from .stages.publish import PublishGitReconciliationAdapter, PublishPullRequestReconciliationAdapter
 
-    pull_request_root = Path(work_root) / "publish-pr-observer"
-    pull_request_root.mkdir(parents=True, exist_ok=True)
-    adapters.setdefault(
-        "pr_upsert",
-        PublishPullRequestReconciliationAdapter(
-            GitHubCliPullRequestClient(pull_request_root)
-        ),
-    )
+        adapters.setdefault("git_ref_update", PublishGitReconciliationAdapter())
+        from ..repository.publish import GitHubCliPullRequestClient
+
+        pull_request_root = Path(work_root) / "publish-pr-observer"
+        pull_request_root.mkdir(parents=True, exist_ok=True)
+        adapters.setdefault(
+            "pr_upsert",
+            PublishPullRequestReconciliationAdapter(GitHubCliPullRequestClient(pull_request_root)),
+        )
     controllers = dict(cancellation_controllers or {})
     if client is not None:
         from .cancellation import CancellationControlService
@@ -1626,19 +1656,21 @@ def application_from_environment(
         if adapters
         else None
     )
-    installed: dict[StageId, StageHandler] = {
-        "freeze": FreezeHandler(),
-        "generate": GenerateHandler(artifacts),
-        "publish": PublishHandler(artifacts),
-        "verify": VerifyHandler(),
-        "mjcf": MJCFHandler(artifacts),
-    }
-    assert discover_adapter is not None
-    assert capture_handler is not None
-    installed["discover"] = DiscoverHandler(discover_adapter)
-    installed["capture"] = capture_handler
-    if publish_handler is not None:
-        installed["publish"] = publish_handler
+    installed: dict[StageId, StageHandler] = {}
+    constructors = {"freeze": FreezeHandler, "generate": lambda: GenerateHandler(artifacts),
+                    "publish": lambda: publish_handler if publish_handler is not None else PublishHandler(artifacts),
+                    "verify": VerifyHandler, "mjcf": lambda: MJCFHandler(artifacts)}
+    for stage in selected:
+        if stage == "discover":
+            if discover_adapter is None:
+                raise ApplicationPortMissing("application.discover_missing", "The native discovery port is required")
+            installed[stage] = DiscoverHandler(discover_adapter)
+        elif stage == "capture":
+            if capture_handler is None:
+                raise ApplicationPortMissing("application.capture_missing", "The native capture port is required")
+            installed[stage] = capture_handler
+        else:
+            installed[stage] = constructors[stage]()
     for stage, handler in (handlers or {}).items():
         if stage in installed and installed[stage] != handler:
             raise ApplicationError(
