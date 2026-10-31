@@ -345,9 +345,9 @@ class PlatformSchemaPostgresTests(unittest.TestCase):
             cursor.execute(statement, values)
         return decision_id
 
-    def _insert_open_claim(self, command_id: str, *, stage: str) -> str:
+    def _insert_open_claim(self, command_id: str, *, stage: str, expired: bool = False) -> str:
         claim_id = f"claim-{command_id}"
-        now = datetime(2026, 10, 25, tzinfo=UTC)
+        now = datetime.now(UTC) - (timedelta(minutes=10) if expired else timedelta())
         with self._connect() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -546,20 +546,17 @@ class PlatformSchemaPostgresTests(unittest.TestCase):
             self._insert_decision(run_id, "freeze", command_id, outcome=outcome)
 
         running_run = "run-running"
-        self._insert_run(running_run)
-        freeze_command = self._insert_stage_command(running_run, "freeze")
-        freeze_decision = self._insert_decision(
-            running_run,
-            "freeze",
-            freeze_command,
-            outcome="completed",
-        )
-        discover_command = self._insert_stage_command(
-            running_run,
-            "discover",
-            predecessor_decision_id=freeze_decision,
-        )
-        self._insert_open_claim(discover_command, stage="discover")
+        expired_run = "run-expired"
+        for run_id, expired in ((running_run, False), (expired_run, True)):
+            self._insert_run(run_id)
+            freeze_command = self._insert_stage_command(run_id, "freeze")
+            freeze_decision = self._insert_decision(
+                run_id, "freeze", freeze_command, outcome="completed",
+            )
+            discover_command = self._insert_stage_command(
+                run_id, "discover", predecessor_decision_id=freeze_decision,
+            )
+            self._insert_open_claim(discover_command, stage="discover", expired=expired)
 
         for run_id, fact_type in (
             ("run-effect-unknown", "dispatch_authorized"),
@@ -616,6 +613,7 @@ class PlatformSchemaPostgresTests(unittest.TestCase):
         self.assertEqual(store.get_admitted_run("run-freeze-failed").state, "failed")
         self.assertEqual(store.get_admitted_run("run-freeze-cancelled").state, "cancelled")
         self.assertEqual(store.get_admitted_run(running_run).state, "incomplete")
+        self.assertEqual(store.get_admitted_run(expired_run).state, "unresolved")
         self.assertEqual(store.get_admitted_run("run-effect-unknown").state, "unresolved")
         self.assertEqual(store.get_admitted_run("run-effect-conflict").state, "unresolved")
         self.assertEqual(store.get_admitted_run(contradiction_run).state, "unresolved")

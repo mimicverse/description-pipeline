@@ -1728,8 +1728,12 @@ else:
             / "repository.bundle"
         )
         snapshot_path.write_bytes(snapshot_path.read_bytes() + b"tamper")
-        with self.assertRaises(PipelineError):
+        with self.assertRaises(StageFailure) as raised:
             self._run()
+        self.assertEqual(raised.exception.reason_code, "publish.local_contract_failed")
+        self.assertEqual(raised.exception.detail["exception"]["operation"], "publish.verify_inputs")
+        self.assertEqual(self.fixture.effects.intents, {})
+        self.assertEqual(self.fixture.effects.authorizations, 0)
 
     def test_head_drift_refuses_before_external_effect(self) -> None:
         branch_ref = self.fixture.command.request["branch_ref"]
@@ -2413,10 +2417,14 @@ class PublicationWarningProjectionTests(unittest.TestCase):
             with self.subTest(diagnostic=diagnostic):
                 fixture = PublishFixture(diagnostics=[diagnostic])
                 self.addCleanup(fixture.close)
-                with self.assertRaisesRegex(PipelineError, "diagnostic"):
+                with self.assertRaises(StageFailure) as raised:
                     fixture.handler.execute(
                         fixture.command, fixture.claim, fixture.workspace, effects=fixture.effects,
                     )
+                self.assertEqual(raised.exception.reason_code, "publish.local_contract_failed")
+                self.assertIn("diagnostic", raised.exception.detail["exception"]["message"])
+                self.assertEqual(fixture.effects.intents, {})
+                self.assertEqual(fixture.effects.authorizations, 0)
                 self.assertEqual(fixture.pr.rows, [])
 
     def test_published_warning_links_resolve_to_the_bound_certificate(self) -> None:

@@ -405,11 +405,23 @@ repeatable-read snapshot 中的 `read_admitted_runs` 复算；该角色不得写
 失败、验证尚未开始和缺少正式资格分别表达；不能用 Airflow 的 running 状态覆盖业务未知。
 
 运行和阶段显示状态是只读投影，不能作为可写业务权威。无 decision 且存在当前 open
-claim 为 `active`；无 open claim 且前置完成但尚未创建/执行后继为 `waiting`；
+claim 且租约未过期时为 `active`；无 open claim 且前置完成但尚未创建/执行后继为 `waiting`；
+未关闭、未有 decision 的过期 claim 按数据库当前事务时间投影为 `unresolved`，
+明细、列表和维护查询共用此规则；只读投影不关闭 claim，不认定进程已退出，也不授予重试权。
 已登记 effect 为 UNKNOWN/CONFLICT 或未封存 candidate 保留为 `unresolved`；已证明
 前置失败且后继未执行为 `blocked`。completed `StageDecision` 必须绑定 completed
 `StageResult`、满足的完整 effect ledger 与相同 executor；failed/cancelled decision
 必须保留 failure/result 原件，未知 effect 不得被隐藏为确定失败。终态不复写。
+
+Publish 的输入复核、快照物化、本地候选与发布计划构建、外发文件准备，以及尚未发送 PR 的
+只读查询、已结算 effect 原件读取和最终只读核验，发生确定的进程或 I/O 失败时，复用
+`StageFailure` 封存原始退出码、超时与脱敏输出，并由共同 engine 提交失败决策、
+关闭 claim。最终本地回执写入及已知 effect 后的本地清理失败也走该边界。
+已有 UNKNOWN/CONFLICT 时的清理异常仍保留不确定性，不创建终态失败。
+共同结果封存或进程崩溃等未形成决定的基础设施异常保留原 claim 与证据，租约过期后
+按同一只读规则显示待对账，不从工作目录日志伪造决定。
+已经满足的 effect 原件保持不变；已授权发送但结果未知的 Git/PR
+仍保持 UNKNOWN 并只读对账，不能套用本地失败结论或重发。
 
 裁决提交在同一短事务内重读 command、cancellation、claim/fence、完整 effect ledger、
 candidate 与所有祖先资格。completed decision 要求 ledger 与 result 声明完全相等且

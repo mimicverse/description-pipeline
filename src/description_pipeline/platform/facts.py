@@ -159,6 +159,7 @@ def _run_state_from_canonical_facts(
     decisions: Mapping[str, str],
     effect_states: tuple[str, ...],
     pending_effect_states: tuple[str, ...],
+    expired_claim: bool = False,
 ) -> str:
     """Consume the common stage/run projectors; this layer only loads raw DB facts."""
 
@@ -168,6 +169,7 @@ def _run_state_from_canonical_facts(
             stage_outcomes=outcomes,
             effect_states=effect_states,
             pending_effect_states=pending_effect_states,
+            expired_claim=expired_claim,
         ).value
 
     diagnostic = DiagnosticAdmissionSpec.from_record(request)
@@ -183,6 +185,7 @@ def _run_state_from_canonical_facts(
         predecessor_completed=True,
         open_claim=False,
         pending_effect_states=pending_effect_states,
+        expired_claim=expired_claim,
     )
     if status in {StageStatus.WAITING, StageStatus.ACTIVE, StageStatus.BLOCKED}:
         return RunStatus.INCOMPLETE.value
@@ -366,16 +369,23 @@ def read_admitted_runs(
 
         cursor.execute(
             """
-            SELECT command.run_id, max(claim.last_seen_at)
+            SELECT command.run_id, max(claim.last_seen_at),
+                   bool_or(command.kind = 'stage' AND claim.closed_at IS NULL
+                           AND claim.expires_at <= CURRENT_TIMESTAMP
+                           AND decision.command_id IS NULL)
             FROM command
             JOIN execution_claim AS claim ON claim.command_id = command.command_id
+            LEFT JOIN stage_decision AS decision ON decision.command_id = command.command_id
             WHERE command.run_id = ANY(%s::text[])
             GROUP BY command.run_id
             """,
             (run_ids,),
         )
-        for claim_run, last_seen_at in cursor.fetchall():
+        expired_claim_runs: set[str] = set()
+        for claim_run, last_seen_at, expired_claim in cursor.fetchall():
             updated_at[claim_run] = max(updated_at[claim_run], last_seen_at)
+            if expired_claim:
+                expired_claim_runs.add(claim_run)
     finally:
         cursor.close()
 
@@ -398,6 +408,7 @@ def read_admitted_runs(
                     if effect_id in yielded_effect_ids[admission_run]
                     and state is EffectState.UNKNOWN
                 ),
+                expired_claim=admission_run in expired_claim_runs,
             ),
             created_at=created_at,
             updated_at=updated_at[admission_run],

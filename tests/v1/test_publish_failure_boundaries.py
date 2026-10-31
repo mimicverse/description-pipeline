@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import json
+import errno
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import ExitStack
 from dataclasses import replace
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-from description_pipeline.io import file_digest, process_error_record, read_data
+from description_pipeline.io import PipelineError, file_digest, process_error_record, read_data
 from description_pipeline.pipeline.contracts import StageDeferral, StageFailure
 from description_pipeline.pipeline.contracts import FailureEnvelope
 from description_pipeline.pipeline.engine import StageWorkspace, execute_stage
@@ -21,11 +23,14 @@ from description_pipeline.io import digest
 from description_pipeline.pipeline.stages import publish as stage
 from description_pipeline.pipeline.reconciliation import EffectReconciliationService
 from description_pipeline.pipeline.effects import EffectState
+from description_pipeline.platform.queries import read_run_projection
+from description_pipeline.platform.facts import read_admitted_runs
 from description_pipeline.repository import publish as repository_module
 from description_pipeline.repository.publish import (
     GITHUB_MAX_BLOB_BYTES,
     PublicationError,
     PublicationRepository,
+    PreparedCandidate,
 )
 
 from tests.v1.test_pipeline_publish import PublishFixture, git
@@ -241,6 +246,49 @@ class PublishFailureBoundaryTests(unittest.TestCase):
             root = self.fixture.store.materialize(artifact, self.fixture.root / f"diagnostic-{index}")
             records.append(read_data(root / "timeout.json"))
         return records
+
+    def test_cleanup_error_keeps_the_existing_unknown_send_unresolved(self) -> None:
+        with (
+            patch.object(PreparedCandidate, "cleanup", side_effect=OSError("local cleanup failed")),
+            patch.object(PublicationRepository, "push", side_effect=OSError("send response unavailable")),
+            patch.object(stage, "_observe_git_exact", side_effect=OSError("observation unavailable")),
+            self.assertRaises(OSError),
+        ):
+            self.run_publish()
+        settlement = self.fixture.effects.effect_settlement_for_key(stage.GIT_EFFECT_KEY)
+        self.assertIs(settlement.state, EffectState.UNKNOWN)
+        self.assertEqual(self.fixture.effects.authorizations, 1)
+        self.assertIsNone(self.fixture.effects.effect_settlement_for_key(stage.PR_EFFECT_KEY))
+        self.assertEqual(self.fixture.pr.create_calls, 0)
+
+    def test_satisfied_effect_evidence_read_failures_never_resend(self) -> None:
+        self.run_publish()
+        authorizations = self.fixture.effects.authorizations
+        materialize = self.fixture.store.materialize
+        pr_payload = self.fixture.effects.effect_settlement_for_key(stage.PR_EFFECT_KEY).payload_artifact
+
+        def fail_pr_payload(artifact, destination):
+            if artifact == pr_payload:
+                raise OSError("sealed PR evidence unavailable")
+            return materialize(artifact, destination)
+
+        for index, operation in enumerate(("publish.git_readback", "publish.effect_readback")):
+            workspace = StageWorkspace(
+                root=self.fixture.root / f"sealed-read-{index}", inputs=self.fixture.workspace.inputs,
+            )
+            fault = (
+                patch.object(
+                    stage, "_read_sealed_git_outbound", side_effect=PipelineError("sealed Git evidence invalid"),
+                )
+                if index == 0 else patch.object(self.fixture.store, "materialize", side_effect=fail_pr_payload)
+            )
+            with self.subTest(operation=operation), fault, self.assertRaises(StageFailure) as raised:
+                self.run_publish(workspace)
+            self.assertEqual(raised.exception.detail["exception"]["operation"], operation)
+            for key in (stage.GIT_EFFECT_KEY, stage.PR_EFFECT_KEY):
+                self.assertIs(self.fixture.effects.effect_settlement_for_key(key).state, EffectState.SATISFIED)
+            self.assertEqual(self.fixture.effects.authorizations, authorizations)
+            self.assertEqual(self.fixture.pr.create_calls, 1)
 
     def test_size_rejection_precedes_bundle_effect_and_dispatch(self) -> None:
         with (
@@ -509,6 +557,232 @@ class PublishFailurePostgresTests(unittest.TestCase):
             self.assertEqual(cursor.fetchall(), [("definite_failure", True)])
             cursor.execute("SELECT count(*) FROM effect_intent WHERE command_id=%s", (command.command_id,))
             self.assertEqual(cursor.fetchone(), (0,))
+
+    def test_real_local_process_failures_close_the_claim_and_project_failed_without_dispatch(self) -> None:
+        harness = self.harness
+        offline_remote = harness.fixture.remote.with_name("offline.git")
+        empty_path = harness.fixture.root / "empty-path"
+        empty_path.mkdir()
+        seal_outbound = stage._seal_effect_outbound
+
+        def collide_outbound(root, payload, **kwargs):
+            root.parent.mkdir(parents=True, exist_ok=True)
+            root.write_text("occupied\n")
+            return seal_outbound(root, payload, **kwargs)
+
+        for index, operation in enumerate(("publish.snapshot", "publish.git_prepare", "publish.outbound_prepare")):
+            with self.subTest(operation=operation), ExitStack() as stack:
+                command = harness._command(f"local-process-{index}")
+                services = _services(
+                    facts=harness.facts,
+                    artifacts=harness.artifacts,
+                    work_root=harness.work_root / str(index),
+                    owner_sha256=digest({"process": f"local-process-{index}"}),
+                    executor_sha256=harness.fixture.executor,
+                    now=harness.now,
+                )
+                if operation == "publish.snapshot":
+                    stack.enter_context(patch.dict(os.environ, {"PATH": str(empty_path)}))
+                elif operation == "publish.git_prepare":
+                    harness.fixture.remote.rename(offline_remote)
+                    stack.callback(offline_remote.rename, harness.fixture.remote)
+                else:
+                    stack.enter_context(patch.object(stage, "_seal_effect_outbound", side_effect=collide_outbound))
+                push = stack.enter_context(patch.object(PublicationRepository, "push"))
+                outcome = execute_stage(
+                    command_id=command.command_id,
+                    handler=stage.PublishHandler(harness.artifacts, pull_requests=harness.fixture.pr),
+                    services=services,
+                )
+                self.assertIsInstance(outcome, FailureEnvelope)
+                self.assertEqual(outcome.reason_code, "publish.local_process_failed")
+                self.assertEqual(outcome.error_detail["exception"]["operation"], operation)
+                if operation == "publish.git_prepare":
+                    self.assertEqual(outcome.error_detail["exception"]["returncode"], 128)
+                    self.assertIn("stderr", outcome.error_detail["exception"])
+                push.assert_not_called()
+                self.assertEqual(harness.fixture.pr.create_calls, 0)
+                with harness._connect() as connection, connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT closure_code, closed_at IS NOT NULL FROM execution_claim WHERE command_id=%s",
+                        (command.command_id,),
+                    )
+                    self.assertEqual(cursor.fetchall(), [("definite_failure", True)])
+                    cursor.execute("SELECT count(*) FROM effect_intent WHERE command_id=%s", (command.command_id,))
+                    self.assertEqual(cursor.fetchone(), (0,))
+                    projection = read_run_projection(connection, command.run_id, artifacts=harness.artifacts)
+                self.assertEqual(projection["state"], "failed")
+                self.assertEqual(projection["stages"][-1]["state"], "failed")
+
+    def test_failed_pr_read_before_dispatch_preserves_the_satisfied_git_effect(self) -> None:
+        harness = self.harness
+        command = harness._command("pr-read-before-write")
+        services = _services(
+            facts=harness.facts, artifacts=harness.artifacts, work_root=harness.work_root,
+            owner_sha256=digest({"process": "pr-read-before-write"}),
+            executor_sha256=harness.fixture.executor, now=harness.now,
+        )
+
+        def fail_read(**kwargs):
+            return subprocess.run(
+                [sys.executable, "-c", "import sys; sys.stderr.write('query unavailable'); sys.exit(3)"],
+                check=True, capture_output=True,
+            )
+
+        with patch.object(harness.fixture.pr, "observe", side_effect=fail_read):
+            outcome = execute_stage(
+                command_id=command.command_id,
+                handler=stage.PublishHandler(harness.artifacts, pull_requests=harness.fixture.pr),
+                services=services,
+            )
+        self.assertIsInstance(outcome, FailureEnvelope)
+        self.assertEqual(outcome.error_detail["exception"]["operation"], "publish.pr_observe")
+        self.assertEqual(outcome.error_detail["exception"]["returncode"], 3)
+        self.assertIs(harness.facts.effect_settlement_for_key(command.command_id, stage.GIT_EFFECT_KEY).state,
+                      EffectState.SATISFIED)
+        self.assertIsNone(harness.facts.effect_settlement_for_key(command.command_id, stage.PR_EFFECT_KEY))
+        self.assertEqual(harness.fixture.pr.create_calls, 0)
+        self.assertEqual(harness.facts.decision_for(command).outcome, "failed")
+
+    def test_failed_final_read_preserves_both_satisfied_effects_and_commits_failure(self) -> None:
+        harness = self.harness
+        command = harness._command("final-read-after-writes")
+        services = _services(
+            facts=harness.facts, artifacts=harness.artifacts, work_root=harness.work_root,
+            owner_sha256=digest({"process": "final-read-after-writes"}),
+            executor_sha256=harness.fixture.executor, now=harness.now,
+        )
+        observe = PublicationRepository.observe
+
+        def fail_final_read(repository, ref):
+            if harness.fixture.pr.create_calls:
+                subprocess.run(
+                    [sys.executable, "-c", "import sys; sys.stderr.write('read timed out'); sys.exit(9)"],
+                    check=True, capture_output=True,
+                )
+            return observe(repository, ref)
+
+        with patch.object(PublicationRepository, "observe", new=fail_final_read):
+            outcome = execute_stage(
+                command_id=command.command_id,
+                handler=stage.PublishHandler(harness.artifacts, pull_requests=harness.fixture.pr),
+                services=services,
+            )
+        self.assertIsInstance(outcome, FailureEnvelope)
+        self.assertEqual(outcome.error_detail["exception"]["operation"], "publish.final_readback")
+        self.assertEqual(outcome.error_detail["exception"]["returncode"], 9)
+        for key in (stage.GIT_EFFECT_KEY, stage.PR_EFFECT_KEY):
+            self.assertIs(harness.facts.effect_settlement_for_key(command.command_id, key).state,
+                          EffectState.SATISFIED)
+        self.assertEqual(harness.fixture.pr.create_calls, 1)
+        self.assertEqual(harness.facts.decision_for(command).outcome, "failed")
+
+    def test_receipt_disk_failure_preserves_satisfied_effects_and_closes_the_claim(self) -> None:
+        harness = self.harness
+        command = harness._command("receipt-disk-failure")
+        services = _services(
+            facts=harness.facts, artifacts=harness.artifacts, work_root=harness.work_root,
+            owner_sha256=digest({"process": "receipt-disk-failure"}),
+            executor_sha256=harness.fixture.executor, now=harness.now,
+        )
+        write_json = stage.write_json
+
+        def fail_receipt(path, value):
+            if Path(path).name == stage.PUBLICATION_RECEIPT:
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return write_json(path, value)
+
+        with patch.object(stage, "write_json", side_effect=fail_receipt):
+            outcome = execute_stage(
+                command_id=command.command_id,
+                handler=stage.PublishHandler(harness.artifacts, pull_requests=harness.fixture.pr),
+                services=services,
+            )
+        self.assertIsInstance(outcome, FailureEnvelope)
+        self.assertEqual(outcome.error_detail["exception"]["operation"], "publish.receipt")
+        for key in (stage.GIT_EFFECT_KEY, stage.PR_EFFECT_KEY):
+            self.assertIs(harness.facts.effect_settlement_for_key(command.command_id, key).state,
+                          EffectState.SATISFIED)
+        with harness._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT closure_code, closed_at IS NOT NULL FROM execution_claim WHERE command_id=%s",
+                (command.command_id,),
+            )
+            self.assertEqual(cursor.fetchall(), [("definite_failure", True)])
+            self.assertEqual(read_run_projection(connection, command.run_id)["state"], "failed")
+        self.assertEqual(harness.fixture.pr.create_calls, 1)
+
+    def test_known_input_and_cleanup_errors_commit_failures_without_hiding_effects(self) -> None:
+        harness = self.harness
+        for index, operation in enumerate(("publish.verify_inputs", "publish.git_prepare", "publish.cleanup")):
+            with self.subTest(operation=operation), ExitStack() as stack:
+                command = harness._command(f"local-validation-{index}")
+                services = _services(
+                    facts=harness.facts, artifacts=harness.artifacts, work_root=harness.work_root / str(index),
+                    owner_sha256=digest({"process": f"local-validation-{index}"}),
+                    executor_sha256=harness.fixture.executor, now=harness.now,
+                )
+                if operation == "publish.verify_inputs":
+                    stack.enter_context(patch.object(
+                        stage.PublishHandler, "_verify_inputs", side_effect=PipelineError("input cannot be verified"),
+                    ))
+                elif operation == "publish.git_prepare":
+                    stack.enter_context(patch.object(
+                        stage.PublishHandler, "_prepare", side_effect=PipelineError("publication inputs invalid"),
+                    ))
+                else:
+                    stack.enter_context(patch.object(
+                        PreparedCandidate, "cleanup", side_effect=OSError("local cleanup failed"),
+                    ))
+                outcome = execute_stage(
+                    command_id=command.command_id,
+                    handler=stage.PublishHandler(harness.artifacts, pull_requests=harness.fixture.pr),
+                    services=services,
+                )
+                self.assertIsInstance(outcome, FailureEnvelope)
+                self.assertEqual(outcome.error_detail["exception"]["operation"], operation)
+                for key in (stage.GIT_EFFECT_KEY, stage.PR_EFFECT_KEY):
+                    settlement = harness.facts.effect_settlement_for_key(command.command_id, key)
+                    if operation != "publish.cleanup":
+                        self.assertIsNone(settlement)
+                    else:
+                        self.assertIs(settlement.state, EffectState.SATISFIED)
+                with harness._connect() as connection, connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT closure_code, closed_at IS NOT NULL FROM execution_claim WHERE command_id=%s",
+                        (command.command_id,),
+                    )
+                    self.assertEqual(cursor.fetchall(), [("definite_failure", True)])
+                    self.assertEqual(read_run_projection(connection, command.run_id)["state"], "failed")
+
+    def test_expired_undecided_claim_is_unresolved_in_detail_and_list_without_mutation(self) -> None:
+        harness = self.harness
+        observed = datetime.now(UTC)
+        for index, expired in enumerate((False, True)):
+            with self.subTest(expired=expired):
+                command = harness._command(f"claim-lease-{index}")
+                issued = observed - timedelta(minutes=10) if expired else observed
+                claim = harness.facts.acquire_claim(
+                    command.command_id,
+                    claim_id=f"claim-lease-{index}",
+                    owner_sha256=digest({"process": f"claim-lease-{index}"}),
+                    executor_sha256=harness.fixture.executor,
+                    now=issued,
+                    expires_at=issued + timedelta(minutes=5),
+                )
+                with harness._connect() as connection, connection.cursor() as cursor:
+                    connection.set_session(readonly=True)
+                    projection = read_run_projection(connection, command.run_id)
+                    summaries = read_admitted_runs(connection, run_id=command.run_id)
+                    self.assertEqual(projection["state"], "unresolved" if expired else "running")
+                    self.assertEqual(projection["stages"][-1]["state"], "unresolved" if expired else "active")
+                    self.assertEqual(summaries[0].state, "unresolved" if expired else "incomplete")
+                    cursor.execute("SELECT closed_at, fence FROM execution_claim WHERE claim_id=%s", (claim.claim_id,))
+                    self.assertEqual(cursor.fetchall(), [(None, claim.fence)])
+                    cursor.execute("SELECT count(*) FROM stage_decision WHERE command_id=%s", (command.command_id,))
+                    self.assertEqual(cursor.fetchone(), (0,))
+                    cursor.execute("SELECT count(*) FROM effect_intent WHERE command_id=%s", (command.command_id,))
+                    self.assertEqual(cursor.fetchone(), (0,))
 
     def test_constraint_reconciliation_is_bound_and_closes_failed_original_stage_without_resend(self) -> None:
         harness = self.harness
