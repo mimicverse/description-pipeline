@@ -8,6 +8,7 @@ the independent checker applies.  It derives no mechanical fact from a robot.
 from __future__ import annotations
 
 import math
+import json
 from pathlib import Path
 from typing import Any
 
@@ -40,8 +41,24 @@ SIMULATION_WARNING = (
     "See reports/mjcf-certificate.json."
 )
 
+FORMAT_WARNING = (
+    "WARNING mjcf.format_projection: Coordinate, inertia-axis and geometry representations "
+    "are derived from the source URDF by declared encoding rules, not read directly from CAD. "
+    "See reports/mjcf-certificate.json for object and field sources."
+)
+COLLISION_WARNING_PREFIX = "WARNING mjcf.collision_proxy: "
+COLLISION_SCOPE = "Convex contact approximation; source concavities and hardware contact behaviour are not qualified"
+
+
+def collision_warning(payload: dict) -> str:
+    """Encode a provenance record without admitting an XML comment terminator."""
+    return COLLISION_WARNING_PREFIX + json.dumps(
+        payload, sort_keys=True, ensure_ascii=True, allow_nan=False, separators=(",", ":")
+    ).replace("--", r"\u002d\u002d")
+
+
 BASE_MODES = ("fixed", "floating")
-COLLISION_SOURCES = ("urdf", "visual_convex", "none")
+COLLISION_SOURCES = ("auto", "urdf", "visual_convex", "none")
 #: The native XML spellings accepted by the locked engine; no aliases.
 INTEGRATORS = ("Euler", "RK4", "implicit", "implicitfast")
 #: The locked MuJoCo enum codes behind those spellings (mjINT_*).
@@ -49,12 +66,15 @@ INTEGRATOR_CODES = {"Euler": 0, "RK4": 1, "implicit": 2, "implicitfast": 3}
 
 #: The schema this projection speaks.  Published defaults of schema 1 are
 #: immutable; any change to the default policy ships as a new schema version.
-CONFIG_SCHEMA_VERSION = 1
+CONFIG_SCHEMA_VERSION = 2
 #: The one versioned default policy every optional user field falls back to.
 DEFAULT_POLICY = {
     "schema_version": CONFIG_SCHEMA_VERSION,
     "base": "floating",
-    "collision": {"source": "urdf", "self_collision": True, "friction": [0.8, 0.005, 0.0001]},
+    "collision": {
+        "source": "auto", "self_collision": True, "friction": [0.8, 0.005, 0.0001],
+        "max_vertices": 256, "max_error_m": 0.00025,
+    },
     "simulation": {"timestep": 0.001, "gravity": [0.0, 0.0, -9.81], "integrator": "implicitfast"},
     "floor": {"height": 0.0},
 }
@@ -73,6 +93,7 @@ CHECK_IDS = (
     "inertia.total",
     "geometry.shapes",
     "geometry.instances",
+    "collision.hulls",
     "joints.config",
     "model.configuration",
     "scene.scene",
@@ -102,6 +123,7 @@ LIGHT_DIR = "0 0 -1"
 
 #: Numeric gates defined once; the report records the actual maximum residual.
 POSITION_ATOL_M = 1e-10
+COLLISION_DISTANCE_ATOL_M = 1e-9
 ROTATION_ATOL = 1e-10
 MASS_REL_TOL = 1e-10
 MASS_ATOL = 1e-12
@@ -150,7 +172,7 @@ ROBOT_XML_SYNTAX = {
     "compiler": ["angle", "fusestatic", "inertiafromgeom"],
     "option": ["timestep", "gravity", "integrator"],
     "asset": [],
-    "mesh": ["name", "file", "scale"],
+    "mesh": ["name", "file", "scale", "inertia", "maxhullvert"],
     "worldbody": [],
     "body": ["name", "pos", "quat"],
     "freejoint": [],
@@ -361,7 +383,7 @@ def load_simulation(content: bytes, label: str = CONFIG_NAME) -> dict:
         raise PipelineError(f"Invalid simulation configuration: base must be one of {BASE_MODES}, got {base!r}")
 
     collision = _optional_mapping(root, "collision", "root")
-    _unknown(collision, {"source", "self_collision", "friction"}, "collision")
+    _unknown(collision, {"source", "self_collision", "friction", "max_vertices", "max_error_m"}, "collision")
     source = _optional(collision, "source", DEFAULT_POLICY["collision"]["source"], "collision")
     if source not in COLLISION_SOURCES:
         raise PipelineError(
@@ -375,6 +397,15 @@ def load_simulation(content: bytes, label: str = CONFIG_NAME) -> dict:
     contact_friction = friction(
         _optional(collision, "friction", DEFAULT_POLICY["collision"]["friction"], "collision"), "collision.friction"
     )
+    max_vertices = _optional(collision, "max_vertices", DEFAULT_POLICY["collision"]["max_vertices"], "collision")
+    if type(max_vertices) is not int or not 4 <= max_vertices <= 4096:
+        raise PipelineError("Invalid simulation configuration: collision.max_vertices must be an integer in [4, 4096]")
+    max_error = number(
+        _optional(collision, "max_error_m", DEFAULT_POLICY["collision"]["max_error_m"], "collision"),
+        "collision.max_error_m",
+    )
+    if max_error <= 0:
+        raise PipelineError("Invalid simulation configuration: collision.max_error_m must be positive")
 
     simulation = _optional_mapping(root, "simulation", "root")
     _unknown(simulation, {"timestep", "gravity", "integrator"}, "simulation")
@@ -475,7 +506,8 @@ def load_simulation(content: bytes, label: str = CONFIG_NAME) -> dict:
     return {
         "schema_version": CONFIG_SCHEMA_VERSION,
         "base": base,
-        "collision": {"source": source, "self_collision": self_collision, "friction": contact_friction},
+        "collision": {"source": source, "self_collision": self_collision, "friction": contact_friction,
+                      "max_vertices": max_vertices, "max_error_m": max_error},
         "simulation": {"timestep": timestep, "gravity": gravity, "integrator": integrator},
         "sites": sites,
         "support_sites": support_sites,

@@ -272,7 +272,7 @@ def _read_simulation(content: bytes, policy: dict) -> dict:
     collision = _default(data, "collision", {}, "root")
     if not isinstance(collision, dict):
         _fail("simulation", "collision must be an object")
-    unknown = sorted(set(collision) - {"source", "self_collision", "friction"})
+    unknown = sorted(set(collision) - {"source", "self_collision", "friction", "max_vertices", "max_error_m"})
     if unknown:
         _fail("simulation", f"unknown key {unknown[0]!r} at collision")
     source = _default(collision, "source", defaults["collision"]["source"], "collision")
@@ -284,6 +284,13 @@ def _read_simulation(content: bytes, policy: dict) -> dict:
     contact_friction = _friction(
         _default(collision, "friction", defaults["collision"]["friction"], "collision"), "collision.friction"
     )
+    max_vertices = _default(collision, "max_vertices", defaults["collision"]["max_vertices"], "collision")
+    if type(max_vertices) is not int or not 4 <= max_vertices <= 4096:
+        _fail("simulation", "collision.max_vertices must be an integer in [4, 4096]")
+    max_error = _number(_default(collision, "max_error_m", defaults["collision"]["max_error_m"], "collision"),
+                        "collision.max_error_m")
+    if max_error <= 0:
+        _fail("simulation", "collision.max_error_m must be positive")
     simulation = _default(data, "simulation", {}, "root")
     if not isinstance(simulation, dict):
         _fail("simulation", "simulation must be an object")
@@ -377,6 +384,8 @@ def _read_simulation(content: bytes, policy: dict) -> dict:
         "base": base,
         "collision": {
             "source": source,
+            "max_vertices": max_vertices,
+            "max_error_m": max_error,
             "self_collision": self_collision,
             "friction": contact_friction,
         },
@@ -842,6 +851,8 @@ def _expected_geoms(document: dict, config: dict, policy: dict) -> list[dict]:
                 }
             )
         source = config["collision"]["source"]
+        if source == "auto":
+            source = "urdf" if link["collisions"] else "visual_convex"
         if source == "urdf":
             for index, collision in enumerate(link["collisions"]):
                 result.append(
@@ -1121,7 +1132,8 @@ def _support_expectations(state: dict) -> dict:
             link = links.get(descriptor["link"])
             if link is None:
                 _fail(f"support site {descriptor['name']!r}", f"unknown link {descriptor['link']!r}")
-            surfaces = link["collisions"] if source == "urdf" else link["visuals"]
+            surfaces = (link["collisions"] if source == "urdf" or (source == "auto" and link["collisions"])
+                    else link["visuals"])
             if not surfaces:
                 _fail(f"support site {descriptor['name']!r}", f"link {descriptor['link']!r} has no {source} geometry")
             where = f"support site {descriptor['name']!r}"
@@ -1240,6 +1252,7 @@ def _gate_engine(state: dict) -> dict:
     robot_xml = _xml_document(_confined(state["root"], policy["robot_name"]).read_bytes(), policy["robot_name"])
     _checked_syntax(robot_xml, policy, "robot", policy["robot_name"])
     _checked_asset_paths(robot_xml, policy["robot_name"], policy, sealed, state["root"])
+    _robot_assets(state)
     robot_path = state["root"] / policy["robot_name"]
     warnings: list[str] = []
     mujoco.set_mju_user_warning(lambda text: warnings.append(text) or 0)
@@ -1582,6 +1595,10 @@ def _robot_assets(state: dict) -> dict:
                 raise CheckError("a mesh asset is missing its name or file")
             if name in assets:
                 raise CheckError(f"duplicate mesh asset {name!r}")
+            if mesh.get("inertia") != "shell":
+                raise CheckError(f"mesh asset {name!r} lacks the declared shell preprocessing policy")
+            if mesh.get("maxhullvert") != str(state["config"]["collision"]["max_vertices"]):
+                raise CheckError(f"mesh asset {name!r} differs from the collision vertex budget")
             scale = mesh.get("scale")
             assets[name] = {
                 "file": file,
@@ -2122,6 +2139,8 @@ def _effective_projection(config: dict, policy: dict) -> dict:
         "base": config["base"],
         "collision": {
             "source": config["collision"]["source"],
+            "max_vertices": config["collision"]["max_vertices"],
+            "max_error_m": config["collision"]["max_error_m"],
             "self_collision": config["collision"]["self_collision"],
             "friction": list(config["collision"]["friction"]),
         },
@@ -2175,6 +2194,116 @@ def _facts(state: dict) -> dict:
 
 
 
+def _compiled_hull(model, mesh_id: int) -> tuple[np.ndarray, np.ndarray]:
+    """Read the actual convex graph, preserving the compiler's mesh-frame transform."""
+    address = int(model.mesh_graphadr[mesh_id])
+    if address < 0:
+        raise CheckError("a collision mesh has no compiled convex graph")
+    count, faces = map(int, model.mesh_graph[address:address + 2])
+    start = address + 2 + 3 * count + 3 * faces
+    indices = np.asarray(model.mesh_graph[start:start + 3 * faces], dtype=int).reshape(-1, 3)
+    begin = int(model.mesh_vertadr[mesh_id])
+    end = begin + int(model.mesh_vertnum[mesh_id])
+    points = np.asarray(model.mesh_vert[begin:end], dtype=float)
+    points = points @ _rotation_from_quat(model.mesh_quat[mesh_id]).T + model.mesh_pos[mesh_id]
+    if not np.isfinite(points).all() or len(indices) == 0:
+        raise CheckError("a collision hull is empty or non-finite")
+    return points, indices
+
+
+def _directed_convex_distance(points: np.ndarray, vertices: np.ndarray, faces: np.ndarray) -> float:
+    """Enumerate convex vertices against the other solid's complete triangular boundary.
+
+    Distance to a convex set is convex; its maximum over a polytope is attained
+    at a vertex. Interior points have zero solid distance. This does not bound
+    the difference from the original concave CAD solid.
+    """
+    triangles = vertices[faces]
+    a, b, c = triangles[:, 0], triangles[:, 1], triangles[:, 2]
+    ab, ac = b - a, c - a
+    normal = np.cross(ab, ac)
+    lengths = np.linalg.norm(normal, axis=1)
+    if not np.isfinite(lengths).all() or bool(np.any(lengths <= 0)):
+        raise CheckError("a collision hull has degenerate triangular faces")
+    normal = normal / lengths[:, None]
+    center = vertices[np.unique(faces)].mean(axis=0)
+    normal = np.where(((center - a) * normal).sum(axis=1)[:, None] > 0, -normal, normal)
+    d00, d01, d11 = (ab * ab).sum(axis=1), (ab * ac).sum(axis=1), (ac * ac).sum(axis=1)
+    denominator = lengths * lengths
+    if bool(np.any(denominator <= 0)):
+        raise CheckError("a collision hull has numerically singular faces")
+    worst = 0.0
+    for offset in range(0, len(points), 32):
+        sample = points[offset:offset + 32]
+        ap = sample[:, None, :] - a
+        plane = (ap * normal).sum(axis=2)
+        interior = (plane <= 0).all(axis=1)
+        d20, d21 = (ap * ab).sum(axis=2), (ap * ac).sum(axis=2)
+        u = (d11 * d20 - d01 * d21) / denominator
+        v = (d00 * d21 - d01 * d20) / denominator
+        projected = (u >= 0) & (v >= 0) & (u + v <= 1)
+        distances = np.where(projected, plane * plane, np.inf)
+        for left, right in ((a, b), (b, c), (c, a)):
+            edge = right - left
+            vector = sample[:, None, :] - left
+            t = np.clip((vector * edge).sum(axis=2) / (edge * edge).sum(axis=1), 0, 1)
+            residual = vector - t[:, :, None] * edge
+            distances = np.minimum(distances, (residual * residual).sum(axis=2))
+        nearest = np.sqrt(distances.min(axis=1))
+        nearest[interior] = 0
+        if not np.isfinite(nearest).all():
+            raise CheckError("a collision distance is non-finite")
+        worst = max(worst, float(nearest.max(initial=0)))
+    return worst
+
+
+def _source_convex_hull(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    import mujoco
+
+    vertices = " ".join(format(float(value), ".17g") for value in np.unique(points, axis=0).flat)
+    source = ET.Element("mujoco")
+    ET.SubElement(source, "compiler", inertiafromgeom="false")
+    ET.SubElement(ET.SubElement(source, "asset"), "mesh", name="source", vertex=vertices, inertia="shell")
+    ET.SubElement(ET.SubElement(source, "worldbody"), "geom", type="mesh", mesh="source")
+    model = mujoco.MjModel.from_xml_string(ET.tostring(source, encoding="unicode"))
+    return _compiled_hull(model, 0)
+
+
+def _gate_collision_hulls(state: dict) -> dict:
+    model = _need(state, "robot_model")
+    document = _need(state, "document")
+    config, policy = state["config"], state["policy"]
+    budget = config["collision"]["max_vertices"]
+    limit = config["collision"]["max_error_m"]
+    directory = "/".join(state["urdf_relative"].split("/")[:-1])
+    seen, rows = set(), []
+    for item in _expected_geoms(document, config, policy):
+        geometry = item["surface"]["geometry"]
+        if item["role"] != "collision" or geometry["kind"] != "mesh":
+            continue
+        mesh_id = int(model.geom(item["name"]).dataid[0])
+        if mesh_id in seen:
+            continue
+        seen.add(mesh_id)
+        reference = _canonical_mesh_path(directory, geometry["filename"], item["name"])
+        expected = state["meshes"][reference] * np.asarray(geometry["scale"], dtype=float)
+        source, source_faces = _source_convex_hull(expected)
+        actual, actual_faces = _compiled_hull(model, mesh_id)
+        source_points, actual_points = source[np.unique(source_faces)], actual[np.unique(actual_faces)]
+        if len(actual_points) > budget:
+            raise CheckError(f"collision {item['name']!r} exceeds the declared convex vertex budget")
+        distance = max(_directed_convex_distance(source_points, actual, actual_faces),
+                       _directed_convex_distance(actual_points, source, source_faces))
+        if distance > limit + policy["tolerances"]["collision_distance_atol_m"]:
+            raise CheckError(f"collision {item['name']!r} approximation distance {distance:.17g} m "
+                             f"exceeds {limit:.17g} m for source {reference!r}")
+        rows.append({"source_mesh": reference, "scale": list(geometry["scale"]),
+                     "source_convex_vertices": len(source_points), "actual_vertices": len(actual_points),
+                     "complete_convex_vertex_distance_m": distance})
+    return {"mesh_proxies": rows, "vertex_budget": budget, "max_error_m": limit,
+            "scope": "Convex-solid distance relative to source component hulls; no concave-surface equivalence claim"}
+
+
 def _gate_provenance_warnings(state: dict) -> dict:
     """Compare the actual source warning comments with the delivered encoding."""
     _need(state, "document")
@@ -2185,7 +2314,22 @@ def _gate_provenance_warnings(state: dict) -> dict:
                 if item.tag is ET.Comment and (item.text or "").startswith("WARNING ")]
     source = warnings(state["urdf_relative"])
     delivered = warnings(state["policy"]["robot_name"])
-    expected = [*source, state["policy"]["simulation_warning"]]
+    policy, config = state["policy"], state["config"]
+    expected = [*source, policy["simulation_warning"], policy["format_warning"]]
+    for link in state["document"]["links"]:
+        role = config["collision"]["source"]
+        if role == "auto":
+            role = "urdf" if link["collisions"] else "visual_convex"
+        selected = link["collisions"] if role == "urdf" else link["visuals"]
+        indices = [index for index, surface in enumerate(selected) if surface["geometry"]["kind"] == "mesh"]
+        if role == "none" or not indices:
+            continue
+        payload = {"link": link["name"], "source_file": state["urdf_relative"],
+                   "source_role": "collision" if role == "urdf" else "visual",
+                   "surface_indices": indices, "max_vertices": config["collision"]["max_vertices"],
+                   "max_error_m": config["collision"]["max_error_m"], "scope": policy["collision_scope"]}
+        encoded = json.dumps(payload, sort_keys=True, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+        expected.append(policy["collision_warning_prefix"] + encoded.replace("--", r"\u002d\u002d"))
     if delivered != expected:
         raise CheckError("MJCF warning comments differ from the source and simulation policy")
     return {"source_warning_count": len(source), "warning_sha256": _canonical_digest(expected)}
@@ -2202,6 +2346,7 @@ _GATES_BY_ID = {
     "inertia.total": _gate_inertia_total,
     "geometry.shapes": _gate_geometry_shapes,
     "geometry.instances": _gate_geometry_instances,
+    "collision.hulls": _gate_collision_hulls,
     "joints.config": _gate_joints_config,
     "model.configuration": _gate_model_configuration,
     "scene.scene": _gate_scene,
@@ -2282,6 +2427,9 @@ def _policy() -> dict:
         "report_schema": contract.REPORT_SCHEMA,
         "report_scope": contract.REPORT_SCOPE,
         "simulation_warning": contract.SIMULATION_WARNING,
+        "format_warning": contract.FORMAT_WARNING,
+        "collision_warning_prefix": contract.COLLISION_WARNING_PREFIX,
+        "collision_scope": contract.COLLISION_SCOPE,
         "process_limits": {"cpu_seconds": contract.VERIFIER_CPU_SECONDS,
                            "memory_bytes": contract.VERIFIER_MEMORY_BYTES},
         "input_binding_schema": contract.INPUT_BINDING_SCHEMA,
@@ -2323,6 +2471,7 @@ def _policy() -> dict:
         },
         "tolerances": {
             "position_atol_m": contract.POSITION_ATOL_M,
+            "collision_distance_atol_m": contract.COLLISION_DISTANCE_ATOL_M,
             "rotation_atol": contract.ROTATION_ATOL,
             "mass_rtol": contract.MASS_REL_TOL,
             "mass_atol": contract.MASS_ATOL,

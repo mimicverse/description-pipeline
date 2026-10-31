@@ -17,12 +17,27 @@ import numpy as np
 from description_pipeline import mjcf
 from description_pipeline import mjcf_contract as contract
 from description_pipeline.io import PipelineError, inventory
-from description_pipeline.verification.mjcf import evaluate_projection
+from description_pipeline.verification.mjcf import evaluate_projection, _directed_convex_distance
 
 
 def tetrahedron() -> bytes:
     vertices = [(0, 0, 0), (0.03, 0, 0), (0, 0.02, 0), (0, 0, 0.04)]
     faces = [(0, 2, 1), (0, 1, 3), (0, 3, 2), (1, 2, 3)]
+    result = bytearray(80) + struct.pack('<I', len(faces))
+    for face in faces:
+        result += struct.pack('<12fH', 0, 0, 0, *(value for index in face for value in vertices[index]), 0)
+    return bytes(result)
+
+
+def cylinder_stl(sides=96):
+    vertices = [(0.02*np.cos(angle), 0.02*np.sin(angle), height)
+                for height in (0.0, 0.04) for angle in np.arange(sides)*2*np.pi/sides]
+    vertices += [(0, 0, 0), (0, 0, 0.04)]
+    faces = []
+    for index in range(sides):
+        after = (index+1) % sides
+        faces += [(2*sides, after, index), (2*sides+1, sides+index, sides+after),
+                  (index, after, sides+after), (index, sides+after, sides+index)]
     result = bytearray(80) + struct.pack('<I', len(faces))
     for face in faces:
         result += struct.pack('<12fH', 0, 0, 0, *(value for index in face for value in vertices[index]), 0)
@@ -89,7 +104,7 @@ class ProjectionTests(unittest.TestCase):
         before = inventory(self.root)
         report = self.build()
         self.assertTrue(report['passed'], report['checks'])
-        self.assertEqual(1, report['facts']['collision_geoms'])
+        self.assertEqual(2, report['facts']['collision_geoms'])
         for name, sha in before.items():
             self.assertEqual(sha, inventory(self.root)[name])
         model = mujoco.MjModel.from_xml_path(str(self.root/contract.ROBOT_NAME))
@@ -98,6 +113,44 @@ class ProjectionTests(unittest.TestCase):
         self.assertAlmostEqual(1.5, float(model.body_mass.sum()))
         self.assertEqual({'bytes': 2, 'sha256': hashlib.sha256(b'{}').hexdigest()},
                          self.binding()['files'][contract.CONFIG_NAME])
+
+    def test_native_hull_budget_reduces_collision_complexity(self):
+        (self.root/'meshes/part.stl').write_bytes(cylinder_stl())
+        report = self.build({'collision': {'source': 'visual_convex', 'max_vertices': 16, 'max_error_m': 0.01}})
+        self.assertTrue(report['passed'], report['checks'])
+        gate = next(row for row in report['checks'] if row['id'] == 'collision.hulls')
+        self.assertTrue(gate['details']['mesh_proxies'])
+        for row in gate['details']['mesh_proxies']:
+            self.assertLessEqual(row['actual_vertices'], 16)
+            self.assertGreater(row['source_convex_vertices'], row['actual_vertices'])
+            self.assertGreater(row['complete_convex_vertex_distance_m'], 0)
+
+    def test_hull_budget_never_bypasses_geometric_quality(self):
+        (self.root/'meshes/part.stl').write_bytes(cylinder_stl())
+        report = self.build({'collision': {'source': 'visual_convex', 'max_vertices': 16, 'max_error_m': 1e-6}})
+        self.assertFalse(report['passed'])
+        failed = {row['id'] for row in report['checks'] if not row['passed']}
+        self.assertIn('collision.hulls', failed)
+        self.assertNotIn('geometry.instances', failed)
+
+    def test_convex_distance_matches_complete_analytic_box_distance(self):
+        vertices = np.array([(x, y, z) for x in (0, 1) for y in (0, 1) for z in (0, 1)], dtype=float)
+        faces = np.array([(0, 1, 3), (0, 3, 2), (4, 6, 7), (4, 7, 5),
+                          (0, 4, 5), (0, 5, 1), (2, 3, 7), (2, 7, 6),
+                          (0, 2, 6), (0, 6, 4), (1, 5, 7), (1, 7, 3)])
+        delta = np.array([0.1, 0.2, 0.3])
+        measured = max(_directed_convex_distance(vertices, vertices+delta, faces),
+                       _directed_convex_distance(vertices+delta, vertices, faces))
+        self.assertAlmostEqual(float(np.linalg.norm(delta)), measured, places=12)
+        self.assertEqual(0, _directed_convex_distance(vertices*0.5+0.25, vertices, faces))
+
+    def test_mesh_budget_tampering_is_rejected_before_engine_load(self):
+        self.assertTrue(self.build()['passed'])
+        report = self.mutate('./asset/mesh', 'maxhullvert', '4')
+        self.assertFalse(report['passed'])
+        gate = next(row for row in report['checks'] if row['id'] == 'engine.load')
+        self.assertFalse(gate['passed'])
+        self.assertIn('vertex budget', gate['details']['error'])
 
     def test_signed_axis_mutation_is_rejected_after_valid_rebinding(self):
         self.assertTrue(self.build()['passed'])

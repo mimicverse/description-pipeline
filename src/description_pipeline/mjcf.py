@@ -755,7 +755,8 @@ def _derive_support_sites(document: dict, config: dict, meshes: dict[str, np.nda
         link = links.get(site["link"])
         if link is None:
             raise PipelineError(f"Support site {site['name']!r} references unknown link {site['link']!r}")
-        surfaces = link["collisions"] if source == "urdf" else link["visuals"]
+        surfaces = (link["collisions"] if source == "urdf" or (source == "auto" and link["collisions"])
+                    else link["visuals"])
         if not surfaces:
             raise PipelineError(
                 f"support site {site['name']!r}: link {site['link']!r} has no {source} geometry"
@@ -907,6 +908,8 @@ def _add_body(
         element.set("mass", _fmt(mass))
         element.set("diaginertia", _fmt3(moments))
     source = config["collision"]["source"]
+    if source == "auto":
+        source = "urdf" if link["collisions"] else "visual_convex"
     self_collision = config["collision"]["self_collision"]
     contact = contract.ROBOT_CONTACT if self_collision else contract.ROBOT_SOLO_CONTACT
     friction = config["collision"]["friction"]
@@ -984,7 +987,7 @@ def _project_robot(document: dict, config: dict, derived_sites: list[dict]) -> b
         # Only surfaces that actually become geoms are registered: visuals always;
         # collisions only for the urdf source (visual_convex copies the visuals).
         used = list(link["visuals"])
-        if config["collision"]["source"] == "urdf":
+        if config["collision"]["source"] in ("urdf", "auto"):
             used += link["collisions"]
         for surface in used:
             geometry = surface["geometry"]
@@ -995,6 +998,8 @@ def _project_robot(document: dict, config: dict, derived_sites: list[dict]) -> b
         mesh = ET.SubElement(asset, "mesh")
         mesh.set("name", assets.name_for(path, scale))
         mesh.set("file", f"{contract.ASSET_PREFIX}{path}")
+        mesh.set("inertia", "shell")
+        mesh.set("maxhullvert", str(config["collision"]["max_vertices"]))
         if tuple(scale) != contract.UNIT_SCALE:
             mesh.set("scale", _fmt3(scale))
 
@@ -1071,7 +1076,22 @@ def project(root: Path, simulation: bytes = contract.EMPTY_CONFIG) -> dict[str, 
     comments = [item for item in warnings.iter() if item.tag is ET.Comment]
     for comment in reversed(comments):
         robot.insert(0, comment)
-    robot.insert(len(comments), ET.Comment(contract.SIMULATION_WARNING))
+    derived_warnings = [contract.SIMULATION_WARNING, contract.FORMAT_WARNING]
+    for link in document["links"]:
+        source_role = config["collision"]["source"]
+        if source_role == "auto":
+            source_role = "urdf" if link["collisions"] else "visual_convex"
+        surfaces = link["collisions"] if source_role == "urdf" else link["visuals"]
+        indices = [index for index, surface in enumerate(surfaces) if surface["geometry"]["kind"] == "mesh"]
+        if source_role != "none" and indices:
+            derived_warnings.append(contract.collision_warning({
+                "link": link["name"], "source_file": contract.URDF_NAME,
+                "source_role": "collision" if source_role == "urdf" else "visual",
+                "surface_indices": indices, "max_vertices": config["collision"]["max_vertices"],
+                "max_error_m": config["collision"]["max_error_m"], "scope": contract.COLLISION_SCOPE,
+            }))
+    for index, warning in enumerate(derived_warnings, len(comments)):
+        robot.insert(index, ET.Comment(warning))
     robot_bytes = _xml_bytes(robot)
     files = {contract.CONFIG_NAME: simulation, contract.ROBOT_NAME: robot_bytes}
     if config["floor"] is not None:
