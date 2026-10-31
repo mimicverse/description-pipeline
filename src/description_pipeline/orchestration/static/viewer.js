@@ -11,6 +11,7 @@ import {
 } from "/static/preview_logic.js";
 
 export function createViewer(container) {
+  let viewer = null;
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0xeef2f7);
 
@@ -55,6 +56,8 @@ export function createViewer(container) {
     );
     camera.position.copy(position);
     camera.lookAt(orbit.target);
+    camera.updateMatrixWorld();
+    viewer?.inspection?.updateScreen();
   }
 
   function resize() {
@@ -63,15 +66,23 @@ export function createViewer(container) {
     renderer.setSize(width, height, false);
     camera.aspect = width / height;
     camera.updateProjectionMatrix();
+    viewer?.inspection?.updateScreen();
   }
 
   function onPointerDown(event) {
+    if (![0, 1, 2].includes(event.button)) return;
+    if (event.button === 0 && viewer.inspection?.beginDrag(event)) {
+      renderer.domElement.setPointerCapture(event.pointerId);
+      return;
+    }
     orbit.dragging = event.button === 0 && !event.shiftKey ? "rotate" : "pan";
     orbit.last = { x: event.clientX, y: event.clientY };
+    orbit.start = { ...orbit.last };
     renderer.domElement.setPointerCapture(event.pointerId);
   }
 
   function onPointerMove(event) {
+    if (viewer.inspection?.drag(event)) return;
     if (!orbit.dragging) return;
     const dx = event.clientX - orbit.last.x;
     const dy = event.clientY - orbit.last.y;
@@ -95,10 +106,14 @@ export function createViewer(container) {
   }
 
   function onPointerUp(event) {
+    viewer.inspection?.endDrag();
+    const click = orbit.dragging && event.button === 0 && !event.shiftKey
+      && Math.hypot(event.clientX - orbit.start.x, event.clientY - orbit.start.y) < 4;
     orbit.dragging = null;
     if (renderer.domElement.hasPointerCapture(event.pointerId)) {
       renderer.domElement.releasePointerCapture(event.pointerId);
     }
+    if (click) viewer.inspection?.pick(event);
   }
 
   function onWheel(event) {
@@ -114,6 +129,8 @@ export function createViewer(container) {
   renderer.domElement.addEventListener("pointerdown", onPointerDown);
   renderer.domElement.addEventListener("pointermove", onPointerMove);
   renderer.domElement.addEventListener("pointerup", onPointerUp);
+  renderer.domElement.addEventListener("pointercancel", () => { orbit.dragging = null; viewer.inspection?.endDrag(); });
+  renderer.domElement.addEventListener("contextmenu", (event) => event.preventDefault());
   renderer.domElement.addEventListener("wheel", onWheel, { passive: false });
   window.addEventListener("resize", resize);
 
@@ -124,14 +141,14 @@ export function createViewer(container) {
     requestAnimationFrame(renderLoop);
   })();
 
-  return {
+  viewer = {
     modelDispose: null,
-    grid,
     scene,
     camera,
     renderer,
     robotRoot,
     orbit,
+    grid,
     resize,
     updateCamera,
     frame() {
@@ -139,12 +156,20 @@ export function createViewer(container) {
       updateCamera();
     },
   };
+  return viewer;
 }
 
 export function disposeRobot(viewer) {
   viewer.modelDispose?.();
   viewer.modelDispose = null;
+  viewer.inspection?.dispose();
+  viewer.inspection = null;
   const root = viewer.robotRoot;
+  disposeGeometry(root);
+  root.clear();
+}
+
+function disposeGeometry(root) {
   root.traverse((node) => {
     if (node.geometry) node.geometry.dispose();
     if (node.material) {
@@ -153,7 +178,6 @@ export function disposeRobot(viewer) {
       }
     }
   });
-  root.clear();
 }
 
 function child(node, tag, required = false) {
@@ -279,7 +303,7 @@ function primitiveGeometry(geometryNode, label) {
   return null;
 }
 
-async function loadMesh(viewer, url, cache, signal) {
+async function loadMesh(url, cache, signal) {
   if (cache.has(url)) return cache.get(url);
   const pending = fetch(url, { credentials: "same-origin", signal })
     .then((response) => {
@@ -310,163 +334,179 @@ export async function loadRobot(viewer, { urdfUrl, urdfPath, files, artifactUrl,
   const links = new Map();
   const joints = [];
   const linkRecords = [];
-  const materials = new Map();
-  for (const node of robot.querySelectorAll(":scope > material")) {
-    const name = requiredName(node);
-    if (materials.has(name)) throw new Error(`URDF material name is duplicated: ${name}`);
-    materials.set(name, node);
-  }
-  for (const node of robot.querySelectorAll(":scope > link")) {
-    const name = requiredName(node);
-    if (links.has(name)) throw new Error(`URDF link name is duplicated: ${name}`);
-    const group = new THREE.Group();
-    group.name = name;
-    links.set(name, { node, group });
-    const inertial = child(node, "inertial");
-    const mass = inertial ? child(inertial, "mass", true) : null;
-    const tensor = inertial ? child(inertial, "inertia", true) : null;
-    const origin = inertial ? originOf(inertial, `Inertial for link ${name}`) : null;
-    linkRecords.push({
-      name,
-      mass_kg: mass ? parseUrdfNumber(mass.getAttribute("value"), `Link ${name} mass`) : null,
-      com_m: origin ? [origin.position.x, origin.position.y, origin.position.z] : null,
-      inertia_kg_m2: tensor ? Object.fromEntries(
-        ["ixx", "ixy", "ixz", "iyy", "iyz", "izz"].map((key) => [
-          key, parseUrdfNumber(tensor.getAttribute(key), `Link ${name} inertia ${key}`),
-        ]),
-      ) : null,
-    });
-  }
-
-  const jointNames = new Set();
-  const parents = new Map();
-  for (const node of robot.querySelectorAll(":scope > joint")) {
-    const name = requiredName(node);
-    if (jointNames.has(name)) throw new Error(`URDF joint name is duplicated: ${name}`);
-    jointNames.add(name);
-    const type = requiredName(node, "type");
-    if (!["fixed", "revolute", "continuous", "prismatic"].includes(type)) {
-      throw new Error(`Joint ${name} type is unsupported: ${type}`);
+  try {
+    const materials = new Map();
+    for (const node of robot.querySelectorAll(":scope > material")) {
+      const name = requiredName(node);
+      if (materials.has(name)) throw new Error(`URDF material name is duplicated: ${name}`);
+      materials.set(name, node);
     }
-    if (child(node, "mimic")) throw new Error(`Joint ${name} mimic motion is unsupported`);
-    const parent = requiredName(child(node, "parent", true), "link");
-    const childName = requiredName(child(node, "child", true), "link");
-    if (!links.has(parent) || !links.has(childName) || parent === childName || parents.has(childName)) {
-      throw new Error(`Joint ${name} has invalid or ambiguous link bindings`);
-    }
-    parents.set(childName, parent);
-    const { position, quaternion } = originOf(node, `Joint ${name}`);
-    const axisNode = child(node, "axis");
-    if (type === "fixed" && axisNode) throw new Error(`Joint ${name} fixed axis is unsupported`);
-    const sourceAxis = axisNode
-      ? parseUrdfVector(axisNode.getAttribute("xyz"), undefined, `Joint ${name} axis`)
-      : type === "fixed" ? null : [1, 0, 0];
-    const direction = sourceAxis ? parseUrdfAxis(sourceAxis.join(" "), `Joint ${name} axis`) : null;
-    const axisVector = direction ? new THREE.Vector3(...direction) : null;
-    const limit = child(node, "limit");
-    if (type === "fixed" && limit) throw new Error(`Joint ${name} fixed limits are unsupported`);
-    if (type === "continuous" && limit && (limit.hasAttribute("lower") || limit.hasAttribute("upper"))) {
-      throw new Error(`Joint ${name} continuous position limits are unsupported`);
-    }
-    if ((type === "revolute" || type === "prismatic") && !limit) throw new Error(`Joint ${name} limit is missing`);
-    const lower = limit ? (limit.hasAttribute("lower") ? parseUrdfNumber(limit.getAttribute("lower"), `Joint ${name} lower limit`) : 0) : null;
-    const upper = limit ? (limit.hasAttribute("upper") ? parseUrdfNumber(limit.getAttribute("upper"), `Joint ${name} upper limit`) : 0) : null;
-    if (limit && lower > upper) throw new Error(`Joint ${name} lower limit exceeds upper limit`);
-    const effort = limit ? parseUrdfNumber(limit.getAttribute("effort"), `Joint ${name} effort limit`) : null;
-    const velocity = limit ? parseUrdfNumber(limit.getAttribute("velocity"), `Joint ${name} velocity limit`) : null;
-    if (effort < 0 || velocity < 0) throw new Error(`Joint ${name} effort and velocity must be non-negative`);
-
-    const pivot = new THREE.Group();
-    pivot.position.copy(position);
-    pivot.quaternion.copy(quaternion);
-    links.get(parent).group.add(pivot);
-    const motion = new THREE.Group();
-    pivot.add(motion);
-    motion.add(links.get(childName).group);
-    joints.push({
-      name, type, motion, axis: axisVector, sourceAxis,
-      lower: type === "continuous" ? null : lower,
-      upper: type === "continuous" ? null : upper,
-      effort, velocity, value: 0,
-      set(value) {
-        this.value = value;
-        if (type === "revolute" || type === "continuous") motion.quaternion.setFromAxisAngle(axisVector, value);
-        else if (type === "prismatic") motion.position.copy(axisVector).multiplyScalar(value);
-      },
-      reset() { this.set(0); },
-    });
-  }
-  const roots = [...links.keys()].filter((name) => !parents.has(name));
-  if (roots.length !== 1) throw new Error("URDF must have exactly one root link");
-  for (const name of links.keys()) {
-    const seen = new Set();
-    let current = name;
-    while (parents.has(current)) {
-      if (seen.has(current)) throw new Error("URDF link graph contains a cycle");
-      seen.add(current);
-      current = parents.get(current);
-    }
-    if (current !== roots[0]) throw new Error("URDF link graph is disconnected");
-  }
-
-  // Attach only after every visual is readable; failed loads never display a partial robot.
-  for (const [name, entry] of links) {
-    for (const visual of entry.node.querySelectorAll(":scope > visual")) {
-      const geometryNode = child(visual, "geometry", true);
-      if (geometryNode.children.length !== 1 || !["mesh", "box", "cylinder", "sphere"].includes(geometryNode.children[0].tagName)) {
-        throw new Error(`Visual for link ${name} must contain exactly one supported geometry`);
-      }
-      const label = `Visual for link ${name}`;
-      const { position, quaternion } = originOf(visual, label);
-      const materialNode = child(visual, "material");
-      const style = materialStyle(materials, materialNode, `${label} material`);
-      if (!materialNode) warnings.push(`${label} has no material; a neutral preview appearance is used`);
-      const meshNode = child(geometryNode, "mesh");
-      let geometry;
-      let meshScale;
-      if (meshNode) {
-        const resolved = resolveUrdfMesh(files, urdfPath, meshNode.getAttribute("filename"));
-        meshScale = parseUrdfVector(meshNode.getAttribute("scale"), [1, 1, 1], `${label} mesh scale`);
-        geometry = (await loadMesh(viewer, artifactUrl(resolved), meshCache, signal)).clone();
-        signal?.throwIfAborted();
-      } else geometry = primitiveGeometry(geometryNode, `${label} geometry`);
-      const material = new THREE.MeshStandardMaterial({
-        color: style.color, opacity: style.opacity,
-        transparent: style.opacity < 1, depthWrite: style.opacity >= 1,
-        metalness: 0.12, roughness: 0.68,
+    for (const node of robot.querySelectorAll(":scope > link")) {
+      const name = requiredName(node);
+      if (links.has(name)) throw new Error(`URDF link name is duplicated: ${name}`);
+      const group = new THREE.Group();
+      group.name = name;
+      const visuals = new THREE.Group();
+      group.add(visuals);
+      links.set(name, { node, group, visuals });
+      const inertial = child(node, "inertial");
+      const mass = inertial ? child(inertial, "mass", true) : null;
+      const tensor = inertial ? child(inertial, "inertia", true) : null;
+      const origin = inertial ? originOf(inertial, `Inertial for link ${name}`) : null;
+      linkRecords.push({
+        name,
+        mass_kg: mass ? parseUrdfNumber(mass.getAttribute("value"), `Link ${name} mass`) : null,
+        com_m: origin ? [origin.position.x, origin.position.y, origin.position.z] : null,
+        inertial_quaternion: origin ? origin.quaternion.toArray() : null,
+        inertia_kg_m2: tensor ? Object.fromEntries(
+          ["ixx", "ixy", "ixz", "iyy", "iyz", "izz"].map((key) => [
+            key, parseUrdfNumber(tensor.getAttribute(key), `Link ${name} inertia ${key}`),
+          ]),
+        ) : null,
       });
-      const mesh = new THREE.Mesh(geometry, material);
-      // Keep reflections on the object transform so Three also reverses face culling.
-      if (meshScale) mesh.scale.set(...meshScale);
-      mesh.position.copy(position);
-      mesh.quaternion.copy(quaternion);
-      entry.group.add(mesh);
+    }
+
+    const jointNames = new Set();
+    const parents = new Map();
+    for (const node of robot.querySelectorAll(":scope > joint")) {
+      const name = requiredName(node);
+      if (jointNames.has(name)) throw new Error(`URDF joint name is duplicated: ${name}`);
+      jointNames.add(name);
+      const type = requiredName(node, "type");
+      if (!["fixed", "revolute", "continuous", "prismatic"].includes(type)) {
+        throw new Error(`Joint ${name} type is unsupported: ${type}`);
+      }
+      if (child(node, "mimic")) throw new Error(`Joint ${name} mimic motion is unsupported`);
+      const parent = requiredName(child(node, "parent", true), "link");
+      const childName = requiredName(child(node, "child", true), "link");
+      if (!links.has(parent) || !links.has(childName) || parent === childName || parents.has(childName)) {
+        throw new Error(`Joint ${name} has invalid or ambiguous link bindings`);
+      }
+      parents.set(childName, parent);
+      const { position, quaternion } = originOf(node, `Joint ${name}`);
+      const axisNode = child(node, "axis");
+      if (type === "fixed" && axisNode) throw new Error(`Joint ${name} fixed axis is unsupported`);
+      const sourceAxis = axisNode
+        ? parseUrdfVector(axisNode.getAttribute("xyz"), undefined, `Joint ${name} axis`)
+        : type === "fixed" ? null : [1, 0, 0];
+      const direction = sourceAxis ? parseUrdfAxis(sourceAxis.join(" "), `Joint ${name} axis`) : null;
+      const axisVector = direction ? new THREE.Vector3(...direction) : null;
+      const limit = child(node, "limit");
+      if (type === "fixed" && limit) throw new Error(`Joint ${name} fixed limits are unsupported`);
+      if (type === "continuous" && limit && (limit.hasAttribute("lower") || limit.hasAttribute("upper"))) {
+        throw new Error(`Joint ${name} continuous position limits are unsupported`);
+      }
+      if ((type === "revolute" || type === "prismatic") && !limit) throw new Error(`Joint ${name} limit is missing`);
+      const lower = limit ? (limit.hasAttribute("lower") ? parseUrdfNumber(limit.getAttribute("lower"), `Joint ${name} lower limit`) : 0) : null;
+      const upper = limit ? (limit.hasAttribute("upper") ? parseUrdfNumber(limit.getAttribute("upper"), `Joint ${name} upper limit`) : 0) : null;
+      if (limit && lower > upper) throw new Error(`Joint ${name} lower limit exceeds upper limit`);
+      const effort = limit ? parseUrdfNumber(limit.getAttribute("effort"), `Joint ${name} effort limit`) : null;
+      const velocity = limit ? parseUrdfNumber(limit.getAttribute("velocity"), `Joint ${name} velocity limit`) : null;
+      if (effort < 0 || velocity < 0) throw new Error(`Joint ${name} effort and velocity must be non-negative`);
+
+      const pivot = new THREE.Group();
+      pivot.position.copy(position);
+      pivot.quaternion.copy(quaternion);
+      links.get(parent).group.add(pivot);
+      const motion = new THREE.Group();
+      pivot.add(motion);
+      motion.add(links.get(childName).group);
+      joints.push({
+        name, type, parent, child: childName, pivot, motion, axis: axisVector, sourceAxis,
+        lower: type === "continuous" ? null : lower,
+        upper: type === "continuous" ? null : upper,
+        effort, velocity, value: 0,
+        set(value) {
+          this.value = value;
+          if (type === "revolute" || type === "continuous") motion.quaternion.setFromAxisAngle(axisVector, value);
+          else if (type === "prismatic") motion.position.copy(axisVector).multiplyScalar(value);
+        },
+        reset() { this.set(0); },
+      });
+    }
+    const roots = [...links.keys()].filter((name) => !parents.has(name));
+    if (roots.length !== 1) throw new Error("URDF must have exactly one root link");
+    for (const name of links.keys()) {
+      const seen = new Set();
+      let current = name;
+      while (parents.has(current)) {
+        if (seen.has(current)) throw new Error("URDF link graph contains a cycle");
+        seen.add(current);
+        current = parents.get(current);
+      }
+      if (current !== roots[0]) throw new Error("URDF link graph is disconnected");
+    }
+
+    // Attach only after every visual is readable; failed loads never display a partial robot.
+    for (const [name, entry] of links) {
+      for (const visual of entry.node.querySelectorAll(":scope > visual")) {
+        const geometryNode = child(visual, "geometry", true);
+        if (geometryNode.children.length !== 1 || !["mesh", "box", "cylinder", "sphere"].includes(geometryNode.children[0].tagName)) {
+          throw new Error(`Visual for link ${name} must contain exactly one supported geometry`);
+        }
+        const label = `Visual for link ${name}`;
+        const { position, quaternion } = originOf(visual, label);
+        const materialNode = child(visual, "material");
+        const style = materialStyle(materials, materialNode, `${label} material`);
+        if (!materialNode) warnings.push(`${label} has no material; a neutral preview appearance is used`);
+        const meshNode = child(geometryNode, "mesh");
+        let geometry;
+        let meshScale;
+        if (meshNode) {
+          const resolved = resolveUrdfMesh(files, urdfPath, meshNode.getAttribute("filename"));
+          meshScale = parseUrdfVector(meshNode.getAttribute("scale"), [1, 1, 1], `${label} mesh scale`);
+          const sourceGeometry = await loadMesh(artifactUrl(resolved), meshCache, signal);
+          signal?.throwIfAborted();
+          geometry = sourceGeometry.clone();
+        } else geometry = primitiveGeometry(geometryNode, `${label} geometry`);
+        const material = new THREE.MeshStandardMaterial({
+          color: style.color, opacity: style.opacity,
+          transparent: style.opacity < 1, depthWrite: style.opacity >= 1,
+          metalness: 0.12, roughness: 0.68,
+        });
+        const mesh = new THREE.Mesh(geometry, material);
+        // Keep reflections on the object transform so Three also reverses face culling.
+        if (meshScale) mesh.scale.set(...meshScale);
+        mesh.position.copy(position);
+        mesh.quaternion.copy(quaternion);
+        mesh.userData.linkName = name;
+        mesh.userData.sourceStyle = { color: material.color.clone(), opacity: material.opacity };
+        entry.visuals.add(mesh);
+      }
+    }
+
+    viewer.robotRoot.add(links.get(roots[0]).group);
+    viewer.robotRoot.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(viewer.robotRoot);
+    if (box.isEmpty()) warnings.push("URDF contains no displayable geometry");
+    else {
+      const center = box.getCenter(new THREE.Vector3());
+      const size = box.getSize(new THREE.Vector3());
+      const span = Math.max(size.x, size.y, size.z, 0.05);
+      viewer.orbit.target.copy(center);
+      viewer.orbit.radius = span * 2.4;
+      viewer.orbit.phi = Math.PI * 0.38;
+      viewer.updateCamera();
+      viewer.camera.near = Math.max(span / 500, 0.001);
+      viewer.camera.far = span * 200;
+      viewer.camera.updateProjectionMatrix();
+    }
+    viewer.frame();
+    if (onWarning) onWarning(warnings);
+    const jointRecords = joints.map((joint) => ({
+      name: joint.name, type: joint.type, lower: joint.lower, upper: joint.upper,
+      effort: joint.effort, velocity: joint.velocity, axis: joint.sourceAxis,
+    }));
+    return { links, allJoints: joints, joints: joints.filter((joint) => joint.type !== "fixed"), warnings, records: { links: linkRecords, joints: jointRecords } };
+  } catch (error) {
+    // Failed or cancelled loads also own resources that have not reached robotRoot yet.
+    for (const { visuals, group } of links.values()) { disposeGeometry(visuals); group.removeFromParent(); }
+    throw error;
+  } finally {
+    for (const result of await Promise.allSettled(meshCache.values())) {
+      if (result.status === "fulfilled") result.value.dispose();
     }
   }
-
-  viewer.robotRoot.add(links.get(roots[0]).group);
-  viewer.robotRoot.updateMatrixWorld(true);
-  const box = new THREE.Box3().setFromObject(viewer.robotRoot);
-  if (box.isEmpty()) warnings.push("URDF contains no displayable geometry");
-  else {
-    const center = box.getCenter(new THREE.Vector3());
-    const size = box.getSize(new THREE.Vector3());
-    const span = Math.max(size.x, size.y, size.z, 0.05);
-    viewer.orbit.target.copy(center);
-    viewer.orbit.radius = span * 2.4;
-    viewer.orbit.phi = Math.PI * 0.38;
-    viewer.updateCamera();
-    viewer.camera.near = Math.max(span / 500, 0.001);
-    viewer.camera.far = span * 200;
-    viewer.camera.updateProjectionMatrix();
-  }
-  viewer.frame();
-  if (onWarning) onWarning(warnings);
-  const jointRecords = joints.map((joint) => ({
-    name: joint.name, type: joint.type, lower: joint.lower, upper: joint.upper,
-    effort: joint.effort, velocity: joint.velocity, axis: joint.sourceAxis,
-  }));
-  return { links, joints: joints.filter((joint) => joint.type !== "fixed"), warnings, records: { links: linkRecords, joints: jointRecords } };
 }
 
 export function buildJointControls(container, joints, { onInput } = {}) {
@@ -482,31 +522,51 @@ export function buildJointControls(container, joints, { onInput } = {}) {
     range.type = "range";
     range.step = "any";
     const angular = joint.type === "revolute" || joint.type === "continuous";
-    if (angular) {
-      range.min = String(((joint.type === "continuous" ? -Math.PI : joint.lower) * 180) / Math.PI);
-      range.max = String(((joint.type === "continuous" ? Math.PI : joint.upper) * 180) / Math.PI);
-    } else {
-      range.min = String(joint.lower);
-      range.max = String(joint.upper);
+    const numeric = document.createElement("input");
+    numeric.type = "number"; numeric.step = "any";
+    numeric.setAttribute("aria-label", `${joint.name} value`);
+    range.setAttribute("aria-label", `${joint.name} slider`);
+    const unit = document.createElement("select");
+    for (const value of angular ? ["deg", "rad"] : ["m"]) {
+      const option = document.createElement("option"); option.value = value; option.textContent = value; unit.append(option);
     }
-    const display = () => {
-      const value = angular ? (joint.value * 180) / Math.PI : joint.value;
+    unit.value = angular ? "deg" : "m";
+    unit.setAttribute("aria-label", `${joint.name} unit`);
+    const factor = () => angular && unit.value === "deg" ? 180 / Math.PI : 1;
+    const display = (syncInput = true) => {
+      const value = joint.value * factor();
+      range.min = String((joint.type === "continuous" ? -Math.PI : joint.lower) * factor());
+      range.max = String((joint.type === "continuous" ? Math.PI : joint.upper) * factor());
       range.value = String(value);
-      readout.textContent = angular ? `${value.toFixed(1)}°` : `${value.toFixed(4)} m`;
+      if (syncInput) numeric.value = String(value);
+      readout.textContent = `${value.toFixed(4)} ${unit.value}`;
       if (value < Number(range.min) || value > Number(range.max)) {
-        readout.textContent += " (reference pose outside position limits)";
+        readout.textContent += joint.type === "continuous"
+          ? " (outside slider window; joint is continuous)"
+          : " (reference pose outside position limits)";
       }
     };
     const update = () => {
       const raw = Number(range.value);
-      const value = angular ? (raw * Math.PI) / 180 : raw;
+      const value = raw / factor();
       joint.set(value);
       display();
       if (onInput) onInput(joint);
     };
     range.addEventListener("input", update);
+    const updateNumeric = (commit) => {
+      const raw = numeric.value.trim() === "" ? NaN : Number(numeric.value);
+      if (!Number.isFinite(raw)) { if (commit) display(); return; }
+      const value = raw / factor();
+      joint.set(joint.type === "continuous" ? value : Math.max(joint.lower, Math.min(joint.upper, value)));
+      display(commit);
+      if (onInput) onInput(joint);
+    };
+    numeric.addEventListener("input", () => updateNumeric(false));
+    numeric.addEventListener("change", () => updateNumeric(true));
+    unit.addEventListener("change", () => display());
     display();
-    row.append(label, readout, range);
+    row.append(label, readout, range, numeric, unit);
     container.append(row);
     rows.push({ joint, display });
   }

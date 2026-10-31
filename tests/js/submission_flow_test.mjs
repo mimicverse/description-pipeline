@@ -3,6 +3,10 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
 
+const modules = await Promise.all(["run_history", "preview_logic", "activity"].map(async (name) => {
+  const moduleSource = readFileSync(new URL(`../../src/description_pipeline/orchestration/static/${name}.js`, import.meta.url), "utf8");
+  return import(`data:text/javascript;base64,${Buffer.from(moduleSource).toString("base64")}`);
+}));
 const source = readFileSync(new URL("../../src/description_pipeline/orchestration/static/app.js", import.meta.url), "utf8")
   .replace(/^import[\s\S]*?from "[^"]+";\n/gm, "")
   .replace("void boot();", "");
@@ -56,6 +60,7 @@ function page() {
     disconnect() { this.finished = true; this.handlers.error(); }
   }
   const context = vm.createContext({
+    ...Object.assign({}, ...modules),
     console, AbortController, XMLHttpRequest: XHR,
     FormData: class { entries = []; append(...entry) { this.entries.push(entry); } },
     crypto: { randomUUID: () => `submission-${++nextKey}` },
@@ -69,7 +74,7 @@ function page() {
     shouldRefreshRunList: () => false,
     fetch: async () => response(200, { runs: [] }),
   });
-  vm.runInContext(`${source}\nglobalThis.app = {state, wire, api, poll, selectRun, showUploadView, clearSession, stopRunRead, refreshRuns, loadMoreRuns, submitRun, retryRun, rerunFromStage, renderRerunPanel, folderPick, changeSubmission, loadTargets};`, context);
+  vm.runInContext(`${source}\nglobalThis.app = {state, wire, api, poll, selectRun, showUploadView, clearSession, stopRunRead, refreshRuns, loadMoreRuns, submitRun, retryRun, rerunFromStage, renderRerunPanel, buildRunItem, renderRun, folderPick, changeSubmission, loadTargets};`, context);
   context.clearPreview = () => {};
   context.renderRun = (run) => { context.displayed = run; };
   context.loadPreview = async () => {};
@@ -89,6 +94,28 @@ function uploadReady(p) {
   p.app.wire();
 }
 const submit = (p) => p.$("run-form").handlers.submit({ preventDefault() {} });
+
+// A start stage does not imply ancestry; list and detail use the recorded parent.
+{
+  const p = page();
+  const fresh = { dag_run_id: "fresh-run", parent_dag_run_id: null, resume_from_name: "Freeze", state: "success" };
+  const heading = (run) => p.app.buildRunItem(run).children[0].children[0].children[0];
+  assert.equal(heading(fresh).children.length, 0, "A fresh Freeze must not display a rerun chip");
+  const child = { ...fresh, dag_run_id: "child-run", parent_dag_run_id: fresh.dag_run_id };
+  const chip = heading(child).children[0];
+  assert.equal(chip.textContent, "Rerun from Freeze");
+  assert.equal(chip.title, "Rerun source: fresh-run");
+  assert.equal(heading({ ...child, resume_from_name: null }).children[0].textContent, "Rerun from upstream stage");
+  p.app.state.runsList = [{ ...fresh, parent_dag_run_id: "stale-parent" }];
+  p.app.renderRun(fresh);
+  assert.equal(p.$("run-origin").hidden, true, "A cached row must not invent a parent");
+  let selected;
+  p.context.selectRun = (id) => { selected = id; };
+  p.app.renderRun(child);
+  assert.equal(p.$("run-origin").hidden, false);
+  p.$("run-origin").children[1].handlers.click();
+  assert.equal(selected, fresh.dag_run_id, "The parent link must work without a cached parent row");
+}
 
 // Exactly one read owns the selected run; the next poll starts only after completion.
 {

@@ -1,6 +1,7 @@
 // Operator page logic. All Airflow and Windows endpoint credentials stay on the server; this
 // module only talks to the portal's own JSON API and the digest-verified artifact routes.
 import { buildJointControls, createViewer, disposeRobot, loadRobot } from "/static/viewer.js";
+import { createInspection } from "/static/inspection.js";
 import {
   menuAction,
   overlayRun,
@@ -817,11 +818,11 @@ function buildRunItem(run) {
   const heading = document.createElement("span");
   heading.className = "run-heading";
   heading.textContent = runDisplayTitle(run);
-  if (run.resume_from_name) {
+  if (run.parent_dag_run_id) {
     const chip = document.createElement("span");
     chip.className = "run-chip";
-    chip.textContent = `Rerun from ${run.resume_from_name}`;
-    chip.title = `Rerun source: ${run.parent_dag_run_id || "not recorded"}`;
+    chip.textContent = `Rerun from ${run.resume_from_name || "upstream stage"}`;
+    chip.title = `Rerun source: ${run.parent_dag_run_id}`;
     heading.append(chip);
   }
   const meta = document.createElement("span");
@@ -1759,7 +1760,7 @@ async function renderPreviewPanels(preview, records, artifactUrl, signal) {
       row.mass_kg === null ? "not provided" : row.mass_kg.toFixed(6),
       row.com_m ? row.com_m.map((value) => fmt(value, 4)).join(", ") : null,
       row.inertia_kg_m2
-        ? `ixx ${fmt(row.inertia_kg_m2.ixx, 6)} · iyy ${fmt(row.inertia_kg_m2.iyy, 6)} · izz ${fmt(row.inertia_kg_m2.izz, 6)}`
+        ? Object.entries(row.inertia_kg_m2).map(([key, value]) => `${key} ${fmt(value, 6)}`).join(" · ")
         : null,
     ]),
   );
@@ -2249,11 +2250,10 @@ function renderRun(run) {
   }
   const origin = $("run-origin");
   origin.textContent = "";
-  // Parent lineage prefers the detail payload; the cached row is only a fallback, so a parent
-  // link never depends on that row being on a loaded page.
-  const parentId = run.parent_dag_run_id || (listEntry && listEntry.parent_dag_run_id) || null;
+  // The detail payload carries immutable lineage independently of cached list rows.
+  const parentId = run.parent_dag_run_id;
   if (parentId) {
-    const parentStage = run.resume_from_name || (listEntry && listEntry.resume_from_name) || "upstream stage";
+    const parentStage = run.resume_from_name || "upstream stage";
     origin.append(`Rerun from ${parentStage} · source `);
     const link = document.createElement("button");
     link.type = "button";
@@ -2761,7 +2761,15 @@ async function loadPreview(dagRunId) {
     }
     if (request.signal.aborted || state.dagRunId !== dagRunId) return;
     note.hidden = true;
-    state.controls = buildJointControls($("joint-controls"), loaded.joints, {});
+    $("inspection-controls").hidden = isMJCF;
+    if (!isMJCF) {
+      createInspection(state.viewer, loaded, $("inspection-controls"), {
+        onPoseChange: () => state.controls?.refresh(),
+      });
+    }
+    state.controls = buildJointControls($("joint-controls"), loaded.joints, {
+      onInput: () => state.viewer.inspection?.update(),
+    });
     $("joints-title").textContent = `Joint controls (${loaded.joints.length})`;
     state.previewKey = previewKey;
     state.previewSubject = isMJCF ? preview.mjcf.subject_sha256 : preview.subject_sha256;

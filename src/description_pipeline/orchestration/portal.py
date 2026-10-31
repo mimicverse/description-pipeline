@@ -1752,6 +1752,10 @@ class PortalApp:
                 "user": display_name,
                 "principal": owner,
                 "state": _run_state(projection),
+                "automatic": {"state": "waiting"} if (
+                    projection.get("state") == "unresolved"
+                    and _waiting_for_effect_results(projection, datetime.now(UTC))
+                ) else None,
                 "started_at": airflow_run.get("start_date") or item.created_at.isoformat(),
                 "parent_dag_run_id": (
                     self._dag_run_id_from_request_id(parent.get("request_id"))
@@ -2322,7 +2326,7 @@ class PortalApp:
             "operator": operator,
             "principal": principal,
             "can_manage": can_manage,
-            # Linked rerun lineage from the child run's own conf, same fields as the list rows.
+            # Linked rerun lineage from canonical admission, same fields as the list rows.
             "parent_dag_run_id": parent_dag_run_id,
             "resume_from": _optional_str(
                 request.get("from_stage") or (projection or {}).get("from_stage")

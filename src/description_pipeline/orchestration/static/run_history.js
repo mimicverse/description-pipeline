@@ -31,8 +31,11 @@ export function overlayRun(runs, run, patch) {
 }
 
 // Canonical state is authoritative in both the detail and the visible cached list. Refresh the
-// list whenever it changes, including a terminal result that later becomes unresolved.
+// list when it changes or an authorized wait ends while canonical UNKNOWN stays unchanged.
 export function shouldRefreshRunList(previous, current) {
   if (!current) return false;
-  return !previous || previous.state !== current.state;
+  return !previous || previous.state !== current.state || (
+    current.state === "unresolved" &&
+    (previous.automatic?.state === "waiting") !== (current.automatic?.state === "waiting")
+  );
 }
