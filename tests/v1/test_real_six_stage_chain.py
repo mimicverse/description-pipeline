@@ -242,21 +242,20 @@ class RealSixStageChainTests(unittest.TestCase):
             install_id="win-" + "4" * 32,
             pipeline_id="solidworks-to-urdf",
         )
+        from description_pipeline.stages import CONTRACT_FILE_SHA256
+
+        package_files = {"runtime.py": "c" * 64, "stage-contract.json": CONTRACT_FILE_SHA256}
         release = {
             "schema_version": "solidworks-to-urdf.release/v1",
             "pipeline_id": "solidworks-to-urdf",
             "version": __version__,
             "source_commit": "a" * 40,
             "source_tree": "b" * 40,
-            "source_sha256": digest(
-                {"description_pipeline/runtime.py": "c" * 64}
-            ),
-            "package_files": {
-                "description_pipeline/runtime.py": "c" * 64,
-            },
+            "source_sha256": digest(package_files),
+            "package_files": package_files,
             "contract": {
                 "schema_version": "fixture-contract/v1",
-                "digest": CONTRACT_SHA256,
+                "stage": CONTRACT_SHA256,
             },
             "support": {
                 "python": "3.12",
@@ -513,9 +512,10 @@ class RealSixStageChainTests(unittest.TestCase):
         native = copy.deepcopy(self.native)
         for role, tool in (("portable", portable), ("native", native)):
             package_files = {
-                f"description_pipeline/{role}_{seed}.py": digest(
+                f"{role}_{seed}.py": digest(
                     {"release-file": role, "seed": seed}
-                )
+                ),
+                "stage-contract.json": tool["release"]["package_files"]["stage-contract.json"],
             }
             source_sha256 = digest(package_files)
             tool["source_sha256"] = source_sha256
@@ -602,6 +602,61 @@ class RealSixStageChainTests(unittest.TestCase):
                 else None
             ),
         )
+
+    def _assert_portal_source_reads(self, run_id):
+        from description_pipeline.orchestration.portal import PortalApp, PortalConfig
+        from description_pipeline.platform.queries import read_run_projection
+        from description_pipeline.io import PipelineError, canonical
+        from description_pipeline.pipeline.contracts import StageCommand
+        from description_pipeline import mjcf_contract
+
+        def read_projection(identifier):
+            with self._connect() as connection:
+                return read_run_projection(connection, identifier, artifacts=self.store)
+
+        portal = PortalApp(PortalConfig(
+            airflow=None, run_projection_factory=read_projection, artifact_store=self.store,
+        ))
+        projection = portal._read_projection(run_id)
+        with (
+            patch.object(mjcf_contract, "tool_identity", side_effect=AssertionError("Current tool is not proof")),
+            patch.object(mjcf_contract, "engine_identity", side_effect=AssertionError("Current engine is not proof")),
+        ):
+            preview = portal._preview_from_projection(run_id, projection)
+        self.assertEqual(preview["verified"], projection["state"] != "unresolved")
+        self.assertEqual(preview["mjcf"]["verified"], projection["state"] != "unresolved")
+        self.assertEqual(run_id, preview["run_id"])
+        self.assertIsNotNone(portal._registered_stage_report(projection, stage="capture"))
+        for stage in ("capture", "generate", "verify"):
+            with self.subTest(source_command=stage):
+                changed = copy.deepcopy(projection)
+                row = changed["stages"][stage]
+                record = dict(row["command"])
+                record["contract_sha256"] = digest({"wrong_contract": stage})
+                record["request_digest"] = digest({k: v for k, v in record.items() if k != "request_digest"})
+                row["command"] = StageCommand.from_record(record).to_record()
+                with self.assertRaises(PipelineError):
+                    if stage == "capture":
+                        portal._registered_stage_report(changed, stage=stage)
+                    else:
+                        portal._urdf_preview_from_projection(run_id, changed)
+        original_read = portal._registered_member_bytes
+
+        def wrong_nested_tool(path, member):
+            content = original_read(path, member)
+            if path == mjcf_contract.REPORT_PATH:
+                record = json.loads(content)
+                record["input_binding"]["tool"]["source_sha256"] = digest({"wrong_nested_tool": True})
+                record["report"]["input_binding_sha256"] = digest(record["input_binding"])
+                record["certificate_key"] = digest({k: v for k, v in record.items() if k != "certificate_key"})
+                content = canonical(record)
+            return content
+
+        with (
+            patch.object(portal, "_registered_member_bytes", side_effect=wrong_nested_tool),
+            self.assertRaisesRegex(PipelineError, "runtime identity differs"),
+        ):
+            portal._mjcf_preview_from_projection(projection)
 
     def test_production_intake_completes_the_real_six_stage_chain(self) -> None:
         application = self._application()
@@ -690,6 +745,7 @@ class RealSixStageChainTests(unittest.TestCase):
                 ("publish", "completed"),
             ],
         )
+        self._assert_portal_source_reads(RUN_ID)
 
     def test_mjcf_only_successor_uses_real_qualified_inputs_without_upstream_execution(self) -> None:
         from description_pipeline.runtime import tool_record
@@ -966,6 +1022,8 @@ class RealSixStageChainTests(unittest.TestCase):
                     {"stage": stage, "result": executed["result"], "failures": executed["failures"]},
                 )
                 self.assertEqual(self.portable["source_sha256"], executed["result"]["actual_executor_sha256"])
+                if stage == "publish":
+                    self._assert_portal_source_reads(adopted.admission.run_id)
             for stage in ("verify", "mjcf", "publish"):
                 admitted = factory.admit_stage_rerun(
                     application,

@@ -13,7 +13,10 @@ from description_pipeline.stages import CONTRACT, stage_view
 from description_pipeline.schemas import PUBLICATION_RECEIPT_SCHEMA
 from tests.v1.protocol_support import protocol_events
 from tests.v1.protocol_support import native_discovery_record
-from tests.v1.portal_read_support import RegisteredProjectionArtifacts, registered_certificate_fixture
+from tests.v1.portal_read_support import (
+    RegisteredProjectionArtifacts, registered_certificate_fixture, registered_command_fixture,
+    native_tool_fixture, bind_source_commands_fixture,
+)
 
 RUN_ID = "7b7dbb68-b7ae-5545-859e-f351415e0fb9"
 SUBJECT = "a" * 64
@@ -87,13 +90,20 @@ class RegisteredStageProjectionTests(unittest.TestCase):
             if stage == "discover":
                 files["prepared/discovery/native-discovery.json"] = json.dumps(native_discovery_record(RUN_ID)).encode()
             if stage == "capture" and state == "completed":
-                files = {"reports/native-stages.json": json.dumps(registered_report()).encode()}
+                files = {
+                    "reports/native-stages.json": json.dumps(registered_report()).encode(),
+                    "reports/native-tool.json": json.dumps(native_tool_fixture()).encode(),
+                }
             projection["by_stage"][stage] = self.stage_members(stage, files)
             projection["stages"][stage] = {
                 "stage": stage, "state": state, "command": command,
                 "decision": {"outcome": state, "reason_code": "capture.native_failed" if state == "failed" else None},
                 "receipt": {"checks_sha256": digest(checks)}, "updated_at": "2026-10-29T01:09:49Z",
             }
+            if stage == "capture" and state == "completed":
+                bind_source_commands_fixture({
+                    **projection, "stages": {stage: projection["stages"][stage]},
+                }, self.artifacts.objects)
         preceding = "completed"
         for definition in CONTRACT["stages"]:
             stage = definition["id"]
@@ -174,23 +184,27 @@ class RegisteredStageProjectionTests(unittest.TestCase):
         projection["by_stage"]["generate"] = self.stage_members(
             "generate", {"receipt.json": b"{}"}, producer="parent-run"
         )
-        view = self.application._registered_stage_view({}, projection)
-        self.assertNotIn("reuse", view["stages"][3])
-        reuse = {"source_run": "parent-run", "source_command_id": "source-generate"}
-        projection["stages"]["generate"].update(in_scope=False, reuse=reuse)
+        with self.assertRaisesRegex(PortalError, "proven producer"):
+            self.application._registered_stage_view({}, projection)
+        command = registered_command_fixture("parent-run", "generate")
+        reuse = {"reused": True, "source_run": "parent-run", "source_command_id": command["command_id"]}
+        projection["stages"]["generate"].update(in_scope=False, reuse=reuse, command=command)
         view = self.application._registered_stage_view({}, projection)
         self.assertEqual(view["stages"][3]["reuse"], reuse)
         self.assertFalse(view["stages"][3]["in_scope"])
         projection["by_stage"]["generate"] = self.stage_members(
             "generate", {"receipt.json": b"{}"}, producer="other-run"
         )
-        with self.assertRaisesRegex(PortalError, "no proven parent"):
+        with self.assertRaisesRegex(PortalError, "proven producer"):
             self.application._registered_stage_view({}, projection)
 
     def test_native_capture_report_must_bind_its_actual_artifact_producer(self) -> None:
         projection = self.projection({"capture": "completed"})
+        member = next(iter(projection["by_stage"]["capture"].values()))
+        files = dict(self.artifacts.objects[member["artifact"]["artifact_id"]])
+        files["reports/native-stages.json"] = json.dumps(registered_report("other-run")).encode()
         projection["by_stage"]["capture"] = self.stage_members(
-            "capture", {"reports/native-stages.json": json.dumps(registered_report("other-run")).encode()})
+            "capture", files)
         with self.assertRaisesRegex(PortalError, "conflicts with its run"):
             self.application._registered_stage_view({}, projection)
 

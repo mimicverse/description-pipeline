@@ -14,13 +14,15 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from description_pipeline.artifacts import ArtifactStore
-from description_pipeline.io import digest, write_json
+from description_pipeline.io import PipelineError, digest, write_json
 from description_pipeline.orchestration.airflow_client import native_run_id
 from description_pipeline.orchestration.portal import PortalApp, PortalConfig, PortalError
 from description_pipeline.pipeline.contracts import RunAdmission, StageCommand, StageResult
 from description_pipeline.schemas import STAGE_RESULT_SCHEMA
 
-from .portal_read_support import RegisteredProjectionArtifacts, registered_certificate_fixture
+from .portal_read_support import (
+    RegisteredProjectionArtifacts, registered_certificate_fixture, registered_command_fixture,
+)
 
 
 class RegisteredReadErrorTests(unittest.TestCase):
@@ -239,7 +241,7 @@ class RegisteredCertificateContractTests(unittest.TestCase):
             for name, data in files.items()
         }
 
-    def projection(self, certificate: dict) -> dict:
+    def projection(self, certificate: dict, *, contract="f" * 64, policy="1" * 64) -> dict:
         data = json.dumps(certificate).encode()
         files = {"verification-certificate.json": data}
         verify = self.artifacts.register(run_id="run", stage="verify", files=files)
@@ -248,10 +250,19 @@ class RegisteredCertificateContractTests(unittest.TestCase):
             "state": "running",
             "purpose": "engineering",
             "stages": {
+                "generate": {
+                    "command": registered_command_fixture(
+                        "run", "generate", request={"capture_artifact_id": self.capture["artifact_id"]},
+                        inputs=[self.capture],
+                    ),
+                },
                 "verify": {
                     "state": "completed",
                     "receipt": {"checks_sha256": digest(certificate)},
-                    "command": {"input_artifacts": [self.generate, self.capture]},
+                    "command": registered_command_fixture(
+                        "run", "verify", request={"purpose": "engineering"}, inputs=[self.generate, self.capture],
+                        contract=contract, policy=policy,
+                    ),
                     "formal_eligible": True,
                     "qualification": {"formal_eligible": True, "scope_kind": "formal", "outcome": "completed"},
                 }
@@ -266,6 +277,24 @@ class RegisteredCertificateContractTests(unittest.TestCase):
     def test_complete_certificate_remains_previewable(self) -> None:
         preview = self.app._preview_from_projection("run", self.projection(self.certificate))
         self.assertTrue(preview["verified"])
+
+    def test_new_verifier_contract_keeps_the_original_generate_receipt(self) -> None:
+        contract, policy = digest({"new_verifier_contract": True}), digest({"new_verifier_policy": True})
+        certificate = registered_certificate_fixture(
+            generate=self.generate, capture=self.capture,
+            generate_files=self.generate_files, capture_files=self.capture_files,
+            report={"passed": True}, contract_sha256=contract, policy_sha256=policy,
+        )
+        projection = self.projection(certificate, contract=contract, policy=policy)
+        preview = self.app._preview_from_projection("run", projection)
+        self.assertTrue(preview["verified"])
+        self.assertEqual(projection["stages"]["generate"]["command"]["contract_sha256"], "f" * 64)
+        projection["stages"]["generate"]["command"] = registered_command_fixture(
+            "run", "generate", request={"capture_artifact_id": self.capture["artifact_id"]},
+            inputs=[self.capture], contract=contract,
+        )
+        with self.assertRaisesRegex(PipelineError, "Generate receipt differs"):
+            self.app._preview_from_projection("run", projection)
 
     def test_registered_bad_schema_proof_and_failed_check_are_refused(self) -> None:
         for mutation, message in (

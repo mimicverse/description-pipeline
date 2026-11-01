@@ -45,8 +45,6 @@ from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 from ..pipeline.verify_contract import validate_certificate_diagnostics
 from ..stages import (
     CONTRACT,
-    CONTRACT_FILE_SHA256,
-    CONTRACT_SHA256,
     VIEW_SCHEMA,
     activity_view,
     stage_display_state,
@@ -74,6 +72,7 @@ from ..interface_records import REQUEST_PURPOSES
 from ..delivery import PIPELINE_ID, SUBJECT_DIRECTORIES, PROJECTION_DIRECTORIES, SUBJECT_FILES
 from ..platform.queries import read_run_projection
 from ..schemas import PUBLICATION_RECEIPT_SCHEMA, RUN_ACTIVITY_SCHEMA
+from ..schemas import NATIVE_TOOL_REQUIREMENT_KIND
 from ..pipeline.contracts import ArtifactRef, StageStatus, StageCommand
 from ..pipeline.dispatch import DispatchObservation
 from ..pipeline.effects import EffectState
@@ -2805,6 +2804,20 @@ class PortalApp:
             raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered reused stage producer is inconsistent")
         return producer
 
+    @staticmethod
+    def _registered_stage_command(projection: dict, row: dict, artifact: ArtifactRef) -> StageCommand:
+        """Read the original producer command, including a reused stage's identity."""
+        command = StageCommand.from_record(row.get("command"))
+        if (
+            command.run_id != PortalApp._registered_producer_run(projection, row)
+            or artifact.producer_run_id != command.run_id
+            or artifact.producer_stage != command.stage
+            or artifact.kind != f"stage_output:{command.stage}"
+            or artifact.producer_tool_sha256 != command.expected_executor_sha256
+        ):
+            raise PipelineError("Registered stage artifact differs from its original producer command")
+        return command
+
     def _mjcf_input_members(self, projection: dict) -> dict:
         """Expose only the registered MJCF command's exact source closure."""
         stages = projection["stages"]
@@ -3093,12 +3106,38 @@ class PortalApp:
         else:
             return None
         report = _parse_registered_json(data)
+        command = self._registered_stage_command(projection, row, artifact)
+        native_member = members.get("reports/native-tool.json")
+        if stage != "capture" or not isinstance(native_member, dict):
+            raise PipelineError("Registered native Capture tool evidence is missing")
+        native_tool = _parse_registered_json(self._registered_member_bytes("reports/native-tool.json", native_member))
+        request = command.request
+        requirements = [ref for ref in command.input_artifacts if ref.kind == NATIVE_TOOL_REQUIREMENT_KIND]
+        release = native_tool.get("release")
+        if not isinstance(release, dict) or not isinstance(release.get("contract"), dict):
+            raise PipelineError("Registered native tool has no original release inventory")
+        package_files = release.get("package_files")
+        if (
+            digest(native_tool) != request.get("native_tool_record_sha256")
+            or native_tool.get("source_sha256") != request.get("native_tool_source_sha256")
+            or len(requirements) != 1
+            or requirements[0].artifact_id != request.get("native_tool_requirement_artifact_id")
+            or requirements[0].producer_run_id is not None
+            or requirements[0].producer_stage is not None
+            or not isinstance(package_files, dict) or not package_files
+            or digest(package_files) != native_tool.get("source_sha256")
+            or release.get("source_sha256") != native_tool.get("source_sha256")
+            or release["contract"].get("stage") != command.contract_sha256
+            or not isinstance(package_files.get("stage-contract.json"), str)
+            or _SHA256_TEXT.fullmatch(package_files["stage-contract.json"]) is None
+        ):
+            raise PipelineError("Registered native tool differs from the original Capture requirement")
         if (
             report.get("schema_version") != VIEW_SCHEMA
             or report.get("pipeline_id") != PIPELINE_ID
             or report.get("run_id") != source_run
-            or report.get("contract_sha256") != CONTRACT_SHA256
-            or report.get("contract_file_sha256") != CONTRACT_FILE_SHA256
+            or report.get("contract_sha256") != command.contract_sha256
+            or report.get("contract_file_sha256") != package_files["stage-contract.json"]
         ):
             raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered stage report conflicts with its run or contract")
         return report
@@ -3431,7 +3470,22 @@ class PortalApp:
             raise PipelineError("The verification certificate differs from its stage result")
         by_stage = projection.get("by_stage")
         by_stage = by_stage if isinstance(by_stage, dict) else {}
+        verify_artifact = self._stage_artifact_ref(by_stage.get("verify") or {}, stage="verify")
+        verify_command = self._registered_stage_command(projection, verify_row, verify_artifact)
+        if verify_command.stage != "verify" or (
+            certificate.get("contract_sha256") != verify_command.contract_sha256
+            or certificate.get("policy_sha256") != verify_command.policy_sha256
+            or certificate.get("config_snapshot_sha256") != verify_command.config_snapshot_sha256
+            or certificate.get("actual_verifier_sha256") != verify_command.expected_executor_sha256
+            or certificate.get("purpose") != verify_command.request.get("purpose")
+        ):
+            raise PipelineError("The verification certificate differs from its original Verify command")
         generate, capture = self._verification_input_pair(verify_row, by_stage)
+        generate_row = (projection.get("stages") or {}).get("generate") or {}
+        generate_command = self._registered_stage_command(projection, generate_row, generate)
+        generate_captures = [ref for ref in generate_command.input_artifacts if ref.kind == "stage_output:capture"]
+        if generate_captures != [capture] or generate_command.request.get("capture_artifact_id") != capture.artifact_id:
+            raise PipelineError("The original Generate command names another Capture artifact")
         certificate_generate = ArtifactRef.from_record(certificate.get("generate_artifact"))
         certificate_capture = ArtifactRef.from_record(certificate.get("capture_artifact"))
         if certificate_generate != generate or certificate_capture != capture:
@@ -3449,21 +3503,8 @@ class PortalApp:
         generate_members = generate_members if isinstance(generate_members, dict) else {}
         capture_members = by_stage.get("capture")
         capture_members = capture_members if isinstance(capture_members, dict) else {}
-        verify_members = by_stage.get("verify")
-        verify_members = verify_members if isinstance(verify_members, dict) else {}
-        if not generate_members:
-            generate_members = {
-                path: member
-                for path, member in verify_members.items()
-                if path == "tool.json"
-                or path.startswith(("model/", "urdf/", "meshes/"))
-            }
-        if not capture_members:
-            capture_members = {
-                path: member
-                for path, member in verify_members.items()
-                if path.startswith(("input/", "evidence/"))
-            }
+        if not generate_members or not capture_members:
+            raise PipelineError("The registered Generate/Capture source inventory is missing")
         evaluation_subject = self._pair_subject_from_members(generate_members, capture_members)
         if (
             evaluation_subject is not None
@@ -3471,24 +3512,22 @@ class PortalApp:
         ):
             raise PipelineError("The verification certificate evaluation subject differs")
 
-        receipt_member = generate_members.get(
-            "reports/generate.json",
-            verify_members.get("reports/generate.json"),
-        )
-        if isinstance(receipt_member, dict):
-            receipt_bytes = self._registered_member_bytes("reports/generate.json", receipt_member)
-            if certificate.get("generate_receipt_sha256") != hashlib.sha256(receipt_bytes).hexdigest():
-                raise PipelineError("The verification certificate names another Generate receipt")
-            receipt = _parse_registered_json(receipt_bytes)
-            if (
-                not isinstance(receipt, dict)
-                or receipt.get("capture_artifact") != capture.to_record()
-                or receipt.get("config_snapshot_sha256") != certificate.get("config_snapshot_sha256")
-                or receipt.get("contract_sha256") != certificate.get("contract_sha256")
-                or receipt.get("actual_executor_sha256") != generate.producer_tool_sha256
-                or receipt.get("required_executor_sha256") != generate.producer_tool_sha256
-            ):
-                raise PipelineError("The Generate receipt differs from the verification pair")
+        receipt_member = generate_members.get("reports/generate.json")
+        if not isinstance(receipt_member, dict):
+            raise PipelineError("The original Generate receipt is missing")
+        receipt_bytes = self._registered_member_bytes("reports/generate.json", receipt_member)
+        if certificate.get("generate_receipt_sha256") != hashlib.sha256(receipt_bytes).hexdigest():
+            raise PipelineError("The verification certificate names another Generate receipt")
+        receipt = _parse_registered_json(receipt_bytes)
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("capture_artifact") != capture.to_record()
+            or receipt.get("config_snapshot_sha256") != generate_command.config_snapshot_sha256
+            or receipt.get("contract_sha256") != generate_command.contract_sha256
+            or receipt.get("actual_executor_sha256") != generate.producer_tool_sha256
+            or receipt.get("required_executor_sha256") != generate.producer_tool_sha256
+        ):
+            raise PipelineError("The Generate receipt differs from the verification pair")
         return generate, capture, evaluation_subject
 
     def _mjcf_preview_from_projection(self, projection: dict) -> dict | None:
@@ -3501,16 +3540,13 @@ class PortalApp:
         member = output.get(mjcf_contract.REPORT_PATH)
         if not isinstance(member, dict):
             raise PipelineError("Completed MJCF stage has no registered certificate")
-        command = StageCommand.from_record(row.get("command"))
+        output_ref = self._stage_artifact_ref(output, stage="mjcf")
+        command = self._registered_stage_command(projection, row, output_ref)
         certificate = mjcf_certificate_from_bytes(
             self._registered_member_bytes(mjcf_contract.REPORT_PATH, member), command,
         )
         if digest(certificate) != (row.get("receipt") or {}).get("checks_sha256"):
             raise PipelineError("MJCF certificate differs from its registered stage result")
-        output_ref = self._stage_artifact_ref(output, stage="mjcf")
-        if (output_ref.producer_run_id != command.run_id
-                or output_ref.producer_tool_sha256 != command.expected_executor_sha256):
-            raise PipelineError("MJCF artifact belongs to another producer")
         for stage, ref in mjcf_source_refs(command).items():
             if ref != self._stage_artifact_ref(by_stage.get(stage) or {}, stage=stage):
                 raise PipelineError("MJCF preview names another source artifact")
@@ -3528,7 +3564,10 @@ class PortalApp:
             sha, size, _ref = self._registered_member_fields(source)
             files[name] = {"sha256": sha, "bytes": size}
         components = mjcf_contract.COMPONENT_SOURCE if mjcf_contract.COMPONENT_SOURCE in files else None
-        actual_binding = mjcf_contract.binding_for_files(files, components=components)
+        binding = certificate["input_binding"]
+        actual_binding = mjcf_contract.binding_for_files(
+            files, components=components, tool=binding["tool"], engine=binding["engine"],
+        )
         if actual_binding != certificate["input_binding"]:
             raise PipelineError("MJCF preview file inventory or engine differs from its certificate")
         projected = {name: record for name, record in files.items() if name.startswith("mjcf/")}
@@ -3548,7 +3587,7 @@ class PortalApp:
         verified = formal and projection.get("state") != "unresolved"
         report_sha, report_bytes, report_ref = self._registered_member_fields(member)
         warning_inventory = text_warning_inventory(mjcf_contract.projection_warnings(certificate), {
-            "artifact": report_ref.to_record(), "path": mjcf_contract.REPORT_PATH,
+            "artifact": report_ref, "path": mjcf_contract.REPORT_PATH,
             "bytes": report_bytes, "sha256": report_sha,
         })
         return {

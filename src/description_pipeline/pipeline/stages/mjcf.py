@@ -181,6 +181,20 @@ def certificate_from_bytes(content: bytes, command: StageCommand, *, require_pas
     files = binding.get("files")
     if not isinstance(files, dict):
         raise PipelineError("MJCF certificate has no bound file inventory")
+    tool, engine = binding.get("tool"), binding.get("engine")
+    if (
+        not isinstance(tool, dict)
+        or set(tool) != {"name", "version", "source_sha256"}
+        or tool["name"] != "mimicverse-description"
+        or not isinstance(tool["version"], str)
+        or not tool["version"]
+        or tool["source_sha256"] != command.expected_executor_sha256
+        or not isinstance(engine, dict)
+        or set(engine) != {"mujoco"}
+        or not isinstance(engine["mujoco"], str)
+        or not engine["mujoco"]
+    ):
+        raise PipelineError("MJCF certificate runtime identity differs from its source command")
     return certificate
 
 
@@ -217,23 +231,9 @@ def validate_certificate(
     refs = source_refs(command)
     _source_certificate(command, refs, source_roots)
     binding = certificate["input_binding"]
-    tool, engine = binding.get("tool"), binding.get("engine")
-    if (
-        not isinstance(tool, dict)
-        or set(tool) != {"name", "version", "source_sha256"}
-        or tool["name"] != "mimicverse-description"
-        or not isinstance(tool["version"], str)
-        or not tool["version"]
-        or tool["source_sha256"] != command.expected_executor_sha256
-        or not isinstance(engine, dict)
-        or set(engine) != {"mujoco"}
-        or not isinstance(engine["mujoco"], str)
-        or not engine["mujoco"]
-    ):
-        raise PipelineError("MJCF certificate runtime identity differs from its source command")
     with tempfile.TemporaryDirectory(prefix="mjcf-certificate-") as temporary:
         view = _view(Path(temporary) / "view", source_roots["generate"], root)
-        if contract.binding_for_projection(view, tool=tool, engine=engine) != binding:
+        if contract.binding_for_projection(view, tool=binding["tool"], engine=binding["engine"]) != binding:
             raise PipelineError("MJCF certificate input bytes or tool identity changed")
     return certificate
 

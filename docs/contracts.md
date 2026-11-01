@@ -926,6 +926,8 @@ Generate 的本地转换、输出表示及 Verify 的本地评估若明确抛出
 
 所有消费者共用 `execution_stage_ids`。共同 `execution_scope` 给出本次实际范围；复用前缀保留 source/reuse 与真实 producer，本次 command/decision 不伪造；未执行后缀为 `out_of_scope`。独立生成的新结果可作为后续有界执行的合法来源；不能回退使用被替代的旧下游成功。`delivery_complete` 与 scope 成功分别计算。
 
+公共报告与预览同样读取原 producer command：Generate receipt 与其原 Generate command 绑定，Verify certificate 与其原 Verify command 绑定，不要求两者的合同或工具相同。原生报告的 canonical contract 对原 Capture command；raw contract 文件摘要对该 command 已绑定的 native ToolRecord 发行 inventory。MJCF 的 sealed tool/engine 须先核验与原 command 的关系，再复算文件 binding，不用当前展示进程的身份解释原证书。缺必要来源拒绝，不从 Verify 副本或当前安装补证。
+
 Airflow 保持七任务并从不可变范围确定实际执行；skipped 不授予领域资格。CLI 与生产 handler 共用同一接纳及来源复核。Freeze-only 不调用 CAD；Discover/Capture 按必要原生端口及唯一所有权执行；Generate、Verify、MJCF、Publish 不需要新 CAD 工作。Publish 重新核验两证书、完整来源与真实 Git/PR expected state；旧外部结果 UNKNOWN/CONFLICT 须先精确对账。
 
 执行中取消沿用原 claim/fence。提交事务发现取消时抛出类型化 `StageCancellationRequested`；共同 engine 保全候选 StageResult、artifact 和原失败上下文，写入 cancelled FailureEnvelope/decision 并关闭原执行权，不再竞争新 claim。重复执行返回原终态；已完成决定不改写；UNKNOWN/CONFLICT 未结算不能终态取消。该通知是进程内控制流，不新增持久状态。
