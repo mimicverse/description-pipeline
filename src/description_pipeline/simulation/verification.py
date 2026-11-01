@@ -39,7 +39,7 @@ class ManagedRecordingVerification:
         if interrupted:
             if connection is not None:
                 await run_thread(connection.close)
-            raise asyncio.CancelledError
+            raise interrupted
         return connection
 
     async def verify_recording(self, session_id, members, read_member):
@@ -103,7 +103,7 @@ class ManagedRecordingVerification:
             admitting.result()
             admitted = True
             if interrupted:
-                raise asyncio.CancelledError
+                raise interrupted
             temporary.mkdir(mode=0o700)
             source = temporary / "source"
             async with self._storage_gate:
