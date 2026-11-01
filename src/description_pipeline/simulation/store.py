@@ -74,6 +74,12 @@ class SimulationStore:
             cursor.execute("SELECT state FROM admission WHERE id=1")
             return cursor.fetchone() == ("open",)
 
+    def active_session_ids(self):
+        """Read the existing session authority for host-space admission."""
+        with self.transaction() as cursor:
+            cursor.execute("SELECT session_id FROM simulation_session WHERE state NOT IN ('stopped','failed')")
+            return [row[0] for row in cursor.fetchall()]
+
     def get(self, session_id: str) -> dict:
         with self.transaction() as cursor:
             cursor.execute(
@@ -317,10 +323,14 @@ class SimulationStore:
             "ELSE result || %s::jsonb END WHERE session_id=%s AND request->>'type' IN ('estop','stop') "
             "AND (result IS NULL OR result->>'state' IN ('pending','accepted'))",
             (
-                json.dumps({
-                    "state": "not_sent", "envelope": None, "response": None,
-                    "error": "Worker dispatch was never registered before session closure",
-                }),
+                json.dumps(
+                    {
+                        "state": "not_sent",
+                        "envelope": None,
+                        "response": None,
+                        "error": "Worker dispatch was never registered before session closure",
+                    }
+                ),
                 json.dumps({"state": "unknown", "error": "Session closed before a terminal command receipt"}),
                 session_id,
             ),
