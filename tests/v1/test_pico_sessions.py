@@ -223,6 +223,15 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
         path.write_text("\n".join(lines) + "\n")
         with self.assertRaisesRegex(ValueError, "TCP differs"):
             await asyncio.to_thread(verify, recording, self.root / "model")
+        saved = self.store.previous_profile("app:tenant:operator", self.request["source"]["subject_sha256"])
+        self.assertEqual(self.request["profile"], saved["profile"])
+        with self.store.transaction() as cursor:
+            cursor.execute(
+                "UPDATE simulation_session SET request=jsonb_set(request,'{record}','false') WHERE session_id=%s",
+                (sid,),
+            )
+        with self.assertRaisesRegex(SimulationConflict, "digest"):
+            self.store.previous_profile("app:tenant:operator", self.request["source"]["subject_sha256"])
 
     async def test_bad_source_and_maintenance_drain_release_capacity(self):
         await self.service.start()

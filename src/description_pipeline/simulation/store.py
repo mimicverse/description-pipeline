@@ -164,12 +164,14 @@ class SimulationStore:
     def previous_profile(self, actor: str, subject: str) -> dict | None:
         with self.transaction() as cursor:
             cursor.execute(
-                "SELECT request FROM simulation_session WHERE actor=%s AND ready_at IS NOT NULL "
+                "SELECT request_digest,request FROM simulation_session WHERE actor=%s AND ready_at IS NOT NULL "
                 "AND request->'source'->>'subject_sha256'=%s ORDER BY created_at DESC LIMIT 1",
                 (actor, subject),
             )
             row = cursor.fetchone()
-            return {key: row[0][key] for key in ("profile", "settings", "record")} if row else None
+            if row is not None and digest(row[1]) != row[0]:
+                raise SimulationConflict("Stored simulation request digest is inconsistent")
+            return {key: row[1][key] for key in ("profile", "settings", "record")} if row else None
 
     def authorize_command(self, session_id: str, command_id: str, actor: str, request: dict) -> dict | None:
         with self.transaction() as cursor:
