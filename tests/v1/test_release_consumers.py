@@ -74,8 +74,19 @@ def consumer_fixture():
         "files": {name: hashlib.sha256(value).hexdigest() for name, value in teleop_files.items()},
     }
     common["wheel_sha256"] = hashlib.sha256(members[common["wheel_filename"]]).hexdigest()
-    asset = {"source_commit": "c" * 40, "wheel_filename": "actuator_model-1.3.0-py3-none-any.whl"}
-    asset["wheel_sha256"] = hashlib.sha256(members[asset["wheel_filename"]]).hexdigest()
+    asset = {
+        "distribution": "actuator-model",
+        "source_commit": "c" * 40,
+        "wheel_filename": "actuator_model-1.3.0-py3-none-any.whl",
+    }
+    actuator_wheel = members[asset["wheel_filename"]]
+    asset["wheel_sha256"] = hashlib.sha256(actuator_wheel).hexdigest()
+    with zipfile.ZipFile(io.BytesIO(actuator_wheel)) as archive:
+        payload = {name: hashlib.sha256(archive.read(name)).hexdigest()
+                   for name in archive.namelist() if not name.endswith("/RECORD")}
+    asset["record_payload_sha256"] = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     versions = {
         "pico": {"robot-teleop": "0.3.0", "numpy": "1.0", "mujoco": "3.13.0"},
         "assessment": {
