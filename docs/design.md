@@ -1,6 +1,6 @@
 # 架构设计
 
-系统只有一条生产工作流：原生 SolidWorks 文件夹 → Airflow 六阶段 → 独立验证 → URDF 预览与评审 PR。架构以正确性、能力完整、职责清楚、可恢复、可测试和实际执行效率为验收依据。最终系统精简的是重复权威、失效入口和无用兼容，不以改动量、抽象数量或删除行数限制必要重构。
+系统只有一条生产工作流：原生 SolidWorks 文件夹 → Airflow 七阶段 → 独立验证 → URDF/MJCF 预览与评审 PR。架构以正确性、能力完整、职责清楚、可恢复、可测试和实际执行效率为验收依据。最终系统精简的是重复权威、失效入口和无用兼容，不以改动量、抽象数量或删除行数限制必要重构。
 
 本文说明模块职责与设计理由。[系统契约](contracts.md)定义数据和状态边界，[机械规范](mechanical-handoff-spec.md)定义工程语义，[质量规范](quality.md)定义判据与容差，[操作指南](operations.md)和[部署指南](deployment.md)分别面向工程使用与平台维护。协议字段和阈值只在各自规范中维护。
 
@@ -15,23 +15,25 @@ flowchart LR
   D --> C[Capture 采集]
   C --> G[Generate 生成]
   G --> V[Verify 独立验证]
-  V --> P[Publish 评审 PR]
-  V --> R[报告与预览]
+  V --> M[MJCF 转换与独立验证]
+  M --> P[Publish 双格式评审 PR]
+  V --> R[URDF 报告与预览]
+  M --> R
 ```
 
-六阶段的输入、检查和输出见[六阶段契约](contracts.md#stages)。每阶段从已登记不可变命令重建自己的输入闭包；阶段之间不依赖进程内对象、可变临时目录或前一阶段仍存活的会话。
+七阶段的输入、检查和输出见[七阶段契约](contracts.md#stages)。每阶段从已登记不可变命令重建自己的输入闭包；阶段之间不依赖进程内对象、可变临时目录或前一阶段仍存活的会话。
 
 检查预览可从当前保存的原生命名基准与轴建立 `inspection_saved_native_carrier/v1` 声明。该规则复用已有用途、采集计划、模型及来源警告；不增加运行入口、配置开关或第二份工程模型。原始对象、作用域、配置、刚性求解声明、根和几何接口均须成立；名称只选择具有同次几何证据的候选。Source 与独立 Verify 分别解释原始事实，后续阶段仍消费同一载体。规则不授予刚体附着、实际自由度、正运动或硬件资格；具体边界见[机械交付规范](mechanical-handoff-spec.md#保存的原生命名基准与检查预览)。
 
 | 边界 | 唯一职责 | 不持有的权威 |
 |---|---|---|
 | 浏览器与 Portal | 认证、上传、提交意图、查询、报告与预览 | 工程推导、阶段成功和 CAD 控制 |
-| Airflow DAG | 依次调度六个 `StageTaskOperator` | 领域状态机和工程检查 |
+| Airflow DAG | 按共同执行范围调度七个 `StageTaskOperator` | 领域状态机和工程检查 |
 | `StageTaskOperator` | 绑定真实 task context，执行、让渡与恢复同一阶段 | 副作用发送资格和阶段判据 |
 | `EffectPollTrigger` | 只读观察既有 effect，产生唤醒提示并释放 worker | claim、发送、取消、封存或成功资格 |
-| `StageApplication` | 接纳、构造命令、组合六个 handler、路由对账和取消 | CAD 原生事实、网页授权 |
+| `StageApplication` | 接纳、构造命令、按已登记命令或执行范围装配所需 handler、路由对账和取消 | CAD 原生事实、网页授权 |
 | 共同 stage engine | claim、执行、候选校验、唯一 decision 及失败保全 | 各阶段领域算法 |
-| Linux handlers | 冻结、原生协调、模型生成、独立验证与发布 | Windows 会话所有权 |
+| Linux handlers | 冻结、原生协调、模型生成、URDF/MJCF 独立验证与组合发布 | Windows 会话所有权 |
 | Windows native runtime | 已保存 CAD 原生事实读取、几何观察、会话管理、原值序列化与证据封包 | 语义投影、惯量规范化、STL、完整模型、URDF、独立质量结论、Git 和 PR |
 | Windows 生命周期脚本 | 当前任务、进程归属、安装身份、ACL 和健康的现场核验 | 业务阶段决定；Linux 控制与恢复只消费其核验结果 |
 | PostgreSQL `FactStore` | 接纳、命令、执行权、effect 与阶段决定 | artifact 文件内容和 Airflow 调度状态 |
@@ -73,9 +75,11 @@ CAD 有值时先读取、保留和检查，再按有据规则修正。规则不�
 
 完整上传、选定原生依赖闭包、prepared package、artifact 集合、tool source、完整 tool record 和交付 subject 的摘要属于不同语义域。逐域核验，不能因两个摘要不同就认定内容冲突，也不能以其中一个代替另一个。
 
-新运行只能从 Freeze 接纳。首次上传封存新 originals；Freeze successor 仅复用父运行已验证的 originals，当前请求、规则、配置、目标、Git 基线和工具要求重新封存，重新执行六阶段。不得继承父运行下游 decision 或成功资格。同一已登记命令的受控重试与新建运行是两种操作，详见[状态与恢复](contracts.md#recovery)。
+新的 CAD 输入从 Freeze 接纳；仅转换重跑可使用受限 `from_stage=mjcf` 后继。首次上传封存新 originals；Freeze successor 仅复用父运行已验证的 originals，当前请求、规则、配置、目标、Git 基线和工具要求重新封存，重新执行七阶段。Freeze successor 不得继承父运行下游 decision 或成功资格。同一已登记命令的受控重试与新建运行是两种操作，详见[状态与恢复](contracts.md#recovery)。
 
 门户每次有意新建请求使用新的 `Idempotency-Key`；结果未确认时保留同一键重试，不能由相同表单值推断这是旧请求。运行列表来自已接纳事实，尚未创建 Airflow DagRun 的请求同样可见；详情及重试读取原不可变请求。浏览器只维护当前请求的读取生命周期，列表、分页和详情的过期响应不得覆盖新读取；读取失败撤下旧成功与预览，不据缓存重判业务状态。
+
+门户采用单页信息层次：提交入口只有一个文件夹选择按钮；运行首层显示当前状态、用途、失败或下一步、唯一阶段导航、当前活动、交付 PR 和模型预览。问题按类别汇总，所选阶段检查、来源证据、工程审查范围、运行身份和模型数据按需展开，不再维护重复标签导航或全阶段检查树。三维预览默认展开，关节保留滑块、数值和单位控制，技术大表默认收起；诊断资格限制始终紧邻模型可见。URDF 与 MJCF 共用该信息层次，格式切换和资格变化均刷新对应诊断提示；Generate 阶段摘要使用报告登记的 URDF subject，不借用当前三维视图的 MJCF subject。MJCF 首层仅显示格式、播放、步进与复位，几何模式、link 和标记在显示选项中展开。流程连接箭头仅沿后台返回的阶段顺序展示，复用不冒称本次执行。预览常用视角、关节选择和当前 link／关联关节摘要位于画布上方；用户主动选择可揭示对应关节控件，轮询不抢焦点。URDF 与 MJCF 的视野适配共用一个基于实际几何包围球、相机视角和画布比例的函数，不按模型特判；外观等加载 warning 在预览旁持续可见。展开时按真实可见画布重新适配，缩放限界与裁剪面从同一场景尺度派生。异步仿真更新保留活动输入框与滑块的编辑内容，数值读数仍反映实际快照；提交等待引擎确认时不以旧值覆盖本次输入。MJCF adapter 仅保留尚未确认的界面请求意图，按 worker 顺序回执删除；数值读数仍只来自引擎快照，待确认时标注 updating。失焦、单位切换和复位共享该意图，复位值直接来自引擎 qpos0，过期回执不能清除更新请求；错误与释放清除相应意图。轮询仅在相关事实变化时替换可交互详情，保留未变内容的焦点和展开状态；这些 DOM 替换键及显示偏好不构成业务缓存或资格权威。历史隐藏保留既有软删除与恢复语义，完整文件、证据及 PR 不变。
 
 ## 模块与依赖
 
@@ -103,7 +107,7 @@ StagePending -> EffectPollTrigger -> StageTaskOperator.execute_complete
 
 等待器每轮先读取原命令的 canonical decision 和 effect settlement；已有结果、冲突或已批准的恢复阶段时，直接唤醒同一不可变 wait，由执行器重新核验。只有仍待观察时才读取原生端、Git 或 PR，不能要求远端再次变化才能响应已登记的对账或取消。唤醒不建立成功资格，不取得执行权，不重发外部请求。
 
-共同引擎不包含 CAD、URDF 或发布算法。各 handler 只持有所需 artifact 和 effect 端口，不能直接提交平台成功。生产组合必须完整安装六阶段、native/Git/PR 对账及 native 取消能力；测试可显式注入端口，缺失生产组件不得被当作可选功能静默忽略。
+共同引擎不包含 CAD、URDF 或发布算法。各 handler 只持有所需 artifact 和 effect 端口，不能直接提交平台成功。生产组合从已登记 command/admission 推导本次所需阶段及端口：Discover/Capture 装配 native 及取消/对账能力，Publish 装配 Git/PR；Generate/Verify/MJCF 不加载 CAD endpoint/token。原 CLI 与 Airflow 使用同一工厂，缺少本次必要能力仍明确拒绝。全流程入口仍覆盖七阶段。
 
 Discover result 表达原生选择、prepared 输入和证据绑定，不作为第二个完整机器人模型。Generate 持久化一个 `EngineeringModel`，URDF 是其交付编码。Verify 独立读取原始证据和实际输出，不借用生成器的期望值、成功标志或缓存。共享代码限于纯数学、格式解析和无领域推导的契约基础，并用解析解、已知答案和变异反例验证。发布重验完整 certificate、execution receipt 及被验证字节。
 
@@ -113,7 +117,7 @@ Windows 的既有 `native_operation_event` 经同一 operation view 与 poll 形
 
 Portal 从 canonical 阶段事实与既有检查摘要生成只读展示：有效执行权仍待外部结果时统一显示等待，真实 UNKNOWN 显示待对账，实际登记失败保留红色与具体错误；展示不改写阶段或执行权。预览只在已登记验证证据存在后请求。详细检查读取该阶段实际密封证据：Freeze/Discover 的 `checks.json`、Capture 的原生报告及 Verify 的独立 certificate。不以静态检查模板或其他阶段报告重新判定终态；证据身份、摘要或结构冲突作为读取错误拒绝展示。原生失败从同阶段密封 `native-result.json` 保留原始消息。Discover 的来源与 warning 直接读取其自身输出，不等待 Capture。
 
-预览只有一个 Three.js 场景。`viewer.js` 负责从摘要验证的 artifact 路由解析真实 URDF/STL、建立唯一 link/joint 层级及关节控制；`inspection.js` 直接读取该层级，提供视角、显示开关、link 选择与外观、坐标轴、质心、惯量、关节拖动及测距，不持久化第二工程模型，不修改交付或验证资格。逐 link 隐藏只作用于该 link 的 visual，不连带隐藏子 link。关节滑杆、数值输入和画布拖动共用同一关节变换与限位；零位复位保留超范围参考姿态的明确提示。
+预览共用一个 Three.js renderer。URDF 模式与 MJCF 模式切换时释放旧层级、监听及 Worker；MJCF 使用固定 MuJoCo WASM 解析实际交付字节，提供 visual/collision/overlay、关节调姿、步进与复位，交互不改交付或证书。`viewer.js` 负责从摘要验证的 artifact 路由解析真实 URDF/STL、建立唯一 link/joint 层级及关节控制；`inspection.js` 直接读取该层级，提供视角、显示开关、link 选择与外观、坐标轴、质心、惯量、关节拖动及测距，不持久化第二工程模型，不修改交付或验证资格。逐 link 隐藏只作用于该 link 的 visual，不连带隐藏子 link。关节滑杆、数值输入和画布拖动共用同一关节变换与限位；零位复位保留超范围参考姿态的明确提示。
 
 惯量椭球由质量和完整对称惯量张量的主轴、主惯量推导，并应用 URDF 惯性原点的平移与旋转；它表示等效均匀实心椭球，不表示真实外形。缺失或不适用的惯量不补值，逐 link 说明无法显示的原因。表面测距读取实际交付的离散网格；关节间距读取 URDF joint-frame 原点。端点保留所选 link/joint 的局部位置，每次姿态变化从同一层级重算世界位置。网格贴地只移动辅助网格，不改模型坐标；颜色、透明度和标记尺寸均明确为显示用途。所有叠加与输入监听随当前产物释放，沿用同一个 renderer 与渲染循环。历史预览工具及手工模型仅用于外置功能核对与测试，不导入其临时自动上传脚本、机器人专用控制或生产真值。
 
@@ -127,7 +131,7 @@ successor 创建、claim 取得、外发授权和 decision 提交各自重验当
 
 Airflow 只拥有实际调度状态。`project_stage_status`、`project_run_status` 从 canonical facts 生成业务投影；Portal、SQL view 和维护脚本不另建 reducer。Portal 列表、详情与预览从同一 canonical 投影读取状态；预览每次请求重读当前资格，不缓存可变的 verified/formal_eligible 结论。`RunControlStore` 只控制显示名、隐藏与恢复显示。维护查询在同一只读 repeatable-read 快照中核对业务投影和真实 Airflow 关联；显示隐藏不删除证据或改变运行资格。
 
-只有六个正式阶段按序完成且全部相关 effect 已满足，运行才成功。诊断阶段通过、文件完整、服务健康或 task 成功都不能替代这一条件。`DiagnosticReplayScope` 保留历史生产者与本次工具身份，只产生隔离诊断资格，不能晋升为正式下游输入。
+完整初始运行要求七个正式阶段按序完成；MJCF 后继只要求本次 MJCF/Publish 完成并重验原始 Verify 前缀。全部相关 effect 必须已满足，复用阶段不生成本次 decision。诊断阶段通过、文件完整、服务健康或 task 成功都不能替代这一条件。`DiagnosticReplayScope` 保留历史生产者与本次工具身份，只产生隔离诊断资格，不能晋升为正式下游输入。
 
 ## 外部副作用与恢复
 
@@ -163,4 +167,12 @@ CAD 排他来自实际资源所有权，不来自 Airflow 并发数字。只能�
 
 旧 Store、文件 checkpoint writer、job/rerun/cache HTTP 和另一套发布链不属于最终生产接口。保全必要业务事实和失败原件，不能恢复旧入口作为 fallback。同版业务数据向空目标恢复并核验身份，具体规程见[灾难恢复](contracts.md#灾难恢复)。
 
-最终候选须交付目录职责、附搜索证据的实际删除清单、新增复杂性理由，以及绑定固定源码的默认工厂六阶段、失败/取消/UNKNOWN、跨进程恢复和真实 Airflow 验证。发行再遵循[开发与发行链路](deployment.md#开发与发行链路)：固定 PR 独立审查、必需 CI、唯一发布执行者亲审并合并固定 head、干净 main 构建、同版双端部署及真实工程端到端验收。局部或离线通过不代替后续资格。
+最终候选须交付目录职责、附搜索证据的实际删除清单、新增复杂性理由，以及绑定固定源码的默认工厂七阶段、失败/取消/UNKNOWN、跨进程恢复和真实 Airflow 验证。发行再遵循[开发与发行链路](deployment.md#开发与发行链路)：固定 PR 独立审查、必需 CI、唯一发布执行者亲审并合并固定 head、干净 main 构建、同版双端部署及真实工程端到端验收。局部或离线通过不代替后续资格。
+
+## MJCF 派生与共同执行范围
+
+MJCF 后继固定直接引用原始完整运行的 Generate/Capture/Verify 闭包，保留来源字节、用途、所有者、规则与平台身份；不追踪多跳后继链。接纳、claim、candidate 提交和 Publish 各自重验来源及 effect 结算。碰撞代理和仿真参数是带来源 warning 的派生策略，不回写 URDF，不建立第二规范化机器人模型。
+
+`execution_stage_ids` 从不可变 `from_stage` 推导范围；共同查询给出 `execution_scope`，复用上游的 command/decision 为 null，真实来源位于 source/reuse。Portal 仅渲染。Airflow 保持七任务，MJCF 使用 `none_failed`，MJCF 后继的上游五任务 skipped；调度跳过不能代替 FactStore 前驱资格。
+
+执行中取消复用共同引擎及原 claim/fence，保全候选与原失败；已完成决定不改写，UNKNOWN/CONFLICT 先对账。具体锁序、通知及请求身份见[系统契约](contracts.md#受限-mjcf-后继与执行范围)，本层不维护另一套终态或执行范围。

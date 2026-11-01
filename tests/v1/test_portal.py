@@ -270,6 +270,7 @@ class MockAirflow:
                                         {"task_id": "capture", "state": "success"},
                                         {"task_id": "generate", "state": "success"},
                                         {"task_id": "verify", "state": "success"},
+                                        {"task_id": "mjcf", "state": "success"},
                                         {"task_id": "publish", "state": "success"},
                                     ],
                                 ),
@@ -710,6 +711,16 @@ class ProjectionArtifactStore:
             target.write_bytes(data)
         return root
 
+    def read_metadata_member(self, artifact, member, *, max_bytes):
+        files = self.objects.get(artifact.artifact_id)
+        if files is None or member not in files:
+            raise PipelineError("Projected member is unavailable")
+        content = files[member]
+        if len(content) > max_bytes:
+            raise PipelineError("Projected member exceeds its size limit")
+        return content, {"path": member, "bytes": len(content),
+                         "sha256": hashlib.sha256(content).hexdigest()}, {}
+
 
 class FakeRunControl:
     """The portal-side admission surface: open by default, recording every admit."""
@@ -776,7 +787,7 @@ class FakeRunControl:
             (
                 index
                 for index, name in enumerate(
-                    ("freeze", "discover", "capture", "generate", "verify", "publish")
+                    ("freeze", "discover", "capture", "generate", "verify", "mjcf", "publish")
                 )
                 if event_states.get(name) == "failed"
             ),
@@ -787,7 +798,7 @@ class FakeRunControl:
         members: dict[str, dict] = {}
         generate_receipt = None
         generate_receipt_bytes = None
-        stage_order = ("freeze", "discover", "capture", "generate", "verify", "publish")
+        stage_order = ("freeze", "discover", "capture", "generate", "verify", "mjcf", "publish")
         for stage_index, stage in enumerate(stage_order):
             selected = {
                 path: bytes(current.get(path, b""))
@@ -1611,7 +1622,7 @@ class PortalTests(unittest.TestCase):
         conf = DispatchConf(
             schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
             run_id=request.run_id,
-            freeze_command_id="freeze:" + digest(request.run_id),
+            entry_command_id="freeze:" + digest(request.run_id),
         )
         outcome = SimpleNamespace(
             admission=SimpleNamespace(
@@ -1645,7 +1656,7 @@ class PortalTests(unittest.TestCase):
         conf = DispatchConf(
             schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
             run_id=request.run_id,
-            freeze_command_id="freeze:" + digest(request.run_id),
+            entry_command_id="freeze:" + digest(request.run_id),
         )
         outcome = SimpleNamespace(
             admission=SimpleNamespace(
@@ -1666,7 +1677,7 @@ class PortalTests(unittest.TestCase):
         conf = DispatchConf(
             schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
             run_id=RUN_ID,
-            freeze_command_id="freeze:" + digest(RUN_ID),
+            entry_command_id="freeze:" + digest(RUN_ID),
         )
         adapter = AirflowDispatchAdapter(
             AirflowApi(self.airflow.url),
@@ -1683,7 +1694,7 @@ class PortalTests(unittest.TestCase):
 
         self.airflow.dag_runs[DAG_RUN_ID]["conf"] = {
             **conf.to_record(),
-            "freeze_command_id": "freeze:another-command",
+            "entry_command_id": "freeze:another-command",
         }
         with self.assertRaisesRegex(
             AirflowApiError,
@@ -2363,9 +2374,9 @@ class PortalTests(unittest.TestCase):
         expected_conf = {
             "schema_version": AIRFLOW_DISPATCH_CONF_SCHEMA,
             "run_id": native_run_id(dag_run_id),
-            "freeze_command_id": next(
+            "entry_command_id": next(
                 iter(self.production_application.dispatch_records.values())
-            )[1].freeze_command_id,
+            )[1].entry_command_id,
         }
         self.assertEqual(self.airflow.conf, expected_conf)
         self.assertEqual(
@@ -2455,8 +2466,8 @@ class PortalTests(unittest.TestCase):
             iter(self.production_application.dispatch_records.values())
         )[1]
         self.assertEqual(
-            self.airflow.trigger_payloads[0]["conf"]["freeze_command_id"],
-            recorded_conf.freeze_command_id,
+            self.airflow.trigger_payloads[0]["conf"]["entry_command_id"],
+            recorded_conf.entry_command_id,
         )
 
     def test_production_admission_reuses_one_idempotent_dispatch(self) -> None:
@@ -2483,7 +2494,7 @@ class PortalTests(unittest.TestCase):
                         DispatchConf(
                             schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
                             run_id=command.run_id,
-                            freeze_command_id="freeze:" + command.run_id,
+                            entry_command_id="freeze:" + command.run_id,
                         ),
                     )
                     self.dispatched.add(command_id)
@@ -3179,7 +3190,7 @@ class PortalTests(unittest.TestCase):
         payload = json.loads(body)
         self.assertEqual(payload["automatic"]["state"], "passed")
         self.assertEqual(payload["report"]["schema_version"], "solidworks-to-urdf.report/v1")
-        self.assertEqual(payload["report"]["overall"]["state"], "passed")
+        self.assertEqual(payload["report"]["overall"]["state"], "waiting")
         coverage = payload["coverage"]
         self.assertEqual(coverage["engineering"]["state"], "external_review")
         self.assertEqual(coverage["engineering"]["tracking"], "external")
@@ -3187,13 +3198,13 @@ class PortalTests(unittest.TestCase):
         self.assertTrue(
             all("scope" in item and "automatic_exclusion" in item for item in coverage["engineering"]["items"])
         )
-        self.assertEqual(coverage["automatic"]["state"], "passed")
+        self.assertEqual(coverage["automatic"]["state"], "waiting")
         self.assertEqual(coverage["structure"]["hardware_id"], "m3.0")
         self.assertTrue(any("Interference and clearance" in text for text in coverage["automatic"]["unsupported"]))
         self.assertEqual(payload["pr"]["url"], "https://github.com/example/m3.0/pull/1")
         self.assertEqual(
             [task["task_id"] for task in payload["tasks"]],
-            ["freeze", "discover", "capture", "generate", "verify", "publish"],
+            ["freeze", "discover", "capture", "generate", "verify", "mjcf", "publish"],
         )
         self.assertEqual(payload["job"]["status"], "passed")
 
@@ -3708,7 +3719,7 @@ class PortalTests(unittest.TestCase):
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
         self.assertEqual(status, 200, body)
         stages = json.loads(body)["report"]["stages"]
-        self.assertEqual(len(stages), 6)
+        self.assertEqual(len(stages), 7)
         code = observations[0]["code"]
         for stage in stages:
             native = [row for row in stage.get("warnings", []) if row["code"] == code]
@@ -3940,7 +3951,7 @@ class PortalTests(unittest.TestCase):
             all(row["state"] == "passed" for row in stages["discover"]["input_qc"] + stages["discover"]["output_qc"])
         )
         self.assertEqual(stages["capture"]["state"], "failed")
-        for downstream in ("generate", "verify", "publish"):
+        for downstream in ("generate", "verify", "mjcf", "publish"):
             with self.subTest(stage=downstream):
                 self.assertEqual(stages[downstream]["state"], "blocked")
 
@@ -3952,7 +3963,7 @@ class PortalTests(unittest.TestCase):
             {"passed": 1, "executed": 1, "total": 1},
         )
         self.assertEqual(report_stages["capture"]["state"], "failed")
-        for downstream in ("generate", "verify", "publish"):
+        for downstream in ("generate", "verify", "mjcf", "publish"):
             with self.subTest(report_stage=downstream):
                 self.assertEqual(report_stages[downstream]["state"], "blocked")
         self.assertEqual(report["failure"]["stage"], "capture")
@@ -4009,6 +4020,7 @@ class PortalTests(unittest.TestCase):
                 "capture": "waiting",
                 "generate": "blocked",
                 "verify": "blocked",
+                "mjcf": "blocked",
                 "publish": "blocked",
             },
         )
@@ -4270,6 +4282,7 @@ class PortalTests(unittest.TestCase):
                 return_value=(
                     lambda _request: None,
                     lambda _request: None,
+                    lambda _request: None,
                     object(),
                     object(),
                     None,
@@ -4464,7 +4477,7 @@ class PortalTests(unittest.TestCase):
                         "id": "solidworks_to_urdf",
                         "path": "/srv/description/dags/solidworks_to_urdf.py",
                         "digest": digest({"dag": "fixture"}),
-                        "tasks": 6,
+                        "tasks": 7,
                     },
                     "ends": {
                         "linux": {
@@ -4559,6 +4572,14 @@ class PortalTests(unittest.TestCase):
                 )
                 self.assertEqual(status, 400, body)
                 self.assertIn("start from Freeze", json.loads(body)["error"])
+        status, _, body = self.client.request(
+            "POST",
+            f"/api/runs/{DAG_RUN_ID}/attempts",
+            {"stage": "mjcf"},
+        )
+        self.assertEqual(status, 409, body)
+        self.assertEqual(json.loads(body)["reason"], "verified_source_unavailable")
+        self.assertEqual(json.loads(body)["earliest_required"], "freeze")
         self.assertEqual(self.airflow.trigger_payloads, [])
         self.assertEqual(self.platform.admits, [])
         self.assertEqual(
@@ -4617,7 +4638,7 @@ class PortalTests(unittest.TestCase):
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
         self.assertEqual(status, 200, body)
         rows = json.loads(body)["stage_reruns"]
-        self.assertEqual([row["stage"] for row in rows], ["freeze"])
+        self.assertEqual([row["stage"] for row in rows], ["freeze", "mjcf"])
         self.assertTrue(rows[0]["eligible"])
         self.assertEqual(
             rows[0]["main_assembly_options"],

@@ -345,8 +345,8 @@ class ReportViewTests(unittest.TestCase):
         report = build_report(passed_job())
         self.assertEqual(report["schema_version"], "solidworks-to-urdf.report/v1")
         self.assertEqual(report["overall"]["state"], "passed")
-        self.assertEqual(report["overall"]["stages_completed"], 6)
-        self.assertEqual(report["overall"]["stages_total"], 6)
+        self.assertEqual(report["overall"]["stages_completed"], 7)
+        self.assertEqual(report["overall"]["stages_total"], 7)
         self.assertIsNone(report["failure"])
         stages = {stage["id"]: stage for stage in report["stages"]}
         self.assertEqual(stages["discover"]["name"], "Discover structure")

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from airflow import DAG
-from airflow.sdk.exceptions import AirflowFailException, TaskDeferred
+from airflow.sdk.exceptions import AirflowFailException, AirflowSkipException, TaskDeferred
 
 from description_pipeline.io import digest
 from description_pipeline.orchestration import airflow_stage_operator
@@ -124,6 +124,7 @@ class StageTaskOperatorTests(unittest.TestCase):
     def test_execute_binds_all_four_real_task_fields_and_returns_result(self) -> None:
         operator = _operator()
         application = Mock()
+        application.execution_scope.return_value = ("capture",)
         application.run_stage.return_value = _result()
         factory = Mock(return_value=application)
 
@@ -135,6 +136,7 @@ class StageTaskOperatorTests(unittest.TestCase):
             output = operator.execute(_context(map_index=3))
 
         binding = factory.call_args.args[0]
+        self.assertEqual(RUN_ID, factory.call_args.args[1])
         self.assertEqual(binding.dag_id, DAG_ID)
         self.assertEqual(binding.dag_run_id, DAG_RUN_ID)
         self.assertEqual(binding.task_id, "capture")
@@ -177,6 +179,7 @@ class StageTaskOperatorTests(unittest.TestCase):
             defer_timeout=90,
         )
         application = Mock()
+        application.execution_scope.return_value = ("capture",)
         application.run_stage.return_value = StagePending(wait)
 
         with patch.object(
@@ -247,6 +250,16 @@ class StageTaskOperatorTests(unittest.TestCase):
         )
         application.resume_stage.assert_called_once_with(wait, wakeup=None)
         self.assertEqual(output["result_digest"], _result().digest)
+
+    def test_reused_stage_is_skipped_without_executing_its_handler(self):
+        application = Mock()
+        application.execution_scope.return_value = ("mjcf", "publish")
+        with (
+            patch.object(airflow_stage_operator, "_application_from_binding", return_value=application),
+            self.assertRaises(AirflowSkipException),
+        ):
+            _operator().execute(_context())
+        application.run_stage.assert_not_called()
 
     def test_still_pending_resume_keeps_the_same_wait(self) -> None:
         wait = _wait()

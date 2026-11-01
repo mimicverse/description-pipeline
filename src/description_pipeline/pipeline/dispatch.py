@@ -1,4 +1,4 @@
-"""Technical Airflow dispatch without a seventh business stage."""
+"""Technical Airflow dispatch outside the engineering stages."""
 
 from __future__ import annotations
 
@@ -87,7 +87,7 @@ class TechnicalDispatchService:
     def dispatch(self, command_id: str, *, retry_absent: bool = False) -> DispatchResult:
         command = self.facts.load_dispatch_command(command_id)
         conf = self.artifacts.read_dispatch_conf(command.conf_artifact)
-        if conf.run_id != command.run_id or conf.freeze_command_id != command.freeze_command_id:
+        if conf.run_id != command.run_id or conf.entry_command_id != command.entry_command_id:
             raise ProtocolError("dispatch.conf_mismatch", {"command_id": command_id})
         settlement = self.facts.effect_settlement_for_key(command.command_id, command.effect_key)
         if settlement is None:

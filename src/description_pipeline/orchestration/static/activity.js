@@ -259,16 +259,3 @@ export function activityView(activity, { runState = "", waitingMessage = "", now
     note: runState === "running" ? "The run is active but no detailed progress is available (no live activity was reported)." : "No detailed progress is available.",
   };
 }
-
-// Where the card belongs on the stage pane: only the running stage shows live activity for
-// itself ("live"), anything else degrades to an explicit note ("note") or hides ("hidden").
-export function activityPlacement(view, { stageId = "", stageRunning = false, stageFailed = false } = {}) {
-  if (!view || view.visible !== true) return "hidden";
-  if (view.final === true) {
-    return stageFailed && (!view.stage || view.stage === stageId) ? "final" : "hidden";
-  }
-  if (!stageRunning) return "hidden";
-  if (view.state === "waiting" && (!view.stage || view.stage === stageId)) return "live";
-  if (view.state === "busy" && view.stage && stageId && view.stage === stageId) return "live";
-  return "note";
-}

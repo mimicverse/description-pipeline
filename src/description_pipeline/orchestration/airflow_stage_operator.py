@@ -7,7 +7,7 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 from airflow.models import BaseOperator
-from airflow.sdk.exceptions import AirflowFailException
+from airflow.sdk.exceptions import AirflowFailException, AirflowSkipException
 
 from ..pipeline.application import (
     AirflowTaskBinding,
@@ -72,9 +72,9 @@ def _binding_from_context(
     return binding, run_id
 
 
-def _application_from_binding(binding: AirflowTaskBinding) -> StageApplication:
+def _application_from_binding(binding: AirflowTaskBinding, run_id: str) -> StageApplication:
     try:
-        return application_from_environment(airflow_task_binding=binding)
+        return application_from_environment(airflow_task_binding=binding, run_id=run_id)
     except ApplicationError as error:
         raise AirflowFailException(f"{error.code}: {error}") from error
 
@@ -136,8 +136,10 @@ class StageTaskOperator(BaseOperator):
             expected_dag_id=self.dag_id,
             context=context,
         )
-        application = _application_from_binding(binding)
+        application = _application_from_binding(binding, run_id)
         try:
+            if self.stage not in application.execution_scope(run_id):
+                raise AirflowSkipException("The stage reuses its original source and is outside this execution")
             result = application.run_stage(run_id, self.stage)
         except ApplicationError as error:
             raise AirflowFailException(
@@ -180,7 +182,7 @@ class StageTaskOperator(BaseOperator):
             raise AirflowFailException(
                 "The effect event names another run or stage"
             )
-        application = _application_from_binding(binding)
+        application = _application_from_binding(binding, run_id)
         try:
             result = application.resume_stage(expected, wakeup=None)
         except ApplicationError as error:

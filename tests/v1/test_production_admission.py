@@ -117,7 +117,7 @@ def _admission_outcome(artifacts: ArtifactStore, spec: AdmissionSpec) -> Admissi
     conf = DispatchConf(
         schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
         run_id=spec.run_id,
-        freeze_command_id=freeze.command_id,
+        entry_command_id=freeze.command_id,
     )
     conf_artifact = artifacts.seal_dispatch_conf(
         conf,
@@ -130,12 +130,12 @@ def _admission_outcome(artifacts: ArtifactStore, spec: AdmissionSpec) -> Admissi
                 "admission_sha256": spec.admission_sha256,
                 "dag_id": "solidworks_to_urdf",
                 "dag_run_id": spec.request_id,
-                "freeze_command_id": freeze.command_id,
+                "entry_command_id": freeze.command_id,
                 "run_id": spec.run_id,
             }
         ),
         run_id=spec.run_id,
-        freeze_command_id=freeze.command_id,
+        entry_command_id=freeze.command_id,
         idempotency_key=f"{spec.run_id}/dispatch",
         dag_id="solidworks_to_urdf",
         dag_run_id=spec.request_id,
@@ -144,7 +144,7 @@ def _admission_outcome(artifacts: ArtifactStore, spec: AdmissionSpec) -> Admissi
     )
     return AdmissionOutcome(
         admission=admission,
-        freeze_command=freeze,
+        entry_command=freeze,
         dispatch_command=dispatch,
     )
 
@@ -340,7 +340,7 @@ class ProductionAdmissionTests(unittest.TestCase):
                 "id": "solidworks_to_urdf",
                 "path": "/srv/description/dags/solidworks_to_urdf.py",
                 "digest": digest({"dag": "fixture"}),
-                "tasks": 6,
+                "tasks": 7,
             },
             "ends": {
                 "linux": {
@@ -964,7 +964,7 @@ class ProductionAdmissionTests(unittest.TestCase):
             portable_tool_provider=lambda: self.portable_tool,
         )
         freeze_result = application.execute_registered_command(
-            parent.freeze_command.command_id
+            parent.entry_command.command_id
         )
         self.assertEqual(
             freeze_result.outcome,
@@ -1212,9 +1212,9 @@ class ProductionAdmissionTests(unittest.TestCase):
             prepared.run_admission.request["native_target_identity"],
             self.native_target.to_record(),
         )
-        freeze_command = build_freeze_command(spec)
+        entry_command = build_freeze_command(spec)
         self.assertEqual(
-            freeze_command.request["native_target_identity"],
+            entry_command.request["native_target_identity"],
             self.native_target.to_record(),
         )
         self.assertEqual(spec.originals.inventory, describe_handoff(self.upload / "CAD")["files"])
@@ -1921,7 +1921,7 @@ class ProductionAdmissionTests(unittest.TestCase):
             )
         self.assertEqual(len(calls), 1)
         self.assertEqual(result.admission.run_id, self.request.run_id)
-        self.assertEqual(result.freeze_command.stage, "freeze")
+        self.assertEqual(result.entry_command.stage, "freeze")
 
     def test_mismatched_application_outcome_is_rejected_after_one_atomic_call(self) -> None:
         work = self.root / "work"
@@ -1937,10 +1937,10 @@ class ProductionAdmissionTests(unittest.TestCase):
                 nonlocal calls
                 calls += 1
                 outcome = _admission_outcome(artifacts, spec)
-                original = outcome.freeze_command
+                original = outcome.entry_command
                 return replace(
                     outcome,
-                    freeze_command=StageCommand.create(
+                    entry_command=StageCommand.create(
                         command_id="freeze:different",
                         run_id=original.run_id,
                         stage="freeze",

@@ -497,7 +497,7 @@ class CaptureHandlerTests(unittest.TestCase):
             "platform_config_sha256": self.stage_fixture.platform_config_sha256,
             "native_target_identity": CAPTURE_TARGET.to_record(),
         }
-        freeze_command = StageCommand.create(
+        entry_command = StageCommand.create(
             command_id="freeze-command",
             run_id=PARENT,
             stage="freeze",
@@ -510,16 +510,16 @@ class CaptureHandlerTests(unittest.TestCase):
             expected_executor_sha256=digest({"executor": "freeze"}),
             predecessor_decision_id=None,
         )
-        freeze_claim = self._claim(freeze_command, "claim-freeze", fence=1)
+        freeze_claim = self._claim(entry_command, "claim-freeze", fence=1)
         freeze_workspace = self._materialized_workspace(
             self.root / "freeze-workspace",
             (self.source_ref, self.ruleset_ref, self.configuration_ref),
         )
         freeze_execution = FreezeHandler().execute(
-            freeze_command,
+            entry_command,
             freeze_claim,
             freeze_workspace,
-            effects=self.effects(freeze_command, freeze_claim),
+            effects=self.effects(entry_command, freeze_claim),
         )
         self.assertEqual(freeze_execution.outcome, "completed")
         self.freeze_ref = self.store.seal_tree(
@@ -527,7 +527,7 @@ class CaptureHandlerTests(unittest.TestCase):
             kind=FREEZE_RESULT_KIND,
             producer_run_id=PARENT,
             producer_stage="freeze",
-            producer_tool_sha256=freeze_command.expected_executor_sha256,
+            producer_tool_sha256=entry_command.expected_executor_sha256,
         )
 
         discover_request = self.stage_fixture.request(

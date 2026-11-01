@@ -44,6 +44,7 @@ from description_pipeline.pipeline.admission import (
     build_freeze_command,
     build_generate_command,
     build_publish_command,
+    build_mjcf_command,
     build_run_admission,
     build_verify_command,
 )
@@ -381,12 +382,12 @@ class _AncestorConflictTransferHandler:
         facts: FactStore,
         *,
         freeze_effect_id: str,
-        freeze_command_id: str,
+        entry_command_id: str,
         observed_at,
     ) -> None:
         self.facts = facts
         self.freeze_effect_id = freeze_effect_id
-        self.freeze_command_id = freeze_command_id
+        self.entry_command_id = entry_command_id
         self.observed_at = observed_at
         self.conflict_fact_id = "ancestor-conflict-" + freeze_effect_id
         self.external_sends = 0
@@ -405,7 +406,7 @@ class _AncestorConflictTransferHandler:
             payload_digest=digest({"conflict": self.freeze_effect_id}),
             observed_at=self.observed_at,
             fact_id=self.conflict_fact_id,
-            expected_command_id=self.freeze_command_id,
+            expected_command_id=self.entry_command_id,
         )
         effects.authorize_resume(
             resume.effect_id,
@@ -586,7 +587,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         self.dispatch_conf = DispatchConf(
             schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
             run_id=self.admission.run_id,
-            freeze_command_id=self.command.command_id,
+            entry_command_id=self.command.command_id,
         )
         self.conf_artifact = self.artifacts.seal_dispatch_conf(
             self.dispatch_conf,
@@ -596,14 +597,14 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         self.dispatch_command = DispatchCommand.create(
             command_id="command-dispatch",
             run_id=self.admission.run_id,
-            freeze_command_id=self.command.command_id,
+            entry_command_id=self.command.command_id,
             idempotency_key="run-1/dispatch",
             dag_id="solidworks_to_urdf",
             dag_run_id="portal-run-1",
             conf_artifact=self.conf_artifact,
             expected_executor_sha256=self.dispatch_executor,
         )
-        self.freeze_command, self.dispatch_command, self.dispatch_effect = self.facts.admit_run(
+        self.entry_command, self.dispatch_command, self.dispatch_effect = self.facts.admit_run(
             self.admission,
             self.command,
             self.dispatch_command,
@@ -681,7 +682,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         conf = DispatchConf(
             schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
             run_id=admission.run_id,
-            freeze_command_id=conf_freeze_id or command.command_id,
+            entry_command_id=conf_freeze_id or command.command_id,
         )
         artifact = self.artifacts.seal_dispatch_conf(
             conf,
@@ -691,7 +692,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         dispatch = DispatchCommand.create(
             command_id=f"command-dispatch-{admission.run_id}",
             run_id=admission.run_id,
-            freeze_command_id=command.command_id,
+            entry_command_id=command.command_id,
             idempotency_key=f"{admission.run_id}/dispatch",
             dag_id="solidworks_to_urdf",
             dag_run_id=f"portal-{admission.run_id}",
@@ -1069,7 +1070,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
             self.assertEqual(binding.run_id, self.admission.run_id)
             self.assertEqual(binding.dag_run_id, self.dispatch_command.dag_run_id)
             self.assertEqual(
-                binding.freeze_command_id,
+                binding.entry_command_id,
                 self.command.command_id,
             )
             self.assertTrue(owner_create_allowed(owner, "solidworks_to_urdf"))
@@ -1092,7 +1093,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         child_conf = DispatchConf(
             schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
             run_id=child_admission.run_id,
-            freeze_command_id=child_command.command_id,
+            entry_command_id=child_command.command_id,
         )
         self.facts.admit_run(
             child_admission,
@@ -1190,13 +1191,13 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
 
     def test_discover_is_rebuilt_from_the_registered_freeze_fact_before_insert(self) -> None:
         self._execute(_EffectHandler())
-        freeze_command = self.facts.load_command(self.command.command_id)
-        freeze_decision = self.facts.decision_for(freeze_command)
+        entry_command = self.facts.load_command(self.command.command_id)
+        freeze_decision = self.facts.decision_for(entry_command)
         self.assertIsNotNone(freeze_decision)
         freeze_result = self.facts.load_result(freeze_decision)
         predecessor = VerifiedPredecessor(
             stage="freeze",
-            command=freeze_command,
+            command=entry_command,
             result=freeze_result,
             decision=freeze_decision,
         )
@@ -1368,7 +1369,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         handler = _AncestorConflictTransferHandler(
             self.facts,
             freeze_effect_id=freeze_effect_id,
-            freeze_command_id=self.command.command_id,
+            entry_command_id=self.command.command_id,
             observed_at=self.now + timedelta(seconds=1),
         )
 
@@ -1692,7 +1693,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
             [(1,)],
         )
 
-    def test_store_persists_the_six_supported_projection_stages_in_order(self) -> None:
+    def test_store_persists_seven_stages_and_admits_one_direct_mjcf_rerun(self) -> None:
         self._execute(_EffectHandler())
         freeze = self._predecessor_for(self.command)
 
@@ -1838,15 +1839,23 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         )
 
         publish_intent = self.admission_harness.spec.publish_intent
+        mjcf_command = build_mjcf_command(self.admission_harness.spec, verify_result)
+        self.facts.create_command(
+            mjcf_command, admission=self.admission, predecessor=verify, verify_result=verify_result,
+        )
+        mjcf = self.admission_harness.predecessor("mjcf", mjcf_command, {"stage": "mjcf"})
+        self._persist_predecessor_decision(mjcf)
         publish_command = build_publish_command(
             self.admission_harness.spec,
             verify_result,
             publish_intent,
+            mjcf,
         )
         self.facts.create_command(
             publish_command,
             admission=self.admission,
-            predecessor=verify,
+            predecessor=mjcf,
+            supporting_predecessors=(verify,),
             verify_result=verify_result,
             publish_intent=publish_intent,
         )
@@ -1858,7 +1867,8 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
             self.facts.create_command(
                 forged_publish,
                 admission=self.admission,
-                predecessor=verify,
+                predecessor=mjcf,
+                supporting_predecessors=(verify,),
                 verify_result=verify_result,
                 publish_intent=publish_intent,
             )
@@ -1868,7 +1878,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         )
         self.assertEqual(
             [row[0] for row in rows],
-            ["capture", "discover", "freeze", "generate", "publish", "verify"],
+            ["capture", "discover", "freeze", "generate", "mjcf", "publish", "verify"],
         )
         self.assertEqual(
             self.facts.load_command(verify_command.command_id),
@@ -1878,6 +1888,106 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
             self.facts.load_command(publish_command.command_id),
             publish_command,
         )
+        self._assert_direct_mjcf_rerun(verify_result, publish_command)
+
+    def _assert_direct_mjcf_rerun(self, verify_result, publish_command):
+        source = self.admission_harness.spec
+        successor = replace(source, run_id="mjcf-rerun", request_id="mjcf-rerun-request",
+                            parent_run_id=source.run_id, from_stage="mjcf", simulation='{"base":"fixed"}')
+        admission = build_run_admission(successor)
+        command = build_mjcf_command(successor, verify_result)
+        conf = DispatchConf(schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
+                            run_id=successor.run_id, entry_command_id=command.command_id)
+        artifact = self.artifacts.seal_dispatch_conf(conf, producer_run_id=successor.run_id,
+                                                    producer_tool_sha256=successor.dispatch_executor_sha256)
+        dispatch = DispatchCommand.create(
+            command_id="mjcf-rerun-dispatch", run_id=successor.run_id, entry_command_id=command.command_id,
+            idempotency_key="mjcf-rerun/dispatch", dag_id="solidworks_to_urdf", dag_run_id=successor.request_id,
+            conf_artifact=artifact, expected_executor_sha256=successor.dispatch_executor_sha256,
+        )
+        def admit():
+            return self.facts.admit_run(admission, command, dispatch, artifact, verify_result=verify_result)
+        with self.assertRaisesRegex(FactStoreError, "settled terminal"):
+            admit()
+        services = CanonicalStageServices(
+            facts=self.facts, artifacts=self.artifacts, work_root=Path(self.directory.name) / "publish-failure",
+            claim_policy=ClaimPolicy(owner_sha256=self.owner, executor_sha256=publish_command.expected_executor_sha256,
+                                     lease=timedelta(minutes=5), claim_id_factory=lambda: "claim-" + uuid.uuid4().hex),
+            clock=lambda: self.now,
+        )
+        failure = execute_stage(command_id=publish_command.command_id, handler=_FailureHandler(), services=services)
+        self.assertEqual("failed", failure.outcome)
+        before = self._query("SELECT decision_id, result_digest FROM stage_decision WHERE run_id = %s ORDER BY stage",
+                             (source.run_id,))
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            admissions = list(pool.map(lambda _index: admit(), range(3)))
+        self.assertTrue(all(value[0] == command and value[1] == dispatch for value in admissions))
+        self.assertEqual([("mjcf",)], self._query("SELECT stage FROM command WHERE run_id = %s AND kind = 'stage'",
+                                                   (successor.run_id,)))
+        self.assertEqual([], self._query("SELECT stage FROM stage_decision WHERE run_id = %s", (successor.run_id,)))
+        self.assertEqual(before, self._query(
+            "SELECT decision_id, result_digest FROM stage_decision WHERE run_id = %s ORDER BY stage", (source.run_id,),
+        ))
+        self.assertEqual(command, self.facts.load_command(command.command_id))
+        self.assertEqual(source.run_id, command.input_artifacts[0].producer_run_id)
+        self._assert_reused_source_read_and_successor_lock_order(command, verify_result.predecessor.command)
+        facts = self.facts
+        facts.request_cancel(
+            target_command_id=command.command_id, cancel_executor_sha256=command.expected_executor_sha256,
+            reason_code="user_cancelled", reason="Cancel the isolated rerun before projection",
+            requested_by=successor.principal, requested_at=self.now,
+        )
+        cancelled_services = CanonicalStageServices(
+            facts=facts, artifacts=self.artifacts, work_root=Path(self.directory.name) / "cancelled-rerun",
+            claim_policy=ClaimPolicy(owner_sha256=self.owner, executor_sha256=command.expected_executor_sha256,
+                                     lease=timedelta(minutes=5), claim_id_factory=lambda: "claim-" + uuid.uuid4().hex),
+            clock=lambda: self.now,
+        )
+        cancelled = execute_stage(command_id=command.command_id, handler=_FailureHandler(), services=cancelled_services)
+        self.assertEqual("cancelled", cancelled.outcome)
+        self.assertEqual("cancelled", self.facts.get_admitted_run(successor.run_id).state)
+        self.assertEqual(before, self._query(
+            "SELECT decision_id, result_digest FROM stage_decision WHERE run_id = %s ORDER BY stage", (source.run_id,),
+        ))
+
+    def _assert_reused_source_read_and_successor_lock_order(self, successor, source):
+        source_held = threading.Event()
+        successor_attempting_source = threading.Event()
+        identities = {}
+        lock_run = self.facts._lock_run_cursor
+
+        def synchronized_run_lock(cursor, run_id):
+            identity = threading.get_ident()
+            if identity == identities.get("writer") and run_id == source.run_id:
+                successor_attempting_source.set()
+            lock_run(cursor, run_id)
+            if identity == identities.get("reader") and run_id == source.run_id and not source_held.is_set():
+                source_held.set()
+                if not successor_attempting_source.wait(5):
+                    raise AssertionError("Successor did not request its source run lock")
+
+        def reader():
+            identities["reader"] = threading.get_ident()
+            return self.facts.decision_for(source)
+
+        def writer():
+            identities["writer"] = threading.get_ident()
+            if not source_held.wait(5):
+                raise AssertionError("Source reader did not acquire its run lock")
+            with self.facts._transaction() as connection:
+                cursor = connection.cursor()
+                cursor.execute("SET LOCAL lock_timeout = '5s'")
+                self.facts._lock_command_chain_cursor(cursor, successor)
+                self.facts._verify_completed_predecessor_chain_cursor(cursor, successor)
+
+        with (
+            mock.patch.object(self.facts, "_lock_run_cursor", side_effect=synchronized_run_lock),
+            ThreadPoolExecutor(max_workers=2) as pool,
+        ):
+            read = pool.submit(reader)
+            write = pool.submit(writer)
+            self.assertEqual("completed", read.result(timeout=12).outcome)
+            write.result(timeout=12)
 
     def test_technical_dispatch_uses_its_own_claim_and_creates_no_stage_decision(self) -> None:
         result = self.dispatch_service.dispatch(self.dispatch_command.command_id)
@@ -1985,11 +2095,11 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         self.assertEqual((reopened.state, reopened.revision), ("open", 3))
 
     def test_transport_identity_is_explicitly_bound_by_its_own_field(self) -> None:
-        admission, freeze_command = self._new_admission("same-transport")
+        admission, entry_command = self._new_admission("same-transport")
         conf = DispatchConf(
             schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
             run_id=admission.run_id,
-            freeze_command_id=freeze_command.command_id,
+            entry_command_id=entry_command.command_id,
         )
         artifact = self.artifacts.seal_dispatch_conf(
             conf,
@@ -1999,7 +2109,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         dispatch = DispatchCommand.create(
             command_id=f"dispatch-{admission.run_id}",
             run_id=admission.run_id,
-            freeze_command_id=freeze_command.command_id,
+            entry_command_id=entry_command.command_id,
             idempotency_key=f"{admission.run_id}/dispatch",
             dag_id="solidworks_to_urdf",
             dag_run_id=f"portal-{admission.run_id}",
@@ -2008,7 +2118,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         )
         stored_freeze, stored_dispatch, _intent = self.facts.admit_run(
             admission,
-            freeze_command,
+            entry_command,
             dispatch,
             artifact,
         )

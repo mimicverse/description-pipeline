@@ -198,6 +198,9 @@ class GeneratePublishDiagnosticPostgresTests(unittest.TestCase):
             services=self._services(command, source.executor),
         )
         self.assertEqual(counter.calls, {stage: int(stage == "generate") for stage in STAGE_IDS})
+        self.assertNotIsInstance(
+            result, FailureEnvelope, {"command": command.to_record(), "result": result.to_record()},
+        )
         self.assertEqual(result.diagnostic_scope, command.diagnostic_scope)
         self.assertEqual(result.output_artifact.producer_run_id, command.run_id)
         qualification = qualify_stage(
@@ -270,6 +273,9 @@ class GeneratePublishDiagnosticPostgresTests(unittest.TestCase):
             services=self._services(command, source.executor),
         )
         self.assertEqual(counter.calls, {stage: int(stage == "publish") for stage in STAGE_IDS})
+        self.assertNotIsInstance(
+            result, FailureEnvelope, {"command": command.to_record(), "result": result.to_record()},
+        )
         self.assertEqual(result.diagnostic_scope, command.diagnostic_scope)
         self.assertEqual(result.output_artifact.producer_run_id, command.run_id)
         output = self.artifacts.materialize(

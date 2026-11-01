@@ -1,4 +1,4 @@
-"""The single production application service for the six engineering stages."""
+"""The single production application service for the engineering stages."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ from ..orchestration.native_operation_client import (
 )
 from ..repository.publish import REPOSITORY_SNAPSHOT_METADATA
 from ..runtime import tool_record
-from ..stages import STAGE_IDS
+from ..stages import STAGE_IDS, execution_stage_ids
 from ..schemas import AIRFLOW_DISPATCH_CONF_SCHEMA
 from .admission import (
     AdmissionSpec,
@@ -45,6 +45,8 @@ from .admission import (
     build_discover_command,
     build_freeze_command,
     build_generate_command,
+    build_mjcf_command,
+    validate_mjcf_successor,
     build_publish_command,
     build_run_admission,
     build_verify_command,
@@ -81,6 +83,7 @@ from .reconciliation import (
     EffectReconciliationService,
 )
 from .stages.generate import GenerateHandler
+from .stages.mjcf import MJCFHandler
 from .stages.publish import PublishHandler
 from .verify import VerifyHandler
 from .verify_contract import CERTIFICATE_FILENAME
@@ -355,11 +358,14 @@ class AdmissionFactPort(Protocol):
         command: StageCommand,
         dispatch_command: DispatchCommand,
         dispatch_outbound_artifact: ArtifactRef,
+        *, verify_result: VerifiedVerifyResult | None = None,
     ) -> tuple[StageCommand, DispatchCommand, EffectIntent]: ...
 
     def load_command(self, command_id: str) -> StageCommand: ...
 
     def load_dispatch_command(self, command_id: str) -> DispatchCommand: ...
+
+    def get_admitted_run(self, run_id: str): ...
 
     def create_command(
         self,
@@ -435,12 +441,17 @@ def _default_builders() -> dict[StageId, CommandBuilder]:
             context.predecessor("generate"),
             context.predecessor("capture"),
         ),
+        "mjcf": lambda context: build_mjcf_command(
+            context.admission,
+            context.verify_result if context.verify_result is not None else _missing_verify_result(context.stage),
+        ),
         "publish": lambda context: build_publish_command(
             context.admission,
             context.verify_result
             if context.verify_result is not None
             else _missing_verify_result(context.stage),
             context.admission.publish_intent,
+            context.predecessor("mjcf"),
         ),
     }
 
@@ -482,11 +493,27 @@ class ApplicationOutcome:
 
 
 @dataclass(frozen=True, slots=True)
+class ReusedStage:
+    """A read-only source reference, never a new execution or stage decision."""
+
+    run_id: str
+    stage: StageId
+    source_run_id: str
+    source_command_id: str
+    source_result_digest: str
+
+    def to_record(self) -> dict:
+        return {"run_id": self.run_id, "stage": self.stage, "outcome": "reused",
+                "source_run_id": self.source_run_id, "source_command_id": self.source_command_id,
+                "source_result_digest": self.source_result_digest}
+
+
+@dataclass(frozen=True, slots=True)
 class AdmissionOutcome:
-    """The atomically registered run and its Freeze/dispatch commands."""
+    """The atomically registered run and its entry/dispatch commands."""
 
     admission: RunAdmission
-    freeze_command: StageCommand
+    entry_command: StageCommand
     dispatch_command: DispatchCommand
 
     def to_record(self) -> dict[str, Any]:
@@ -502,7 +529,7 @@ class AdmissionOutcome:
                 "schema_version": self.admission.schema_version,
             },
             "dispatch_command": self.dispatch_command.to_record(),
-            "freeze_command": self.freeze_command.to_record(),
+            "entry_command": self.entry_command.to_record(),
         }
 
 
@@ -739,7 +766,7 @@ class StageApplication:
             )
 
     def admit(self, spec: AdmissionSpec) -> AdmissionOutcome:
-        """Atomically register admission, Freeze and technical Airflow dispatch."""
+        """Atomically register admission, entry stage and technical Airflow dispatch."""
 
         if not isinstance(spec, AdmissionSpec):
             raise ApplicationError("application.admission_required", "AdmissionSpec is required")
@@ -754,7 +781,7 @@ class StageApplication:
                         "admission": admitted_target.to_record(),
                     },
                 )
-        if spec.from_stage not in {None, "freeze"}:
+        if spec.from_stage not in {None, "freeze", "mjcf"}:
             raise ApplicationError(
                 "application.linked_admission_builder_missing",
                 "The linked-run admission builder is not installed",
@@ -762,11 +789,12 @@ class StageApplication:
             )
         self._verify_admission_artifacts(spec)
         admission = build_run_admission(spec)
-        command = build_freeze_command(spec)
+        verify_result = self._mjcf_source_context(spec)[2] if spec.from_stage == "mjcf" else None
+        command = build_mjcf_command(spec, verify_result) if verify_result is not None else build_freeze_command(spec)
         conf = DispatchConf(
             schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
             run_id=spec.run_id,
-            freeze_command_id=command.command_id,
+            entry_command_id=command.command_id,
         )
         dispatch_executor_sha256 = spec.dispatch_executor_sha256
         conf_artifact = self.artifacts.seal_dispatch_conf(
@@ -779,11 +807,13 @@ class StageApplication:
             command,
             conf_artifact,
         )
+        admission_keywords = {"verify_result": verify_result} if verify_result is not None else {}
         stored_command, stored_dispatch, _intent = self.facts.admit_run(
             admission,
             command,
             dispatch_command,
             conf_artifact,
+            **admission_keywords,
         )
         if stored_command != command or stored_dispatch != dispatch_command:
             raise ApplicationError(
@@ -792,7 +822,7 @@ class StageApplication:
             )
         return AdmissionOutcome(
             admission=admission,
-            freeze_command=stored_command,
+            entry_command=stored_command,
             dispatch_command=stored_dispatch,
         )
 
@@ -805,7 +835,7 @@ class StageApplication:
             "admission_sha256": spec.admission_sha256,
             "dag_id": "solidworks_to_urdf",
             "dag_run_id": spec.request_id,
-            "freeze_command_id": command.command_id,
+            "entry_command_id": command.command_id,
             "run_id": spec.run_id,
         }
 
@@ -819,7 +849,7 @@ class StageApplication:
         return DispatchCommand.create(
             command_id="dispatch:" + digest(dispatch_identity),
             run_id=spec.run_id,
-            freeze_command_id=command.command_id,
+            entry_command_id=command.command_id,
             idempotency_key=f"{spec.run_id}/dispatch",
             dag_id="solidworks_to_urdf",
             dag_run_id=spec.request_id,
@@ -842,12 +872,13 @@ class StageApplication:
         spec = AdmissionSpec.from_record(request_record)
         validate_run_admission(spec, admission)
         self._verify_admission_artifacts(spec)
-        freeze_command = build_freeze_command(spec)
-        stored_freeze = self.facts.load_command(freeze_command.command_id)
-        if stored_freeze != freeze_command:
+        entry_command = (build_mjcf_command(spec, self._mjcf_source_context(spec)[2])
+                         if spec.from_stage == "mjcf" else build_freeze_command(spec))
+        stored_freeze = self.facts.load_command(entry_command.command_id)
+        if stored_freeze != entry_command:
             raise ApplicationError(
                 "application.admission_command_mismatch",
-                "Stored Freeze command differs from its deterministic admission projection",
+                "Stored entry command differs from its deterministic admission projection",
             )
         dispatch_identity = self._dispatch_identity(spec, stored_freeze)
         dispatch_command_id = "dispatch:" + digest(dispatch_identity)
@@ -865,15 +896,15 @@ class StageApplication:
         conf = self.artifacts.read_dispatch_conf(stored_dispatch.conf_artifact)
         if (
             conf.run_id != spec.run_id
-            or conf.freeze_command_id != stored_freeze.command_id
+            or conf.entry_command_id != stored_freeze.command_id
         ):
             raise ApplicationError(
                 "application.admission_command_mismatch",
-                "Stored dispatch conf names another run or Freeze command",
+                "Stored dispatch conf names another run or entry command",
             )
         return AdmissionOutcome(
             admission=admission,
-            freeze_command=stored_freeze,
+            entry_command=stored_freeze,
             dispatch_command=stored_dispatch,
         )
 
@@ -881,9 +912,9 @@ class StageApplication:
         """Read parent CAD originals only through one committed Freeze closure."""
 
         spec, admission = self._load_spec(run_id)
-        freeze_command = build_freeze_command(spec)
-        stored_command = self.facts.load_command(freeze_command.command_id)
-        if stored_command != freeze_command:
+        entry_command = build_freeze_command(spec)
+        stored_command = self.facts.load_command(entry_command.command_id)
+        if stored_command != entry_command:
             raise ApplicationError(
                 "application.freeze_origin_mismatch",
                 "Stored Freeze command differs from its admission projection",
@@ -1045,10 +1076,45 @@ class StageApplication:
             predecessor=previous,
             supporting_predecessors=supporting,
             discover_result=command_discover_result,
-            verify_result=verify_result if stage == "publish" else None,
+            verify_result=verify_result if stage in {"mjcf", "publish"} else None,
             publish_intent=spec.publish_intent if stage == "publish" else None,
         )
         return command
+
+    def _mjcf_source_context(self, spec: AdmissionSpec):
+        """Load completed source facts only; this path never executes upstream work."""
+        if spec.parent_run_id is None:
+            raise ApplicationError("application.mjcf_source_required", "MJCF rerun requires an original source run")
+        source, _admission = self._load_spec(spec.parent_run_id)
+        validate_mjcf_successor(spec, source)
+        summary = self.facts.get_admitted_run(source.run_id)
+        if summary is None or summary.state not in {"succeeded", "failed", "cancelled"}:
+            raise ApplicationError(
+                "application.mjcf_source_unsettled", "Source run must have a settled terminal outcome",
+            )
+        predecessors = {}
+        discovered = verified = None
+        for stage in STAGE_IDS[:STAGE_IDS.index("verify") + 1]:
+            expected = self._build_command(source, stage, predecessors, discovered, verified)
+            stored = self.facts.load_command(expected.command_id)
+            if stored != expected:
+                raise ApplicationError("application.mjcf_source_mismatch", "Source command differs from admission")
+            predecessor = self._completed_predecessor(stored)
+            if predecessor is None:
+                raise ApplicationError("application.mjcf_source_unverified", "Source upstream stage is not completed")
+            self.artifacts.verify(predecessor.result.output_artifact)
+            predecessors[stage] = predecessor
+            if stage == "discover":
+                discovered = self._verified_discover_result(predecessor)
+            elif stage == "verify":
+                verified = self._verified_verify_result(predecessor)
+        if verified is None:
+            raise ApplicationError("application.mjcf_source_unverified", "Source has no passing URDF certificate")
+        return predecessors, discovered, verified
+
+    def mjcf_source_result(self, spec: AdmissionSpec) -> VerifiedVerifyResult:
+        """Expose the checked source certificate to the admission boundary."""
+        return self._mjcf_source_context(spec)[2]
 
     @staticmethod
     def _command_predecessors(
@@ -1067,6 +1133,8 @@ class StageApplication:
             supporting = (predecessors["freeze"],)
         elif stage == "verify":
             supporting = (predecessors["capture"],)
+        elif stage == "publish":
+            supporting = (predecessors["verify"],)
         return previous, supporting, discover_result if stage == "capture" else None
 
     def _completed_predecessor(
@@ -1156,15 +1224,14 @@ class StageApplication:
         scope.validate_for(command.stage, command.input_artifacts)
         return self.execute_registered_command(command_id)
 
-    def run_stage(self, run_id: str, stage: StageId) -> StageAttemptResult:
+    def run_stage(self, run_id: str, stage: StageId) -> StageAttemptResult | ReusedStage:
         """Execute one admitted stage or return its canonical pending wait."""
 
         if stage not in STAGE_IDS:
             raise ApplicationError("application.stage_invalid", f"Unknown stage {stage!r}")
         self._validate_airflow_task_binding(run_id, stage)
         spec, admission = self._load_spec(run_id)
-        self._require_handler(stage)
-        if spec.from_stage not in {None, "freeze"}:
+        if spec.from_stage not in {None, "freeze", "mjcf"}:
             raise ApplicationError(
                 "application.linked_run_not_supported",
                 "This application composition has no linked-run predecessor builder",
@@ -1173,8 +1240,16 @@ class StageApplication:
         predecessors: dict[StageId, VerifiedPredecessor] = {}
         discover_result: VerifiedDiscoverResult | None = None
         verify_result: VerifiedVerifyResult | None = None
-        target_index = STAGE_IDS.index(stage)
-        for current_stage in STAGE_IDS[: target_index + 1]:
+        planned = execution_stage_ids(spec.from_stage)
+        if spec.from_stage == "mjcf":
+            predecessors, discover_result, verify_result = self._mjcf_source_context(spec)
+            if stage not in planned:
+                source = predecessors[stage]
+                return ReusedStage(
+                    run_id, stage, source.command.run_id, source.command.command_id, source.result.digest,
+                )
+        self._require_handler(stage)
+        for current_stage in planned[:planned.index(stage) + 1]:
             command = self._build_command(
                 spec,
                 current_stage,
@@ -1182,12 +1257,12 @@ class StageApplication:
                 discover_result,
                 verify_result,
             )
-            if current_stage == "freeze":
+            if current_stage == planned[0]:
                 stored = self.facts.load_command(command.command_id)
                 if stored != command:
                     raise ApplicationError(
                         "application.admission_command_mismatch",
-                        "Stored Freeze command differs from its deterministic admission projection",
+                        "Stored entry command differs from its deterministic admission projection",
                     )
             else:
                 previous, supporting, command_discover_result = self._command_predecessors(
@@ -1207,7 +1282,7 @@ class StageApplication:
                     predecessor=previous,
                     supporting_predecessors=supporting,
                     discover_result=command_discover_result,
-                    verify_result=verify_result if current_stage == "publish" else None,
+                    verify_result=verify_result if current_stage in {"mjcf", "publish"} else None,
                     publish_intent=spec.publish_intent if current_stage == "publish" else None,
                 )
                 if stored != command:
@@ -1334,6 +1409,15 @@ class StageApplication:
                 },
             )
 
+    def execution_scope(self, run_id: str) -> tuple[str, ...]:
+        """Read the admitted range without executing or rebuilding its source stages."""
+        policy = getattr(self.services, "claim_policy", None)
+        task_id = getattr(policy, "task_id", None)
+        if task_id is not None:
+            self._validate_airflow_task_binding(run_id, task_id)
+        spec, _admission = self._load_spec(run_id)
+        return execution_stage_ids(spec.from_stage)
+
     def execute_run(self, run_id: str, *, through: StageId = "publish") -> ApplicationOutcome:
         """Run stages one at a time from one admission; no downstream work is hidden in a handler."""
 
@@ -1341,7 +1425,10 @@ class StageApplication:
             raise ApplicationError("application.stage_invalid", f"Unknown stage {through!r}")
         last: StageAttemptResult | None = None
         completed_stage: StageId | None = None
-        for stage in STAGE_IDS[: STAGE_IDS.index(through) + 1]:
+        spec, _admission = self._load_spec(run_id)
+        if through not in execution_stage_ids(spec.from_stage):
+            raise ApplicationError("application.reused_stage", "Target stage belongs to the original source run")
+        for stage in execution_stage_ids(spec.from_stage, through=through):
             last = self.run_stage(run_id, stage)
             outcome, payload = _stage_attempt_record(last)
             if outcome != "completed":
@@ -1367,6 +1454,39 @@ class StageApplication:
         )
 
 
+def _runtime_stage_ids(facts, *, command_id, run_id, through, binding, admission_spec=None):
+    """Select capabilities from registered facts or an actual Airflow task binding."""
+    if command_id is not None and (run_id is not None or binding is not None):
+        raise ApplicationError("application.runtime_target_invalid", "Runtime targets are mutually exclusive")
+    if admission_spec is not None:
+        if not isinstance(admission_spec, AdmissionSpec):
+            raise ApplicationError("application.admission_required", "AdmissionSpec is required")
+        if command_id is not None or run_id is not None or binding is not None:
+            raise ApplicationError("application.runtime_target_invalid", "Runtime targets are mutually exclusive")
+        # Admission verifies the sealed source in StageApplication.admit; no handler executes here.
+        return ()
+    if command_id is not None:
+        command = facts.load_command(command_id)
+        if command.kind != "stage" or command.stage not in STAGE_IDS:
+            raise ApplicationError("application.command_not_stage", "Only registered stage commands can execute")
+        return (command.stage,)
+    selected = STAGE_IDS
+    if run_id is not None:
+        admission = facts.load_admission(run_id)
+        if admission is None:
+            raise ApplicationError("application.run_not_admitted", "The runtime run is not admitted")
+        spec = AdmissionSpec.from_record(admission.request)
+        validate_run_admission(spec, admission)
+        selected = execution_stage_ids(spec.from_stage, through=through)
+    if binding is not None:
+        if not isinstance(binding, AirflowTaskBinding) or binding.task_id not in STAGE_IDS:
+            raise ApplicationError(
+                "application.airflow_binding_invalid", "The runtime binding has no engineering stage",
+            )
+        return (binding.task_id,) if binding.task_id in selected else ()
+    return selected
+
+
 def application_from_environment(
     environ: Mapping[str, str] | None = None,
     *,
@@ -1380,18 +1500,21 @@ def application_from_environment(
     reconciliation_adapters: Mapping[str, EffectReconciliationAdapter] | None = None,
     cancellation_controllers: Mapping[str, CancellationControlPort] | None = None,
     airflow_task_binding: AirflowTaskBinding | None = None,
+    command_id: str | None = None,
+    run_id: str | None = None,
+    through: StageId = "publish",
+    admission_spec: AdmissionSpec | None = None,
     clock: Callable[[], datetime] = _utc_now,
 ) -> StageApplication:
     """Compose implemented handlers; missing runtime capabilities remain explicit."""
 
-    from .stages.publish import (
-        PublishGitReconciliationAdapter,
-        PublishPullRequestReconciliationAdapter,
-    )
-
     source = os.environ if environ is None else environ
     artifacts = ArtifactStore.from_environment(source)
     facts = FactStore.from_environment(source, result_reader=artifacts)
+    selected = _runtime_stage_ids(
+        facts, command_id=command_id, run_id=run_id, through=through, binding=airflow_task_binding,
+        admission_spec=admission_spec,
+    )
     work_root = source.get("PIPELINE_WORK_ROOT")
     if not work_root:
         raise ApplicationError("application.work_root_missing", "PIPELINE_WORK_ROOT is not configured")
@@ -1400,14 +1523,17 @@ def application_from_environment(
         native_target_identity
         if native_target_identity is not None
         else _registered_native_target_from_environment(source)
+        if (any(stage in selected for stage in ("freeze", "discover", "capture"))
+            or (admission_spec is not None and admission_spec.from_stage != "mjcf")) else None
     )
-    if not isinstance(registered_target, NativeTargetIdentity):
+    if registered_target is not None and not isinstance(registered_target, NativeTargetIdentity):
         raise ApplicationError(
             "application.native_target_invalid",
             "native_target_identity must be a NativeTargetIdentity",
         )
     if (
         native_operation_client is not None
+        and registered_target is not None
         and getattr(native_operation_client, "target_id", None)
         != registered_target.target_id
     ):
@@ -1453,7 +1579,7 @@ def application_from_environment(
         clock=clock,
         transfer_resume_gate=_transfer_resume_gate_from_environment(source),
     )
-    client = native_operation_client
+    client = native_operation_client if any(stage in selected for stage in ("discover", "capture")) else None
 
     def record_native_activity(run_id: str, view) -> None:
         if getattr(view, "activity", None) is not None:
@@ -1466,7 +1592,8 @@ def application_from_environment(
                     in {"satisfied", "failed", "cancelled", "unknown"},
                 )
 
-    if discover_adapter is None or capture_handler is None:
+    if (("discover" in selected and discover_adapter is None)
+            or ("capture" in selected and capture_handler is None)):
         client = (
             native_operation_client
             if native_operation_client is not None
@@ -1476,7 +1603,7 @@ def application_from_environment(
             )
         )
         tool_provider = NativeOperationToolProvider(client)
-        if discover_adapter is None:
+        if "discover" in selected and discover_adapter is None:
             discover_adapter = NativeRemoteDiscoverAdapter(
                 port=NativeOperationDiscoverPort(
                     client,
@@ -1486,7 +1613,7 @@ def application_from_environment(
                 ),
                 artifacts=artifacts,
             )
-        if capture_handler is None:
+        if "capture" in selected and capture_handler is None:
             capture_handler = capture_handler_from_native_operation(
                 client,
                 artifact_store=artifacts,
@@ -1499,17 +1626,18 @@ def application_from_environment(
             "native_operation",
             NativeOperationEffectObserver(client),
         )
-    adapters.setdefault("git_ref_update", PublishGitReconciliationAdapter())
-    from ..repository.publish import GitHubCliPullRequestClient
+    if "publish" in selected:
+        from .stages.publish import PublishGitReconciliationAdapter, PublishPullRequestReconciliationAdapter
 
-    pull_request_root = Path(work_root) / "publish-pr-observer"
-    pull_request_root.mkdir(parents=True, exist_ok=True)
-    adapters.setdefault(
-        "pr_upsert",
-        PublishPullRequestReconciliationAdapter(
-            GitHubCliPullRequestClient(pull_request_root)
-        ),
-    )
+        adapters.setdefault("git_ref_update", PublishGitReconciliationAdapter())
+        from ..repository.publish import GitHubCliPullRequestClient
+
+        pull_request_root = Path(work_root) / "publish-pr-observer"
+        pull_request_root.mkdir(parents=True, exist_ok=True)
+        adapters.setdefault(
+            "pr_upsert",
+            PublishPullRequestReconciliationAdapter(GitHubCliPullRequestClient(pull_request_root)),
+        )
     controllers = dict(cancellation_controllers or {})
     if client is not None:
         from .cancellation import CancellationControlService
@@ -1545,18 +1673,21 @@ def application_from_environment(
         if adapters
         else None
     )
-    installed: dict[StageId, StageHandler] = {
-        "freeze": FreezeHandler(),
-        "generate": GenerateHandler(artifacts),
-        "publish": PublishHandler(artifacts),
-        "verify": VerifyHandler(),
-    }
-    assert discover_adapter is not None
-    assert capture_handler is not None
-    installed["discover"] = DiscoverHandler(discover_adapter)
-    installed["capture"] = capture_handler
-    if publish_handler is not None:
-        installed["publish"] = publish_handler
+    installed: dict[StageId, StageHandler] = {}
+    constructors = {"freeze": FreezeHandler, "generate": lambda: GenerateHandler(artifacts),
+                    "publish": lambda: publish_handler if publish_handler is not None else PublishHandler(artifacts),
+                    "verify": VerifyHandler, "mjcf": lambda: MJCFHandler(artifacts)}
+    for stage in selected:
+        if stage == "discover":
+            if discover_adapter is None:
+                raise ApplicationPortMissing("application.discover_missing", "The native discovery port is required")
+            installed[stage] = DiscoverHandler(discover_adapter)
+        elif stage == "capture":
+            if capture_handler is None:
+                raise ApplicationPortMissing("application.capture_missing", "The native capture port is required")
+            installed[stage] = capture_handler
+        else:
+            installed[stage] = constructors[stage]()
     for stage, handler in (handlers or {}).items():
         if stage in installed and installed[stage] != handler:
             raise ApplicationError(

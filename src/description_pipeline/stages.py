@@ -1,6 +1,6 @@
 """One engineering-stage contract and its evidence-driven run view.
 
-Airflow coordinates native acquisition and Linux verification. These six stages
+Airflow coordinates native acquisition and Linux verification. These stages
 describe the engineering work; reading this view never executes that work.
 """
 
@@ -41,6 +41,17 @@ WINDOWS_STAGES = tuple(stage for stage, hosts in HOST_BY_STAGE.items() if "windo
 #: field so the set never depends on stage order (ORC-02).  Mixed Windows+Linux
 #: stages (discover, capture) are native-driven and stay out of this set.
 PORTABLE_STAGES = tuple(stage for stage, hosts in HOST_BY_STAGE.items() if hosts == ("linux",))
+
+
+def execution_stage_ids(from_stage: str | None = None, *, through: str = "publish") -> tuple[str, ...]:
+    """Derive the execution range from the immutable admission and stage contract."""
+    if from_stage not in {None, "freeze", "mjcf"} or through not in STAGE_IDS:
+        raise PipelineError("The admitted execution range is invalid")
+    start = STAGE_IDS.index(from_stage or "freeze")
+    end = STAGE_IDS.index(through)
+    if end < start:
+        raise PipelineError("The target stage precedes the admitted entry stage")
+    return STAGE_IDS[start:end + 1]
 
 
 def canonical_freeze_timestamp(value) -> str:

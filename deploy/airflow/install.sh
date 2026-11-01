@@ -31,7 +31,7 @@ AIRFLOW_DB_URL="$AIRFLOW_DB_URL" AIRFLOW_API_PORT="$AIRFLOW_API_PORT" "$AIRFLOW_
   --template "$HERE/airflow.cfg.template" --dags-folder "$HERE/dags"
 
 AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/airflow" db migrate
-# The native stage waits on this pool (six-stage contract / IF-02): create it
+# The native stage waits on this pool (seven-stage contract / IF-02): create it
 # idempotently so the first run cannot fail on a missing pool.
 AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/python" "$HERE/scripts/ensure_pool.py"
 # The sign-in state table is created inside this migration window by the one canonical owner

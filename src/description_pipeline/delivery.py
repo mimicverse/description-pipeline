@@ -19,6 +19,7 @@ PIPELINE_ID = "solidworks-to-urdf"
 BUNDLE_SCHEMA = "solidworks-to-urdf.bundle/v1"
 
 SUBJECT_DIRECTORIES = ("input", "evidence", "model", "urdf", "meshes")
+PROJECTION_DIRECTORIES = ("mjcf",)
 SUBJECT_FILES = ("tool.json",)
 MANIFEST = "manifest.json"
 SOURCE_RECORD = "input/source.json"
@@ -75,7 +76,7 @@ def subject_inventory(root: Path) -> dict[str, str]:
     root = root.resolve()
     _reject_root_links(root)
     files: dict[str, str] = {}
-    for name in SUBJECT_DIRECTORIES:
+    for name in (*SUBJECT_DIRECTORIES, *(name for name in PROJECTION_DIRECTORIES if (root / name).exists())):
         directory = root / name
         if not directory.exists():
             raise PipelineError(f"Missing delivery directory: {name}")

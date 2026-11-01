@@ -46,7 +46,7 @@ WINDOWS_RESULT_SCHEMA = "solidworks-to-urdf.windows-lifecycle-result/v1"
 DAG_ID = "solidworks_to_urdf"
 DAG_MEMBER = "deploy/airflow/dags/solidworks_to_urdf.py"
 #: Frozen stage contract size; tests guard parity with description_pipeline.stages.STAGE_IDS.
-DAG_TASK_COUNT = 6
+DAG_TASK_COUNT = 7
 
 _COMMIT = re.compile(r"\A[0-9a-f]{40}\Z")
 _HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")

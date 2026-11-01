@@ -197,7 +197,7 @@ else
   report FAIL "run-ownership request-context plugin cannot be verified: AIRFLOW_VENV is not executable"
 fi
 
-# The native-stage pool is part of the six-stage contract: a missing pool or a
+# The native-stage pool is part of the seven-stage contract: a missing pool or a
 # capacity other than 1 is a deployment failure (contracts stage contract / IF-02).
 if [ -x "${AIRFLOW_VENV:-}/bin/python" ]; then
   if AIRFLOW_HOME="${AIRFLOW_HOME:-}" "$AIRFLOW_VENV/bin/python" - <<'PY'

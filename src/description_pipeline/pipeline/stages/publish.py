@@ -6,6 +6,8 @@ import asyncio
 import contextlib
 import hashlib
 import json
+from ... import mjcf_contract
+from .mjcf import validate_certificate as validate_mjcf_certificate
 import os
 import re
 import signal
@@ -114,6 +116,8 @@ _PUBLICATION_PLAN_FIELDS = frozenset(
         "schema_version",
         "verification_certificate_sha256",
         "verify_artifact",
+        "mjcf_artifact",
+        "mjcf_certificate_sha256",
     }
 )
 _PR_OUTBOUND_FIELDS = frozenset(
@@ -144,6 +148,10 @@ class PublishDomainRequest:
     generate_artifact: ArtifactRef
     capture_artifact: ArtifactRef
     verify_artifact: ArtifactRef
+    mjcf_artifact: ArtifactRef
+    mjcf_command_id: str
+    mjcf_request_digest: str
+    mjcf_certificate_sha256: str
     repository_snapshot: ArtifactRef
     verified_subject_sha256: str
     repository_slug: str
@@ -161,6 +169,7 @@ class PublishDomainRequest:
             self.generate_artifact,
             self.capture_artifact,
             self.verify_artifact,
+            self.mjcf_artifact,
             self.repository_snapshot,
         )
         if any(not isinstance(item, ArtifactRef) for item in refs):
@@ -172,13 +181,18 @@ class PublishDomainRequest:
             or self.capture_artifact.producer_stage != "capture"
             or self.verify_artifact.kind != VERIFY_ARTIFACT_KIND
             or self.verify_artifact.producer_stage != "verify"
+            or self.mjcf_artifact.kind != mjcf_contract.ARTIFACT_KIND
+            or self.mjcf_artifact.producer_stage != "mjcf"
             or self.repository_snapshot.kind != REPOSITORY_SNAPSHOT_KIND
         ):
             raise ProtocolError("publish.input_ref", {"reason": "kind-or-producer"})
-        if len({item.artifact_id for item in refs}) != 4:
+        if len({item.artifact_id for item in refs}) != 5:
             raise ProtocolError("publish.input_ref", {"reason": "duplicate"})
         if _HEX64.fullmatch(self.verified_subject_sha256) is None:
             raise ProtocolError("publish.subject", {"field": "verified_subject_sha256"})
+        if any(not isinstance(value, str) or _HEX64.fullmatch(value) is None
+               for value in (self.mjcf_request_digest, self.mjcf_certificate_sha256)) or not self.mjcf_command_id:
+            raise ProtocolError("publish.mjcf_identity")
         if not isinstance(self.repository_slug, str) or "/" not in self.repository_slug:
             raise ProtocolError("publish.repository", {"value": self.repository_slug})
         if not isinstance(self.origin_url, str) or not self.origin_url:
@@ -223,6 +237,10 @@ class PublishDomainRequest:
             "repository_snapshot_artifact": self.repository_snapshot.to_record(),
             "schema_version": self.schema_version,
             "verify_artifact": self.verify_artifact.to_record(),
+            "mjcf_artifact": self.mjcf_artifact.to_record(),
+            "mjcf_command_id": self.mjcf_command_id,
+            "mjcf_request_digest": self.mjcf_request_digest,
+            "mjcf_certificate_sha256": self.mjcf_certificate_sha256,
         }
 
 
@@ -267,6 +285,10 @@ def _request_contract(command: StageCommand) -> PublishDomainRequest:
         "repository_snapshot_artifact_id",
         "schema_version",
         "verify_artifact_id",
+        "mjcf_artifact_id",
+        "mjcf_command_id",
+        "mjcf_request_digest",
+        "mjcf_certificate_sha256",
     }
     if set(request) != required:
         raise ProtocolError(
@@ -276,12 +298,13 @@ def _request_contract(command: StageCommand) -> PublishDomainRequest:
     if request["schema_version"] != PUBLISH_REQUEST_SCHEMA or request["output_contract"] != PUBLISH_OUTPUT_CONTRACT:
         raise ProtocolError("publish.request_contract", {"command_id": command.command_id})
     by_id = {item.artifact_id: item for item in command.input_artifacts}
-    if len(by_id) != 4 or len(command.input_artifacts) != 4:
+    if len(by_id) != 5 or len(command.input_artifacts) != 5:
         raise ProtocolError("publish.input_closure", {"command_id": command.command_id})
     try:
         generate = by_id[request["generate_artifact_id"]]
         capture = by_id[request["capture_artifact_id"]]
         verify = by_id[request["verify_artifact_id"]]
+        mjcf = by_id[request["mjcf_artifact_id"]]
         repository_snapshot = by_id[request["repository_snapshot_artifact_id"]]
     except (KeyError, TypeError) as error:
         raise ProtocolError("publish.input_closure", {"command_id": command.command_id}) from error
@@ -302,6 +325,10 @@ def _request_contract(command: StageCommand) -> PublishDomainRequest:
         generate_artifact=generate,
         capture_artifact=capture,
         verify_artifact=verify,
+        mjcf_artifact=mjcf,
+        mjcf_command_id=request["mjcf_command_id"],
+        mjcf_request_digest=request["mjcf_request_digest"],
+        mjcf_certificate_sha256=request["mjcf_certificate_sha256"],
         repository_snapshot=repository_snapshot,
         verified_subject_sha256=str(request["verified_subject_sha256"]),
         repository_slug=str(request["repository_slug"]),
@@ -546,6 +573,7 @@ def _publication_text(
     certificate: Mapping[str, Any],
     certificate_sha256: str,
     subject_sha256: str,
+    mjcf_certificate: Mapping[str, Any],
 ) -> tuple[str, str]:
     body = (
         request.commit.body.rstrip()
@@ -554,7 +582,11 @@ def _publication_text(
         + f"Verification-Certificate-SHA256: {certificate_sha256}\n"
         + f"Publication-Subject-SHA256: {subject_sha256}\n"
         + f"Repository: {request.repository_slug}\n"
+        + f"MJCF-Certificate-SHA256: {request.mjcf_certificate_sha256}\n"
     )
+    body += "\n### MJCF projection warnings\n\n" + "\n".join(
+        "- " + warning for warning in mjcf_contract.projection_warnings(mjcf_certificate)
+    ) + "\n"
     return request.commit.subject, body
 
 
@@ -565,6 +597,7 @@ def _publication_root(
     generate_root: Path,
     capture_root: Path,
     verify_root: Path,
+    mjcf_root: Path,
     destination: Path,
 ) -> tuple[Path, str, str, str]:
     destination.mkdir(parents=True)
@@ -577,6 +610,8 @@ def _publication_root(
     reports.mkdir()
     shutil.copyfile(verify_root / VERIFY_CERTIFICATE, reports / VERIFY_CERTIFICATE)
     shutil.copyfile(verify_root / VERIFY_EXECUTION, reports / VERIFY_EXECUTION)
+    shutil.copytree(mjcf_root / "mjcf", destination / "mjcf")
+    shutil.copyfile(mjcf_root / mjcf_contract.REPORT_PATH, destination / mjcf_contract.REPORT_PATH)
     write_delivery_manifest(
         destination,
         contract={"schema_version": CONTRACT["schema_version"], "digest": command.contract_sha256},
@@ -588,6 +623,7 @@ def _publication_root(
         certificate=_require_object(read_data(verify_root / VERIFY_CERTIFICATE), "verification certificate"),
         certificate_sha256=file_digest(verify_root / VERIFY_CERTIFICATE),
         subject_sha256=subject,
+        mjcf_certificate=_require_object(read_data(mjcf_root / mjcf_contract.REPORT_PATH), "MJCF certificate"),
     )
     return destination, subject, title, body
 
@@ -603,6 +639,8 @@ def _write_publication_plan(
         "capture_artifact": inputs.request.capture_artifact.to_record(),
         "generate_artifact": inputs.request.generate_artifact.to_record(),
         "verify_artifact": inputs.request.verify_artifact.to_record(),
+        "mjcf_artifact": inputs.request.mjcf_artifact.to_record(),
+        "mjcf_certificate_sha256": inputs.request.mjcf_certificate_sha256,
         "repository_snapshot_artifact": inputs.request.repository_snapshot.to_record(),
         "repository": inputs.request.repository_slug,
         "origin_url": inputs.request.origin_url,
@@ -771,6 +809,8 @@ def _read_sealed_git_outbound_root(
         ("capture_artifact", request.capture_artifact.to_record()),
         ("generate_artifact", request.generate_artifact.to_record()),
         ("verify_artifact", request.verify_artifact.to_record()),
+        ("mjcf_artifact", request.mjcf_artifact.to_record()),
+        ("mjcf_certificate_sha256", request.mjcf_certificate_sha256),
         ("repository_snapshot_artifact", request.repository_snapshot.to_record()),
     )
     request_values = {
@@ -836,6 +876,9 @@ def _read_sealed_git_outbound_root(
     certificate_raw = repository.read_blob(commit=commit, path=f"reports/{VERIFY_CERTIFICATE}")
     if hashlib.sha256(certificate_raw).hexdigest() != plan["verification_certificate_sha256"]:
         raise PublicationError("publish.git_recovery_certificate")
+    mjcf_raw = repository.read_blob(commit=commit, path=mjcf_contract.REPORT_PATH)
+    if hashlib.sha256(mjcf_raw).hexdigest() != plan["mjcf_certificate_sha256"]:
+        raise PublicationError("publish.git_recovery_mjcf_certificate")
     return _SealedGit(
         outbound_root=Path(outbound_root),
         candidate=_PublishedCandidate(
@@ -858,14 +901,19 @@ def _sealed_publication_text(
     subject = sealed.candidate.subject_sha256
     plan = sealed.plan
     certificate_raw = repository.read_blob(commit=commit, path=f"reports/{VERIFY_CERTIFICATE}")
+    mjcf_raw = repository.read_blob(commit=commit, path=mjcf_contract.REPORT_PATH)
     try:
         certificate = json.loads(certificate_raw)
+        mjcf_certificate = json.loads(mjcf_raw)
     except ValueError as error:
         raise PublicationError("publish.git_recovery_certificate") from error
     if (
         not isinstance(certificate, dict)
         or certificate_raw != canonical(certificate)
         or digest(certificate) != plan["verification_certificate_sha256"]
+        or not isinstance(mjcf_certificate, dict)
+        or mjcf_raw != canonical(mjcf_certificate)
+        or digest(mjcf_certificate) != plan["mjcf_certificate_sha256"]
     ):
         raise PublicationError("publish.git_recovery_certificate")
     title, body = _publication_text(
@@ -873,6 +921,7 @@ def _sealed_publication_text(
         certificate=certificate,
         certificate_sha256=plan["verification_certificate_sha256"],
         subject_sha256=subject,
+        mjcf_certificate=mjcf_certificate,
     )
     if plan["pr_title_sha256"] != digest({"title": title}) or plan["pr_body_sha256"] != digest({"body": body}):
         raise PublicationError("publish.git_recovery_pr_text")
@@ -2218,6 +2267,7 @@ class PublishHandler:
             request.generate_artifact,
             request.capture_artifact,
             request.verify_artifact,
+            request.mjcf_artifact,
             request.repository_snapshot,
         ):
             self.artifacts.verify(artifact)
@@ -2237,6 +2287,7 @@ class PublishHandler:
         generate_root = Path(workspace.inputs[request.generate_artifact.artifact_id])
         capture_root = Path(workspace.inputs[request.capture_artifact.artifact_id])
         verify_root = Path(workspace.inputs[request.verify_artifact.artifact_id])
+        mjcf_root = Path(workspace.inputs[request.mjcf_artifact.artifact_id])
         certificate, execution = _certificate(
             request=request,
             verify_root=verify_root,
@@ -2244,12 +2295,29 @@ class PublishHandler:
             capture_root=capture_root,
             command=command,
         )
+        mjcf_record = _require_object(read_data(mjcf_root / mjcf_contract.REPORT_PATH), "MJCF certificate")
+        if not isinstance(mjcf_record.get("command"), Mapping):
+            raise PipelineError("Publish MJCF certificate has no source command")
+        mjcf_command = StageCommand.from_record(mjcf_record["command"])
+        if (mjcf_command.command_id != request.mjcf_command_id
+                or mjcf_command.request_digest != request.mjcf_request_digest
+                or mjcf_command.run_id != request.mjcf_artifact.producer_run_id
+                or (command.diagnostic_scope is None and (
+                    mjcf_command.run_id != command.run_id or mjcf_command.diagnostic_scope is not None
+                ))
+                or mjcf_command.expected_executor_sha256 != request.mjcf_artifact.producer_tool_sha256
+                or file_digest(mjcf_root / mjcf_contract.REPORT_PATH) != request.mjcf_certificate_sha256):
+            raise PipelineError("Publish MJCF certificate differs from its completed predecessor")
+        validate_mjcf_certificate(mjcf_root, mjcf_command, source_roots={
+            "generate": generate_root, "capture": capture_root, "verify": verify_root,
+        })
         publication_root, subject, title, body = _publication_root(
             request=request,
             command=command,
             generate_root=generate_root,
             capture_root=capture_root,
             verify_root=verify_root,
+            mjcf_root=mjcf_root,
             destination=workspace.root / "publication",
         )
         publisher_tool, actual_executor = _executor_identity(command, claim)
@@ -2506,6 +2574,8 @@ class PublishHandler:
                 "generate_artifact": request.generate_artifact.to_record(),
                 "capture_artifact": request.capture_artifact.to_record(),
                 "verify_artifact": request.verify_artifact.to_record(),
+                "mjcf_artifact": request.mjcf_artifact.to_record(),
+                "mjcf_certificate_sha256": request.mjcf_certificate_sha256,
                 "repository_snapshot_artifact": request.repository_snapshot.to_record(),
                 "git_effect": {"effect_id": git_effect_id, "observation": git_observation},
                 "pr_effect": {
@@ -2644,6 +2714,8 @@ def validate_publication_receipt(
         "schema_version",
         "verification_certificate_sha256",
         "verify_artifact",
+        "mjcf_artifact",
+        "mjcf_certificate_sha256",
     }
     if (
         set(receipt) != required
@@ -2669,6 +2741,8 @@ def validate_publication_receipt(
         or receipt["generate_artifact"] not in [item.to_record() for item in command.input_artifacts]
         or receipt["capture_artifact"] not in [item.to_record() for item in command.input_artifacts]
         or receipt["verify_artifact"] not in [item.to_record() for item in command.input_artifacts]
+        or receipt["mjcf_artifact"] != _request_contract(command).mjcf_artifact.to_record()
+        or receipt["mjcf_certificate_sha256"] != _request_contract(command).mjcf_certificate_sha256
         or receipt["repository_snapshot_artifact"] not in [item.to_record() for item in command.input_artifacts]
         or artifact.kind != "stage_output:publish"
         or artifact.producer_run_id != command.run_id

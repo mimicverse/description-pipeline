@@ -9,7 +9,7 @@ import shutil
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -21,6 +21,7 @@ from description_pipeline.artifacts import ArtifactStore
 from description_pipeline.io import PipelineError, digest, write_json
 from description_pipeline.pipeline.admission import build_run_admission
 from description_pipeline.pipeline.application import (
+    AirflowTaskBinding,
     ApplicationError,
     ApplicationPortMissing,
     EffectWakeupHint,
@@ -199,12 +200,12 @@ class _MemoryBackend:
         self.dispatch_commands[dispatch_command.command_id] = dispatch_command
         if (
             dispatch_command.conf_artifact != dispatch_outbound_artifact
-            or dispatch_command.freeze_command_id != command.command_id
+            or dispatch_command.entry_command_id != command.command_id
             or dispatch_command.run_id != command.run_id
         ):
             raise PipelineError("dispatch identity conflict")
         conf = self.artifacts.read_dispatch_conf(dispatch_outbound_artifact)
-        if conf.run_id != command.run_id or conf.freeze_command_id != command.command_id:
+        if conf.run_id != command.run_id or conf.entry_command_id != command.command_id:
             raise PipelineError("dispatch conf identity conflict")
         return command, dispatch_command, None
 
@@ -398,7 +399,7 @@ class StageApplicationTests(unittest.TestCase):
     def test_admit_then_run_stage_uses_one_admission_and_real_engine(self):
         admitted = self.application.admit(self.harness.spec)
         self.assertEqual(admitted.admission, build_run_admission(self.harness.spec))
-        self.assertEqual(admitted.dispatch_command.freeze_command_id, admitted.freeze_command.command_id)
+        self.assertEqual(admitted.dispatch_command.entry_command_id, admitted.entry_command.command_id)
         self.assertEqual(
             admitted.dispatch_command.expected_executor_sha256,
             self.harness.spec.dispatch_executor_sha256,
@@ -419,8 +420,8 @@ class StageApplicationTests(unittest.TestCase):
             },
         )
         self.assertEqual(
-            self.harness.store.read_dispatch_conf(admitted.dispatch_command.conf_artifact).freeze_command_id,
-            admitted.freeze_command.command_id,
+            self.harness.store.read_dispatch_conf(admitted.dispatch_command.conf_artifact).entry_command_id,
+            admitted.entry_command.command_id,
         )
         self.assertEqual(
             self.backend.dispatch_commands[admitted.dispatch_command.command_id],
@@ -430,7 +431,7 @@ class StageApplicationTests(unittest.TestCase):
         self.assertIsInstance(freeze, StageResult)
         self.assertEqual(freeze.outcome, "completed")
         self.assertEqual(self.freeze.executions, 1)
-        again = self.application.execute_registered_command(admitted.freeze_command.command_id)
+        again = self.application.execute_registered_command(admitted.entry_command.command_id)
         self.assertEqual(again, freeze)
         self.assertEqual(self.application.run_stage("run-1", "freeze"), freeze)
         self.assertEqual(self.freeze.executions, 1)
@@ -440,7 +441,7 @@ class StageApplicationTests(unittest.TestCase):
         self.assertEqual(discover.outcome, "completed")
         self.assertEqual(self.discover.executions, 1)
         self.assertEqual(set(self.backend.commands), {
-            admitted.freeze_command.command_id,
+            admitted.entry_command.command_id,
             discover.command_id,
         })
 
@@ -506,6 +507,7 @@ class StageApplicationTests(unittest.TestCase):
             outbound_digest=digest({"outbound": "freeze"}),
             expected_state_digest=digest({"expected": "freeze"}),
         )
+        self.application.admit(self.harness.spec)
         with patch.object(
             self.application,
             "run_stage",
@@ -522,10 +524,10 @@ class StageApplicationTests(unittest.TestCase):
         admitted = self.application.admit(self.harness.spec)
         wait = StageEffectWait(
             schema_version=STAGE_EFFECT_WAIT_SCHEMA,
-            run_id=admitted.freeze_command.run_id,
+            run_id=admitted.entry_command.run_id,
             stage="freeze",
-            command_id=admitted.freeze_command.command_id,
-            request_digest=admitted.freeze_command.request_digest,
+            command_id=admitted.entry_command.command_id,
+            request_digest=admitted.entry_command.request_digest,
             effect_id="effect-freeze",
             effect_key="dispatch",
             effect_kind="airflow_dispatch",
@@ -543,7 +545,7 @@ class StageApplicationTests(unittest.TestCase):
 
         self.assertEqual(result, pending)
         execute.assert_called_once_with(
-            command_id=admitted.freeze_command.command_id,
+            command_id=admitted.entry_command.command_id,
             handler=self.freeze,
             services=self.backend,
             resume=wait,
@@ -554,10 +556,10 @@ class StageApplicationTests(unittest.TestCase):
         admitted = self.application.admit(self.harness.spec)
         wait = StageEffectWait(
             schema_version=STAGE_EFFECT_WAIT_SCHEMA,
-            run_id=admitted.freeze_command.run_id,
+            run_id=admitted.entry_command.run_id,
             stage="freeze",
-            command_id=admitted.freeze_command.command_id,
-            request_digest=admitted.freeze_command.request_digest,
+            command_id=admitted.entry_command.command_id,
+            request_digest=admitted.entry_command.request_digest,
             effect_id="effect-freeze",
             effect_key="dispatch",
             effect_kind="airflow_dispatch",
@@ -584,10 +586,10 @@ class StageApplicationTests(unittest.TestCase):
         admitted = self.application.admit(self.harness.spec)
         wait = StageEffectWait(
             schema_version=STAGE_EFFECT_WAIT_SCHEMA,
-            run_id=admitted.freeze_command.run_id,
+            run_id=admitted.entry_command.run_id,
             stage="freeze",
-            command_id=admitted.freeze_command.command_id,
-            request_digest=admitted.freeze_command.request_digest,
+            command_id=admitted.entry_command.command_id,
+            request_digest=admitted.entry_command.request_digest,
             effect_id="effect-freeze",
             effect_key="dispatch",
             effect_kind="airflow_dispatch",
@@ -715,10 +717,10 @@ class StageApplicationTests(unittest.TestCase):
     def test_replay_refuses_until_common_command_scope_is_available(self):
         admitted = self.application.admit(self.harness.spec)
         with self.assertRaisesRegex(ApplicationError, "diagnostic qualification"):
-            self.application.replay(admitted.freeze_command.command_id)
+            self.application.replay(admitted.entry_command.command_id)
 
     def test_replay_executes_the_registered_diagnostic_command_once(self):
-        formal = self.application.admit(self.harness.spec).freeze_command
+        formal = self.application.admit(self.harness.spec).entry_command
         scope = DiagnosticReplayScope.from_inputs("freeze", formal.input_artifacts)
         diagnostic = StageCommand.create(
             command_id="diagnostic:freeze",
@@ -759,7 +761,7 @@ class StageApplicationTests(unittest.TestCase):
         admitted = self.application.admit(self.harness.spec)
         with redirect_stdout(io.StringIO()):
             code = cli.main(
-                ["stage", admitted.freeze_command.command_id],
+                ["stage", admitted.entry_command.command_id],
                 application_factory=lambda: self.application,
             )
         self.assertEqual(code, 0)
@@ -777,12 +779,20 @@ class StageApplicationTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(payload["outcome"], "admitted")
         self.assertEqual(payload["admission"]["run_id"], self.harness.spec.run_id)
-        self.assertIn("freeze_command", payload)
+        self.assertIn("entry_command", payload)
         self.assertIn("dispatch_command", payload)
         self.assertEqual(
-            payload["dispatch_command"]["freeze_command_id"],
-            payload["freeze_command"]["command_id"],
+            payload["dispatch_command"]["entry_command_id"],
+            payload["entry_command"]["command_id"],
         )
+
+    def test_cli_rejects_invalid_admission_before_composing_runtime(self):
+        spec_path = self.root / "invalid-admission.json"
+        write_json(spec_path, {})
+        factory = Mock(side_effect=AssertionError("Invalid intent loaded runtime capabilities"))
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(1, cli.main(["admit", str(spec_path)], application_factory=factory))
+        factory.assert_not_called()
 
     def _environment_composition(self):
         executor = "a" * 64
@@ -879,6 +889,51 @@ class StageApplicationTests(unittest.TestCase):
             self.assertRaises(ModuleNotFoundError),
         ):
             application_from_environment(environment)
+
+    def test_portable_stage_composition_needs_no_native_or_publication_ports(self):
+        environment, executor, _native_target = self._environment_composition()
+        for key in ("SOLIDWORKS_ENDPOINT_URL", "ENDPOINT_TOKEN_FILE", "PLATFORM_CONFIG_SNAPSHOT"):
+            environment.pop(key)
+        for stage in ("generate", "verify", "mjcf"):
+            with (
+                self.subTest(stage=stage),
+                patch("description_pipeline.pipeline.application.tool_record",
+                      return_value={"source_sha256": executor}),
+                patch("description_pipeline.pipeline.application._registered_native_target_from_environment",
+                      side_effect=AssertionError("A portable stage loaded native identity")),
+                patch("description_pipeline.pipeline.application._native_client_from_environment",
+                      side_effect=AssertionError("A portable stage loaded native credentials")),
+                patch("description_pipeline.repository.publish.GitHubCliPullRequestClient",
+                      side_effect=AssertionError("A portable stage constructed a publication client")),
+            ):
+                application = application_from_environment(
+                    environment,
+                    airflow_task_binding=AirflowTaskBinding("solidworks_to_urdf", "isolated-run", stage, -1),
+                )
+                self.assertEqual([stage], list(application.handlers))
+                self.assertIsNone(application.native_target_identity)
+                self.assertFalse(application.reconciliation_adapters)
+                self.assertFalse(application.cancellation_controllers)
+                self.assertFalse((application.services.work_root / "publish-pr-observer").exists())
+
+    def test_admission_composition_has_no_handlers_and_preserves_initial_target_binding(self):
+        environment, executor, native_target = self._environment_composition()
+        native_target = NativeTargetIdentity.create(install_id="win-" + "b" * 32,
+                                                   pipeline_id="solidworks-to-urdf")
+        with (
+            patch("description_pipeline.pipeline.application.tool_record", return_value={"source_sha256": executor}),
+            patch("description_pipeline.pipeline.application._registered_native_target_from_environment",
+                  return_value=native_target),
+            patch("description_pipeline.pipeline.application._native_client_from_environment",
+                  side_effect=AssertionError("Admission loaded native credentials")),
+            patch("description_pipeline.repository.publish.GitHubCliPullRequestClient",
+                  side_effect=AssertionError("Admission loaded a publication client")),
+        ):
+            application = application_from_environment(environment, admission_spec=self.harness.spec)
+            self.assertFalse(application.handlers)
+            self.assertEqual(native_target, application.native_target_identity)
+            with self.assertRaisesRegex(ApplicationError, "differs from the registered target"):
+                application.admit(self.harness.spec)
 
     def test_environment_composition_rejects_missing_native_cancellation(self):
         environment, executor, native_target = self._environment_composition()

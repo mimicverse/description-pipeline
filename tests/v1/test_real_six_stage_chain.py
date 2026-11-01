@@ -5,13 +5,17 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 import unittest
 import uuid
+from contextlib import ExitStack
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -57,6 +61,8 @@ from description_pipeline.pipeline.freeze import (
 )
 from description_pipeline.pipeline.ingestion import (
     ProductionAdmissionRequest,
+    ProductionAdmissionFactory,
+    ProductionMJCFSuccessorRequest,
     ProductionFreezeSuccessorRequest,
     ReceivedUploadReceipt,
     load_production_admission,
@@ -68,6 +74,7 @@ from description_pipeline.pipeline.services import (
 )
 from description_pipeline.pipeline.reconciliation import EffectReconciliationService
 from description_pipeline.pipeline.stages.generate import GenerateHandler
+from description_pipeline.pipeline.stages.mjcf import MJCFHandler
 from description_pipeline.pipeline.stages.publish import (
     PR_EFFECT_KEY,
     PublishHandler,
@@ -221,7 +228,7 @@ class RealSixStageChainTests(unittest.TestCase):
             )
 
         self.publish = PublishFixture()
-        self.addCleanup(self.publish.temporary.cleanup)
+        self.addCleanup(self.publish.close)
         git_target = patch(
             "description_pipeline.pipeline.ingestion.validate_git_remote",
             return_value=str(self.publish.remote),
@@ -261,6 +268,10 @@ class RealSixStageChainTests(unittest.TestCase):
         self.native["release"] = copy.deepcopy(release)
         self.portable["source_sha256"] = release["source_sha256"]
         self.native["source_sha256"] = release["source_sha256"]
+        mjcf_identity = patch("description_pipeline.mjcf_contract.tool_record",
+                              side_effect=lambda **_kwargs: copy.deepcopy(self.portable))
+        mjcf_identity.start()
+        self.addCleanup(mjcf_identity.stop)
 
         self.handoff_root = self.root / "handoff"
         self.upload_root = self.handoff_root / "run-produced"
@@ -468,7 +479,7 @@ class RealSixStageChainTests(unittest.TestCase):
                 "id": "solidworks_to_urdf",
                 "path": "/srv/description/dags/solidworks_to_urdf.py",
                 "digest": digest({"dag": "fixture"}),
-                "tasks": 6,
+                "tasks": 7,
             },
             "ends": {
                 "linux": {
@@ -577,6 +588,7 @@ class RealSixStageChainTests(unittest.TestCase):
                         self.portable
                     )
                 ),
+                "mjcf": MJCFHandler(self.store),
                 "publish": PublishHandler(
                     self.store,
                     pull_requests=self.pull_requests,
@@ -662,7 +674,7 @@ class RealSixStageChainTests(unittest.TestCase):
                 "SELECT stage, outcome FROM stage_decision "
                 "WHERE run_id = %s "
                 "ORDER BY array_position("
-                "ARRAY['freeze','discover','capture','generate','verify','publish'],"
+                "ARRAY['freeze','discover','capture','generate','verify','mjcf','publish'],"
                 " stage)",
                 (RUN_ID,),
             )
@@ -675,9 +687,118 @@ class RealSixStageChainTests(unittest.TestCase):
                 ("capture", "completed"),
                 ("generate", "completed"),
                 ("verify", "completed"),
+                ("mjcf", "completed"),
                 ("publish", "completed"),
             ],
         )
+
+    def test_mjcf_only_successor_uses_real_qualified_inputs_without_upstream_execution(self) -> None:
+        from description_pipeline.runtime import tool_record
+
+        actual_executor = tool_record(role="portable")["source_sha256"]
+        application = self._application()
+        work = self.root / "mjcf-successor-factory"
+        work.mkdir()
+        snapshot = self._platform_snapshot()
+        factory = ProductionAdmissionFactory(
+            artifacts=self.store, platform_snapshot=snapshot, native_tool_provider=lambda: copy.deepcopy(self.native),
+            portable_tool_provider=lambda: copy.deepcopy(self.portable), work_root=work,
+            clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
+        )
+        with (
+            patch("description_pipeline.runtime.tool_record", return_value=copy.deepcopy(self.native)),
+            patch("description_pipeline.pipeline.stages.generate.tool_record",
+                  return_value=copy.deepcopy(self.portable)),
+            patch("description_pipeline.pipeline.stages.publish.tool_record",
+                  return_value=copy.deepcopy(self.portable)),
+        ):
+            prepared = factory.prepare(self._production_request())
+            source = replace(prepared.spec,
+                             simulation='{"collision":{"source":"visual_convex","max_vertices":4,"max_error_m":1e-12}}')
+            application.admit(source)
+            failed = application.execute_run(source.run_id)
+            self.assertEqual(("mjcf", "failed"), (failed.stage, failed.outcome))
+            with self._connect() as connection, connection.cursor() as cursor:
+                cursor.execute("SELECT stage, result_digest FROM stage_decision WHERE run_id = %s ORDER BY stage",
+                               (source.run_id,))
+                before = cursor.fetchall()
+            def forbidden_native():
+                raise AssertionError("MJCF rerun contacted the native endpoint")
+            factory.native_tool_provider = forbidden_native
+            cold_request = ProductionMJCFSuccessorRequest(
+                run_id="cold-mjcf-run", request_id="cold-mjcf-request", parent_run_id=source.run_id,
+                principal=source.principal, change_summary="Admit and execute MJCF without native capabilities",
+            )
+            captured = []
+
+            class CapturedAdmission(Exception):
+                pass
+
+            def capture_spec(spec):
+                captured.append(spec)
+                raise CapturedAdmission()
+
+            with patch.object(application, "admit", side_effect=capture_spec), self.assertRaises(CapturedAdmission):
+                factory.admit_mjcf(application, cold_request)
+            cold_spec = replace(captured[0], executors=replace(captured[0].executors, mjcf=actual_executor))
+            spec_path = work / "cold-admission.json"
+            write_json(spec_path, cold_spec.to_record())
+            self.assertIsNone(application.facts.load_admission(cold_spec.run_id))
+            environment = {
+                "PATH": os.environ["PATH"],
+                "PYTHONPATH": str(Path(application_from_environment.__code__.co_filename).resolve().parents[2]),
+                "PLATFORM_SERVICE_DSN": psycopg2.extensions.make_dsn(
+                    self.server.get_uri(), options=f"-c search_path={self.schema},public",
+                ),
+                "PLATFORM_ARTIFACT_ROOT": str(self.store.root),
+                "PIPELINE_WORK_ROOT": str(work / "cold-runtime"),
+            }
+
+            def cold_cli(*args):
+                return subprocess.run([sys.executable, "-B", "-m", "description_pipeline.cli", *args],
+                                      env=environment, capture_output=True, text=True, timeout=60)
+
+            cold = cold_cli("admit", str(spec_path))
+            self.assertEqual(0, cold.returncode, cold.stderr)
+            admitted_cold = json.loads(cold.stdout)
+            self.assertEqual(cold_spec.run_id, admitted_cold["admission"]["run_id"])
+            repeated = cold_cli("admit", str(spec_path))
+            self.assertEqual(0, repeated.returncode, repeated.stderr)
+            self.assertEqual(admitted_cold, json.loads(repeated.stdout))
+            cold_stage = cold_cli("stage", admitted_cold["entry_command"]["command_id"])
+            self.assertEqual(0, cold_stage.returncode, cold_stage.stderr)
+            self.assertEqual("completed", json.loads(cold_stage.stdout)["outcome"])
+            invalid = replace(cold_spec, run_id="invalid-cold-run", request_id="invalid-cold-request",
+                              parent_run_id="missing-source")
+            write_json(spec_path, invalid.to_record())
+            rejected = cold_cli("admit", str(spec_path))
+            self.assertNotEqual(0, rejected.returncode)
+            self.assertNotIn("native_target_missing", rejected.stderr)
+            self.assertIsNone(application.facts.load_admission(invalid.run_id))
+            rerun = ProductionMJCFSuccessorRequest(
+                run_id="mjcf-only-run", request_id="mjcf-only-request", parent_run_id=source.run_id,
+                principal=source.principal, change_summary="Use a qualified collision budget",
+                simulation='{"collision":{"max_vertices":128}}',
+            )
+            with ExitStack() as stack:
+                for stage in ("freeze", "discover", "capture", "generate", "verify"):
+                    stack.enter_context(patch.object(application.handlers[stage], "execute",
+                                                     side_effect=AssertionError("Upstream execution was repeated")))
+                admitted = factory.admit_mjcf(application, rerun)
+                self.assertEqual("mjcf", admitted.entry_command.stage)
+                self.assertEqual(admitted, factory.admit_mjcf(application, rerun))
+                for stage in ("freeze", "discover", "capture", "generate", "verify"):
+                    reuse = application.run_stage(rerun.run_id, stage).to_record()
+                    self.assertEqual(("reused", source.run_id), (reuse["outcome"], reuse["source_run_id"]))
+                completed = application.execute_run(rerun.run_id)
+                self.assertEqual(("publish", "completed"), (completed.stage, completed.outcome), completed)
+            with self._connect() as connection, connection.cursor() as cursor:
+                cursor.execute("SELECT stage, outcome FROM stage_decision WHERE run_id = %s ORDER BY stage",
+                               (rerun.run_id,))
+                self.assertEqual([("mjcf", "completed"), ("publish", "completed")], cursor.fetchall())
+                cursor.execute("SELECT stage, result_digest FROM stage_decision WHERE run_id = %s ORDER BY stage",
+                               (source.run_id,))
+                self.assertEqual(before, cursor.fetchall())
 
     def _assert_published_change_summary(self, spec: AdmissionSpec, summary: str) -> None:
         branch = spec.publish_intent.repository.branch_ref
@@ -925,7 +1046,7 @@ class RealSixStageChainTests(unittest.TestCase):
                 portable_tool_provider=lambda: copy.deepcopy(self.portable),
             )
             freeze = parent_application.execute_registered_command(
-                parent.freeze_command.command_id
+                parent.entry_command.command_id
             )
         self.assertEqual(freeze.outcome, "completed")
         parent_spec = AdmissionSpec.from_record(parent.admission.request)
@@ -1040,7 +1161,7 @@ class RealSixStageChainTests(unittest.TestCase):
                 "SELECT stage, outcome FROM stage_decision "
                 "WHERE run_id = %s "
                 "ORDER BY array_position("
-                "ARRAY['freeze','discover','capture','generate','verify','publish'],"
+                "ARRAY['freeze','discover','capture','generate','verify','mjcf','publish'],"
                 " stage)",
                 (SUCCESSOR_RUN_ID,),
             )
@@ -1053,6 +1174,7 @@ class RealSixStageChainTests(unittest.TestCase):
                 ("capture", "completed"),
                 ("generate", "completed"),
                 ("verify", "completed"),
+                ("mjcf", "completed"),
                 ("publish", "completed"),
             ],
         )
@@ -1106,7 +1228,7 @@ class RealSixStageChainTests(unittest.TestCase):
                 "SELECT stage, outcome FROM stage_decision "
                 "WHERE run_id = %s "
                 "ORDER BY array_position("
-                "ARRAY['freeze','discover','capture','generate','verify','publish'],"
+                "ARRAY['freeze','discover','capture','generate','verify','mjcf','publish'],"
                 " stage)",
                 (RUN_ID,),
             )
@@ -1178,7 +1300,7 @@ class RealSixStageChainTests(unittest.TestCase):
                 "SELECT stage, outcome FROM stage_decision "
                 "WHERE run_id = %s "
                 "ORDER BY array_position("
-                "ARRAY['freeze','discover','capture','generate','verify','publish'],"
+                "ARRAY['freeze','discover','capture','generate','verify','mjcf','publish'],"
                 " stage)",
                 (RUN_ID,),
             )
@@ -1190,6 +1312,7 @@ class RealSixStageChainTests(unittest.TestCase):
                     ("capture", "completed"),
                     ("generate", "completed"),
                     ("verify", "completed"),
+                ("mjcf", "completed"),
                 ],
             )
 
@@ -1252,7 +1375,7 @@ class RealSixStageChainTests(unittest.TestCase):
                 "SELECT stage, outcome FROM stage_decision "
                 "WHERE run_id = %s "
                 "ORDER BY array_position("
-                "ARRAY['freeze','discover','capture','generate','verify','publish'],"
+                "ARRAY['freeze','discover','capture','generate','verify','mjcf','publish'],"
                 " stage)",
                 (RUN_ID,),
             )
@@ -1264,6 +1387,7 @@ class RealSixStageChainTests(unittest.TestCase):
                     ("capture", "completed"),
                     ("generate", "completed"),
                     ("verify", "completed"),
+                ("mjcf", "completed"),
                     ("publish", "completed"),
                 ],
             )
@@ -1353,7 +1477,7 @@ class RealSixStageChainTests(unittest.TestCase):
                 "SELECT stage, outcome FROM stage_decision "
                 "WHERE run_id = %s "
                 "ORDER BY array_position("
-                "ARRAY['freeze','discover','capture','generate','verify','publish'],"
+                "ARRAY['freeze','discover','capture','generate','verify','mjcf','publish'],"
                 " stage)",
                 (RUN_ID,),
             )

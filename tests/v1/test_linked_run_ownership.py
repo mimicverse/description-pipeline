@@ -43,7 +43,7 @@ PRINCIPAL = "cli_app:tenant-a:ou_worker"
 CONF = {
     "schema_version": AIRFLOW_DISPATCH_CONF_SCHEMA,
     "run_id": RUN_ID,
-    "freeze_command_id": FREEZE_COMMAND_ID,
+    "entry_command_id": FREEZE_COMMAND_ID,
 }
 
 
@@ -72,7 +72,7 @@ def binding(**overrides) -> CreateDispatchBinding:
         "parent_dag_run_id": None,
         "dag_id": "solidworks_to_urdf",
         "dag_run_id": DAG_RUN_ID,
-        "freeze_command_id": FREEZE_COMMAND_ID,
+        "entry_command_id": FREEZE_COMMAND_ID,
     }
     values.update(overrides)
     return CreateDispatchBinding(**values)
@@ -123,7 +123,7 @@ def typed_canonical_projection(*, state: str = "running") -> dict:
         conf = DispatchConf(
             schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
             run_id=run_id,
-            freeze_command_id=freeze.command_id,
+            entry_command_id=freeze.command_id,
         )
         conf_artifact = harness.store.seal_dispatch_conf(
             conf,
@@ -137,12 +137,12 @@ def typed_canonical_projection(*, state: str = "running") -> dict:
                     "admission_sha256": spec.admission_sha256,
                     "dag_id": "solidworks_to_urdf",
                     "dag_run_id": DAG_RUN_ID,
-                    "freeze_command_id": freeze.command_id,
+                    "entry_command_id": freeze.command_id,
                     "run_id": run_id,
                 }
             ),
             run_id=run_id,
-            freeze_command_id=freeze.command_id,
+            entry_command_id=freeze.command_id,
             idempotency_key=f"{run_id}/dispatch",
             dag_id="solidworks_to_urdf",
             dag_run_id=DAG_RUN_ID,
@@ -218,7 +218,7 @@ class LinkedRunOwnershipTests(unittest.TestCase):
             ),
             create_body(conf={**CONF, "owner": "forged"}),
             create_body(conf={**CONF, "run_id": ""}),
-            create_body(conf={**CONF, "freeze_command_id": ""}),
+            create_body(conf={**CONF, "entry_command_id": ""}),
             create_body(conf={**CONF, "schema_version": "forged"}),
             create_body(dag_run_id="../escape"),
             create_body(extras={"purpose": "engineering"}),
@@ -246,7 +246,7 @@ class LinkedRunOwnershipTests(unittest.TestCase):
             (binding(dag_id="other_dag"), False),
             (binding(run_id="run-other"), False),
             (binding(dag_run_id="portal-other"), False),
-            (binding(freeze_command_id="freeze:other"), False),
+            (binding(entry_command_id="freeze:other"), False),
             (
                 binding(
                     parent_run_id="parent-platform-run",
@@ -320,7 +320,7 @@ class LinkedRunOwnershipTests(unittest.TestCase):
                 parent_dag_run_id=None,
                 dag_id="solidworks_to_urdf",
                 dag_run_id=DAG_RUN_ID,
-                freeze_command_id=FREEZE_COMMAND_ID,
+                entry_command_id=FREEZE_COMMAND_ID,
             ),
         )
         psycopg2.connect.assert_called_once_with(
@@ -604,7 +604,7 @@ class LinkedRunOwnershipTests(unittest.TestCase):
 
         invalid_dispatch_request = clone_projection(projection)
         invalid_dispatch_request["technical"]["commands"][1]["request"][
-            "freeze_command_id"
+            "entry_command_id"
         ] = "freeze:drifted"
         cases.append(("dispatch validator", invalid_dispatch_request))
 

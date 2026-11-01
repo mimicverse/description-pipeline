@@ -186,7 +186,7 @@ class RunMetadataTests(unittest.TestCase):
                 "decision": None,
                 "receipt": {"artifacts": []},
             }
-            for stage in ("freeze", "discover", "capture", "generate", "verify", "publish")
+            for stage in ("freeze", "discover", "capture", "generate", "verify", "mjcf", "publish")
         ]
         return {
             "run_id": run_id,
@@ -204,7 +204,9 @@ class RunMetadataTests(unittest.TestCase):
             "state": state,
             "events": [],
             "stages": stages,
-            "by_stage": {stage: {} for stage in ("freeze", "discover", "capture", "generate", "verify", "publish")},
+            "by_stage": {stage: {} for stage in (
+                "freeze", "discover", "capture", "generate", "verify", "mjcf", "publish",
+            )},
             "members": {},
             "technical": {"commands": [], "claims": [], "effects": []},
         }
