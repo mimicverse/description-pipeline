@@ -90,10 +90,12 @@ def _login_page(message: str, status_code: int) -> HTMLResponse:
     """A fixed, escaped-by-construction sign-in failure page; no request data is interpolated."""
     body = (
         '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
-        "<title>Feishu sign-in</title></head><body>"
-        '<main style="font-family:system-ui;max-width:32rem;margin:15vh auto;line-height:1.7">'
-        f'<h1 style="font-size:1.2rem">Feishu sign-in did not complete</h1><p>{message}</p>'
-        '<p><a href="/">Return to the operator portal</a></p></main></body></html>'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        '<title>Feishu sign-in</title><link rel="stylesheet" href="/static/style.css"></head><body>'
+        '<main class="auth-message"><section class="card narrow">'
+        '<h1>Feishu sign-in did not complete</h1>'
+        f'<p class="error" role="alert">{message}</p>'
+        '<p><a class="button" href="/">Return to portal</a></p></section></main></body></html>'
     )
     return HTMLResponse(body, status_code=status_code)
 

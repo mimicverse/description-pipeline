@@ -107,6 +107,8 @@ StagePending -> EffectPollTrigger -> StageTaskOperator.execute_complete
 
 等待器每轮先读取原命令的 canonical decision 和 effect settlement；已有结果、冲突或已批准的恢复阶段时，直接唤醒同一不可变 wait，由执行器重新核验。只有仍待观察时才读取原生端、Git 或 PR，不能要求远端再次变化才能响应已登记的对账或取消。唤醒不建立成功资格，不取得执行权，不重发外部请求。
 
+GUI 的唯一视觉定义位于 `style.css`，门户登录和 SSO 失败页共用本地样式与 viewport；不引入字体、图标或主题依赖。页面标题、分区、正文、辅助信息和代码保留清楚层级，普通操作中性，主操作与当前选择使用同一强调色。状态色只消费已有 state/severity：检查 badge/chip 保持一致，证书下载及信息记录中性，混合 finding 分组按已记录最高严重性呈现并逐条保留原 severity。历史行操作在列表内展开，详情头操作独立锚定；二者使用原生按钮/表单/Tab 及 Escape 回焦，不冒称完整 ARIA menu。键值记录始终按 dt/dd 成对两列排列，阶段与技术表局部滚动，长名称、路径、关节读数及错误不能撑宽整页。显示层光照增强形体辨识，不改变原材质、几何、坐标或资格。
+
 共同引擎不包含 CAD、URDF 或发布算法。各 handler 只持有所需 artifact 和 effect 端口，不能直接提交平台成功。生产组合从已登记 command/admission 推导本次所需阶段及端口：Discover/Capture 装配 native 及取消/对账能力，Publish 装配 Git/PR；Generate/Verify/MJCF 不加载 CAD endpoint/token。原 CLI 与 Airflow 使用同一工厂，缺少本次必要能力仍明确拒绝。全流程入口仍覆盖七阶段。
 
 Discover result 表达原生选择、prepared 输入和证据绑定，不作为第二个完整机器人模型。Generate 持久化一个 `EngineeringModel`，URDF 是其交付编码。Verify 独立读取原始证据和实际输出，不借用生成器的期望值、成功标志或缓存。共享代码限于纯数学、格式解析和无领域推导的契约基础，并用解析解、已知答案和变异反例验证。发布重验完整 certificate、execution receipt 及被验证字节。

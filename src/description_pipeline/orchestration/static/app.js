@@ -600,6 +600,7 @@ function showSession(session) {
   $("workspace").hidden = false;
   $("account").hidden = false;
   $("account-user").textContent = session.user;
+  $("account-user").title = session.user;
   if (state.targetsRetryPick) void loadTargets(state.targetsRetryPick);
 }
 
@@ -864,11 +865,9 @@ function buildRunMenu(run) {
   trigger.className = "ghost run-menu-trigger";
   trigger.textContent = "⋯";
   trigger.setAttribute("aria-label", `Actions: ${runDisplayTitle(run)}`);
-  trigger.setAttribute("aria-haspopup", "true");
   trigger.setAttribute("aria-expanded", "false");
   const pop = document.createElement("div");
   pop.className = "run-menu-pop";
-  pop.setAttribute("role", "menu");
   pop.hidden = true;
   const close = (refocus) => {
     pop.hidden = true;
@@ -878,12 +877,10 @@ function buildRunMenu(run) {
   const showMenu = () => {
     pop.textContent = "";
     const rename = ghostButton("Rename");
-    rename.setAttribute("role", "menuitem");
     rename.addEventListener("click", showRename);
     pop.append(rename);
     if (run.deleted === true) {
       const restore = ghostButton("Restore");
-      restore.setAttribute("role", "menuitem");
       restore.addEventListener("click", () => {
         close(false);
         void mutateRun(run, "POST");
@@ -891,7 +888,6 @@ function buildRunMenu(run) {
       pop.append(restore);
     } else {
       const remove = ghostButton("Hide from list");
-      remove.setAttribute("role", "menuitem");
       const blocked = deleteBlockedReason(run);
       if (blocked) {
         remove.disabled = true;
@@ -2237,9 +2233,11 @@ function renderFindings(run, report) {
     const value = typeof detail.name === "string" ? detail.name.trim() : "";
     return value || null;
   };
+  const findingClass = (finding) => !finding.severity || finding.severity === "error"
+    ? "finding-error" : finding.severity === "warning" ? "warn" : "finding-info";
   const renderFinding = (finding) => {
     const item = document.createElement("li");
-    if (finding.severity && finding.severity !== "error") item.className = "warn";
+    item.className = findingClass(finding);
     const message = document.createElement("div");
     // A missing robot name is not a malformed name; keep the two cases distinct.
     message.textContent =
@@ -2248,7 +2246,7 @@ function renderFindings(run, report) {
         : finding.message || "No description provided";
     const context = document.createElement("div");
     context.className = "object";
-    context.textContent = [finding.id, finding.stage, finding.object].filter(Boolean).join(" · ") || "—";
+    context.textContent = [finding.severity, finding.id, finding.stage, finding.object].filter(Boolean).join(" · ") || "—";
     item.append(message, context);
     if (finding.evidence && Object.keys(finding.evidence).length) {
       const evidence = document.createElement("pre");
@@ -2304,7 +2302,8 @@ function renderFindings(run, report) {
       if (section.open) populate();
     });
     section.append(header, nested);
-    outer.className = items.every((finding) => finding.severity === "warning") ? "warn" : "";
+    const kinds = items.map(findingClass);
+    outer.className = kinds.includes("finding-error") ? "finding-error" : kinds.includes("warn") ? "warn" : "finding-info";
     outer.append(section);
     findings.append(outer);
   });
