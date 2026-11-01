@@ -5361,7 +5361,9 @@ def _run_windows_powershell(
     timeout: int,
     commands: list[dict] | None = None,
 ) -> tuple[dict, subprocess.CompletedProcess[bytes]]:
+    transport = None
     try:
+        transport = _windows_request_metadata(script)
         completed = _transport_powershell(
             ssh_host=ssh_host,
             script=script,
@@ -5374,7 +5376,7 @@ def _run_windows_powershell(
             "returncode": None,
             "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
             "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
-            "transport": _windows_request_metadata(script),
+            "transport": transport,
             "error_type": type(error).__name__,
         }
         if commands is not None:

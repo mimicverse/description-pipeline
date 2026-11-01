@@ -4017,6 +4017,25 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 self.assertEqual(detail["transport"], windows_transport.request_metadata("fixture"))
                 self.assertEqual(commands, [detail] if record else [])
 
+    def test_windows_unencodable_request_is_classified_before_dispatch(self) -> None:
+        commands: list[dict] = []
+        with (
+            mock.patch.object(recovery, "_transport_powershell") as dispatch,
+            self.assertRaises(recovery.RecoveryError) as raised,
+        ):
+            recovery._run_windows_powershell(
+                ssh_host="windows-fixture",
+                script="\ud800",
+                timeout=5,
+                commands=commands,
+            )
+        dispatch.assert_not_called()
+        self.assertEqual(raised.exception.code, "windows_recovery_transport_unknown")
+        self.assertEqual(raised.exception.detail["error_type"], "UnicodeEncodeError")
+        self.assertIsNone(raised.exception.detail["transport"])
+        self.assertIsNone(raised.exception.detail["returncode"])
+        self.assertEqual(commands, [raised.exception.detail])
+
     def test_recovery_propagates_bytecode_suppression_to_children(self) -> None:
         self.assertEqual(os.environ.get("PYTHONDONTWRITEBYTECODE"), "1")
         source = (DEPLOY / "recovery.py").read_text(encoding="utf-8")
