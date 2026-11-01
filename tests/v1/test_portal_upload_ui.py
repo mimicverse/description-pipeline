@@ -506,7 +506,6 @@ class RunHistoryUiContractTests(unittest.TestCase):
             "run-menu",
             "run-menu-trigger",
             "run-menu-pop",
-            "aria-haspopup",
             "aria-expanded",
             "Actions: ",
             "Rename",

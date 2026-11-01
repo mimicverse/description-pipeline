@@ -25,6 +25,7 @@ const STAGE_TEXT = {
   capture: "Capture evidence",
   generate: "Generate URDF",
   verify: "Independent verification",
+  mjcf: "Convert and verify MJCF",
   publish: "Publish review PR",
 };
 
