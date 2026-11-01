@@ -15,6 +15,7 @@ import zipfile
 from pathlib import Path
 from unittest import mock
 
+from description_pipeline import io as io_module
 from description_pipeline.delivery import PIPELINE_ID
 from description_pipeline.pipeline.contracts import NativeTargetIdentity
 
@@ -236,6 +237,29 @@ def running_windows_identity(record: dict) -> dict:
 
 
 class InstallRecordTests(unittest.TestCase):
+    def test_prepared_record_accepts_a_valid_long_basename_and_remains_create_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / ("p" * 245 + ".json")
+            target.write_bytes(b"ordinary destination control")
+            self.assertEqual(target.read_bytes(), b"ordinary destination control")
+            target.unlink()
+            record = {"install_id": "gen-1"}
+
+            self.assertEqual(install_record.write_prepared_record(target, record, io_module), target)
+
+            payload = io_module.canonical(record)
+            self.assertEqual(target.read_bytes(), payload)
+            self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(root.stat().st_mode & 0o777, 0o700)
+            with self.assertRaisesRegex(SystemExit, "prepared record already exists"):
+                install_record.write_prepared_record(target, record, io_module)
+            self.assertEqual(platform_config.atomic_write_once(target, payload), target)
+            with self.assertRaisesRegex(SystemExit, "different bytes"):
+                platform_config.atomic_write_once(target, b"different bytes")
+            self.assertEqual(target.read_bytes(), payload)
+            self.assertEqual([entry.name for entry in root.iterdir()], [target.name])
+
     def test_linux_wheelhouse_requires_release_bytes_and_confined_members(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

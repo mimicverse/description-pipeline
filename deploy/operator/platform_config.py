@@ -493,8 +493,8 @@ def atomic_write_once(path: Path, payload: bytes) -> Path:
     os.chmod(path.parent, stat.S_IRWXU)
     if path.exists():
         return _require_same_bytes(path, payload)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".part-", dir=path.parent)
+    temporary = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(payload)
