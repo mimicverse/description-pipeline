@@ -20,6 +20,7 @@ BUNDLE_SCHEMA = "description.dynamics-execution-bundle/v1"
 RUNTIME_SCHEMA = "description.assessment-runtime/v1"
 RESULT_SCHEMA = "description.dynamics-assessment-result/v1"
 DAG_ID = "upper_body_dynamics"
+POOL_ID = "dynamics_assessment"
 BUNDLE_MEMBER = "assessment.json"
 TERMINAL_STATES = frozenset({"completed", "unsupported", "failed", "cancelled", "timeout"})
 ACTIVE_STATES = frozenset({"registered", "dispatching", "queued", "running", "verifying", "sealing", "unknown"})
