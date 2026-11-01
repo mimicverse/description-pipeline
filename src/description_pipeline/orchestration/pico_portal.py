@@ -23,6 +23,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 from ..orchestration.airflow_client import native_run_id
 from ..simulation.service import SimulationService
 from ..simulation.store import SimulationConflict
+from ..simulation.tasks import run_thread
 from ..simulation.warnings import bind_warning_source
 from .portal import PortalApp, PortalError
 
@@ -39,16 +40,21 @@ class RecordingResponse(StreamingResponse):
 
     def __init__(self, archive):
         self._archive = archive
-        super().__init__(archive, media_type="application/zip", headers={
+        super().__init__(self._chunks(), media_type="application/zip", headers={
             "Cache-Control": "no-store",
             "Content-Disposition": 'attachment; filename="teleop-recording.zip"',
         })
+
+    async def _chunks(self):
+        exhausted = object()
+        while (chunk := await run_thread(next, self._archive, exhausted)) is not exhausted:
+            yield chunk
 
     async def __call__(self, scope, receive, send):
         try:
             await super().__call__(scope, receive, send)
         finally:
-            self._archive.close()
+            await run_thread(self._archive.close)
 
 
 class PicoPortal:

@@ -18,7 +18,7 @@ from .schemas import TOOL_SCHEMA
 #: staged capture/conversion pipeline: it imports packaging (stage transfer and tool records)
 #: and the pywin32 COM bindings.  numpy, PyYAML, jsonschema and python-multipart belong to
 #: the portable (Linux) surfaces (model derivation, pages, uploads, authored YAML inputs).
-#: Starlette, Uvicorn, a2wsgi and websockets serve the same authenticated portal
+#: Starlette, AnyIO, Uvicorn, a2wsgi and websockets serve the same authenticated portal
 #: and its PICO WebSocket consumer; they never enter the native endpoint closure.
 RUNTIME_PACKAGES = {
     "native": ("packaging", "pywin32"),
@@ -30,6 +30,7 @@ RUNTIME_PACKAGES = {
         "python-multipart",
         "mujoco",
         "starlette",
+        "anyio",
         "uvicorn",
         "a2wsgi",
         "websockets",
@@ -44,6 +45,7 @@ RUNTIME_VERSIONS = {
     "pywin32": "311",
     "mujoco": "3.13.0",
     "starlette": "1.6.0",
+    "anyio": "4.15.1",
     "uvicorn": "0.52.4",
     "a2wsgi": "1.10.10",
     "websockets": "16.1.1",
