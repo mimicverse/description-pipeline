@@ -51,6 +51,7 @@ from description_pipeline.sources.solidworks.capture_projection import (
     _project_link_group_mass,
     _project_mass_reading,
 )
+
 #: SolidWorks ``MathTransform.ArrayData`` order for an identity occurrence.
 SW_IDENTITY = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0)
 PLANE_XY = {"normal": [0.0, 0.0, 1.0], "point": [0.0, 0.0, 0.0]}
@@ -528,7 +529,7 @@ class _Doc:
         children=(),
         configuration_children=None,
         configuration="Default",
-        doc_type=1,
+        doc_type=None,
         show_success=True,
         show_effect=True,
         custom_property_manager=_AUTO,
@@ -539,8 +540,9 @@ class _Doc:
         self._children = list(children)
         self._configuration_children = {name: list(items) for name, items in (configuration_children or {}).items()}
         self._configuration_features = dict(configuration_features or {})
-        self._doc_type = doc_type
+        self._doc_type = doc_type if doc_type is not None else (2 if self._path.lower().endswith(".sldasm") else 1)
         self.active_configuration = configuration
+        self._initial_configuration = configuration
         self._show_success = show_success
         self._show_effect = show_effect
         self._display_states = (
@@ -564,7 +566,7 @@ class _Doc:
     def ShowConfiguration2(self, name):
         """Documented contract: boolean success, never an exception for a bad name."""
 
-        known = set(self._configuration_children) | set(self._configuration_features)
+        known = {self._initial_configuration} | set(self._configuration_children) | set(self._configuration_features)
         if not self._show_success or (name not in known and name != self.active_configuration):
             return False
         if self._show_effect:
@@ -576,6 +578,9 @@ class _Doc:
 
     def GetTitle(self):
         return os.path.basename(self._path)
+
+    def IsComponentTreeValid(self):
+        return True
 
     def GetType(self):
         return self._doc_type
@@ -835,6 +840,7 @@ class _CaptureBackend(SolidWorksBackend):
             },
         }
 
+
 def _write(root: Path, name: str) -> Path:
     path = root / name
     path.write_bytes(f"portable fixture: {name}\n".encode())
@@ -895,8 +901,6 @@ def _component_bodies3(provider):
 def _component_body_count(holder, body_type):
     body_info = types.SimpleNamespace(value=None)
     return len(holder.GetBodies3(body_type, body_info))
-
-
 
 
 @contextmanager
@@ -1415,7 +1419,7 @@ class ProducerContextTests(unittest.TestCase):
                 first_feature=_Feature("CS_tip", "CoordSys"),
             )
             arm_component = _Component(
-                "arm-1", arm_path, doc=arm_doc, transform=_sw_translation(0.0, 0.5, 0.0), configuration="Tip"
+                "arm-1", arm_path, doc=arm_doc, transform=_sw_translation(1.0, 0.5, 0.0), configuration="Tip"
             )
             sub_doc = _Doc(
                 sub_path,
@@ -1638,7 +1642,7 @@ class ProducerContextTests(unittest.TestCase):
 class SolverObservationTests(unittest.TestCase):
     """Context-bound solver readings: provenance, context binding, explicit unknowns."""
 
-    def test_solver_observation_binds_defining_context_and_keeps_reference_distinct(self) -> None:
+    def test_solver_observation_binds_main_context_and_keeps_reference_distinct(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             arm_path = _write(root, "arm.SLDPRT")
@@ -1687,7 +1691,7 @@ class SolverObservationTests(unittest.TestCase):
             nested = entries["sub-1/arm-1"]
             self.assertEqual(
                 nested["solver_observation"]["context"],
-                {"document": "sub.SLDASM", "configuration": "Sub", "scope": "sub-1"},
+                {"document": "robot.SLDASM", "configuration": "Parent", "scope": ""},
             )
             self.assertEqual(nested["solver_observation"]["solving"]["value"], 1)
             self.assertEqual(nested["solver_observation"]["constrained_status"]["value"], 2)
@@ -3193,7 +3197,7 @@ class AppearanceRawTests(_FixtureAppearanceInterfaceMixin, unittest.TestCase):
             )
             self.assertEqual(face_raw[0]["appearance"]["read_errors"], {})
 
-    def test_appearance_receiver_requires_the_exact_part_document(self) -> None:
+    def test_instance_document_type_or_path_drift_blocks_geometry(self) -> None:
         for failure in ("type", "path"):
             with self.subTest(failure=failure), TemporaryDirectory() as tmp, _com_stubs():
                 root = Path(tmp)
@@ -3218,11 +3222,7 @@ class AppearanceRawTests(_FixtureAppearanceInterfaceMixin, unittest.TestCase):
                 face.HasMaterialPropertyValues = lambda: False
                 face.GetTexture = lambda _configuration: None
                 body = _mesh_body([face], "owner-domain")
-                component = _Component(
-                    "arm-1",
-                    part,
-                    doc=part_document,
-                )
+                component = _Component("arm-1", part, doc=part_document)
                 face._fixture_component = component
                 component.GetBodies3 = _component_bodies3(
                     lambda body_type, value=body: (
@@ -3235,11 +3235,7 @@ class AppearanceRawTests(_FixtureAppearanceInterfaceMixin, unittest.TestCase):
                 component.HasMaterialPropertyValues = lambda: False
                 component.GetTexture = lambda _configuration: None
                 assembly = _write(root, "robot.SLDASM")
-                main = _Doc(
-                    assembly,
-                    doc_type=2,
-                    children=[component],
-                )
+                main = _Doc(assembly, doc_type=2, children=[component])
                 backend = _CaptureBackend(
                     session_factory=lambda path=assembly, document=main: _Session(
                         _App({path: document})
@@ -3250,21 +3246,9 @@ class AppearanceRawTests(_FixtureAppearanceInterfaceMixin, unittest.TestCase):
                     part_document._doc_type = 2
                 else:
                     part_document._path = str(other)
-                geometry = backend.capture_geometry_for_test()["arm-1"]
-                document_errors = geometry["appearance_raw"]["document"][
-                    "read_errors"
-                ]
-                self.assertTrue(
-                    any(
-                        error["code"]
-                        in {
-                            "cad_appearance_part_document_mismatch",
-                            "cad_source_state_unreadable",
-                        }
-                        for error in document_errors.values()
-                    ),
-                    document_errors,
-                )
+                with self.assertRaises(CadError) as caught:
+                    backend.capture_geometry_for_test()
+                self.assertEqual(caught.exception.code, "cad_source_changed")
 
     def test_null_material_values_follow_same_owner_presence(self) -> None:
         with TemporaryDirectory() as tmp, _com_stubs():
@@ -6492,7 +6476,7 @@ class ExplicitSelectionTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "robot.SLDASM").write_bytes(b"assembly")
-            backend = SolidWorksBackend()  # no session factory: a CAD session must not be reached
+            backend = SolidWorksBackend()
             with self.assertRaises(CadError) as invalid:
                 backend.discover_native(root, {"main_assembly": "..\\x.SLDASM"})
             self.assertEqual("native_discovery_selection_invalid", invalid.exception.code)
@@ -6791,9 +6775,8 @@ class ReferenceCycleTests(unittest.TestCase):
             group = _Feature("MateGroup", "MateGroup", first_sub=mate)
             doc = _Doc(assembly, first_feature=group, children=[component, leaf_self])
 
-            record = _read(root, _App({assembly: doc}))
             with self.assertRaises(CadError) as caught:
-                _project_sealed_record(record)
+                _read(root, _App({assembly: doc}))
             self.assertEqual(caught.exception.code, "cad_reference_cycle")
             self.assertEqual(caught.exception.detail.get("component"), "robot-2")
 
@@ -7074,7 +7057,7 @@ class MateEntityReferenceTests(unittest.TestCase):
             self.assertIn("RuntimeError: no type", projected_reference["error"])
             self.assertIsNone(projected_reference["geometry"])
 
-    def test_linux_projection_requires_proper_rigid_local_transform(self) -> None:
+    def test_linux_projection_requires_proper_rigid_world_transform(self) -> None:
         identity = SW_IDENTITY
         scaled = (*SW_IDENTITY[:12], 2.0, 0.0, 0.0, 0.0)
         reflected = (
@@ -7083,9 +7066,11 @@ class MateEntityReferenceTests(unittest.TestCase):
             *SW_IDENTITY[9:],
         )
         boolean = (True, *identity[1:])
+
         def project(values):
             return _project_native_record(
                 {
+                    "transform_frame": "main_assembly",
                     "identity": {"main_assembly": "robot.SLDASM"},
                     "components": [
                         {
@@ -7180,7 +7165,7 @@ class MateEntityReferenceTests(unittest.TestCase):
             sub_path = _write(root, "sub.SLDASM")
             arm_doc = _Doc(arm_path)
             # Child: +90 degree Z rotation plus translation (1, 2, 3) inside the sub-assembly.
-            arm_transform = (0.0, 1.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 2.0, 3.0, 1.0, 0.0, 0.0, 0.0)
+            arm_transform = (0.0, 1.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 11.0, 2.0, 3.0, 1.0, 0.0, 0.0, 0.0)
             arm_component = _Component("arm-1", arm_path, doc=arm_doc, transform=arm_transform)
             sub_reference = _Component("sub", sub_path, is_root=True)
             nested = _mate(
@@ -7434,7 +7419,7 @@ class ComponentSuppressionStateTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, "cad_component_identity_unreadable")
             self.assertEqual(caught.exception.detail["raw_name"], "")
 
-    def test_unreadable_child_transform_blocks_descent_without_fabrication(self):
+    def test_unreadable_parent_preserves_child_identity_without_fabricating_a_frame(self):
         """An unreadable occurrence transform must not become an empty parent frame.
 
         Regression for the empty-parent-transform defect: the occurrence keeps its
@@ -7458,14 +7443,10 @@ class ComponentSuppressionStateTests(unittest.TestCase):
             record = _read(root, _App({assembly: _Doc(assembly, doc_type=2, children=[broken, sibling])}))
             by_name = {item["name2"]: item for item in record["components"]}
             self.assertEqual(by_name["sub-1"]["transform_raw"], [])
-            self.assertNotIn("sub-1/leaf-1", by_name)
+            self.assertIn("sub-1/leaf-1", by_name)
             self.assertEqual(len(by_name["arm-1"]["transform_raw"]), 16)
             notes = record["notes"]
-            self.assertTrue(
-                any(note.startswith("transform:sub-1:") and "GetTotalTransform(False)" in note for note in notes),
-                notes,
-            )
-            self.assertIn("transform:sub-1:subtree_skipped_unreadable_parent", notes)
+            self.assertTrue(any(note.startswith("transform:sub-1:") for note in notes), notes)
 
 
 class ComponentSourceDocumentTests(unittest.TestCase):
@@ -8131,6 +8112,290 @@ class LinkGroupMassPropertiesTests(unittest.TestCase):
             with self.assertRaises(CadError) as caught:
                 backend.link_group_mass_properties(str(assembly), {"body": ["c-1"]})
             self.assertEqual(caught.exception.code, "cad_not_assembly")
+
+
+class NativeOccurrenceContextTests(unittest.TestCase):
+    """The real readers consume one instance domain before any document selection."""
+
+    def test_document_children_cannot_expand_the_main_instance_domain(self):
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            main_path, sub_path = _write(root, "robot.SLDASM"), _write(root, "sub.SLDASM")
+            leaf_path, document_only_path = _write(root, "leaf.SLDPRT"), _write(root, "document-only.SLDPRT")
+            leaf = _Component("sub-1/leaf-1", leaf_path)
+            document_only = _Component("document-only-1", document_only_path)
+            sub_doc = _Doc(
+                sub_path,
+                configuration="Parked",
+                doc_type=2,
+                configuration_children={"Parked": [], "Delivery": [leaf, document_only]},
+            )
+            sub = _Component("sub-1", sub_path, children=[leaf], doc=sub_doc, configuration="Delivery")
+            main = _Doc(main_path, doc_type=2, children=[sub])
+            app = _App({main_path: main, sub_path: sub_doc})
+            record = _read(root, app)
+            self.assertEqual({row["name2"] for row in record["components"]}, {"sub-1", "sub-1/leaf-1"})
+            self.assertEqual(sub_doc.active_configuration, "Parked")
+            backend = _CaptureBackend(session_factory=lambda: _Session(app))
+            backend.prepare_prepared_capture(str(root), str(main_path), "Default")
+            facts = backend.collect_prepared_scene(
+                str(main_path),
+                [],
+                groups=[{"name": "body", "components": ["sub-1/leaf-1"]}],
+                expected_occurrences=record["components"],
+            )
+            self.assertEqual([row["name"] for row in facts["scene_raw"]["components"]], ["sub-1/leaf-1"])
+            self.assertEqual(facts["link_group_mass_raw"]["links"]["body"]["selection"], ["sub-1/leaf-1"])
+            self.assertEqual(sub_doc.active_configuration, "Parked")
+
+    def test_context_delta_is_complete_and_precedes_mass(self):
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            path = _write(root, "robot.SLDASM")
+            base = _Component("base-1", _write(root, "base.SLDPRT"))
+            gone = _Component("gone-1", _write(root, "gone.SLDPRT"))
+            extra = _Component("extra-1", _write(root, "extra.SLDPRT"))
+            main = _Doc(path, children=[base, gone])
+            app = _App({path: main})
+            record = _read(root, app)
+            main._children = [base, extra]
+            base._suppression = 3
+            base.ReferencedConfiguration = "Other"
+            backend = _CaptureBackend(session_factory=lambda: _Session(app))
+            backend.prepare_prepared_capture(str(root), str(path), "Default")
+            backend._mass_properties_document = Mock(
+                side_effect=AssertionError("measurement preceded context validation")
+            )
+            with self.assertRaises(CadError) as caught:
+                backend.collect_prepared_scene(
+                    str(path),
+                    [],
+                    groups=[{"name": "body", "components": ["base-1", "gone-1"]}],
+                    expected_occurrences=record["components"],
+                )
+            self.assertEqual(caught.exception.code, "cad_occurrence_context_changed")
+            self.assertEqual(caught.exception.detail["missing"], ["gone-1"])
+            self.assertEqual(caught.exception.detail["extra"], ["extra-1"])
+            self.assertEqual(set(caught.exception.detail["changed"]["base-1"]), {"configuration", "suppression_state"})
+            backend._mass_properties_document.assert_not_called()
+
+    def test_native_drift_matrix_refuses_before_measurement(self):
+        for field in ("configuration", "document_type", "source", "suppression", "unknown_type", "unknown_state"):
+            with self.subTest(field=field), TemporaryDirectory() as tmp, _com_stubs():
+                root = Path(tmp)
+                path = _write(root, "robot.SLDASM")
+                part = _write(root, "part.SLDPRT")
+                other = _write(root, "other.SLDPRT")
+                component = _Component("part-1", part)
+                main = _Doc(path, children=[component])
+                app = _App({path: main})
+                record = _read(root, app)
+                if field == "configuration":
+                    component.ReferencedConfiguration = "Other"
+                elif field == "document_type":
+                    component._doc._doc_type = 2
+                elif field == "source":
+                    component._path, component._doc = str(other), _Doc(other)
+                elif field == "suppression":
+                    component._suppression = 0
+                elif field == "unknown_type":
+                    component._doc._doc_type = True
+                else:
+                    component._suppression = 7
+                backend = _CaptureBackend(session_factory=lambda current=app: _Session(current))
+                backend.prepare_prepared_capture(str(root), str(path), "Default")
+                backend._mass_properties_document = Mock(
+                    side_effect=AssertionError("measurement preceded the context guard")
+                )
+                with self.assertRaises(CadError) as caught:
+                    backend.collect_prepared_scene(str(path), [], groups=[{"name": "body", "components": ["part-1"]}],
+                                                   expected_occurrences=record["components"])
+                if not field.startswith("unknown"):
+                    self.assertEqual(caught.exception.code, "cad_occurrence_context_changed")
+                    expected_field = {"suppression": "suppression_state", "source": "source"}.get(field, field)
+                    self.assertIn(expected_field, caught.exception.detail["changed"]["part-1"])
+                backend._mass_properties_document.assert_not_called()
+
+    def test_tree_validity_uses_the_published_interface_and_refuses_unknown(self):
+        with _com_stubs():
+            owner = types.SimpleNamespace(IsComponentTreeValid=Mock(spec=lambda: None, return_value=True))
+            query = Mock(return_value=owner)
+            document = types.SimpleNamespace(_oleobj_=types.SimpleNamespace(QueryInterface=query))
+            native_module._require_valid_component_tree(document)
+            self.assertEqual(query.call_args.args[0], native_module.IASSEMBLYDOC_IID)
+            owner.IsComponentTreeValid.assert_called_once_with()
+            for value in (False, None, 1):
+                owner.IsComponentTreeValid.return_value = value
+                with self.subTest(value=value), self.assertRaises(CadError) as caught:
+                    native_module._require_valid_component_tree(document)
+                self.assertEqual(caught.exception.code, "cad_component_tree_invalid")
+            owner.IsComponentTreeValid.side_effect = RuntimeError("unreadable")
+            with self.assertRaises(CadError) as caught:
+                native_module._require_valid_component_tree(document)
+            self.assertEqual(caught.exception.code, "cad_component_tree_unreadable")
+
+    def test_fresh_root_precedes_validity_and_invalid_tree_never_reaches_children(self):
+        consumers = ("discover", "context", "assembly_mass", "link_mass", "component_mass", "group_mass", "current")
+        for consumer in consumers:
+            for valid_after_root in (True, False):
+                with self.subTest(consumer=consumer, valid=valid_after_root):
+                    self._check_fresh_root_consumer(consumer, valid_after_root)
+
+    def _check_fresh_root_consumer(self, consumer, valid_after_root):
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            path = _write(root, "robot.SLDASM")
+            leaf = _Component("part-1", _write(root, "part.SLDPRT"))
+            main = _Doc(path, children=[leaf])
+            app = _App({path: main})
+            backend = _CaptureBackend(session_factory=lambda: _Session(app))
+            backend.prepare_prepared_capture(str(root), str(path), "Default")
+            backend.collect_prepared_scene(
+                str(path), [], groups=[{"name": "body", "components": ["part-1"]}]
+            )
+            events = []
+            state = {"valid": False}
+
+            class FreshConfigurationManager(_ConfigurationManager):
+                def _configuration(self, name):
+                    configuration = super()._configuration(name)
+                    acquire = configuration.GetRootComponent3
+
+                    def fresh_root(resolve):
+                        self_case.assertIs(resolve, True)
+                        events.append("root")
+                        state["valid"] = valid_after_root
+                        component = acquire(resolve)
+                        children = component.GetChildren
+
+                        def read_children():
+                            events.append("children")
+                            self_case.assertIs(state["valid"], True)
+                            return children()
+
+                        component.GetChildren = read_children
+                        return component
+
+                    configuration.GetRootComponent3 = fresh_root
+                    return configuration
+
+            def validity():
+                events.append("validity")
+                return state["valid"]
+
+            def current():
+                with backend._current_components("test_fresh_root") as components:
+                    return sorted(components)
+
+            self_case = self
+            main.ConfigurationManager = FreshConfigurationManager(main)
+            main.IsComponentTreeValid = validity
+            calls = {
+                "discover": lambda: _read(root, app),
+                "context": lambda: backend._read_context_occurrences(str(path), root),
+                "assembly_mass": lambda: SolidWorksBackend.assembly_mass_properties(backend, str(path)),
+                "link_mass": lambda: SolidWorksBackend.link_group_mass_properties(
+                    backend, str(path), {"body": ["part-1"]}
+                ),
+                "component_mass": lambda: SolidWorksBackend.assembly_component_mass_properties(
+                    backend, str(path)
+                ),
+                "group_mass": lambda: SolidWorksBackend.assembly_group_mass_properties(
+                    backend, str(path), ["part-1"]
+                ),
+                "current": current,
+            }
+            if valid_after_root:
+                calls[consumer]()
+            else:
+                with self.assertRaises(CadError) as caught:
+                    calls[consumer]()
+                self.assertEqual(
+                    caught.exception.code,
+                    "cad_source_state_unreadable" if consumer == "current" else "cad_component_tree_invalid",
+                )
+                self.assertNotIn("children", events)
+            self.assertIn("validity", events)
+            for index, event in enumerate(events):
+                if event == "validity":
+                    self.assertGreater(index, 0)
+                    self.assertEqual(events[index - 1], "root")
+
+
+    def test_session_source_comparison_uses_canonical_owner_and_preserves_each_path(self):
+        from description_pipeline.sources.solidworks.occurrence_context import compare_occurrence_context
+        for virtual in (False, True):
+            with (
+                self.subTest(virtual=virtual), TemporaryDirectory() as inputs,
+                TemporaryDirectory() as cache, _com_stubs(),
+            ):
+                root = Path(inputs)
+                main_path = _write(root, "robot.SLDASM")
+                records = []
+                for pid in (21040, 21041):
+                    folder = Path(cache) / f"swx{pid}" / ("VC~~" if virtual else "IC~~")
+                    if virtual:
+                        folder = folder / "robot"
+                    folder.mkdir(parents=True)
+                    materialized = _write(folder, "part.SLDPRT")
+                    component = _Component("part-1", materialized)
+                    component.IsVirtual = virtual
+                    component.GetImportedPath = lambda: None
+                    main = _Doc(main_path, children=[component])
+                    app = _App({main_path: main})
+                    app.GetProcessID = lambda value=pid: value
+                    records.append(_read(root, app))
+                expected, observed = (record["components"] for record in records)
+                files = records[0]["files"]
+                self.assertNotEqual(expected[0]["document"], observed[0]["document"])
+                snapshot = copy.deepcopy((expected, observed))
+                compare_occurrence_context(expected, observed, native_files=files)
+                self.assertEqual((expected, observed), snapshot)
+                for field, value in (("owner_sha256", "0" * 64), ("defining_anchor", "foreign-1")):
+                    invalid = copy.deepcopy(observed)
+                    invalid[0]["source_provenance"][field] = value
+                    with self.subTest(field=field), self.assertRaises(CadError):
+                        compare_occurrence_context(expected, invalid, native_files=files)
+
+    def test_reference_axis_reads_each_instance_configuration_before_restoration(self):
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            part_path, main_path = _write(root, "shared.SLDPRT"), _write(root, "robot.SLDASM")
+            borrowed = []
+
+            class Shared(_Doc):
+                def ShowConfiguration2(self, name):
+                    if name != self.active_configuration and any(ref() is not None for ref in borrowed):
+                        raise RuntimeError("feature escaped its configuration scope")
+                    return super().ShowConfiguration2(name)
+
+            shared = Shared(part_path, configuration="Parked", configuration_children={"Short": [], "Long": []})
+
+            def feature(configuration, end):
+                def read():
+                    axis = types.SimpleNamespace(GetRefAxisParams=lambda: [0, 0, 0, end, 0, 0])
+                    result = _Feature("Axis", "RefAxis", specific=axis)
+                    borrowed.append(weakref.ref(result))
+                    return result
+
+                return read
+
+            shared._configuration_features = {"Short": feature("Short", 1), "Long": feature("Long", 2)}
+            short = _Component("short-1", part_path, doc=shared, configuration="Short")
+            long = _Component("long-1", part_path, doc=shared, configuration="Long")
+            app = _App({main_path: _Doc(main_path, children=[short, long]), part_path: shared})
+            backend = _CaptureBackend(session_factory=lambda: _Session(app))
+            backend.prepare_prepared_capture(str(root), str(main_path), "Default")
+            backend.collect_prepared_scene(
+                str(main_path), [], groups=[{"name": "body", "components": ["short-1", "long-1"]}]
+            )
+            for component, end in (("short-1", 1), ("long-1", 2)):
+                raw = backend.capture_axis_reference(
+                    {"kind": "reference_axis", "component": component, "feature_name": "Axis"}
+                )
+                self.assertEqual(raw["read_errors"], {})
+                self.assertEqual(raw["endpoints_raw"], [0, 0, 0, end, 0, 0])
+                self.assertEqual(shared.active_configuration, "Parked")
 
 
 if __name__ == "__main__":

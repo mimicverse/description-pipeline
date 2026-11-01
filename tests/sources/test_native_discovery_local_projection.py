@@ -78,8 +78,10 @@ def _rotated_z_90_with_translation() -> list[float]:
 
 
 def _record() -> dict:
-    local_arm = _rotated_z_90_with_translation()
+    world_arm = _rotated_z_90_with_translation()
+    world_arm[3] += 10.0
     return {
+        "transform_frame": "main_assembly",
         "identity": {"main_assembly": "robot.SLDASM"},
         "files": {
             "robot.SLDASM": "a" * 64,
@@ -95,9 +97,7 @@ def _record() -> dict:
                 "configuration": "Sub",
                 "suppressed": False,
                 "suppression_state": 2,
-                "transform_raw": support.solidworks_transform(
-                    _translated(10.0, 0.0, 0.0)
-                ),
+                "transform_raw": support.solidworks_transform(_translated(10.0, 0.0, 0.0)),
             },
             {
                 "name2": "sub-1/arm-1",
@@ -106,7 +106,7 @@ def _record() -> dict:
                 "configuration": "Sub",
                 "suppressed": False,
                 "suppression_state": 2,
-                "transform_raw": support.solidworks_transform(local_arm),
+                "transform_raw": support.solidworks_transform(world_arm),
             },
         ],
         "mates": [
@@ -161,9 +161,7 @@ def _record() -> dict:
                 "name": "CS_arm_link",
                 "owner": "sub-1/arm-1",
                 "configuration": "Sub",
-                "array_raw": support.solidworks_transform(
-                    _translated(0.0, 0.0, 0.5)
-                ),
+                "array_raw": support.solidworks_transform(_translated(0.0, 0.0, 0.5)),
             }
         ],
         "properties": {"document": {}, "components": {}, "mates": {}},
@@ -431,6 +429,70 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
                 strict=True,
             ):
                 self.assertAlmostEqual(actual, expected, places=12)
+
+    def test_rotated_parent_world_contract_has_independent_numeric_oracles(self):
+        parent = [0.0, -1.0, 0.0, 10.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+        child = [-1.0, 0.0, 0.0, 11.0, 0.0, -1.0, 0.0, 2.0, 0.0, 0.0, 1.0, 3.0, 0.0, 0.0, 0.0, 1.0]
+        datum = [1.0, 0.0, 0.0, 0.5, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+        raw = _record()
+        raw["saved_configuration"] = "Robot"
+        raw["components"][0]["transform_raw"] = support.solidworks_transform(parent)
+        raw["components"][1].update(configuration="Child", transform_raw=support.solidworks_transform(child))
+        raw["mates"] = [
+            {
+                "name": "point",
+                "scope": "sub-1",
+                "configuration": "Sub",
+                "suppressed": False,
+                "entities": [
+                    {
+                        "reference_name": "arm-1",
+                        "reference_document": "arm.SLDPRT",
+                        "reference_configuration": "Child",
+                        "assembly_frame": False,
+                        "mate_entity_reference": {
+                            "source": "mate-entity-params",
+                            "reference_type": 1,
+                            "reference_type2": 3,
+                            "space": "mate-assembly",
+                            "params": [2.0, 0.0, 0.0],
+                            "error": None,
+                        },
+                    }
+                ],
+            }
+        ]
+        raw["datums"] = [
+            {
+                "name": "CS",
+                "owner": "sub-1/arm-1",
+                "array_raw": support.solidworks_transform(datum),
+                "configuration": "Child",
+                "references": [],
+            }
+        ]
+        raw = seal_fixture_object_observation(raw, main_assembly="robot.SLDASM")
+        original = copy.deepcopy(raw)
+        for project in (_project_native_record, project_native_verification_record):
+            with self.subTest(project=project.__name__):
+                result = project(raw)
+                self.assertEqual(result["components"][1]["transform"], child)
+                self.assertEqual(
+                    result["mates"][0]["entities"][0]["mate_entity_reference"]["geometry"]["point"], [1.0, 0.0, -3.0]
+                )
+                self.assertEqual([result["datums"][0]["array"][i] for i in (3, 7, 11)], [10.5, 2.0, 3.0])
+        self.assertEqual(raw, original)
+
+    def test_missing_or_foreign_world_frame_is_rejected_by_both_projections(self):
+        for frame in (None, "child_document"):
+            raw = _sealed_record()
+            if frame is None:
+                raw.pop("transform_frame")
+            else:
+                raw["transform_frame"] = frame
+            for project in (_project_native_record, project_native_verification_record):
+                with self.subTest(frame=frame, project=project.__name__), self.assertRaises((CadError, _Failure)):
+                    project(raw)
 
     def test_missing_parent_is_refused_by_both_independent_projections(self) -> None:
         raw = _sealed_record()

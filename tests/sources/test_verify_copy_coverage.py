@@ -68,7 +68,7 @@ class CopyCoverageTests(unittest.TestCase):
         discovery = {
             "schema_version": NATIVE_DISCOVERY_SCHEMA,
             "run_id": "copy-coverage",
-            "contract": "native-discovery/v1",
+            "contract": "native-discovery/v2",
             "namespace": "dp",
             "identity": {
                 "main_assembly": "robot.SLDASM",

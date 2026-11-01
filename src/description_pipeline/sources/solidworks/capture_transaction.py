@@ -314,6 +314,7 @@ def capture_native_package(
             "source": source,
             "plan": plan,
             "native_files": dict(native_files),
+            "native_occurrences": raw["components"],
         }
         write_json(staging / "input/handoff.json", report)
         return definition, report, prepared_files
@@ -351,6 +352,7 @@ def capture_native_package(
         backend=backend,
         worker_version=__version__,
         expected_session_sources=expected_session_sources,
+        expected_occurrences=definition["native_occurrences"],
         on_activity=on_activity,
         resource_settlement=resource_boundary,
     )

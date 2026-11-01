@@ -368,14 +368,14 @@ class ImportedSourceTests(unittest.TestCase):
             **({"source_selection": source_selection} if isinstance(source_selection, dict) else {}),
             **extra_raw,
         }
-        raw = support.local_native_record_payload(
+        raw = support.world_native_record_payload(
             raw,
             default_mate_scope=True,
             fill_missing_parents=True,
         )
         payload = {
             "schema_version": DISCOVERY_SCHEMA,
-            "contract": "native-discovery/v1",
+            "contract": "native-discovery/v2",
             "run_id": "imported-source-test",
             "namespace": "dp",
             "handoff_sha256": (
@@ -527,6 +527,7 @@ class ImportedSourceTests(unittest.TestCase):
     def test_foreign_imported_ancestor_under_selected_container_fails(self):
         contents = {"module.SLDASM": b"module bytes", "tool_part.SLDPRT": b"tool bytes"}
         ancestor = foreign_component("module-1", containing="module.SLDASM")
+        ancestor["native_reference"] = {"defining": "module.SLDASM"}
         child = {
             "name2": "module-1/tool_part",
             "document": "tool_part.SLDPRT",
@@ -750,7 +751,9 @@ class ImportedSourceTests(unittest.TestCase):
                 slot = cached_slot(owner_sha, author_imported_error=selection_error)
                 with tempfile.TemporaryDirectory() as directory:
                     package = self._package(
-                        directory, {CACHED_OWNER: content}, [component],
+                        directory,
+                        {CACHED_OWNER: content},
+                        [component],
                         extra_raw={"source_selection": cached_carrier(owner_sha, slot)},
                     )
                     report = verify_discovery(package)
@@ -775,7 +778,9 @@ class ImportedSourceTests(unittest.TestCase):
                     (slot if target == "selection" else component["source_provenance"]).update(fields)
                     with tempfile.TemporaryDirectory() as directory:
                         package = self._package(
-                            directory, {CACHED_OWNER: content}, [component],
+                            directory,
+                            {CACHED_OWNER: content},
+                            [component],
                             extra_raw={"source_selection": cached_carrier(owner_sha, slot)},
                         )
                         report = verify_discovery(package)

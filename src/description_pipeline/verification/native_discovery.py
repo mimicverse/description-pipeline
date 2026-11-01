@@ -53,6 +53,7 @@ from ..schemas import (
     NATIVE_DISCOVERY_OPTIONAL_ENVELOPE_KEYS,
     NATIVE_DISCOVERY_RECORD_KEYS,
     NATIVE_DISCOVERY_SCHEMA,
+    NATIVE_TRANSFORM_FRAME,
     exporter_declaration_present,
     saved_native_reference_present,
 )
@@ -944,16 +945,17 @@ def _suppressed_exclusion_reason(component: dict, raw: dict, native: dict) -> st
     if parent:
         if len(parents) != 1 or parents[0].get("document") != defining:
             return "the excluded occurrence is not bound to its immediate parent"
-        configuration = parents[0].get("configuration")
     else:
         if defining != selection.get("main_assembly"):
             return "the excluded top-level occurrence names another defining assembly"
-        configuration = raw.get("saved_configuration")
     if (
-        reference.get("defining") != defining or not isinstance(context, dict)
-        or context.get("document") != defining or context.get("scope") != component.get("parent_occurrence")
-        or not isinstance(context.get("configuration"), str) or not context["configuration"]
-        or context["configuration"] != configuration
+        reference.get("defining") != defining
+        or not isinstance(context, dict)
+        or context.get("document") != selection.get("main_assembly")
+        or context.get("scope") != ""
+        or not isinstance(context.get("configuration"), str)
+        or not context["configuration"]
+        or context["configuration"] != raw.get("saved_configuration")
     ):
         return "the suppression exclusion differs from the native definition context"
     for row in components:
@@ -1676,12 +1678,14 @@ def _check_inplace_observations(mate: dict) -> None:
 
 
 def project_native_verification_record(record: dict) -> dict:
-    """Materialize a verifier-only view from preserved local native facts."""
+    """Materialize a verifier-only view from preserved world native facts."""
 
     if not isinstance(record, dict):
         raise _Failure("discovery.raw", "native discovery raw record is not an object")
     if isinstance(record, _ProjectedNativeRecord):
         return copy.deepcopy(record)
+    if record.get("transform_frame") != NATIVE_TRANSFORM_FRAME:
+        raise _Failure("discovery.world_frame", "native discovery has no explicit main-assembly transform frame")
     projected = copy.deepcopy(record)
     components = projected.get("components")
     if not isinstance(components, list):
@@ -1706,7 +1710,7 @@ def project_native_verification_record(record: dict) -> dict:
         if "transform" in component or "transform_raw" not in component:
             raise _Failure(
                 "discovery.local_transform",
-                "native occurrence must carry local transform_raw, not a normalized transform",
+                "native occurrence must carry world transform_raw, not a normalized transform",
                 {"component": name},
             )
         expected_parent = name.rsplit("/", 1)[0] if "/" in name else ""
@@ -1748,15 +1752,15 @@ def project_native_verification_record(record: dict) -> dict:
             visiting.remove(name)
             frames[name] = None
             return None
-        raw_local = component.get("transform_raw")
-        if raw_local is None:
+        raw_world = component.get("transform_raw")
+        if raw_world is None:
             visiting.remove(name)
             raise _Failure(
                 "discovery.local_transform",
                 "native occurrence transform_raw is null rather than a raw value or explicit read failure",
                 {"component": name},
             )
-        if raw_local == []:
+        if raw_world == []:
             visiting.remove(name)
             frames[name] = None
             component["transform"] = []
@@ -1768,8 +1772,7 @@ def project_native_verification_record(record: dict) -> dict:
             frames[name] = None
             component["transform"] = []
             return None
-        local = _verification_frame(raw_local)
-        world = _verification_multiply(parent_frame, local)
+        world = _verification_frame(raw_world)
         visiting.remove(name)
         frames[name] = world
         component["transform"] = [value for row in world for value in row]
@@ -4370,12 +4373,10 @@ def verify_discovery(package: Path) -> dict:
                 continue
             observed += 1
             document = component.get("document")
-            observation = component.get("solver_observation")
-            context = observation.get("context") if isinstance(observation, dict) else None
             entry = {
                 "occurrence": str(component.get("name2") or ""),
                 "document": document,
-                "containing_document": context.get("document") if isinstance(context, dict) else None,
+                "containing_document": (component.get("native_reference") or {}).get("defining"),
                 "native_path": provenance.get("native_document_path") if isinstance(provenance, dict) else None,
                 "imported_path": provenance.get("imported_path") if isinstance(provenance, dict) else None,
             }
@@ -4407,7 +4408,12 @@ def verify_discovery(package: Path) -> dict:
                 )
                 if reason is not None:
                     unbound.append(
-                        {**entry, "state": provenance.get("state"), "reason": reason, "error": provenance.get("error")}
+                        {
+                            **entry,
+                            "state": provenance.get("state"),
+                            "reason": reason,
+                            "error": provenance.get("error"),
+                        }
                     )
                 continue
             if provenance.get("state") == "embedded_virtual_component":
@@ -4416,7 +4422,12 @@ def verify_discovery(package: Path) -> dict:
                 )
                 if reason is not None:
                     unbound.append(
-                        {**entry, "state": provenance.get("state"), "reason": reason, "error": provenance.get("error")}
+                        {
+                            **entry,
+                            "state": provenance.get("state"),
+                            "reason": reason,
+                            "error": provenance.get("error"),
+                        }
                     )
                 continue
             reason = None

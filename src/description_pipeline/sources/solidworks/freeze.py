@@ -827,6 +827,7 @@ def _capture_prepared_local(
     backend: Any,
     worker_version: str,
     expected_session_sources: Mapping[str, str] | None = None,
+    expected_occurrences=None,
     on_activity=None,
 ) -> dict[str, Any]:
     """Capture one already sealed prepared assembly in a single owned session."""
@@ -948,6 +949,7 @@ def _capture_prepared_local(
             cfg["coordinate_systems"],
             groups=cfg["groups"],
             expected_session_sources=expected_session_sources or {},
+            expected_occurrences=expected_occurrences,
             native_files=native_files,
             on_activity=activity.publish,
             require_material=True,
@@ -1084,6 +1086,7 @@ def _capture_prepared_local(
     finally:
         activity.stop_keepalive()
 
+
 def capture_prepared(
     config: dict[str, Any],
     destination: Path,
@@ -1094,6 +1097,7 @@ def capture_prepared(
     backend: Any,
     worker_version: str,
     expected_session_sources: Mapping[str, str] | None = None,
+    expected_occurrences=None,
     on_activity=None,
     resource_settlement: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -1109,5 +1113,6 @@ def capture_prepared(
             backend=backend,
             worker_version=worker_version,
             expected_session_sources=expected_session_sources,
+            expected_occurrences=expected_occurrences,
             on_activity=on_activity,
         )

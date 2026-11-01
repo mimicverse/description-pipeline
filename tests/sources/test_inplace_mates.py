@@ -62,7 +62,7 @@ def native_record(mate):
                 )
 
     rewrite(raw, namespace_types)
-    raw = support.local_native_record_payload(raw, default_mate_scope=True)
+    raw = support.world_native_record_payload(raw, default_mate_scope=True)
     raw["mates"].append(copy.deepcopy(mate))
     return raw
 

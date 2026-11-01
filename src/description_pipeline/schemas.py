@@ -33,12 +33,13 @@ NATIVE_SCENE_RAW_KEYS = frozenset(
         "document",
         "configuration",
         "occurrences",
+        "transform_frame",
         "components",
         "coordinate_systems",
     }
 )
 NATIVE_CAPTURE_OBSERVATION_SCHEMA = (
-    "solidworks-to-urdf.native-capture-facts/v2"
+    "solidworks-to-urdf.native-capture-facts/v3"
 )
 NATIVE_CAPTURE_OBSERVATION_KEYS = frozenset(
     {
@@ -56,7 +57,9 @@ CAPTURE_EVIDENCE_REQUESTS = (
     "evidence/raw/dependency_closure.json",
     "evidence/raw/triangles/",
 )
-NATIVE_DISCOVERY_SCHEMA = "solidworks-to-urdf.native-discovery/v1"
+NATIVE_DISCOVERY_SCHEMA = "solidworks-to-urdf.native-discovery/v2"
+NATIVE_TRANSFORM_FRAME = "main_assembly"
+NATIVE_DISCOVERY_CONTRACT = "native-discovery/v2"
 SAVED_NATIVE_REFERENCE_RULE = "inspection_saved_native_carrier/v1"
 SAVED_NATIVE_REFERENCE_POSITION_TOL_M = 1e-7
 SAVED_NATIVE_REFERENCE_DOT_TOL = 1e-8

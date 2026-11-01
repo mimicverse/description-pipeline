@@ -6,7 +6,7 @@ import hashlib
 from pathlib import Path
 
 from ...io import PipelineError, _physical_path, artifact_path_parts, digest, read_data
-from ...schemas import CAPTURE_EVIDENCE_REQUESTS
+from ...schemas import CAPTURE_EVIDENCE_REQUESTS, NATIVE_DISCOVERY_SCHEMA, NATIVE_TRANSFORM_FRAME
 from .discovery import (
     DISCOVERY_FILE,
     PLAN_FILE,
@@ -334,6 +334,11 @@ def consume_sealed_definition(package: Path) -> tuple[dict, dict]:
             "The sealed capture plan names another project entry than the sealed discovery"
         )
     record = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
+    if (
+        payload.get("schema_version") != NATIVE_DISCOVERY_SCHEMA
+        or record.get("transform_frame") != NATIVE_TRANSFORM_FRAME
+    ):
+        raise PipelineError("The sealed discovery does not use the current main-assembly raw contract")
     raw_selection = record.get("source_selection")
     bindings = selection_bindings(raw_selection)
     if (
@@ -392,6 +397,12 @@ def consume_sealed_definition(package: Path) -> tuple[dict, dict]:
         zip(component_names, component_rows, strict=True)
     )
     registered = set(raw_documents)
+    from .errors import CadError
+    from .occurrence_context import validate_occurrence_context
+    try:
+        validate_occurrence_context(component_rows)
+    except CadError as error:
+        raise PipelineError("The sealed discovery lacks current native occurrence facts") from error
     objects = plan.get("objects")
     if not isinstance(objects, list) or not objects:
         raise PipelineError(
@@ -575,9 +586,7 @@ def consume_sealed_definition(package: Path) -> tuple[dict, dict]:
     datums = plan.get("datums")
     if (
         not isinstance(datums, list)
-        or any(
-            not isinstance(item, str) or not item for item in datums
-        )
+        or any(not isinstance(item, str) or not item for item in datums)
         or len(set(datums)) != len(datums)
     ):
         raise PipelineError(

@@ -300,7 +300,7 @@ def capture_root(
     )
     package_files["source.json"] = file_digest(root / "input/source.json")
     discovery = {
-        "schema_version": "solidworks-to-urdf.native-discovery/v1",
+        "schema_version": "solidworks-to-urdf.native-discovery/v2",
         "run_id": run_id,
         "derivation": {
             "main_assembly": main,
@@ -1246,7 +1246,9 @@ class StageTransferTests(unittest.TestCase):
         write_json(mutated_facts, facts)
         payload = mutated_facts.read_bytes()
         with zipfile.ZipFile(self.archive) as source:
-            evidence_manifest = json.loads(source.read("evidence/manifest.json"))
+            evidence_manifest = json.loads(
+                source.read("evidence/manifest.json")
+            )
         evidence_manifest["files"]["raw/native_capture_facts.json.gz"] = hashlib.sha256(
             payload
         ).hexdigest()
@@ -1979,10 +1981,7 @@ class StageTransferTests(unittest.TestCase):
         manifest["total_bytes"] += 1
         receipts["transfer_manifest_bytes"] = canonical(manifest)
         with self.assertRaisesRegex(PipelineError, "size differs"):
-            _verify_transfer(
-                destination,
-                native_receipts=receipts,
-            )
+            _verify_transfer(destination, native_receipts=receipts)
 
     def test_source_record_is_required_and_cross_bound(self) -> None:
         missing = capture_root(self.base / "missing-source")
@@ -2294,9 +2293,7 @@ class StageTransferTests(unittest.TestCase):
                 report["input_receipt"]["inventory"]["extra.SLDPRT"] = file_digest(extra)
                 report["package_files"]["cad/extra.SLDPRT"] = file_digest(extra)
                 write_json(report_path, report)
-                discovery_path = (
-                    root / "input/discovery/native-discovery.json"
-                )
+                discovery_path = root / "input/discovery/native-discovery.json"
                 discovery = read_data(discovery_path)
                 if added:
                     discovery["native_files"]["extra.SLDPRT"] = "0" * 64
