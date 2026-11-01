@@ -68,6 +68,9 @@ sys.path[:] = [
     *(entry for entry in sys.path if entry != release_source),
 ]
 
+from description_pipeline.dynamics_assessment.queries import (  # noqa: E402
+    read_lifecycle_rows as read_assessment_lifecycle_rows,
+)
 from description_pipeline.pipeline.contracts import RunStatus  # noqa: E402
 from description_pipeline.platform.facts import read_admitted_runs  # noqa: E402
 
@@ -1636,6 +1639,30 @@ def _roles_settings_snapshot(connection) -> dict:
 
 
 def _maintenance_probe(connection) -> dict:
+    """Read admission, business and scheduler facts in one consistent snapshot."""
+    if connection.get_transaction_status() == _psycopg2().extensions.TRANSACTION_STATUS_IDLE:
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY" if connection.autocommit
+                    else "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+                )
+            return _maintenance_probe_snapshot(connection)
+        finally:
+            if connection.autocommit:
+                with connection.cursor() as cursor:
+                    cursor.execute("ROLLBACK")
+            else:
+                connection.rollback()
+    require(
+        _connection_scalar(connection, "SHOW transaction_isolation") in {"repeatable read", "serializable"},
+        "recovery_database_readback_failed",
+        "maintenance probe requires a consistent caller snapshot",
+    )
+    return _maintenance_probe_snapshot(connection)
+
+
+def _maintenance_probe_snapshot(connection) -> dict:
     status = _connection_json(connection, MAINTENANCE_QUERY)
     run_rows = read_admitted_runs(connection)
     scheduling_rows = _connection_json(
@@ -1681,6 +1708,7 @@ def _maintenance_probe(connection) -> dict:
         for row in scheduling_rows
         if isinstance(row, dict) and row.get("bucket") != "terminal"
     )
+    unsettled.extend(row for row in read_assessment_lifecycle_rows(connection) if row["bucket"] != "terminal")
     return {
         "admission": status["admission"],
         "settled": not unsettled,

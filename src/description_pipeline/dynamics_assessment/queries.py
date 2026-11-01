@@ -7,7 +7,15 @@ from pathlib import Path
 from ..artifacts import ArtifactStore
 from ..artifacts.store import path_has_link_ancestor
 from ..pipeline.contracts import ArtifactRef
-from .contracts import AssessmentRequest, MemberRef, RESULT_SCHEMA, parse_json, require
+from .contracts import (
+    RESULT_SCHEMA,
+    TERMINAL_STATES,
+    AssessmentRequest,
+    MemberRef,
+    parse_json,
+    project_attempt,
+    require,
+)
 
 
 def _rows(connection, query: str, parameters=()) -> list[dict]:
@@ -15,6 +23,41 @@ def _rows(connection, query: str, parameters=()) -> list[dict]:
         cursor.execute(query, parameters)
         fields = [field[0] for field in cursor.description]
         return [dict(zip(fields, values, strict=True)) for values in cursor.fetchall()]
+
+
+def read_lifecycle_rows(connection) -> list[dict]:
+    """Classify shared attempt projections without opening another transaction."""
+    rows = _rows(
+        connection,
+        "SELECT attempt.*,attempt.lease_until<=now() AS lease_expired,request.source_run_id "
+        "FROM assessment_attempt attempt JOIN assessment_request request "
+        "ON request.request_id=attempt.request_id ORDER BY attempt.attempt_id",
+    )
+    projected = []
+    for record in rows:
+        attempt = project_attempt(record)
+        settled = attempt["resources_settled"]
+        require(
+            type(settled) is bool and settled == (attempt["state"] in TERMINAL_STATES),
+            "Assessment resource settlement differs from its terminal state",
+        )
+        bucket = (
+            "unresolved" if attempt["state"] == "unknown"
+            else "terminal" if settled else "in_flight"
+        )
+        projected.append(
+            {
+                "object_kind": "assessment",
+                "object_id": attempt["attempt_id"],
+                "run_id": attempt["source_run_id"],
+                "state": attempt["state"],
+                "bucket": bucket,
+                "updated_at": attempt["updated_at"],
+                "resources_settled": settled,
+                "detail": attempt["detail"],
+            }
+        )
+    return projected
 
 
 def _registered_artifacts(connection, identities) -> dict[str, ArtifactRef]:
@@ -45,7 +88,9 @@ def read_recovery_artifacts(connection, artifact_root: Path) -> tuple[ArtifactRe
         return ()
     root = Path(artifact_root)
     require(
-        root.is_absolute() and root.is_dir() and (root / "objects").is_dir()
+        root.is_absolute()
+        and root.is_dir()
+        and (root / "objects").is_dir()
         and not path_has_link_ancestor(root / "objects"),
         "Assessment recovery artifact root is missing or unsafe",
     )

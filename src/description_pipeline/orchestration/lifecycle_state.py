@@ -17,6 +17,7 @@ import json
 import os
 import sys
 
+from ..dynamics_assessment.queries import read_lifecycle_rows as read_assessment_lifecycle_rows
 from ..pipeline.contracts import RunStatus
 from ..platform.facts import read_admitted_runs
 
@@ -75,6 +76,7 @@ def collect_projection() -> dict:
             )
             columns = [description[0] for description in cursor.description]
             rows = [dict(zip(columns, values, strict=True)) for values in cursor.fetchall()]
+            rows.extend(read_assessment_lifecycle_rows(connection))
             cursor.execute("SELECT session_id,source_run_id,state,updated_at FROM simulation_session "
                            "WHERE state NOT IN ('stopped','failed')")
             rows.extend({"object_kind": "simulation", "object_id": sid, "run_id": source,
