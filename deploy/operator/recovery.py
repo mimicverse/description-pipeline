@@ -9605,12 +9605,8 @@ def copy_extracted_directory(
             f"target root became nonempty: {target}",
         )
         target.rmdir()
-    partial = target.with_name(f".{target.name}.{os.getpid()}.partial")
-    require(
-        not path_exists(partial),
-        "recovery_target_not_empty",
-        f"partial target path already exists: {partial}",
-    )
+    staging = Path(tempfile.mkdtemp(prefix=".part-", dir=target.parent))
+    partial = staging / "tree"
     try:
         copy_tree_strict(source, partial)
         modes = {
@@ -9633,9 +9629,9 @@ def copy_extracted_directory(
         )
         os.replace(partial, target)
     finally:
-        if path_exists(partial):
+        if path_exists(staging):
             with contextlib.suppress(OSError, SystemExit):
-                _remove_staging_tree(partial)
+                _remove_staging_tree(staging)
 
 
 def restore_directories(
@@ -9682,13 +9678,10 @@ def restore_exact_files(
             f"exact file target already exists: {target}",
         )
         target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        partial = target.with_name(f".{target.name}.{os.getpid()}.partial")
-        require(
-            not path_exists(partial),
-            "recovery_target_not_empty",
-            f"secret partial path already exists: {partial}",
-        )
+        descriptor, temporary_name = tempfile.mkstemp(prefix=".part-", dir=target.parent)
+        partial = Path(temporary_name)
         try:
+            os.close(descriptor)
             shutil.copy2(source, partial)
             os.chmod(partial, entry["mode"])
             os.replace(partial, target)
@@ -10597,19 +10590,13 @@ def restore_workspaces(manifest: dict, extracted: Path, *, verify_only: bool) ->
         )
         require_no_links(target.parent, "workspace target parent")
         target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        partial = target.parent / f".{target.name}.{os.getpid()}.partial"
-        require(
-            not path_exists(partial),
-            "recovery_target_not_empty",
-            f"workspace partial target already exists: {partial}",
-        )
         try:
-            _materialize_workspace(bundle, partial, row)
-            os.replace(partial, target)
-            _workspace_verify(target, row)
+            with tempfile.TemporaryDirectory(prefix=".part-", dir=target.parent) as staging:
+                partial = Path(staging) / "tree"
+                _materialize_workspace(bundle, partial, row)
+                os.replace(partial, target)
+                _workspace_verify(target, row)
         except (OSError, subprocess.SubprocessError, RecoveryError) as error:
-            if path_exists(partial):
-                _remove_staging_tree(partial)
             raise RecoveryError(
                 "recovery_workspace_failed",
                 f"workspace reconstruction failed: {row['repository_slug']}",

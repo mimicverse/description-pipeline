@@ -2265,10 +2265,20 @@ class RecoveryControlFlowTests(unittest.TestCase):
 
     def test_workspace_bundle_roundtrip_is_offline_and_verified(self) -> None:
         extracted, origin, manifest = self.workspace_bundle()
+        target = self.root / "workspace-targets" / ("w" * 250)
+        target.mkdir(parents=True)
+        write(target / "control", "ordinary destination control\n")
+        self.assertEqual((target / "control").read_text(), "ordinary destination control\n")
+        (target / "control").unlink()
+        target.rmdir()
+        plan_path = extracted / "reconstruct" / "workspace-plan.json"
+        plan = json.loads(plan_path.read_text())
+        plan["repositories"][0]["path"] = str(target)
+        plan_path.write_bytes(recovery.canonical_json(plan))
         origin.rename(self.root / "workspace-origin-unavailable.git")
         recovery.restore_workspaces(manifest, extracted, verify_only=False)
-        target = self.root / "workspace-targets" / "workspace-source"
         self.assertEqual((target / "tracked.txt").read_text(), "restored\n")
+        self.assertEqual(list(target.parent.iterdir()), [target])
         self.assertEqual(
             subprocess.check_output(
                 ["git", "-C", str(target), "remote", "get-url", "origin"],
@@ -2286,6 +2296,22 @@ class RecoveryControlFlowTests(unittest.TestCase):
             text=True,
         )
         self.assertEqual(before, after)
+
+    def test_workspace_clone_failure_removes_owned_staging(self) -> None:
+        extracted, _, manifest = self.workspace_bundle()
+        plan_path = extracted / "reconstruct" / "workspace-plan.json"
+        plan = json.loads(plan_path.read_text())
+        row = plan["repositories"][0]
+        bundle = extracted / row["bundle_member"]
+        bundle.write_bytes(b"invalid private fixture bundle\n")
+        row["bundle_sha256"] = recovery.sha256_file(bundle)
+        plan_path.write_bytes(recovery.canonical_json(plan))
+        with self.assertRaises(recovery.RecoveryError) as raised:
+            recovery.restore_workspaces(manifest, extracted, verify_only=False)
+        self.assertEqual(raised.exception.code, "recovery_workspace_failed")
+        self.assertFalse(Path(row["path"]).exists())
+        self.assertEqual(list(Path(row["path"]).parent.iterdir()), [])
+        self.assertEqual(bundle.read_bytes(), b"invalid private fixture bundle\n")
 
     def test_workspace_restore_refuses_a_preexisting_target(self) -> None:
         extracted, _, manifest = self.workspace_bundle()
@@ -4536,6 +4562,78 @@ class RecoveryControlFlowTests(unittest.TestCase):
                     action()
                 self.assertEqual(raised.exception.code, "recovery_target_path_unsafe")
                 self.assertEqual(list(external.iterdir()), [])
+
+    def test_exact_file_and_directory_restore_accept_valid_long_basenames(self):
+        source = self.root / "long-name-source"
+        payload = b"exact archived bytes\n"
+        archived = write(source / "secret", payload)
+        target_parent = self.root / "long-name-targets"
+        target_parent.mkdir()
+        file_target = target_parent / ("f" * 245 + ".json")
+        file_target.write_bytes(payload)
+        self.assertEqual(file_target.read_bytes(), payload)
+        file_target.unlink()
+        manifest = {"files": [{"name": "platform_config", "member": "secret",
+            "path": str(file_target), "mode": 0o600}], "secrets": []}
+        recovery.restore_exact_files(manifest, source)
+        self.assertEqual(file_target.read_bytes(), payload)
+        self.assertEqual(stat.S_IMODE(file_target.stat().st_mode), 0o600)
+
+        directory_target = target_parent / ("d" * 250)
+        directory_target.mkdir()
+        write(directory_target / "control", payload)
+        self.assertEqual((directory_target / "control").read_bytes(), payload)
+        (directory_target / "control").unlink()
+        members = [{"member": "state", "type": "directory", "mode": 0o750},
+            {"member": "state/secret", "type": "file", "mode": 0o640}]
+        recovery.copy_extracted_directory(source, directory_target, members, "state")
+        self.assertEqual((directory_target / "secret").read_bytes(), payload)
+        self.assertEqual(stat.S_IMODE(directory_target.stat().st_mode), 0o750)
+        self.assertEqual(stat.S_IMODE((directory_target / "secret").stat().st_mode), 0o640)
+        self.assertEqual(set(target_parent.iterdir()), {file_target, directory_target})
+        self.assertEqual(archived.read_bytes(), payload)
+        for action in (
+            lambda: recovery.restore_exact_files(manifest, source),
+            lambda: recovery.copy_extracted_directory(source, directory_target, members, "state"),
+        ):
+            with self.subTest(action=action):
+                with self.assertRaises(recovery.RecoveryError) as raised:
+                    action()
+                self.assertEqual(raised.exception.code, "recovery_target_not_empty")
+        self.assertEqual(file_target.read_bytes(), payload)
+        self.assertEqual((directory_target / "secret").read_bytes(), payload)
+
+    def test_failed_file_and_directory_restore_remove_owned_staging(self):
+        source = self.root / "failed-copy-source"
+        archived = write(source / "secret", b"archived bytes\n")
+        target_parent = self.root / "failed-copy-targets"
+        target_parent.mkdir()
+        file_target = target_parent / "file.json"
+        manifest = {"files": [{"name": "platform_config", "member": "secret",
+            "path": str(file_target), "mode": 0o600}], "secrets": []}
+
+        def fail_file_copy(source, partial):
+            Path(partial).write_bytes(b"incomplete file")
+            raise OSError("private fixture file copy failed")
+
+        with (
+            mock.patch.object(recovery.shutil, "copy2", side_effect=fail_file_copy),
+            self.assertRaisesRegex(OSError, "file copy failed"),
+        ):
+            recovery.restore_exact_files(manifest, source)
+        self.assertEqual(list(target_parent.iterdir()), [])
+
+        def fail_tree_copy(source, partial):
+            write(partial / "incomplete", b"incomplete directory")
+            raise OSError("private fixture directory copy failed")
+
+        with (
+            mock.patch.object(recovery, "copy_tree_strict", side_effect=fail_tree_copy),
+            self.assertRaisesRegex(OSError, "directory copy failed"),
+        ):
+            recovery.copy_extracted_directory(source, target_parent / "tree", [], "state")
+        self.assertEqual(list(target_parent.iterdir()), [])
+        self.assertEqual(archived.read_bytes(), b"archived bytes\n")
 
     def test_restore_refuses_public_or_link_keys_before_extraction(self):
         out, manifest = self.backup()
