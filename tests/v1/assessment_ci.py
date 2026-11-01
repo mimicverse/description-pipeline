@@ -25,7 +25,10 @@ def main(argv=None) -> int:
     python = Path(location)
     if not python.is_absolute() or not python.is_file():
         parser.error("The fixed assessment interpreter must be an existing absolute file")
-    suite = unittest.defaultTestLoader.loadTestsFromNames(args.tests or TEST_NAMES)
+    try:
+        suite = unittest.defaultTestLoader.loadTestsFromNames(args.tests or TEST_NAMES)
+    except unittest.SkipTest as error:
+        parser.exit(1, "The required assessment software suite must not skip selected tests: " + str(error) + "\n")
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     if result.skipped:
         parser.exit(1, "The required assessment software suite must not skip selected tests\n")
