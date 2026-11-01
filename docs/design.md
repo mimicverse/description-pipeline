@@ -41,7 +41,7 @@ flowchart LR
 | PostgreSQL `FactStore` | 接纳、命令、执行权、effect 与阶段决定 | artifact 文件内容和 Airflow 调度状态 |
 | `ArtifactStore` | 不可变文件集合、manifest、摘要及物化 | 运行成功、阶段决定和业务显示状态 |
 
-Linux 完成上传与 Freeze 后，Windows 为 Discover 和 Capture 分别物化受控输入、建立并释放自己的原生会话。Discover 在同一个自有会话中打开指定主装配，从同次观察形成来源闭包和机械事实；搜索环境恢复与会话释放完成后才封存和裁剪目录。Capture 仍需依据 prepared 计划读取分组物性与轴等原生事实，不把两阶段合成跨 operation 的长驻会话。Linux 接纳 Capture 时只核必要字节、schema、身份、scope 和计划绑定；Generate 执行一次语义投影。SourceSet archive 与 prepared archive 分别绑定摘要并证明同一原件血缘，等待 Linux 时不占用 CAD。
+Linux 完成上传与 Freeze 后，Windows 为 Discover 和 Capture 分别完整物化已接纳 SourceSet、建立并释放自己的原生会话。Discover 在同一个自有会话中打开指定主装配，从同次观察形成对象绑定和机械事实，搜索环境恢复与会话释放后封存。SourceSet 是文件字节唯一权威；组件图只约束实际对象、owner、配置、拓扑和导出范围，不能决定文件保留范围。`raw.files` 记录全部可用输入的字节身份，不声称未打开文件已获得机械观察。Capture 仍需依据 prepared 计划读取分组物性与轴等原生事实，不把两阶段合成跨 operation 的长驻会话。Linux 接纳 Capture 时核必要字节、schema、身份、scope 和计划绑定；Generate 执行一次语义投影。完整 SourceSet 与含生成 metadata 的 prepared archive 分别绑定必要摘要并证明同一原件血缘，等待 Linux 时不占用 CAD。
 
 Windows 工作目录直接使用已登记的唯一 claim，不在路径中重复嵌套 operation 标识，输入相对路径与字节保持原样。Capture 发生异常时，原生会话边界按实际释放结果记录资源结算；成功释放后的领域失败与清理未证明的 UNKNOWN 分开处理。原始结构化错误通过既有失败链保留至 GUI，不用笼统超时替代已收到的失败响应。
 

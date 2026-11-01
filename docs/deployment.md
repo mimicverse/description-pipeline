@@ -302,6 +302,8 @@ fact/decision、不取消外部操作。401/403、`native_operation_identity_mis
 
 从已有运行重跑阶段时，`/api/runs/<parent>/attempts` 提交 `from_stage/through_stage`，调用唯一 `load_production_stage_rerun(...)`。Freeze 只复用已核 originals；其他阶段沿同一来源职责核验实际必要前缀及 producer。所有入口仍经 `StageApplication.admit/dispatch`、共同 claim/fence 与 technical dispatch 授权。Portal 不构造 `VerifiedArtifact`，不创建第二 Factory，不把 GUI 的 eligible 或调度 skipped 当作资格。提交响应未知时保留同一正文、幂等键和原 DagRun，刷新后继续精确对账；不能编辑待确认正文并另建执行。
 
+Discover/Capture 完整保留已接纳原件，不按组件图删减底层支持文件。输入覆盖需要重新建立时，从最早受影响的 Discover 发起新不可变请求，可复用已核实的完整 Freeze/CAS 原件，无需重新上传；旧失败、输入和证据保持不变。新的原生执行仍由唯一 CAD 操作者按当次 exact runner 授权执行，离线保全探针不能代替真实观察。
+
 方向验收绑定本次 CAD、规则版本、固定代码提交及实际交付：先核对全部关节的原值、作者声明绑定、必要坐标转换和未解决项，再通过门户预览执行有效范围内的非零运动，验证 CAD 运动语义、零位及范围的一致性。当前不发布基于右手定则或功能动作的新正向推导规则，历史试算不作为通过证据。必须注入共享 `status=local_class_aligned` 而作者正向证据仍缺失的负例，证明 Discovery、Generate、独立验证、模型来源、URDF、报告、预览和 PR 均保留同一
 `direction.semantics_unresolved` warning；同时核对 axis／xyz／rpy／limits、封存
 Capture bytes 和 `machine_qualification` 不受 warning 影响。生成与独立工程验证只取得

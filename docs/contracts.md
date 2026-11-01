@@ -12,8 +12,8 @@ CAD 提供工程事实，版本化规则负责规范化、派生与有依据的�
 | 对象 | 定义与不变量 |
 |---|---|
 | `handoff_digest` | 封存上传文件清单的摘要；主装配相对路径另行固定 |
-| 原生传输 `handoff_sha256` | 已封存选择的原生依赖闭包摘要；有未选文件时不等于完整上传摘要，不等于含生成身份与规格文件的制备包摘要 |
-| 阶段收据 `handoff_sha256` | `freeze` 绑定完整上传索引；原生阶段及其生成、验证、发布后继绑定原生传输选择身份。复用保留原生产者的同一绑定 |
+| 原生传输 `handoff_sha256` | 完整已接纳上传清单的摘要，与 `upload_sha256` 及原请求 `handoff_digest` 一致；不等于含生成身份与规格文件的制备包摘要 |
+| 阶段收据 `handoff_sha256` | 各阶段均绑定同一完整上传身份；复用保留原生产者的同一绑定 |
 | `source_revision_id` | 工程内容身份：完整上传清单摘要、主装配、交付配置、选定硬件标识及实际引用的受控记录摘要的规范对象之 SHA-256；使用完整 64 位十六进制值 |
 | 工程修订 | CAD/PDM 编写的版本标签及受控原件引用；保持原值与缺项，不用内容摘要冒充工程修订 |
 | `request_id` | 一次认证提交的稳定标识；请求封存后不可变，绑定用途、目标配置、七阶段 executor、native tool source/record、契约/检查/资源策略摘要与发布前置基线 |
@@ -826,7 +826,9 @@ reports/verification-execution.json
 reports/mjcf-certificate.json
 ```
 
-每个原生文件、观察、实例、物理读数和网格都必须能够追溯到主装配、配置和对应来源。完整上传清单留存所有上传字节的身份；模型交付只携带经原生绑定核验的依赖闭包。完整上传原件另外保存在平台冻结存储中。
+所有已接纳原件始终完整保留，Discover/Capture 和模型交付不能按组件图删减支持文件。`selection.files` 与 `raw.files` 绑定完整可用输入，`upload_sha256` 是该清单的内容摘要；实际归档清单还须与原请求 `handoff_digest` 复算一致，不维护 selected/excluded 子集或另一份子集摘要。
+
+可用文件不等于已观察对象。组件图、原生实例、配置、会话与 owner 约束实际对象读取、绑定、拓扑及导出范围；物理读数与网格须追溯到相应原生证据。warning 的 `actual_scope.input_files` 仅表示可用输入，graph 与 occurrences 才记录对象观察，不能宣称未打开文件已获得机械资格。
 
 `input/` 与 `evidence/` 由 Capture admitted tree 原字节提供；Generate 只增加 `model/`、
 `urdf/`、`meshes/` 和 `tool.json`，Verify 只增加两个 verification 文件；MJCF 增加实际转换资源和独立证书。Publish
