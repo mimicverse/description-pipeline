@@ -17,7 +17,7 @@ from .contracts import AssessmentConflict, RuntimePin, require
 # This code is part of the assessment executor bytes. It receives only data,
 # validates the installed runtime, and delegates execution to Teleop.
 BOOTSTRAP = r"""
-import hashlib, importlib.metadata, importlib.util, json, os, resource, runpy, sys
+import hashlib, json, os, resource, runpy, sys
 from pathlib import Path
 try:
     gate = json.loads(sys.stdin.readline())
@@ -31,25 +31,18 @@ try:
     pin = gate["runtime"]
     if sys.version_info[:2] != (3, 12):
         raise ValueError("Assessment runtime requires CPython 3.12")
-    spec = importlib.util.find_spec("teleop")
-    if spec is None or spec.origin is None:
-        raise ValueError("Fixed Teleop distribution is not installed")
-    root = Path(spec.origin).resolve().parent.parent
-    actual_names = {p.relative_to(root).as_posix() for p in (root / "teleop").rglob("*")
-                    if p.is_file() and p.suffix not in {".pyc", ".pyo"} and "__pycache__" not in p.parts}
-    if actual_names != set(pin["files"]):
-        raise ValueError("Installed Teleop file inventory differs from the fixed runtime")
-    for name, expected in pin["files"].items():
-        path = root / name
-        if path.is_symlink() or not path.resolve().is_relative_to(root):
-            raise ValueError("Installed Teleop file escapes the fixed runtime")
-        if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
-            raise ValueError("Installed Teleop file digest differs: " + name)
-    versions = {name: importlib.metadata.version(name) for name in pin["dependency_versions"]}
-    if versions != pin["dependency_versions"]:
-        raise ValueError("Installed dependency versions differ from the fixed runtime")
+    helper_path = Path(gate["runtime_checker"]["path"])
+    helper_bytes = helper_path.read_bytes()
+    if hashlib.sha256(helper_bytes).hexdigest() != gate["runtime_checker"]["sha256"]:
+        raise ValueError("Assessment runtime checker differs from the fixed executor")
+    api = {"__file__": str(helper_path), "__name__": "_assessment_runtime_checker"}
+    exec(compile(helper_bytes, str(helper_path), "exec"), api)
+    contract = {key: value for key, value in pin.items() if key != "schema"}
+    contract["schema_version"] = api["RUNTIME_CONTRACT_SCHEMA"]
+    identity = api["verify_runtime_contract"](contract)
     Path(gate["runtime_receipt"]).write_text(json.dumps({
-        "runtime": pin, "python": sys.version, "teleop_root": str(root), "versions": versions
+        "runtime": pin, "python": sys.version, "identity": identity,
+        "runtime_checker_sha256": gate["runtime_checker"]["sha256"]
     }, sort_keys=True) + "\n")
 except Exception as error:
     print(json.dumps({"assessment_error": "runtime_identity", "error": str(error)}), flush=True)
@@ -89,6 +82,9 @@ class ProcessLimits:
         require(type(self.output_bytes) is int and self.output_bytes > 0, "Assessment output budget is invalid")
 
 
+RUNTIME_CHECKER = Path(__file__).resolve().parents[1] / "simulation/runtime.py"
+
+
 class TeleopProcess:
     """Gate native execution until its identity is durably associated with the attempt."""
 
@@ -97,10 +93,28 @@ class TeleopProcess:
         self.python = python
         self.runtime = runtime
         self.limits = limits
+        self.runtime_checker = RUNTIME_CHECKER
+        require(
+            self.runtime_checker.is_absolute() and self.runtime_checker.is_file(),
+            "The fixed assessment runtime checker is unavailable",
+        )
+        self._runtime_checker_sha256 = hashlib.sha256(self.runtime_checker.read_bytes()).hexdigest()
+
+    def _checker_identity(self) -> dict:
+        require(
+            self.runtime_checker.is_absolute() and self.runtime_checker.is_file(),
+            "The fixed assessment runtime checker is unavailable",
+        )
+        actual = hashlib.sha256(self.runtime_checker.read_bytes()).hexdigest()
+        require(actual == self._runtime_checker_sha256, "Assessment runtime checker changed within the executor")
+        return {"path": str(self.runtime_checker), "sha256": actual}
 
     @property
     def adapter_sha256(self) -> str:
-        return hashlib.sha256(BOOTSTRAP.encode()).hexdigest()
+        return hashlib.sha256(canonical({
+            "bootstrap_sha256": hashlib.sha256(BOOTSTRAP.encode()).hexdigest(),
+            "runtime_checker_sha256": self._checker_identity()["sha256"],
+        })).hexdigest()
 
     def run(
         self, *, operation: str, root: Path, plan: Path, output: Path, nonce: str, checkpoint, should_cancel
@@ -119,6 +133,7 @@ class TeleopProcess:
         gate = {
             "nonce": nonce,
             "runtime": self.runtime.to_record(),
+            "runtime_checker": self._checker_identity(),
             "operation": operation,
             "plan": str(plan),
             "run": str(output),

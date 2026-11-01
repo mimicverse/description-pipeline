@@ -21,6 +21,7 @@ from contextlib import suppress
 from pathlib import Path
 from unittest import mock
 
+from description_pipeline.dynamics_assessment import runtime as runtime_module
 from description_pipeline.dynamics_assessment.contracts import (
     BUNDLE_SCHEMA,
     SOURCE_SCHEMA,
@@ -55,11 +56,20 @@ class Dispatch:
         return self.runs.get(dag_run_id)
 
 
+def fixed_process(python, runtime, limits):
+    checker = os.environ.get("ASSESSMENT_TEST_RUNTIME_CHECKER")
+    if not checker:
+        raise unittest.SkipTest("A fixed release checker snapshot is required")
+    with mock.patch.object(runtime_module, "RUNTIME_CHECKER", Path(checker)):
+        return TeleopProcess(python, runtime, limits)
+
+
 def build_native_case(database, modes=None):
     fixture = os.environ.get("ASSESSMENT_TEST_TELEOP_PLAN")
     interpreter = os.environ.get("ASSESSMENT_TEST_TELEOP_PYTHON")
     pin_path = os.environ.get("ASSESSMENT_TEST_RUNTIME_PIN")
-    if not all((fixture, interpreter, pin_path)):
+    checker_path = os.environ.get("ASSESSMENT_TEST_RUNTIME_CHECKER")
+    if not all((fixture, interpreter, pin_path, checker_path)):
         raise unittest.SkipTest("A fixed installed Teleop runtime and independent software input are required")
     store, _old_request, root = database
     modes = {modes} if isinstance(modes, str) else set(modes or ())
@@ -156,7 +166,7 @@ def build_native_case(database, modes=None):
     module = Path(__file__).resolve().parents[2] / "src/description_pipeline/dynamics_assessment"
     executor_sha = digest({p.name: file_digest(p) for p in sorted(module.glob("*.py"))})
     service = AssessmentService(store, enabled=True, runtime=runtime, executor_sha256=executor_sha, work_root=work)
-    process = TeleopProcess(Path(interpreter), runtime, ProcessLimits(120, 2 * 1024**3, 60, 256 * 1024**2))
+    process = fixed_process(Path(interpreter), runtime, ProcessLimits(120, 2 * 1024**3, 60, 256 * 1024**2))
 
     def authorized(dag, _control):
         assert dag == source.record["dag_run_id"]
@@ -247,6 +257,91 @@ def reap_orphan(controller, identity):
 
 
 class NativeDatabaseTests(PostgresCase):
+    def test_real_cancel_before_runtime_gate_does_not_import_or_execute_the_model(self):
+        native_case = build_native_case(self.database)
+        service, _executor, access, *_ = native_case
+        release = self.root / "release-startup-gate"
+        heartbeat = service.store.heartbeat
+
+        def gated(*args, **kwargs):
+            result = heartbeat(*args, **kwargs)
+            if kwargs.get("process") is not None:
+                deadline = time.monotonic() + 30
+                while not release.exists():
+                    assert time.monotonic() < deadline, "The private startup gate was not released"
+                    time.sleep(0.01)
+            return result
+
+        with mock.patch.object(service.store, "heartbeat", gated):
+            _public, attempt_id, controller = start_controller(native_case)
+            try:
+                attempt = wait_for_attempt(service, attempt_id, controller, lambda row: row["process"] is not None)
+                child = attempt["process"]
+                output = service.work_root / attempt_id / "result"
+                assert not (output / "run.runtime.json").exists()
+                service.cancel(access, attempt_id)
+                release.touch()
+                controller.join(timeout=20)
+                assert controller.exitcode == 0
+                settled = service.store.attempt(attempt_id)
+                assert settled["state"] == "cancelled" and settled["resources_settled"]
+                assert process_state(child) == "dead"
+                assert not (output / "run.runtime.json").exists()
+                assert not (output / "run/records.jsonl").exists()
+                summary = json.loads(service.read_result(access, attempt_id)[0])
+                assert summary["operations"]["run"]["reason"] == "cancelled"
+            finally:
+                release.touch()
+                cleanup_controller(service, attempt_id, controller)
+
+    def test_real_unknown_before_runtime_gate_retains_original_child_for_reconciliation(self):
+        native_case = build_native_case(self.database)
+        service, executor, access, *_ = native_case
+        release = self.root / "release-startup-gate"
+        heartbeat = service.store.heartbeat
+
+        def gated(*args, **kwargs):
+            result = heartbeat(*args, **kwargs)
+            if kwargs.get("process") is not None:
+                deadline = time.monotonic() + 30
+                while not release.exists():
+                    assert time.monotonic() < deadline, "The private startup gate was not released"
+                    time.sleep(0.01)
+            return result
+
+        with mock.patch.object(service.store, "heartbeat", gated):
+            public, attempt_id, controller = start_controller(native_case)
+            try:
+                attempt = wait_for_attempt(service, attempt_id, controller, lambda row: row["process"] is not None)
+                child = attempt["process"]
+                os.kill(child["pid"], signal.SIGSTOP)
+                controller.kill()
+                controller.join(timeout=5)
+                assert controller.exitcode == -signal.SIGKILL
+                reap_orphan(controller, child)
+                with service.store.transaction() as cursor:
+                    cursor.execute(
+                        "UPDATE assessment_attempt SET lease_until=now()-interval '1 second' WHERE attempt_id=%s",
+                        (attempt_id,),
+                    )
+                assert service.get(access, public["request_id"])["attempt"]["state"] == "unknown"
+                with self.assertRaisesRegex(ValueError, "settled"):
+                    service.retry(access, public["request_id"], Dispatch())
+                result = executor.reconcile(attempt_id)
+                assert result["state"] == "failed"
+                assert process_state(child) == "dead"
+                summary = json.loads(service.read_result(access, attempt_id)[0])
+                assert summary["detail"]["previous_process"] == child
+                assert summary["operations"] == {}
+                assert service.store.attempt(attempt_id)["resources_settled"]
+                assert executor.reconcile(attempt_id)["state"] == "failed"
+                output = service.work_root / attempt_id / "result"
+                assert not (output / "run.runtime.json").exists()
+                assert not (output / "run/records.jsonl").exists()
+            finally:
+                release.touch()
+                cleanup_controller(service, attempt_id, controller)
+
     def _check_actual_native_execution_verification_and_detached_archive(self, case_modes):
         tmp_path = self.root
         native_case = build_native_case(self.database, case_modes)
@@ -315,7 +410,7 @@ class NativeDatabaseTests(PostgresCase):
         name = next(iter(record["files"]))
         record["files"][name] = "0" * 64
         service.runtime = RuntimePin(record)
-        executor.process = TeleopProcess(executor.process.python, service.runtime, executor.process.limits)
+        executor.process = fixed_process(executor.process.python, service.runtime, executor.process.limits)
         public, result = execute_case(native_case)
         assert result["state"] == "failed"
         data, _member = service.read_result(access, result["attempt_id"], "run.stdout.json")
@@ -469,7 +564,7 @@ class NativeDatabaseTests(PostgresCase):
     def test_native_wall_budget_cannot_report_completion(self):
         native_case = build_native_case(self.database, None)
         _service, executor, _access, *_ = native_case
-        executor.process = TeleopProcess(
+        executor.process = fixed_process(
             executor.process.python, executor.process.runtime, ProcessLimits(0.01, 2 * 1024**3, 60, 256 * 1024**2)
         )
         _public, result = execute_case(native_case)
@@ -478,7 +573,7 @@ class NativeDatabaseTests(PostgresCase):
     def _check_native_output_budget_cannot_report_completion(self, case_modes):
         native_case = build_native_case(self.database, case_modes)
         service, executor, access, *_ = native_case
-        executor.process = TeleopProcess(
+        executor.process = fixed_process(
             executor.process.python, executor.process.runtime, ProcessLimits(120, 2 * 1024**3, 60, 128 * 1024)
         )
         _public, result = execute_case(native_case)

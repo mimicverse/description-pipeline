@@ -2,20 +2,28 @@
 
 from __future__ import annotations
 
+import base64
+import csv
 import ctypes
+import hashlib
+import io
+import json
 import os
 import secrets
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import unittest
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from unittest import mock
 
 from description_pipeline.dynamics_assessment import runtime as runtime_module
-from description_pipeline.dynamics_assessment.contracts import AssessmentConflict
+from description_pipeline.dynamics_assessment.contracts import AssessmentConflict, RuntimePin
 from description_pipeline.owned_process import (
     module_command, process_identity, process_state, resource_state, terminate_owned,
 )
@@ -259,9 +267,12 @@ class RuntimeTests(AssessmentCase):
             if identity is None:
                 self.assertEqual(resource_state(identities[-2]), "dead")
 
-        process = TeleopProcess(
-            Path(sys.executable), runtime_pin(), ProcessLimits(0.2 if mode == "timeout" else 10, 1024**3, 10, 1024**2)
-        )
+        # This ownership-only child does not call the runtime checker.
+        with mock.patch.object(runtime_module, "RUNTIME_CHECKER", Path(runtime_module.__file__)):
+            process = TeleopProcess(
+                Path(sys.executable), runtime_pin(),
+                ProcessLimits(0.2 if mode == "timeout" else 10, 1024**3, 10, 1024**2),
+            )
         try:
             with mock.patch.object(runtime_module, "BOOTSTRAP", "MODE=" + repr(mode) + "\n" + GATED_GROUP):
                 result = process.run(
@@ -326,7 +337,9 @@ class RuntimeTests(AssessmentCase):
 
     def test_unsettled_termination_returns_conflict_without_releasing_identity(self):
         tmp_path = self.root
-        process = TeleopProcess(Path(sys.executable), runtime_pin(), ProcessLimits(30, 1024**3, 10, 1024**2))
+        # Cancellation closes stdin before any checker code can execute.
+        with mock.patch.object(runtime_module, "RUNTIME_CHECKER", Path(runtime_module.__file__)):
+            process = TeleopProcess(Path(sys.executable), runtime_pin(), ProcessLimits(30, 1024**3, 10, 1024**2))
         registered = []
 
         def checkpoint(identity):
@@ -350,3 +363,154 @@ class RuntimeTests(AssessmentCase):
         while process_state(registered[0]) == "alive" and time.monotonic() < deadline:
             time.sleep(0.01)
         assert process_state(registered[0]) == "dead"
+
+
+class NativeRuntimeGateTests(AssessmentCase):
+    def setUp(self):
+        super().setUp()
+        interpreter = os.environ.get("ASSESSMENT_TEST_TELEOP_PYTHON")
+        pin = os.environ.get("ASSESSMENT_TEST_RUNTIME_PIN")
+        checker = os.environ.get("ASSESSMENT_TEST_RUNTIME_CHECKER")
+        if not all((interpreter, pin, checker)):
+            raise unittest.SkipTest("An installed fixed runtime and release checker snapshot are required")
+        self.pin = RuntimePin(json.loads(Path(pin).read_bytes()))
+        self.python = Path(interpreter)
+        self.checker = Path(checker)
+
+    def execute_gate(self, pin=None, checkpoint=None):
+        with mock.patch.object(runtime_module, "RUNTIME_CHECKER", self.checker):
+            process = TeleopProcess(self.python, pin or self.pin, ProcessLimits(30, 2 * 1024**3, 20, 64 * 1024**2))
+        plan = self.root / "unsupported-plan.json"
+        plan.write_text("{}\n")
+        identities = []
+
+        def register(identity):
+            identities.append(identity)
+            if checkpoint is not None:
+                checkpoint(identity)
+
+        result = process.run(
+            operation="run", root=self.root, plan=plan, output=self.root / "unused-run",
+            nonce=secrets.token_hex(32), checkpoint=register, should_cancel=lambda: False,
+        )
+        self.assertIsNone(identities[-1])
+        self.assertEqual(resource_state(result["identity"]), "dead")
+        self.assertFalse((self.root / "unused-run").exists())
+        return result, json.loads((self.root / "run.stdout.json").read_bytes())
+
+    def test_release_checker_preserves_native_package_and_consumer_asset_separately(self):
+        result, output = self.execute_gate()
+        self.assertEqual(result["exit_code"], 65, output)
+        self.assertEqual(output["assessment_error"], "unsupported_input")
+        receipt = json.loads((self.root / "run.runtime.json").read_bytes())
+        self.assertEqual(receipt["runtime"], self.pin.to_record())
+        self.assertEqual(receipt["identity"]["actuator_model"], {
+            "version": "1.3.0", "git_commit": None, "editable": False,
+        })
+        self.assertEqual(receipt["identity"]["actuator_model_asset"], self.pin.record["actuator_model"])
+        self.assertEqual(receipt["identity"]["engine"], self.pin.record["dependency_versions"]["mujoco"])
+
+    def test_release_checker_rejects_wrong_dependency_before_model_execution(self):
+        record = self.pin.to_record()
+        record["dependency_versions"]["mujoco"] = "0.0.0"
+        result, output = self.execute_gate(RuntimePin(record))
+        self.assertEqual(result["exit_code"], 78)
+        self.assertEqual(output["assessment_error"], "runtime_identity")
+        self.assertIn("dependencies differ", output["error"])
+        self.assertFalse((self.root / "run.runtime.json").exists())
+
+    def test_release_checker_rejects_wrong_actuator_archive_before_model_execution(self):
+        record = self.pin.to_record()
+        record["actuator_model"]["wheel_sha256"] = "0" * 64
+        result, output = self.execute_gate(RuntimePin(record))
+        self.assertEqual(result["exit_code"], 78)
+        self.assertEqual(output["assessment_error"], "runtime_identity")
+        self.assertIn("actuator-model archive differs", output["error"])
+        self.assertFalse((self.root / "run.runtime.json").exists())
+
+    def test_checker_mutation_after_registration_is_rejected_before_executing_its_bytes(self):
+        checker = self.root / "release-checker.py"
+        checker.write_bytes(self.checker.read_bytes())
+        self.checker = checker
+        marker = self.root / "injected-marker"
+
+        def mutate(identity):
+            if identity is not None:
+                checker.write_text("from pathlib import Path\nPath(" + repr(str(marker)) + ").touch()\n")
+
+        result, output = self.execute_gate(checkpoint=mutate)
+        self.assertEqual(result["exit_code"], 78)
+        self.assertIn("checker differs", output["error"])
+        self.assertFalse(marker.exists())
+        self.assertFalse((self.root / "run.runtime.json").exists())
+
+
+    def clone_native_runtime(self):
+        temporary = tempfile.TemporaryDirectory(prefix="assessment-runtime-", dir=Path(__file__).resolve().parents[2])
+        self.addCleanup(temporary.cleanup)
+        clone = Path(temporary.name) / "runtime"
+        shutil.copytree(self.python.parent.parent, clone, symlinks=True, copy_function=os.link)
+        self.python = clone / "bin/python"
+        info = subprocess.run(
+            [str(self.python), "-I", "-B", "-c",
+             "from importlib.metadata import distribution;d=distribution('actuator-model');"
+             "print(next(d.locate_file(p).parent for p in d.files "
+             "if str(p).endswith('.dist-info/direct_url.json')))"],
+            capture_output=True, text=True, check=True, timeout=10,
+        )
+        return Path(info.stdout.strip())
+
+    def alter_native_origin(self, change):
+        distribution = self.clone_native_runtime()
+        origin_path = distribution / "direct_url.json"
+        inventory_path = distribution / "RECORD"
+        original_prefix = Path(os.environ["ASSESSMENT_TEST_TELEOP_PYTHON"]).parent.parent
+        original_path = original_prefix / origin_path.relative_to(self.python.parent.parent)
+        original_origin = original_path.read_bytes()
+        original_inventory = original_path.with_name("RECORD").read_bytes()
+        origin = json.loads(origin_path.read_bytes())
+        change(origin)
+        data = json.dumps(origin).encode()
+        # Atomic replacement breaks the clone's hard links before mutation.
+        replacement = origin_path.with_suffix(".replacement")
+        replacement.write_bytes(data)
+        replacement.replace(origin_path)
+        rows = list(csv.reader(io.StringIO(inventory_path.read_text())))
+        member = origin_path.relative_to(distribution.parent).as_posix()
+        found = False
+        for row in rows:
+            if row[0] == member:
+                row[1:] = ["sha256=" + base64.urlsafe_b64encode(hashlib.sha256(data).digest()).decode().rstrip("="),
+                           str(len(data))]
+                found = True
+        self.assertTrue(found)
+        output = io.StringIO()
+        csv.writer(output, lineterminator="\n").writerows(rows)
+        replacement = inventory_path.with_suffix(".replacement")
+        replacement.write_text(output.getvalue())
+        replacement.replace(inventory_path)
+        self.assertEqual(original_path.read_bytes(), original_origin)
+        self.assertEqual(original_path.with_name("RECORD").read_bytes(), original_inventory)
+
+    def test_real_native_editable_metadata_is_rejected_before_model_execution(self):
+        self.alter_native_origin(lambda origin: origin.update(dir_info={"editable": True}))
+        result, output = self.execute_gate()
+        self.assertEqual(result["exit_code"], 78)
+        self.assertIn("noneditable actuator-model", output["error"])
+        self.assertFalse((self.root / "run.runtime.json").exists())
+
+    def test_real_available_native_commit_cannot_conflict_with_consumer_asset(self):
+        self.alter_native_origin(lambda origin: origin.update(vcs_info={"commit_id": "0" * 40}))
+        result, output = self.execute_gate()
+        self.assertEqual(result["exit_code"], 78)
+        self.assertIn("commit conflicts", output["error"])
+        self.assertFalse((self.root / "run.runtime.json").exists())
+
+    def test_real_missing_actuator_distribution_is_rejected_before_model_execution(self):
+        distribution = self.clone_native_runtime()
+        distribution.rename(self.python.parent.parent.parent / "removed-actuator-metadata")
+        (distribution.parent / "actuator_model").rename(self.python.parent.parent.parent / "removed-actuator-package")
+        result, output = self.execute_gate()
+        self.assertEqual(result["exit_code"], 78)
+        self.assertIn("actuator-model", output["error"])
+        self.assertFalse((self.root / "run.runtime.json").exists())
