@@ -175,8 +175,8 @@ CAD 排他来自实际资源所有权，不来自 Airflow 并发数字。只能�
 
 ## MJCF 派生与共同执行范围
 
-MJCF 后继固定直接引用原始完整运行的 Generate/Capture/Verify 闭包，保留来源字节、用途、所有者、规则与平台身份；不追踪多跳后继链。接纳、claim、candidate 提交和 Publish 各自重验来源及 effect 结算。碰撞代理和仿真参数是带来源 warning 的派生策略，不回写 URDF，不建立第二规范化机器人模型。
+阶段后继沿统一来源解析核验真实 Generate/Capture/Verify 闭包，支持从先前独立重跑结果继续必要后继，保留每个实际 producer、来源字节、用途、所有者、规则与平台身份。接纳、claim、candidate 提交和 Publish 各自重验来源及 effect 结算。碰撞代理和仿真参数是带来源 warning 的派生策略，不回写 URDF，不建立第二规范化机器人模型。
 
 `execution_stage_ids` 从不可变 `from_stage/through_stage` 推导范围；共同查询给出 `execution_scope` 与 `delivery_complete`。复用上游的真实来源位于 source/reuse，本次 command/decision 不伪造；未执行后缀标为 out_of_scope。Portal 只渲染共同事实。Airflow 保持同一七任务图并从该范围决定跳过和执行；调度 skipped 不能代替 FactStore 前驱资格。
 
-执行中取消复用共同引擎及原 claim/fence，保全候选与原失败；已完成决定不改写，UNKNOWN/CONFLICT 先对账。具体锁序、通知及请求身份见[系统契约](contracts.md#受限-mjcf-后继与执行范围)，本层不维护另一套终态或执行范围。
+执行中取消复用共同引擎及原 claim/fence，保全候选与原失败；已完成决定不改写，UNKNOWN/CONFLICT 先对账。具体锁序、通知及请求身份见[系统契约](contracts.md#七阶段独立重跑与执行范围)，本层不维护另一套终态或执行范围。
