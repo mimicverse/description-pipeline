@@ -331,17 +331,8 @@ jobs:
           PICO_LINK_PYTHON: ${{ runner.temp }}/pico-link/bin/python
         run: |
           set -o pipefail
-          "$CI_NATIVE_PYTHON" -B - <<'PY' 2>&1 | tee "$RUNNER_TEMP/pico-native-ci.log"
-          import unittest
-
-          suite = unittest.defaultTestLoader.loadTestsFromNames([
-              "tests.v1.test_pico_sessions",
-              "tests.v1.test_teleop_runtime.TeleopRuntimeTests.test_real_pico_closure_and_protocol_replay_after_source_relocation",
-              "tests.v1.test_teleop_runtime.TeleopRuntimeTests.test_real_assessment_closure_public_controller_and_delay",
-          ])
-          result = unittest.TextTestRunner(verbosity=2).run(suite)
-          raise SystemExit(0 if result.wasSuccessful() and not result.skipped else 1)
-          PY
+          "$CI_NATIVE_PYTHON" -B -m tests.v1.run_pico_native \
+            --report "$RUNNER_TEMP/pico-native-ci.json" 2>&1 | tee "$RUNNER_TEMP/pico-native-ci.log"
       - name: Real optional dynamics execution must run
         env:
           TELEOP_ASSESSMENT_PYTHON: ${{ runner.temp }}/teleop-assessment/bin/python
@@ -372,6 +363,7 @@ jobs:
             release-verify-report.json
             release-verify-environment.json
             ${{ runner.temp }}/pico-native-ci.log
+            ${{ runner.temp }}/pico-native-ci.json
             ${{ runner.temp }}/assessment-native-ci.log
 
   real-chain:
