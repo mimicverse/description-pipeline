@@ -16,8 +16,7 @@ import logging
 from a2wsgi import WSGIMiddleware
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse as StarletteJSONResponse, FileResponse
-from starlette.background import BackgroundTask
+from starlette.responses import JSONResponse as StarletteJSONResponse, StreamingResponse
 from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
@@ -33,6 +32,23 @@ log = logging.getLogger(__name__)
 class JSONResponse(StarletteJSONResponse):
     def __init__(self, content, status_code=200):
         super().__init__(content, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+
+class RecordingResponse(StreamingResponse):
+    """Close the read-only archive on completion, disconnect or cancellation."""
+
+    def __init__(self, archive):
+        self._archive = archive
+        super().__init__(archive, media_type="application/zip", headers={
+            "Cache-Control": "no-store",
+            "Content-Disposition": 'attachment; filename="teleop-recording.zip"',
+        })
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._archive.close()
 
 
 class PicoPortal:
@@ -132,14 +148,8 @@ class PicoPortal:
             from ..pipeline.contracts import ArtifactRef
 
             ref = ArtifactRef.from_record(row["recording_artifact"])
-            path, temporary = await asyncio.to_thread(self.service.recording_archive, ref)
-            return FileResponse(
-                path,
-                media_type="application/zip",
-                filename="teleop-recording.zip",
-                headers={"Cache-Control": "no-store"},
-                background=BackgroundTask(temporary.cleanup),
-            )
+            archive = await asyncio.to_thread(self.service.recording_archive, ref)
+            return RecordingResponse(archive)
         except Exception as error:
             return self.error(error)
 
