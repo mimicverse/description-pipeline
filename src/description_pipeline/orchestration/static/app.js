@@ -2,6 +2,7 @@
 // module only talks to the portal's own JSON API and the digest-verified artifact routes.
 import { buildJointControls, createViewer, disposeRobot, loadRobot } from "/static/viewer.js";
 import { createInspection } from "/static/inspection.js";
+import { mountDynamicsAssessment } from "/static/dynamics_assessment.js";
 import {
   menuAction,
   overlayRun,
@@ -61,6 +62,8 @@ const state = {
   rerunNotice: null,
   rerunError: null,
   rerunRequests: {},
+  assessmentView: null,
+  assessmentBinding: null,
   runsList: [],
   listRequest: null,
   runView: "active",
@@ -643,6 +646,7 @@ function clearPreview() {
 }
 
 function stopRunRead() {
+  stopAssessmentView();
   if (state.timer) window.clearTimeout(state.timer);
   state.timer = null;
   if (state.pollRequest) state.pollRequest.abort();
@@ -2042,6 +2046,28 @@ function renderRerunPanel(run) {
   }
 }
 
+function stopAssessmentView() {
+  state.assessmentView?.destroy();
+  state.assessmentView = null;
+  state.assessmentBinding = null;
+}
+
+function renderAssessment(run) {
+  const host = $("dynamics-assessment");
+  if (!host) return;
+  host.hidden = run.assessment_enabled !== true;
+  if (host.hidden) { stopAssessmentView(); return; }
+  const binding = JSON.stringify([run.dag_run_id, run.can_manage === true, run.deleted === true]);
+  if (state.assessmentBinding === binding) return;
+  stopAssessmentView();
+  host.replaceChildren();
+  state.assessmentBinding = binding;
+  state.assessmentView = mountDynamicsAssessment({
+    container: host, runId: run.dag_run_id, requestJson: api,
+    canManage: run.can_manage === true && run.deleted !== true,
+  });
+}
+
 async function rerunFromStage(stageId) {
   const run = state.lastRun, runId = state.dagRunId;
   const row = run?.stage_reruns?.find((item) => item.stage === stageId);
@@ -2443,6 +2469,7 @@ function renderRun(run) {
     pr.hidden = true;
   }
   renderRerunPanel(run);
+  renderAssessment(run);
   updatePreviewLayout();
 }
 

@@ -649,6 +649,7 @@ class PortalConfig:
     upload_root: Path | None = None
     upload_concurrency: int = 2
     simulation: dict | None = None
+    assessment_executor: Any | None = None
     #: Split-pipeline routing: the model-repository checkouts.
     pipeline_repositories: dict[str, Path] | None = None
     #: Configured publication targets used by the upload selector and conf validation.
@@ -855,6 +856,9 @@ def load_portal_config(path: Path) -> PortalConfig:
         production_native_client,
         production_snapshot,
     ) = _production_admission_runtime(endpoint_section, os.environ)
+    from ..dynamics_assessment.composition import assessment_executor_from_environment
+
+    assessment_executor = assessment_executor_from_environment(os.environ)
     return PortalConfig(
         airflow=AirflowApi(url.strip()),
         host=str(portal_section.get("host") or "127.0.0.1"),
@@ -862,6 +866,7 @@ def load_portal_config(path: Path) -> PortalConfig:
         upload_root=_upload_root(portal_section),
         upload_concurrency=_upload_concurrency(portal_section),
         simulation=_simulation_config(portal_section),
+        assessment_executor=assessment_executor,
         pipeline_repositories=pipeline_repositories,
         pipeline_targets=pipeline_targets,
         production_admission_loader=production_loader,
@@ -1410,6 +1415,14 @@ class PortalApp:
         self._run_control_store = config.run_control_store
         self._platform_lock = threading.Lock()
         self._artifacts_cache = config.artifact_store
+        self._assessment_api = None
+        if config.assessment_executor is not None:
+            from ..dynamics_assessment.api import AssessmentApi
+
+            self._assessment_api = AssessmentApi(
+                config.assessment_executor.service, self._assessment_context,
+                runtime_reconciler=config.assessment_executor.reconcile,
+            )
 
     def _run_control(self):
         """The canonical admission-control and display-metadata surface."""
@@ -1489,6 +1502,79 @@ class PortalApp:
                 "Run facts are temporarily unavailable; retry later",
             ) from error
 
+    def _assessment_context(self, environ: dict, mutating: bool):
+        from ..dynamics_assessment.service import AssessmentAccess
+
+        session = self._session(environ, csrf=mutating)
+        principal, is_admin = self._viewer_identity(session)
+        portal = self
+
+        class DispatchTransport:
+            def trigger(self, dag_id, dag_run_id, conf):
+                return portal.config.airflow.trigger_dag_run(session.token, dag_id, dag_run_id, conf)
+
+            def observe(self, dag_id, dag_run_id):
+                try:
+                    return portal.config.airflow.dag_run(session.token, dag_id, dag_run_id)
+                except AirflowApiError as error:
+                    if isinstance(error.__cause__, urlerror.HTTPError) and error.__cause__.code == 404:
+                        return None
+                    raise
+
+        return AssessmentAccess(
+            principal, is_admin, lambda dag, control: self._assessment_source(session, dag, control),
+        ), DispatchTransport()
+
+    def _assessment_source(self, session: PortalSession, dag_run_id: str, control: bool):
+        from ..dynamics_assessment.contracts import MemberRef, SOURCE_SCHEMA, SourceBinding, SourceNotReady
+
+        source_id = self._authorize_run(session, dag_run_id)
+        if control:
+            run = self.config.airflow.dag_run(session.token, self.config.dag_id, dag_run_id)
+            if not self._can_manage(session, run):
+                raise PortalError(HTTPStatus.FORBIDDEN, "Only the source operator or an administrator can assess it")
+            if self._metadata_overlay(dag_run_id)["deleted"]:
+                raise PortalError(HTTPStatus.CONFLICT, "Restore the delivery before requesting assessment")
+        projection = self._read_projection(source_id)
+        if projection is None:
+            raise SourceNotReady("Registered engineering source is unavailable")
+        urdf = self._urdf_preview_from_projection(source_id, projection)
+        mjcf = self._mjcf_preview_from_projection(projection)
+        if not urdf or not mjcf or urdf.get("verified") is not True or mjcf.get("verified") is not True:
+            raise SourceNotReady("Qualified URDF and MJCF certificates are required for optional assessment")
+        by_stage = projection["by_stage"]
+
+        def member(stage, path):
+            declared = (by_stage.get(stage) or {}).get(path)
+            if declared is None:
+                raise SourceNotReady("A required registered engineering source member is unavailable")
+            checksum, size, artifact = self._registered_member_fields(declared)
+            return MemberRef(artifact, path, size, checksum).to_record()
+
+        return SourceBinding({
+            "schema": SOURCE_SCHEMA, "run_id": source_id, "dag_run_id": dag_run_id,
+            "subject_sha256": urdf["subject_sha256"],
+            "urdf": member("generate", "urdf/robot.urdf"),
+            "mjcf": member("mjcf", mjcf_contract.ROBOT_NAME),
+            "certificates": {
+                "urdf": member("verify", CERTIFICATE_FILENAME),
+                "mjcf": member("mjcf", mjcf_contract.REPORT_PATH),
+            },
+        })
+
+    def _assessment_response(self, environ, start_response, action, identity):
+        if self._assessment_api is None:
+            self._session(environ, csrf=environ.get("REQUEST_METHOD") != "GET")
+            if action == "list":
+                return _json_response(start_response, 200, {
+                    "enabled": False, "assessments": [], "publish_dependency": False,
+                }, self.config)
+            raise PortalError(HTTPStatus.CONFLICT, "Optional dynamics assessment is disabled")
+        result = self._assessment_api.handle(environ, action=action, identity=identity)
+        headers = [*result.headers, ("Content-Length", str(len(result.body)))]
+        start_response(f"{result.status} {HTTPStatus(result.status).phrase}", _common_headers(headers, self.config))
+        return [result.body]
+
     # ------------------------------------------------------------------ WSGI
     def __call__(self, environ: dict, start_response: Callable) -> Iterable[bytes]:
         try:
@@ -1523,6 +1609,17 @@ class PortalApp:
                 return self._list_runs(environ, start_response)
             if method == "POST":
                 return self._start_run(environ, start_response)
+        match = re.fullmatch(r"/api/runs/([^/]+)/assessments/dynamics(?:/(source|bundles))?", path)
+        if match:
+            action = ({"source": "source", "bundles": "bundle"}.get(match.group(2))
+                      or ("list" if method == "GET" else "create"))
+            return self._assessment_response(environ, start_response, action, match.group(1))
+        match = re.fullmatch(r"/api/dynamics-assessments/attempts/([^/]+)/(cancel|reconcile|dispatch|result)", path)
+        if match:
+            return self._assessment_response(environ, start_response, match.group(2), match.group(1))
+        match = re.fullmatch(r"/api/dynamics-assessments/([^/]+)(?:/(retry))?", path)
+        if match:
+            return self._assessment_response(environ, start_response, match.group(2) or "get", match.group(1))
         match = re.fullmatch(r"/api/runs/([^/]+)", path)
         if match:
             if method == "GET":
@@ -2329,6 +2426,7 @@ class PortalApp:
             "operator": operator,
             "principal": principal,
             "can_manage": can_manage,
+            "assessment_enabled": self._assessment_api is not None,
             # Linked rerun lineage from canonical admission, same fields as the list rows.
             "parent_dag_run_id": parent_dag_run_id,
             "resume_from": _optional_str(
@@ -2571,13 +2669,14 @@ class PortalApp:
                 HTTPStatus.BAD_REQUEST, "Idempotency-Key must be a safe identifier of at most 110 characters"
             )
         body = self._body(environ)
-        if set(body) - {"from_stage", "through_stage", "change_summary", "main_assembly", "simulation"}:
+        allowed = {"from_stage", "through_stage", "change_summary", "main_assembly", "simulation", "target_hardware"}
+        if set(body) - allowed:
             raise PortalError(HTTPStatus.BAD_REQUEST, "Stage rerun parameters are invalid")
         stage = body.get("from_stage")
         through = body.get("through_stage", stage)
         if stage not in _STAGE_IDS or through not in _STAGE_IDS or _STAGE_IDS.index(through) < _STAGE_IDS.index(stage):
             raise PortalError(HTTPStatus.BAD_REQUEST, "Stage rerun execution range is invalid")
-        for name in ("change_summary", "main_assembly", "simulation"):
+        for name in ("change_summary", "main_assembly", "simulation", "target_hardware"):
             if name in body and not isinstance(body[name], str):
                 raise PortalError(HTTPStatus.BAD_REQUEST, "Stage rerun parameters must be text")
         try:
@@ -2610,8 +2709,11 @@ class PortalApp:
                 outcome = loader(ProductionStageRerunRequest(
                     run_id=new_run_id, request_id=new_dag_run_id, parent_run_id=source_id,
                     principal=principal, from_stage=stage, through_stage=through,
-                    change_summary=body.get("change_summary", projection["request"]["change_summary"]),
+                    change_summary=normalize_change_summary(
+                        body.get("change_summary", projection["request"]["change_summary"])
+                    ),
                     main_assembly=body.get("main_assembly"), simulation=body.get("simulation"),
+                    target_hardware=body.get("target_hardware"),
                 ))
             except (PipelineError, ValueError) as error:
                 return self._rerun_refusal(
