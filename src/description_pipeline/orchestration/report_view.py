@@ -1420,23 +1420,24 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
     elif "blocked" in states:
         overall_state, headline = "blocked", "Stages are blocked by an incomplete predecessor"
     elif stages_out and states == {"completed"} and verification_completed:
-        overall_state, headline = "passed", "All stages completed and independent verification passed"
+        overall_state, headline = "passed", "Completed; independent verification passed"
     elif stages_out and states == {"completed"}:
         overall_state, headline = (
             "failed",
-            "All stages completed, but independent verification did not pass",
+            "Completed, but independent verification did not pass",
         )
     else:
         overall_state, headline = "not_run", "No stage records yet"
     warning_items = [item for stage in stages_out for item in stage.get("warnings") or []]
+    scoped_stages = [stage for stage in stages_out if stage.get("in_scope") is not False]
     report = {
         "schema_version": REPORT_SCHEMA,
         "overall": {
             "state": overall_state,
             "state_label": _OVERALL_STATE_LABELS[overall_state],
             "headline": headline,
-            "stages_completed": sum(1 for stage in stages_out if stage["state"] == "completed"),
-            "stages_total": len(stages_out),
+            "stages_completed": sum(1 for stage in scoped_stages if stage["state"] == "completed"),
+            "stages_total": len(scoped_stages),
             "engineering_state": "not_ready",
         },
         "failure": _failure(job, first_failed) if first_failed is not None else None,

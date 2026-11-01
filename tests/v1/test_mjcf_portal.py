@@ -241,5 +241,7 @@ class MJCFPortalTests(unittest.TestCase):
             self.assertFalse(portal._mjcf_successor_row(expanded, principal="cli:tenant:other")["eligible"])
             self.assertEqual(["freeze", "mjcf"], [row["stage"] for row in view["stage_reruns"]])
             self.assertEqual("passed", view["report"]["overall"]["state"])
+            self.assertEqual(2, view["report"]["overall"]["stages_completed"])
+            self.assertEqual(2, view["report"]["overall"]["stages_total"])
             failed_projection = {"stages": {"mjcf": {"state": "failed"}}}
             self.assertEqual("failed", _automatic_summary({"status": "failed"}, failed_projection)["state"])

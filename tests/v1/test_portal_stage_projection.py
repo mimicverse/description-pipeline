@@ -169,13 +169,18 @@ class RegisteredStageProjectionTests(unittest.TestCase):
                     self.application._registered_stage_view({}, projection)
                 self.assertEqual(row["state"], "completed")
 
-    def test_reused_output_requires_a_proven_parent(self) -> None:
+    def test_reuse_display_comes_from_the_common_projection_and_keeps_parent_binding(self) -> None:
         projection = self.projection({"generate": "completed"}, parent="parent-run")
         projection["by_stage"]["generate"] = self.stage_members(
             "generate", {"receipt.json": b"{}"}, producer="parent-run"
         )
         view = self.application._registered_stage_view({}, projection)
-        self.assertEqual(view["stages"][3]["reuse"]["source_run"], "parent-run")
+        self.assertNotIn("reuse", view["stages"][3])
+        reuse = {"source_run": "parent-run", "source_command_id": "source-generate"}
+        projection["stages"]["generate"].update(in_scope=False, reuse=reuse)
+        view = self.application._registered_stage_view({}, projection)
+        self.assertEqual(view["stages"][3]["reuse"], reuse)
+        self.assertFalse(view["stages"][3]["in_scope"])
         projection["by_stage"]["generate"] = self.stage_members(
             "generate", {"receipt.json": b"{}"}, producer="other-run"
         )
