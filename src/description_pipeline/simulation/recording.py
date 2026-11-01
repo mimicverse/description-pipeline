@@ -322,7 +322,7 @@ async def run_verification(payload: dict, python: Path, *, register_process) -> 
         finally:
             await wait_task(asyncio.create_task(register_process(identity)))
         if interrupted:
-            raise asyncio.CancelledError
+            raise interrupted
         stdout, stderr = await asyncio.wait_for(process.communicate(content), 240)
         if len(stdout) > 128 * 1024 or len(stderr) > 128 * 1024:
             raise ValueError("Recording verifier exceeded its output budget")
@@ -349,7 +349,7 @@ async def run_verification(payload: dict, python: Path, *, register_process) -> 
             if not quiescent:
                 raise VerificationUnresolved("Recording verifier process group is unresolved")
             if interrupted:
-                raise asyncio.CancelledError
+                raise interrupted
 
 
 def main():

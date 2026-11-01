@@ -161,7 +161,7 @@ class SimulationService(ManagedRecordingVerification):
         interrupted = await settle_task(acquiring)
         self._database_lock = acquiring.result()
         if interrupted:
-            raise asyncio.CancelledError
+            raise interrupted
         if self._lifecycle_state != "starting":
             raise SimulationConflict("Simulation supervisor closed during startup")
         await self._reconcile_verifications()
@@ -233,7 +233,7 @@ class SimulationService(ManagedRecordingVerification):
                 self._probe_identity = process_identity(probe.pid, nonce)
                 self._write_probe_identity()
                 if interrupted:
-                    raise asyncio.CancelledError
+                    raise interrupted
                 if self._lifecycle_state not in allowed:
                     raise SimulationConflict("Simulation supervisor closed during startup")
                 stdout, stderr = await asyncio.wait_for(
@@ -355,7 +355,7 @@ class SimulationService(ManagedRecordingVerification):
                         "failed",
                         error="Session admission was cancelled",
                     )
-                raise asyncio.CancelledError
+                raise interrupted
             if session_id in self.running or row["state"] != "starting" or row["owner_nonce"] != self.owner:
                 return self.public(row)
             request = row["request"]
@@ -460,7 +460,7 @@ class SimulationService(ManagedRecordingVerification):
                 self.running[session_id] = current
                 current.identity = process_identity(process.pid, nonce)
                 if interrupted:
-                    raise asyncio.CancelledError
+                    raise interrupted
                 if self._lifecycle_state != "open":
                     raise SimulationConflict("Simulation supervisor is closing")
                 await run_thread(self.store.transition, session_id, self.owner, "starting", process=current.identity)
