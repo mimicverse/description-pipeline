@@ -74,7 +74,8 @@ worker 必需的临时控制证据遵守同一私有目录和容量限制。未�
 复验先从数据库和 CAS 核验登记事实，再使用固定 PICO 环境执行公共事件回放与独立 MuJoCo FK，检查状态、关节范围/速率、固定关节、显示变换和实际 TCP。与运行态分开的受管进程不继承 CAD、Git 或数据库秘密。API 和 CLI 复用同一验证核心，保留原录制的引擎和包身份；不把当前 runtime 替换到旧证据中。
 
 ```sh
-python -m description_pipeline.simulation.verify_recording --session <registered-session-id>
+python -m description_pipeline.simulation.verify_recording \
+  --session <registered-session-id> --python /absolute/path/pico-runtime/bin/python
 ```
 
 运动学一致性、完整事件回放、真实设备输入、持续性能与硬件资格分别验收。软件夹具或原始帧重放不能替代真人 PICO；凸代理接触不能等同于真实曲面干涉。真实模型、设备和性能证据按同发行验收要求给出，不能用绿色 CI 或预览成功代替。

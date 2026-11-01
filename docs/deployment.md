@@ -146,6 +146,20 @@ python3.12 -m venv /path/to/bootstrap-venv
 export PATH="/path/to/bootstrap-venv/bin:$PATH"
 ```
 
+启用 PICO 或 assessment 前，从同一 Linux 档案保留 `consumers/wheels/`，使用本次已安装产品的引导环境执行部署档案中的安装器。将同一 `release.json` 原字节复制到解包的部署根目录，与 `scripts/`、`requirements/` 同级；原六资产目录独立保留以供完整校验。安装器核对产品、部署资源、角色 lock、模型 wheel 和实际原生环境的身份。按实际启用角色分别执行：
+
+```sh
+/path/to/bootstrap-venv/bin/python /path/to/deployment/scripts/install_teleop_worker.py \
+  --role pico --wheel /path/to/fixed-models/robot_teleop-0.3.0-cp312-cp312-linux_x86_64.whl \
+  --wheelhouse /path/to/linux-runtime/consumers/wheels --destination /path/to/pico-runtime
+/path/to/bootstrap-venv/bin/python /path/to/deployment/scripts/install_teleop_worker.py \
+  --role assessment --wheel /path/to/fixed-models/robot_teleop-0.3.0-cp312-cp312-linux_x86_64.whl \
+  --actuator-wheel /path/to/fixed-models/actuator_model-1.3.0-py3-none-any.whl \
+  --wheelhouse /path/to/linux-runtime/consumers/wheels --destination /path/to/assessment-runtime
+```
+
+文件名与目标路径须替换为本次固定资产及全新私有目录。在 `operator.teleop.python` 或 `operator.assessment.python` 中引用对应环境；未启用的角色不安装。轻量设备 link 使用相同安装器的 `--role pico-link` 和 consumer 池，不提供模型 wheel。主平台的临时 wheelhouse 只用于主运行闭包，不混入或替代 consumer 池。失败环境保留供定位，不能直接复用未知残留目录。
+
 在提取的同版部署目录执行唯一生命周期入口：
 
 ```sh
