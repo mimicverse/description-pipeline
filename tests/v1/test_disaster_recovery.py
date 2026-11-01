@@ -3977,6 +3977,46 @@ class RecoveryControlFlowTests(unittest.TestCase):
             self.assertEqual(raised.exception.detail["stdout_sha256"], hashlib.sha256(process.stdout).hexdigest())
         self.assertEqual(commands, [raised.exception.detail])
 
+    def test_windows_transport_exception_preserves_partial_streams_and_request(self) -> None:
+        with self.assertRaises(subprocess.TimeoutExpired) as timeout:
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys,time; sys.stderr.buffer.write(bytes.fromhex('b2e2cad4')); "
+                    "sys.stderr.buffer.flush(); time.sleep(30)",
+                ],
+                capture_output=True,
+                check=False,
+                timeout=1,
+            )
+        with self.assertRaises(FileNotFoundError) as missing:
+            subprocess.run([str(self.root / "missing-transport")], capture_output=True, check=False)
+        self.assertEqual(timeout.exception.stderr, bytes.fromhex("b2e2cad4"))
+        for error in (timeout.exception, missing.exception):
+            for record in (True, False):
+                commands: list[dict] = []
+                with (
+                    self.subTest(error=type(error).__name__, record=record),
+                    mock.patch.object(recovery, "_transport_powershell", side_effect=error),
+                    self.assertRaises(recovery.RecoveryError) as raised,
+                ):
+                    recovery._run_windows_powershell(
+                        ssh_host="windows-fixture",
+                        script="fixture",
+                        timeout=5,
+                        commands=commands if record else None,
+                    )
+                self.assertEqual(raised.exception.code, "windows_recovery_transport_unknown")
+                detail = raised.exception.detail
+                self.assertIsNone(detail["returncode"])
+                self.assertEqual(detail["error_type"], type(error).__name__)
+                stdout, stderr = windows_transport.error_streams(error)
+                self.assertEqual(detail["stdout_sha256"], hashlib.sha256(stdout).hexdigest())
+                self.assertEqual(detail["stderr_sha256"], hashlib.sha256(stderr).hexdigest())
+                self.assertEqual(detail["transport"], windows_transport.request_metadata("fixture"))
+                self.assertEqual(commands, [detail] if record else [])
+
     def test_recovery_propagates_bytecode_suppression_to_children(self) -> None:
         self.assertEqual(os.environ.get("PYTHONDONTWRITEBYTECODE"), "1")
         source = (DEPLOY / "recovery.py").read_text(encoding="utf-8")

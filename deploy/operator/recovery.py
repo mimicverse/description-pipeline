@@ -81,6 +81,8 @@ try:
     systemd_units = render_operator.systemd_units
     from windows_transport import TransportDecodeError
     from windows_transport import decode_output as _decode_windows_output
+    from windows_transport import error_streams as _windows_error_streams
+    from windows_transport import request_metadata as _windows_request_metadata
     from windows_transport import run_powershell as _transport_powershell
 except ImportError as error:  # pragma: no cover - exercised by deployment layout
     raise SystemExit(
@@ -5366,9 +5368,21 @@ def _run_windows_powershell(
             timeout=timeout,
         )
     except (OSError, subprocess.SubprocessError, ValueError) as error:
+        stdout, stderr = _windows_error_streams(error)
+        evidence = {
+            "program": "windows-lifecycle",
+            "returncode": None,
+            "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
+            "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
+            "transport": _windows_request_metadata(script),
+            "error_type": type(error).__name__,
+        }
+        if commands is not None:
+            commands.append(evidence)
         raise RecoveryError(
             "windows_recovery_transport_unknown",
             f"Windows transport failed: {error}",
+            evidence,
         ) from error
     evidence = {
         "program": "windows-lifecycle",
