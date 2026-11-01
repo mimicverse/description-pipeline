@@ -22,7 +22,7 @@ import uuid
 import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[2]
-WORKER = os.environ.get("TELEOP_WORKER_PYTHON")
+WORKER = os.environ.get("TELEOP_PICO_PYTHON")
 LINK = os.environ.get("PICO_LINK_PYTHON", WORKER)
 SESSION_TESTS = bool(WORKER) and sys.platform == "linux"
 
@@ -110,7 +110,7 @@ def model_source(root):
     return profile, files
 
 
-@unittest.skipUnless(SESSION_TESTS, "Linux and TELEOP_WORKER_PYTHON with a fixed wheel are required")
+@unittest.skipUnless(SESSION_TESTS, "Linux and TELEOP_PICO_PYTHON with a fixed wheel are required")
 class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls):
