@@ -21,6 +21,7 @@ from ..owned_process import module_command, process_identity, resource_state, te
 from .store import SimulationConflict, SimulationStore
 from .recording import VerificationUnresolved, prepare_source, recording_binding, run_verification, session_identity
 from .schemas import load_runtime_contract
+from .runtime import validate_runtime_identity
 from .warnings import warning_inventory
 
 log = logging.getLogger(__name__)
@@ -100,7 +101,7 @@ class SimulationService:
         self._probe_identity = self._read_probe_identity()
         if self._probe_identity is not None and not await self._close_probe():
             raise SimulationConflict("Previous startup process group is unresolved")
-        contract = load_runtime_contract(Path(__file__).with_name("teleop-runtime.json"))
+        contract = load_runtime_contract(Path(__file__).with_name("teleop-runtime.json"), consumer="pico")
         nonce = secrets.token_hex(24)
         self._probe_identity = {"nonce": nonce}
         self._write_probe_identity()
@@ -109,8 +110,7 @@ class SimulationService:
                 str(self.python),
                 "-I",
                 "-B",
-                "-c",
-                _IDENTITY_PROBE,
+                str(Path(__file__).with_name("runtime.py")),
                 nonce,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
@@ -152,15 +152,7 @@ class SimulationService:
             raise ValueError(f"Teleop runtime identity failed: {stderr.decode(errors='replace')[-1000:]}")
         if self._lifecycle_state != "starting":
             raise SimulationConflict("Simulation supervisor closed during startup")
-        self.runtime_identity = json.loads(stdout)
-        if {name: item["version"] for name, item in self.runtime_identity["packages"].items()} != contract[
-            "dependency_versions"
-        ]:
-            raise ValueError("Worker dependency versions differ from the fixed integration lock")
-        if self.runtime_identity.pop("teleop_files") != contract["files"]:
-            raise ValueError("Installed Teleop package differs from the fixed source wheel")
-        self.runtime_identity["source_commit"] = contract["source_commit"]
-        self.runtime_identity["wheel_sha256"] = contract["wheel_sha256"]
+        self.runtime_identity = validate_runtime_identity(json.loads(stdout), contract)
         acquiring = asyncio.create_task(asyncio.to_thread(self.store.acquire_supervisor))
         try:
             self._database_lock = await asyncio.shield(acquiring)
@@ -781,37 +773,3 @@ class SimulationService:
                 self._database_lock.close()
                 self._database_lock = None
             self.runtime_identity = None
-
-
-_IDENTITY_PROBE = """
-import base64,hashlib,importlib.metadata as m,json,sys
-dependencies=json.load(sys.stdin)
-import mujoco,teleop
-packages={}
-for name in dependencies:
-    d=m.distribution(name)
-    rows=[]
-    for f in d.files or []:
-        if f.hash is None:
-            continue
-        p=d.locate_file(f)
-        if not p.resolve().is_relative_to(__import__('pathlib').Path(sys.prefix).resolve()):
-            raise ValueError('Runtime dependency escapes its installation')
-        actual=hashlib.new(f.hash.mode,p.read_bytes()).digest()
-        if base64.urlsafe_b64encode(actual).decode().rstrip('=')!=f.hash.value:
-            raise ValueError('Runtime dependency bytes differ from RECORD')
-        rows.append((str(f),actual.hex()))
-    if not rows:
-        raise ValueError('Runtime dependency has no verifiable inventory')
-    packages[name]={'version':d.version,'files_sha256':hashlib.sha256(json.dumps(sorted(rows)).encode()).hexdigest()}
-if packages['robot-teleop']['version']!='0.3.0' or mujoco.mj_versionString()!='3.13.0':
-    raise ValueError('Unsupported Teleop runtime contract')
-from pathlib import Path
-root=Path(teleop.__file__).resolve().parent
-if not root.is_relative_to(Path(sys.prefix).resolve()):
-    raise ValueError('Teleop must be installed from a fixed noneditable wheel')
-files={'teleop/'+p.relative_to(root).as_posix():hashlib.sha256(p.read_bytes()).hexdigest()
-       for p in root.rglob('*') if p.is_file() and '__pycache__' not in p.parts}
-print(json.dumps({'schema_version':'teleop.runtime/v1','packages':packages,
-                  'teleop_files':files,'engine':mujoco.mj_versionString()}))
-"""
