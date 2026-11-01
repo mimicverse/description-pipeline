@@ -369,6 +369,8 @@ class NativeDatabaseTests(PostgresCase):
             str(archive / "run"),
         ]
         verified = subprocess.run(command, cwd=archive, capture_output=True, timeout=120, check=False)
+        (self.root / "detached-verify.stdout.json").write_bytes(verified.stdout)
+        (self.root / "detached-verify.stderr.log").write_bytes(verified.stderr)
         assert verified.returncode == 0, verified.stderr.decode()
         assert json.loads(verified.stdout)["pass"] is True
         assert service.get(access, public["request_id"])["attempt"]["state"] == "completed"
