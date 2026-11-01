@@ -99,6 +99,43 @@ def platform_document(root: Path) -> dict:
 
 
 class PlatformEnvTests(unittest.TestCase):
+    def test_teleop_snapshot_derives_the_same_portal_configuration(self):
+        snapshot = json.loads(json.dumps(self.snapshot))
+        snapshot["resolved"]["operator"]["teleop"] = {"python": "/opt/teleop/bin/python", "capacity": 2}
+        path = self.root / "teleop-snapshot.json"
+        path.write_bytes(pipeline_io.canonical(snapshot))
+        result = platform_env.derive(
+            path.read_bytes(),
+            install_id="gen-1",
+            snapshot_path=path,
+            tree_root=self.tree,
+            release=self.release,
+            wheel=self.wheel,
+        )
+        simulation = json.loads(result["env"]["SIMULATION_CONFIG_JSON"])
+        self.assertEqual(
+            {"python": "/opt/teleop/bin/python", "capacity": 2, "root": str(self.root / "state" / "simulations")},
+            simulation,
+        )
+        state = self.root / "portal"
+        state.mkdir()
+        rendered = render_operator.ensure_portal_config(
+            state,
+            {
+                "AIRFLOW_BASE_URL": "http://127.0.0.1:8080",
+                "TUNNEL_LOOPBACK_PORT": "18765",
+                "PORTAL_HOST": "127.0.0.1",
+                "PORTAL_PORT": "8081",
+                "ENDPOINT_TOKEN_FILE": "/private/token",
+                "SOLIDWORKS_HANDOFF_ROOT": "/private/intake",
+                "MODEL_REPOSITORIES_JSON": "{}",
+                "MODEL_TARGETS_JSON": "{}",
+                "DISCOVERY_SETTINGS_JSON": "{}",
+                "SIMULATION_CONFIG_JSON": result["env"]["SIMULATION_CONFIG_JSON"],
+            },
+        )
+        self.assertEqual(simulation, json.loads(rendered.read_bytes())["portal"]["simulation"])
+
     def setUp(self) -> None:
         self._temporary = tempfile.TemporaryDirectory(prefix="platform-env-")
         self.root = Path(self._temporary.name)
@@ -194,9 +231,7 @@ class PlatformEnvTests(unittest.TestCase):
         # decoder must reproduce every value byte-for-byte (shell-safety quoting included).
         parsed = {
             key: render_operator.decode_env_value(raw.strip())
-            for key, raw in (
-                line.split("=", 1) for line in env_file.read_text(encoding="utf-8").splitlines() if line
-            )
+            for key, raw in (line.split("=", 1) for line in env_file.read_text(encoding="utf-8").splitlines() if line)
         }
         self.assertEqual(parsed, env)
 
@@ -240,26 +275,32 @@ class PlatformEnvTests(unittest.TestCase):
         release_file = self.root / "release.json"
         release = json.loads(release_file.read_text())
         release["deployment_files"] = {
-            f"deploy/operator/{name}": hashlib.sha256((helpers / name).read_bytes()).hexdigest()
-            for name in names
+            f"deploy/operator/{name}": hashlib.sha256((helpers / name).read_bytes()).hexdigest() for name in names
         }
         release_file.write_text(json.dumps(release))
 
         def verify():
             return subprocess.run(
                 [
-                    "bash", "-c",
+                    "bash",
+                    "-c",
                     'set -euo pipefail; source "$1"; shift; verify_snapshot_derived_env "$@"',
-                    "boundary", str(OPERATOR / "environment.sh"),
-                    str(self.snapshot_path), "gen-1", str(result["env_path"]),
-                    str(self.tree), str(release_file),
+                    "boundary",
+                    str(OPERATOR / "environment.sh"),
+                    str(self.snapshot_path),
+                    "gen-1",
+                    str(result["env_path"]),
+                    str(self.tree),
+                    str(release_file),
                 ],
                 env={
                     "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
                     "CONTROL_PYTHON": sys.executable,
                     "HERE": str(helpers),
                 },
-                capture_output=True, text=True, check=False,
+                capture_output=True,
+                text=True,
+                check=False,
             )
 
         completed = verify()
@@ -267,11 +308,13 @@ class PlatformEnvTests(unittest.TestCase):
         cases = (
             ("MODEL_REPOSITORIES_FILE", "MODEL_REPOSITORIES_JSON", {"owner/model-repository": "/other/workspace"}),
             (
-                "MODEL_TARGETS_FILE", "MODEL_TARGETS_JSON",
+                "MODEL_TARGETS_FILE",
+                "MODEL_TARGETS_JSON",
                 {"m3.0": {"repository_slug": "owner/model-repository", "base": "other"}},
             ),
             (
-                "DISCOVERY_SETTINGS_FILE", "DISCOVERY_SETTINGS_JSON",
+                "DISCOVERY_SETTINGS_FILE",
+                "DISCOVERY_SETTINGS_JSON",
                 {"record_roots": ["/other/specifications"]},
             ),
         )
@@ -368,15 +411,10 @@ class PlatformEnvTests(unittest.TestCase):
             "comma_list": "tenant-a,tenant-b",
             "space_only": " ",
         }
-        lines = render_operator.encode_env_lines(
-            (f"VALUE_{key.upper()}", value) for key, value in samples.items()
-        )
+        lines = render_operator.encode_env_lines((f"VALUE_{key.upper()}", value) for key, value in samples.items())
         env_file = self.root / "boundary.env"
         env_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        decoded = {
-            key: render_operator.decode_env_value(raw)
-            for key, raw in (line.split("=", 1) for line in lines)
-        }
+        decoded = {key: render_operator.decode_env_value(raw) for key, raw in (line.split("=", 1) for line in lines)}
         self.assertEqual(decoded, {f"VALUE_{key.upper()}": value for key, value in samples.items()})
         # A clean bash source (no inherited environment) observes the same bytes.
         # The format stays single-quoted: an unquoted \0 is quote-removed to a literal "0".
@@ -622,9 +660,7 @@ except io.PipelineError as error:
             package.mkdir(parents=True)
             (package / "__init__.py").write_text("", encoding="utf-8")
             (package / "interface_records.py").write_text(validator, encoding="utf-8")
-            (home / "sitecustomize.py").write_text(
-                "import description_pipeline.interface_records\n", encoding="utf-8"
-            )
+            (home / "sitecustomize.py").write_text("import description_pipeline.interface_records\n", encoding="utf-8")
             return dict(os.environ, PYTHONPATH=str(home))
 
         weak = ambient_home(

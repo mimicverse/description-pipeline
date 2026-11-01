@@ -2736,6 +2736,9 @@ async function loadPreview(dagRunId) {
       for (const warning of preview.mjcf.warnings || []) { const item = document.createElement("li"); item.textContent = warning; $("mjcf-warnings").append(item); }
       loaded.setMode($("mjcf-mode").value); loaded.setMarkers($("mjcf-markers").checked);
       $("preview-meta").textContent = `MJCF ${preview.mjcf.entry} · ${preview.mjcf.verified ? "Verified" : "Diagnostic"} · ${preview.mjcf.subject_sha256.slice(0, 12)}...`;
+      const teleop = document.createElement("a"); teleop.href = `/static/pico.html?run=${encodeURIComponent(dagRunId)}&launch=1`;
+      teleop.textContent = "Open PICO Teleop"; teleop.target = "_blank"; teleop.rel = "noopener";
+      $("preview-meta").append(" · ", teleop);
       const evidence = document.createElement("a"); evidence.href = artifactUrl(preview.mjcf.certificate.path);
       evidence.textContent = "Collision approximation and source warnings"; evidence.target = "_blank"; evidence.rel = "noopener";
       $("preview-meta").append(" · ", evidence);

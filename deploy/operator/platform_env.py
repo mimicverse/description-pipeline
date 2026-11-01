@@ -287,6 +287,15 @@ def derive(
         "MODEL_TARGETS_FILE": str(targets_file),
         "DISCOVERY_SETTINGS_FILE": str(discovery_file),
     }
+    if "teleop" in operator:
+        env["SIMULATION_CONFIG_JSON"] = json.dumps(
+            {
+                "root": str(Path(state_root) / "simulations"),
+                "python": operator["teleop"]["python"],
+                "capacity": operator["teleop"]["capacity"],
+            },
+            sort_keys=True,
+        )
     # The one env encoding (render_operator.encode_env_lines): values that are not shell-safe
     # - the libpq DSNs' "&" and "?" above all - are single-quoted so that a shell `source`
     # and the KEY=VALUE parser read the identical bytes.

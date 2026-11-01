@@ -315,7 +315,20 @@ def ensure_portal_config(state: Path, resolved: dict[str, str]) -> Path:
     rendered = rendered.replace("@MODEL_REPOSITORIES_JSON@", resolved["MODEL_REPOSITORIES_JSON"])
     rendered = rendered.replace("@MODEL_TARGETS_JSON@", resolved["MODEL_TARGETS_JSON"])
     rendered = rendered.replace("@DISCOVERY_SETTINGS_JSON@", resolved["DISCOVERY_SETTINGS_JSON"])
-    write_private(target, rendered)
+    document = json.loads(rendered)
+    simulation = resolved.get("SIMULATION_CONFIG_JSON")
+    if simulation:
+        value = json.loads(simulation)
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"root", "python", "capacity"}
+            or type(value["capacity"]) is not int
+            or not 1 <= value["capacity"] <= 8
+            or any(not isinstance(value[key], str) or not Path(value[key]).is_absolute() for key in ("root", "python"))
+        ):
+            die("SIMULATION_CONFIG_JSON is invalid")
+        document["portal"]["simulation"] = value
+    write_private(target, json.dumps(document, indent=2) + "\n")
     return target
 
 
@@ -345,9 +358,11 @@ def main() -> int:
     parser.add_argument("--json", action="store_true", help="print the resolved environment as JSON")
     args = parser.parse_args()
 
-    values = read_env(args.env_file) if args.env_file is not None else {
-        key: value for key, value in os.environ.items() if re.fullmatch(r"[A-Z][A-Z0-9_]*", key)
-    }
+    values = (
+        read_env(args.env_file)
+        if args.env_file is not None
+        else {key: value for key, value in os.environ.items() if re.fullmatch(r"[A-Z][A-Z0-9_]*", key)}
+    )
     values = validate_env(values)
     if args.state:
         values["OPERATOR_STATE"] = args.state

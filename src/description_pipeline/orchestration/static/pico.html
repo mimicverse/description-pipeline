@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PICO Upper-body Teleop</title>
+
+<link rel="stylesheet" href="/static/pico.css">
+<main>
+<h1>PICO Upper-body Teleop</h1>
+<p>Kinematic IK · fixed base, waist and legs · independent arms and head tracking. No actuator dynamics or hardware qualification.</p>
+<p id="error" role="alert"></p><p id="status" aria-live="polite">Loading authenticated source…</p>
+<div class="layout"><section class="panel"><div id="scene"></div>
+<p class="pose-legend">Targets: red requested · orange admitted · green applied. Axes show orientation.</p>
+<label>Geometry <select id="mode"><option value="visual">Visual</option><option value="collision">Collision</option><option value="overlay">Overlay</option></select></label>
+<button id="estop" disabled>Emergency Stop</button><button id="stop" disabled>Stop Session</button>
+<button id="pair" disabled>Pair PICO Link</button><a id="recording" hidden>Download Recording</a>
+<p id="pairing"></p><details><summary>Immutable source and runtime</summary><pre id="source"></pre></details>
+<details><summary>Source warnings and verification scope</summary><pre id="warnings"></pre></details>
+</section><section class="panel">
+<form id="setup"><h2>Session configuration</h2>
+<p>A profile binds explicit joints, TCP frames, home pose and input rotation to this exact model revision. It does not change the delivered model.</p>
+<label>Robot profile JSON<textarea id="profile" required spellcheck="false"></textarea></label>
+<label>Control settings JSON<textarea id="settings" required spellcheck="false">{"position_scale":0.1,"joint_speed_radps":1.0,"head_speed_radps":4.0}</textarea></label>
+<label><input type="checkbox" id="record">Record raw inputs and control ticks</label>
+<button id="launch">Start Session</button></form>
+<h2>Live control state</h2><p id="live-status">No active session</p><div id="arms"></div>
+<p id="head"></p><details><summary>Detailed control report</summary><pre id="state">No active session</pre></details>
+</section></div>
+</main><script type="module" src="/static/pico.js"></script>
+</html>

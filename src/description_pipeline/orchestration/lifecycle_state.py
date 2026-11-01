@@ -75,6 +75,12 @@ def collect_projection() -> dict:
             )
             columns = [description[0] for description in cursor.description]
             rows = [dict(zip(columns, values, strict=True)) for values in cursor.fetchall()]
+            cursor.execute("SELECT session_id,source_run_id,state,updated_at FROM simulation_session "
+                           "WHERE state NOT IN ('stopped','failed')")
+            rows.extend({"object_kind": "simulation", "object_id": sid, "run_id": source,
+                         "state": state, "updated_at": updated,
+                         "bucket": "unresolved" if state == "unresolved" else "in_flight"}
+                        for sid, source, state, updated in cursor.fetchall())
             for run in read_admitted_runs(connection):
                 bucket = (
                     "unresolved"

@@ -3,6 +3,11 @@
 -- grants everything below itself. Role creation and attributes live in bootstrap.sql.
 
 GRANT USAGE ON SCHEMA :"platform_schema" TO platform_service;
+GRANT SELECT, INSERT ON :"platform_schema".simulation_session, :"platform_schema".simulation_command TO platform_service;
+GRANT UPDATE (state, revision, error, process_identity, recording_artifact, updated_at, ready_at)
+    ON :"platform_schema".simulation_session TO platform_service;
+GRANT UPDATE (result) ON :"platform_schema".simulation_command TO platform_service;
+GRANT SELECT ON :"platform_schema".simulation_session TO operator_ro;
 
 -- Admission is the one mutable control row. Canonical pipeline facts are immutable
 -- except for the bounded execution-claim lifecycle and display-only metadata.
