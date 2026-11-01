@@ -2687,6 +2687,21 @@ class PortalApp:
         }
         return self._mjcf_input_members(result)
 
+    @staticmethod
+    def _registered_producer_run(projection: dict, row: dict) -> str:
+        reuse = row.get("reuse")
+        if not reuse:
+            return projection["run_id"]
+        command = row.get("command") or {}
+        producer = reuse.get("source_run")
+        if (
+            reuse.get("reused") is not True or not isinstance(producer, str) or not producer
+            or command.get("run_id") != producer
+            or command.get("command_id") != reuse.get("source_command_id")
+        ):
+            raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered reused stage producer is inconsistent")
+        return producer
+
     def _mjcf_input_members(self, projection: dict) -> dict:
         """Expose only the registered MJCF command's exact source closure."""
         stages = projection["stages"]
@@ -2699,7 +2714,7 @@ class PortalApp:
             return projection
         try:
             command = StageCommand.from_record(command_record)
-            producer_run = (row.get("reuse") or {}).get("source_run", projection["run_id"])
+            producer_run = self._registered_producer_run(projection, row)
             if command.run_id != producer_run:
                 raise PipelineError("MJCF command differs from its registered source producer")
             refs = mjcf_source_refs(command)
@@ -3080,10 +3095,10 @@ class PortalApp:
             members = by_stage.get(stage_id) or {}
             if members:
                 artifact = self._registered_stage_artifact(members, stage=stage_id)
-                if artifact.producer_run_id != run_id:
-                    parent = projection.get("parent_run_id")
-                    if not parent or artifact.producer_run_id != parent:
-                        raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered stage artifact has no proven parent run")
+                if artifact.producer_run_id != self._registered_producer_run(projection, row):
+                    raise PortalError(
+                        HTTPStatus.BAD_GATEWAY, "Registered stage artifact differs from its proven producer"
+                    )
                 stage["outputs"] = [{
                     "path": ".", "label": "Sealed stage output", "availability": "recorded",
                     "files": {name: member["sha256"] for name, member in members.items()},
