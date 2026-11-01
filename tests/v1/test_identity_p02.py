@@ -97,7 +97,7 @@ class PortalConfigTargetsTests(unittest.TestCase):
             with patch.object(
                 portal,
                 "_production_admission_runtime",
-                return_value=(None, None, None, None, None, None),
+                return_value=(None, None, None, None, None),
             ):
                 loaded = portal.load_portal_config(config)
             self.assertEqual(loaded.pipeline_targets["m3.0"]["base"], "main")

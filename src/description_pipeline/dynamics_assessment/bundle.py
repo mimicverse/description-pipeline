@@ -159,7 +159,7 @@ def seal_upload(service, access, source, archive: bytes, *, should_cancel):
         (root / "admission.json").write_bytes(
             canonical(
                 {
-                    "schema": "description.dynamics-bundle-admission/v1",
+                    "schema": "solidworks-to-urdf.dynamics-bundle-admission/v1",
                     "principal": access.principal,
                     "source_sha256": source.sha256,
                     "archive_sha256": hashlib.sha256(archive).hexdigest(),

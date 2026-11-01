@@ -24,13 +24,12 @@ import unittest
 import shutil
 from pathlib import Path
 
-from description_pipeline.delivery import read_delivery_manifest, write_delivery_manifest
 from description_pipeline.io import write_json
 from description_pipeline.orchestration import portal as portal_module
 from description_pipeline.orchestration.airflow_client import native_run_id
 
-from .portal_read_support import RegisteredPlatform, build_sealed_delivery
-from .protocol_support import discovery_finding, native_discovery_record
+from .portal_read_support import RegisteredPlatform
+from .protocol_support import discovery_finding
 
 DAG_RUN_ID = "portal-20261010T000000-abcdef01"
 RUN = native_run_id(DAG_RUN_ID)
@@ -141,13 +140,17 @@ class DiagnosticPreviewTests(unittest.TestCase):
         state: str = "failed",
         certificate_overrides: dict | None = None,
     ) -> RegisteredPlatform:
-        """The registered state a failing verify stage leaves: sealed members, failed receipt."""
+        """Register the source pair separately from the retained Verify certificate."""
         platform = RegisteredPlatform(self.tmp / "platform")
         platform.admit(RUN)
+        platform.register_capture(
+            RUN, handoff_warnings=INPUT_WARNINGS["warnings"], discovery_findings=DISCOVERY_FINDINGS,
+        )
+        generate = platform.tree(RUN, "generate")
+        (generate / "urdf").mkdir()
+        (generate / "urdf/robot.urdf").write_bytes(URDF)
+        platform.stage(RUN, "generate")
         tree = platform.tree(RUN, "verify")
-        (tree / "urdf").mkdir()
-        (tree / "urdf/robot.urdf").write_bytes(URDF)
-        (tree / "reports").mkdir()
         write_json(
             tree / "verification-certificate.json",
             {
@@ -161,26 +164,8 @@ class DiagnosticPreviewTests(unittest.TestCase):
                 "diagnostics": diagnostics or [],
             },
         )
-        (tree / "input").mkdir()
-        write_json(tree / "input/handoff.json", {"passed": True, "warnings": INPUT_WARNINGS["warnings"]})
-        (tree / "input/discovery").mkdir()
-        (tree / "evidence").mkdir()
-        write_json(
-            tree / "input/discovery/native-discovery.json",
-            native_discovery_record(
-                RUN,
-                DISCOVERY_FINDINGS,
-                main_assembly="cad/robot.SLDASM",
-                native_files={"cad/robot.SLDASM": "a" * 64},
-            ),
-        )
         members = []
-        for path in (
-            "urdf/robot.urdf",
-            "verification-certificate.json",
-            "input/handoff.json",
-            "input/discovery/native-discovery.json",
-        ):
+        for path in ("verification-certificate.json",):
             data = (tree / path).read_bytes()
             members.append({"path": path, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()})
         platform.stage(
@@ -391,6 +376,12 @@ class DiagnosticPreviewTests(unittest.TestCase):
         self.assertEqual(preview["state"], "unverified")
         self.assertEqual(preview["reason"], "verification_failed")
         projection = platform.fact_projection(RUN)
+        self.assertEqual(
+            set(projection["by_stage"]["verify"]),
+            {"verification-certificate.json", "verification-execution.json"},
+        )
+        self.assertIn("urdf/robot.urdf", projection["by_stage"]["generate"])
+        self.assertIn("input/handoff.json", projection["by_stage"]["capture"])
         certificate_member = projection["by_stage"]["verify"]["verification-certificate.json"]
         certificate = json.loads(
             platform.projection_artifacts.objects[
@@ -440,23 +431,20 @@ class DiagnosticPreviewTests(unittest.TestCase):
             app._artifact(environ, start_response, DAG_RUN_ID, "reports/stages.json")
 
     def test_a_linked_child_serves_its_diagnostic_with_the_parent_transfer(self) -> None:
-        """A reachable linked failure: the child really registers its reuse of the
-        parent's completed capture and really registers its own failed verify; the
-        diagnostic is then served from the child's registered tree with the
-        parent's sealed transfer behind it."""
+        """The child reuses the parent's exact source pair and owns its failed Verify."""
         platform = RegisteredPlatform(self.tmp / "linked-platform")
         platform.admit(RUN)
         platform.register_capture(RUN)
+        generate = platform.tree(RUN, "generate")
+        (generate / "urdf").mkdir()
+        (generate / "urdf/robot.urdf").write_bytes(URDF)
+        platform.stage(RUN, "generate")
         child_dag = "portal-20261010T000001-abcdef02"
         child = native_run_id(child_dag)
         platform.admit(child, from_stage="verify", parent_run_id=RUN)
-        parent_row = platform.facts.stage_records(RUN)["capture"]
-        platform.stage(
-            child,
-            "capture",
-            receipt=parent_row["receipt"],
-            reuse_from=(RUN, "capture"),
-        )
+        for stage in ("capture", "generate"):
+            parent_row = platform.facts.stage_records(RUN)[stage]
+            platform.stage(child, stage, receipt=parent_row["receipt"], reuse_from=(RUN, stage))
         self._register_child_failed_verify(platform, child)
         app = portal_module.PortalApp(
             portal_module.PortalConfig(
@@ -478,17 +466,18 @@ class DiagnosticPreviewTests(unittest.TestCase):
         def start_response(status, headers):
             captured["status"] = status
 
-        child_urdf = (platform.sealed(f"store://sealed/{child}/verify") / "urdf/robot.urdf").read_bytes()
+        projection = platform.fact_projection(child)
+        for stage in ("capture", "generate", "verify"):
+            artifact = next(iter(projection["by_stage"][stage].values()))["artifact"]
+            self.assertEqual(artifact["producer_run_id"], child if stage == "verify" else RUN)
+        child_urdf = (generate / "urdf/robot.urdf").read_bytes()
         body = b"".join(app._artifact(environ, start_response, child_dag, "urdf/robot.urdf"))
         self.assertEqual(captured["status"], "200 OK")
         self.assertEqual(body, child_urdf)
 
     def _register_child_failed_verify(self, platform: RegisteredPlatform, child: str) -> None:
         """The child's own executed-and-failed verify stage, registered through the writer."""
-        tree = platform.sealed(f"store://sealed/{child}/verify")
-        tree.mkdir(parents=True)
-        build_sealed_delivery(tree, run_id=child)
-        manifest = read_delivery_manifest(tree)
+        tree = platform.tree(child, "verify")
         write_json(
             tree / "verification-certificate.json",
             {
@@ -497,23 +486,8 @@ class DiagnosticPreviewTests(unittest.TestCase):
                 "checks": FAILING_CHECKS,
             },
         )
-        handoff = json.loads((tree / "input/handoff.json").read_text(encoding="utf-8"))
-        handoff["warnings"] = INPUT_WARNINGS["warnings"]
-        write_json(tree / "input/handoff.json", handoff)
-        discovery = json.loads(
-            (
-                tree / "input/discovery/native-discovery.json"
-            ).read_text(encoding="utf-8")
-        )
-        discovery["findings"] = DISCOVERY_FINDINGS
-        write_json(
-            tree / "input/discovery/native-discovery.json",
-            discovery,
-        )
-        write_delivery_manifest(tree, contract=manifest["contract"], policy=manifest["policy"])
-        manifest = read_delivery_manifest(tree)
         report = (tree / "verification-certificate.json").read_bytes()
-        artifacts = [dict(record) for record in manifest["subject"]["files"]] + [
+        artifacts = [
             {
                 "path": "verification-certificate.json",
                 "bytes": len(report),
@@ -532,7 +506,6 @@ class DiagnosticPreviewTests(unittest.TestCase):
                 "state": "failed",
                 "passed": False,
                 "error": "URDF verification failed; see verification-certificate.json",
-                "subject_sha256": manifest["subject"]["digest"],
                 "artifacts": artifacts,
             },
         )

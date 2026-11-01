@@ -14,11 +14,11 @@ from ..artifacts import ArtifactStore
 from ..io import PipelineError, canonical, digest
 from ..pipeline.contracts import ArtifactRef
 
-SOURCE_SCHEMA = "description.assessment-source/v1"
-REQUEST_SCHEMA = "description.dynamics-assessment-request/v1"
-BUNDLE_SCHEMA = "description.dynamics-execution-bundle/v1"
-RUNTIME_SCHEMA = "description.assessment-runtime/v2"
-RESULT_SCHEMA = "description.dynamics-assessment-result/v1"
+SOURCE_SCHEMA = "solidworks-to-urdf.assessment-source/v1"
+REQUEST_SCHEMA = "solidworks-to-urdf.dynamics-assessment-request/v1"
+BUNDLE_SCHEMA = "solidworks-to-urdf.dynamics-execution-bundle/v1"
+RUNTIME_SCHEMA = "solidworks-to-urdf.assessment-runtime/v2"
+RESULT_SCHEMA = "solidworks-to-urdf.dynamics-assessment-result/v1"
 DAG_ID = "upper_body_dynamics"
 POOL_ID = "dynamics_assessment"
 BUNDLE_MEMBER = "assessment.json"

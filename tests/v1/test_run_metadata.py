@@ -156,7 +156,7 @@ class RunMetadataTests(unittest.TestCase):
         self.client.login()
 
     # ------------------------------------------------------------------ helpers
-    def _serve(self, *, store=None):
+    def _serve(self, *, store=None, stage_rerun_loader=None, application=None):
         config = PortalConfig(
             airflow=AirflowApi(self.airflow.url),
             static_dir=self.static_dir,
@@ -165,6 +165,8 @@ class RunMetadataTests(unittest.TestCase):
             run_projection_factory=self._projection,
             pipeline_targets=TEST_TARGETS,
             config_identity_provider=lambda: "c" * 64,
+            production_stage_rerun_loader=stage_rerun_loader,
+            production_application=application,
         )
         server = make_server(
             "127.0.0.1", 0, PortalApp(config), server_class=_ThreadingWSGIServer, handler_class=_QuietHandler
@@ -337,7 +339,17 @@ class RunMetadataTests(unittest.TestCase):
         self.assertEqual(json.loads(body)["reason"], "deleted")
         status, _, body = self.client.request("POST", f"/api/runs/{run_id}/attempts", {"stage": "verify"})
         self.assertEqual(status, 400, body)
-        self.assertIn("start from Freeze", json.loads(body)["error"])
+        self.assertEqual(json.loads(body)["error"], "Stage rerun parameters are invalid")
+        stage_rerun_loader = mock.Mock()
+        application = SimpleNamespace(load_admission_outcome=mock.Mock())
+        server = self._serve(stage_rerun_loader=stage_rerun_loader, application=application)
+        rerun_client = PortalClient(f"http://127.0.0.1:{server.server_address[1]}")
+        rerun_client.login()
+        status, _, body = rerun_client.request("POST", f"/api/runs/{run_id}/attempts", {"from_stage": "verify"})
+        self.assertEqual(status, 409, body)
+        self.assertEqual(json.loads(body)["reason"], "deleted")
+        stage_rerun_loader.assert_not_called()
+        application.load_admission_outcome.assert_not_called()
 
         # Renaming a deleted record is allowed (display-only) and restore brings it back.
         status, _, body = self.client.request("PATCH", f"/api/runs/{run_id}", {"title": "装配线 A（待恢复）"})

@@ -493,7 +493,8 @@ class RunHistoryUiContractTests(unittest.TestCase):
         page = self.page()
         self.assertIn('id="run-deleted"', page)
         self.assertIn("This delivery is hidden; restore it before retrying or rerunning.", app)
-        self.assertIn("This delivery is hidden; restore it before rerunning.", app)
+        self.assertIn('run.deleted ? "Restore the delivery before rerunning."', app)
+        self.assertIn("row.eligible === true && !run.deleted", app)
         self.assertIn("RETRY_REASONS.deleted", app)
 
     def test_keyboard_and_focus_contract(self) -> None:
