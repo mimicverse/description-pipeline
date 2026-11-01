@@ -80,7 +80,7 @@ wire/view/expectation 和入站 upload admission。不得在 `run_stage`、trigg
 还须在 admit 前拒绝 application/client target 与 spec target 不一致；现有 request
 重试先复用已封存 spec，再考虑当前登记。
 
-新的 CAD 输入从 `freeze` 起点开始。阶段重跑由统一的 `ProductionStageRerunRequest` 与 `load_production_stage_rerun(...)` 接纳，固定 `parent_run_id/from_stage/through_stage`。默认终点为所选起点；正常首次上传的终点为 Publish。Freeze 后继仅复用经 `load_verified_freeze_origins` 核验的 originals；其他阶段从真实父来源解析必要前缀，支持由先前独立重跑结果继续下一阶段。原件、command、decision、certificate 和 artifact 的真实 producer 保留，不回填旧运行或复制旧下游成功。
+新的 CAD 输入从 `freeze` 起点开始。阶段重跑由统一的 `ProductionStageRerunRequest` 与 `load_production_stage_rerun(...)` 接纳，固定 `parent_run_id/from_stage/through_stage`。默认终点为所选起点；正常首次上传的终点为 Publish。Freeze 后继仅复用经统一 `source_admission/source_context` 核验的 originals；其他阶段从真实父来源解析必要前缀，支持由先前独立重跑结果继续下一阶段。原件、command、decision、certificate 和 artifact 的真实 producer 保留，不回填旧运行或复制旧下游成功。
 
 同一幂等身份只有完整请求及来源一致时才返回原接纳，改变已提交正文拒绝。普通上传不接受 parent；stage 后继必须经过同一事实和来源资格核验，不能把任意目录或诊断输出当作正式前缀。已有 command 的恢复仍走共同 engine；UNKNOWN effect 先按原身份对账。
 
@@ -922,7 +922,7 @@ Generate 的本地转换、输出表示及 Verify 的本地评估若明确抛出
 
 ## 七阶段独立重跑与执行范围
 
-`ProductionStageRerunRequest` 经统一 attempts 入口接纳 `from_stage/through_stage`，使用新的不可变 request/run。七阶段均可独立选择，默认仅执行所选阶段，也可明确指定下游终点。来源可以是完整运行或前次有界执行，但所需前缀必须具有完整 formal 字节、command、decision、证书、producer/executor 与 supporting predecessors；所有者、用途、规则、配置及目标相容。诊断来源、未决 effect、缺失或错绑来源拒绝。原失败和原 artifact 不改写，旧所选阶段及下游决定不继承。
+`ProductionStageRerunRequest` 经统一 attempts 入口接纳 `from_stage/through_stage`，使用新的不可变 request/run。七阶段均可独立选择，默认仅执行所选阶段，也可明确指定下游终点。来源可以是完整运行或前次有界执行，必要前缀须具有完整 formal 字节、command、decision、证书、producer/executor 与 supporting predecessors；不要求父无关后缀全部结束。复用前缀按其原封存合同、规则、策略和配置核验，所选阶段采用当前工具及适用策略。部署路由或 TLS 等执行 metadata 变化不冒充工程输入变化；不能只比较整份配置 digest 就强迫重做 CAD。诊断来源、未决 effect、缺失或错绑来源拒绝。原失败和原 artifact 不改写，旧所选阶段及下游决定不继承。
 
 所有消费者共用 `execution_stage_ids`。共同 `execution_scope` 给出本次实际范围；复用前缀保留 source/reuse 与真实 producer，本次 command/decision 不伪造；未执行后缀为 `out_of_scope`。独立生成的新结果可作为后续有界执行的合法来源；不能回退使用被替代的旧下游成功。`delivery_complete` 与 scope 成功分别计算。
 
