@@ -525,6 +525,19 @@ console.log("unfinished preview and activity polling OK");
   run.automatic.state = "waiting"; p.app.renderRun(run);
   assert.notEqual(p.$("stage-detail").children[0], unresolved, "A qualification display change must invalidate rendered details");
 }
+// Registering a certificate must refresh its stage link without any stage or subject change.
+{
+  const p = page();
+  const run = {dag_run_id: "certificate-refresh", state: "failed", automatic: {state: "failed"}, verification_reports: [],
+    report: {stages: [{id: "verify", name: "Verify", state: "failed", counts: {warnings: 1},
+      warnings: [{code: "source.warning", message: "Recorded warning", records_total: 1, objects: []}]}]}};
+  p.app.state.dagRunId = run.dag_run_id; p.app.state.lastRun = run;
+  const hasCertificate = (node) => node.textContent === "Open complete verification certificate" ||
+    node.children.some((child) => child && typeof child === "object" && hasCertificate(child));
+  p.app.renderRun(run); assert.equal(hasCertificate(p.$("stage-detail")), false);
+  run.verification_reports = [{path: "verification-certificate.json", url: "/api/runs/certificate-refresh/artifacts/verification-certificate.json"}];
+  p.app.renderRun(run); assert.equal(hasCertificate(p.$("stage-detail")), true);
+}
 // Warning disclosure survives identical subjects, while a changed qualification always refreshes.
 {
   const p = page(); p.app.state.dagRunId = "diagnostic-dom";

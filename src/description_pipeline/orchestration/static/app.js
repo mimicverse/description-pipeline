@@ -1450,7 +1450,7 @@ function renderStageDetail() {
     pr: run ? run.pr : null, subjectSha256: state.previewSubject,
   }) : { rows: [] };
   $("stage-selection-label").textContent = stage?.name || "";
-  if (!beginRender(root, [state.dagRunId, stage, quick, state.previewFiles, warningNote,
+  if (!beginRender(root, [state.dagRunId, stage, quick, state.previewFiles, warningNote, run?.verification_reports,
     stage ? displayState(stage.state, run?.automatic) : null])) return;
   if (!stage) {
     root.textContent = "Stage details are not available yet.";
