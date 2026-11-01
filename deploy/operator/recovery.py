@@ -5354,6 +5354,30 @@ def _windows_lifecycle_paths(state_root: str) -> tuple[str, str]:
     return root + "/instance-lifecycle.ps1", root + "/windows-binding.json"
 
 
+def _windows_transport_evidence(
+    program: str,
+    result: subprocess.CompletedProcess[bytes] | BaseException,
+    transport: dict | None,
+) -> dict:
+    if isinstance(result, subprocess.CompletedProcess):
+        stdout, stderr = result.stdout, result.stderr
+    else:
+        stdout, stderr = _windows_error_streams(result)
+    evidence = {
+        "program": program,
+        "returncode": getattr(result, "returncode", None),
+        "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
+        "stdout_base64": base64.b64encode(stdout).decode("ascii"),
+        "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
+        "stderr_base64": base64.b64encode(stderr).decode("ascii"),
+        "transport": transport,
+    }
+    if isinstance(result, BaseException):
+        evidence["error_type"] = type(result).__name__
+        evidence["timeout_seconds"] = getattr(result, "timeout", None)
+    return evidence
+
+
 def _run_windows_powershell(
     *,
     ssh_host: str,
@@ -5370,15 +5394,7 @@ def _run_windows_powershell(
             timeout=timeout,
         )
     except (OSError, subprocess.SubprocessError, ValueError) as error:
-        stdout, stderr = _windows_error_streams(error)
-        evidence = {
-            "program": "windows-lifecycle",
-            "returncode": None,
-            "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
-            "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
-            "transport": transport,
-            "error_type": type(error).__name__,
-        }
+        evidence = _windows_transport_evidence("windows-lifecycle", error, transport)
         if commands is not None:
             commands.append(evidence)
         raise RecoveryError(
@@ -5386,12 +5402,7 @@ def _run_windows_powershell(
             f"Windows transport failed: {error}",
             evidence,
         ) from error
-    evidence = {
-        "program": "windows-lifecycle",
-        "returncode": completed.returncode,
-        "stdout_sha256": hashlib.sha256(completed.stdout).hexdigest(),
-        "stderr_sha256": hashlib.sha256(completed.stderr).hexdigest(),
-    }
+    evidence = _windows_transport_evidence("windows-lifecycle", completed, transport)
     if commands is not None:
         commands.append(evidence)
     try:
@@ -5484,26 +5495,34 @@ def _windows_scp(
     if recursive:
         argv.append("-r")
     argv.extend([str(source), str(destination)])
+    transport = {
+        "argv": argv,
+        "argv_sha256": hashlib.sha256(json.dumps(argv, separators=(",", ":")).encode("ascii")).hexdigest(),
+    }
     try:
         completed = subprocess.run(
             argv,
             capture_output=True,
-            text=True,
             timeout=timeout,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError) as error:
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        evidence = _windows_transport_evidence("scp", error, transport)
+        if commands is not None:
+            commands.append(evidence)
         raise RecoveryError(
             "windows_recovery_transport_unknown",
             f"Windows file transfer failed: {error}",
+            evidence,
         ) from error
+    evidence = _windows_transport_evidence("scp", completed, transport)
     if commands is not None:
-        commands.append({"program": "scp", "returncode": completed.returncode})
+        commands.append(evidence)
     require(
         completed.returncode == 0,
         "windows_recovery_transport_unknown",
         "Windows file transfer failed",
-        {"stderr": completed.stderr.strip()[-2000:]},
+        evidence,
     )
 
 
@@ -11959,13 +11978,26 @@ def record_backup_failure(
         receipt_written = False
     staging_removed = False
     try:
-        partial_download = (
-            isinstance(payload["detail"], dict) and payload["detail"].get("download", {}).get("present") is True
-        )
+        # The owned workspace is the download evidence authority; exception
+        # metadata cannot grant permission to discard bytes already received.
+        windows_staging = out / "backup" / "windows"
+        try:
+            mode = windows_staging.lstat().st_mode
+        except FileNotFoundError:
+            partial_download = False
+        except OSError:
+            partial_download = True
+            payload["staging_retained_reason"] = "windows_download_observation_unknown"
+        else:
+            try:
+                partial_download = not stat.S_ISDIR(mode) or any(windows_staging.iterdir())
+            except OSError:
+                partial_download = True
+                payload["staging_retained_reason"] = "windows_download_observation_unknown"
         if _claim_is_current(claim) and not partial_download:
             staging_removed = remove_private_staging(out)
         if partial_download:
-            payload["staging_retained_reason"] = "partial_windows_download"
+            payload.setdefault("staging_retained_reason", "partial_windows_download")
     except (SystemExit, OSError, RecoveryError):
         staging_removed = False
     if receipt_written:

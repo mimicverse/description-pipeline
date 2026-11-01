@@ -4612,6 +4612,120 @@ class RecoveryControlFlowTests(unittest.TestCase):
 
 
 class RecoveryFailureEvidenceTests(unittest.TestCase):
+    @contextlib.contextmanager
+    def local_scp(self, root, mode):
+        bin_dir = root / "scp-bin"
+        bin_dir.mkdir(exist_ok=True)
+        if mode != "missing":
+            write(
+                bin_dir / "scp",
+                f"#!{sys.executable}\n" + textwrap.dedent("""\
+                    import os,sys,time
+                    from pathlib import Path
+                    Path(sys.argv[-1]).write_bytes(b"partial transfer")
+                    sys.stdout.buffer.write(b"copy partial")
+                    sys.stdout.buffer.flush()
+                    sys.stderr.buffer.write(bytes.fromhex("b2e2cad4"))
+                    sys.stderr.buffer.flush()
+                    if os.environ["RECOVERY_SCP_MODE"] == "timeout":
+                        time.sleep(30)
+                    raise SystemExit(0 if os.environ["RECOVERY_SCP_MODE"] == "success" else 17)
+                    """),
+                mode=0o700,
+            )
+        with mock.patch.dict(os.environ, {"PATH": str(bin_dir), "RECOVERY_SCP_MODE": mode}):
+            yield
+
+    def test_windows_scp_preserves_actual_raw_attempts_before_classifying_results(self):
+        for mode in ("success", "nonzero", "timeout", "missing"):
+            for record in (True, False):
+                with self.subTest(mode=mode, record=record), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    commands: list[dict] = []
+                    with self.local_scp(root, mode):
+                        if mode == "success":
+                            recovery._windows_scp(
+                                ssh_host="windows-fixture", source="windows-fixture:/source with space",
+                                destination=root / "target", timeout=1, commands=commands if record else None,
+                            )
+                            if not record:
+                                continue
+                            evidence = commands[0]
+                        else:
+                            with self.assertRaises(recovery.RecoveryError) as raised:
+                                recovery._windows_scp(
+                                    ssh_host="windows-fixture", source="windows-fixture:/source with space",
+                                    destination=root / "target", timeout=1, commands=commands if record else None,
+                                )
+                            self.assertEqual("windows_recovery_transport_unknown", raised.exception.code)
+                            evidence = raised.exception.detail
+                    self.assertEqual("scp", evidence["program"])
+                    self.assertEqual(
+                        0 if mode == "success" else 17 if mode == "nonzero" else None,
+                        evidence["returncode"],
+                    )
+                    stdout = b"" if mode == "missing" else b"copy partial"
+                    stderr = b"" if mode == "missing" else bytes.fromhex("b2e2cad4")
+                    self.assertEqual(stdout, base64.b64decode(evidence["stdout_base64"]))
+                    self.assertEqual(stderr, base64.b64decode(evidence["stderr_base64"]))
+                    self.assertEqual(hashlib.sha256(stdout).hexdigest(), evidence["stdout_sha256"])
+                    self.assertEqual(hashlib.sha256(stderr).hexdigest(), evidence["stderr_sha256"])
+                    argv = evidence["transport"]["argv"]
+                    self.assertEqual(str(root / "target"), argv[-1])
+                    self.assertEqual(
+                        hashlib.sha256(json.dumps(argv, separators=(",", ":")).encode("ascii")).hexdigest(),
+                        evidence["transport"]["argv_sha256"],
+                    )
+                    if mode == "timeout":
+                        self.assertEqual(1, evidence["timeout_seconds"])
+                    self.assertEqual(commands, [evidence] if record else [])
+
+    def test_real_failed_scp_download_is_retained_by_backup_failure_cleanup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            out = root / "backup-output"
+            claim = recovery.claim_backup_output(out, "fixture")
+            windows = out / "backup" / "windows"
+            windows.mkdir(parents=True)
+            piece = windows / "partial.bin"
+            with self.local_scp(root, "nonzero"), self.assertRaises(recovery.RecoveryError) as raised:
+                recovery._windows_scp(
+                    ssh_host="windows-fixture", source="windows-fixture:/source",
+                    destination=piece, timeout=1, commands=[],
+                )
+            self.assertNotIn("download", raised.exception.detail)
+            recovery.record_backup_failure(
+                argparse.Namespace(out=out, backup_id="fixture", config=root / "platform.json"),
+                raised.exception, claim,
+            )
+            receipt = json.loads((out / "receipt.json").read_bytes())
+            self.assertEqual(b"partial transfer", piece.read_bytes())
+            self.assertFalse(receipt["private_staging_removed"])
+            self.assertEqual("partial_windows_download", receipt["staging_retained_reason"])
+            self.assertEqual(bytes.fromhex("b2e2cad4"), base64.b64decode(receipt["detail"]["stderr_base64"]))
+
+    def test_unreadable_owned_download_workspace_is_retained_without_inventing_presence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            out = root / "backup-output"
+            claim = recovery.claim_backup_output(out, "fixture")
+            staging = out / "backup"
+            windows = staging / "windows"
+            windows.mkdir(parents=True)
+            piece = write(windows / "partial.bin", b"original partial")
+            staging.chmod(0)
+            try:
+                recovery.record_backup_failure(
+                    argparse.Namespace(out=out, backup_id="fixture", config=root / "platform.json"),
+                    recovery.RecoveryError("windows_recovery_transport_unknown", "transfer failed"), claim,
+                )
+                receipt = json.loads((out / "receipt.json").read_bytes())
+                self.assertFalse(receipt["private_staging_removed"])
+                self.assertEqual("windows_download_observation_unknown", receipt["staging_retained_reason"])
+            finally:
+                staging.chmod(0o700)
+            self.assertEqual(b"original partial", piece.read_bytes())
+
     def test_failure_cleanup_keeps_referenced_sidecars_and_partial_download(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -4620,11 +4734,9 @@ class RecoveryFailureEvidenceTests(unittest.TestCase):
                 claim = recovery.claim_backup_output(out, "fixture")
                 staging = out / "backup"
                 staging.mkdir()
-                piece = write(staging / "partial.zip", "partial")
+                piece = write(staging / "windows" / "partial.zip" if partial else staging / "partial.zip", "partial")
                 sidecar = write(out / "windows-transfer-evidence" / "upload.stderr", "diagnostic")
                 detail = {"phase": "download" if partial else "upload", "stderr": {"path": str(sidecar)}}
-                if partial:
-                    detail["download"] = {"present": True, "partial": {"path": str(piece)}}
                 recovery.record_backup_failure(
                     argparse.Namespace(out=out, backup_id="fixture", config=root / "platform.json"),
                     recovery.RecoveryError("windows_recovery_transport_unknown", "transfer failed", detail),
@@ -4633,6 +4745,7 @@ class RecoveryFailureEvidenceTests(unittest.TestCase):
                 receipt = json.loads((out / "receipt.json").read_text())
                 self.assertTrue(Path(receipt["detail"]["stderr"]["path"]).is_file())
                 self.assertEqual(staging.exists(), partial)
+                self.assertEqual(piece.exists(), partial)
 
     def test_tar_reader_drains_after_archive_end_and_rejects_decrypt_failure(self):
         payload = io.BytesIO()
