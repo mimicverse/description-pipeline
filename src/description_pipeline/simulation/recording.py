@@ -14,6 +14,7 @@ from ..io import canonical, digest
 from ..owned_process import process_identity, resource_state, terminate_owned
 from ..pipeline.contracts import ArtifactRef
 from .store import SimulationConflict
+from .resources import SESSION_QUOTA_BYTES
 from .warnings import warning_inventory, verify_warning_inventory
 
 
@@ -44,8 +45,28 @@ def prepare_bound(binding: dict, artifacts, source: Path, *, commands: list, exe
     if digest(request["runtime"]) != binding["runtime_digest"]:
         raise ValueError("Recording runtime differs from the registered session")
     outcome = json.loads((root / "outcome.json").read_bytes())
-    if set(outcome) != {"complete", "error"} or type(outcome["complete"]) is not bool:
+    if set(outcome) != {
+        "complete",
+        "error",
+        "manifest_sha256",
+        "container_complete",
+        "streams",
+        "session_complete",
+        "formal_one_hour_qualified",
+    } or any(
+        type(outcome[key]) is not bool
+        for key in (
+            "complete",
+            "container_complete",
+            "session_complete",
+            "formal_one_hour_qualified",
+        )
+    ):
         raise ValueError("Recording completion metadata is invalid")
+    if not (outcome["complete"] and outcome["container_complete"] and outcome["session_complete"]):
+        raise ValueError("Diagnostic recording is not a complete session verification input")
+    if outcome["manifest_sha256"] != inventory.get("native/session-manifest.json"):
+        raise ValueError("Platform outcome differs from its committed native manifest")
     warning_identity = verify_warning_inventory(request["source"], source)
     return {
         "binding": binding,
@@ -60,15 +81,13 @@ def prepare_bound(binding: dict, artifacts, source: Path, *, commands: list, exe
     }
 
 
-def materialize_source(destination: Path, source: dict, members: dict, read_member) -> Path:
+def _source_members(source: dict, members: dict):
     files = source["files"]
     certificate = warning_inventory(source)["certificate"]
     if files.get(certificate["path"]) != certificate["sha256"]:
         raise ValueError("Source files do not bind the original warning certificate")
     if len(files) > 2048:
         raise ValueError("Simulation source exceeds the file-count budget")
-    destination.mkdir(parents=True, exist_ok=False, mode=0o700)
-    total = 0
     for name, expected in files.items():
         relative = Path(name)
         if (
@@ -81,10 +100,35 @@ def materialize_source(destination: Path, source: dict, members: dict, read_memb
         ):
             raise ValueError("Simulation source path is invalid")
         member = certificate if name == certificate["path"] else members[name]
-        content = read_member(name, member)
+        if (
+            member["path"] != name
+            or member["sha256"] != expected
+            or type(member["bytes"]) is not int
+            or not 0 <= member["bytes"] <= 64 * 1024 * 1024
+        ):
+            raise ValueError("Simulation source member identity or declared size is invalid")
+        yield relative, expected, member
+
+
+def declared_source_bytes(source: dict, members: dict) -> int:
+    """Read only exact member sizes from the bound immutable artifact inventory."""
+    return sum(member["bytes"] for _relative, _expected, member in _source_members(source, members))
+
+
+def materialize_source(
+    destination: Path, source: dict, members: dict, read_member, *, max_bytes=SESSION_QUOTA_BYTES
+) -> Path:
+    if type(max_bytes) is not int or not 0 < max_bytes <= SESSION_QUOTA_BYTES:
+        raise ValueError("Simulation source requires an admitted byte budget")
+    destination.mkdir(parents=True, exist_ok=False, mode=0o700)
+    total = 0
+    for relative, expected, member in _source_members(source, members):
+        content = read_member(relative.as_posix(), member)
         total += len(content)
-        if len(content) > 64 * 1024 * 1024 or total > 1024 * 1024 * 1024:
+        if len(content) > 64 * 1024 * 1024 or total > max_bytes:
             raise ValueError("Simulation source exceeds the materialization budget")
+        if member["bytes"] != len(content):
+            raise ValueError("Simulation source differs from its declared member size")
         if hashlib.sha256(content).hexdigest() != expected:
             raise ValueError("Simulation source digest changed")
         path = destination / relative
@@ -123,8 +167,12 @@ def recording_binding(row: dict) -> dict:
     }
 
 
-async def prepare_source(destination: Path, source: dict, members: dict, read_member) -> Path:
-    task = asyncio.create_task(asyncio.to_thread(materialize_source, destination, source, members, read_member))
+async def prepare_source(
+    destination: Path, source: dict, members: dict, read_member, *, max_bytes=SESSION_QUOTA_BYTES
+) -> Path:
+    task = asyncio.create_task(
+        asyncio.to_thread(materialize_source, destination, source, members, read_member, max_bytes=max_bytes)
+    )
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
@@ -171,6 +219,8 @@ def verification_execution(*, consumer="pico") -> dict:
 def _helper_command(python: Path, nonce: str, helper: Path, expected: str, operation: str) -> list[str]:
     if not python.is_absolute() or not python.is_file():
         raise ValueError("Native verification requires an absolute fixed PICO interpreter")
+    if not os.access(python, os.X_OK):
+        raise PermissionError("Native consumer interpreter is not executable")
     limiter = shutil.which("prlimit")
     if limiter is None:
         raise ValueError("Native verification requires resource control")
@@ -192,6 +242,10 @@ try:
     exec(compile(code, str(path), 'exec'), scope)
     if sys.argv[3] == 'runtime':
         print(json.dumps(scope['verify_runtime_contract'](payload['runtime_contract'])))
+    elif sys.argv[3] == 'resources':
+        print(json.dumps(scope['resolve_resources'](payload)))
+    elif sys.argv[3] == 'inspect':
+        print(json.dumps(scope['inspect_native'](payload)))
     else:
         raise SystemExit(scope['worker_main'](payload))
 except Exception as error:
@@ -230,6 +284,18 @@ def evidence_command(python: Path, nonce: str, execution: dict) -> list[str]:
 def runtime_command(python: Path, nonce: str, execution: dict) -> list[str]:
     return _helper_command(
         python, nonce, Path(__file__).with_name("runtime.py"), execution["runtime_helper_sha256"], "runtime"
+    )
+
+
+def resource_command(python: Path, nonce: str, execution: dict) -> list[str]:
+    return _helper_command(
+        python, nonce, Path(__file__).with_name("runtime.py"), execution["runtime_helper_sha256"], "resources"
+    )
+
+
+def inspection_command(python: Path, nonce: str, execution: dict) -> list[str]:
+    return _helper_command(
+        python, nonce, Path(__file__).with_name("verify_recording.py"), execution["helper_sha256"], "inspect"
     )
 
 

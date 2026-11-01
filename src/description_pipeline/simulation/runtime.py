@@ -228,5 +228,21 @@ def verify_runtime_contract(contract: dict) -> dict:
     )
 
 
+def resolve_resources(payload: dict) -> dict:
+    """Resolve pre-materialization limits using only the verified public native policy."""
+    runtime = verify_runtime_contract(payload["runtime_contract"])
+    from teleop.robots.m3_0.session_evidence import resolve_session_resource_policy
+
+    request = payload["resource_request"]
+    policy = resolve_session_resource_policy(
+        request["resource_policy"],
+        control_period_s=request["control_period_s"],
+        declared_source_bytes=request["declared_source_bytes"],
+        session_dir=Path(request["session_dir"]),
+        request_session_bytes=request["request_session_bytes"],
+    )
+    return {"runtime": runtime, "policy": policy}
+
+
 if __name__ == "__main__":
     raise SystemExit("Load the runtime helper through its registered byte gate")

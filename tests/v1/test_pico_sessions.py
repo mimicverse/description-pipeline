@@ -318,6 +318,14 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(result["parent_runtime_imported_before"])
             self.assertFalse(result["parent_recording_imported_before"])
 
+    async def test_active_session_ids_keep_unresolved_capacity_and_exclude_terminal_rows(self):
+        first = self.store.create("fixture-operator", "capacity-one", self.run_id, self.request, self.service.owner)
+        second = self.store.create("fixture-operator", "capacity-two", self.run_id, self.request, self.service.owner)
+        self.assertEqual({first["session_id"], second["session_id"]}, set(self.store.active_session_ids()))
+        self.store.transition(first["session_id"], self.service.owner, "unresolved", error="Fixture unknown ownership")
+        self.store.transition(second["session_id"], self.service.owner, "failed", error="Fixture confirmed failure")
+        self.assertEqual([first["session_id"]], self.store.active_session_ids())
+
     async def test_fresh_parent_cold_runtime_import_rejects_marker_before_execution(self):
         await self.exercise_fresh_parent_helper_drift("cold_runtime")
 

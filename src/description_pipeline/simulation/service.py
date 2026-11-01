@@ -7,6 +7,7 @@ from collections import OrderedDict
 from copy import deepcopy
 from dataclasses import dataclass, field
 import hashlib
+import errno
 import fcntl
 import json
 import logging
@@ -24,6 +25,10 @@ from ..owned_process import module_command, process_identity, resource_state, te
 from .store import SimulationConflict, SimulationStore
 from .recording import (
     VerificationUnresolved,
+    INPUT_LIMIT,
+    declared_source_bytes,
+    inspection_command,
+    resource_command,
     prepare_bound,
     prepare_source,
     recording_binding,
@@ -32,6 +37,17 @@ from .recording import (
     session_identity,
     verification_execution,
 )
+from .resources import (
+    SESSION_QUOTA_BYTES,
+    SessionResourceError,
+    check_session_capacity,
+    directory_bytes,
+    require_storage,
+    validate_policy,
+    validate_ready,
+    validate_state,
+)
+from .evidence import RecordingDiagnostic, SessionEvidenceError, verify_manifest_counts, verify_session_finalization
 from .warnings import warning_inventory
 
 log = logging.getLogger(__name__)
@@ -68,13 +84,30 @@ class RunningSession:
     ending: bool = False
     reader_eof: bool = False
     failure: str | None = None
+    expected_policy: dict | None = None
+    ready_evidence: dict | None = None
+    evidence: dict | None = None
+    last_state_tick: int | None = None
+    last_state_received_ns: int = field(default_factory=time.monotonic_ns)
 
 
 class SimulationService:
-    def __init__(self, store: SimulationStore, artifacts, root: Path, python: Path, *, capacity: int = 2):
+    def __init__(
+        self,
+        store: SimulationStore,
+        artifacts,
+        root: Path,
+        python: Path,
+        *,
+        capacity: int = 2,
+        resource_policy: dict | None = None,
+    ):
         self.store, self.artifacts = store, artifacts
         self.root, self.python = Path(root), Path(python)
         self.capacity = capacity
+        self._resource_policy_input = deepcopy(resource_policy or {})
+        self._probe_gate = asyncio.Lock()
+        self._storage_gate = asyncio.Lock()
         self._consumer_execution = verification_execution()
         self.owner = secrets.token_hex(24)
         self.runtime_identity = None
@@ -106,7 +139,12 @@ class SimulationService:
 
     async def _start(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if self.root.is_symlink() or not self.python.is_absolute() or not self.python.is_file():
+        if (
+            self.root.is_symlink()
+            or not self.root.is_absolute()
+            or not self.python.is_absolute()
+            or not self.python.is_file()
+        ):
             raise ValueError("Simulation root or worker interpreter is invalid")
         if shutil.which("prlimit") is None:
             raise ValueError("Native worker resource control requires prlimit")
@@ -123,57 +161,7 @@ class SimulationService:
             raise SimulationConflict("Previous startup process group is unresolved")
         execution = self._consumer_execution
         contract = execution["runtime_contract"]
-        nonce = secrets.token_hex(24)
-        self._probe_identity = {"nonce": nonce}
-        self._write_probe_identity()
-        spawning = asyncio.create_task(
-            asyncio.create_subprocess_exec(
-                *runtime_command(self.python, nonce, execution),
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
-                start_new_session=True,
-            )
-        )
-        interrupted = False
-        try:
-            try:
-                probe = await asyncio.shield(spawning)
-            except asyncio.CancelledError:
-                probe = await spawning
-                interrupted = True
-        except Exception:
-            self._probe_identity = None
-            self._write_probe_identity()
-            raise
-        self._probe = probe
-        self._probe_identity = {"pid": probe.pid, "nonce": nonce}
-        self._write_probe_identity()
-        self._probe_identity = process_identity(probe.pid, nonce)
-        self._write_probe_identity()
-        if interrupted:
-            raise asyncio.CancelledError
-        if self._lifecycle_state != "starting":
-            raise SimulationConflict("Simulation supervisor closed during startup")
-        stdout, stderr = await asyncio.wait_for(
-            probe.communicate(canonical(execution)),
-            30,
-        )
-        clean = await asyncio.to_thread(resource_state, self._probe_identity) == "dead"
-        if not await self._close_probe():
-            raise SimulationConflict("Startup process group is unresolved")
-        if not clean:
-            raise SimulationConflict("Startup process group did not exit cleanly")
-        if probe.returncode != 0:
-            try:
-                error = json.loads(stdout)["error"]
-            except (ValueError, KeyError, TypeError):
-                error = stderr.decode(errors="replace")[-1000:]
-            raise ValueError(f"Teleop runtime identity failed: {error}")
-        if self._lifecycle_state != "starting":
-            raise SimulationConflict("Simulation supervisor closed during startup")
-        self.runtime_identity = json.loads(stdout)
+        self.runtime_identity = await self._native_probe(execution, lifecycle="starting")
         if any(self.runtime_identity.get(key) != contract[key] for key in ("source_commit", "wheel_sha256")):
             raise ValueError("Native runtime returned another fixed consumer identity")
         acquiring = asyncio.create_task(asyncio.to_thread(self.store.acquire_supervisor))
@@ -194,21 +182,98 @@ class SimulationService:
             if not quiescent:
                 await asyncio.to_thread(self.store.reconcile_orphan, row["session_id"], row["owner_nonce"])
             else:
-                recording = await self._seal_recording(
-                    self.root / row["session_id"],
-                    False,
-                    "Supervisor interrupted",
-                    runtime=row["request"]["runtime"],
-                    save=row["request"]["record"],
-                )
+                error = "Supervisor interrupted; previous process group is absent"
+                try:
+                    recording = await self._seal_recording(
+                        self.root / row["session_id"],
+                        False,
+                        error,
+                        runtime=row["request"]["runtime"],
+                        save=row["request"]["record"],
+                    )
+                except RecordingDiagnostic as diagnostic:
+                    recording, error = diagnostic.recording, str(diagnostic)
                 await asyncio.to_thread(
                     self.store.transition,
                     row["session_id"],
                     row["owner_nonce"],
                     "failed",
-                    error="Supervisor interrupted; previous process group is absent",
+                    error=error,
                     recording=recording,
                 )
+
+    async def _native_probe(self, execution, *, lifecycle, command=None, timeout=30):
+        async with self._probe_gate:
+            allowed = (lifecycle,) if isinstance(lifecycle, str) else lifecycle
+            content = canonical(execution)
+            if len(content) > INPUT_LIMIT:
+                raise ValueError("Native probe input exceeds its byte budget")
+            try:
+                if command is None:
+                    command = runtime_command
+                if self._probe_identity is not None and not await self._close_probe():
+                    raise SimulationConflict("Previous native probe process group is unresolved")
+                nonce = secrets.token_hex(24)
+                argv = command(self.python, nonce, execution)
+                self._probe_identity = {"nonce": nonce}
+                self._write_probe_identity()
+                spawning = asyncio.create_task(
+                    asyncio.create_subprocess_exec(
+                        *argv,
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        env={
+                            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                            "OPENBLAS_NUM_THREADS": "1",
+                            "OMP_NUM_THREADS": "1",
+                        },
+                        start_new_session=True,
+                    )
+                )
+                interrupted = False
+                try:
+                    try:
+                        probe = await asyncio.shield(spawning)
+                    except asyncio.CancelledError:
+                        probe = await spawning
+                        interrupted = True
+                except Exception:
+                    self._probe_identity = None
+                    self._write_probe_identity()
+                    raise
+                self._probe = probe
+                self._probe_identity = {"pid": probe.pid, "nonce": nonce}
+                self._write_probe_identity()
+                self._probe_identity = process_identity(probe.pid, nonce)
+                self._write_probe_identity()
+                if interrupted:
+                    raise asyncio.CancelledError
+                if self._lifecycle_state not in allowed:
+                    raise SimulationConflict("Simulation supervisor closed during startup")
+                stdout, stderr = await asyncio.wait_for(
+                    probe.communicate(content),
+                    timeout,
+                )
+                clean = await asyncio.to_thread(resource_state, self._probe_identity) == "dead"
+                if not await self._close_probe():
+                    raise SimulationConflict("Startup process group is unresolved")
+                if not clean:
+                    raise SimulationConflict("Startup process group did not exit cleanly")
+                if len(stdout) > 128 * 1024 or len(stderr) > 128 * 1024:
+                    raise ValueError("Native probe exceeded its output byte budget")
+                if probe.returncode != 0:
+                    try:
+                        error = json.loads(stdout)["error"]
+                    except (ValueError, KeyError, TypeError):
+                        error = stderr.decode(errors="replace")[-1000:]
+                    raise ValueError(f"Teleop runtime identity failed: {error}")
+                if self._lifecycle_state not in allowed:
+                    raise SimulationConflict("Simulation supervisor closed during startup")
+                return json.loads(stdout)
+            finally:
+                if self._probe is not None and not await self._close_probe():
+                    raise SimulationConflict("Native probe process group is unresolved")
 
     def _read_probe_identity(self):
         self._lock.seek(0)
@@ -312,10 +377,57 @@ class SimulationService:
                 raise asyncio.CancelledError
             if session_id in self.running or row["state"] != "starting" or row["owner_nonce"] != self.owner:
                 return self.public(row)
+            request = row["request"]
             session_root = self.root / session_id
             source = session_root / "source"
             try:
-                await prepare_source(source, request["source"], members, read_member)
+                session_root.mkdir(parents=True, exist_ok=False, mode=0o700)
+                request_bytes = canonical(request) + b"\n"
+                identity_bytes = canonical(session_identity(row)) + b"\n"
+                declared = declared_source_bytes(request["source"], members)
+                policy_input = deepcopy(self._resource_policy_input)
+                observed = {
+                    "session_dir": str(session_root),
+                    "quota_bytes": SESSION_QUOTA_BYTES,
+                    "compiled_bytes": 0,
+                    "stderr_request_session_bytes": len(request_bytes) + len(identity_bytes),
+                    "declared_source_bytes": declared,
+                }
+                for name, value in observed.items():
+                    if name in policy_input and policy_input[name] != value:
+                        raise SessionResourceError("Frozen resource input conflicts with actual session observations")
+                    policy_input[name] = value
+                period = request["settings"].get("period_s", 0.02)
+                resource_request = {
+                    "resource_policy": policy_input,
+                    "control_period_s": period,
+                    "declared_source_bytes": declared,
+                    "session_dir": str(session_root),
+                    "request_session_bytes": observed["stderr_request_session_bytes"],
+                }
+                resolved = await self._native_probe(
+                    {**self._consumer_execution, "resource_request": resource_request},
+                    lifecycle="open",
+                    command=resource_command,
+                )
+                if resolved["runtime"] != request["runtime"]:
+                    raise SessionResourceError("Policy resolver returned a different fixed runtime")
+                policy = validate_policy(resolved["policy"], session_root)
+                if policy["declared_source_bytes"] != declared or any(
+                    policy[name] != value for name, value in observed.items()
+                ):
+                    raise SessionResourceError("Policy resolver changed the frozen session observations")
+                async with self._storage_gate:
+                    await asyncio.to_thread(self._admit_storage, session_root, policy["quota_bytes"], session_id)
+                    await prepare_source(
+                        source,
+                        request["source"],
+                        members,
+                        read_member,
+                        max_bytes=policy["source_materialization_limit_bytes"],
+                    )
+                if await asyncio.to_thread(directory_bytes, source) != declared:
+                    raise SessionResourceError("Materialized source differs from its exact artifact member bytes")
                 if self._lifecycle_state != "open":
                     raise SimulationConflict("Simulation supervisor is closing")
                 config = {
@@ -327,11 +439,13 @@ class SimulationService:
                     "entry": request["source"]["entry"],
                     "profile": request["profile"],
                     **request["settings"],
+                    "period_s": period,
+                    "resource_policy": policy_input,
                 }
                 output = session_root / "recording"
                 output.mkdir(mode=0o700)
-                (output / "request.json").write_bytes(canonical(request) + b"\n")
-                (output / "session.json").write_bytes(canonical(session_identity(row)) + b"\n")
+                (output / "request.json").write_bytes(request_bytes)
+                (output / "session.json").write_bytes(identity_bytes)
                 config["record_dir"] = str(output / "native")
                 environment = {key: os.environ[key] for key in ("PATH", "LANG", "LC_ALL") if key in os.environ}
                 environment.update({"PYTHONUNBUFFERED": "1", "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1"})
@@ -364,7 +478,9 @@ class SimulationService:
                         interrupted = True
                 finally:
                     error_log.close()
-                current = RunningSession(process, session_root, identity={"pid": process.pid, "nonce": nonce})
+                current = RunningSession(
+                    process, session_root, identity={"pid": process.pid, "nonce": nonce}, expected_policy=policy
+                )
                 self.running[session_id] = current
                 current.identity = process_identity(process.pid, nonce)
                 if interrupted:
@@ -402,10 +518,36 @@ class SimulationService:
                         )
                 raise
 
+    def _admit_storage(self, destination, additional_bytes, excluded_session=None):
+        remaining = 0
+        for identifier in self.store.active_session_ids():
+            if identifier == excluded_session:
+                continue
+            if (
+                not isinstance(identifier, str)
+                or not identifier
+                or Path(identifier).name != identifier
+                or identifier in {".", ".."}
+            ):
+                raise SessionResourceError("Active session identity is not a confined workspace name")
+            directory = self.root / identifier
+            observed = directory_bytes(directory) if directory.exists() or directory.is_symlink() else 0
+            if observed > SESSION_QUOTA_BYTES:
+                raise SessionResourceError("An active session already exceeds its complete workspace budget")
+            remaining += SESSION_QUOTA_BYTES - observed
+        if destination.stat().st_dev == self.root.stat().st_dev:
+            require_storage(destination, additional_bytes=additional_bytes + remaining, reserve_bytes=0)
+        else:
+            require_storage(destination, additional_bytes=additional_bytes, reserve_bytes=0)
+            require_storage(self.root, additional_bytes=remaining, reserve_bytes=0)
+
     @staticmethod
     def public(row: dict) -> dict:
         return {
-            key: row[key] for key in ("session_id", "source_run_id", "request_digest", "state", "revision", "error")
+            **{
+                key: row[key] for key in ("session_id", "source_run_id", "request_digest", "state", "revision", "error")
+            },
+            "session_complete": row["state"] == "stopped" and row["error"] is None,
         }
 
     def recording_archive(self, ref):
@@ -727,11 +869,30 @@ class SimulationService:
                         raise ValueError("Native worker engine differs from the verified MJCF engine")
                     if current.model is not None:
                         raise ValueError("Native worker sent duplicate model initialization")
+                    if current.expected_policy is None:
+                        raise SessionResourceError("Native ready has no frozen resource admission")
+                    current.ready_evidence = validate_ready(
+                        message.get("evidence"), current.expected_policy, current.root
+                    )
+                    current.last_state_received_ns = time.monotonic_ns()
                     current.model = {"type": "model", **message["model"]}
                     current.state = message["model"]["state"]
                     if row["state"] == "starting":
                         await asyncio.to_thread(self.store.transition, session_id, self.owner, "ready")
                 elif message.get("type") == "state":
+                    tick = message["state"]["tick"]
+                    if current.ready_evidence is None or (
+                        current.last_state_tick is not None and tick <= current.last_state_tick
+                    ):
+                        raise SessionResourceError("Native state arrived before ready or regressed its control tick")
+                    current.evidence = validate_state(
+                        message.get("evidence"),
+                        current.ready_evidence,
+                        tick=tick,
+                        previous=current.evidence,
+                    )
+                    current.last_state_tick = tick
+                    current.last_state_received_ns = time.monotonic_ns()
                     current.state = message["state"]
                 elif message.get("type") in {"accepted", "applied"} or (
                     message.get("type") == "error" and "command_id" in message
@@ -834,10 +995,12 @@ class SimulationService:
                         runtime=row["request"]["runtime"],
                         save=row["request"]["record"],
                     )
+                except RecordingDiagnostic as diagnostic:
+                    # Preserve known native termination and command outcomes independently
+                    # from evidence completeness or artifact-storage success.
+                    error, recording = str(diagnostic), diagnostic.recording
                 except OSError as failure:
-                    if row["request"]["record"]:
-                        raise
-                    terminal, error, recording = "failed", f"Session evidence cleanup failed: {failure}", None
+                    error, recording = f"Session evidence storage failed: {type(failure).__name__}", None
                 await asyncio.to_thread(
                     self.store.transition,
                     session_id,
@@ -855,28 +1018,210 @@ class SimulationService:
                 task.cancel()
 
     async def _seal_recording(self, root, complete, error, *, runtime, save):
+        """Called only after the original worker's entire owned group is absent."""
         directory = root / "recording"
         if not directory.is_dir():
-            return None
-        (directory / "outcome.json").write_bytes(canonical({"complete": complete, "error": error}) + b"\n")
-        if not save:
             if complete:
-                removing = asyncio.create_task(asyncio.to_thread(shutil.rmtree, directory))
-                try:
-                    await asyncio.shield(removing)
-                except asyncio.CancelledError:
-                    await removing
-                    raise
+                raise RecordingDiagnostic("Native session evidence is missing")
             return None
-        artifact = await asyncio.to_thread(
-            self.artifacts.seal_tree,
-            directory,
-            kind="teleop_recording",
-            producer_run_id=None,
-            producer_stage=None,
-            producer_tool_sha256=digest(runtime),
-        )
-        return artifact.to_record()
+        manifest_path = directory / "native/session-manifest.json"
+        manifest_sha = None
+        inspected = {
+            "manifest": None,
+            "container_complete": False,
+            "business_complete": False,
+            "streams": {
+                key: {"name": name, "container_complete": False}
+                for key, name in (
+                    ("raw", "raw-input.jsonl.gz"),
+                    ("events", "session-events.jsonl.gz"),
+                    ("records", "records.jsonl.gz"),
+                )
+            },
+        }
+        evidence_error = None
+        try:
+            await asyncio.to_thread(directory_bytes, root)
+            row = await asyncio.to_thread(self.store.get, root.name)
+            if (
+                runtime != row["request"]["runtime"]
+                or (directory / "request.json").read_bytes() != canonical(row["request"]) + b"\n"
+                or (directory / "session.json").read_bytes() != canonical(session_identity(row)) + b"\n"
+            ):
+                raise SessionEvidenceError("Platform evidence identity differs from the registered request")
+            if manifest_path.is_symlink() or not manifest_path.is_file():
+                raise SessionEvidenceError("Native session manifest is missing or symbolic")
+
+            def manifest_digest():
+                with manifest_path.open("rb") as stream:
+                    return hashlib.file_digest(stream, "sha256").hexdigest()
+
+            manifest_sha = await asyncio.to_thread(manifest_digest)
+            inspected = await self._native_probe(
+                {
+                    "execution": self._consumer_execution,
+                    "runtime": runtime,
+                    "native": str(directory / "native"),
+                    "session_id": root.name,
+                    "manifest_sha256": manifest_sha,
+                    "commands": await asyncio.to_thread(self.store.worker_commands, root.name),
+                },
+                lifecycle=("starting", "open", "closing"),
+                command=inspection_command,
+                timeout=240,
+            )
+            if inspected["runtime"] != runtime or inspected["manifest_sha256"] != manifest_sha:
+                raise SessionEvidenceError("Native evidence inspector returned a different immutable binding")
+            if not inspected["container_complete"] or not inspected["business_complete"]:
+                raise SessionEvidenceError(inspected["error"] or "Native evidence completeness is unproven")
+            manifest = inspected["manifest"]
+            current = self.running.get(root.name)
+            if current is not None and manifest["resource_policy"] != current.expected_policy:
+                raise SessionEvidenceError("Native manifest changed the admitted resource policy")
+            await asyncio.to_thread(verify_session_finalization, root, manifest)
+            verify_manifest_counts(manifest, inspected["counts"])
+            if await asyncio.to_thread(manifest_digest) != manifest_sha:
+                raise SessionEvidenceError("Native manifest changed after evidence verification")
+            if manifest["status"] != "stopped" or manifest["exit_code"] != 0 or manifest["reason"] != "normal_stop":
+                evidence_error = f"Native session termination is not normal: {manifest['reason']}"
+        except (OSError, ValueError, KeyError, TypeError) as failure:
+            evidence_error = f"Session evidence is incomplete: {type(failure).__name__}: {failure}"
+        session_complete = complete and evidence_error is None
+        reasons = [value for value in (error, evidence_error) if value]
+        outcome = {
+            "complete": session_complete,
+            "error": "; ".join(dict.fromkeys(reasons)) or None,
+            "manifest_sha256": manifest_sha,
+            "container_complete": inspected["container_complete"] is True,
+            "streams": inspected["streams"],
+            "session_complete": session_complete,
+            "formal_one_hour_qualified": False,
+        }
+        try:
+            async with self._storage_gate:
+                if session_complete:
+                    # The inspector does no writes, but remeasure at the final
+                    # admission boundary before any seal or discard action.
+                    await asyncio.to_thread(verify_session_finalization, root, inspected["manifest"])
+                storing = asyncio.create_task(
+                    asyncio.to_thread(self._store_recording_result, root, outcome, runtime, save)
+                )
+                try:
+                    recording = await asyncio.shield(storing)
+                except asyncio.CancelledError:
+                    await storing
+                    raise
+        except RecordingDiagnostic:
+            raise
+        except (OSError, SessionResourceError) as failure:
+            message = "; ".join(
+                value for value in (outcome["error"], f"Session result storage failed: {failure}") if value
+            )
+            raise RecordingDiagnostic(message) from failure
+        if not session_complete:
+            raise RecordingDiagnostic(outcome["error"] or "Native session is not complete", recording=recording)
+        return recording
+
+    def _store_recording_result(self, root, outcome, runtime, save):
+        """Place only post-verification conclusions outside the frozen native session."""
+        directory = root / "recording"
+        if (directory / "outcome.json").exists() or (directory / "outcome.json").is_symlink():
+            raise SessionEvidenceError("Frozen session contains reserved external outcome metadata")
+        outcome_bytes = canonical(outcome) + b"\n"
+        recording_size = directory_bytes(directory)
+        retained_size = directory_bytes(root)
+        self._admit_storage(self.artifacts.root, len(outcome_bytes), root.name)
+        temporary = Path(tempfile.mkdtemp(prefix=f"session-result-{root.name}-", dir=self.artifacts.root))
+        stage = temporary / "recording"
+        preserved = False
+        copied_bytes = 0
+        artifact = None
+        new_cas_bytes = 0
+        try:
+            if save or outcome["session_complete"]:
+
+                def copy_member(source, destination):
+                    nonlocal copied_bytes
+                    try:
+                        os.link(source, destination)
+                    except OSError as failure:
+                        if failure.errno != errno.EXDEV:
+                            raise
+                        size = Path(source).stat().st_size
+                        self._admit_storage(temporary, size + len(outcome_bytes), root.name)
+                        shutil.copy2(source, destination)
+                        copied_bytes += size
+                    return destination
+
+                shutil.copytree(directory, stage, copy_function=copy_member)
+                stderr = root / "worker-stderr.log"
+                if stderr.is_file():
+                    copy_member(stderr, stage / stderr.name)
+                for path in stage.rglob("*"):
+                    if path.is_dir():
+                        path.chmod(0o700)
+            else:
+                stage.mkdir(mode=0o700)
+            (stage / "outcome.json").write_bytes(outcome_bytes)
+            if save:
+
+                def admit_storage(total_new_bytes):
+                    nonlocal new_cas_bytes
+                    self._admit_storage(self.artifacts.objects, total_new_bytes, root.name)
+                    new_cas_bytes = total_new_bytes
+
+                artifact = self.artifacts.seal_tree(
+                    stage,
+                    kind="teleop_recording",
+                    producer_run_id=None,
+                    producer_stage=None,
+                    producer_tool_sha256=digest(runtime),
+                    admit_storage=admit_storage,
+                )
+                result = artifact.to_record()
+            else:
+                result = None
+                if outcome["session_complete"]:
+                    try:
+                        shutil.rmtree(directory)
+                    except OSError as failure:
+                        # The stage still holds every original recording byte
+                        # even when unlinking the original tree partly failed.
+                        preserved = True
+                        message = f"Session evidence cleanup failed: {failure}; diagnostic snapshot: {temporary}"
+                        failed_outcome = {**outcome, "complete": False, "session_complete": False, "error": message}
+                        (stage / "outcome.json").write_bytes(canonical(failed_outcome) + b"\n")
+                        raise RecordingDiagnostic(message) from failure
+                else:
+                    preserved = True
+            cas_size = directory_bytes(self.artifacts.objects / artifact.artifact_id) if artifact is not None else 0
+            log.info(
+                "Session result storage: %s",
+                json.dumps(
+                    {
+                        "session_id": root.name,
+                        "session_bytes": retained_size,
+                        "recording_bytes": recording_size,
+                        "outcome_bytes": len(outcome_bytes),
+                        "result_staging_bytes": directory_bytes(stage),
+                        "staging_copied_bytes": copied_bytes,
+                        "cas_object_bytes": cas_size,
+                        "cas_new_file_bytes": new_cas_bytes,
+                        "admission_is_reservation": False,
+                        "simultaneous_logical_bytes": retained_size + directory_bytes(stage) + cas_size,
+                        "session_complete": outcome["session_complete"],
+                        "diagnostic_path": str(temporary) if preserved else None,
+                    },
+                    sort_keys=True,
+                ),
+            )
+            return result
+        finally:
+            if not preserved:
+                try:
+                    shutil.rmtree(temporary)
+                except OSError:
+                    log.exception("Session result staging cleanup failed: %s", temporary)
 
     @staticmethod
     async def _terminate(current):
@@ -924,17 +1269,20 @@ class SimulationService:
                         current.tasks.append(asyncio.create_task(self.stop(session_id)))
                         return
                     checked_admission = time.monotonic()
-                if (current.model is None and time.monotonic() - started > 60) or time.monotonic() - started > 3600:
-                    current.failure = "Simulation exceeded its startup or session time budget"
+                if current.model is None and time.monotonic() - started > 60:
+                    current.failure = "Simulation exceeded its preparation time budget"
                     await self._terminate(current)
                     current.tasks[0].cancel()
                     return
-                recording = current.root / "recording"
-                if sum(path.stat().st_size for path in recording.rglob("*") if path.is_file()) > 512 * 1024 * 1024:
-                    current.failure = "Simulation exceeded its recording size budget"
-                    await self._terminate(current)
-                    current.tasks[0].cancel()
-                    return
+                if current.ready_evidence is not None:
+                    if time.monotonic_ns() - current.last_state_received_ns > 60 * 1_000_000_000:
+                        raise SessionResourceError("Native control progress stopped within its existing startup budget")
+                    await asyncio.to_thread(check_session_capacity, current.root, current.expected_policy)
+                    if current.evidence is not None and current.evidence["run_window"]["minimum_duration_met"]:
+                        current.tasks.append(asyncio.create_task(self.stop(session_id)))
+                        return
+                elif await asyncio.to_thread(directory_bytes, current.root) > SESSION_QUOTA_BYTES:
+                    raise SessionResourceError("Simulation exceeded its complete session workspace budget")
                 if current.model is None:
                     await asyncio.sleep(0.1)
                     continue
@@ -1012,7 +1360,7 @@ class SimulationService:
                 await self._terminate(current)
         if current.tasks:
             _, pending = await asyncio.wait(current.tasks[:1], timeout=1)
-            if pending:
+            if pending and not current.reader_eof:
                 current.failure = current.failure or "Worker output did not close after stop"
                 current.tasks[0].cancel()
             await asyncio.gather(current.tasks[0], return_exceptions=True)
