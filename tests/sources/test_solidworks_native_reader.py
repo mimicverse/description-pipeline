@@ -31,6 +31,8 @@ from unittest.mock import Mock, patch
 
 import description_pipeline.sources.solidworks.native as native_module
 from description_pipeline.sources.solidworks.discovery import _project_native_record
+from description_pipeline.sources.solidworks.native_selection import project_native_closure
+from description_pipeline.sources.solidworks.selection import seal_closure_selection
 from description_pipeline.io import digest
 from description_pipeline.sources.solidworks.errors import BridgeError, CadError
 from description_pipeline.sources.solidworks.isolation import CadSession
@@ -54,6 +56,17 @@ SW_IDENTITY = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 
 PLANE_XY = {"normal": [0.0, 0.0, 1.0], "point": [0.0, 0.0, 0.0]}
 CYLINDER_Z = {"point": [0.0, 0.0, 0.0], "direction": [0.0, 0.0, 1.0], "radius": 0.02}
 _PRODUCTION_APPEARANCE_INTERFACE = native_module._appearance_interface
+
+
+def _project_sealed_record(record):
+    released = copy.deepcopy(record)
+    stage = Path(released["search"]["pinned"][0])
+    main = released["selection"]["main_assembly"]
+    files = released["files"]
+    reader = "ab" * 32
+    closure = project_native_closure(stage, main, files, released, reader_sha256=reader)
+    released["source_selection"] = seal_closure_selection(files, main, closure, reader_sha256=reader)
+    return _project_native_record(released)
 
 
 def _sw_translation(x, y, z):
@@ -1049,7 +1062,7 @@ class MateRecordTests(unittest.TestCase):
             self.assertEqual(mates["travel_limit"]["error_code"], 0)
             self.assertEqual(mates["travel_limit"]["scope"], "")
             entity = mates["travel_limit"]["entities"][0]
-            projected = _project_native_record(record)
+            projected = _project_sealed_record(record)
             projected_entity = next(
                 mate
                 for mate in projected["mates"]
@@ -1224,7 +1237,7 @@ class MateRecordTests(unittest.TestCase):
             self.assertEqual(record["mates"][0]["name"], "nested_seat")
             self.assertEqual(record["mates"][0]["scope"], "sub-1")
             self.assertEqual(record["mates"][0]["configuration"], "Sub")
-            projected = _project_native_record(record)
+            projected = _project_sealed_record(record)
             self.assertEqual(
                 projected["mates"][0]["entities"][0]["component"],
                 "sub-1/arm-1",
@@ -1440,7 +1453,7 @@ class ProducerContextTests(unittest.TestCase):
             datums = [datum for datum in record["datums"] if datum["owner"] == "sub-1/arm-1"]
             self.assertEqual([datum["name"] for datum in datums], ["CS_tip"])
             self.assertEqual(datums[0]["configuration"], "Tip")
-            projected = _project_native_record(record)
+            projected = _project_sealed_record(record)
             matrix = next(
                 datum
                 for datum in projected["datums"]
@@ -1557,7 +1570,7 @@ class ProducerContextTests(unittest.TestCase):
             mate = record["mates"][0]
             self.assertEqual(mate["name"], "top_descendant")
             self.assertEqual(mate["scope"], "")
-            projected = _project_native_record(record)
+            projected = _project_sealed_record(record)
             self.assertEqual(
                 projected["mates"][0]["entities"][0]["component"],
                 "sub-1/arm-1",
@@ -1588,7 +1601,7 @@ class ProducerContextTests(unittest.TestCase):
 
             record = _read(root, _App({assembly: main_doc, sub_path: sub_doc}))
             with self.assertRaises(CadError) as caught:
-                _project_native_record(record)
+                _project_sealed_record(record)
             self.assertEqual(caught.exception.code, "cad_mate_scope_ambiguous")
             self.assertEqual(caught.exception.detail["component"], "arm-1")
 
@@ -1609,7 +1622,7 @@ class ProducerContextTests(unittest.TestCase):
 
             record = _read(root, _App({assembly: main_doc, sub_path: sub_doc}))
 
-            projected = _project_native_record(record)
+            projected = _project_sealed_record(record)
             resolved = {
                 mate["scope"]: mate["entities"][0]["component"]
                 for mate in projected["mates"]
@@ -6172,7 +6185,7 @@ class EntityGeometryTests(unittest.TestCase):
                 geometry["cylinder"],
                 {"point": [0.1, 0.2, 0.3], "direction": [0.0, 1.0, 0.0], "radius": 0.05},
             )
-            projected = _project_native_record(record)
+            projected = _project_sealed_record(record)
             self.assertEqual(
                 projected["mates"][0]["entities"][0]["component"],
                 "base-1",
@@ -6413,7 +6426,7 @@ class MateFailureTests(unittest.TestCase):
             app = _single_mate_scene(root, wrong_component)
             record = _read(root, app)
             with self.assertRaises(CadError) as caught:
-                _project_native_record(record)
+                _project_sealed_record(record)
         self.assertEqual(caught.exception.code, "cad_mate_scope_ambiguous")
         self.assertEqual(caught.exception.detail["component"], "ghost-1")
 
@@ -6515,7 +6528,7 @@ class AssemblyFrameMateTests(unittest.TestCase):
 
             record = _read(root, _App({assembly: doc}))
 
-            projected = _project_native_record(record)
+            projected = _project_sealed_record(record)
             entities = projected["mates"][0]["entities"]
             self.assertEqual(entities[0]["component"], "base-1")
             self.assertEqual(entities[1]["component"], "")
@@ -6561,7 +6574,7 @@ class AssemblyFrameMateTests(unittest.TestCase):
 
             record = _read(root, _App({assembly: main_doc, sub_path: sub_doc}))
 
-            projected = _project_native_record(record)
+            projected = _project_sealed_record(record)
             nested_mate = projected["mates"][0]
             self.assertEqual(nested_mate["scope"], "sub-1")
             entities = nested_mate["entities"]
@@ -6595,7 +6608,7 @@ class AssemblyFrameMateTests(unittest.TestCase):
 
             record = _read(root, _App({assembly: doc}))
             with self.assertRaises(CadError) as caught:
-                _project_native_record(record)
+                _project_sealed_record(record)
             self.assertEqual(caught.exception.code, "cad_mate_scope_ambiguous")
             self.assertEqual(caught.exception.detail.get("component"), "orphan-1")
 
@@ -6619,7 +6632,7 @@ class AssemblyFrameMateTests(unittest.TestCase):
 
             record = _read(root, _App({assembly: doc}))
             with self.assertRaises(CadError) as caught:
-                _project_native_record(record)
+                _project_sealed_record(record)
             self.assertEqual(caught.exception.code, "cad_mate_scope_ambiguous")
             self.assertEqual(caught.exception.detail.get("component"), "robot (copy)")
 
@@ -6644,7 +6657,7 @@ class AssemblyFrameMateTests(unittest.TestCase):
 
             record = _read(root, _App({assembly: doc}))
             with self.assertRaises(CadError) as caught:
-                _project_native_record(record)
+                _project_sealed_record(record)
             self.assertEqual(caught.exception.code, "cad_mate_scope_ambiguous")
 
     def test_unreadable_is_root_is_not_the_root(self) -> None:
@@ -6668,7 +6681,7 @@ class AssemblyFrameMateTests(unittest.TestCase):
 
             record = _read(root, _App({assembly: doc}))
             with self.assertRaises(CadError) as caught:
-                _project_native_record(record)
+                _project_sealed_record(record)
             self.assertEqual(caught.exception.code, "cad_mate_scope_ambiguous")
             self.assertEqual(caught.exception.detail.get("component"), "robot")
 
@@ -6693,7 +6706,7 @@ class AssemblyFrameMateTests(unittest.TestCase):
 
             record = _read(root, _App({assembly: doc}))
             with self.assertRaises(CadError) as caught:
-                _project_native_record(record)
+                _project_sealed_record(record)
             self.assertEqual(caught.exception.code, "cad_mate_scope_ambiguous")
             self.assertEqual(caught.exception.detail.get("component"), "robot")
 
@@ -6717,7 +6730,7 @@ class AssemblyFrameMateTests(unittest.TestCase):
 
             record = _read(root, _App({assembly: doc}))
             with self.assertRaises(CadError) as caught:
-                _project_native_record(record)
+                _project_sealed_record(record)
             self.assertEqual(caught.exception.code, "cad_mate_scope_ambiguous")
             self.assertEqual(caught.exception.detail.get("component"), "robot")
 
@@ -6780,7 +6793,7 @@ class ReferenceCycleTests(unittest.TestCase):
 
             record = _read(root, _App({assembly: doc}))
             with self.assertRaises(CadError) as caught:
-                _project_native_record(record)
+                _project_sealed_record(record)
             self.assertEqual(caught.exception.code, "cad_reference_cycle")
             self.assertEqual(caught.exception.detail.get("component"), "robot-2")
 
@@ -6824,7 +6837,7 @@ class MateEntityReferenceTests(unittest.TestCase):
             self.assertEqual(raw_reference["reference_type2"], 1)
             self.assertEqual(raw_reference["space"], "mate-assembly")
             self.assertEqual(raw_reference["params"], [0.1, 0.2, 0.3, 0.0, 2.0, 0.0, 0.0, 0.0])
-            projected = _project_native_record(raw_record)
+            projected = _project_sealed_record(raw_record)
             reference = projected["mates"][0]["entities"][0][
                 "mate_entity_reference"
             ]
@@ -6858,7 +6871,7 @@ class MateEntityReferenceTests(unittest.TestCase):
             raw_record = _read(root, _App({assembly: doc}))
             raw_entity = raw_record["mates"][0]["entities"][1]
             self.assertEqual(raw_entity["reference_document"], "robot.SLDASM")
-            projected = _project_native_record(raw_record)
+            projected = _project_sealed_record(raw_record)
             record = projected["mates"][0]["entities"][1]
             self.assertEqual(record["component"], "")
             self.assertIs(record["assembly_frame"], True)
@@ -6882,7 +6895,7 @@ class MateEntityReferenceTests(unittest.TestCase):
                 entity_params=[1.5, 2.5, 3.0],
             )
             raw_record = self._read_single_record(root, component, entity)
-            projected = _project_native_record(raw_record)
+            projected = _project_sealed_record(raw_record)
             reference = projected["mates"][0]["entities"][0][
                 "mate_entity_reference"
             ]
@@ -6920,7 +6933,7 @@ class MateEntityReferenceTests(unittest.TestCase):
                 [1.0, 2.0, 3.0, 0.0, 0.0, 1.0, 0.02, 0.0],
             )
 
-            projected = _project_native_record(raw_record)
+            projected = _project_sealed_record(raw_record)
             projected_entity = projected["mates"][0]["entities"][0]
             reference = projected_entity["mate_entity_reference"]
             self.assertIsNone(reference["error"])
@@ -6957,7 +6970,7 @@ class MateEntityReferenceTests(unittest.TestCase):
                 entity_params=[1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
             )
             raw_record = self._read_single_record(root, component, entity)
-            projected = _project_native_record(raw_record)
+            projected = _project_sealed_record(raw_record)
             geometry = projected["mates"][0]["entities"][0][
                 "mate_entity_reference"
             ]["geometry"]
@@ -6985,7 +6998,7 @@ class MateEntityReferenceTests(unittest.TestCase):
             self.assertIn("RuntimeError: boom", reference["error"])
             self.assertIsNone(reference["params"])
             self.assertNotIn("geometry", reference)
-            projected = _project_native_record(raw_record)
+            projected = _project_sealed_record(raw_record)
             projected_entity = projected["mates"][0]["entities"][0]
             self.assertIsNone(
                 projected_entity["mate_entity_reference"]["geometry"]
@@ -7017,7 +7030,7 @@ class MateEntityReferenceTests(unittest.TestCase):
             )
             self.assertIsNone(raw_reference["reference_type2"])
             self.assertIsNone(raw_reference["error"])
-            projected = _project_native_record(raw_record)
+            projected = _project_sealed_record(raw_record)
             self.assertEqual(
                 projected["mates"][0]["entities"][0][
                     "mate_entity_reference"
@@ -7051,7 +7064,7 @@ class MateEntityReferenceTests(unittest.TestCase):
             )
             self.assertIn("RuntimeError: no type", raw_reference["error"])
 
-            projected_reference = _project_native_record(raw_record)["mates"][
+            projected_reference = _project_sealed_record(raw_record)["mates"][
                 0
             ]["entities"][0]["mate_entity_reference"]
             self.assertEqual(
@@ -7130,14 +7143,14 @@ class MateEntityReferenceTests(unittest.TestCase):
                 self.assertEqual(raw_reference["params"], expected_params)
                 self.assertNotIn("geometry", raw_reference)
                 if name == "bad-type":
-                    projected = _project_native_record(raw_record)
+                    projected = _project_sealed_record(raw_record)
                     reference = projected["mates"][0]["entities"][0][
                         "mate_entity_reference"
                     ]
                     self.assertIn(expected_error, reference["error"])
                     self.assertIsNone(reference["geometry"])
                     continue
-                projected = _project_native_record(raw_record)
+                projected = _project_sealed_record(raw_record)
                 reference = projected["mates"][0]["entities"][0][
                     "mate_entity_reference"
                 ]
@@ -7152,7 +7165,7 @@ class MateEntityReferenceTests(unittest.TestCase):
             component = _Component("base-1", base, transform=())
             entity = _MateEntity(component, "Face1", reference_type=1, entity_params=[1.0, 2.0, 3.0])
             raw_record = self._read_single_record(root, component, entity)
-            projected = _project_native_record(raw_record)
+            projected = _project_sealed_record(raw_record)
             reference = projected["mates"][0]["entities"][0][
                 "mate_entity_reference"
             ]
@@ -7214,7 +7227,7 @@ class MateEntityReferenceTests(unittest.TestCase):
 
             record = _read(root, _App({assembly: main_doc, sub_path: sub_doc}))
 
-            projected = _project_native_record(record)
+            projected = _project_sealed_record(record)
             nested_mate = projected["mates"][0]
             self.assertEqual(nested_mate["scope"], "sub-1")
             entities = nested_mate["entities"]
@@ -7297,7 +7310,7 @@ class MateEntityReferenceTests(unittest.TestCase):
                 component["source_provenance"]["state"],
                 "embedded_virtual_component",
             )
-            projected = _project_native_record(record)
+            projected = _project_sealed_record(record)
             self.assertEqual(
                 projected["mates"][0]["entities"][0]["component"],
                 "virtual-1",

@@ -37,7 +37,7 @@ def seal_fixture_open_observation(record: dict, *, configuration: str = "Default
     record["open_status"] = copy.deepcopy(closure["open_status"])
     record.setdefault("unresolved_components", [])
     record["source_selection"] = seal_closure_selection(
-        {**selection["files"], **selection["excluded_files"]},
+        dict(selection["files"]),
         selection["main_assembly"], closure, reader_sha256=selection["reader_sha256"],
     )
 
@@ -126,12 +126,13 @@ def sealed_selection(
     return seal_closure_selection(upload_files, main_assembly, evidence, reader_sha256=reader_sha256)
 
 
-def observation_from_closure_fixture(record: dict, closure: dict) -> dict:
+def observation_from_closure_fixture(record: dict, closure: dict, *, files: Mapping[str, str]) -> dict:
     """Give one test backend the same primitive carrier as native Discover."""
 
     import copy
 
     record = copy.deepcopy(record)
+    record["files"] = dict(files)
     rows = []
     edges = [
         (owner, edge)

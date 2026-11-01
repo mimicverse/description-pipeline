@@ -456,9 +456,7 @@ class CapturePlanTests(unittest.TestCase):
             "upload_sha256",
             "main_assembly",
             "files",
-            "handoff_sha256",
             "closure",
-            "excluded_files",
             "selection_sha256",
         ):
             with self.subTest(field=field):

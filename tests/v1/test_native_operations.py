@@ -153,7 +153,7 @@ def _operation(
                 "run_id": operation_id,
                 "request_digest": digest({"request": operation_id}),
                 "effect_key": "capture-native",
-                "handoff_sha256": "b" * 64,
+                "handoff_sha256": "c" * 64,
                 "upload_sha256": "c" * 64,
                 "prepared_sha256": digest(package_files),
                 "main_assembly": "cad/robot.SLDASM",
@@ -1486,7 +1486,7 @@ class NativeOperationRuntimeTests(unittest.TestCase):
             self.root / "capture-adapter-input.zip",
         )
         request_digest = digest({"request": run_id})
-        handoff_sha256 = "b" * 64
+        handoff_sha256 = "c" * 64
         upload_sha256 = "c" * 64
         main_assembly = "cad/robot.SLDASM"
         native_request = CaptureOperationRequest.from_record(
@@ -1626,7 +1626,7 @@ class NativeOperationRuntimeTests(unittest.TestCase):
             "run_id": run_id,
             "request_digest": digest({"request": run_id}),
             "effect_key": effect_key,
-            "handoff_sha256": "b" * 64,
+            "handoff_sha256": "c" * 64,
             "upload_sha256": "c" * 64,
             "prepared_sha256": digest(
                 {"cad/robot.SLDASM": "a" * 64}
@@ -1753,7 +1753,7 @@ class NativeOperationRuntimeTests(unittest.TestCase):
             "run_id": run_id,
             "request_digest": digest({"request": run_id}),
             "effect_key": effect_key,
-            "handoff_sha256": "b" * 64,
+            "handoff_sha256": "c" * 64,
             "upload_sha256": "c" * 64,
             "prepared_sha256": digest(
                 {"cad/robot.SLDASM": "a" * 64}
@@ -2407,7 +2407,7 @@ class _CountingBackend(FakeBackend):
         closure = self.observation_fixture.closure_facts(
             frozen_source, settings["main_assembly"], package_inventory(frozen_source),
         )
-        return observation_from_closure_fixture(record, closure)
+        return observation_from_closure_fixture(record, closure, files=package_inventory(frozen_source))
 
 
 class _NativeObservationFixture:
@@ -2699,9 +2699,9 @@ class NativeDiscoverOperationTests(unittest.TestCase):
         capture.assert_not_called()
         self.assertEqual(
             set(observation.selection["files"]),
-            {self.MAIN, self.SELECTED},
+            set(self.files),
         )
-        self.assertNotIn(self.DECOY, observation.selection["files"])
+        self.assertNotIn(self.DECOY, observation.selection["closure"]["graph"])
 
         remote = client.get_operation(request.operation_id)
         self.assertEqual(remote.state, "satisfied")

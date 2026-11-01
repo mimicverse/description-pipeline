@@ -777,7 +777,7 @@ def _handoff_native_hashes(root: Path) -> set[str]:
     The discovery record carries its own provenance; its byte binding is the
     delivery manifest subject entry (re-checked by ``read_delivery_manifest``),
     and ``native_inventory_sha256`` is a top-level digest over the inventory.
-    The raw record may only confirm a matching subset of that inventory.
+    The raw record binds the same complete available byte inventory.
     """
 
     payload = evidence.discovery(root)
@@ -801,8 +801,8 @@ def _handoff_native_hashes(root: Path) -> set[str]:
     raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
     raw_files = {str(name): str(checksum) for name, checksum in (raw.get("files") or {}).items()}
     _require(
-        raw_files.items() <= frozen.items(),
-        "Raw-recorded documents are not a matching subset of the frozen native inventory: "
+        raw_files == frozen,
+        "Raw-recorded input differs from the complete frozen native inventory: "
         f"{sorted(set(raw_files) - set(frozen))}",
     )
     return set(frozen.values())

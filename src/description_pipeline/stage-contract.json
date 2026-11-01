@@ -53,7 +53,7 @@
       "name": "Discover structure",
       "doc": {
         "input": "Verified Freeze output, immutable SourceSet, ruleset/configuration identities, and admitted same-release native tool source/record identities; the artifact closure and native identities agree",
-        "output": "Raw native observation, Linux-derived prepared source package, request/check/result receipts, and the resolved engineering definition; native evidence, selection, ruleset and prepared bytes agree"
+        "output": "Raw native observation, Linux-derived prepared source package, request/check/result receipts, and the resolved engineering definition; all admitted SourceSet bytes remain available; native object evidence, ruleset and prepared bytes agree"
       },
       "inputs": [
         {

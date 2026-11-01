@@ -43,18 +43,16 @@ class ClosureSealContractTests(unittest.TestCase):
         )
         return closure_evidence(self.upload, MAIN, **kwargs)
 
-    def test_seal_reports_the_reachable_closure_and_excludes_the_rest(self) -> None:
+    def test_seal_preserves_all_input_bytes_independently_of_object_reachability(self) -> None:
         manifest = sealed_selection(
             self.upload,
             MAIN,
             edges={MAIN: ["cad/base.SLDPRT", "cad/arm.SLDPRT"], "cad/base.SLDPRT": [], "cad/arm.SLDPRT": []},
             stage_root=self.stage_root,
         )
-        self.assertEqual(set(manifest["files"]), {"cad/robot.SLDASM", "cad/base.SLDPRT", "cad/arm.SLDPRT"})
-        self.assertEqual(set(manifest["excluded_files"]), {"notes.txt"})
-        self.assertEqual(manifest["handoff_sha256"], digest(manifest["files"]))
+        self.assertEqual(manifest["files"], self.upload)
         self.assertEqual(manifest["upload_sha256"], digest(self.upload))
-        self.assertEqual(len({manifest["upload_sha256"], manifest["handoff_sha256"], manifest["selection_sha256"]}), 3)
+        self.assertNotEqual(manifest["upload_sha256"], manifest["selection_sha256"])
         self.assertEqual(manifest["closure"]["stage_root"], self.stage_root)
         verified = verify_selection(manifest, self.upload, manifest["files"], reader_sha256=manifest["reader_sha256"])
         self.assertEqual(verified, manifest)
@@ -239,7 +237,7 @@ class ClosureSealContractTests(unittest.TestCase):
             }
         ]
         manifest = seal_closure_selection(self.upload, MAIN, evidence, reader_sha256="ab" * 32)
-        self.assertEqual(set(manifest["files"]), {"cad/robot.SLDASM", "cad/base.SLDPRT", "cad/arm.SLDPRT"})
+        self.assertEqual(manifest["files"], self.upload)
         self.assertEqual(manifest["closure"]["suppressed"][0]["justification"], "authored_suppression_clean_open")
         self.assertEqual(manifest["closure"]["imports"][0]["binding"], "author_metadata_only")
         self.assertEqual(manifest["closure"]["imports"][1]["state"], "bound")
@@ -300,7 +298,7 @@ class ClosureSealContractTests(unittest.TestCase):
                 sink.writestr(name, data)
         return session, archive
 
-    def test_single_provisional_batch_seals_and_prunes_with_snapshot_proof(self) -> None:
+    def test_single_provisional_batch_seals_complete_input_with_snapshot_proof(self) -> None:
         session, archive = self._staged_session()
         self.assertEqual(set(session.snapshot()), {"state", "reader_sha256", "upload_sha256", "staged_files"})
         self.assertTrue(session.accept_batch(archive))
@@ -312,7 +310,6 @@ class ClosureSealContractTests(unittest.TestCase):
         self.assertEqual(session.snapshot()["staged_files"], self.upload)
         self.assertEqual(session.snapshot()["manifest"], manifest)
         self.assertEqual(inventory(session.stage), manifest["files"])
-        self.assertEqual(set(manifest["excluded_files"]), {"notes.txt"})
 
     def test_transport_refuses_a_tampered_stage_and_a_wrong_index(self) -> None:
         session, archive = self._staged_session()

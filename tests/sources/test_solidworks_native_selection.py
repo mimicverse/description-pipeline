@@ -168,7 +168,6 @@ class ClosureAdmissionTests(unittest.TestCase):
         self.assertEqual(sorted(payload["documents"]), sorted(payload["graph"]))
         # Stored authoring-absolute locations are verbatim evidence, never admission.
         self.assertEqual(payload["documents"]["robot.SLDASM"]["stored_references"], stored["robot.SLDASM"])
-        self.assertEqual(payload["excluded"], [])
         self.assertEqual(payload["suppressed"], [])
         self.assertEqual(payload["imports"], [])
         self.assertEqual(payload["search_configuration"]["pinned"], [str(self.stage)])
@@ -178,13 +177,14 @@ class ClosureAdmissionTests(unittest.TestCase):
         self.assertTrue(payload["session"]["closed"])
         # The produced payload is exactly the current seal contract.
         manifest = seal_closure_selection(self.files, "robot.SLDASM", payload, reader_sha256=READER)
-        self.assertEqual(sorted(manifest["files"]), ["arm.SLDPRT", "base.SLDPRT", "robot.SLDASM"])
-        self.assertEqual(manifest["excluded_files"], {})
+        self.assertEqual(manifest["files"], self.files)
         self.assertEqual(manifest["closure"]["main_assembly"], "robot.SLDASM")
 
-    def test_excluded_lists_unresolved_staged_files(self) -> None:
+    def test_unobserved_files_remain_available_without_becoming_objects(self) -> None:
         payload = self.observe([occurrence("arm-1", self.resolved("arm.SLDPRT"))])
-        self.assertEqual(payload["excluded"], ["base.SLDPRT"])
+        manifest = seal_closure_selection(self.files, "robot.SLDASM", payload, reader_sha256=READER)
+        self.assertEqual(manifest["files"], self.files)
+        self.assertNotIn("base.SLDPRT", manifest["closure"]["graph"])
 
     def test_outside_resolution_refused_with_verbatim_paths(self) -> None:
         with self.assertRaises(SelectionError) as caught:
@@ -323,7 +323,7 @@ class ClosureAdmissionTests(unittest.TestCase):
         self.assertTrue(warning["requires_owner_binding"])
         manifest = seal_closure_selection(self.files, "robot.SLDASM", payload, reader_sha256=READER)
         self.assertEqual(manifest["closure"]["virtual_components"], [entry])
-        self.assertEqual(sorted(manifest["files"]), ["robot.SLDASM"])
+        self.assertEqual(manifest["files"], self.files)
 
     def test_embedded_virtual_component_requires_complete_api_and_owner_evidence(self) -> None:
         document = session_temp("swx21040", "VC~~", "waist", "virtual_part.SLDPRT")
@@ -470,7 +470,7 @@ class ClosureAdmissionTests(unittest.TestCase):
         self.assertEqual(edge["defining_session_document"], virtual_assembly)
         self.assertEqual(len(payload["virtual_components"]), 1)
         manifest = seal_closure_selection(self.files, "robot.SLDASM", payload, reader_sha256=READER)
-        self.assertEqual(sorted(manifest["files"]), ["arm.SLDPRT", "robot.SLDASM"])
+        self.assertEqual(manifest["files"], self.files)
         forged = copy.deepcopy(payload)
         forged["documents"]["robot.SLDASM"]["resolved_edges"][0][
             "defining_session_document"
@@ -514,7 +514,7 @@ class ClosureAdmissionTests(unittest.TestCase):
         self.assertEqual(payload["graph"]["robot.SLDASM"]["references"], ["sub.SLDASM"])
         self.assertEqual({row["owner"] for row in payload["virtual_components"]}, {"robot.SLDASM", "sub.SLDASM"})
         manifest = seal_closure_selection(files, "robot.SLDASM", payload, reader_sha256=READER)
-        self.assertEqual(sorted(manifest["files"]), ["robot.SLDASM", "sub.SLDASM"])
+        self.assertEqual(manifest["files"], files)
         forged = copy.deepcopy(payload)
         nested_slot = next(
             row for row in forged["virtual_components"] if row["owner"] == "sub.SLDASM"
@@ -830,9 +830,9 @@ class ClosureAdmissionTests(unittest.TestCase):
         )
         # The seal resolves graph membership from the validated ultimate owner.
         manifest = seal_closure_selection(self.files, "robot.SLDASM", payload, reader_sha256=READER)
-        # Cached imports add no edges, so only the main is reachable here; the
-        # staged parts remain reported as excluded, never silently dropped.
-        self.assertEqual(sorted(manifest["files"]), ["robot.SLDASM"])
+        # Cached imports add no graph edges; supporting bytes still remain
+        # available without acquiring a native object binding.
+        self.assertEqual(manifest["files"], self.files)
 
     def _nested_payload(self):
         parent = session_temp("swx25524", "IC~~", "bracket_a.stp.SLDASM")
@@ -1237,7 +1237,7 @@ class BackendShapeIntegrationTests(unittest.TestCase):
         self.assertIn("document_state", payload)
         manifest = seal_closure_selection(files, "robot.SLDASM", payload, reader_sha256=READER)
         self.assertEqual(manifest["main_assembly"], "robot.SLDASM")
-        self.assertEqual(sorted(manifest["files"]), ["arm.SLDPRT", "robot.SLDASM"])
+        self.assertEqual(manifest["files"], files)
 
     def test_real_walk_nested_materialization_and_virtual_component_seal_with_owner(self) -> None:
         from .test_solidworks_native_reader import _App, _Component, _Doc, _Session, _com_stubs
@@ -1311,7 +1311,7 @@ class BackendShapeIntegrationTests(unittest.TestCase):
         )
         manifest = seal_closure_selection(files, "robot.SLDASM", payload, reader_sha256=READER)
         self.assertEqual(manifest["main_assembly"], "robot.SLDASM")
-        self.assertEqual(sorted(manifest["files"]), ["arm.SLDPRT", "robot.SLDASM"])
+        self.assertEqual(manifest["files"], files)
 
 
 class CuPreverifyTests(unittest.TestCase):

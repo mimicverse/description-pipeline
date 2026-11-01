@@ -46,7 +46,6 @@ _OBSERVATION_FIELDS = frozenset(
         "source_inventory_sha256",
         "main_assembly",
         "selection_sha256",
-        "selected_files_sha256",
         "native_tool",
         "native_tool_sha256",
         "record_sha256",
@@ -216,7 +215,7 @@ def _validated_tool(
 
 
 def seal_native_observation(
-    selected_source: Path,
+    source_root: Path,
     output: Path,
     request: NativeDiscoverRequest,
     *,
@@ -227,7 +226,7 @@ def seal_native_observation(
 ) -> NativeObservation:
     """Seal the released native observation after its closure was admitted."""
 
-    selected_source = Path(selected_source)
+    source_root = Path(source_root)
     output = Path(output)
     _require(output.exists() is False, "discover.observation_exists", "Observation destination already exists")
     bindings = selection_bindings(selection)
@@ -237,9 +236,9 @@ def seal_native_observation(
         "Sealed selection was computed from another full SourceSet",
     )
     _require(
-        package_inventory(selected_source) == bindings["files"],
+        package_inventory(source_root) == bindings["files"],
         "discover.source_selection_mismatch",
-        "Selected staged files differ from the sealed selection",
+        "Staged files differ from the complete admitted input",
     )
     tool = _validated_tool(
         native_tool,
@@ -251,7 +250,7 @@ def seal_native_observation(
     _require(
         isinstance(record.get("files"), Mapping) and dict(record["files"]) == dict(bindings["files"]),
         "discover.native_record_mismatch",
-        "Native observation did not read exactly the sealed selection",
+        "Native observation does not bind the complete admitted input",
     )
 
     output.mkdir(parents=True)
@@ -279,7 +278,6 @@ def seal_native_observation(
         "source_inventory_sha256": request.source_inventory_sha256,
         "main_assembly": request.main_assembly,
         "selection_sha256": bindings["selection_sha256"],
-        "selected_files_sha256": bindings["handoff_sha256"],
         "native_tool": tool,
         "native_tool_sha256": digest(tool),
         "record_sha256": digest(record),
@@ -340,7 +338,6 @@ def admit_native_observation(
     _sha(manifest["request_sha256"], "request_sha256")
     _sha(manifest["source_inventory_sha256"], "source_inventory_sha256")
     _sha(manifest["selection_sha256"], "selection_sha256")
-    _sha(manifest["selected_files_sha256"], "selected_files_sha256")
     _sha(manifest["native_tool_sha256"], "native_tool_sha256")
     _sha(manifest["record_sha256"], "record_sha256")
     files = manifest["files"]
@@ -406,11 +403,6 @@ def admit_native_observation(
         bindings["selection_sha256"] == manifest["selection_sha256"],
         "discover.observation_mismatch",
         "Selection digest is inconsistent",
-    )
-    _require(
-        bindings["handoff_sha256"] == manifest["selected_files_sha256"],
-        "discover.observation_mismatch",
-        "Selected files digest is inconsistent",
     )
     _require(
         bindings["upload_sha256"] == request.source_inventory_sha256,

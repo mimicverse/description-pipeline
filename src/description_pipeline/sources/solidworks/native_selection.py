@@ -616,9 +616,9 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
                 owner = owner if isinstance(owner, str) and owner in files else (defining_name or raw_defining)
                 owner_sha256 = files.get(owner) if isinstance(owner, str) and owner in files else None
                 # An author import path that resolves to a staged index file is
-                # the actual delivered source: retain it as a bound graph edge
-                # so the sealed selection keeps it in the frozen folder (the
-                # collector needs it and pruning would otherwise lose it).
+                # a delivered source only when its exact native path and bytes
+                # bind it. This graph edge proves object provenance; the input
+                # inventory retains all files independently.
                 bound_source = None
                 if imported:
                     candidate = _indexed(stage_root, imported, files)
@@ -875,7 +875,6 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
         entry["staged_sha256"] = actual
         entry["resolved_edges"] = sorted(entry["resolved_edges"], key=lambda item: str(item.get("instance")))
         documents_out[name] = entry
-    excluded = sorted(set(files) - set(graph))
     occurrences_out = []
     for record in occurrences:
         if not isinstance(record, Mapping):
@@ -930,7 +929,6 @@ def _closure_payload(stage_root: Path, main: str, files: Mapping[str, str], read
                 str(item.get("resolved_path")),
             ),
         ),
-        "excluded": excluded,
         "session": readings.get("session") or {},
     }
 

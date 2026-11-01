@@ -1,4 +1,4 @@
-"""One native observation closes before its closure is sealed or pruned."""
+"""One native observation closes before its complete input is sealed."""
 
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -23,9 +23,14 @@ class UnifiedDiscoverObservationTests(unittest.TestCase):
         self.root = Path(temporary.name)
         self.source = self.root / "source"
         self.source.mkdir()
-        for name in ("robot.SLDASM", "arm.SLDPRT", "excluded.SLDPRT"):
-            (self.source / name).write_bytes(name.encode())
-        self.files = {path.name: file_digest(path) for path in self.source.iterdir()}
+        for name in ("robot.SLDASM", "arm.SLDPRT", "unobserved.SLDPRT", "other/unobserved.SLDPRT", "unrelated.SLDPRT"):
+            path = self.source / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(name.encode())
+        self.files = {
+            path.relative_to(self.source).as_posix(): file_digest(path)
+            for path in self.source.rglob("*") if path.is_file()
+        }
         self.request = NativeDiscoverRequest(
             schema_version=NATIVE_DISCOVER_REQUEST_SCHEMA,
             operation_id="unified-native-operation",
@@ -45,7 +50,9 @@ class UnifiedDiscoverObservationTests(unittest.TestCase):
         self.sessions = []
         self.backends = []
 
-    def run_observation(self, *, missing=False, fail_restore=False, fail_close=False, default_backend=False):
+    def run_observation(
+        self, *, missing=False, fail_restore=False, fail_close=False, default_backend=False, mutate_input=False,
+    ):
         events, sessions, backends = self.events, self.sessions, self.backends
 
         def factory(stage, files):
@@ -59,12 +66,16 @@ class UnifiedDiscoverObservationTests(unittest.TestCase):
                     if not search:
                         self_outer.assertNotIn("open", events)
                         events.append("stored")
+                        if str(path).endswith("arm.SLDPRT"):
+                            return ("seed", "C:/author/CopyDesignTemp/unobserved.SLDPRT")
                         return ()
                     events.append("missing")
                     return ("construction", "C:/missing/construction.SLDPRT", True)
 
                 def OpenDoc6(self, *args):
                     events.append("open")
+                    if mutate_input:
+                        (stage / "unobserved.SLDPRT").write_bytes(b"changed supporting bytes")
                     return super().OpenDoc6(*args)
 
                 def SetSearchFolders(self, folder_type, folders):
@@ -80,7 +91,7 @@ class UnifiedDiscoverObservationTests(unittest.TestCase):
             class Session(_Session):
                 def close(self):
                     events.append("close")
-                    self_outer.assertTrue((stage / "excluded.SLDPRT").exists())
+                    self_outer.assertTrue((stage / "unobserved.SLDPRT").exists())
                     if fail_close:
                         raise RuntimeError("owned session close failed")
                     return super().close()
@@ -125,37 +136,51 @@ class UnifiedDiscoverObservationTests(unittest.TestCase):
             backend.discover_native(self.source, {"main_assembly": "robot.SLDASM"})
         self.assertEqual(raised.exception.code, "cad_discovery_nested_session")
 
-    def test_one_exact_open_and_one_released_observation_before_pruning(self):
+    def test_one_exact_open_and_one_released_observation_preserve_complete_input(self):
         observation = self.run_observation(missing=True)
         self.assertEqual(len(self.backends), 1)
         self.assertEqual(len(self.sessions), 1)
         self.assertEqual(self.events.count("open"), 1)
-        self.assertEqual(self.events.count("stored"), 3)
+        self.assertEqual(self.events.count("stored"), len(self.files))
         self.assertLess(self.events.index("stored"), self.events.index("open"))
         self.assertLess(self.events.index("restore"), self.events.index("close"))
         self.assertTrue(self.sessions[0].closed)
         self.assertTrue(observation.record["session"]["closed"])
         self.assertTrue(observation.record["search"]["restored"])
-        self.assertFalse((self.root / "workspace/staged/excluded.SLDPRT").exists())
+        self.assertTrue((self.root / "workspace/staged/unobserved.SLDPRT").is_file())
         self.assertEqual(observation.record["open_status"]["errors"], 2)
         self.assertEqual(observation.record["open_status"], observation.selection["closure"]["open_status"])
         warning = warning_from_selection(observation.selection)
         self.assertEqual(warning["detail"]["open_observations"]["discover"]["status"]["errors"], 2)
-        self.assertEqual(set(observation.selection["files"]), {"robot.SLDASM", "arm.SLDPRT"})
+        self.assertEqual(observation.selection["files"], self.files)
+        self.assertNotIn("unobserved.SLDPRT", observation.selection["closure"]["graph"])
+        self.assertNotIn("other/unobserved.SLDPRT", observation.selection["closure"]["graph"])
+        self.assertNotIn("unrelated.SLDPRT", observation.selection["closure"]["graph"])
+        self.assertEqual(observation.record["files"], self.files)
+        self.assertEqual(observation.record["stored_references"]["arm.SLDPRT"], [
+            {"name": "seed", "location": "C:/author/CopyDesignTemp/unobserved.SLDPRT"},
+        ])
+        self.assertEqual(len(observation.record["components"]), 1)
 
-    def test_search_restore_failure_closes_then_refuses_without_pruning(self):
+    def test_supporting_byte_drift_fails_even_without_a_component_graph_node(self):
+        with self.assertRaises(CadError) as raised:
+            self.run_observation(mutate_input=True)
+        self.assertEqual(raised.exception.code, "native_discovery_source_changed")
+        self.assertTrue(self.sessions[0].closed)
+
+    def test_search_restore_failure_closes_then_refuses_with_complete_input(self):
         with self.assertRaises(NativeDiscoverRefusal):
             self.run_observation(fail_restore=True)
         self.assertTrue(self.sessions[0].closed)
         self.assertLess(self.events.index("restore"), self.events.index("close"))
-        self.assertTrue((self.root / "workspace/staged/excluded.SLDPRT").exists())
+        self.assertTrue((self.root / "workspace/staged/unobserved.SLDPRT").exists())
         self.assertFalse((self.root / "workspace/native-observation/observation.json").exists())
 
-    def test_failed_close_cannot_claim_settlement_or_prune(self):
+    def test_failed_close_preserves_input_without_claiming_settlement(self):
         with self.assertRaises(EnvironmentError_):
             self.run_observation(fail_close=True)
         self.assertFalse(self.sessions[0].closed)
-        self.assertTrue((self.root / "workspace/staged/excluded.SLDPRT").exists())
+        self.assertTrue((self.root / "workspace/staged/unobserved.SLDPRT").exists())
         self.assertFalse((self.root / "workspace/native-observation/observation.json").exists())
 
 

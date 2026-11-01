@@ -21,7 +21,7 @@ from xml.sax.saxutils import escape
 
 from description_pipeline.verification import v14_declarations as v14
 from description_pipeline.interface_records import PURPOSE_ENGINEERING, PURPOSE_INSPECTION_PREVIEW
-from description_pipeline.io import PipelineError, digest
+from description_pipeline.io import PipelineError, artifact_path_parts, digest
 from description_pipeline.verification import solidworks_urdf
 from description_pipeline.verification import native_declarations as native_declarations_module
 from description_pipeline.verification.native_declarations import (
@@ -48,6 +48,12 @@ def verify_declarations(raw, source=None, *, purpose=None):
         )
         if isinstance(main_assembly, str) and main_assembly:
             documents.add(main_assembly)
+        # Invalid component claims stay in the scenario, never in its admitted bytes.
+        for document in tuple(documents):
+            try:
+                artifact_path_parts(document)
+            except PipelineError:
+                documents.remove(document)
         raw["files"] = dict.fromkeys(sorted(documents), "f" * 64)
     if all(
         "transform_raw" not in item
@@ -58,6 +64,9 @@ def verify_declarations(raw, source=None, *, purpose=None):
             raw,
             default_mate_scope=True,
         )
+    if "source_selection" not in raw:
+        main = raw["selection"]["main_assembly"]
+        raw["source_selection"] = sealed_selection(raw["files"], main)
     return _verify_declarations(raw, source, purpose=purpose)
 
 
@@ -592,7 +601,6 @@ class DeclarationConsumerTests(unittest.TestCase):
         raw["source_selection"] = sealed_selection(
             native_files,
             "robot.SLDASM",
-            edges={document: [] for document in documents},
         )
         raw = support.local_native_record_payload(
             raw,
@@ -605,7 +613,7 @@ class DeclarationConsumerTests(unittest.TestCase):
                 "schema_version": "solidworks-to-urdf.native-discovery/v1",
                 "run_id": "declaration-consumer",
                 "contract": "native-discovery/v1",
-                    "handoff_sha256": raw["source_selection"]["handoff_sha256"],
+                    "handoff_sha256": raw["source_selection"]["upload_sha256"],
                 "raw": raw,
                 "identity": copy.deepcopy(raw["identity"]),
             },
@@ -1571,6 +1579,7 @@ class NativeDeclarationsTests(unittest.TestCase):
                 and component.get("document") != "source.step"
             },
             "source.step": "a" * 64,
+            "robot.SLDASM": "f" * 64,
         }
         self.assertTrue(verify_declarations(raw)["passed"])
         for patch in [
@@ -1668,7 +1677,6 @@ class NativeDeclarationsTests(unittest.TestCase):
         raw["source_selection"] = sealed_selection(
             raw["files"],
             owner,
-            edges={document: [] for document in raw["files"]},
             imports=[],
             virtual_components=[slot],
         )
@@ -1876,7 +1884,7 @@ class NativeDeclarationsTests(unittest.TestCase):
                     "schema_version": "solidworks-to-urdf.native-discovery/v1",
                     "run_id": "test",
                     "contract": "native-discovery/v1",
-                    "handoff_sha256": raw["source_selection"]["handoff_sha256"],
+                    "handoff_sha256": raw["source_selection"]["upload_sha256"],
                     "raw": raw,
                     "identity": copy.deepcopy(raw["identity"]),
                 },

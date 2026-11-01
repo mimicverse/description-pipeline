@@ -675,12 +675,16 @@ def _projected_component_document_is_bound(
                 native_files,
             )
         )
+    carrier = record.get("source_selection")
+    closure = carrier.get("closure") if isinstance(carrier, dict) else None
+    graph = closure.get("graph") if isinstance(closure, dict) else None
+    normalized = document.replace("\\", "/")
+    node = graph.get(normalized) if isinstance(graph, dict) else None
     return (
         isinstance(native_files, dict)
-        and isinstance(
-            native_files.get(document.replace("\\", "/")),
-            str,
-        )
+        and isinstance(native_files.get(normalized), str)
+        and isinstance(node, dict)
+        and node.get("sha256") == native_files[normalized]
     )
 
 

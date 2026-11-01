@@ -603,8 +603,7 @@ class AdmissionProjectionTests(unittest.TestCase):
             "run_id": self.harness.spec.run_id,
             "request_digest": discover_command.request_digest,
             "selection": {
-                "files": {"cad/robot.SLDASM": self.harness.originals.inventory["cad/robot.SLDASM"]},
-                "handoff_sha256": digest({"selected": 1}),
+                "files": dict(self.harness.originals.inventory),
                 "upload_sha256": self.harness.originals.inventory_sha256,
                 "main_assembly": self.harness.spec.main_assembly,
             },
@@ -620,7 +619,6 @@ class AdmissionProjectionTests(unittest.TestCase):
             "discovery_file": "input/discovery/native-discovery.json",
             "findings_file": "input/discovery/findings.json",
         }
-        discover_payload["selection"]["handoff_sha256"] = digest(discover_payload["selection"]["files"])
         discover = self.harness.predecessor("discover", discover_command, discover_payload)
         discover_result = VerifiedDiscoverResult.from_record(discover, discover_payload)
         with self.assertRaises(ProtocolError):
@@ -877,7 +875,7 @@ class AdmissionProjectionTests(unittest.TestCase):
             "run_id": self.harness.spec.run_id,
             "request_digest": discover_command.request_digest,
             "selection": {
-                "files": {"cad/robot.SLDASM": self.harness.originals.inventory["cad/robot.SLDASM"]},
+                "files": dict(self.harness.originals.inventory),
                 "upload_sha256": self.harness.originals.inventory_sha256,
                 "main_assembly": self.harness.spec.main_assembly,
             },
@@ -893,7 +891,6 @@ class AdmissionProjectionTests(unittest.TestCase):
             "discovery_file": "input/discovery/native-discovery.json",
             "findings_file": "input/discovery/findings.json",
         }
-        discover_payload["selection"]["handoff_sha256"] = digest(discover_payload["selection"]["files"])
         discover = self.harness.predecessor("discover", discover_command, discover_payload)
         discover_result = VerifiedDiscoverResult.from_record(discover, discover_payload)
         capture = build_capture_command(self.harness.spec, freeze, discover, discover_result)
@@ -951,7 +948,7 @@ class AdmissionProjectionTests(unittest.TestCase):
             "run_id": self.harness.spec.run_id,
             "request_digest": discover_command.request_digest,
             "selection": {
-                "files": {"cad/robot.SLDASM": self.harness.originals.inventory["cad/robot.SLDASM"]},
+                "files": dict(self.harness.originals.inventory),
                 "upload_sha256": self.harness.originals.inventory_sha256,
                 "main_assembly": self.harness.spec.main_assembly,
             },
@@ -967,7 +964,6 @@ class AdmissionProjectionTests(unittest.TestCase):
             "discovery_file": "input/discovery/native-discovery.json",
             "findings_file": "input/discovery/findings.json",
         }
-        discover_payload["selection"]["handoff_sha256"] = digest(discover_payload["selection"]["files"])
         discover = self.harness.predecessor("discover", discover_command, discover_payload)
         discover_result = VerifiedDiscoverResult.from_record(discover, discover_payload)
         capture_command = build_capture_command(self.harness.spec, freeze, discover, discover_result)

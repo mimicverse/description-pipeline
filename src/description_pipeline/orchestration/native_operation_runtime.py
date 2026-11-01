@@ -617,6 +617,8 @@ class CaptureOperationRequest:
         _sha256(self.request_digest, "request_digest")
         _sha256(self.handoff_sha256, "handoff_sha256")
         _sha256(self.upload_sha256, "upload_sha256")
+        if self.handoff_sha256 != self.upload_sha256:
+            raise NativeOperationError("Native Capture must preserve the complete frozen upload")
         _sha256(self.prepared_sha256, "prepared_sha256")
         _sha256(
             self.native_tool_source_sha256,

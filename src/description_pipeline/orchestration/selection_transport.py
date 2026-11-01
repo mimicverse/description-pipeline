@@ -8,7 +8,6 @@ import os
 import stat
 import tempfile
 import zipfile
-from contextlib import suppress
 from pathlib import Path
 
 from ..io import _filesystem_path, _physical_path, confined, digest
@@ -176,14 +175,10 @@ class StagedSelection:
         return True
 
     def seal_closure(self, evidence: dict) -> dict:
-        """Seal one native closure: prune only excluded bytes and freeze the selection.
+        """Seal object evidence without deleting admitted input bytes.
 
-        The provisional staged inventory is re-hashed against the full upload index, the
-        closure graph is sealed by :func:`seal_closure_selection`, the excluded staged
-        files are removed, and the retained bytes must equal the selected files exactly.
-        ``snapshot()`` keeps the full original inventory as the upload proof.  Sealing is
-        idempotent only for the identical evidence, because the excluded bytes no longer
-        exist on disk once the closure is sealed.
+        Before and after sealing, the stage must match the complete upload.
+        A component graph can omit native document-level dependencies.
         """
 
         if self.state == "sealed":
@@ -209,16 +204,11 @@ class StagedSelection:
         manifest = seal_closure_selection(
             self.upload_files, self.main_assembly, evidence, reader_sha256=self.reader_sha256
         )
-        for name in sorted(self.upload_files):
-            if name in manifest["files"]:
-                continue
-            with suppress(OSError, SelectionError):
-                Path(_filesystem_path(confined(self.stage, name))).unlink()
         retained = package_inventory(self.stage)
         _refuse(
             retained == manifest["files"],
             "selection_inventory_changed",
-            "Retained staged bytes differ from the sealed selection",
+            "Staged bytes differ from the complete admitted input",
         )
         self.manifest = manifest
         self.sealed_evidence = copy.deepcopy(evidence)

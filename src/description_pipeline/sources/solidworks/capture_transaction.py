@@ -270,22 +270,19 @@ def capture_native_package(
             raise PipelineError(
                 "The sealed discovery record carries no source selection"
             )
-        selected = source_selection.get("files")
-        excluded = source_selection.get("excluded_files")
+        source_files = source_selection.get("files")
         if (
-            not isinstance(selected, dict)
-            or not isinstance(excluded, dict)
-            or set(selected) & set(excluded)
-            or selected != native_files
-            or selected != raw.get("files")
+            not isinstance(source_files, dict)
+            or source_files != native_files
+            or source_files != raw.get("files")
         ):
             raise PipelineError(
                 "The sealed discovery source selection differs from its file inventory"
             )
         verify_selection(
             source_selection,
-            {**excluded, **selected},
-            selected,
+            source_files,
+            source_files,
             reader_sha256=source_selection.get("reader_sha256"),
         )
         expected_session_sources = {

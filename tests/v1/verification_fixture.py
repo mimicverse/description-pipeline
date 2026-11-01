@@ -425,7 +425,7 @@ def incomplete_saved_state_record() -> dict:
     closure["observed_occurrences"] = occurrences
     closure["saved_configuration"] = "Default"
     closure["unresolved"] = []
-    upload = {**selection["excluded_files"], **selection["files"]}
+    upload = dict(selection["files"])
     record["source_selection"] = seal_closure_selection(
         upload,
         selection["main_assembly"],

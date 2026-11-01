@@ -8145,55 +8145,17 @@ class SolidWorksBackend(CadBackend):
                 values = _custom_properties(document, entry["configuration"] or None)
                 if values:
                     property_buckets["components"][entry["name2"]] = values
-            files = {}
-            hash_plan = []
-            planned = set()
-            observed_paths = [
-                Path(by_component[entry["name2"]][0]) for entry in components if not entry["suppressed"]
-            ]
-            for path in (main_path, *observed_paths):
-                relative = _relative_document(path, source_root)
-                if relative and relative not in planned:
-                    planned.add(relative)
-                    hash_plan.append((path, relative))
-            for entry in components:
-                if entry["suppressed"]:
-                    continue
-                provenance = entry.get("source_provenance", {})
-                relative = provenance.get("document") if provenance.get("state") == "resolved" else None
-                if relative and relative not in planned:
-                    planned.add(relative)
-                    hash_plan.append((source_root / relative, relative))
-                elif provenance.get("state") == "cached_materialization" and provenance.get(
-                    "author_imported_in_source_root"
-                ):
-                    # A validated in-stage author source of a cached
-                    # materialization is an acquired CAD document: hash the
-                    # staged bytes that the sealed selection retains as
-                    # bound_source, so the native file inventory carries the
-                    # same file.  Strictly confined to the source root;
-                    # external author metadata never enters the file map.
-                    bound_relative = provenance.get("author_imported_relative")
-                    if isinstance(bound_relative, str) and bound_relative:
-                        staged = source_root / bound_relative
-                        if _relative_document(staged, source_root) != bound_relative:
-                            raise CadError(
-                                "cad_import_source_unavailable",
-                                "the validated in-stage import source is missing from the acquired folder",
-                                {"path": bound_relative},
-                            )
-                        if bound_relative not in planned:
-                            planned.add(bound_relative)
-                            hash_plan.append((staged, bound_relative))
-            for index, (path, relative) in enumerate(hash_plan):
-                activity.emit(
-                    "hash_sources",
-                    current_object=_activity_object(path, source_root) or relative,
-                    completed=index,
-                    total=len(hash_plan),
+            # Available byte identity is distinct from native object evidence:
+            # unopened supporting documents acquire no mechanical observation.
+            activity.emit("hash_sources", completed=0, total=len(source_files), force=True)
+            files = package_inventory(source_root)
+            if files != source_files:
+                raise CadError(
+                    "native_discovery_source_changed",
+                    "admitted input bytes changed during native discovery",
+                    {"expected": source_files, "observed": files},
                 )
-                files[relative] = _hash(str(Path(source_root) / relative))
-            activity.emit("hash_sources", completed=len(hash_plan), total=len(hash_plan), force=True)
+            activity.emit("hash_sources", completed=len(files), total=len(files), force=True)
             activity.emit(
                 "build_record",
                 force=True,

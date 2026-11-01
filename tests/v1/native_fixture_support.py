@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import os
 from pathlib import Path
 
 from description_pipeline.sources.solidworks.selection import seal_closure_selection
@@ -25,7 +26,7 @@ def capture_record() -> dict:
         "resolved_edges"
     ]:
         edge["instance"] = instances[edge["resolved"].replace("\\", "/")]
-    files = {**selection["excluded_files"], **selection["files"]}
+    files = dict(selection["files"])
     record["source_selection"] = seal_closure_selection(
         files,
         selection["main_assembly"],
@@ -54,6 +55,20 @@ class AxisFixtureBackend(support.FixtureCadBackend):
 
     evidence_class = "cad"
 
+    def prepare_prepared_capture(self, source_root, assembly, configuration):
+        policy = super().prepare_prepared_capture(source_root, assembly, configuration)
+        self._fixture_capture_document = Path(assembly).resolve()
+        return policy
+
+    def _copied_component(self, entry):
+        original = Path(entry.get("path") or self.document).resolve()
+        relative = os.path.relpath(original, Path(self.document).resolve().parent)
+        copied = (self._fixture_capture_document.parent / relative).resolve()
+        root = Path(self._prepared_capture_root).resolve()
+        if not copied.is_relative_to(root) or not copied.is_file():
+            raise AssertionError("Fixture component has no exact copied source: " + str(original))
+        return copied
+
     def collect_scene(
         self,
         doc_path,
@@ -67,18 +82,9 @@ class AxisFixtureBackend(support.FixtureCadBackend):
             on_activity=on_activity,
             require_material=require_material,
         )
-        root = Path(self._prepared_capture_root).resolve()
+        by_name = {str(entry["name"]): entry for entry in self.components}
         for component in scene.components:
-            candidates = sorted(
-                path
-                for path in root.rglob(Path(component.path).name)
-                if path.is_file()
-            )
-            if len(candidates) != 1:
-                raise AssertionError(
-                    f"fixture scene path is ambiguous for {component.name}"
-                )
-            component.path = str(candidates[0])
+            component.path = str(self._copied_component(by_name[component.name]))
         return scene
 
     def assembly_mass_properties(self, path) -> dict:
@@ -102,17 +108,7 @@ class AxisFixtureBackend(support.FixtureCadBackend):
                 for item in self.components
                 if str(item["name"]) == str(component)
             )
-            original = Path(entry.get("path") or self.document).resolve()
-            candidates = sorted(
-                path
-                for path in root.rglob(original.name)
-                if path.is_file()
-            )
-            if len(candidates) != 1:
-                raise AssertionError(
-                    f"fixture source scope is ambiguous for {component}"
-                )
-            copied = candidates[0]
+            copied = self._copied_component(entry)
             checksum = hashlib.sha256(copied.read_bytes()).hexdigest()
             scopes[str(component)] = support.fixture_source_scope(
                 str(component),

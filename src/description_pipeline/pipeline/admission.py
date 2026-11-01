@@ -679,7 +679,6 @@ class VerifiedDiscoverResult:
 
     predecessor: VerifiedPredecessor
     prepared_sha256: str
-    selected_files_sha256: str
     upload_inventory_sha256: str
     main_assembly: str
     native_observation_sha256: str
@@ -694,7 +693,6 @@ class VerifiedDiscoverResult:
             raise ProtocolError("admission.discover_result_invalid", {"where": "predecessor"})
         for field in (
             "prepared_sha256",
-            "selected_files_sha256",
             "upload_inventory_sha256",
             "native_observation_sha256",
             "native_tool_source_sha256",
@@ -750,9 +748,8 @@ class VerifiedDiscoverResult:
         main = selection.get("main_assembly")
         if not isinstance(files, Mapping) or not files:
             raise ProtocolError("admission.discover_result_invalid", {"where": "selection.files"})
-        selected_files_sha256 = digest({str(path): str(checksum) for path, checksum in files.items()})
-        if selection.get("handoff_sha256") != selected_files_sha256:
-            raise ProtocolError("admission.discover_result_invalid", {"where": "selection.handoff_sha256"})
+        if digest({str(path): str(checksum) for path, checksum in files.items()}) != upload:
+            raise ProtocolError("admission.discover_result_invalid", {"where": "selection.upload_sha256"})
         _require_digest(upload, "admission.discover_result_invalid", "selection.upload_sha256")
         _require_text(main, "admission.discover_result_invalid", "selection.main_assembly")
         native_tool = record["native_tool"]
@@ -767,7 +764,6 @@ class VerifiedDiscoverResult:
         return cls(
             predecessor=predecessor,
             prepared_sha256=record["prepared_sha256"],
-            selected_files_sha256=selected_files_sha256,
             upload_inventory_sha256=upload,
             main_assembly=main,
             native_observation_sha256=record["native_observation_sha256"],
@@ -1281,7 +1277,7 @@ def build_capture_command(
     )
     request = {
         "effect_key": effect_key,
-        "handoff_sha256": discover_result.selected_files_sha256,
+        "handoff_sha256": discover_result.upload_inventory_sha256,
         "upload_sha256": discover_result.upload_inventory_sha256,
         "prepared_sha256": discover_result.prepared_sha256,
         "main_assembly": discover_result.main_assembly,

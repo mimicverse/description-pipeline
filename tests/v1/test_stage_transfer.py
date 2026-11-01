@@ -1070,27 +1070,14 @@ class StageTransferTests(unittest.TestCase):
             sealed = archive.read(transfer.CAPTURE_MANIFEST)
         self.assertEqual((destination / transfer.CAPTURE_MANIFEST).read_bytes(), sealed)
 
-    def test_full_upload_and_selected_native_handoff_are_bound_separately(self) -> None:
-        upload_files = {**NATIVE_FILES, "excluded.SLDPRT": "e" * 64}
+    def test_pruned_input_cannot_be_sealed_as_the_complete_upload(self) -> None:
+        upload_files = {**NATIVE_FILES, "support.SLDPRT": "e" * 64}
         upload_sha256 = digest(upload_files)
         root = capture_root(
-            self.base / "separate-upload",
-            upload=upload_sha256,
-            upload_files=upload_files,
+            self.base / "pruned-input", upload=upload_sha256, upload_files=upload_files,
         )
-        archive = self.base / "separate-upload.zip"
-        manifest = seal(root, archive, upload_sha256=upload_sha256)
-        self.assertEqual(manifest["upload_sha256"], upload_sha256)
-        self.assertEqual(manifest["handoff_sha256"], HANDOFF)
-
-        destination = self.base / "separate-upload-admitted"
-        admit(archive, destination, expected_upload_sha256=upload_sha256)
-        summary = _verify_transfer(
-            destination,
-            expected_upload_sha256=upload_sha256,
-        )
-        self.assertEqual(summary["upload_sha256"], upload_sha256)
-        self.assertEqual(summary["handoff_sha256"], HANDOFF)
+        with self.assertRaisesRegex(PipelineError, "complete frozen upload"):
+            seal(root, self.base / "pruned-input.zip", upload_sha256=upload_sha256)
 
     def test_structural_team_reports_are_not_capture_payload(self) -> None:
         (self.root / "reports/structural-team.md").write_text(

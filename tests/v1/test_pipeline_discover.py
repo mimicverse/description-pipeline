@@ -171,7 +171,7 @@ class CountingBackend(FakeBackend):
         closure = self.observation_fixture.closure_facts(
             frozen_source, settings["main_assembly"], package_inventory(frozen_source),
         )
-        return observation_from_closure_fixture(record, closure)
+        return observation_from_closure_fixture(record, closure, files=package_inventory(frozen_source))
 
 
 class EffectLedger:
@@ -366,8 +366,8 @@ class DiscoverHarness:
             MAIN: b"placeholder cad/robot.SLDASM\n",
             "cad/base.SLDPRT": b"placeholder cad/base.SLDPRT\n",
             "cad/arm.SLDPRT": b"placeholder cad/arm.SLDPRT\n",
-            "spare/base.SLDPRT": b"selected same-basename part\n",
-            "unused/base.SLDPRT": b"excluded same-basename part\n",
+            "spare/base.SLDPRT": b"unobserved same-basename support\n",
+            "unused/base.SLDPRT": b"unobserved same-basename part\n",
         }
         for name, payload in self.source_bytes.items():
             path = self.source / name
@@ -666,8 +666,11 @@ class DiscoverDomainTests(unittest.TestCase):
         self.assertTrue((root / "native-observation/observation.json").is_file())
         result = read_data(root / "result.json")
         self.assertTrue(result["passed"])
-        self.assertNotIn("spare/base.SLDPRT", result["selection"]["files"])
-        self.assertNotIn("unused/base.SLDPRT", result["selection"]["files"])
+        self.assertEqual(result["selection"]["files"], self.harness.source_files)
+        self.assertNotIn("spare/base.SLDPRT", result["selection"]["closure"]["graph"])
+        self.assertNotIn("unused/base.SLDPRT", result["selection"]["closure"]["graph"])
+        for name, checksum in self.harness.source_files.items():
+            self.assertEqual(file_digest(root / "prepared" / name), checksum)
 
     def test_nonterminal_native_submission_returns_one_effect_deferral(self) -> None:
         backend = CountingBackend(copy.deepcopy(self.harness.record))

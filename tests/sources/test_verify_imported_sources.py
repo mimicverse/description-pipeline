@@ -379,7 +379,7 @@ class ImportedSourceTests(unittest.TestCase):
             "run_id": "imported-source-test",
             "namespace": "dp",
             "handoff_sha256": (
-                source_selection.get("handoff_sha256", "0" * 64)
+                source_selection.get("upload_sha256", "0" * 64)
                 if isinstance(source_selection, dict)
                 else "0" * 64
             ),

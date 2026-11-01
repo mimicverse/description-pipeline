@@ -1055,8 +1055,9 @@ def _require_source_selection(payload: dict) -> None:
 
     The proof is mandatory: the one supported native capture carries
     ``raw.source_selection``, and a bundle without it is not verifiable.  The manifest
-    must recompute exactly, every selected source must be bound by the raw native file
-    inventory with a matching hash, and the raw main choice must agree.
+    must recompute exactly, all available input bytes must be bound by the raw
+    inventory, and the main choice must agree. Object observations are checked
+    separately; hashing an available file does not claim mechanical readings.
     """
 
     from ..sources.solidworks.selection import verify_selection
@@ -1082,24 +1083,15 @@ def _require_source_selection(payload: dict) -> None:
             None,
         )
     files = manifest.get("files")
-    excluded = manifest.get("excluded_files")
-    if not isinstance(files, dict) or not isinstance(excluded, dict):
-        raise _Failure("discovery.selection", "sealed selection carries no file inventories", None)
-    upload = {**excluded, **files}
+    if not isinstance(files, dict):
+        raise _Failure("discovery.selection", "sealed selection carries no input inventory", None)
     try:
-        verify_selection(manifest, upload, files, reader_sha256=manifest.get("reader_sha256"))
+        verify_selection(manifest, files, files, reader_sha256=manifest.get("reader_sha256"))
     except Exception as error:  # noqa: BLE001 - reported as a structured verifier failure
         raise _Failure("discovery.selection", f"sealed selection does not recompute: {error}", None) from error
     native_files = raw.get("files")
-    if not isinstance(native_files, dict) or not native_files:
-        raise _Failure("discovery.selection", "the raw record carries no native file inventory", None)
-    for name, checksum in files.items():
-        if native_files.get(name) != checksum:
-            raise _Failure(
-                "discovery.selection",
-                f"selected source {name!r} is not bound by the raw record",
-                {"document": name},
-            )
+    if not isinstance(native_files, dict) or native_files != files:
+        raise _Failure("discovery.selection", "the raw record does not bind the complete input inventory", None)
     raw_selection = raw.get("selection")
     if isinstance(raw_selection, dict):
         chosen = raw_selection.get("main_assembly")
@@ -1460,12 +1452,16 @@ def _verification_component_document_is_bound(
             name,
             native_files,
         )
+    carrier = record.get("source_selection")
+    closure = carrier.get("closure") if isinstance(carrier, dict) else None
+    graph = closure.get("graph") if isinstance(closure, dict) else None
+    normalized = document.replace("\\", "/")
+    node = graph.get(normalized) if isinstance(graph, dict) else None
     return (
         isinstance(native_files, dict)
-        and isinstance(
-            native_files.get(document.replace("\\", "/")),
-            str,
-        )
+        and isinstance(native_files.get(normalized), str)
+        and isinstance(node, dict)
+        and node.get("sha256") == native_files[normalized]
     )
 
 
@@ -4183,9 +4179,9 @@ def verify_discovery(package: Path) -> dict:
             {"field": "handoff_digest"},
         )
         _require(
-            payload.get("handoff_sha256") == sealed_selection.get("handoff_sha256"),
+            payload.get("handoff_sha256") == sealed_selection.get("upload_sha256"),
             "discovery.request",
-            "the native discovery record is not bound to the selected closure handoff",
+            "the native discovery record is not bound to the complete frozen upload",
             {"field": "handoff_sha256"},
         )
         _require(
@@ -4246,14 +4242,13 @@ def verify_discovery(package: Path) -> dict:
                 "a native file differs from the recorded bytes",
                 {"file": relative},
             )
-        declared = {name for name in native if Path(name).suffix.lower() in {".sldasm", ".sldprt"}}
-        observed = {name for name in inventory if Path(name).suffix.lower() in {".sldasm", ".sldprt"}}
         _require(
-            declared == observed,
+            inventory == native and digest(inventory) == state["request"]["handoff_digest"],
             "discovery.files",
-            "the package contains CAD documents the record never read",
-            {"extra": sorted(observed - declared)},
+            "the archived input does not preserve the complete frozen upload",
+            {"missing": sorted(set(native) - set(inventory)), "extra": sorted(set(inventory) - set(native))},
         )
+        observed = {name for name in inventory if Path(name).suffix.lower() in {".sldasm", ".sldprt"}}
         raw = payload.get("raw") or {}
         for relative, checksum in sorted((raw.get("files") or {}).items()):
             _require(

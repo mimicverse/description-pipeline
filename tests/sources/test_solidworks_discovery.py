@@ -3899,57 +3899,55 @@ class DiscoveryTests(unittest.TestCase):
                         records_prefix="input/",
                     )
 
-    def test_verifier_separates_full_upload_and_selected_closure_handoff(self) -> None:
+    def test_complete_input_survives_derivation_and_independent_byte_checks(self) -> None:
+        from description_pipeline.sources.solidworks.revision import package_inventory
+        from .selection_support import seal_fixture_open_observation
+
+        native, records = self._native()
+        support_path = native / "cad/support.SLDPRT"
+        support_path.write_bytes(b"supporting derived-part source")
+        files = package_inventory(native)
         raw = record()
-        main = "cad/robot.SLDASM"
-        selected = raw["source_selection"]["files"]
-        upload = {**selected, "cad/excluded.SLDPRT": "f" * 64}
+        raw["files"] = files
         raw["source_selection"] = sealed_selection(
-            upload,
-            main,
+            files,
+            "cad/robot.SLDASM",
             edges={
-                main: ["cad/base.SLDPRT", "cad/arm.SLDPRT"],
+                "cad/robot.SLDASM": ["cad/base.SLDPRT", "cad/arm.SLDPRT"],
                 "cad/base.SLDPRT": [],
                 "cad/arm.SLDPRT": [],
             },
         )
-        from .selection_support import seal_fixture_open_observation
-
         seal_fixture_open_observation(raw)
-        result, output = self._derive_pure(raw)
+        raw = support.local_native_record_payload(raw, default_mate_scope=True)
+        output = self.tmp / "complete-input-prepared"
+        result = derive_native_package(
+            native, output, "run-1", raw,
+            settings=DiscoverySettings(record_roots=(records,)),
+        )
         self.assertTrue(result.passed, result.findings)
         delivery = self._deliver(output)
-        request = json.loads((delivery / "input/request.json").read_text(encoding="utf-8"))
-        payload = json.loads((delivery / "input/discovery/native-discovery.json").read_text(encoding="utf-8"))
-        upload_sha256 = payload["raw"]["source_selection"]["upload_sha256"]
-        selected_sha256 = payload["raw"]["source_selection"]["handoff_sha256"]
-        self.assertNotEqual(upload_sha256, selected_sha256)
-        self.assertEqual(request["handoff_digest"], upload_sha256)
-        source_record = json.loads((delivery / "input/source.json").read_text(encoding="utf-8"))
-        self.assertEqual(source_record["identity"]["handoff_digest"], upload_sha256)
+        self.assertEqual((delivery / "input/cad/cad/support.SLDPRT").read_bytes(), support_path.read_bytes())
+        self.assertNotIn("cad/support.SLDPRT", raw["source_selection"]["closure"]["graph"])
+        self.assertTrue(verify_discovery(delivery)["passed"])
+        request = json.loads((delivery / "input/request.json").read_bytes())
+        self.assertEqual(request["handoff_digest"], digest(files))
 
-        self._tamper_delivered(
-            delivery,
-            "input/request.json",
-            lambda value: value.__setitem__("handoff_digest", selected_sha256),
-        )
-        report = verify_discovery(delivery)
-        self.assertFalse(report["passed"])
-        self.assertIn("discovery.request", [item["code"] for item in report["errors"]])
-
-        self._tamper_delivered(
-            delivery,
-            "input/request.json",
-            lambda value: value.__setitem__("handoff_digest", upload_sha256),
-        )
-        report = verify_discovery(delivery)
-        self.assertTrue(report["passed"], report["errors"])
-        self.assertEqual(
-            json.loads((delivery / "input/request.json").read_text(encoding="utf-8"))["handoff_digest"],
-            upload_sha256,
-        )
-        self.assertEqual(payload["handoff_sha256"], selected_sha256)
-
+        for fault in ("missing", "bytes", "extra"):
+            with self.subTest(fault=fault):
+                altered = self.tmp / ("altered-input-" + fault)
+                shutil.copytree(delivery, altered)
+                path = altered / "input/cad/cad/support.SLDPRT"
+                if fault == "missing":
+                    path.unlink()
+                elif fault == "bytes":
+                    path.write_bytes(b"changed supporting bytes")
+                else:
+                    (altered / "input/cad/extra.SLDPRT").write_bytes(b"unadmitted bytes")
+                support.seal_delivery(altered)
+                report = verify_discovery(altered)
+                self.assertFalse(report["passed"])
+                self.assertIn("discovery.files", [item["code"] for item in report["errors"]])
 
     def _delivery_with_frozen_request(self, *, drop: tuple[str, ...]):
         """One fallback delivery whose request record is written before any tamper."""
@@ -4314,7 +4312,7 @@ class DerivationSplitTests(unittest.TestCase):
 
         selection = payload["source_selection"]
         payload["source_selection"] = seal_closure_selection(
-            {**selection["excluded_files"], **selection["files"]},
+            dict(selection["files"]),
             selection["main_assembly"],
             selection["closure"],
             reader_sha256=selection["reader_sha256"],

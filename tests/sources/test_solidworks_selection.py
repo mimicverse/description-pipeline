@@ -41,11 +41,26 @@ class ClosureSelectionTests(unittest.TestCase):
         graph = {name: {"sha256": FILES[name], "references": refs} for name, refs in EDGES.items()}
         self.assertEqual(reachable_closure(graph, MAIN), {"cad/robot.SLDASM", "cad/base.SLDPRT", "cad/arm.SLDPRT"})
         manifest = sealed_selection(FILES, MAIN, edges=EDGES)
-        self.assertEqual(set(manifest["files"]), {"cad/robot.SLDASM", "cad/base.SLDPRT", "cad/arm.SLDPRT"})
-        self.assertEqual(set(manifest["excluded_files"]), {"notes.txt"})
+        self.assertEqual(manifest["files"], FILES)
         self.assertEqual(
             verify_selection(manifest, FILES, manifest["files"], reader_sha256=manifest["reader_sha256"]), manifest
         )
+
+    def test_support_bytes_do_not_authorize_an_unconnected_observed_document(self) -> None:
+        files = {**FILES, "cad/seed.SLDPRT": "e" * 64}
+        with self.assertRaisesRegex(SelectionError, "not connected"):
+            sealed_selection(files, MAIN, edges={**EDGES, "cad/seed.SLDPRT": []})
+
+    def test_support_byte_identity_does_not_prove_an_object_binding(self) -> None:
+        from description_pipeline.sources.solidworks.discovery import _projected_component_document_is_bound
+        from description_pipeline.verification.native_discovery import _verification_component_document_is_bound
+
+        files = {**FILES, "cad/seed.SLDPRT": "e" * 64}
+        record = {"files": files, "source_selection": sealed_selection(files, MAIN, edges=EDGES)}
+        for binding in (_projected_component_document_is_bound, _verification_component_document_is_bound):
+            with self.subTest(binding=binding.__name__):
+                self.assertFalse(binding({"document": "cad/seed.SLDPRT"}, "seed-1", "cad/seed.SLDPRT", record))
+                self.assertTrue(binding({"document": "cad/base.SLDPRT"}, "base-1", "cad/base.SLDPRT", record))
 
     def test_main_must_be_an_indexed_assembly(self) -> None:
         evidence = closure_evidence(FILES, MAIN, edges=EDGES)

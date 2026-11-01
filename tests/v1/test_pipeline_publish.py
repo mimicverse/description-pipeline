@@ -2329,8 +2329,7 @@ class PublicationWarningProjectionTests(unittest.TestCase):
             "actual_scope": {
                 "graph_nodes": 3,
                 "occurrence_count": 7,
-                "selected_files": ["a", "b", "c"],
-                "excluded_files": ["d"],
+                "input_files": ["a", "b", "c"],
                 "unresolved_occurrences": [{"instance": "missing-1"}],
             },
             "source_integrity_proven": False,
