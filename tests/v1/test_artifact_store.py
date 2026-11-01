@@ -32,14 +32,46 @@ class ArtifactStoreTests(unittest.TestCase):
         (root / "b.bin").write_bytes(b"\x00\x01\x02")
         return root
 
-    def seal(self, source: Path):
+    def seal(self, source: Path, **options):
         return self.store.seal_tree(
             source,
             kind="generated",
             producer_run_id="run-1",
             producer_stage="generate",
             producer_tool_sha256=self.tool,
+            **options,
         )
+
+    def test_storage_admission_counts_exact_new_bytes_and_reuses_existing_objects(self) -> None:
+        source = self.source("source")
+        admitted = []
+
+        def admit(size):
+            self.assertEqual(list(self.store.objects.iterdir()), [])
+            admitted.append(size)
+
+        artifact = self.seal(source, admit_storage=admit)
+        object_root = self.store.objects / artifact.artifact_id
+        self.assertEqual(admitted, [sum(path.stat().st_size for path in object_root.rglob("*") if path.is_file())])
+        self.assertEqual(artifact, self.seal(source, admit_storage=lambda _: self.fail("No copy is required")))
+        self.store.verify(artifact)
+
+    def test_rejected_storage_admission_creates_no_temporary_or_copied_bytes(self) -> None:
+        source = self.source("source")
+
+        def refuse(_size):
+            raise ArtifactStoreError("Insufficient host storage")
+
+        with (
+            patch.object(store_module.tempfile, "mkdtemp") as temporary,
+            patch.object(store_module.shutil, "copyfile") as copyfile,
+            self.assertRaisesRegex(ArtifactStoreError, "Insufficient host storage"),
+        ):
+            self.seal(source, admit_storage=refuse)
+        temporary.assert_not_called()
+        copyfile.assert_not_called()
+        self.assertEqual(list(self.store.objects.iterdir()), [])
+        self.assertEqual((source / "nested/a.txt").read_bytes(), b"alpha\n")
 
     def test_same_tree_identity_is_independent_of_its_work_root(self) -> None:
         first = self.seal(self.source("first"))

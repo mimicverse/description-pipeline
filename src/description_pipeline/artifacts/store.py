@@ -7,6 +7,7 @@ import os
 import shutil
 import stat
 import tempfile
+from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 
 from ..io import PipelineError, canonical, digest, file_digest, read_data
@@ -321,7 +322,9 @@ class ArtifactStore:
         producer_run_id: str | None,
         producer_stage: StageId | None,
         producer_tool_sha256: str,
+        admit_storage: Callable[[int], None] | None = None,
     ) -> ArtifactRef:
+        """Seal a tree, admitting exact new payload and manifest bytes before copying."""
         supplied = Path(source)
         if path_has_link_ancestor(supplied):
             raise ArtifactStoreError("An artifact source may not traverse a symbolic link")
@@ -342,6 +345,9 @@ class ArtifactStore:
             self.verify(self._ref(self._manifest(artifact_id), target / MANIFEST_NAME))
             return self._ref(self._manifest(artifact_id), target / MANIFEST_NAME)
 
+        manifest_bytes = canonical(record) + b"\n"
+        if admit_storage is not None:
+            admit_storage(sum(item["bytes"] for item in first) + len(manifest_bytes))
         temporary = Path(tempfile.mkdtemp(prefix=f".{artifact_id}.", dir=self.objects))
         try:
             for item in first:
@@ -353,7 +359,6 @@ class ArtifactStore:
             copied = self._members(temporary)
             if copied != first:
                 raise ArtifactStoreError("The artifact source changed while it was being sealed")
-            manifest_bytes = canonical(record) + b"\n"
             (temporary / MANIFEST_NAME).write_bytes(manifest_bytes)
             _fsync_path(temporary / MANIFEST_NAME)
             for directory in sorted(
