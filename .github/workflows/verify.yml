@@ -47,21 +47,6 @@ jobs:
         run: |
           python -m pip install --disable-pip-version-check -r requirements/linux-py312.lock -r requirements/build-py312.lock
           python -m pip install --no-deps --no-build-isolation -e .
-      - name: Fetch the exact model wheels
-        uses: ./.github/actions/fetch-teleop-assets
-        with:
-          destination: ${{ runner.temp }}/model-assets
-      - name: Install the isolated native consumers
-        run: |
-          set -eu
-          python scripts/install_teleop_worker.py --role pico --wheel "$TELEOP_WHEEL" \
-            --destination "$RUNNER_TEMP/teleop-pico"
-          python scripts/install_teleop_worker.py --role assessment --wheel "$TELEOP_WHEEL" \
-            --actuator-wheel "$ACTUATOR_WHEEL" --destination "$RUNNER_TEMP/teleop-assessment"
-          python scripts/install_teleop_worker.py --role pico-link --destination "$RUNNER_TEMP/pico-link"
-          echo "TELEOP_PICO_PYTHON=$RUNNER_TEMP/teleop-pico/bin/python" >> "$GITHUB_ENV"
-          echo "TELEOP_ASSESSMENT_PYTHON=$RUNNER_TEMP/teleop-assessment/bin/python" >> "$GITHUB_ENV"
-          echo "PICO_LINK_PYTHON=$RUNNER_TEMP/pico-link/bin/python" >> "$GITHUB_ENV"
       - name: Static checks
         run: python -m ruff check src tests tools deploy scripts
       - name: Install the pinned Node.js
@@ -308,6 +293,61 @@ jobs:
             --runtime-lock deploy/airflow/requirements.lock \
             --wheelhouse /tmp/role-linux/wheels \
             --report release-verify-report.json
+      - name: Install native consumers from the verified release
+        run: |
+          set -eu
+          python -m venv "$RUNNER_TEMP/native-test-runtime"
+          native_python="$RUNNER_TEMP/native-test-runtime/bin/python"
+          "$native_python" -m pip install --no-index --require-hashes --only-binary=:all: \
+            --find-links /tmp/role-linux/wheels -r deploy/airflow/requirements.lock
+          "$native_python" -m pip install --require-hashes --only-binary=:all: -r requirements/test-py312.lock
+          wheel=( "$RUNNER_TEMP"/release-a/*.whl )
+          "$native_python" -m pip install --no-deps "${wheel[0]}"
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import shutil
+          import zipfile
+
+          root = Path(os.environ["RUNNER_TEMP"])
+          (archive,) = (root / "release-a").glob("description-*-deployment.zip")
+          with zipfile.ZipFile(archive) as source:
+              source.extractall(root / "native-deployment")
+          shutil.copyfile(root / "release-a/release.json", root / "native-deployment/release.json")
+          PY
+          installer="$RUNNER_TEMP/native-deployment/scripts/install_teleop_worker.py"
+          "$native_python" "$installer" --role pico --wheel "$TELEOP_WHEEL" \
+            --wheelhouse /tmp/role-linux/consumers/wheels --destination "$RUNNER_TEMP/teleop-pico"
+          "$native_python" "$installer" --role assessment --wheel "$TELEOP_WHEEL" \
+            --actuator-wheel "$ACTUATOR_WHEEL" --wheelhouse /tmp/role-linux/consumers/wheels \
+            --destination "$RUNNER_TEMP/teleop-assessment"
+          "$native_python" "$installer" --role pico-link --wheelhouse /tmp/role-linux/consumers/wheels \
+            --destination "$RUNNER_TEMP/pico-link"
+          echo "CI_NATIVE_PYTHON=$native_python" >> "$GITHUB_ENV"
+      - name: Real PICO sessions and protocol replay must run
+        env:
+          TELEOP_PICO_PYTHON: ${{ runner.temp }}/teleop-pico/bin/python
+          TELEOP_ASSESSMENT_PYTHON: ${{ runner.temp }}/teleop-assessment/bin/python
+          PICO_LINK_PYTHON: ${{ runner.temp }}/pico-link/bin/python
+        run: |
+          set -o pipefail
+          "$CI_NATIVE_PYTHON" -B - <<'PY' 2>&1 | tee "$RUNNER_TEMP/pico-native-ci.log"
+          import unittest
+
+          suite = unittest.defaultTestLoader.loadTestsFromNames([
+              "tests.v1.test_pico_sessions",
+              "tests.v1.test_teleop_runtime.TeleopRuntimeTests.test_real_pico_closure_and_protocol_replay_after_source_relocation",
+              "tests.v1.test_teleop_runtime.TeleopRuntimeTests.test_real_assessment_closure_public_controller_and_delay",
+          ])
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          raise SystemExit(0 if result.wasSuccessful() and not result.skipped else 1)
+          PY
+      - name: Real optional dynamics execution must run
+        env:
+          TELEOP_ASSESSMENT_PYTHON: ${{ runner.temp }}/teleop-assessment/bin/python
+        run: |
+          set -o pipefail
+          "$CI_NATIVE_PYTHON" -B -m tests.v1.assessment_ci 2>&1 | tee "$RUNNER_TEMP/assessment-native-ci.log"
       - name: Record the verification runtime environment
         run: |
           set -eu
@@ -331,6 +371,8 @@ jobs:
           path: |
             release-verify-report.json
             release-verify-environment.json
+            ${{ runner.temp }}/pico-native-ci.log
+            ${{ runner.temp }}/assessment-native-ci.log
 
   real-chain:
     # The isolated true-chain gate: real PostgreSQL (service container), real portal admission
