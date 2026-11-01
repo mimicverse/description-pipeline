@@ -2596,7 +2596,15 @@ async function loadPreview(dagRunId) {
       };
       linkSelect.onchange = showCollision; showCollision();
       $("mjcf-warnings").replaceChildren();
-      for (const warning of preview.mjcf.warnings || []) { const item = document.createElement("li"); item.textContent = warning; $("mjcf-warnings").append(item); }
+      const inventory = preview.mjcf.warning_inventory;
+      for (const warning of inventory?.items || []) {
+        const item = document.createElement("li"); item.textContent = warning.text; $("mjcf-warnings").append(item);
+      }
+      if (inventory?.omitted > 0) {
+        const more = document.createElement("li");
+        more.textContent = `${inventory.omitted} more source warnings are available in the original certificate.`;
+        $("mjcf-warnings").append(more);
+      }
       loaded.setMode($("mjcf-mode").value); loaded.setMarkers($("mjcf-markers").checked);
       $("preview-meta").textContent = `MJCF ${preview.mjcf.entry} · subject ${preview.mjcf.subject_sha256.slice(0, 12)}...`;
       const teleop = document.createElement("a"); teleop.href = `/static/pico.html?run=${encodeURIComponent(dagRunId)}&launch=1`;

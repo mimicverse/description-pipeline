@@ -11,7 +11,7 @@ import unittest
 from datetime import UTC, datetime
 from unittest.mock import patch
 
-from description_pipeline.io import canonical, PipelineError
+from description_pipeline.io import canonical, digest, PipelineError
 from description_pipeline import mjcf_contract
 from description_pipeline.orchestration.airflow_client import native_run_id
 from description_pipeline.orchestration.feishu_oauth import build_actor_name
@@ -131,7 +131,7 @@ class MJCFPortalTests(unittest.TestCase):
                     run_projection_factory=projection,
                     run_control_store=chain.facts,
                     production_application=application,
-                    production_mjcf_successor_loader=lambda req: factory.admit_mjcf(application, req),
+                    production_stage_rerun_loader=lambda req: factory.admit_stage_rerun(application, req),
                     session_cookie="mjcf_development_session",
                 )
             )
@@ -164,7 +164,10 @@ class MJCFPortalTests(unittest.TestCase):
             self.assertTrue(preview["verified"])
             self.assertTrue(preview["mjcf"]["verified"])
             self.assertIn(preview["mjcf"]["entry"], preview["mjcf"]["files"])
-            self.assertTrue(preview["mjcf"]["warnings"])
+            inventory = preview["mjcf"]["warning_inventory"]
+            self.assertTrue(inventory["items"])
+            self.assertEqual(inventory["shown"] + inventory["omitted"], inventory["count"])
+            self.assertLessEqual(len(canonical(inventory)), 32768)
             encoded = {path: sha for path, sha in preview['mjcf']['files'].items()
                        if path.startswith(mjcf_contract.MESH_ENCODING_PREFIX)}
             self.assertTrue(encoded)
@@ -172,17 +175,22 @@ class MJCFPortalTests(unittest.TestCase):
                 status, content = call('GET', f'/api/runs/{dag_id}/artifacts/{path}')
                 self.assertEqual(200, status, content)
                 self.assertEqual(sha, hashlib.sha256(content).hexdigest())
-            encoding_warnings = [warning for warning in preview['mjcf']['warnings']
+            status, certificate_bytes = call("GET", f"/api/runs/{dag_id}/artifacts/{mjcf_contract.REPORT_PATH}")
+            self.assertEqual(status, 200, certificate_bytes)
+            complete_warnings = mjcf_contract.projection_warnings(json.loads(certificate_bytes))
+            self.assertEqual(inventory["sha256"], digest(complete_warnings))
+            encoding_warnings = [warning for warning in complete_warnings
                                  if warning.startswith(mjcf_contract.MESH_WARNING_PREFIX)]
             self.assertTrue(encoding_warnings)
             self.assertTrue(all(warning in chain.pull_requests.rows[0].body for warning in encoding_warnings))
             original = projection(source_id)
             source_decisions = [row["decision"] for row in original["stages"]]
-            status, body = call("POST", f"/api/runs/{dag_id}/attempts", {"stage": "mjcf", "simulation": "{}\n"})
+            rerun_body = {"from_stage": "mjcf", "through_stage": "publish", "simulation": "{}\n"}
+            status, body = call("POST", f"/api/runs/{dag_id}/attempts", rerun_body)
             self.assertEqual(202, status, body)
             successor_dag = json.loads(body)["dag_run_id"]
             successor_id = native_run_id(successor_dag)
-            status, repeated = call("POST", f"/api/runs/{dag_id}/attempts", {"stage": "mjcf", "simulation": "{}\n"})
+            status, repeated = call("POST", f"/api/runs/{dag_id}/attempts", rerun_body)
             self.assertEqual((202, body), (status, repeated))
             completed = application.execute_run(successor_id)
             self.assertEqual("completed", completed.outcome)
@@ -192,7 +200,7 @@ class MJCFPortalTests(unittest.TestCase):
                 dag_id="solidworks_to_urdf",
                 dag_run_id=successor_dag,
                 canonical_run_id=successor_id,
-                mjcf_source=original,
+                source_projection=original,
                 artifacts=chain.store,
             )
             self.assertIs(current, authenticated)

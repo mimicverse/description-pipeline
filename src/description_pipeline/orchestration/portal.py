@@ -104,6 +104,7 @@ from .run_ownership import (
 from .report_view import (
     _display_check_details, _display_value, display_stage_view,
     warning_summaries,
+    text_warning_inventory,
     build_report,
     merge_warnings,
     registered_discovery_record,
@@ -3443,6 +3444,11 @@ class PortalApp:
         if not formal and not diagnostic:
             raise PipelineError("Completed MJCF output has no matching stage qualification")
         verified = formal and projection.get("state") != "unresolved"
+        report_sha, report_bytes, report_ref = self._registered_member_fields(member)
+        warning_inventory = text_warning_inventory(mjcf_contract.projection_warnings(certificate), {
+            "artifact": report_ref.to_record(), "path": mjcf_contract.REPORT_PATH,
+            "bytes": report_bytes, "sha256": report_sha,
+        })
         return {
             "entry": mjcf_contract.SCENE_NAME if mjcf_contract.SCENE_NAME in files else mjcf_contract.ROBOT_NAME,
             "files": {name: record["sha256"] for name, record in files.items()},
@@ -3452,7 +3458,7 @@ class PortalApp:
             "verified": verified, "formal_eligible": verified, "mechanical_passed": True,
             "state": "verified" if verified else "unverified",
             "verification_scope": qualification["scope_kind"],
-            "warnings": mjcf_contract.projection_warnings(certificate),
+            "warning_inventory": warning_inventory,
             "collision": next((item["details"] for item in certificate["report"]["checks"]
                                if item["id"] == "collision.hulls"), {}),
             "facts": certificate["report"]["facts"], "scope": certificate["report"]["scope"],
