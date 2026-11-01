@@ -501,6 +501,24 @@ for (const automaticState of ["waiting", "unresolved"]) {
 }
 console.log("unfinished preview and activity polling OK");
 
+// Evidence links are neutral; grouped and individual findings retain their source severity.
+{
+  const p = page();
+  const run = {dag_run_id: "finding-severity", state: "failed", verification_reports: [{url: "/certificate", label: "Certificate"}],
+    findings: [{id: "mixed", severity: "info", message: "Source note"},
+      {id: "mixed", severity: "warning", message: "Source warning"},
+      {id: "failure", severity: "error", message: "Source error"},
+      {severity: "info", message: "Uncoded note"}, {message: "Unclassified failure"}],
+    report: {stages: []}};
+  p.app.state.dagRunId = run.dag_run_id; p.app.renderRun(run);
+  const items = p.$("findings").children;
+  assert.equal(items[0].className, "report-download");
+  assert.equal(items[1].className, "finding-info");
+  assert.equal(items[2].className, "finding-error");
+  assert.equal(items[3].className, "finding-error");
+  assert.equal(items[4].className, "warn");
+}
+
 // Polling keeps the selected stage and its expanded DOM stable, but updates changed evidence.
 {
   const p = page();

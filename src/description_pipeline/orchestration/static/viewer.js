@@ -40,11 +40,11 @@ export function createViewer(container) {
   renderer.setPixelRatio(window.devicePixelRatio || 1);
   container.appendChild(renderer.domElement);
 
-  scene.add(new THREE.HemisphereLight(0xffffff, 0x5a6b7d, 2.2));
-  const key = new THREE.DirectionalLight(0xffffff, 2.0);
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x5a6b7d, 0.9));
+  const key = new THREE.DirectionalLight(0xffffff, 2.4);
   key.position.set(2.5, -3, 4);
   scene.add(key);
-  const fill = new THREE.DirectionalLight(0xffffff, 0.7);
+  const fill = new THREE.DirectionalLight(0xffffff, 0.4);
   fill.position.set(-3, 2, 2);
   scene.add(fill);
 
