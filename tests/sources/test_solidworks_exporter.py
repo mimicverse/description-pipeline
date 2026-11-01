@@ -15,6 +15,7 @@ from . import support  # noqa: E402
 from .selection_support import sealed_selection  # noqa: E402
 from .test_solidworks_discovery import IDENTITY, FakeBackend
 from description_pipeline.sources.solidworks import discovery as discovery_module
+from tests.sources.preparation_support import prepare_native_package
 from description_pipeline.sources.solidworks.discovery import (
     DISCOVERY_SCHEMA,
     _exporter_constraint_checks,
@@ -22,7 +23,6 @@ from description_pipeline.sources.solidworks.discovery import (
     _declared_joint_facts,
     _exporter_memberships,
     _exporter_native_pairs,
-    prepare_native_package,
     source_definition,
 )
 from description_pipeline.sources.solidworks.exporter import (
@@ -482,7 +482,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
                 self.assertEqual(joints[0]["limits"]["upper"], 1.0)
                 self.assertFalse(any(item.get("blocking") for item in findings), findings)
 
-    def test_engineering_unreadable_native_limit_uses_default_and_retains_errors(self) -> None:
+    def test_engineering_unreadable_native_limit_blocks_without_a_default(self) -> None:
         record = raw_record()
         record["exporter"]["raw_xml"] = wire_xml({"lower": 0.0, "upper": 0.0, "effort": 0.0, "velocity": 0.0})
         record["exporter"]["raw_xml_sha256"] = hashlib.sha256(record["exporter"]["raw_xml"].encode()).hexdigest()
@@ -502,21 +502,9 @@ class ExporterDiscoveryTests(unittest.TestCase):
             }
         ]
         _bodies, joints, findings = self.derive(record)
-        self.assertEqual(joints[0]["limit_source"], "default_policy")
-        policy = joints[0]["default_policy"]
-        self.assertEqual(policy["native_absence"], "native_limit_observation_unreadable")
-        self.assertEqual(
-            policy["native_observation_errors"],
-            [
-                {
-                    "mate": "hinge__limit",
-                    "reason": "native limit entities are not readable",
-                }
-            ],
-        )
-        warning = next(item for item in findings if item["code"] == "discovery.joint_default_policy")
-        self.assertFalse(warning["blocking"])
-        self.assertEqual(warning["detail"]["native_observation_errors"], policy["native_observation_errors"])
+        self.assertEqual(joints, [])
+        self.assertIn("discovery.joint_limits_unreadable", {item["code"] for item in findings if item["blocking"]})
+        self.assertNotIn("discovery.joint_default_policy", {item["code"] for item in findings})
 
     def test_engineering_invalid_native_limit_evidence_blocks_instead_of_defaulting(self) -> None:
         def zero_record() -> dict:

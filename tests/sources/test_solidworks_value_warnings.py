@@ -1495,6 +1495,10 @@ class ValueWarningTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(PipelineError, "reused across joint identities"):
             _value_warning_gate(self.root, reused_source, reused_model)
+        forged_drive = copy.deepcopy(model)
+        forged_drive["joints"][0]["provenance"]["drive_evidence"]["declared_values"]["effort"] = False
+        with self.assertRaisesRegex(PipelineError, "Model drive evidence"):
+            _value_warning_gate(self.root, source, forged_drive)
 
     def test_native_selected_author_placeholder_keeps_evidence_without_replacing_native_limits(self):
         limits = {"lower": -1.5, "upper": 1.5, "effort": 1.0, "velocity": 1.0}
@@ -1567,6 +1571,16 @@ class ValueWarningTests(unittest.TestCase):
         foreign["joints"][0]["provenance"]["limits_evidence"]["anchor"] = '"forged"'
         with self.assertRaisesRegex(PipelineError, "native-selected limits evidence"):
             _value_warning_gate(self.root, source, foreign)
+        forged_joint = copy.deepcopy(canonical)
+        forged_joint["provenance"]["limits_evidence"]["declared_values"] = {"lower": False, "upper": False}
+        with self.assertRaisesRegex(PipelineError, "exact embedded controlled record"):
+            _joint(node, authored, forged_joint, {}, body_datums, [])
+        forged_model = copy.deepcopy(model)
+        forged_model["joints"][0]["provenance"]["limits_evidence"]["declared_values"] = {
+            "lower": False, "upper": False,
+        }
+        with self.assertRaisesRegex(PipelineError, "native-selected limits evidence"):
+            _value_warning_gate(self.root, source, forged_model)
 
     def test_preview_policy_warning_gate_accepts_the_policy(self):
         source = copy.deepcopy(self.source)
@@ -1714,6 +1728,7 @@ class ValueWarningTests(unittest.TestCase):
             "rule_version": "v1",
             "native_cad_ranges": False,
             "hardware_qualified": False,
+            "author_limits": {"lower": 0.0, "upper": 0.0},
         }
         authored = {
             "name": "hinge",
@@ -1729,6 +1744,7 @@ class ValueWarningTests(unittest.TestCase):
             **authored,
             "xyz": [0.0, 0.0, 0.0],
             "rpy": [0.0, 0.0, 0.0],
+            "provenance": {"preview_policy": copy.deepcopy(policy)},
         }
         body_datums = {"base": np.eye(4), "tool": np.eye(4)}
         self.assertEqual(
@@ -1737,6 +1753,12 @@ class ValueWarningTests(unittest.TestCase):
         )
         with self.assertRaises(PipelineError):
             _joint(node, authored, canonical, {}, body_datums, [], preview=False)
+        for field, value in (("hardware_qualified", 0), ("author_limits", {"lower": False, "upper": False})):
+            with self.subTest(metadata_field=field):
+                forged = copy.deepcopy(canonical)
+                forged["provenance"]["preview_policy"][field] = value
+                with self.assertRaisesRegex(PipelineError, "inspection-preview window provenance"):
+                    _joint(node, authored, forged, {}, body_datums, [], preview=True)
 
     def test_engineering_default_policy_joint_gate_requires_engineering_and_exact_qualification(self):
         node = ET.fromstring(
@@ -1755,6 +1777,7 @@ class ValueWarningTests(unittest.TestCase):
             "engineering_position_range_qualified": False,
             "native_absence": "complete_mate_inventory_no_enabled_limit",
             "native_observation_errors": [],
+            "author_limits": {"lower": 0.0, "upper": 0.0},
         }
         authored = {
             "name": "hinge",
@@ -1770,6 +1793,7 @@ class ValueWarningTests(unittest.TestCase):
             **authored,
             "xyz": [0.0, 0.0, 0.0],
             "rpy": [0.0, 0.0, 0.0],
+            "provenance": {"default_policy": copy.deepcopy(policy)},
         }
         body_datums = {"base": np.eye(4), "tool": np.eye(4)}
         self.assertEqual(
@@ -1784,6 +1808,47 @@ class ValueWarningTests(unittest.TestCase):
         forged_canonical["default_policy"] = forged["default_policy"]
         with self.assertRaises(PipelineError):
             _joint(node, forged, forged_canonical, {}, body_datums, [], preview=False)
+        for field, value in (
+            ("native_absence", "native_limit_observation_unreadable"),
+            ("native_observation_errors", [{"mate": "limit", "reason": "unreadable"}]),
+        ):
+            with self.subTest(field=field):
+                forged_source = copy.deepcopy(authored)
+                forged_model = copy.deepcopy(canonical)
+                forged_source["default_policy"][field] = value
+                forged_model["provenance"]["default_policy"][field] = value
+                with self.assertRaises(PipelineError):
+                    _joint(node, forged_source, forged_model, {}, body_datums, [], preview=False)
+        forged_model = copy.deepcopy(canonical)
+        forged_model["provenance"]["default_policy"]["author_limits"] = {"lower": -1.0, "upper": 1.0}
+        with self.assertRaises(PipelineError):
+            _joint(node, authored, forged_model, {}, body_datums, [], preview=False)
+        for field, value in (
+            ("author_limits", {"lower": False, "upper": False}),
+            ("native_cad_ranges", 0),
+            ("hardware_qualified", 0.0),
+            ("engineering_position_range_qualified", 0),
+        ):
+            with self.subTest(metadata_field=field):
+                forged_model = copy.deepcopy(canonical)
+                forged_model["provenance"]["default_policy"][field] = value
+                with self.assertRaisesRegex(PipelineError, "default window provenance"):
+                    _joint(node, authored, forged_model, {}, body_datums, [], preview=False)
+
+        missing_drive = copy.deepcopy(authored)
+        for field in ("effort", "velocity"):
+            missing_drive["limits"].pop(field)
+        defaulted_model = copy.deepcopy(canonical)
+        defaulted_model["provenance"]["drive_defaults"] = {
+            "rule_id": "drive.missing_zero", "rule_version": "v1",
+            "fields": ["effort", "velocity"], "drive_qualified": False,
+        }
+        self.assertEqual(
+            _joint(node, missing_drive, defaulted_model, {}, body_datums, [], preview=False)["limits"], limits,
+        )
+        defaulted_model["provenance"]["drive_defaults"]["drive_qualified"] = 0
+        with self.assertRaisesRegex(PipelineError, "drive defaults"):
+            _joint(node, missing_drive, defaulted_model, {}, body_datums, [], preview=False)
 
 
 if __name__ == "__main__":
