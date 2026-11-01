@@ -81,6 +81,7 @@ class PicoStorageContractTests(unittest.IsolatedAsyncioTestCase):
             "manifest": self.fixture.manifest,
             "container_complete": True,
             "business_complete": True,
+            "finalization_verification": self.fixture.finalization_result_double(),
             "streams": {},
             "counts": self.fixture.manifest["counts"],
             "error": None,
@@ -112,6 +113,7 @@ class PicoStorageContractTests(unittest.IsolatedAsyncioTestCase):
         outcome = self.outcome(record)
         self.assertTrue(outcome["complete"] and outcome["session_complete"])
         self.assertFalse(outcome["formal_one_hour_qualified"])
+        self.assertEqual(self.report["finalization_verification"], outcome["finalization_verification"])
         self.assertFalse((self.session / "recording/outcome.json").exists())
         self.assertEqual(before, self.snapshot())
         ref = ArtifactRef.from_record(record)
@@ -153,6 +155,19 @@ class PicoStorageContractTests(unittest.IsolatedAsyncioTestCase):
         outcomes = list(self.artifacts.root.glob("session-result-*/recording/outcome.json"))
         self.assertEqual(1, len(outcomes))
         self.assertFalse(json.loads(outcomes[0].read_bytes())["session_complete"])
+
+    async def test_native_finalization_failure_or_false_byte_proof_retains_the_original_session(self):
+        original = deepcopy(self.report["finalization_verification"])
+        for change in (
+            {"pass": False, "detail": "Native finalization rejected"},
+            {"observed_bytes": original["observed_bytes"] - 1},
+        ):
+            self.report["finalization_verification"] = {**original, **change}
+            before = self.snapshot()
+            with self.subTest(change=change), self.assertRaises(RecordingDiagnostic) as caught:
+                await self.seal(save=False)
+            self.assertIsNone(caught.exception.recording)
+            self.assertEqual(before, self.snapshot())
 
     async def test_unsaved_success_discards_only_after_complete_verification(self):
         self.assertIsNone(await self.seal(save=False))

@@ -17,35 +17,60 @@ class RecordingDiagnostic(SessionEvidenceError):
         self.recording = recording
 
 
-def verify_session_finalization(root: Path, manifest: dict) -> dict:
-    """Independently measure the exact frozen native workspace, including its manifest."""
+def validate_finalization_proof(root: Path, manifest: dict, native: dict) -> dict:
+    """Validate a sealed public proof without reopening its historical session path."""
     policy = validate_policy(manifest["resource_policy"], root)
     finalization = manifest["finalization"]
     keys = {
-        "whole_session",
+        "schema_version",
+        "pass",
+        "session_dir",
         "observed_bytes",
-        "finalization_reserve_bytes",
-        "failure_reserve_bytes",
+        "manifest_observed_bytes",
+        "reserve_bytes",
         "quota_bytes",
+        "self_bytes_match",
         "quota_ok",
+        "finalization",
+        "detail",
     }
     if (
-        not isinstance(finalization, dict)
-        or not keys <= finalization.keys()
-        or finalization["whole_session"] is not True
-        or finalization["quota_ok"] is not True
-        or type(finalization["observed_bytes"]) is not int
-        or finalization["observed_bytes"] < 0
+        not isinstance(native, dict)
+        or native.keys() != keys
+        or native["schema_version"] != "teleop-pico-session-finalization-verification/1"
+        or any(native[key] is not True for key in ("pass", "self_bytes_match", "quota_ok"))
+        or native["detail"] is not None
+        or native["session_dir"] != str(root)
+        or native["finalization"] != finalization
+        or not isinstance(finalization, dict)
+        or finalization.get("whole_session") is not True
+        or finalization.get("quota_ok") is not True
         or any(
-            type(finalization[key]) is not int or finalization[key] != policy[key]
+            type(native[key]) is not int or native[key] < 0
+            for key in ("observed_bytes", "manifest_observed_bytes", "reserve_bytes", "quota_bytes")
+        )
+        or type(finalization.get("observed_bytes")) is not int
+        or native["manifest_observed_bytes"] != finalization["observed_bytes"]
+        or native["observed_bytes"] != native["manifest_observed_bytes"]
+        or native["quota_bytes"] != policy["quota_bytes"]
+        or native["reserve_bytes"] != policy["finalization_reserve_bytes"] + policy["failure_reserve_bytes"]
+        or any(
+            type(finalization.get(key)) is not int or finalization[key] != policy[key]
             for key in ("finalization_reserve_bytes", "failure_reserve_bytes", "quota_bytes")
         )
     ):
-        raise SessionEvidenceError("Native finalization has an invalid complete-session capacity claim")
+        raise SessionEvidenceError("Public native finalization proof differs from the frozen session")
+    return native
+
+
+def verify_finalization_observation(root: Path, manifest: dict, native: dict) -> dict:
+    """Bind the public finalization proof to the parent's exact immutable workspace."""
+    validate_finalization_proof(root, manifest, native)
+    policy = manifest["resource_policy"]
     actual = check_session_capacity(root, policy)
-    if actual != finalization["observed_bytes"]:
+    if actual != native["observed_bytes"] or actual != native["manifest_observed_bytes"]:
         raise SessionEvidenceError("Native finalization bytes differ from the complete immutable session")
-    return {"schema_version": "teleop-pico-session-finalization/1", **finalization, "observed_bytes": actual}
+    return native
 
 
 def verify_manifest_counts(manifest: dict, observed: dict) -> None:

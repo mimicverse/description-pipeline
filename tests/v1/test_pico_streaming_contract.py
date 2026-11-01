@@ -47,7 +47,7 @@ class PicoStreamingContractTests(unittest.TestCase):
             "complete": True,
         }
 
-    def verify(self, rows, *, commands=None, reconciliation=None):
+    def verify(self, rows, *, commands=None, reconciliation=None, events=None):
         # This explicit design double tests only the pipeline consumer. It does
         # not implement gzip, reconciliation, replay or native worker behavior.
         modules = {}
@@ -57,6 +57,9 @@ class PicoStreamingContractTests(unittest.TestCase):
             modules[name] = module
         api = ModuleType("teleop.robots.m3_0.session_evidence")
         api.iter_raw_input_evidence = lambda _path: iter(rows)
+        api.iter_session_event_evidence = lambda _path: iter(
+            [{"command_id": self.identifier}] * 2 if events is None else events
+        )
         requested = []
 
         def reconcile(_path, *, expected_command_ids):
@@ -101,9 +104,36 @@ class PicoStreamingContractTests(unittest.TestCase):
         reconciliation = {
             **self.reconciliation,
             "commands": [],
-            "counts": {**self.reconciliation["counts"], "raw_input": 0},
+            "counts": {**self.reconciliation["counts"], "raw_input": 0, "session_events": 0},
         }
-        self.assertEqual((), self.verify(iter([]), commands=commands, reconciliation=reconciliation))
+        self.assertEqual((), self.verify(iter([]), commands=commands, reconciliation=reconciliation, events=[]))
+
+    def test_missing_operator_facts_are_rejected_from_both_raw_and_event_streams(self):
+        foreign = "operator-" + "f" * 64
+        for rows, events in (
+            ([{"raw": {**self.envelope, "id": foreign}}], []),
+            ([{"raw": self.envelope}], [{"command_id": foreign}]),
+        ):
+            with self.subTest(events=events), self.assertRaisesRegex(ValueError, "no registered platform fact"):
+                self.verify(iter(rows), events=events)
+        with self.assertRaisesRegex(ValueError, "no registered platform fact"):
+            self.verify(iter([{"raw": self.envelope}]), commands=[])
+
+    def test_registered_dispatch_requires_events_and_not_sent_forbids_event_only_evidence(self):
+        with self.assertRaisesRegex(ValueError, "events differ"):
+            self.verify(iter([{"raw": self.envelope}]), events=[])
+        with self.assertRaisesRegex(ValueError, "not sent has native event"):
+            self.verify(
+                iter([]),
+                commands=[{"command_id": "estop-request", "result": {"state": "not_sent"}}],
+            )
+
+    def test_native_proof_does_not_rewrite_an_unknown_platform_result(self):
+        commands = deepcopy(self.commands)
+        commands[0]["result"].update(state="unknown", response=None, error="Receipt connection lost")
+        before = deepcopy(commands)
+        self.assertEqual((self.identifier,), self.verify(iter([{"raw": self.envelope}]), commands=commands))
+        self.assertEqual(before, commands)
 
     def test_propagates_public_iterator_failure_after_complete_rows(self):
         class IncompleteContractStream(RuntimeError):
@@ -115,6 +145,13 @@ class PicoStreamingContractTests(unittest.TestCase):
 
         with self.assertRaisesRegex(IncompleteContractStream, "Missing footer"):
             self.verify(rows())
+
+        def events():
+            yield {"command_id": self.identifier}
+            raise IncompleteContractStream("Missing event footer")
+
+        with self.assertRaisesRegex(IncompleteContractStream, "Missing event footer"):
+            self.verify(iter([{"raw": self.envelope}]), events=events())
 
     def test_global_unknown_malformed_and_incomplete_cannot_be_hidden_by_filtering(self):
         for field, value in (
