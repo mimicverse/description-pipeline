@@ -1,6 +1,9 @@
 """Composition uses a test-installed resource and the existing private stores."""
 
 import json
+import os
+from pathlib import Path
+import tempfile
 import unittest
 from unittest import mock
 
@@ -21,6 +24,35 @@ class CompositionTests(AssessmentCase):
         self.enterContext(mock.patch.object(composition, "ArtifactStore", forbidden))
         assert composition.assessment_executor_from_environment({}) is None
         assert composition.assessment_executor_from_environment({"ASSESSMENT_CONFIG_JSON": '{"enabled":false}'}) is None
+
+    def test_unusable_private_root_is_rejected_before_runtime_or_database_reads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "executor"
+            config = {
+                "enabled": True,
+                "root": str(root),
+                "python": "/unused/python",
+                "capacity": 1,
+                "limits": {},
+            }
+            environment = {"ASSESSMENT_CONFIG_JSON": json.dumps(config)}
+            with mock.patch.object(composition, "files", side_effect=AssertionError("Runtime must not be read")):
+                root.mkdir(mode=0o500)
+                try:
+                    with self.assertRaisesRegex(ValueError, "0700"):
+                        composition.assessment_executor_from_environment(environment)
+                    self.assertEqual(root.stat().st_mode & 0o777, 0o500)
+                finally:
+                    root.chmod(0o700)
+                root.rmdir()
+                previous_umask = os.umask(0o200)
+                try:
+                    with self.assertRaisesRegex(ValueError, "0700"):
+                        composition.assessment_executor_from_environment(environment)
+                    self.assertEqual(root.stat().st_mode & 0o777, 0o500)
+                finally:
+                    os.umask(previous_umask)
+                    root.chmod(0o700)
 
 
 class CompositionDatabaseTests(PostgresCase):

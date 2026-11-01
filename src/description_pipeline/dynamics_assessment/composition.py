@@ -34,8 +34,8 @@ def assessment_executor_from_environment(environment=None) -> AssessmentExecutor
     root.mkdir(mode=0o700, exist_ok=True)
     identity = root.stat()
     require(
-        identity.st_uid == os.geteuid() and stat.S_IMODE(identity.st_mode) & 0o077 == 0,
-        "Assessment root must be private to the resource service account",
+        identity.st_uid == os.geteuid() and stat.S_IMODE(identity.st_mode) == 0o700,
+        "Assessment root must be private to the resource service account with mode 0700",
     )
     limits = ProcessLimits(
         **object_record(
