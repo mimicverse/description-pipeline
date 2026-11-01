@@ -3129,7 +3129,7 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                 continue
             declared_bounds = (declared_lower, declared_upper)
         default_allowed = settings.purpose == PURPOSE_ENGINEERING and joint_type == "revolute"
-        if native_limit_errors and (native_limit_values or isinstance(native, dict)):
+        if native_limit_errors:
             findings.append(
                 _finding(
                     "discovery.joint_limits_unreadable",
@@ -3226,15 +3226,20 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
             limit_source = "declared_author"
             limit_evidence = declared_limit
         elif default_allowed:
+            if not native_limit_inventory_complete(record.get("mates")):
+                findings.append(
+                    _finding(
+                        "discovery.joint_limits_unreadable",
+                        obj,
+                        "the complete native inventory does not prove absence of enabled position limits",
+                    )
+                )
+                continue
             default_policy = rotation_window_policy(
                 ENGINEERING_DEFAULT_POLICY_ID,
                 author_limits=None,
-                native_absence=(
-                    "complete_mate_inventory_no_enabled_limit"
-                    if native_limit_inventory_complete(raw_mates) and not native_limit_errors
-                    else "native_limit_observation_unreadable"
-                ),
-                native_errors=native_limit_errors,
+                native_absence="complete_mate_inventory_no_enabled_limit",
+                native_errors=[],
             )
             limits = {"lower": -ROTATION_WINDOW_RAD, "upper": ROTATION_WINDOW_RAD}
             limit_source = "default_policy"
@@ -3247,16 +3252,6 @@ def _joint_facts(record: dict, clusters: _Clusters, settings: DiscoverySettings,
                     blocking=False,
                 )
             )
-        elif native_limit_errors:
-            findings.append(
-                _finding(
-                    "discovery.joint_limits_unreadable",
-                    obj,
-                    "native position-limit evidence is incomplete or unreadable",
-                    {"errors": native_limit_errors},
-                )
-            )
-            continue
         else:
             findings.append(
                 _finding(
@@ -4468,6 +4463,7 @@ def _declared_joint_facts(
                         limits,
                     )
                 )
+                continue
             native_values = set()
             native_read_errors = []
             native_invalid_errors = []
@@ -4594,6 +4590,16 @@ def _declared_joint_facts(
                     )
                 )
                 continue
+            if native_read_errors:
+                findings.append(
+                    _finding(
+                        "discovery.joint_limits_unreadable",
+                        obj,
+                        "native position-limit evidence is incomplete or unreadable",
+                        {"errors": native_read_errors},
+                    )
+                )
+                continue
             if kind == "continuous":
                 if native_values or (
                     isinstance(limits, dict) and any(limits.get(key) is not None for key in ("lower", "upper"))
@@ -4607,29 +4613,9 @@ def _declared_joint_facts(
                         )
                     )
                     continue
-                if native_read_errors:
-                    findings.append(
-                        _finding(
-                            "discovery.joint_limits_unreadable",
-                            obj,
-                            "native position-limit evidence is incomplete or unreadable",
-                            {"errors": native_read_errors},
-                        )
-                    )
-                    continue
                 limits = {key: (limits or {}).get(key) for key in ("effort", "velocity")}
                 limit_source = "declared_author"
             elif native_values:
-                if native_read_errors:
-                    findings.append(
-                        _finding(
-                            "discovery.joint_limits_unreadable",
-                            obj,
-                            "native position-limit evidence is incomplete or unreadable",
-                            {"errors": native_read_errors},
-                        )
-                    )
-                    continue
                 native_lower, native_upper = next(iter(native_values))
                 declared_values = (float(limits.get("lower")), float(limits.get("upper"))) if bounds_usable else None
                 if declared_values is not None and declared_values != (
@@ -4663,15 +4649,20 @@ def _declared_joint_facts(
                 if author_nonzero:
                     limit_source = "declared_author"
                 elif kind == "revolute" and purpose == PURPOSE_ENGINEERING:
+                    if not native_inventory_complete:
+                        findings.append(
+                            _finding(
+                                "discovery.joint_limits_unreadable",
+                                obj,
+                                "the complete native inventory does not prove absence of enabled position limits",
+                            )
+                        )
+                        continue
                     default_policy = rotation_window_policy(
                         ENGINEERING_DEFAULT_POLICY_ID,
                         author_limits=author_limits,
-                        native_absence=(
-                            "complete_mate_inventory_no_enabled_limit"
-                            if native_inventory_complete and not native_read_errors
-                            else "native_limit_observation_unreadable"
-                        ),
-                        native_errors=native_read_errors,
+                        native_absence="complete_mate_inventory_no_enabled_limit",
+                        native_errors=[],
                     )
                     limits = {
                         "lower": -ROTATION_WINDOW_RAD,
@@ -4726,16 +4717,6 @@ def _declared_joint_facts(
                             blocking=False,
                         )
                     )
-                elif native_read_errors:
-                    findings.append(
-                        _finding(
-                            "discovery.joint_limits_unreadable",
-                            obj,
-                            "native position-limit evidence is incomplete or unreadable",
-                            {"errors": native_read_errors},
-                        )
-                    )
-                    continue
                 else:
                     findings.append(
                         _finding(
@@ -6026,42 +6007,6 @@ def _check_authored_files(native_files: Mapping[str, str]) -> None:
     authored = sorted(name for name in native_files if name == SOURCE_FILE or name.startswith("discovery/"))
     if authored:
         raise PipelineError(f"frozen_source already contains authored package files: {authored[:5]}")
-
-
-def prepare_native_package(
-    frozen_source: Path,
-    output: Path,
-    run_id: str,
-    *,
-    backend=None,
-    settings: DiscoverySettings | None = None,
-    configuration: str | None = None,
-    assembly: str | None = None,
-    on_event=None,
-    on_activity=None,
-) -> PreparedPackage:
-    """Read one immutable engineering directory natively, then derive purely.
-
-    The native-reading adapter is the only step that needs Windows/COM; the
-    derivation below is pure and can run wherever the raw record is available.
-    ``on_activity`` observes the native read and can never change the derived
-    record, the returned package or any failure path.
-    """
-
-    settings = settings or DiscoverySettings()
-    _check_derivation_paths(Path(frozen_source), Path(output))
-    _check_authored_files(package_inventory(Path(frozen_source)))
-    record = read_native_record(frozen_source, settings, backend=backend, on_activity=on_activity)
-    return derive_native_package(
-        frozen_source,
-        output,
-        run_id,
-        record,
-        settings=settings,
-        configuration=configuration,
-        assembly=assembly,
-        on_event=on_event,
-    )
 
 
 def read_native_record(frozen_source: Path, settings: DiscoverySettings, *, backend=None, on_activity=None) -> dict:

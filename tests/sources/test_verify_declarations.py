@@ -554,6 +554,10 @@ def lock(left, right, *, error=0, kind="lock"):
         "suppressed": False,
         "error_code": error,
         "limits": None,
+        "native_limit": None,
+        "is_advanced_mate": None,
+        "is_advanced_mate_error": None,
+        "is_advanced_mate_api": None,
         "entities": [{"component": left, "point": [0, 0, 0]}, {"component": right, "point": [0, 0, 0]}],
     }
 
@@ -1145,6 +1149,13 @@ class NativeDeclarationsTests(unittest.TestCase):
         report = verify_declarations(raw, purpose=PURPOSE_INSPECTION_PREVIEW)
         self.assertTrue(report["passed"], report["errors"])
         self.assertEqual(report["carrier"]["joints"][0]["limit_source"], "preview_policy")
+        preview_source = copy.deepcopy(report["carrier"])
+        preview_baseline = verify_declarations(raw, preview_source, purpose=PURPOSE_INSPECTION_PREVIEW)
+        self.assertTrue(preview_baseline["passed"], preview_baseline["errors"])
+        preview_source["joints"][0]["preview_policy"]["hardware_qualified"] = 0
+        preview_forged = verify_declarations(raw, preview_source, purpose=PURPOSE_INSPECTION_PREVIEW)
+        self.assertFalse(preview_forged["passed"])
+        self.assertIn("v14.claims", {item["code"] for item in preview_forged["errors"]})
 
         engineering = verify_declarations(raw, purpose=PURPOSE_ENGINEERING)
         self.assertTrue(engineering["passed"], engineering["errors"])
@@ -1158,6 +1169,14 @@ class NativeDeclarationsTests(unittest.TestCase):
         self.assertIs(joint["default_policy"]["engineering_position_range_qualified"], False)
         self.assertEqual(joint["default_policy"]["native_observation_errors"], [])
         self.assertIn("v14.default_policy", {item["code"] for item in engineering["diagnostics"]})
+
+        source = copy.deepcopy(engineering["carrier"])
+        baseline = verify_declarations(raw, source, purpose=PURPOSE_ENGINEERING)
+        self.assertTrue(baseline["passed"], baseline["errors"])
+        source["joints"][0]["default_policy"]["author_limits"]["lower"] = False
+        forged = verify_declarations(raw, source, purpose=PURPOSE_ENGINEERING)
+        self.assertFalse(forged["passed"])
+        self.assertIn("v14.claims", {item["code"] for item in forged["errors"]})
 
         native = copy.deepcopy(raw)
         native["mates"] = [
@@ -1334,7 +1353,7 @@ class NativeDeclarationsTests(unittest.TestCase):
             {item["code"] for item in report["errors"]},
         )
 
-    def test_engineering_unreadable_native_limit_defaults_and_retains_errors(self) -> None:
+    def test_engineering_unreadable_native_limit_blocks_without_a_default(self) -> None:
         raw = zero_limit_values(fixture())
         raw["mates"] = [
             {
@@ -1347,19 +1366,9 @@ class NativeDeclarationsTests(unittest.TestCase):
             }
         ]
         report = verify_declarations(raw, purpose=PURPOSE_ENGINEERING)
-        self.assertTrue(report["passed"], report["errors"])
-        joint = report["carrier"]["joints"][0]
-        self.assertEqual(joint["limit_source"], "default_policy")
-        self.assertEqual(
-            joint["limits"],
-            {"lower": -math.pi, "upper": math.pi, "effort": 0.0, "velocity": 0.0},
-        )
-        policy = joint["default_policy"]
-        self.assertEqual(policy["native_absence"], "native_limit_observation_unreadable")
-        self.assertEqual(
-            policy["native_observation_errors"],
-            [{"mate": "native_lock", "reason": "IsAdvancedMate is missing or unreadable"}],
-        )
+        self.assertFalse(report["passed"])
+        self.assertIn("v14.native_limits_unreadable", {item["code"] for item in report["errors"]})
+        self.assertNotIn("v14.default_policy", {item["code"] for item in report["diagnostics"]})
 
     def test_engineering_invalid_native_limit_evidence_blocks_instead_of_defaulting(self) -> None:
         raw = zero_limit_values(fixture())

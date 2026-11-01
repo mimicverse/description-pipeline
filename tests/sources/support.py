@@ -2272,6 +2272,10 @@ def native_hinge_mates(
             "error_code": 0,
             "scope": "",
             "limits": None,
+            "native_limit": None,
+            "is_advanced_mate": None,
+            "is_advanced_mate_error": None,
+            "is_advanced_mate_api": None,
             "entities": [cylinder(left, "Cyl1", 3, left_point), cylinder(right, "Cyl2", 7, right_point)],
         },
         {
@@ -2282,6 +2286,10 @@ def native_hinge_mates(
             "error_code": 0,
             "scope": "",
             "limits": None,
+            "native_limit": None,
+            "is_advanced_mate": None,
+            "is_advanced_mate_error": None,
+            "is_advanced_mate_api": None,
             "entities": [plane(left, "Plane1", left_point, 1.0), plane(right, "Plane2", right_point, -1.0)],
         },
     ]
@@ -2386,6 +2394,10 @@ def native_lock(members: Sequence[str], *, name: str = "board_rigid") -> dict:
         "error_code": 0,
         "scope": "",
         "limits": None,
+        "native_limit": None,
+        "is_advanced_mate": None,
+        "is_advanced_mate_error": None,
+        "is_advanced_mate_api": None,
         "entities": [{"component": str(member)} for member in members],
     }
 

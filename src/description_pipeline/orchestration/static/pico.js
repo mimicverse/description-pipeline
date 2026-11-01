@@ -117,7 +117,8 @@ async function inspect() {
 async function command(type) {
   const result = await api(`/api/simulations/${sessionId}/commands`, { method: "POST", body: JSON.stringify({ type, command_id: crypto.randomUUID() }) });
   if (type === "pair") $("pairing").textContent = `One-time code (60 s): ${result.pairing_code}. Session: ${sessionId}. Enter this code into the local PICO link.`;
-  if (type === "stop") { socket?.close(); await inspect(); $("status").textContent = "Session stopped.";
+  if (type === "stop") { socket?.close(); const row = await inspect(); $("status").textContent = `Session ${row.state}.`;
+    if (row.error) failure(new Error(row.error));
     for (const name of ["estop", "stop", "pair"]) $(name).disabled = true;
     $("pairing").textContent = "";
   }

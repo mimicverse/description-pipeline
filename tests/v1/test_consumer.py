@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 from description_pipeline import solidworks
 from description_pipeline.verification import consumer
-from description_pipeline.sources.solidworks.discovery import prepare_native_package
+from tests.sources.preparation_support import prepare_native_package
 
 URDF = (
     '<robot name="test"><link name="base_link"><inertial><mass value="1"/>'

@@ -5,8 +5,10 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -691,6 +693,9 @@ class RealSixStageChainTests(unittest.TestCase):
         )
 
     def test_mjcf_only_successor_uses_real_qualified_inputs_without_upstream_execution(self) -> None:
+        from description_pipeline.runtime import tool_record
+
+        actual_executor = tool_record(role="portable")["source_sha256"]
         application = self._application()
         work = self.root / "mjcf-successor-factory"
         work.mkdir()
@@ -720,6 +725,56 @@ class RealSixStageChainTests(unittest.TestCase):
             def forbidden_native():
                 raise AssertionError("MJCF rerun contacted the native endpoint")
             factory.native_tool_provider = forbidden_native
+            cold_request = ProductionMJCFSuccessorRequest(
+                run_id="cold-mjcf-run", request_id="cold-mjcf-request", parent_run_id=source.run_id,
+                principal=source.principal, change_summary="Admit and execute MJCF without native capabilities",
+            )
+            captured = []
+
+            class CapturedAdmission(Exception):
+                pass
+
+            def capture_spec(spec):
+                captured.append(spec)
+                raise CapturedAdmission()
+
+            with patch.object(application, "admit", side_effect=capture_spec), self.assertRaises(CapturedAdmission):
+                factory.admit_mjcf(application, cold_request)
+            cold_spec = replace(captured[0], executors=replace(captured[0].executors, mjcf=actual_executor))
+            spec_path = work / "cold-admission.json"
+            write_json(spec_path, cold_spec.to_record())
+            self.assertIsNone(application.facts.load_admission(cold_spec.run_id))
+            environment = {
+                "PATH": os.environ["PATH"],
+                "PYTHONPATH": str(Path(application_from_environment.__code__.co_filename).resolve().parents[2]),
+                "PLATFORM_SERVICE_DSN": psycopg2.extensions.make_dsn(
+                    self.server.get_uri(), options=f"-c search_path={self.schema},public",
+                ),
+                "PLATFORM_ARTIFACT_ROOT": str(self.store.root),
+                "PIPELINE_WORK_ROOT": str(work / "cold-runtime"),
+            }
+
+            def cold_cli(*args):
+                return subprocess.run([sys.executable, "-B", "-m", "description_pipeline.cli", *args],
+                                      env=environment, capture_output=True, text=True, timeout=60)
+
+            cold = cold_cli("admit", str(spec_path))
+            self.assertEqual(0, cold.returncode, cold.stderr)
+            admitted_cold = json.loads(cold.stdout)
+            self.assertEqual(cold_spec.run_id, admitted_cold["admission"]["run_id"])
+            repeated = cold_cli("admit", str(spec_path))
+            self.assertEqual(0, repeated.returncode, repeated.stderr)
+            self.assertEqual(admitted_cold, json.loads(repeated.stdout))
+            cold_stage = cold_cli("stage", admitted_cold["entry_command"]["command_id"])
+            self.assertEqual(0, cold_stage.returncode, cold_stage.stderr)
+            self.assertEqual("completed", json.loads(cold_stage.stdout)["outcome"])
+            invalid = replace(cold_spec, run_id="invalid-cold-run", request_id="invalid-cold-request",
+                              parent_run_id="missing-source")
+            write_json(spec_path, invalid.to_record())
+            rejected = cold_cli("admit", str(spec_path))
+            self.assertNotEqual(0, rejected.returncode)
+            self.assertNotIn("native_target_missing", rejected.stderr)
+            self.assertIsNone(application.facts.load_admission(invalid.run_id))
             rerun = ProductionMJCFSuccessorRequest(
                 run_id="mjcf-only-run", request_id="mjcf-only-request", parent_run_id=source.run_id,
                 principal=source.principal, change_summary="Use a qualified collision budget",

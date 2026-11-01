@@ -9,7 +9,7 @@ import shutil
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -786,6 +786,14 @@ class StageApplicationTests(unittest.TestCase):
             payload["entry_command"]["command_id"],
         )
 
+    def test_cli_rejects_invalid_admission_before_composing_runtime(self):
+        spec_path = self.root / "invalid-admission.json"
+        write_json(spec_path, {})
+        factory = Mock(side_effect=AssertionError("Invalid intent loaded runtime capabilities"))
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(1, cli.main(["admit", str(spec_path)], application_factory=factory))
+        factory.assert_not_called()
+
     def _environment_composition(self):
         executor = "a" * 64
         native_target = NativeTargetIdentity.create(
@@ -907,6 +915,25 @@ class StageApplicationTests(unittest.TestCase):
                 self.assertFalse(application.reconciliation_adapters)
                 self.assertFalse(application.cancellation_controllers)
                 self.assertFalse((application.services.work_root / "publish-pr-observer").exists())
+
+    def test_admission_composition_has_no_handlers_and_preserves_initial_target_binding(self):
+        environment, executor, native_target = self._environment_composition()
+        native_target = NativeTargetIdentity.create(install_id="win-" + "b" * 32,
+                                                   pipeline_id="solidworks-to-urdf")
+        with (
+            patch("description_pipeline.pipeline.application.tool_record", return_value={"source_sha256": executor}),
+            patch("description_pipeline.pipeline.application._registered_native_target_from_environment",
+                  return_value=native_target),
+            patch("description_pipeline.pipeline.application._native_client_from_environment",
+                  side_effect=AssertionError("Admission loaded native credentials")),
+            patch("description_pipeline.repository.publish.GitHubCliPullRequestClient",
+                  side_effect=AssertionError("Admission loaded a publication client")),
+        ):
+            application = application_from_environment(environment, admission_spec=self.harness.spec)
+            self.assertFalse(application.handlers)
+            self.assertEqual(native_target, application.native_target_identity)
+            with self.assertRaisesRegex(ApplicationError, "differs from the registered target"):
+                application.admit(self.harness.spec)
 
     def test_environment_composition_rejects_missing_native_cancellation(self):
         environment, executor, native_target = self._environment_composition()

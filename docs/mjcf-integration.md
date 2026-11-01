@@ -1,6 +1,6 @@
 # URDF pipeline 集成 MJCF：当前设计与验收边界
 
-更新：2026-11-01。本文是 MJCF 集成提案与开发记录；第二轮执行方案见 [mjcf-refactor-plan.md](mjcf-refactor-plan.md)。用户已授权按 Goal 在独立 worktree 执行。产品实现和开发验收不等于正式发行，权威文档同步及正式发布门见文末。
+更新：2026-11-01。本文是 MJCF 集成提案与开发记录；第二轮执行方案见 [mjcf-refactor-plan.md](mjcf-refactor-plan.md)。用户已授权按 Goal 在独立 worktree 执行。负责人已核验原始需求并亲自同步权威文档；独立审查提出的三项修改已进入本轮定向收口，最终固定提交的验证和复核完成前不能认定通过或正式发行。
 
 ## 需求与阶段边界
 
@@ -68,11 +68,11 @@ MJCF artifact 只封存新增文件，visual 资源引用最终交付的 `../mes
 
 CoACD 1.0.14 已在中性凹槽样本评估：组件凸包会封槽，三个凸分量保留已测接触探针；更细阈值产生278分量。它尚未进入默认生产路径；确有凹槽/间隙保真需求时应以接触及成本证据选择，不能声称现有凸包已覆盖凹形保真。
 
-投影与独立检查分别在受限子进程运行，具备CPU、内存、时限和实际退出状态检查；超时、错误退出、退化几何、误差超标或封存失败保留原件及原因。不能用有效 JSON、预算耗尽或局部抽样冒充成功或完整最大误差界限。
+网格支撑面计算按块对全部顶点与全部候选法向归约，临时点积矩阵最多1048576个float64元素，不采样、不删除支持条件。投影与独立检查分别在受限子进程运行，具备CPU、内存、时限和实际退出状态检查；超时、错误退出、退化几何、误差超标或封存失败保留原件及原因。不能用有效 JSON、预算耗尽或局部抽样冒充成功或完整最大误差界限。
 
 ## 独立验证与预览
 
-独立证书通过需完整19项检查，覆盖输入/工具/策略闭包、引擎加载、拓扑与自由度、零位及非零 FK、有向轴、逐 link/整体质量和完整惯量、几何及重复实例、碰撞代理、限位/恢复力、配置/场景、支撑接触、短时步进、warning 和结束后字节稳定性。`engine.process` 仅为失败证据，不能重签成通过证书。
+共同几何实例门逐项核对实际 `geom_bodyid` 与源link，visual/collision、primitive/mesh均覆盖。错挂反例属于通用URDF callable边界；当前正式原生链的跨link唯一名称不变量仍保留，不把该边界缺口夸大为已证明的正式链绕过。独立证书通过需完整19项检查，覆盖输入/工具/策略闭包、引擎加载、拓扑与自由度、零位及非零 FK、有向轴、逐 link/整体质量和完整惯量、几何及重复实例、碰撞代理、限位/恢复力、配置/场景、支撑接触、短时步进、warning 和结束后字节稳定性。`engine.process` 仅为失败证据，不能重签成通过证书。
 
 惯量主轴表达由独立还原张量检查；限位恢复力在源界外各偏移0.02 rad或m实测。接触探针在私有 MjData 中移动地面实际位置后调用碰撞计算，不用修改静态 geom_pos 冒充实际接触变化。短时稳定、加载或 PR 不建立控制、训练、站立及硬件资格。
 
@@ -95,7 +95,7 @@ CoACD 1.0.14 已在中性凹槽样本评估：组件凸包会封槽，三个凸�
 
 `execution_stage_ids` 从不可变 admission 推导范围。共同查询给出 `execution_scope`；复用上游为 `state=reused / in_scope=false / command=null / decision=null`，真实来源在 `source/reuse`。Portal 仅渲染，不将源 command/decision 冒充本次事实。
 
-既有 `description stage COMMAND_ID` 及 Airflow 工厂先读取登记目标，只装配所需端口。Generate/Verify/MJCF 无 CAD endpoint/token 可启动；Discover/Capture 仍要求真实原生端口；Publish 才加载发布能力。能力选择只在进程内，不保存第二份计划。
+既有 `description admit SPEC` 先解析类型化请求，再组合FactStore/ArtifactStore接纳能力，不构造阶段handler或CAD/发布客户端；初始Freeze接纳仍核当前登记target，MJCF后继的原始来源在共同接纳门完整核验后才能登记。`description stage COMMAND_ID` 及 Airflow 工厂先读取登记目标，只装配所需端口。Generate/Verify/MJCF 无 CAD endpoint/token 可启动；Discover/Capture 仍要求真实原生端口；Publish 才加载发布能力。能力选择只在进程内，不保存第二份计划。
 
 DAG 保持七任务；仅 MJCF 使用 `none_failed`，其他为 `all_success`。MJCF-only 的 Freeze 在共同范围核验后 skip，四个后续上游由调度器 skip，实际执行 MJCF/Publish。误标 skipped 不能绕过共同引擎的真实前驱资格。
 
@@ -121,10 +121,10 @@ UNKNOWN/CONFLICT 必须先按原 effect 对账；取消不能掩盖外部结果�
 | `R5-DELETION-AUDIT.json` | 门户重复范围与Airflow伪成功分支已删除，真实共同调用 |
 | `AUTHORITY-PROPOSAL-CHECK.log` | 权威文档和契约断言的隔离建议副本通过，未修改原文档 |
 
-参考完整模型的19项检查、40个输入SHA不变、惯量/支撑/接触/限位及原生/WASM对照记录继承 `.dev/m1/`、`.dev/m2/` 中未变化且适用的证据。完整回归、最终开发截图和包字节核验以本轮执行方案的最终记录为准，不把继承结果称为最终全套通过。
+原40个参考输入保持原字节，历史惯量/接触/限位及原生/WASM对照仅按未变范围继承。独立审查发现旧完整参考脚本调用无界project，不能证明真实project_isolated支撑配置可运行；本轮必须保留原SUPPORT-CONFIG，在既有2GiB/CPU/时限下实际转换并完成全部19项检查，不能继承旧无界入口通过来关闭该缺陷。证据在 `.dev/closeout-20261101/`，最终CI与差量复核按同一固定集成提交记录。
 
 ## 待集成与正式发布门
 
-[Draft PR #184](https://github.com/mimicverse/description-pipeline/pull/184) 保持Draft。`docs/design.md`、`docs/contracts.md`、`docs/deployment.md` 依项目规则只由总负责人维护；[精确建议补丁](../reviews/mjcf-refactor-20261101/authority-sync.patch) 同时包含三文档及原契约测试的七阶段/范围差量，当前工作文件不代改、不skip其失败门。
+[Draft PR #184](https://github.com/mimicverse/description-pipeline/pull/184) 保持Draft。负责人亲写的权威文档提交d907e149、7a265112已按原字节重放，并集成精确main3da83503。当前三文档分别维护职责、契约和部署验收；旧authority-sync.patch只保全前轮提案历史，包含已纠正的错误，不作为当前同步依据。阶段表断言保持严格检查，没有skip或放宽。
 
 独立固定head审查、负责人文档同步、必需CI、唯一发布者match-head合main、干净main完整发行、双端实际身份、正式CAD GUI七阶段、独立Verify、双格式预览/PR及清场仍须按原权限执行。离线夹具、CLI、开发门户和本地DAG.test不能替代正式调度器服务或CAD E2E。本轮不操作共享检出、CAD、生产、main或正式发行。

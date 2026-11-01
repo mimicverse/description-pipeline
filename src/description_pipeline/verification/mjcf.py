@@ -1785,6 +1785,12 @@ def _geometry_instance(item, model, data, assets, meshes, directory, poses, refe
     index = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, item["name"])
     if index < 0:
         raise CheckError("the geom is missing from the compiled model")
+    expected_body = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, item["link"])
+    actual_body = int(model.geom_bodyid[index])
+    if expected_body < 0 or actual_body != expected_body:
+        raise CheckError(
+            f"the geom belongs to body {model.body(actual_body).name!r} instead of {item['link']!r}"
+        )
     surface = item["surface"]
     origin = np.eye(4)
     origin[:3, :3] = _rpy_matrix(surface["origin"]["rpy"])

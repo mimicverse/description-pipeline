@@ -262,6 +262,14 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0.05)
         self.assertEqual("ready", row["state"], row)
 
+    def assert_stopped(self, sid):
+        row = self.store.get(sid)
+        if row["state"] != "stopped":
+            with (self.service.root / sid / "worker-stderr.log").open("rb") as stream:
+                details = {"session": row, "worker_stderr": stream.read(8192).decode(errors="replace")}
+            self.fail(json.dumps(details, sort_keys=True))
+        return row
+
     async def test_cancelled_materialization_settles_admission_and_cleans_verification(self):
         await self.start_service()
         entered, release = threading.Event(), threading.Event()
@@ -369,7 +377,7 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(current.state["report"]["estop_latched"])
         self.assertIsNotNone(current.state["report"]["head"])
         await self.service.stop(sid)
-        self.assertEqual("stopped", self.store.get(sid)["state"])
+        self.assert_stopped(sid)
         self.assertIsNotNone(self.store.get(sid)["recording_artifact"])
         bound = await self.service.verify_recording(sid, self.members, self.read_member)
         self.assertEqual(self.store.get(sid)["request_digest"], bound["binding"]["request_digest"])
@@ -403,6 +411,7 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
         )
         await self.wait_ready(other["session_id"])
         await self.service.stop(other["session_id"])
+        self.assert_stopped(other["session_id"])
         self.assertEqual(self.store.get(sid)["request_digest"], self.store.get(other["session_id"])["request_digest"])
         original_ref = self.store.get(sid)["recording_artifact"]
         with self.store.transaction() as cursor:
@@ -459,7 +468,7 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
         async with asyncio.timeout(10):
             while sid in self.service.running:
                 await asyncio.sleep(0.05)
-        self.assertEqual("stopped", self.store.get(sid)["state"])
+        self.assert_stopped(sid)
         with self.assertRaisesRegex(SimulationConflict, "admission is closed"):
             await self.service.create(
                 "app:tenant:operator", "closed", self.run_id, self.request, self.members, self.read_member
@@ -642,6 +651,8 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
                     f"/api/simulations/{sid}/commands", headers=headers, json={"type": "stop", "command_id": "stop"}
                 )
                 self.assertEqual(200, response.status_code, response.text)
+                self.assertEqual({"stopped": True, "state": "stopped", "error": None}, response.json())
+                self.assert_stopped(sid)
                 await asyncio.to_thread(
                     verify,
                     self.service.root / sid / "recording",
@@ -658,6 +669,46 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
                 response = await client.get(f"/api/simulations/{sid}/recording")
                 self.assertEqual(200, response.status_code, response.text[:100] if response.status_code != 200 else "")
                 self.assertTrue(response.content.startswith(b"PK"))
+                response = await client.post(
+                    "/api/runs/source/simulations",
+                    headers={**headers, "Idempotency-Key": "http-stop-failure"},
+                    json={key: self.request[key] for key in ("profile", "settings", "record")},
+                )
+                self.assertEqual(202, response.status_code, response.text)
+                failed_sid = response.json()["session_id"]
+                await self.wait_ready(failed_sid)
+                native_send = self.service.send
+
+                async def kill_during_stop(session_id, command):
+                    if session_id == failed_sid and command["type"] == "stop":
+                        process = self.service.running[session_id].process
+                        process.kill()
+                        await process.wait()
+                        self.assertEqual(-9, process.returncode)
+                    else:
+                        await native_send(session_id, command)
+
+                self.service.send = kill_during_stop
+                try:
+                    response = await client.post(
+                        f"/api/simulations/{failed_sid}/commands", headers=headers,
+                        json={"type": "stop", "command_id": "failed-stop"},
+                    )
+                finally:
+                    self.service.send = native_send
+                self.assertEqual(200, response.status_code, response.text)
+                failure = response.json()
+                self.assertFalse(failure["stopped"])
+                self.assertEqual("failed", failure["state"])
+                self.assertTrue(failure["error"])
+                self.assertEqual(self.store.get(failed_sid)["error"], failure["error"])
+                repeated = await client.post(
+                    f"/api/simulations/{failed_sid}/commands", headers=headers,
+                    json={"type": "stop", "command_id": "failed-stop"},
+                )
+                self.assertEqual(failure, repeated.json())
+                outcome = json.loads((self.service.root / failed_sid / "recording/outcome.json").read_bytes())
+                self.assertFalse(outcome["complete"])
         finally:
             server.should_exit = True
             await task

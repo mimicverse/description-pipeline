@@ -1,0 +1,213 @@
+{
+  "schema_version": "description.pico-main-integration-evidence/1",
+  "target_main": "e6e7851af873df7357eae3448312665e700d8d12",
+  "target_main_tree": "dd84d8407560084f564b55801e640221fd37b512",
+  "original_pico_head": "d109cfbc4e5d149135a1640e81f160a9b9fd1066",
+  "merge_strategy": "Merge exact authorized main into own isolated feature branch; preserve original commit identities",
+  "scope": "Development branch only; no protected main, formal deployment, CAD or publisher operations",
+  "source_files": {
+    "deploy/operator/health.sh": "da1a28e05e26c0aa381a445922d293ae30530e8991de5e1a6456f073781ae3c9",
+    "deploy/operator/nginx.conf.template": "0ecd6871628c9e223050b05ec7515f86ed5c12a67ce52cde669efda9adaeb02f",
+    "deploy/operator/platform_config.py": "e147ab859ac21685bdbf077a3af6935f3b1712aad4cba6568429a46efac47e99",
+    "deploy/operator/platform_env.py": "54e45606f9c0ead9bac90530730484078ee8bf66206d46cbb7585ed0fcab2c9e",
+    "deploy/operator/recovery.py": "9b11b0df6004cd3c01a9071ae71af24f40b2f9590995dc486d8210fa3a4a11b8",
+    "deploy/operator/render_operator.py": "104322f5c97e9e75d0d9c81d3b4531534c6b5aacc7ac26a87994967c1a0563af",
+    "deploy/platform/roles.sql": "a4b34195e30e872b89f57cf88c0e6fb2f3e0db951f218227a7b9446eb00b2aca",
+    "deploy/platform/schema.sql": "8dbd826667029c2d7d8ec0ee2d29817987531a2300fa4ce732f22b466c6cd58b",
+    "docs/pico-upper-body.md": "501aa6053b1d1317cb9be58e14c8cccc74e99cadbd669a0bd4ab3bea67465d3b",
+    "pyproject.toml": "34609ec067d41fd97b72435e21bfa8919912a6ae3e6ef734272107575bd46b1f",
+    "requirements/linux-py312.lock": "071c3e703789a41d4e8d4af6aa2822a4d0e8cd51d26bbb8759bbfa8a9b201f8a",
+    "requirements/pico-link-py312.lock": "21919f264b16c07820618577ab8a900ecc3ede0bfb2dfd33aea6527e0134cd3e",
+    "requirements/teleop-worker-py312.lock": "f6c2d987df75d1b1c99e271b7bd31e9bbb0c09aaeb8317f636fb6ba6d1dd908e",
+    "reviews/pico-optimization-20261101/M1-RECORDING-EVIDENCE.json": "473b1672bf4d8a2278db42a4a70727918ae3612876bf7f5eff4096125e74ff8d",
+    "reviews/pico-optimization-20261101/M2-REAL-MODEL-EVIDENCE.json": "2775abb69e5343f47e4987cf8959cad8bbf823b55f0016a7b95ae5bee34781ba",
+    "reviews/pico-optimization-20261101/M4-PROFILE-EVIDENCE.json": "5faeadb4b0973729766d33c525fadcb810d3f0fa6d9b974ef58a05ca13e52646",
+    "reviews/pico-upper-body-20261101/DEVELOPMENT-EVIDENCE.json": "b5c403e6955bfa3568d3ba58d75f8010f7ab611a010b389317c2f535ad728643",
+    "scripts/install_teleop_worker.py": "8c8bbfb14f2099b4db7524a155e5af2bd358f277551cf8ae8ab27bc13fd3a372",
+    "scripts/pico_pipeline_link.py": "9acc4db8fd5bc841312a3597b1e2b3944a95f7f1e0df53fc5be0f97e8992c6d4",
+    "src/description_pipeline/interface_records.py": "0b1daf76bd69172237a81bab1cf2b5d27b81bb354f2c7604baa55c3e4fd31f2a",
+    "src/description_pipeline/orchestration/lifecycle_state.py": "7c88d826e63eece4a7b1cdc6ab98d6edf76428a74ecaaab2fefc2718ccabe176",
+    "src/description_pipeline/orchestration/pico_portal.py": "b280ae241bd98e79d10a5af0efcd792eae25a5bb6c9b43e78b553a080d1a7f1a",
+    "src/description_pipeline/orchestration/portal.py": "98b404c1bcaab234403d0e4b97a92c8b4b470f3bedc741c034131da7bafc4652",
+    "src/description_pipeline/orchestration/static/app.js": "de878e01b3d7ac9bdffef999dbaa9b3e44c5320ce390c1592ef2261f425077be",
+    "src/description_pipeline/orchestration/static/mjcf_viewer.js": "edd3c35ed58bbeda34862eaa06df83bb82b231b6a230ffa2b47d62ce85628ba2",
+    "src/description_pipeline/orchestration/static/pico.css": "289e4fc8b0a611bde56e2452e179ff88bcad97d1a2ba3ed3fca48001312f074c",
+    "src/description_pipeline/orchestration/static/pico.html": "417296506a3578e26a44c6e5517535f2d67391de5dd080ab58df2501f131e69e",
+    "src/description_pipeline/orchestration/static/pico.js": "f883d2fd870ce401426f08d717cc07ca15d02ba642dfe7fea400c2ce8dd1b43b",
+    "src/description_pipeline/orchestration/static/pico_profile.js": "b33c5ada9cf273c4b83a719c73c8c73b8c54299f2275cffb9d022f6d5b5144eb",
+    "src/description_pipeline/runtime.py": "7b573e39f65ab2f2e88445e8fa857794bcd744d96ae3216976c37fa71b398537",
+    "src/description_pipeline/simulation/__init__.py": "743ce12c616924eca5a410d3ec0039bd7bbe7583a606c358c26ae7e8c573ea03",
+    "src/description_pipeline/simulation/recording.py": "616d103e2be3528a5f57a54f3d7cbeeedaa3c3cabd7b7acc7d7492940822c3df",
+    "src/description_pipeline/simulation/service.py": "5ad37d74ea93daeb2c243fb8fd7c1263c02b92d13da25f5191845848c8083d59",
+    "src/description_pipeline/simulation/store.py": "4104f76754573ff91fa5b994996ead7157d2f46c61590c5dba69ef8c5459788f",
+    "src/description_pipeline/simulation/teleop-runtime.json": "713547476f6cee014e65904b987ca571aef283f980ccec478224af32cbda95fc",
+    "src/description_pipeline/simulation/verify_recording.py": "fdf8ad9fec0f43598a0c8f2e17aeb5dadce71a4e6e5f4f0c407e838c1de1485d",
+    "tests/js/mjcf_preview_test.mjs": "65082f355edc420a588d02886d359f704c2edd7cd381f1c45922d246e55eafa9",
+    "tests/v1/pico_link_probe.py": "1fd3d76b59342e4fa0b67e0e2559a6c70ad665a5a4b20f9a68f7d022c1049070",
+    "tests/v1/test_operator_assets.py": "6c66a0704b2170d9a00d90ab2e3a35f22710bc6fe56aacc52e46fe7ce317e485",
+    "tests/v1/test_pico_sessions.py": "58760d3fff76c9044ab03f737c0980d86e59a545c8cace92058451a0fc5aae01",
+    "tests/v1/test_platform_config.py": "a7049681452b0429f91317e0344e6b0ebd195334ee3c3aefd77257eac94e2a0b",
+    "tests/v1/test_platform_env.py": "2993a030f3550ef444f9bf9db701120f331cc1fb1a637695b04a9205061abda1"
+  },
+  "inherited_main_ci": {
+    "run_id": 41277190634,
+    "head": "e6e7851af873df7357eae3448312665e700d8d12",
+    "conclusion": "success",
+    "jobs": [
+      "distribution",
+      "verify",
+      "real-chain",
+      "windows-ps51"
+    ],
+    "verified_with": "gh run view; applies only to unchanged main, not to the new feature merge"
+  },
+  "conflict_resolution": {
+    "app.js": "Keep main subject/status text and the PICO launch link",
+    "mjcf_viewer.js": "Retain ordered native worker request/ack/reset behavior; export JSON-compatible geometry and delegate both native-view framing paths to the same frameBounds"
+  },
+  "validation": {
+    "javascript_entrypoints": 9,
+    "node": "26.8.1",
+    "initial_targeted": {
+      "run": 65,
+      "passed": 63,
+      "failures": 1,
+      "errors": 1,
+      "error_cause": "The private minimal environment lacks Airflow; the real registered MJCF portal case passed in the existing full environment."
+    },
+    "final_targeted": {
+      "run": 64,
+      "passed": 64,
+      "seconds": 43.051
+    },
+    "full_airflow_mjcf_portal": {
+      "run": 1,
+      "passed": 1,
+      "seconds": 19.075
+    },
+    "native_diagnostic_rerun": {
+      "run": 6,
+      "passed": 6,
+      "seconds": 27.086
+    },
+    "stop_failure_http": {
+      "run": 1,
+      "passed": 1,
+      "seconds": 9.384,
+      "fault": "Actual owned native worker killed at stop transport boundary; repeated command returns the same registered failure"
+    },
+    "static_checks": [
+      "Ruff src/tests/tools/deploy passed",
+      "JS syntax passed",
+      "git diff --check passed"
+    ],
+    "browser": "Actual native model displayed with main framing; injected stop failure showed Session failed and Worker exited -9; partial recording preserved."
+  },
+  "stop_result_defect": {
+    "original_observation": {
+      "response": {
+        "stopped": true
+      },
+      "registered_state": "failed",
+      "error": "Worker exited: -9"
+    },
+    "cause": "The HTTP handler returned an unconditional stopped boolean and the page used an unconditional normal-stop label.",
+    "coverage_gap": "Prior stop tests validated normal exit and did not inject process failure inside the stop command.",
+    "fix": "Return/display the same registered terminal state and error; preserve partial recording and idempotent failure result.",
+    "scope": "Stop HTTP result, duplicate command result, viewer close, recording completion and UI terminal status."
+  },
+  "unresolved_maintenance_failure": {
+    "status": "open",
+    "original_details_available": false,
+    "reason": "Original assertion only printed stopped versus failed; fixture cleanup removed the worker files before diagnosis.",
+    "reproductions": 20,
+    "reproduction_failures": 0,
+    "enhancement": "Failed stop assertions now include registered request/runtime/process identity and bounded native stderr.",
+    "closure": "Green reruns do not establish the cause or close the first failure; new fixed worker must still qualify stop/EOF/heartbeat/backpressure/event replay."
+  },
+  "test_adapter_failure": {
+    "scope": "External browser fault adapter only",
+    "cause": "It indexed command.type on the untyped first initialization payload.",
+    "fix": "Forward initialization unchanged and match only stop commands.",
+    "actual_validation": "After the adapter correction, the browser started the native session and reported the injected native failure accurately."
+  },
+  "artifacts": {
+    "BEFORE-INTEGRATION.json": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/main-e6e-integration/BEFORE-INTEGRATION.json",
+      "sha256": "baebc67b6d178ecf2f2a23bf03d4948029a4cf6e2e4697d8a03b24effcde00e6"
+    },
+    "pico-before-main.patch": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/main-e6e-integration/pico-before-main.patch",
+      "sha256": "89d9fbc87091f536ea0117550f50f95a9ffc65e9b1a1cc17eadd7bb70f1aff9c"
+    },
+    "javascript-tests.log": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/main-e6e-integration/javascript-tests.log",
+      "sha256": "c110f019cdf54fdf993238a9919f731445d247fa744d6195a7fe432cd6c69862"
+    },
+    "targeted-tests.log": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/main-e6e-integration/targeted-tests.log",
+      "sha256": "6792d8ade20f2f384f58d684f32b25ef2b3910a027b4f8bbff5dcdd949a4af4e"
+    },
+    "native-tests-with-diagnostics.log": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/main-e6e-integration/native-tests-with-diagnostics.log",
+      "sha256": "9a960d85b6f5517de508a2f73a9dce04d56db5b981d47a5aee304b296f5a9f86"
+    },
+    "final-targeted-tests.log": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/main-e6e-integration/final-targeted-tests.log",
+      "sha256": "b4bab8ea28bb34d32caaa5731cd1e169b15a93adeeb5511f507881602ae67d8f"
+    },
+    "mjcf-portal-full-env-tests.log": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/main-e6e-integration/mjcf-portal-full-env-tests.log",
+      "sha256": "b08ea07f336146338f2545a15928c5e31c57634e0fd33b6cb6343e879f3f551f"
+    },
+    "stop-outcome-tests.log": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/main-e6e-integration/stop-outcome-tests.log",
+      "sha256": "fdcb6187150bbd4cfe6ef239916afb7ee495b3b6cf334501c81b43a6a99e43fb"
+    },
+    "maintenance-reproduction.log": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/main-e6e-integration/maintenance-reproduction.log",
+      "sha256": "d6b396523f66806830df5500bf9d3e502ad3ca09fd35a4d1076b10eeac20a0e2"
+    },
+    "stop-outcome-reproduction.log": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/main-e6e-integration/stop-outcome-reproduction.log",
+      "sha256": "4c25dbd9ef2b23e6d947163a37fa18019addb0a5f2b542b6b6ea842f3b3e1d49"
+    },
+    "stop-outcome-reproduction/original.json": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/main-e6e-integration/stop-outcome-reproduction/original.json",
+      "sha256": "c34d5bd01a143d1850f149a8673e41878df1c178f3f1a443af29973da5b9a2b2"
+    },
+    "stop-outcome-reproduction/fixed.json": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/main-e6e-integration/stop-outcome-reproduction/fixed.json",
+      "sha256": "a041d7d50933036eede98e3b684086fffe356d1d6fbb6b24093ab40a12f81b30"
+    },
+    "browser-session-outcomes.json": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/main-e6e-integration/browser-session-outcomes.json",
+      "sha256": "b9f3e742d09f768a6d8a89d108e2d3519db985ae298155e3c7f64ab9d05c20fc"
+    },
+    "browser-native-fit-fixed.png": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/main-e6e-integration/browser-native-fit-fixed.png",
+      "sha256": "d0fbceda35c92764df25a6d6be2942f2e178f0af09ae4e3e5fad2ac0617c9550"
+    },
+    "browser-stop-failed.png": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/main-e6e-integration/browser-stop-failed.png",
+      "sha256": "09592cdbe54f300b86084708eb6a21b89eda85af378705b51b12115d4b30e717"
+    },
+    "browser-fixture-error.json": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/main-e6e-integration/browser-fixture-error.json",
+      "sha256": "567bc6f2f0a0e7dd4b9a3728a7d5e4ecf534f0538d44fd6e6218684320282cf0"
+    },
+    "browser-stop-failure-fixture.py": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/main-e6e-integration/browser-stop-failure-fixture.py",
+      "sha256": "1163ed5ad79fb38265064093dc9178e00d68cebe554f889838aea90e66c25805"
+    }
+  },
+  "unchanged_historical_evidence": true,
+  "not_verified": [
+    "New fixed worker protocol/effective tick/event replay",
+    "Formal two-revision source closure and full head following",
+    "Long-run performance",
+    "Daily lightweight link launch packaging",
+    "Human PICO and same-release offline/formal pipeline E2E",
+    "Independent review and applicable CI of the new merge head"
+  ]
+}

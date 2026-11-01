@@ -10,6 +10,22 @@ import {
   resolveUrdfMesh,
 } from "/static/preview_logic.js";
 
+export function frameBounds(viewer, bounds) {
+  if (bounds.isEmpty()) return;
+  const sphere = bounds.getBoundingSphere(new THREE.Sphere());
+  const radius = Math.max(sphere.radius, 1e-6);
+  const vertical = THREE.MathUtils.degToRad(viewer.camera.fov);
+  const horizontal = 2 * Math.atan(Math.tan(vertical / 2) * viewer.camera.aspect);
+  viewer.orbit.target.copy(sphere.center);
+  viewer.orbit.radius = 1.15 * radius / Math.sin(Math.min(vertical, horizontal) / 2);
+  viewer.orbit.minRadius = radius * 0.02;
+  viewer.orbit.maxRadius = viewer.orbit.radius * 20;
+  viewer.camera.near = radius / 1000;
+  viewer.camera.far = viewer.orbit.maxRadius + 2 * radius;
+  viewer.camera.updateProjectionMatrix();
+  viewer.updateCamera();
+}
+
 export function createViewer(container) {
   let viewer = null;
   const scene = new THREE.Scene();
@@ -19,6 +35,8 @@ export function createViewer(container) {
   camera.up.set(0, 0, 1);
 
   const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1;
   renderer.setPixelRatio(window.devicePixelRatio || 1);
   container.appendChild(renderer.domElement);
 
@@ -315,7 +333,7 @@ async function loadMesh(url, cache, signal) {
   return pending;
 }
 
-export async function loadRobot(viewer, { urdfUrl, urdfPath, files, artifactUrl, onWarning, signal }) {
+export async function loadRobot(viewer, { urdfUrl, urdfPath, files, artifactUrl, signal }) {
   const response = await fetch(urdfUrl, { credentials: "same-origin", signal });
   if (!response.ok) throw new Error(`URDF load failed (HTTP ${response.status})`);
   const xml = await response.text();
@@ -480,19 +498,11 @@ export async function loadRobot(viewer, { urdfUrl, urdfPath, files, artifactUrl,
     const box = new THREE.Box3().setFromObject(viewer.robotRoot);
     if (box.isEmpty()) warnings.push("URDF contains no displayable geometry");
     else {
-      const center = box.getCenter(new THREE.Vector3());
-      const size = box.getSize(new THREE.Vector3());
-      const span = Math.max(size.x, size.y, size.z, 0.05);
-      viewer.orbit.target.copy(center);
-      viewer.orbit.radius = span * 2.4;
+      viewer.orbit.theta = Math.PI * 0.75;
       viewer.orbit.phi = Math.PI * 0.38;
-      viewer.updateCamera();
-      viewer.camera.near = Math.max(span / 500, 0.001);
-      viewer.camera.far = span * 200;
-      viewer.camera.updateProjectionMatrix();
+      frameBounds(viewer, box);
     }
     viewer.frame();
-    if (onWarning) onWarning(warnings);
     const jointRecords = joints.map((joint) => ({
       name: joint.name, type: joint.type, lower: joint.lower, upper: joint.upper,
       effort: joint.effort, velocity: joint.velocity, axis: joint.sourceAxis,
@@ -517,6 +527,7 @@ export function buildJointControls(container, joints, { onInput } = {}) {
     row.className = "joint-row";
     const label = document.createElement("label");
     label.textContent = joint.name;
+    label.title = joint.name;
     const readout = document.createElement("output");
     const range = document.createElement("input");
     range.type = "range";
@@ -535,11 +546,12 @@ export function buildJointControls(container, joints, { onInput } = {}) {
     const factor = () => angular && unit.value === "deg" ? 180 / Math.PI : 1;
     const display = (syncInput = true) => {
       const value = joint.value * factor();
+      const inputValue = (joint.requestedValue ?? joint.value) * factor();
       range.min = String((joint.type === "continuous" ? -Math.PI : joint.lower) * factor());
       range.max = String((joint.type === "continuous" ? Math.PI : joint.upper) * factor());
-      range.value = String(value);
-      if (syncInput) numeric.value = String(value);
-      readout.textContent = `${value.toFixed(4)} ${unit.value}`;
+      if (syncInput || document.activeElement !== range) range.value = String(inputValue);
+      if (syncInput) numeric.value = String(inputValue);
+      readout.textContent = `${value.toFixed(4)} ${unit.value}${joint.requestedValue === undefined ? "" : " (updating)"}`;
       if (value < Number(range.min) || value > Number(range.max)) {
         readout.textContent += joint.type === "continuous"
           ? " (outside slider window; joint is continuous)"
@@ -550,7 +562,8 @@ export function buildJointControls(container, joints, { onInput } = {}) {
       const raw = Number(range.value);
       const value = raw / factor();
       joint.set(value);
-      display();
+      display(false);
+      numeric.value = String(raw);
       if (onInput) onInput(joint);
     };
     range.addEventListener("input", update);
@@ -558,8 +571,10 @@ export function buildJointControls(container, joints, { onInput } = {}) {
       const raw = numeric.value.trim() === "" ? NaN : Number(numeric.value);
       if (!Number.isFinite(raw)) { if (commit) display(); return; }
       const value = raw / factor();
-      joint.set(joint.type === "continuous" ? value : Math.max(joint.lower, Math.min(joint.upper, value)));
-      display(commit);
+      const requested = joint.type === "continuous" ? value : Math.max(joint.lower, Math.min(joint.upper, value));
+      joint.set(requested);
+      display(false);
+      if (commit) numeric.value = String(requested * factor());
       if (onInput) onInput(joint);
     };
     numeric.addEventListener("input", () => updateNumeric(false));
@@ -568,10 +583,23 @@ export function buildJointControls(container, joints, { onInput } = {}) {
     display();
     row.append(label, readout, range, numeric, unit);
     container.append(row);
-    rows.push({ joint, display });
+    rows.push({ joint, display, row, numeric, range });
   }
   return {
-    refresh() { for (const row of rows) row.display(); },
+    refresh() {
+      for (const row of rows) {
+        const editing = document.activeElement === row.numeric || document.activeElement === row.range;
+        row.display(!editing);
+      }
+    },
+    reveal(name, { focus = false } = {}) {
+      const selected = rows.find((entry) => entry.joint.name === name) || (focus ? rows[0] : null);
+      for (const entry of rows) entry.row.classList.toggle("selected", entry === selected);
+      if (focus && selected) {
+        selected.numeric.focus();
+        selected.numeric.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      }
+    },
     reset() {
       for (const row of rows) {
         row.joint.reset();

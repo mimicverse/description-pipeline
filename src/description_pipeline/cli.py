@@ -54,13 +54,16 @@ def _record(value) -> dict:
     raise PipelineError(f"Unsupported CLI result type: {type(value).__name__}")
 
 
-def _default_application(arguments: argparse.Namespace) -> StageApplication:
+def _default_application(
+    arguments: argparse.Namespace, *, admission_spec: AdmissionSpec | None = None,
+) -> StageApplication:
     from .pipeline.application import application_from_environment
 
     return application_from_environment(
         command_id=arguments.command_id if arguments.operation == "stage" else None,
         run_id=arguments.run_id if arguments.operation == "run" else None,
         through=getattr(arguments, "through", "publish"),
+        admission_spec=admission_spec,
     )
 
 
@@ -75,9 +78,10 @@ def main(
         if arguments.operation == "doctor":
             result = {"passed": True, "role": "portable", "identity": tool_record(role="portable")}
         else:
-            application = application_factory() if application_factory is not None else _default_application(arguments)
+            spec = AdmissionSpec.from_record(read_data(arguments.spec)) if arguments.operation == "admit" else None
+            application = (application_factory() if application_factory is not None
+                           else _default_application(arguments, admission_spec=spec))
             if arguments.operation == "admit":
-                spec = AdmissionSpec.from_record(read_data(arguments.spec))
                 admitted = application.admit(spec)
                 result = {
                     "passed": True,

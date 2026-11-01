@@ -1,5 +1,6 @@
 // Read-only inspection of the loaded URDF scene. Display edits never change delivery bytes.
 import * as THREE from "/static/vendor/three.module.min.js";
+import { frameBounds } from "/static/viewer.js";
 
 export function inertiaEllipsoid(mass, tensor) {
   if (!(mass > 0) || !tensor) throw new Error("positive mass and an inertia tensor are required");
@@ -43,7 +44,7 @@ export function visualBounds(loaded) {
   return bounds;
 }
 
-export function createInspection(viewer, loaded, container, { onPoseChange } = {}) {
+export function createInspection(viewer, loaded, container, { onPoseChange, onJointSelect } = {}) {
   container.textContent = "";
   const { links, allJoints, records } = loaded;
   const controls = new AbortController();
@@ -89,16 +90,12 @@ export function createInspection(viewer, loaded, container, { onPoseChange } = {
     const node = element("details"); node.className = "preview-panel";
     element("summary", title, node); return element("div", null, node);
   };
-  const toolbar = element("div"); toolbar.className = "inspection-toolbar";
+  const primary = element("div"); primary.className = "inspection-primary";
+  const toolbar = element("div", null, primary); toolbar.className = "inspection-toolbar";
   function fit() {
     const box = visualBounds(loaded);
-    if (!box.isEmpty()) {
-      viewer.orbit.target.copy(box.getCenter(new THREE.Vector3()));
-      viewer.orbit.radius = Math.max(...box.getSize(new THREE.Vector3()).toArray(), 0.001) * 2.4;
-    }
-    viewer.updateCamera();
+    frameBounds(viewer, box);
   }
-  button("Fit", fit, toolbar);
   const view = select("View ", [["iso", "Isometric"], ["front", "Front (−Y)"], ["back", "Back (+Y)"], ["left", "Left (−X)"], ["right", "Right (+X)"], ["top", "Top (+Z)"], ["bottom", "Bottom (−Z)"]], toolbar);
   listen(view, "change", () => {
     const angles = { iso: [Math.PI * 0.75, Math.PI * 0.38], front: [-Math.PI / 2, Math.PI / 2], back: [Math.PI / 2, Math.PI / 2], left: [Math.PI, Math.PI / 2], right: [0, Math.PI / 2], top: [0, 1e-6], bottom: [0, Math.PI - 1e-6] };
@@ -108,20 +105,24 @@ export function createInspection(viewer, loaded, container, { onPoseChange } = {
   const dragMode = toggle("Drag joint in view", false, () => { pointMode.checked = false; dragState = null; }, toolbar);
   const help = element("p", "Drag to orbit; Shift/right drag to pan; scroll to zoom. To move a joint, select it and enable Drag joint in view. Rotations follow the joint-axis plane; translations follow the projected axis. Use numeric controls when the axis is edge-on.");
   help.className = "muted small";
+  const navigation = details("Navigation help"); navigation.append(help);
   const jointBadge = element("div", null, viewer.renderer.domElement.parentElement);
   jointBadge.className = "joint-badge"; jointBadge.hidden = true;
   const arc = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0xf4b400, depthTest: false }));
   viewer.scene.add(arc); overlays.push(arc); arc.visible = false;
-  listen(jointSelect, "change", update);
+  listen(jointSelect, "change", () => {
+    const joint = loaded.joints.find((entry) => entry.name === jointSelect.value);
+    choose(joint?.child || "");
+  });
   const display = details("Display and engineering overlays"); display.className = "inspection-toolbar";
-  toggle("Grid", true, (value) => { viewer.grid.visible = value; }, display);
+  toggle("Grid", viewer.grid.visible, (value) => { viewer.grid.visible = value; }, display);
   const worldAxes = new THREE.AxesHelper(size * 2); viewer.scene.add(worldAxes); overlays.push(worldAxes);
   toggle("World axes", true, (value) => { worldAxes.visible = value; }, display);
   toggle("Wireframe", false, (value) => {
     wireframe = value;
     for (const { visuals } of links.values()) for (const mesh of visuals.children) mesh.material.wireframe = value;
   }, display);
-  toggle("Dark background", false, (value) => { viewer.scene.background.set(value ? 0x18202b : 0xeef2f7); }, display);
+  toggle("Dark background", viewer.scene.background.getHex() === 0x18202b, (value) => { viewer.scene.background.set(value ? 0x18202b : 0xeef2f7); }, display);
   toggle("Ground grid", true, (value) => { ground = value; update(); }, display);
   const axisSize = field("Axis size (m)", "number", display);
   axisSize.min = "0.000001"; axisSize.step = "any"; axisSize.value = String(size);
@@ -180,13 +181,20 @@ export function createInspection(viewer, loaded, container, { onPoseChange } = {
   const visible = toggle("Visible", true, (value) => { if (selected) links.get(selected).visuals.visible = value; }, partControls);
   const opacity = field("Opacity multiplier", "range", partControls); opacity.min = "0"; opacity.max = "1"; opacity.step = "0.01"; opacity.value = "1";
   const color = field("Preview color", "color", partControls);
-  const selectionInfo = element("p", "Click a visible mesh or select a link.", parts); selectionInfo.className = "muted small";
+  const selectionInfo = element("p", "Click a link in the model or choose a joint above.", primary);
+  selectionInfo.className = "inspection-selection muted small";
+  selectionInfo.setAttribute("role", "status");
+  const selectionDetails = element("p", null, parts); selectionDetails.className = "muted small";
   const highlight = new THREE.Box3Helper(new THREE.Box3(), 0xf4b400); viewer.scene.add(highlight); overlays.push(highlight); highlight.visible = false;
   function choose(name) {
     selected = name || null; linkSelect.value = name;
     const entry = links.get(name);
     for (const input of [visible, opacity, color]) input.disabled = !entry;
-    if (!entry) { highlight.visible = false; return; }
+    if (!entry) {
+      highlight.visible = false; jointSelect.value = "";
+      selectionInfo.textContent = "Click a link in the model or choose a joint above.";
+      selectionDetails.textContent = ""; return;
+    }
     visible.checked = entry.visuals.visible;
     opacity.value = String(entry.visuals.userData.opacity ?? 1);
     color.value = `#${(entry.visuals.children[0]?.material.color.getHex() ?? 0x8fa8bf).toString(16).padStart(6, "0")}`;
@@ -195,9 +203,10 @@ export function createInspection(viewer, loaded, container, { onPoseChange } = {
     selectionInfo.textContent = `${name} · parent: ${parentByChild.get(name) || "root"}${incoming ? ` · joint: ${incoming.name} (${incoming.type})` : ""}`;
     const record = records.links.find((item) => item.name === name);
     const children = allJoints.filter((joint) => joint.parent === name).map((joint) => joint.name);
-    selectionInfo.textContent += ` · child joints: ${children.join(", ") || "none"} · visuals: ${entry.visuals.children.length} · mass: ${record.mass_kg ?? "not provided"} kg`;
-    if (record.inertia_kg_m2) selectionInfo.textContent += ` · inertia (kg*m²): ${Object.entries(record.inertia_kg_m2).map(([key, value]) => `${key}=${value}`).join(", ")}`;
+    selectionDetails.textContent = `Child joints: ${children.join(", ") || "none"} · visuals: ${entry.visuals.children.length} · mass: ${record.mass_kg ?? "not provided"} kg`;
+    if (record.inertia_kg_m2) selectionDetails.textContent += ` · inertia (kg*m²): ${Object.entries(record.inertia_kg_m2).map(([key, value]) => `${key}=${value}`).join(", ")}`;
     update();
+    if (jointSelect.value) onJointSelect?.(jointSelect.value);
   }
   listen(linkSelect, "change", () => choose(linkSelect.value));
   function applyOpacity(entry, value) {
@@ -292,7 +301,7 @@ export function createInspection(viewer, loaded, container, { onPoseChange } = {
     if (!hit) return;
     const name = hit.object.userData.linkName; choose(name);
     const entry = links.get(name), local = entry.group.worldToLocal(hit.point.clone());
-    selectionInfo.textContent += ` · picked link xyz (m): ${local.toArray().map((value) => value.toFixed(6)).join(", ")}`;
+    selectionDetails.textContent += ` · picked link xyz (m): ${local.toArray().map((value) => value.toFixed(6)).join(", ")}`;
     if (pointMode.checked) {
       if (endpoints.length === 2) endpoints = [];
       endpoints.push({ object: entry.group, local, label: name }); update();
@@ -344,9 +353,10 @@ export function createInspection(viewer, loaded, container, { onPoseChange } = {
   }
   // One callback for pose-dependent overlays; no second animation loop or kinematic model.
   const inspection = {
+    primary, get selectedJointName() { return jointSelect.value; },
     pick, update, updateScreen, fit, beginDrag, drag, endDrag() { dragState = null; },
     dispose() {
-      controls.abort(); container.textContent = "";
+      controls.abort(); primary.remove(); container.textContent = "";
       jointBadge.remove();
       for (const object of [...overlays, measurements]) {
         object.removeFromParent();

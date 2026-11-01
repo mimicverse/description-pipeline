@@ -8,9 +8,10 @@ const logic = await import(new URL("preview_logic.js", staticDir));
 const source = readFileSync(new URL("viewer.js", staticDir), "utf8")
   .replace('"/static/vendor/three.module.min.js"', JSON.stringify(new URL("vendor/three.module.min.js", staticDir).href))
   .replace('"/static/preview_logic.js"', JSON.stringify(new URL("preview_logic.js", staticDir).href));
-const { loadRobot, buildJointControls, parseStl } = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
+const { loadRobot, buildJointControls, parseStl, frameBounds } = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
 const inspectionSource = readFileSync(new URL("inspection.js", staticDir), "utf8")
-  .replace('"/static/vendor/three.module.min.js"', JSON.stringify(new URL("vendor/three.module.min.js", staticDir).href));
+  .replace('"/static/vendor/three.module.min.js"', JSON.stringify(new URL("vendor/three.module.min.js", staticDir).href))
+  .replace('"/static/viewer.js"', JSON.stringify(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`));
 const { inertiaEllipsoid, createInspection } = await import(`data:text/javascript;base64,${Buffer.from(inspectionSource).toString("base64")}`);
 class Element {
   constructor(tagName, attributes = {}, children = []) { Object.assign(this, { tagName, attributes, children, textContent: "", listeners: {}, style: {} }); }
@@ -39,6 +40,25 @@ function model() {
     e("joint", { name: "axis_joint", type: "revolute" }, e("parent", { link: "base" }), e("child", { link: "moving" }),
       e("limit", { effort: "0", velocity: "0" })),
   );
+}
+// Real camera projection covers aspect, model scale and wheel transitions after fitting.
+for (const aspect of [0.3, 1, 3]) for (const scale of [1e-6, 1]) {
+  const camera = new THREE.PerspectiveCamera(45, aspect, 0.01, 100);
+  const orbit = {target: new THREE.Vector3(), radius: 1};
+  const view = {camera, orbit, updateCamera() {
+    camera.position.copy(orbit.target).addScaledVector(new THREE.Vector3(1, -2, 1).normalize(), orbit.radius);
+    camera.up.set(0, 0, 1); camera.lookAt(orbit.target); camera.updateMatrixWorld();
+  }};
+  const bounds = new THREE.Box3(new THREE.Vector3(-4, -1, -0.5).multiplyScalar(scale), new THREE.Vector3(3, 2, 5).multiplyScalar(scale));
+  frameBounds(view, bounds);
+  for (const delta of [0, -1, 12000]) {
+    orbit.radius = logic.applyInteraction(orbit, "zoom", delta).radius; view.updateCamera();
+    for (const x of [-4, 3]) for (const y of [-1, 2]) for (const z of [-0.5, 5]) {
+      const point = new THREE.Vector3(x * scale, y * scale, z * scale).project(camera);
+      assert.ok(Math.abs(point.x) <= 1 && Math.abs(point.y) <= 1 && Math.abs(point.z) <= 1,
+        `Camera clipped a model corner at aspect ${aspect}, scale ${scale}, wheel ${delta}`);
+    }
+  }
 }
 let current;
 const saved = { DOMParser: globalThis.DOMParser, fetch: globalThis.fetch, document: globalThis.document };
@@ -73,6 +93,34 @@ async function rejected(change, pattern) {
   cases += 1;
 }
 try {
+  // Worker-backed joints acknowledge asynchronously; refreshing must preserve active edits.
+  {
+    let actual = 0.5, requested;
+    const joint = {name: "deferred_joint", type: "revolute", lower: -1, upper: 1,
+      get value() { return actual; }, get requestedValue() { return requested; },
+      set(value) { requested = value; }, reset() { requested = 0.125; }};
+    const container = e("container"), controls = buildJointControls(container, [joint]);
+    const [, readout, range, numeric, unit] = container.children[0].children;
+    unit.value = "rad"; unit.listeners.change();
+    document.activeElement = numeric; numeric.value = ""; controls.refresh();
+    assert.equal(numeric.value, "", "A worker update must not erase an in-progress numeric prefix");
+    numeric.value = "0.25"; numeric.listeners.change();
+    assert.equal(requested, 0.25); assert.equal(Number(numeric.value), 0.25,
+      "Committing a request must not substitute the previous worker state");
+    document.activeElement = null; controls.refresh(); assert.equal(Number(numeric.value), 0.25);
+    assert.match(readout.textContent, /0.5000 rad \(updating\)/);
+    unit.value = "deg"; unit.listeners.change(); assert.equal(Number(numeric.value), 0.25 * 180 / Math.PI);
+    unit.value = "rad"; unit.listeners.change();
+    actual = requested; requested = undefined; controls.refresh(); assert.match(readout.textContent, /0.2500 rad$/);
+    document.activeElement = range; range.value = "0.75"; range.listeners.input();
+    assert.equal(Number(range.value), 0.75, "An active slider must retain the requested position before acknowledgement");
+    controls.refresh(); assert.equal(Number(range.value), 0.75);
+    document.activeElement = null; controls.refresh(); assert.equal(Number(numeric.value), 0.75);
+    actual = requested; requested = undefined; controls.refresh();
+    assert.equal(Number(numeric.value), 0.75);
+    controls.reset(); controls.refresh(); assert.equal(Number(numeric.value), 0.125);
+    actual = requested; requested = undefined; controls.refresh(); assert.equal(Number(range.value), 0.125);
+  }
   const { result } = await load();
   assert.deepEqual(result.records.joints[0], { name: "axis_joint", type: "revolute", lower: 0, upper: 0, effort: 0, velocity: 0, axis: [1, 0, 0] });
   assert.equal(result.records.links[0].mass_kg, null);
@@ -255,3 +303,4 @@ try {
   assert.ok(parseStl(mesh).getAttribute("position"));
   console.log(`viewer parser: production load/geometry/records/controls passed; ${cases} invalid declarations rejected`);
 } finally { Object.assign(globalThis, saved); }
+await import("./mjcf_preview_test.mjs");

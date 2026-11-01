@@ -1,6 +1,6 @@
 // Draw engine-produced geometry and poses. Physics stays in the dedicated MuJoCo worker.
 import * as THREE from "/static/vendor/three.module.min.js";
-import { disposeRobot } from "/static/viewer.js";
+import { disposeRobot, frameBounds } from "/static/viewer.js";
 const hex = (buffer) => [...new Uint8Array(buffer)].map((n) => n.toString(16).padStart(2, "0")).join("");
 export function compiledGeometry(record) {
   const s = record.size;
@@ -20,12 +20,7 @@ export function frameCompiledGeometry(viewer, objects) {
   viewer.robotRoot.updateMatrixWorld(true); viewer.resize();
   const bounds = new THREE.Box3();
   for (const { object, record } of objects) if (record.type !== "mjGEOM_PLANE") bounds.union(new THREE.Box3().setFromObject(object));
-  if (!bounds.isEmpty()) {
-    viewer.orbit.target.copy(bounds.getCenter(new THREE.Vector3()));
-    const radius = bounds.getSize(new THREE.Vector3()).length() / 2;
-    viewer.orbit.radius = Math.max(0.1, 1.1 * radius / Math.sin(THREE.MathUtils.degToRad(viewer.camera.fov / 2)) * Math.max(1, 1 / viewer.camera.aspect));
-    viewer.frame();
-  }
+  frameBounds(viewer, bounds);
 }
 export async function loadMJCF(viewer, { descriptor, artifactUrl, signal, onStatus }) {
   if (!descriptor.files[descriptor.entry]) throw new Error("MJCF entry is absent from the verified inventory");
@@ -52,10 +47,17 @@ export async function loadMJCF(viewer, { descriptor, artifactUrl, signal, onStat
   }
   const worker = new Worker("/static/mjcf_worker.js", { type: "module" });
   let disposed = false, mode = "visual", markers = false, selectedLink = "", snapshot, definition;
+  let requestId = 0;
+  const pendingJoints = new Map();
   const objects = [], helpers = [];
   const matrix = new THREE.Matrix4();
-  const cleanup = () => { if (!disposed) { disposed = true; worker.terminate(); } };
-  const send = (message) => { if (!disposed) worker.postMessage(message); };
+  const cleanup = () => { if (!disposed) { disposed = true; pendingJoints.clear(); worker.terminate(); } };
+  const send = (message, requested = []) => {
+    if (disposed) return;
+    const id = ++requestId;
+    for (const [name, value] of requested) pendingJoints.set(name, { id, value });
+    worker.postMessage({ ...message, requestId: id });
+  };
   const abort = () => cleanup(); signal?.addEventListener("abort", abort, { once: true });
   try {
     const initial = await new Promise((resolve, reject) => {
@@ -121,23 +123,34 @@ export async function loadMJCF(viewer, { descriptor, artifactUrl, signal, onStat
     }
     worker.onmessage = ({ data }) => {
       if (disposed) return;
-      if (data.type === "state") { snapshot = data.state; sync(); }
-      if (data.type === "error") onStatus?.({ error: data.message });
+      if (data.type === "state") {
+        snapshot = data.state;
+        for (const [name, request] of pendingJoints) if (request.id <= data.appliedRequest) pendingJoints.delete(name);
+        sync();
+      }
+      if (data.type === "error") {
+        for (const [name, request] of pendingJoints) if (data.requestId === undefined || request.id <= data.requestId) pendingJoints.delete(name);
+        onStatus?.({ error: data.message });
+      }
     };
-    worker.onerror = (event) => onStatus?.({ error: event.message || "MuJoCo worker failed" });
+    worker.onerror = (event) => { pendingJoints.clear(); onStatus?.({ error: event.message || "MuJoCo worker failed" }); };
     sync(); viewer.robotRoot.updateMatrixWorld(true); viewer.resize();
-    frameCompiledGeometry(viewer, objects);
+    const fit = () => frameCompiledGeometry(viewer, objects);
+    fit();
     return {
-      engineMemoryBytes: initial.memory_bytes,
+      fit, engineMemoryBytes: initial.memory_bytes,
       links: [...new Set(initial.geoms.filter((geom) => geom.collision && geom.type !== "mjGEOM_PLANE").map((geom) => geom.link))],
       joints: initial.joints.map((joint) => ({ ...joint,
         get value() { return snapshot.qpos[joint.q]; },
-        set(value) { send({ type: "joint", name: joint.name, value }); },
-        reset() { send({ type: "joint-reset", name: joint.name }); },
+        get requestedValue() { return pendingJoints.get(joint.name)?.value; },
+        set(value) { send({ type: "joint", name: joint.name, value }, [[joint.name, value]]); },
+        reset() { send({ type: "joint-reset", name: joint.name }, [[joint.name, joint.resetValue]]); },
       })),
       selectLink(value) { selectedLink = value; sync(); }, setMode(value) { mode = value; sync(); },
       setMarkers(value) { markers = value; sync(); }, togglePlay() { send({ type: "play" }); },
-      step() { send({ type: "step" }); }, reset() { send({ type: "reset" }); }, dispose: cleanup,
+      step() { send({ type: "step" }); },
+      reset() { send({ type: "reset" }, initial.joints.map((joint) => [joint.name, joint.resetValue])); },
+      dispose: cleanup,
     };
   } catch (error) {
     signal?.removeEventListener("abort", abort); cleanup();

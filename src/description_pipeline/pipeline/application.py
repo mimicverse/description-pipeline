@@ -1454,10 +1454,17 @@ class StageApplication:
         )
 
 
-def _runtime_stage_ids(facts, *, command_id, run_id, through, binding):
+def _runtime_stage_ids(facts, *, command_id, run_id, through, binding, admission_spec=None):
     """Select capabilities from registered facts or an actual Airflow task binding."""
     if command_id is not None and (run_id is not None or binding is not None):
         raise ApplicationError("application.runtime_target_invalid", "Runtime targets are mutually exclusive")
+    if admission_spec is not None:
+        if not isinstance(admission_spec, AdmissionSpec):
+            raise ApplicationError("application.admission_required", "AdmissionSpec is required")
+        if command_id is not None or run_id is not None or binding is not None:
+            raise ApplicationError("application.runtime_target_invalid", "Runtime targets are mutually exclusive")
+        # Admission verifies the sealed source in StageApplication.admit; no handler executes here.
+        return ()
     if command_id is not None:
         command = facts.load_command(command_id)
         if command.kind != "stage" or command.stage not in STAGE_IDS:
@@ -1496,6 +1503,7 @@ def application_from_environment(
     command_id: str | None = None,
     run_id: str | None = None,
     through: StageId = "publish",
+    admission_spec: AdmissionSpec | None = None,
     clock: Callable[[], datetime] = _utc_now,
 ) -> StageApplication:
     """Compose implemented handlers; missing runtime capabilities remain explicit."""
@@ -1505,6 +1513,7 @@ def application_from_environment(
     facts = FactStore.from_environment(source, result_reader=artifacts)
     selected = _runtime_stage_ids(
         facts, command_id=command_id, run_id=run_id, through=through, binding=airflow_task_binding,
+        admission_spec=admission_spec,
     )
     work_root = source.get("PIPELINE_WORK_ROOT")
     if not work_root:
@@ -1514,7 +1523,8 @@ def application_from_environment(
         native_target_identity
         if native_target_identity is not None
         else _registered_native_target_from_environment(source)
-        if any(stage in selected for stage in ("freeze", "discover", "capture")) else None
+        if (any(stage in selected for stage in ("freeze", "discover", "capture"))
+            or (admission_spec is not None and admission_spec.from_stage != "mjcf")) else None
     )
     if registered_target is not None and not isinstance(registered_target, NativeTargetIdentity):
         raise ApplicationError(

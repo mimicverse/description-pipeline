@@ -234,7 +234,10 @@ class PicoPortal:
                 result = {"accepted": True}
             else:
                 await self.service.stop(session_id)
-                result = {"stopped": True}
+                settled = await asyncio.to_thread(self.service.store.get, session_id)
+                result = {
+                    "stopped": settled["state"] == "stopped", "state": settled["state"], "error": settled["error"]
+                }
             await asyncio.to_thread(self.service.store.complete_command, session_id, body["command_id"], result)
             return JSONResponse(result)
         except Exception as error:

@@ -28,6 +28,7 @@ from .io import PipelineError, artifact_path_parts, confined, format_number, par
 
 _STL_RECORD = np.dtype([("normal", "<f4", (3,)), ("vertices", "<f4", (3, 3)), ("attribute", "<u2")])
 _JOINT_TYPES = ("fixed", "revolute", "continuous", "prismatic")
+_SUPPORT_BLOCK_ELEMENTS = 1024 * 1024
 
 
 # --------------------------------------------------------------------------
@@ -671,7 +672,20 @@ def _minimum_support(geometry: dict, directions: np.ndarray) -> np.ndarray:
     """The realised minimum of direction . point over one whole surface."""
 
     if geometry["kind"] == "mesh":
-        return np.min(geometry["vertices"] @ np.asarray(directions).T, axis=0)
+        vertices = geometry["vertices"]
+        directions = np.asarray(directions)
+        if not len(vertices):
+            raise PipelineError("Mesh support requires a nonempty vertex set")
+        minima = np.full(len(directions), np.inf)
+        direction_step = min(256, _SUPPORT_BLOCK_ELEMENTS)
+        for start in range(0, len(directions), direction_step):
+            block = directions[start:start + direction_step]
+            vertex_step = max(1, _SUPPORT_BLOCK_ELEMENTS // len(block))
+            current = minima[start:start + len(block)]
+            for offset in range(0, len(vertices), vertex_step):
+                values = vertices[offset:offset + vertex_step] @ block.T
+                np.minimum(current, np.min(values, axis=0), out=current)
+        return minima
     projection = np.asarray(directions) @ geometry["center"]
     if geometry["kind"] == "box":
         local = np.asarray(directions) @ geometry["rotation"]

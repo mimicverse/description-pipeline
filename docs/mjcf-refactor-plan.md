@@ -50,7 +50,7 @@ FactStore 保留提交时的取消门，并以明确的类型化结果通知共�
 
 依次执行 R1 → R2 → R3 → R4 → R5。每项先保全原失败，形成实现和针对性验证，再进入依赖它的下一项。发现新的同源问题须追踪全部消费者；不为进度截止降低质量，也不重复没有变化的全套检查。证据保存在本 worktree 的 `.dev/refactor-20261101/`，前轮复审原件保留在 `.dev/review-20261101/`。
 
-当前状态：R1–R5 开发实现、验证、隔离部署及可评审资料完成。PR保持Draft，最终CI以PR当前状态为准；正式门仍未完成。
+当前状态：前轮R1–R5开发交付已完成；用户追加的权威文档/独立审查/CI收口正在执行，三项实际发现修复后需在固定新集成提交完成验证及差量独立复核，PR保持Draft。
 
 ## 已完成的实现与删减
 
@@ -97,3 +97,19 @@ rg -n 'StageCancellationRequested|_commit_owned_cancellation' src/description_pi
 [证据摘要](../reviews/mjcf-refactor-20261101/DEVELOPMENT-EVIDENCE.json) 绑定产品提交、真实运行、完整/差量回归范围、wheel、原始日志及页面SHA。本轮开发构建只用于核字节，正式发行仍须干净main完整构建。最后的文档和证据提交不改变上述产品源码，最终wheel会再核对同一字节。
 
 开发实例为自有8878/PID707888；隔离检查证明生产8791/PID1766、8971/PID1796、8793/PID2734不变，三份权威文档及原契约测试原字节不变。旧实例和数据库已按身份核对、无活动任务、保全CAS/metadata/SQL后停止；不删除失败证据或用户输入。不要将该隔离交付视为生产上线。
+
+## 用户追加的合并前收口（2026-11-01）
+
+负责人实际回读原始用户消息并形成 `/home/andy/Work/reviews/mjcf-root-system-review-20261101/ROOT-DESIGN-DECISION.json`：确认完整成功必须双格式，允许受限MJCF新后继直接复用原始已结算Verify前缀。原工程request/URDF证书字节不改；本次转换request/summary/simulation/Publish intent是分别封存的现有事实。根亲写的d907e149、7a265112已重放，三权威文档和配套断言同步，不机械采用前轮提案。
+
+三条固定字节独立审查的结论为CHANGES_REQUIRED，原件保存在根的mjcf-root-system-review-20261101目录，不能用过程测试代替最终ALLOW。统一修复经ROOT-FIX-CLOSURE-ACTIVATION.json激活本worktree唯一写者，并保留生产/CAD/main/新平台run禁区。
+
+| 发现 | 根因与原验证缺口 | 修复与必要验证 |
+|---|---|---|
+| CLI admit加载无关原生能力 | 默认适配器先装完整运行环境再解析spec；此前新进程只测已登记stage，后继接纳使用注入完整应用 | 先解析AdmissionSpec，接纳只组合事实/产物能力，初始target绑定保留；真实新进程无native配置/token/snapshot完成新的合格后继接纳、幂等读取及MJCF阶段，坏来源拒绝且不登记 |
+| 大网格支撑配置内存失败 | `_minimum_support`构造全部顶点×全部法向矩阵，原参考需2.36GiB超过既有2GiB；旧参考脚本用无界入口，小夹具才测隔离入口 | 在同一函数对全部数据有界分块归约，不放宽资源/误差、不删supports；分块边界与34项投影/handler回归，并在原40输入、原SUPPORT-CONFIG实际project_isolated+19项检查闭环 |
+| 通用checker漏geom所属body | 零位几何和名称核对不足以证明运动归属；未命名相同surface可在零位等价错挂 | 共同instance门核实际geom_bodyid与源link，visual/collision及primitive/mesh四组合都在geometry.instances拒绝；证明零位等价但0.4rad运动偏差，原URDF字节不变。现正式原生链唯一名称不变量仍保留，不夸大可达范围 |
+
+旧49d源码上的新增工程反例实际5项失败，原CLI接纳新进程因native配置缺失失败，日志均保留在 `.dev/closeout-20261101/`。首轮新测试有碰撞geom命名、target夹具错误，已保全并纠正；不把测试夹具错误算作产品发现。修复覆盖共同装配入口和共同实例门，不为模型/数量/路径特判，也不新增状态或执行计划。
+
+开发分支已合入精确main3da83503，保留R01测试组合辅助迁出、R08原生读取错误门及元数据类型保真；共享main未写。最终固定集成提交需跑受影响的真实组合、原参考有界重放、完整适用CI、包字节检查并交根亲审和独立差量复核。最终结果只在该固定头记录；本文不预先宣称这些门已通过。GUI布局由根的独立description-gui-clarity工作树负责，本轮不改static/index.html/style.css/app.js或viewer布局。
