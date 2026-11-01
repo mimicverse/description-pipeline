@@ -1,11 +1,12 @@
 import * as THREE from "/static/vendor/three.module.min.js";
 import { createViewer, disposeRobot } from "/static/viewer.js";
 import { compiledGeometry, frameCompiledGeometry } from "/static/mjcf_viewer.js";
+import { createProfileEditor } from "/static/pico_profile.js";
 const $ = (id) => document.getElementById(id);
 const run = new URL(location.href).searchParams.get("run");
 const launchSaved = new URL(location.href).searchParams.get("launch") === "1";
 history.replaceState(null, "", `/static/pico.html?run=${encodeURIComponent(run || "")}`);
-let csrf, sessionId, socket, heartbeat, objects = [], targetObjects = [], mode = "visual";
+let csrf, sessionId, socket, heartbeat, profileEditor, objects = [], targetObjects = [], mode = "visual";
 const pendingKey = `pico-request:${run}`;
 let pending = JSON.parse(sessionStorage.getItem(pendingKey) || "null");
 const viewer = createViewer($("scene"));
@@ -16,6 +17,11 @@ async function api(path, options = {}) {
   return result;
 }
 function failure(error) { $("error").textContent = error.message; }
+function pendingControls() {
+  for (const input of $("profile-editor").querySelectorAll("input, select, textarea, button")) input.disabled = Boolean(pending) || input.dataset.sourceFixed === "true";
+  $("record").disabled = Boolean(pending);
+  if (!pending) $("launch").textContent = "Start Session";
+}
 function draw(state) {
   const matrix = new THREE.Matrix4();
   objects.forEach(({ object, record }, index) => {
@@ -131,10 +137,11 @@ for (const type of ["estop", "stop", "pair"]) $(type).onclick = () => command(ty
 $("setup").onsubmit = async (event) => {
   event.preventDefault(); $("error").textContent = ""; $("launch").disabled = true;
   try {
-    const entered = { profile: JSON.parse($("profile").value), settings: JSON.parse($("settings").value), record: $("record").checked };
+    const entered = pending?.body || { ...profileEditor.read(), record: $("record").checked };
     if (!pending) { pending = { key: crypto.randomUUID(), body: entered }; sessionStorage.setItem(pendingKey, JSON.stringify(pending)); }
+    pendingControls();
     const row = await api(`/api/runs/${encodeURIComponent(run)}/simulations`, { method: "POST", headers: { "Idempotency-Key": pending.key }, body: JSON.stringify(pending.body) });
-    sessionStorage.removeItem(pendingKey); pending = null;
+    sessionStorage.removeItem(pendingKey); pending = null; pendingControls();
     sessionId = row.session_id; sessionStorage.setItem(`pico:${run}`, sessionId);
     const status = await inspect();
     if (!["starting", "ready"].includes(status.state)) throw new Error(status.error || `Session ${status.state}`);
@@ -143,8 +150,10 @@ $("setup").onsubmit = async (event) => {
     $("setup").hidden = true;
   } catch (error) {
     if ([400, 403, 404].includes(error.status)) { sessionStorage.removeItem(pendingKey); pending = null; }
+    pendingControls();
     failure(error); $("launch").disabled = false;
-    if (pending) $("launch").textContent = "Retry Original Request";
+    $("launch").textContent = pending ? "Retry Original Request" : "Start Session";
+    if (pending) $("status").textContent = "Launch outcome is unknown. Retry the original request to reconcile its result.";
   }
 };
 async function initialize() {
@@ -152,15 +161,19 @@ async function initialize() {
   csrf = (await api("/api/session")).csrf_token;
   if (!(await api("/api/simulation-capability")).available) throw new Error("The native Teleop worker is not configured on this portal");
   const saved = await api(`/api/runs/${encodeURIComponent(run)}/simulation-profile`);
-  if (saved.saved) { $("profile").value = JSON.stringify(saved.saved.profile, null, 2); $("settings").value = JSON.stringify(saved.saved.settings, null, 2); $("record").checked = saved.saved.record; }
-  $("status").textContent = `Source ${saved.subject_sha256}. Confirm the explicit profile and control budgets.`;
+  $("source").textContent = JSON.stringify({ subject_sha256: saved.subject_sha256, robot_name: saved.model.robot_name }, null, 2);
+  $("warnings").textContent = JSON.stringify({ warnings: saved.warnings, scope: saved.verification_scope }, null, 2);
+  profileEditor = createProfileEditor($("profile-editor"), saved.model, saved.subject_sha256, failure);
+  if (saved.saved) { profileEditor.load(saved.saved); $("record").checked = saved.saved.record; }
+  $("status").textContent = `Source ${saved.model.robot_name}. Review the profile and software execution budgets.`;
   const previous = sessionStorage.getItem(`pico:${run}`);
   if (pending) {
-    $("profile").value = JSON.stringify(pending.body.profile, null, 2);
-    $("settings").value = JSON.stringify(pending.body.settings, null, 2);
+    profileEditor.load(pending.body);
     $("record").checked = pending.body.record;
     $("launch").textContent = "Retry Original Request";
+    $("status").textContent = "Launch outcome is unknown. Retry the original request to reconcile its result.";
   }
+  pendingControls();
   if (previous) {
     sessionId = previous;
     try {
@@ -174,6 +187,7 @@ async function initialize() {
       sessionStorage.removeItem(`pico:${run}`); sessionId = null;
     }
   }
+  $("launch").disabled = false;
   if (launchSaved && saved.saved && !$("setup").hidden && !pending) $("setup").requestSubmit();
 }
 window.addEventListener("pagehide", () => { clearInterval(heartbeat); socket?.close(); });

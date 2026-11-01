@@ -504,6 +504,29 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
             origin = f"http://127.0.0.1:{port}"
             cookie = f"{portal.config.session_cookie}={session.session_id}"
             async with httpx.AsyncClient(base_url=origin, headers={"Cookie": cookie}) as client:
+                choices = await client.get("/api/runs/source/simulation-profile")
+                self.assertEqual(200, choices.status_code, choices.text)
+                descriptor = choices.json()
+                self.assertIsNone(descriptor["saved"])
+                self.assertEqual(self.request["source"]["subject_sha256"], descriptor["subject_sha256"])
+                self.assertEqual(self.request["source"]["warnings"], descriptor["warnings"])
+                self.assertEqual(self.request["source"]["verification_scope"], descriptor["verification_scope"])
+                self.assertEqual("probe", descriptor["model"]["robot_name"])
+                self.assertEqual(9, len(descriptor["model"]["joints"]))
+                self.assertIn("head_link3", descriptor["model"]["links"])
+                self.assertEqual(
+                    {"name": "left_0", "type": "revolute", "parent": "base", "child": "left_link_0",
+                     "lower": "-1.2", "upper": "1.2"},
+                    descriptor["model"]["joints"][0],
+                )
+                member_reader = portal._registered_member_bytes
+                portal._registered_member_bytes = lambda *_args: b"<robot name='wrong-revision'/>"
+                try:
+                    mismatch = await client.get("/api/runs/source/simulation-profile")
+                    self.assertEqual(400, mismatch.status_code, mismatch.text)
+                    self.assertIn("registered source URDF", mismatch.json()["error"])
+                finally:
+                    portal._registered_member_bytes = member_reader
                 headers = {"X-CSRF-Token": session.csrf_token, "Idempotency-Key": "http-create"}
                 response = await client.post(
                     "/api/runs/source/simulations",

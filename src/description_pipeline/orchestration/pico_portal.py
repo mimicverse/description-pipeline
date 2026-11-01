@@ -6,6 +6,7 @@ import asyncio
 from contextlib import asynccontextmanager, suppress
 import json
 import hmac
+import hashlib
 import xml.etree.ElementTree as ET
 import time
 import math
@@ -164,7 +165,40 @@ class PicoPortal:
             if source is None:
                 raise ValueError("This run has no completed MJCF")
             profile = await asyncio.to_thread(self.service.store.previous_profile, principal, source["subject_sha256"])
-            return JSONResponse({"saved": profile, "subject_sha256": source["subject_sha256"]})
+            projection = await asyncio.to_thread(
+                self.portal._read_fact_projection, native_run_id(request.path_params["run_id"])
+            )
+            content = await asyncio.to_thread(
+                self.portal._registered_member_bytes, "urdf/robot.urdf", projection["members"]["urdf/robot.urdf"]
+            )
+            if hashlib.sha256(content).hexdigest() != source["files"].get("urdf/robot.urdf"):
+                raise ValueError("Profile choices differ from the registered source URDF")
+            robot = ET.fromstring(content)
+            choices = {
+                "robot_name": robot.get("name"),
+                "urdf": "urdf/robot.urdf",
+                "mjcf": "mjcf/robot.xml" if "mjcf/robot.xml" in source["files"] else source["entry"],
+                "mjcf_files": sorted(name for name in source["files"] if name.endswith(".xml")),
+                "links": [link.get("name") for link in robot.findall("link")],
+                "joints": [
+                    {
+                        "name": joint.get("name"),
+                        "type": joint.get("type"),
+                        "parent": joint.find("parent").get("link"),
+                        "child": joint.find("child").get("link"),
+                        "lower": joint.find("limit").get("lower") if joint.find("limit") is not None else None,
+                        "upper": joint.find("limit").get("upper") if joint.find("limit") is not None else None,
+                    }
+                    for joint in robot.findall("joint")
+                ],
+            }
+            return JSONResponse({
+                "saved": profile,
+                "subject_sha256": source["subject_sha256"],
+                "model": choices,
+                "warnings": source["warnings"],
+                "verification_scope": source["verification_scope"],
+            })
         except Exception as error:
             return self.error(error)
 

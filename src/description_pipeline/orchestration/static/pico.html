@@ -18,10 +18,9 @@
 </section><section class="panel">
 <form id="setup"><h2>Session configuration</h2>
 <p>A profile binds explicit joints, TCP frames, home pose and input rotation to this exact model revision. It does not change the delivered model.</p>
-<label>Robot profile JSON<textarea id="profile" required spellcheck="false"></textarea></label>
-<label>Control settings JSON<textarea id="settings" required spellcheck="false">{"position_scale":0.1,"joint_speed_radps":1.0,"head_speed_radps":4.0}</textarea></label>
+<div id="profile-editor"></div>
 <label><input type="checkbox" id="record">Record raw inputs and control ticks</label>
-<button id="launch">Start Session</button></form>
+<button id="launch" disabled>Start Session</button></form>
 <h2>Live control state</h2><p id="live-status">No active session</p><div id="arms"></div>
 <p id="head"></p><details><summary>Detailed control report</summary><pre id="state">No active session</pre></details>
 </section></div>
