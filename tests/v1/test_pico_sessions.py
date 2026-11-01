@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager, contextmanager, suppress
 from copy import deepcopy
 import ctypes
 from datetime import datetime, UTC
+import gzip
 import hashlib
 import json
 import math
@@ -203,6 +204,43 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         await self.service.close()
+
+    def sealed_recording(self, sid):
+        ref = ArtifactRef.from_record(self.store.get(sid)["recording_artifact"])
+        self.artifacts.verify(ref)
+        return self.artifacts.objects / ref.artifact_id
+
+    def diagnostic_recording(self, sid):
+        matches = list(self.artifacts.root.glob(f"session-result-{sid}-*/recording"))
+        self.assertEqual(1, len(matches))
+        return matches[0]
+
+    async def native_rows(self, native, logical):
+        manifest = json.loads((native / "session-manifest.json").read_bytes())
+        member = manifest["files"][logical]
+        self.assertEqual("gzip-jsonl", member["encoding"])
+        self.assertEqual(
+            {"raw": "raw-input.jsonl.gz", "records": "records.jsonl.gz"}[logical], member["name"]
+        )
+        self.assertEqual(member["sha256"], hashlib.sha256((native / member["name"]).read_bytes()).hexdigest())
+        program = """import json,sys
+from pathlib import Path
+from teleop.robots.m3_0.session_evidence import iter_raw_input_evidence,iter_record_evidence
+decoder = {"raw": iter_raw_input_evidence, "records": iter_record_evidence}[sys.argv[2]]
+print(json.dumps(list(decoder(Path(sys.argv[1])))))
+"""
+        child = await asyncio.create_subprocess_exec(
+            WORKER, "-I", "-B", "-c", program, str(native), logical,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(child.communicate(), 30)
+        finally:
+            if child.returncode is None:
+                child.kill()
+                await child.wait()
+        self.assertEqual(0, child.returncode, stderr.decode())
+        return json.loads(stdout)
 
     def register_cli_source_fixture(self):
         # Canonical fixture facts exercise CLI reads; they do not claim a production pipeline execution.
@@ -1084,7 +1122,7 @@ sys.stdin.buffer.read(1)
             self.assertEqual("dead", resource_state(current.identity))
             self.assertFalse(Path(f"/proc/{child}").exists())
             self.assertIsNotNone(settled["recording_artifact"])
-            self.assertFalse(json.loads((current.root / "recording/outcome.json").read_bytes())["complete"])
+            self.assertFalse(json.loads((self.sealed_recording(sid) / "outcome.json").read_bytes())["complete"])
             self.assertNotIn(sid, self.service.running)
 
     async def test_unknown_group_retains_partial_identity_and_capacity_until_reconciled(self):
@@ -1120,7 +1158,7 @@ sys.stdin.buffer.read(1)
         reconciled = self.store.get(sid)
         self.assertEqual("failed", reconciled["state"])
         self.assertIsNotNone(reconciled["recording_artifact"])
-        self.assertFalse(json.loads((current.root / "recording/outcome.json").read_bytes())["complete"])
+        self.assertFalse(json.loads((self.sealed_recording(sid) / "outcome.json").read_bytes())["complete"])
 
     async def test_orphan_with_exited_leader_settles_only_after_owned_descendant_reaped(self):
         async with self.exited_leader_group(marked=True, owner="previous-supervisor") as (row, current, child):
@@ -1155,6 +1193,8 @@ sys.stdin.buffer.read(1)
         spawned = []
 
         async def delayed_spawn(*args, **options):
+            if args[-2] != "teleop.backends.mujoco.upper_body_worker":
+                return await actual_spawn(*args, **options)
             process = await actual_spawn(*args, **options)
             spawned.append(process)
             entered.set()
@@ -1189,7 +1229,8 @@ sys.stdin.buffer.read(1)
         self.assertEqual("dead", resource_state(settled["process_identity"]))
         self.assertIsNotNone(spawned[0].returncode)
         self.assertIsNotNone(settled["recording_artifact"])
-        self.assertFalse(json.loads((self.service.root / sid / "recording/outcome.json").read_bytes())["complete"])
+        self.assertEqual(1, len(spawned))
+        self.assertFalse(json.loads((self.sealed_recording(sid) / "outcome.json").read_bytes())["complete"])
         self.assertFalse(self.service.running)
 
     async def test_cancelled_probe_spawn_retains_handle_until_group_is_reaped(self):
@@ -1240,6 +1281,8 @@ sys.stdin.buffer.read(1)
         spawned = []
 
         async def delayed_spawn(*args, **options):
+            if args[-2] != "teleop.backends.mujoco.upper_body_worker":
+                return await actual_spawn(*args, **options)
             process = await actual_spawn(*args, **options)
             spawned.append((process, process_identity(process.pid, args[-1])))
             entered.set()
@@ -1287,6 +1330,7 @@ sys.stdin.buffer.read(1)
             cursor.execute("SELECT session_id FROM simulation_session WHERE request_key='close-during-real-spawn'")
             sid = cursor.fetchone()[0]
         self.assertEqual("failed", self.store.get(sid)["state"])
+        self.assertEqual(1, len(spawned))
         self.assertEqual(spawned[0][1], self.store.get(sid)["process_identity"])
         self.assertEqual("dead", resource_state(spawned[0][1]))
         self.assertIsNone(self.service._lock)
@@ -1718,8 +1762,15 @@ sys.stdin.buffer.read(1)
         return row
 
     async def test_cancelled_materialization_settles_admission_and_cleans_verification(self):
+        from unittest.mock import patch
+
         await self.start_service()
         entered, release = threading.Event(), threading.Event()
+        materializing = asyncio.Event()
+
+        async def observe_materialization(*args, **kwargs):
+            materializing.set()
+            return await recording_module.prepare_source(*args, **kwargs)
 
         def slow_member(name, member):
             entered.set()
@@ -1727,16 +1778,22 @@ sys.stdin.buffer.read(1)
                 raise TimeoutError("Fixture reader was not released")
             return self.read_member(name, member)
 
-        creating = asyncio.create_task(
-            self.service.create(
-                "app:tenant:operator", "cancel-create", self.run_id, self.request, self.members, slow_member
+        with patch("description_pipeline.simulation.service.prepare_source", observe_materialization):
+            creating = asyncio.create_task(
+                self.service.create(
+                    "app:tenant:operator", "cancel-create", self.run_id, self.request, self.members, slow_member
+                )
             )
-        )
-        self.assertTrue(await asyncio.to_thread(entered.wait, 2))
-        creating.cancel()
-        release.set()
-        with self.assertRaises(asyncio.CancelledError):
-            await creating
+            try:
+                await asyncio.wait_for(materializing.wait(), 30)
+                self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+                creating.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(creating.done())
+            finally:
+                release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await creating
         with self.store.transaction() as cursor:
             cursor.execute("SELECT session_id FROM simulation_session WHERE request_key='cancel-create'")
             cancelled_id = cursor.fetchone()[0]
@@ -1749,14 +1806,28 @@ sys.stdin.buffer.read(1)
         await self.service.stop(row["session_id"])
         entered.clear()
         release.clear()
-        checking = asyncio.create_task(self.service.verify_recording(row["session_id"], self.members, slow_member))
-        self.assertTrue(await asyncio.to_thread(entered.wait, 2))
-        checking.cancel()
-        release.set()
-        with self.assertRaises(asyncio.CancelledError):
-            await checking
+        materializing.clear()
+        with patch("description_pipeline.simulation.verification.prepare_source", observe_materialization):
+            checking = asyncio.create_task(self.service.verify_recording(row["session_id"], self.members, slow_member))
+            try:
+                await asyncio.wait_for(materializing.wait(), 30)
+                self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+                checking.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(checking.done())
+            finally:
+                release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await checking
         self.assertFalse(list(self.service.root.glob("recording-verification-*")))
         self.assertFalse(self.service.verification_gate.locked())
+        self.assertEqual("cancelled", self.store.verification_attempts(row["session_id"])[-1]["result"]["state"])
+        slot = await asyncio.to_thread(self.store.acquire_verification_slot)
+        self.assertIsNotNone(slot)
+        slot.close()
+        await self.service.close()
+        self.assertIsNone(self.service._lock)
+        self.assertIsNone(self.service._database_lock)
 
     async def test_cancelled_verifier_reaps_its_real_process(self):
         from unittest.mock import patch
@@ -1968,15 +2039,16 @@ sys.stdin.buffer.read(1)
         recording = self.root / "diagnostic-recording"
         shutil.copytree(payload["recording"], recording)
         payload["recording"] = str(recording)
-        path = recording / "native/records.jsonl"
-        lines = path.read_text().splitlines()
-        tampered = json.loads(lines[0])
+        manifest = json.loads((recording / "native/session-manifest.json").read_bytes())
+        path = recording / "native" / manifest["files"]["records"]["name"]
+        rows = await self.native_rows(recording / "native", "records")
+        self.assertTrue(rows)
+        tampered = rows[0]
         tampered["extension"]["pico_session"]["state"]["report"]["arms"]["left"]["applied_pose"]["position_m"][0] += 0.1
-        lines[0] = json.dumps(tampered)
-        path.write_text("\n".join(lines) + "\n")
+        path.write_bytes(gzip.compress(b"".join(canonical(row) + b"\n" for row in rows), mtime=0))
         # This private diagnostic bypasses only the archive hash, to reach independent FK.
         # The real CAS artifact and registered session remain untouched.
-        payload["inventory"]["native/records.jsonl"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        payload["inventory"][path.relative_to(recording).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
         identities = []
 
         async def register(identity):
@@ -1997,9 +2069,17 @@ sys.stdin.buffer.read(1)
 
     async def test_bad_source_and_maintenance_drain_release_capacity(self):
         await self.start_service()
+
+        def changed_member(name, member):
+            original = self.read_member(name, member)
+            self.assertTrue(original)
+            changed = bytes([original[0] ^ 1]) + original[1:]
+            self.assertEqual(member["bytes"], len(changed))
+            return changed
+
         with self.assertRaisesRegex(ValueError, "digest changed"):
             await self.service.create(
-                "app:tenant:operator", "bad-source", self.run_id, self.request, self.members, lambda *_args: b"changed"
+                "app:tenant:operator", "bad-source", self.run_id, self.request, self.members, changed_member
             )
         self.assertFalse(self.service.running)
         row = await self.service.create(
@@ -2082,8 +2162,8 @@ sys.stdin.buffer.read(1)
         self.store.authorize_command(sid, stop["command_id"], "app:tenant:operator", stop)
         await self.service.stop(sid, command_id=stop["command_id"])
         self.assert_stopped(sid)
-        recording = self.service.root / sid / "recording"
-        raw = [json.loads(line)["raw"] for line in (recording / "native/raw-input.jsonl").read_text().splitlines()]
+        recording = self.sealed_recording(sid)
+        raw = [row["raw"] for row in await self.native_rows(recording / "native", "raw")]
         self.assertEqual(1, sum(item.get("id") == envelope["id"] for item in raw))
         self.assertTrue(json.loads((recording / "outcome.json").read_bytes())["complete"])
         self.assertEqual(["applied", "applied"], [item["result"]["state"] for item in self.store.worker_commands(sid)])
@@ -2317,7 +2397,7 @@ sys.stdin.buffer.read(1)
         )
         sid = row["session_id"]
         await self.wait_ready(sid)
-        self.assertTrue((self.service.root / sid / "recording/native/raw-input.jsonl").is_file())
+        self.assertTrue((self.service.root / sid / "recording/native/raw-input.jsonl.gz").is_file())
         await self.service.stop(sid)
         self.assertEqual("stopped", self.store.get(sid)["state"])
         self.assertIsNone(self.store.get(sid)["recording_artifact"])
@@ -2343,8 +2423,9 @@ sys.stdin.buffer.read(1)
         self.assertEqual("failed", self.store.get(sid)["state"])
         self.assertIsNone(self.store.get(sid)["recording_artifact"])
         self.assertEqual("dead", resource_state(current.identity))
-        self.assertTrue((current.root / "recording/native/raw-input.jsonl").is_file())
-        self.assertFalse(json.loads((current.root / "recording/outcome.json").read_bytes())["complete"])
+        self.assertTrue((current.root / "recording/native/raw-input.jsonl.gz").is_file())
+        self.assertFalse((current.root / "recording/outcome.json").exists())
+        self.assertFalse(json.loads((self.diagnostic_recording(sid) / "outcome.json").read_bytes())["complete"])
 
     async def test_unsaved_worker1_cleanup_failure_retains_native_evidence(self):
         await self.start_service()
@@ -2376,7 +2457,7 @@ sys.stdin.buffer.read(1)
             self.assertIn("cleanup failed", settled["error"])
             self.assertIsNone(settled["recording_artifact"])
             self.assertEqual("dead", resource_state(settled["process_identity"]))
-            self.assertTrue((native / "raw-input.jsonl").is_file())
+            self.assertTrue((native / "raw-input.jsonl.gz").is_file())
         finally:
             native.chmod(0o700)
 
@@ -2441,7 +2522,7 @@ sys.stdin.buffer.read(1)
             self.assertEqual("dead", resource_state(identity))
             native = self.service.root / sid / "recording/native"
             before = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in native.iterdir() if p.is_file()}
-            self.assertIn("raw-input.jsonl", before)
+            self.assertIn("raw-input.jsonl.gz", before)
             await self.start_service()
             settled = self.store.get(sid)
             self.assertEqual("failed", settled["state"])
@@ -2457,7 +2538,8 @@ sys.stdin.buffer.read(1)
             self.assertEqual(
                 before, {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in native.iterdir() if p.is_file()}
             )
-            self.assertFalse(json.loads((native.parent / "outcome.json").read_bytes())["complete"])
+            self.assertFalse((native.parent / "outcome.json").exists())
+            self.assertFalse(json.loads((self.diagnostic_recording(sid) / "outcome.json").read_bytes())["complete"])
         finally:
             if parent is not None and parent.returncode is None:
                 parent.kill()
@@ -2714,7 +2796,7 @@ sys.stdin.buffer.read(1)
                     json={"type": "stop", "command_id": "failed-stop"},
                 )
                 self.assertEqual(failure, repeated.json())
-                outcome = json.loads((self.service.root / failed_sid / "recording/outcome.json").read_bytes())
+                outcome = json.loads((self.sealed_recording(failed_sid) / "outcome.json").read_bytes())
                 self.assertFalse(outcome["complete"])
         finally:
             server.should_exit = True
