@@ -5370,6 +5370,14 @@ def _run_windows_powershell(
             "windows_recovery_transport_unknown",
             f"Windows transport failed: {error}",
         ) from error
+    evidence = {
+        "program": "windows-lifecycle",
+        "returncode": completed.returncode,
+        "stdout_sha256": hashlib.sha256(completed.stdout).hexdigest(),
+        "stderr_sha256": hashlib.sha256(completed.stderr).hexdigest(),
+    }
+    if commands is not None:
+        commands.append(evidence)
     try:
         stdout = _decode_windows_output(completed.stdout, stream="stdout")
         _decode_windows_output(completed.stderr, stream="stderr")
@@ -5377,7 +5385,7 @@ def _run_windows_powershell(
         raise RecoveryError(
             "windows_recovery_transport_unknown",
             "Windows transport output is not valid text",
-            {"stream": error.stream, "sha256": error.payload_sha256},
+            {**evidence, "stream": error.stream, "sha256": error.payload_sha256},
         ) from error
     document = None
     for line in reversed(stdout.splitlines()):
@@ -5391,16 +5399,7 @@ def _run_windows_powershell(
         raise RecoveryError(
             "windows_recovery_transport_unknown",
             "Windows lifecycle returned no result object",
-            {"returncode": completed.returncode},
-        )
-    if commands is not None:
-        commands.append(
-            {
-                "program": "windows-lifecycle",
-                "returncode": completed.returncode,
-                "stdout_sha256": hashlib.sha256(completed.stdout).hexdigest(),
-                "stderr_sha256": hashlib.sha256(completed.stderr).hexdigest(),
-            }
+            evidence,
         )
     return document, completed
 

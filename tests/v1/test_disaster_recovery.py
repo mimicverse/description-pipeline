@@ -3931,6 +3931,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
             b"",
         )
         process.transport = windows_transport.request_metadata("fixture")
+        commands: list[dict] = []
         with (
             mock.patch.object(recovery, "_transport_powershell", return_value=process),
             self.assertRaises(recovery.RecoveryError) as raised,
@@ -3939,7 +3940,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 ssh_host="windows-fixture",
                 script="fixture",
                 timeout=5,
-                commands=[],
+                commands=commands,
             )
         self.assertEqual(raised.exception.code, "windows_recovery_transport_unknown")
         self.assertEqual(raised.exception.detail["stream"], "stdout")
@@ -3947,6 +3948,34 @@ class RecoveryControlFlowTests(unittest.TestCase):
             raised.exception.detail["sha256"],
             hashlib.sha256(b"\xff\xfeA").hexdigest(),
         )
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0]["returncode"], process.returncode)
+        self.assertEqual(commands[0]["stdout_sha256"], raised.exception.detail["sha256"])
+
+    def test_windows_missing_result_preserves_raw_transport_evidence(self) -> None:
+        process = subprocess.run(
+            [sys.executable, "-c", "import sys; sys.stderr.buffer.write(bytes.fromhex('b2e2cad4')); sys.exit(23)"],
+            capture_output=True,
+            check=False,
+        )
+        commands: list[dict] = []
+        for recorded_commands in (commands, None):
+            with (
+                self.subTest(commands=recorded_commands),
+                mock.patch.object(recovery, "_transport_powershell", return_value=process),
+                self.assertRaises(recovery.RecoveryError) as raised,
+            ):
+                recovery._run_windows_powershell(
+                    ssh_host="windows-fixture",
+                    script="fixture",
+                    timeout=5,
+                    commands=recorded_commands,
+                )
+            self.assertEqual(raised.exception.code, "windows_recovery_transport_unknown")
+            self.assertEqual(raised.exception.detail["returncode"], 23)
+            self.assertEqual(raised.exception.detail["stderr_sha256"], hashlib.sha256(process.stderr).hexdigest())
+            self.assertEqual(raised.exception.detail["stdout_sha256"], hashlib.sha256(process.stdout).hexdigest())
+        self.assertEqual(commands, [raised.exception.detail])
 
     def test_recovery_propagates_bytecode_suppression_to_children(self) -> None:
         self.assertEqual(os.environ.get("PYTHONDONTWRITEBYTECODE"), "1")
