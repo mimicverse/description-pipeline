@@ -11,10 +11,10 @@
       "teleop/backends/mujoco/preview_hud.py": "d6cb147f609a0e807f754da744b1d66cf12f23bd49cc23556f5eb07364924537",
       "teleop/backends/mujoco/runner.py": "423aabb89b483d13c29976aaf10784bb28416d0e400c85dd341d5984ff30c312",
       "teleop/backends/mujoco/upper_body.py": "65233f3256ce4f455906de01257820769ebec23ff416e8c99ce933a8fc1ab7ed",
-      "teleop/backends/mujoco/upper_body_worker.py": "a739ea522c468e292606b60aa1bc2b94752e0d310fed4cf813594a99e0e9194c",
+      "teleop/backends/mujoco/upper_body_worker.py": "458169662d6cdff9ac66e2aeee85a7de7938d9349c0e35c068649c447834fe40",
       "teleop/core/__init__.py": "915fac7f90bd75b49f4d5fd23b92447fbd30834138177588da294fdb22b01930",
       "teleop/core/_bounded_step_cy.c": "64addbf95e8b5e1653109cbac0e5d5b71a2d76eda876923a441b055f5395e86c",
-      "teleop/core/_bounded_step_cy.cpython-312-x86_64-linux-gnu.so": "44868ff6d773ab71dfba30f81da4f9d3f6928b4fee030b49a0ba53803044bd85",
+      "teleop/core/_bounded_step_cy.cpython-312-x86_64-linux-gnu.so": "6445ba4a911b5044175acf7a16ffb95d181100a3299adc81e44a2303ab5f0f11",
       "teleop/core/calibration.py": "1210b1ee5757ba6e316cb314f44ef85a371375c905045f934d57ac3c92fb8525",
       "teleop/core/constrained_step.py": "7b435797b1f8021c00ded5de81e041db9ca7e99268dfb008aa8cf9838912d0b8",
       "teleop/core/control_clock.py": "f693b31531737a38b8879fd86c5178b7d19ce839fd6c9188886c2bc4c0bcee31",
@@ -126,7 +126,7 @@
       "teleop/robots/m3_0/pico_feedback.py": "655fc53c16fdd455e0c4dd1d5a8459e9ae6d2ae7234a6a09d3a5a31de4781792",
       "teleop/robots/m3_0/pico_intent.py": "4cda7df892df2d0f370cb7283812e0041cd7918c260e6226ed144bd78a0bead2",
       "teleop/robots/m3_0/pico_profile.py": "472a9dac4092b3e9a7feef2203718546a5bcd38a8f38327084bd9978fafc0ac8",
-      "teleop/robots/m3_0/session_evidence.py": "b07ddeb038c38510b52013ef5ee5d139ebc9a5edb98f155de58cdbdd1af4aa05",
+      "teleop/robots/m3_0/session_evidence.py": "ff0d2787047940c3bae15cddfcaecd6b535dcffd0d75fa38b03e6771b9017e6f",
       "teleop/robots/m3_0/telemetry.py": "f8f1fd9370b0bbd8599ff457b90c619a712d721bf8e998205119187e4033cf2b",
       "teleop/robots/m3_0/telemetry_validation.py": "4672ec3ffcccb8ac757a96f8b4f841121358a54e4a78cb88568c31e6c85c19e9",
       "teleop/robots/m3_0/whole_body_intent.py": "349e05e000b555f1ee3f6b8764b561c94907ba72934536384876afbdec95d128",
@@ -135,10 +135,10 @@
       "teleop/robots/profiles/m3.0.3.json": "7ff0fd2ededdaf2c4945d20560169dc09e0b9fde75e3723928ac3abcf915347f",
       "teleop/robots/profiles/m3.0.json": "1664c8bfbdd1899450781543799355e0c38087affb0aba52579ddb94b9fecf2f"
     },
-    "source_commit": "33908ccc39ac427a178855927f43924d6bd58d6c",
-    "source_tree": "dcc6c458d50abaf7663c13c8800c84173b51ad40",
+    "source_commit": "9bd779d0f5d0e7f620de173379d85a49c567ee4e",
+    "source_tree": "b4014fdf1ac9b61d000bb69290d414298f7a6f84",
     "wheel_filename": "robot_teleop-0.3.0-cp312-cp312-linux_x86_64.whl",
-    "wheel_sha256": "6f148d7ce435820e618c4fad88e505c5407259c260fd2164f55cee29518ae108"
+    "wheel_sha256": "a3a97085e9bfb3a4386ac1eb0d08cadf59d551b3065a5f173576265e587f8dcc"
   },
   "consumers": {
     "assessment": {
