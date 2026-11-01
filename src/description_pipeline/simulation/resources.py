@@ -218,6 +218,18 @@ def validate_policy(policy: dict, root: Path) -> dict:
     return policy
 
 
+def validate_manifest_policy(observed: dict, admitted: dict, root: Path) -> dict:
+    """Preserve additional native observations while binding every admitted resolver field."""
+    validate_policy(observed, root)
+    if (
+        not isinstance(admitted, dict)
+        or not admitted.keys() <= observed.keys()
+        or any(observed[key] != value for key, value in admitted.items())
+    ):
+        raise SessionResourceError("Native manifest changed the admitted resource policy")
+    return observed
+
+
 def _validate_phase(phase):
     if (
         not isinstance(phase, dict)

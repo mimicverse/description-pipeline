@@ -8,6 +8,7 @@ import unittest
 from description_pipeline.simulation.resources import (
     SessionResourceError,
     validate_policy,
+    validate_manifest_policy,
     validate_ready,
     validate_state,
 )
@@ -144,6 +145,15 @@ class PicoProjectionContractTests(unittest.TestCase):
             ready["resource_policy"] = {**policy, key: received}
             with self.subTest(key=key, expected=expected), self.assertRaises(SessionResourceError):
                 validate_ready(ready, policy, self.root)
+
+    def test_manifest_observations_cannot_change_or_replace_any_admitted_policy_field(self):
+        observed = {**self.policy, "observed_evidence_bytes": 3711, "observed_session_bytes": 16551}
+        self.assertEqual(observed, validate_manifest_policy(observed, self.policy, self.root))
+        for change in ({"compiled_bytes": False}, {"raw_row_cap": self.policy["raw_row_cap"] + 1}):
+            with self.subTest(change=change), self.assertRaises(SessionResourceError):
+                validate_manifest_policy({**observed, **change}, self.policy, self.root)
+        with self.assertRaises(SessionResourceError):
+            validate_manifest_policy(observed, None, self.root)
 
     def test_idle_has_no_running_clock_and_short_running_is_not_duration_eligible(self):
         idle = self.state(running=False)

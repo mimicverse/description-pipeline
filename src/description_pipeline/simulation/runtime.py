@@ -230,7 +230,7 @@ def verify_runtime_contract(contract: dict) -> dict:
 
 def resolve_resources(payload: dict) -> dict:
     """Resolve pre-materialization limits using only the verified public native policy."""
-    runtime = verify_runtime_contract(payload["runtime_contract"])
+    runtime = verify_runtime_contract(payload["execution"]["runtime_contract"])
     from teleop.robots.m3_0.session_evidence import resolve_session_resource_policy
 
     request = payload["resource_request"]
