@@ -512,7 +512,7 @@ class RunHistoryUiContractTests(unittest.TestCase):
             "Rename",
             "run-menu-buttons",
             "This delivery cannot be hidden before it ends.",
-            "Run state is unknown, so deletion is unavailable.",
+            "The delivery state is unknown, so it cannot be hidden.",
             "Remove this run from the list. It can be restored from Hidden; models, evidence, and PRs remain.",
             "Hidden · ",
             "Hidden by: ",

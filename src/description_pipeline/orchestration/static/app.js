@@ -686,9 +686,9 @@ function formatRunTime(value) {
 
 function deleteBlockedReason(run) {
   if (run.state === "success" || run.state === "failed" || run.state === "cancelled") return "";
-  if (run.state === "unresolved") return "External effects require reconciliation before deletion.";
+  if (run.state === "unresolved") return "External effects require reconciliation before hiding this delivery.";
   if (run.state === "queued" || run.state === "running") return "This delivery cannot be hidden before it ends.";
-  return "Run state is unknown, so deletion is unavailable.";
+  return "The delivery state is unknown, so it cannot be hidden.";
 }
 
 function runsForView(runs, view) {
@@ -1925,9 +1925,12 @@ function renderStepper() {
 function renderRerunPanel(run) {
   const host = $("stage-rerun");
   if (!host) return;
-  host.textContent = "";
   const rows = Array.isArray(run.stage_reruns) ? run.stage_reruns : null;
   const stage = state.stages[state.selectedStage];
+  // The select owns its in-progress input; changes to eligibility still replace the panel.
+  if (!beginRender(host, [run.dag_run_id, rows, stage?.id, run.main_assembly, run.can_manage,
+    run.deleted, state.rerunningRunId, state.rerunKeyByRun[run.dag_run_id], state.rerunNotice,
+    state.rerunError])) return;
   if (!stage) {
     host.hidden = true;
     return;

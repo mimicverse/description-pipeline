@@ -525,6 +525,19 @@ console.log("unfinished preview and activity polling OK");
   run.automatic.state = "waiting"; p.app.renderRun(run);
   assert.notEqual(p.$("stage-detail").children[0], unresolved, "A qualification display change must invalidate rendered details");
 }
+// Polling must preserve a Freeze assembly selection, but permission changes replace the controls.
+{
+  const p = page();
+  const run = {dag_run_id: "freeze-selection", state: "success", main_assembly: "a.SLDASM", can_manage: true,
+    stage_reruns: [{stage: "freeze", eligible: true, main_assembly_options: ["a.SLDASM", "b.SLDASM"]}],
+    report: {stages: [{id: "freeze", name: "Freeze", state: "completed", counts: {}}]}};
+  p.app.state.dagRunId = run.dag_run_id; p.app.state.lastRun = run;
+  p.app.renderRun(run); const form = p.$("stage-rerun").children[0];
+  p.app.state.rerunMainByRun[run.dag_run_id] = "b.SLDASM";
+  p.app.renderRun(run); assert.equal(p.$("stage-rerun").children[0], form);
+  run.can_manage = false; p.app.renderRun(run);
+  assert.notEqual(p.$("stage-rerun").children[0], form);
+}
 // Registering a certificate must refresh its stage link without any stage or subject change.
 {
   const p = page();
