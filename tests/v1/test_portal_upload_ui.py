@@ -129,7 +129,7 @@ class UploadUiContractTests(unittest.TestCase):
             "detail-card",
             "new-run-button",
             "stage-detail",
-            "inspect-tabs",
+            "stage-panel",
             "run-dot",
             "run-state-label",
             "run-initiator",
@@ -139,7 +139,7 @@ class UploadUiContractTests(unittest.TestCase):
         ):
             self.assertIn(f'id="{element}"', html)
         app = (STATIC / "app.js").read_text(encoding="utf-8")
-        for name in ("showUploadView", "showRunView", "renderStepper", "selectInspectTab"):
+        for name in ("showUploadView", "showRunView", "renderStepper", "renderStageDetail"):
             self.assertIn(f"function {name}(", app)
         self.assertIn('$("upload-view").hidden = true', app)
         self.assertIn('$("detail-card").hidden = true', app)
@@ -405,8 +405,8 @@ class ReportUiContractTests(unittest.TestCase):
         css = (STATIC / "style.css").read_text(encoding="utf-8")
         self.assertIn("STEP_STATE_SHORT", app)
         self.assertIn("Blocked", app)
-        self.assertIn("minmax(3.5em, 1fr)", css)
-        self.assertIn("max-width: 5.5em", css)
+        self.assertIn(".step-label", css)
+        self.assertIn("text-overflow: ellipsis", css)
         self.assertIn("Objects: ", app)
         self.assertIn("visibleFindings", app)
 
@@ -432,7 +432,7 @@ class AssemblySelectorUiContractTests(unittest.TestCase):
             "Select the main assembly...",
         ):
             self.assertIn(token, app)
-        self.assertIn(".assembly-row", css)
+        self.assertIn(".form-field", css)
 
 
 class RunHistoryUiContractTests(unittest.TestCase):
@@ -452,8 +452,8 @@ class RunHistoryUiContractTests(unittest.TestCase):
 
     def test_page_title_is_exact(self) -> None:
         page = self.page()
-        self.assertIn("<title>SolidWorks2URDF Delivery Portal</title>", page)
-        self.assertIn("<h1>SolidWorks2URDF Delivery Portal</h1>", page)
+        self.assertIn("<title>Robot delivery</title>", page)
+        self.assertIn("<h1>Robot delivery</h1>", page)
 
     def test_rows_render_name_time_state_actor_and_secondary_rerun_chip(self) -> None:
         app = self.app()
@@ -485,7 +485,7 @@ class RunHistoryUiContractTests(unittest.TestCase):
             "next_offset",
             "loadMoreRuns",
             "Load more",
-            "No runs are visible in the loaded records; load more.",
+            "No deliveries are visible in the loaded records; load more.",
             "All runs shown",
             "state.runView",
             "state.runsNextOffset",
@@ -511,11 +511,11 @@ class RunHistoryUiContractTests(unittest.TestCase):
             "Actions: ",
             "Rename",
             "run-menu-buttons",
-            "This run cannot be deleted before it ends.",
+            "This delivery cannot be hidden before it ends.",
             "Run state is unknown, so deletion is unavailable.",
-            "Remove this run from the list. It can be restored from Deleted; models, evidence, and PRs remain.",
-            "Deleted · ",
-            "Deleted by: ",
+            "Remove this run from the list. It can be restored from Hidden; models, evidence, and PRs remain.",
+            "Hidden · ",
+            "Hidden by: ",
             "overlayRun",
         ):
             self.assertIn(token, app)
@@ -545,8 +545,8 @@ class RunHistoryUiContractTests(unittest.TestCase):
         app = self.app()
         page = self.page()
         self.assertIn('id="run-deleted"', page)
-        self.assertIn("This run is deleted; restore it before retrying or rerunning.", app)
-        self.assertIn("This run is deleted; restore it before rerunning.", app)
+        self.assertIn("This delivery is hidden; restore it before retrying or rerunning.", app)
+        self.assertIn("This delivery is hidden; restore it before rerunning.", app)
         self.assertIn("RETRY_REASONS.deleted", app)
 
     def test_keyboard_and_focus_contract(self) -> None:
@@ -585,16 +585,15 @@ class ActivityUiContractTests(unittest.TestCase):
     def activity(self) -> str:
         return (STATIC / "activity.js").read_text(encoding="utf-8")
 
-    def test_page_mounts_the_card_in_overview_and_running_stage(self) -> None:
+    def test_page_has_one_activity_mount(self) -> None:
         html = (STATIC / "index.html").read_text(encoding="utf-8")
         self.assertIn('id="activity-overview"', html)
-        self.assertIn('id="activity-stage"', html)
+        self.assertNotIn('id="activity-stage"', html)
         app = (STATIC / "app.js").read_text(encoding="utf-8")
         for token in (
             'from "/static/activity.js"',
             "renderActivity(run);",
             "activityView(run.activity",
-            "activityPlacement(",
             "startActivityTimer()",
             "stopActivityTimer()",
             "Related object: ",
@@ -711,7 +710,6 @@ class FailureDisplayUiContractTests(unittest.TestCase):
     def test_large_finding_groups_are_lazy_and_bounded(self) -> None:
         app = (STATIC / "app.js").read_text(encoding="utf-8")
         for token in (
-            "items.length <= 12",
             "populated",
             'section.addEventListener("toggle"',
             "if (!knownRun) void refreshRuns();",

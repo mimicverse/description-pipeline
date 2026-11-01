@@ -9,7 +9,7 @@ import {
   resolveTitle,
   shouldRefreshRunList,
 } from "/static/run_history.js";
-import { activityPlacement, activityView } from "/static/activity.js";
+import { activityView } from "/static/activity.js";
 import {
   closureRows,
   ensureSingleViewer,
@@ -53,7 +53,7 @@ const state = {
   pollRequest: null,
   activityTimer: null,
   retryingRunId: null,
-  tabsInitializedFor: null,
+  detailsInitializedFor: null,
   rerunningRunId: null,
   rerunNotice: null,
   rerunError: null,
@@ -146,7 +146,7 @@ const RETRY_REASONS = {
   sealed_evidence_reimport: "Capture evidence is sealed; recovery rereads sealed evidence without repeating CAD.",
   portable_retry: "Continue side-effect-free stages without repeating CAD capture.",
   endpoint_evidence_unavailable: "The original job state cannot be confirmed; retry later.",
-  deleted: "This run is deleted; restore it before retrying or rerunning.",
+  deleted: "This delivery is hidden; restore it before retrying or rerunning.",
 };
 
 const $ = (id) => document.getElementById(id);
@@ -297,6 +297,7 @@ function applyAssemblies(pick) {
 async function loadTargets(pick) {
   const requestId = state.targetsRequest + 1;
   state.targetsRequest = requestId;
+  $("targets-retry").hidden = true;
   const row = $("target-row");
   const select = $("target-select");
   const summary = $("change-summary");
@@ -327,7 +328,8 @@ async function loadTargets(pick) {
     failure.selected = true;
     select.append(failure);
     note.hidden = false;
-    note.textContent = "Publication targets could not load because the network or service failed; reselect the folder and retry.";
+    note.textContent = "Publication targets could not be loaded. Keep this folder selected and reload targets.";
+    $("targets-retry").hidden = false;
     updateStartEnabled();
     return;
   }
@@ -404,7 +406,7 @@ function updateStartEnabled() {
   const target = $("target-select");
   const summary = $("change-summary");
   const purpose = $("purpose-select");
-  $("start-button").textContent = state.blockedPick ? "Retry same submission" : "Start";
+  $("start-button").textContent = state.blockedPick ? "Retry same submission" : "Start delivery";
   $("start-button").disabled = !(
     state.folderPick &&
     !state.uploading &&
@@ -613,6 +615,7 @@ function clearPreview() {
   $("preview-info").textContent = "";
   $("preview-diagnostic").hidden = true;
   $("preview-diagnostic").replaceChildren();
+  delete $("preview-diagnostic").dataset.renderKey;
   $("viewer-note").hidden = true;
   $("joint-controls").textContent = "";
   $("preview-panels").querySelectorAll(".panel-table").forEach((node) => {
@@ -646,7 +649,7 @@ function clearSession() {
   state.user = null;
   state.dagRunId = null;
   state.lastRun = null;
-  state.tabsInitializedFor = null;
+  state.detailsInitializedFor = null;
   state.rerunNotice = "";
   state.rerunError = "";
   state.runsList = [];
@@ -684,7 +687,7 @@ function formatRunTime(value) {
 function deleteBlockedReason(run) {
   if (run.state === "success" || run.state === "failed" || run.state === "cancelled") return "";
   if (run.state === "unresolved") return "External effects require reconciliation before deletion.";
-  if (run.state === "queued" || run.state === "running") return "This run cannot be deleted before it ends.";
+  if (run.state === "queued" || run.state === "running") return "This delivery cannot be hidden before it ends.";
   return "Run state is unknown, so deletion is unavailable.";
 }
 
@@ -774,8 +777,8 @@ function renderRunsList() {
     const empty = document.createElement("li");
     empty.className = "muted";
     empty.textContent = state.runsNextOffset !== null
-      ? "No runs are visible in the loaded records; load more."
-      : state.runView === "deleted" ? "No deleted runs" : "No runs";
+      ? "No deliveries are visible in the loaded records; load more."
+      : state.runView === "deleted" ? "No hidden deliveries" : "No deliveries";
     list.append(empty);
   }
   for (const run of rows) list.append(buildRunItem(run));
@@ -832,7 +835,7 @@ function buildRunItem(run) {
     const tombstone = document.createElement("span");
     tombstone.className = "run-tombstone";
     tombstone.textContent =
-      `Deleted · ${formatRunTime(run.deleted_at) || "time not recorded"} · Deleted by: ${run.deleted_by || "not recorded"}`;
+      `Hidden · ${formatRunTime(run.deleted_at) || "time not recorded"} · Hidden by: ${run.deleted_by || "not recorded"}`;
     box.append(tombstone);
   }
   if (run.can_manage === true) box.append(buildRunMenu(run));
@@ -876,7 +879,7 @@ function buildRunMenu(run) {
       });
       pop.append(restore);
     } else {
-      const remove = ghostButton("Delete");
+      const remove = ghostButton("Hide from list");
       remove.setAttribute("role", "menuitem");
       const blocked = deleteBlockedReason(run);
       if (blocked) {
@@ -928,10 +931,10 @@ function buildRunMenu(run) {
     pop.textContent = "";
     const note = document.createElement("p");
     note.className = "muted small";
-    note.textContent = "Remove this run from the list. It can be restored from Deleted; models, evidence, and PRs remain.";
+    note.textContent = "Remove this run from the list. It can be restored from Hidden; models, evidence, and PRs remain.";
     const buttons = document.createElement("div");
     buttons.className = "run-menu-buttons";
-    const confirm = ghostButton("Move to Deleted");
+    const confirm = ghostButton("Hide delivery");
     const cancel = ghostButton("Cancel");
     cancel.addEventListener("click", showMenu);
     confirm.addEventListener("click", () => {
@@ -1000,32 +1003,24 @@ function runDotState(state) {
   return "idle";
 }
 
-function showUploadView() {
+function showUploadView(focus = false) {
   stopRunRead();
   state.dagRunId = null;
   state.lastRun = null;
   $("upload-view").hidden = false;
   $("detail-card").hidden = true;
+  if (focus) $("upload-heading").focus();
 }
 
 function showRunView() {
   $("upload-view").hidden = true;
   $("detail-card").hidden = false;
+  $("run-heading").focus();
   if (state.viewer) {
     requestAnimationFrame(() => {
       state.viewer.resize?.();
       state.viewer.frame();
     });
-  }
-}
-
-function selectInspectTab(name) {
-  for (const tab of ["overview", "stage", "checks", "engineering"]) {
-    const pane = $(`tab-${tab}`);
-    if (pane) pane.hidden = tab !== name;
-  }
-  for (const button of document.querySelectorAll("#inspect-tabs .tab")) {
-    button.classList.toggle("active", button.dataset.tab === name);
   }
 }
 
@@ -1290,7 +1285,7 @@ function renderStageWarnings(root, stage, note) {
 
 function buildFailureCard(failure, report) {
   const card = document.createElement("div");
-  card.className = "fail-card";
+  card.className = "failure-summary";
   const title = document.createElement("strong");
   title.textContent = failure.title || "Run failed";
   card.append(title);
@@ -1306,6 +1301,12 @@ function buildFailureCard(failure, report) {
     meaning.textContent = failure.meaning;
     card.append(meaning);
   }
+  if ((!failure.meaning || failure.kind === "unknown") && failedChecks.length) {
+    const reason = document.createElement("p");
+    reason.textContent = failedChecks[0].summary?.actual || failedChecks[0].label || "A required check failed.";
+    card.append(reason);
+  }
+  const details = expandable(card, "Failure details");
   for (const [label, value] of [
     ["Error code", failure.error_code],
     ["Phase", failure.phase],
@@ -1315,56 +1316,56 @@ function buildFailureCard(failure, report) {
     if (value === undefined || value === null || value === "") continue;
     const line = document.createElement("p");
     line.textContent = `${label}: ${value}`;
-    card.append(line);
+    details.append(line);
   }
   if (failure.values && typeof failure.values === "object") {
     const line = document.createElement("p");
     line.className = "muted small";
     line.textContent = `Recorded values: ${inlineValue(failure.values)}`;
-    card.append(line);
-    appendEvidence(card, "Recorded failure values", failure.values);
+    details.append(line);
+    appendEvidence(details, "Recorded failure values", failure.values);
   }
   if (failedChecks.length) {
     const heading = document.createElement("p");
     heading.textContent = `Failed automatic checks (${failedChecks.length}):`;
-    card.append(heading);
+    details.append(heading);
     for (const row of failedChecks.slice(0, 5)) {
       const line = document.createElement("p");
       line.className = "muted small";
       const message = row.summary && row.summary.actual ? row.summary.actual : "Failed";
       line.textContent = `${row.label || row.id || "Check"}: ${message}`;
-      card.append(line);
+      details.append(line);
     }
     if (failedChecks.length > 5) {
       const more = document.createElement("p");
       more.className = "muted small";
       more.textContent = `${failedChecks.length - 5} more checks failed; see the stage checks below for per-item evidence.`;
-      card.append(more);
+      details.append(more);
     }
     if (failedChecks.some((row) => String(row.id || "").startsWith("source."))) {
       const hint = document.createElement("p");
       hint.className = "muted small";
       hint.textContent =
         "A source-evidence check failed. Use the failed checks and raw evidence to distinguish missing input, inconsistent provenance, or a discovery defect.";
-      card.append(hint);
+      details.append(hint);
     } else {
       const detail = document.createElement("p");
       detail.className = "muted small";
       detail.textContent = "See Raw evidence in the stage checks below for per-item evidence.";
-      card.append(detail);
+      details.append(detail);
     }
   }
   if (warningCount > 0) {
     const warnings = document.createElement("p");
     warnings.className = "muted small";
     warnings.textContent = `This stage has ${warningCount} recorded warnings. Warnings are neither passes nor acceptance/publication evidence.`;
-    card.append(warnings);
+    details.append(warnings);
   }
   if (failure.kind === "definition" || failure.kind === "runtime") {
     const kind = document.createElement("p");
     kind.className = "muted small";
     kind.textContent = failure.kind === "definition" ? "Class: engineering-definition check" : "Class: runtime issue";
-    card.append(kind);
+    details.append(kind);
   }
   if (Array.isArray(failure.finding_counts) && failure.finding_counts.length) {
     const groups = document.createElement("p");
@@ -1375,13 +1376,13 @@ function buildFailureCard(failure, report) {
       shown.map((group) => `${group.label || group.code} x ${group.count}`).join(", ") +
       (failure.finding_counts.length > shown.length ? "..." : "") +
       (failure.finding_total ? ` (${failure.finding_total} total; expand the issue list below for details)` : "");
-    card.append(groups);
+    details.append(groups);
   }
   if (Array.isArray(failure.finding_counts) && failure.finding_counts.length) {
     const note = document.createElement("p");
     note.className = "muted small";
     note.textContent = "Counts describe reported findings and affected instances, not CAD defects. The issue list below is collapsed by default.";
-    card.append(note);
+    details.append(note);
     if (failure.finding_counts.some((group) => group && group.code === "discovery.link_name_missing")) {
       const hint = document.createElement("p");
       hint.className = "muted small";
@@ -1389,7 +1390,7 @@ function buildFailureCard(failure, report) {
         "discovery.link_name_missing means rigid-body ownership and naming are not proven; it does not prove that CAD has no coordinate system. " +
         "Complete the delivery definition and coordinate-system ownership in the native project. " +
         "Do not add a separate coordinate system for every supplier-internal leaf.";
-      card.append(hint);
+      details.append(hint);
       const samples = failure.finding_samples && Array.isArray(failure.finding_samples["discovery.link_name_missing"])
         ? failure.finding_samples["discovery.link_name_missing"]
         : [];
@@ -1398,7 +1399,7 @@ function buildFailureCard(failure, report) {
         const sample = document.createElement("p");
         sample.className = "muted small";
         sample.textContent = `Example objects: ${objects.join(", ")} (see the complete issue list below)`;
-        card.append(sample);
+        details.append(sample);
       }
     }
   }
@@ -1406,7 +1407,7 @@ function buildFailureCard(failure, report) {
     const stage = document.createElement("p");
     stage.className = "muted small";
     stage.textContent = `Stage: ${failure.stage_name}`;
-    card.append(stage);
+    details.append(stage);
   }
   const affected = failure.object
     ? String(failure.object)
@@ -1419,25 +1420,42 @@ function buildFailureCard(failure, report) {
   if (affected) {
     const object = document.createElement("p");
     object.textContent = `Objects: ${affected}`;
-    card.append(object);
+    details.append(object);
   }
   const raw = {};
   for (const key of ["raw_type", "raw_error", "raw_detail"]) {
     if (failure[key] !== undefined && failure[key] !== null) raw[key] = failure[key];
   }
-  if (Object.keys(raw).length) appendEvidence(card, "Raw error (diagnostic)", raw);
+  if (Object.keys(raw).length) appendEvidence(details, "Raw error (diagnostic)", raw);
   return card;
+}
+
+function beginRender(node, facts) {
+  // A DOM replacement key preserves interaction; it never supplies business facts.
+  const key = JSON.stringify(facts);
+  if (node.dataset.renderKey === key) return false;
+  node.dataset.renderKey = key;
+  node.textContent = "";
+  return true;
 }
 
 function renderStageDetail() {
   const root = $("stage-detail");
-  root.textContent = "";
-  if (!state.stages.length) {
-    root.textContent = "Report data is unavailable, so stage checks cannot be shown. Refresh or contact platform maintenance.";
+  const stage = state.stages[state.selectedStage];
+  const run = state.lastRun && state.lastRun.dag_run_id === state.dagRunId ? state.lastRun : null;
+  const warningNote = run?.report?.warnings?.note || "";
+  const quick = stage ? stageSummaryRows(stage.id, {
+    files: state.previewFiles, stage,
+    certificate: state.previewData ? state.previewData.certificate : null,
+    pr: run ? run.pr : null, subjectSha256: state.previewSubject,
+  }) : { rows: [] };
+  $("stage-selection-label").textContent = stage?.name || "";
+  if (!beginRender(root, [state.dagRunId, stage, quick, state.previewFiles, warningNote,
+    stage ? displayState(stage.state, run?.automatic) : null])) return;
+  if (!stage) {
+    root.textContent = "Stage details are not available yet.";
     return;
   }
-  const stage = state.stages[state.selectedStage];
-  if (!stage) return;
   const shownState = displayState(stage.state, state.lastRun?.automatic);
 
   const summary = document.createElement("div");
@@ -1476,16 +1494,6 @@ function renderStageDetail() {
   }
   root.append(summary);
 
-  // Lightweight per-stage preview: a data-bound summary with its necessity, so a reviewer
-  // reads the stage's outcome without expanding the raw evidence.
-  const run = state.lastRun && state.lastRun.dag_run_id === state.dagRunId ? state.lastRun : null;
-  const quick = stageSummaryRows(stage.id, {
-    files: state.previewFiles,
-    stage,
-    certificate: state.previewData ? state.previewData.certificate : null,
-    pr: run ? run.pr : null,
-    subjectSha256: state.previewSubject,
-  });
   if (quick.rows.length) {
     const block = document.createElement("div");
     block.className = "stage-quick-summary";
@@ -1528,12 +1536,7 @@ function renderStageDetail() {
     root.append(group);
   }
 
-  const reportWarnings = state.lastRun && state.lastRun.report ? state.lastRun.report.warnings : null;
-  renderStageWarnings(
-    root,
-    stage,
-    reportWarnings && typeof reportWarnings.note === "string" ? reportWarnings.note : "",
-  );
+  renderStageWarnings(root, stage, warningNote);
 
   const fileRows = (stage.files || []).map((file) => ({
     label: file.label || file.path || "File",
@@ -1858,96 +1861,64 @@ function buildActivityCard(view) {
 }
 
 function renderActivity(run) {
-  const overview = $("activity-overview");
-  const stageHost = $("activity-stage");
-  if (!overview || !stageHost) return;
-  overview.textContent = "";
-  stageHost.textContent = "";
+  const host = $("activity-overview");
+  host.textContent = "";
   if (!run || run.dag_run_id !== state.dagRunId) return;
   const view = activityView(run.activity, {
     runState: displayState(run.state, run.automatic),
     waitingMessage: run.automatic?.message || "",
     nowMs: Date.now(),
   });
-  if (view.visible) overview.append(buildActivityCard(view));
-  const selected = Array.isArray(state.stages) && Number.isInteger(state.selectedStage)
-    ? state.stages[state.selectedStage] || null
-    : null;
-  const mode = activityPlacement(view, {
-    stageId: selected ? selected.id : "",
-    stageRunning: Boolean(
-      selected && ["running", "waiting"].includes(displayState(selected.state, run.automatic)),
-    ),
-    stageFailed: Boolean(selected && selected.state === "failed"),
-  });
-  if (mode === "live" || mode === "final") {
-    stageHost.append(buildActivityCard(view));
-  } else if (mode === "note") {
-    const note = document.createElement("p");
-    note.className = "activity-note muted small";
-    note.textContent = view.state === "busy" && view.stageText && selected && view.stage !== selected.id
-      ? `Live stage is ${view.stageText}; no detailed progress is available for this stage.`
-      : "No detailed progress is available for this stage.";
-    stageHost.append(note);
-  }
+  if (view.visible) host.append(buildActivityCard(view));
 }
 
 function renderStepper() {
   const stepper = $("stages");
-  stepper.textContent = "";
-  state.stages.forEach((stage, index) => {
-    const shownState = displayState(stage.state, state.lastRun?.automatic);
-    const step = document.createElement("button");
-    step.type = "button";
-    step.className = `step ${shownState || ""}${index === state.selectedStage ? " selected" : ""}`.trim();
-    step.setAttribute("aria-pressed", index === state.selectedStage ? "true" : "false");
-    const dot = document.createElement("span");
-    dot.className = `dot ${stageDotState(shownState)}`;
-    const label = document.createElement("span");
-    label.className = "step-label";
-    label.textContent = stage.name || stage.id;
-    const meta = document.createElement("span");
-    meta.className = "step-meta";
-    if (!Number.isFinite(stage.total) || stage.total <= 0) {
-      // No recorded checks: a short neutral state word instead of a failed percentage.
-      meta.textContent = STEP_STATE_SHORT[shownState] || stage.stateLabel;
-    } else {
-      meta.textContent = `${Number.isFinite(stage.passed) ? stage.passed : 0}/${stage.total} passed`;
-    }
-    const warningCount = Number.isFinite(stage.counts.warnings) ? stage.counts.warnings : 0;
-    const tooltip = `${stage.name} · ${stage.stateLabel}${warningCount > 0 ? ` · warnings ${warningCount}` : ""}${
-      Number.isFinite(stage.total) && stage.total > 0
-        ? ` · passed ${Number.isFinite(stage.passed) ? stage.passed : 0}/${stage.total} · executed ${
-            Number.isFinite(stage.executed) ? stage.executed : 0
-          }/${stage.total}`
-        : ""
-    }`;
-    step.title = tooltip;
-    step.setAttribute("aria-label", tooltip);
-    step.append(dot, label, meta);
-    step.addEventListener("click", () => {
-      const runId = state.dagRunId;
-      try {
-        localStorage.setItem(stageSelectionKey(runId), stage.id);
-      } catch {
-        // Remembering the chosen stage is best-effort only.
+  const existing = Array.from(stepper.children);
+  if (existing.length !== state.stages.length || existing.some((node, index) => node.dataset.stage !== state.stages[index].id)) {
+    stepper.textContent = "";
+    for (const stage of state.stages) {
+      const step = document.createElement("button");
+      step.type = "button";
+      step.dataset.stage = stage.id;
+      for (const className of ["dot", "step-label", "step-meta"]) {
+        const node = document.createElement("span");
+        node.className = className;
+        step.append(node);
       }
-      state.selectedStage = index;
-      if (stageEntersPreview(stage.id) && state.previewSubject) {
-        // Entering the generate-URDF block expands the interactive preview again; the
-        // collapse control stays available for every other stage.
-        state.previewCollapsed = false;
-        try {
-          localStorage.setItem(previewCollapseKey(runId), "0");
-        } catch {
-          // best-effort persistence
+      step.addEventListener("click", () => {
+        const index = state.stages.findIndex((entry) => entry.id === step.dataset.stage);
+        if (index < 0) return;
+        const selected = state.stages[index];
+        try { localStorage.setItem(stageSelectionKey(state.dagRunId), selected.id); } catch { /* Display preference only. */ }
+        state.selectedStage = index;
+        if (stageEntersPreview(selected.id) && state.previewSubject) {
+          state.previewCollapsed = false;
+          try { localStorage.setItem(previewCollapseKey(state.dagRunId), "0"); } catch { /* Display preference only. */ }
+          applyPreviewExpansion();
         }
-        applyPreviewExpansion();
-      }
-      if (state.lastRun) renderRun(state.lastRun);
-      selectInspectTab("stage");
-    });
-    stepper.append(step);
+        if (state.lastRun) renderRun(state.lastRun);
+        $("stage-panel").open = true;
+      });
+      stepper.append(step);
+    }
+  }
+  state.stages.forEach((stage, index) => {
+    const step = stepper.children[index];
+    const shownState = displayState(stage.state, state.lastRun?.automatic);
+    const selected = index === state.selectedStage;
+    const reused = stage.reuse?.reused === true;
+    step.className = `step ${shownState || ""}${selected ? " selected" : ""}`.trim();
+    step.setAttribute("aria-pressed", selected ? "true" : "false");
+    step.children[0].className = `dot ${stageDotState(shownState)}`;
+    step.children[1].textContent = stage.name || stage.id;
+    step.children[2].textContent = reused ? "Reused" : Number.isFinite(stage.total) && stage.total > 0
+      ? `${Number.isFinite(stage.passed) ? stage.passed : 0}/${stage.total}`
+      : STEP_STATE_SHORT[shownState] || stage.stateLabel;
+    const warningCount = Number.isFinite(stage.counts.warnings) ? stage.counts.warnings : 0;
+    const label = `${stage.name} · ${reused ? "Reused" : stage.stateLabel}${warningCount ? ` · warnings ${warningCount}` : ""}`;
+    step.title = label;
+    step.setAttribute("aria-label", label);
   });
 }
 
@@ -2031,7 +2002,7 @@ function renderRerunPanel(run) {
   if (state.rerunNotice) {
     note.textContent = state.rerunNotice;
   } else if (deleted) {
-    note.textContent = "This run is deleted; restore it before rerunning.";
+    note.textContent = "This delivery is hidden; restore it before rerunning.";
   } else if (!canManage) {
     note.textContent = "Only the initiator or a platform administrator can rerun.";
   } else if (row && row.message) {
@@ -2168,6 +2139,117 @@ async function rerunFromStage(stageId) {
   }
 }
 
+function renderFindings(run, report) {
+  const findings = $("findings");
+  if (!beginRender(findings, [run.dag_run_id, run.findings, run.verification_reports, report?.failure, Boolean(report)])) return;
+  // The registered verification evidence stays directly downloadable on runs
+  // without a verified delivery (failed Windows or Linux runs); no URL hunting required.
+  const retainedReports = Array.isArray(run.verification_reports) ? run.verification_reports : [];
+  if (retainedReports.length) {
+    const item = document.createElement("li");
+    item.className = "report-download";
+    const label = document.createElement("span");
+    label.textContent = "Verification evidence:";
+    item.append(label, " ");
+    for (const entry of retainedReports) {
+      const link = document.createElement("a");
+      link.href = String(entry.url || "");
+      link.target = "_blank";
+      link.rel = "noopener";
+      link.textContent = entry.label || entry.path || "Verification evidence";
+      item.append(link, " ");
+    }
+    findings.append(item);
+  }
+  const failure = report && report.failure ? report.failure : null;
+  // The auto finding repeating the failure card's raw error would be a second
+  // red container for the same fact; show each failure once.
+  const visibleFindings = (run.findings || []).filter(
+    (finding) => !(failure && !finding.id && finding.message === failure.raw_error),
+  );
+  const codeLabels = new Map(
+    ((failure && failure.finding_counts) || []).map((group) => [group.code, group.label || group.code]),
+  );
+  const findingNameValue = (finding) => {
+    const evidence = finding && finding.evidence && typeof finding.evidence === "object" ? finding.evidence : {};
+    const detail = evidence.detail && typeof evidence.detail === "object" ? evidence.detail : {};
+    const value = typeof detail.name === "string" ? detail.name.trim() : "";
+    return value || null;
+  };
+  const renderFinding = (finding) => {
+    const item = document.createElement("li");
+    if (finding.severity && finding.severity !== "error") item.className = "warn";
+    const message = document.createElement("div");
+    // A missing robot name is not a malformed name; keep the two cases distinct.
+    message.textContent =
+      finding.id === "discovery.robot_name_invalid" && findingNameValue(finding) === null
+        ? "No robot name was read (detail.name is empty)."
+        : finding.message || "No description provided";
+    const context = document.createElement("div");
+    context.className = "object";
+    context.textContent = [finding.id, finding.stage, finding.object].filter(Boolean).join(" · ") || "—";
+    item.append(message, context);
+    if (finding.evidence && Object.keys(finding.evidence).length) {
+      const evidence = document.createElement("pre");
+      evidence.className = "object";
+      evidence.textContent = JSON.stringify(finding.evidence, null, 2);
+      expandable(item, "View evidence").append(evidence);
+    }
+    return item;
+  };
+  if (!visibleFindings.length) {
+    const item = document.createElement("li");
+    item.className = "muted";
+    item.textContent = report ? "No findings reported." : "Check results are not available yet.";
+    findings.append(item);
+  }
+  // Coded findings are grouped by their check code so a large discovery set stays a
+  // compact hierarchy with every finding retained and expandable inside its group.
+  const findingGroups = new Map();
+  for (const finding of visibleFindings) {
+    const code = finding.id || "";
+    if (!code) {
+      findings.append(renderFinding(finding));
+      continue;
+    }
+    if (!findingGroups.has(code)) findingGroups.set(code, []);
+    findingGroups.get(code).push(finding);
+  }
+  const orderedGroups = [...findingGroups.entries()].sort(
+    (a, b) => Number(b[1].some((item) => item.severity === "error")) -
+      Number(a[1].some((item) => item.severity === "error")) ||
+      b[1].length - a[1].length || a[0].localeCompare(b[0]),
+  );
+  orderedGroups.forEach(([code, items]) => {
+    const outer = document.createElement("li");
+    const section = document.createElement("details");
+    const header = document.createElement("summary");
+    let groupLabel = codeLabels.get(code) || items[0].message || code;
+    if (code === "discovery.robot_name_invalid") {
+      const missing = items.filter((finding) => findingNameValue(finding) === null).length;
+      if (missing === items.length) groupLabel = "Missing robot name";
+    }
+    header.textContent = `${groupLabel} (${items.length})`;
+    const nested = document.createElement("ul");
+    nested.className = "finding-group";
+    // Bounded first paint: a large group renders its rows only when the operator opens it.
+    let populated = false;
+    const populate = () => {
+      if (populated) return;
+      populated = true;
+      for (const finding of items) nested.append(renderFinding(finding));
+    };
+    section.addEventListener("toggle", () => {
+      if (section.open) populate();
+    });
+    section.append(header, nested);
+    outer.className = items.every((finding) => finding.severity === "warning") ? "warn" : "";
+    outer.append(section);
+    findings.append(outer);
+  });
+
+}
+
 function renderRun(run) {
   $("run-loading").hidden = true;
   $("run-content").hidden = false;
@@ -2179,11 +2261,12 @@ function renderRun(run) {
   $("run-state-label").textContent = RUN_STATES[displayState(run.state, run.automatic)] || run.state || "State unconfirmed";
   $("run-dot").className = `dot ${runDotState(displayState(run.state, run.automatic))}`;
   $("run-initiator").textContent = `Initiator: ${run.operator || run.user || "not recorded"}`;
+  $("run-purpose").textContent = purposeLabel(run.purpose);
   const deletedTag = $("run-deleted");
   const deletedAt = run.deleted_at || (listEntry && listEntry.deleted_at) || null;
   const deletedBy = run.deleted_by || (listEntry && listEntry.deleted_by) || null;
   deletedTag.textContent = deleted
-    ? `Deleted · ${formatRunTime(deletedAt) || "time not recorded"} · Deleted by: ${deletedBy || "not recorded"}`
+    ? `Hidden · ${formatRunTime(deletedAt) || "time not recorded"} · Hidden by: ${deletedBy || "not recorded"}`
     : "";
   deletedTag.hidden = !deleted;
   const actionsHost = $("run-actions");
@@ -2265,16 +2348,13 @@ function renderRun(run) {
   headline.textContent = headlineText || "";
   headline.hidden = !headlineText;
   const failureCard = $("failure-card");
-  failureCard.textContent = "";
-  if (report && report.failure) {
-    failureCard.append(buildFailureCard(report.failure, report));
-    failureCard.hidden = false;
-  } else {
-    failureCard.hidden = true;
+  if (beginRender(failureCard, [runId, report?.failure, report?.stages])) {
+    if (report?.failure) failureCard.append(buildFailureCard(report.failure, report));
   }
-  if (state.tabsInitializedFor !== runId) {
-    state.tabsInitializedFor = runId;
-    selectInspectTab(run.state === "failed" ? "stage" : "overview");
+  failureCard.hidden = !report?.failure;
+  if (state.detailsInitializedFor !== runId) {
+    state.detailsInitializedFor = runId;
+    $("stage-panel").open = run.state !== "success";
   }
 
   const retry = run.retry || {};
@@ -2325,25 +2405,6 @@ function renderRun(run) {
     chipRow.append(chip);
   }
   automatic.append(chipRow);
-  if (report) {
-    for (const stage of state.stages) {
-      const rows = [...stage.boundary, ...stage.independent];
-      if (!rows.length) continue;
-      const group = document.createElement("div");
-      group.className = "check-group";
-      const titleRow = document.createElement("h4");
-      titleRow.textContent = `${stage.name} (${countChecks(rows)})`;
-      group.append(titleRow);
-      for (const row of rows) checkRow(group, row);
-      automatic.append(group);
-    }
-  } else {
-    const note = document.createElement("p");
-    note.className = "muted small";
-    note.textContent = "Report data is unavailable, so per-check results cannot be shown. Refresh or contact platform maintenance.";
-    chipRow.append(note);
-  }
-
   const confirmations = $("confirmations");
   confirmations.textContent = "";
   const external = report && report.external_review && typeof report.external_review === "object" ? report.external_review : null;
@@ -2403,114 +2464,7 @@ function renderRun(run) {
     confirmations.append(note);
   }
 
-  const findings = $("findings");
-  findings.textContent = "";
-  // The registered verification evidence stays directly downloadable on runs
-  // without a verified delivery (failed Windows or Linux runs); no URL hunting required.
-  const retainedReports = Array.isArray(run.verification_reports) ? run.verification_reports : [];
-  if (retainedReports.length) {
-    const item = document.createElement("li");
-    item.className = "report-download";
-    const label = document.createElement("span");
-    label.textContent = "Verification evidence:";
-    item.append(label, " ");
-    for (const entry of retainedReports) {
-      const link = document.createElement("a");
-      link.href = String(entry.url || "");
-      link.target = "_blank";
-      link.rel = "noopener";
-      link.textContent = entry.label || entry.path || "Verification evidence";
-      item.append(link, " ");
-    }
-    findings.append(item);
-  }
-  const failure = report && report.failure ? report.failure : null;
-  // The auto finding repeating the failure card's raw error would be a second
-  // red container for the same fact; show each failure once.
-  const visibleFindings = (run.findings || []).filter(
-    (finding) => !(failure && !finding.id && finding.message === failure.raw_error),
-  );
-  const codeLabels = new Map(
-    ((failure && failure.finding_counts) || []).map((group) => [group.code, group.label || group.code]),
-  );
-  const findingNameValue = (finding) => {
-    const evidence = finding && finding.evidence && typeof finding.evidence === "object" ? finding.evidence : {};
-    const detail = evidence.detail && typeof evidence.detail === "object" ? evidence.detail : {};
-    const value = typeof detail.name === "string" ? detail.name.trim() : "";
-    return value || null;
-  };
-  const renderFinding = (finding) => {
-    const item = document.createElement("li");
-    if (finding.severity && finding.severity !== "error") item.className = "warn";
-    const message = document.createElement("div");
-    // A missing robot name is not a malformed name; keep the two cases distinct.
-    message.textContent =
-      finding.id === "discovery.robot_name_invalid" && findingNameValue(finding) === null
-        ? "No robot name was read (detail.name is empty)."
-        : finding.message || "No description provided";
-    const context = document.createElement("div");
-    context.className = "object";
-    context.textContent = [finding.id, finding.stage, finding.object].filter(Boolean).join(" · ") || "—";
-    item.append(message, context);
-    if (finding.evidence && Object.keys(finding.evidence).length) {
-      const evidence = document.createElement("pre");
-      evidence.className = "object";
-      evidence.textContent = JSON.stringify(finding.evidence, null, 2);
-      expandable(item, "View evidence").append(evidence);
-    }
-    return item;
-  };
-  if (!visibleFindings.length) {
-    const item = document.createElement("li");
-    item.className = "muted";
-    item.textContent = "No issues";
-    findings.append(item);
-  }
-  // Coded findings are grouped by their check code so a large discovery set stays a
-  // compact hierarchy with every finding retained and expandable inside its group.
-  const findingGroups = new Map();
-  for (const finding of visibleFindings) {
-    const code = finding.id || "";
-    if (!code) {
-      findings.append(renderFinding(finding));
-      continue;
-    }
-    if (!findingGroups.has(code)) findingGroups.set(code, []);
-    findingGroups.get(code).push(finding);
-  }
-  const orderedGroups = [...findingGroups.entries()].sort(
-    (a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]),
-  );
-  orderedGroups.forEach(([code, items], index) => {
-    const outer = document.createElement("li");
-    const section = document.createElement("details");
-    const header = document.createElement("summary");
-    let groupLabel = codeLabels.get(code) || code;
-    if (code === "discovery.robot_name_invalid") {
-      const missing = items.filter((finding) => findingNameValue(finding) === null).length;
-      if (missing === items.length) groupLabel = "Missing robot name";
-    }
-    header.textContent = `${groupLabel} (${items.length})`;
-    const nested = document.createElement("ul");
-    nested.className = "finding-group";
-    // Bounded first paint: a large group renders its rows only when the operator opens it.
-    let populated = false;
-    const populate = () => {
-      if (populated) return;
-      populated = true;
-      for (const finding of items) nested.append(renderFinding(finding));
-    };
-    section.addEventListener("toggle", () => {
-      if (section.open) populate();
-    });
-    if (index === 0 && items.length <= 12) {
-      section.open = true;
-      populate();
-    }
-    section.append(header, nested);
-    outer.append(section);
-    findings.append(outer);
-  });
+  renderFindings(run, report);
 
   const pr = $("pr");
   pr.textContent = "";
@@ -2519,7 +2473,8 @@ function renderRun(run) {
     link.href = run.pr.url;
     link.target = "_blank";
     link.rel = "noreferrer noopener";
-    link.textContent = "View PR";
+    link.textContent = "Open delivery PR";
+    link.className = "button";
     link.title = String(run.pr.url || "");
     pr.append(link);
     const stateText = document.createElement("span");
@@ -2528,7 +2483,7 @@ function renderRun(run) {
     pr.append(stateText);
     pr.hidden = false;
   } else if (automaticState === "passed") {
-    pr.textContent = "The model passed independent verification, but no PR is available yet (not created or publication failed). The verified URDF is available on the left.";
+    pr.textContent = "Verification passed. Publication has not completed.";
     pr.hidden = false;
   } else {
     pr.hidden = true;
@@ -2539,6 +2494,7 @@ function renderRun(run) {
 
 function renderPreviewDiagnostic(preview) {
   const node = $("preview-diagnostic");
+  if (!beginRender(node, [state.dagRunId, preview])) return;
   const diagnostic = previewDiagnosticState(preview);
   if (!diagnostic.visible) {
     node.hidden = true;
@@ -2752,6 +2708,7 @@ function renderRunLoading(dagRunId, unavailable = false) {
   $("run-state-label").textContent = unavailable ? "Unknown" : "Loading";
   $("run-dot").className = "dot idle";
   $("run-initiator").textContent = "";
+  $("run-purpose").textContent = "";
   for (const id of ["run-origin", "run-deleted", "pr", "retry-panel"]) $(id).hidden = true;
   $("run-actions").textContent = "";
   state.runActionsFor = null;
@@ -2762,7 +2719,7 @@ async function selectRun(dagRunId) {
   state.dagRunId = dagRunId;
   state.lastRun = null;
   state.selectedStage = null;
-  state.tabsInitializedFor = null;
+  state.detailsInitializedFor = null;
   state.rerunNotice = "";
   state.rerunError = "";
   renderRunLoading(dagRunId);
@@ -2811,14 +2768,10 @@ async function retryRun() {
 
 function wire() {
   $("new-run-button").addEventListener("click", () => {
-    showUploadView();
+    showUploadView(true);
     setError($("run-error"), "");
     void refreshRuns();
   });
-  for (const button of document.querySelectorAll("#inspect-tabs .tab")) {
-    button.addEventListener("click", () => selectInspectTab(button.dataset.tab));
-  }
-  selectInspectTab("overview");
 
   $("runs-view-active").addEventListener("click", () => setRunView("active"));
   $("runs-view-deleted").addEventListener("click", () => setRunView("deleted"));
@@ -2834,6 +2787,9 @@ function wire() {
   });
 
   $("choose-button").addEventListener("click", () => $("folder-input").click());
+  $("targets-retry").addEventListener("click", async () => {
+    if (state.folderPick) await loadTargets(state.folderPick);
+  });
 
   $("folder-input").addEventListener("change", () => {
     state.blockedPick = false;

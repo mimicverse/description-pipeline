@@ -107,8 +107,8 @@ const {
   assert.ok(byKey.get("tool_identity").includes(tool.source_sha256), "tool_identity must carry the machine digest");
   assert.equal(byKey.get("qualification_states"), "drive_sizing=unqualified, machine_qualification=not applicable");
   assert.equal(byKey.get("purpose"), "not recorded");
-  assert.equal(purposeLabel("engineering"), "engineering");
-  assert.equal(purposeLabel("inspection_preview"), "inspection_preview");
+  assert.equal(purposeLabel("engineering"), "Engineering delivery");
+  assert.equal(purposeLabel("inspection_preview"), "Inspection preview");
   assert.equal(purposeLabel("unknown"), "not recorded");
   assert.equal(infoPanelRows({ runId: "", subjectSha256: "", tool: null }).length, MACHINE_FIELD_KEYS.length + 2);
   // Every (fact_id, scope, object_id) identity renders independently in a stable

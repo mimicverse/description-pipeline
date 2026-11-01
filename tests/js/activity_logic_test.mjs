@@ -11,7 +11,6 @@ const source = readFileSync(
   "utf8",
 );
 const {
-  activityPlacement,
   activityView,
   actionText,
   countsText,
@@ -149,9 +148,6 @@ assert.equal(finalView.actionText, "Reading mates");
 assert.equal(finalView.objectText, "headM3.0.SLDASM");
 assert.ok(finalView.freshnessText.startsWith("Last activity:"), finalView.freshnessText);
 assert.equal(finalView.recent.length, 1);
-assert.equal(activityPlacement(finalView, { stageId: "capture", stageRunning: false, stageFailed: true }), "final");
-assert.equal(activityPlacement(finalView, { stageId: "capture", stageRunning: false, stageFailed: false }), "hidden");
-assert.equal(activityPlacement(finalView, { stageId: "discover", stageRunning: false, stageFailed: true }), "hidden");
 
 // The full emitted vocabulary maps to concrete labels (a slow open/rebuild call must not stay
 // at a blind 进行中); unknown codes keep the neutral fallback.
@@ -210,19 +206,6 @@ assert.equal(formatDuration(3600000 + 120000), "1h 2m");
 assert.equal(freshnessText(null, nowMs).known, false);
 assert.equal(freshnessText(new Date(nowMs - 30000).toISOString(), nowMs).text, "Updated 30s ago");
 
-// Placement: live only for the running stage's own activity; otherwise an explicit note.
-assert.equal(activityPlacement(busy, { stageId: "discover", stageRunning: true }), "live");
-assert.equal(activityPlacement(busy, { stageId: "capture", stageRunning: true }), "note");
-assert.equal(activityPlacement(busy, { stageId: "discover", stageRunning: false }), "hidden");
-assert.equal(activityPlacement(none, { stageId: "discover", stageRunning: true }), "note");
-assert.equal(
-  activityPlacement(
-    activityView({ available: false, state: "finished", recent: [] }, { runState: "success", nowMs }),
-    { stageId: "discover", stageRunning: true },
-  ),
-  "hidden",
-);
-
 // Objects stay plain strings (escaping is the DOM layer's textContent job, never HTML).
 const literal = activityView(
   {
@@ -256,7 +239,6 @@ assert.equal(authorizedWait.stateText, "Awaiting external result");
 assert.equal(authorizedWait.actionText, "");
 assert.equal(authorizedWait.countsText, "");
 assert.equal(authorizedWait.elapsedText, "");
-assert.equal(activityPlacement(authorizedWait, {stageId: "capture", stageRunning: true}), "live");
 const recordedWait = activityView({available: true, state: "busy", stage: "capture", action: {code: "capture.geometry_facts"}, counts: {done: 1, total: 111}}, {runState: "waiting", nowMs});
 assert.equal(recordedWait.state, "busy");
 assert.equal(recordedWait.countsText, "Processed 1/111");
