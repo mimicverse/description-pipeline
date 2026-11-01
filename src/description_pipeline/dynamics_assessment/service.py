@@ -14,6 +14,7 @@ from ..pipeline.contracts import ArtifactRef
 from .contracts import (
     DAG_ID,
     REQUEST_SCHEMA,
+    AssessmentAdmissionClosed,
     AssessmentConflict,
     AssessmentDisabled,
     AssessmentRequest,
@@ -74,7 +75,7 @@ class AssessmentService:
         self.runtime = runtime
         self.executor_sha256 = executor_sha256
         self.work_root = work_root
-        require(type(capacity) is int and 1 <= capacity <= 16, "Assessment capacity is invalid")
+        require(type(capacity) is int and 1 <= capacity <= 8, "Assessment capacity is invalid")
         require(type(input_limit) is int and 0 < input_limit <= 64 * 1024**2, "Assessment input limit is invalid")
         self.capacity = capacity
         self.input_limit = input_limit
@@ -127,6 +128,7 @@ class AssessmentService:
 
                 self._upload_gate = UploadGate(self.capacity)
         with self._upload_gate.slot(access.principal):
+            self.store.require_admission_open()
             if should_cancel():
                 raise AssessmentConflict("Execution input upload was cancelled")
             archive = read_archive(self.input_limit)
@@ -155,6 +157,16 @@ class AssessmentService:
                 "executor_sha256": self.executor_sha256,
             }
         )
+        original = self.store.matching_request(key, request)
+        if original is not None:
+            if self.store.latest(original) is None:
+                try:
+                    attempt = self.store.new_attempt(original)
+                    self.dispatch(attempt["attempt_id"], transport)
+                except AssessmentAdmissionClosed:
+                    pass
+            return self.get(access, original)
+        self.store.require_admission_open()
         source.verify(self.store.artifacts)
         if bundle is not None:
             manifest = self.store.artifacts.verify(bundle)
@@ -167,7 +179,6 @@ class AssessmentService:
                     admission.get("principal") == access.principal and admission.get("source_sha256") == source.sha256,
                     "Execution bundle was admitted for another operator or source",
                 )
-            self.store.platform.register_artifact(bundle)
         request_id = digest({"principal": access.principal, "key": key})
         with tempfile.TemporaryDirectory(prefix="assessment-request-", dir=self.work_root) as temporary:
             root = Path(temporary)

@@ -179,5 +179,5 @@ def seal_upload(service, access, source, archive: bytes, *, should_cancel):
             producer_tool_sha256=service.executor_sha256,
         )
         check_cancel()
-        service.store.platform.register_artifact(artifact)
+        service.store.register_input_bundle(artifact)
         return {"bundle": artifact.to_record(), "source_sha256": source.sha256, "bytes": total, "files": len(names)}

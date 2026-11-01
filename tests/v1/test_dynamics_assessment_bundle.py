@@ -6,8 +6,12 @@ import base64
 import io
 import json
 import stat
+import threading
+import time
 import unittest
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
+from unittest import mock
 
 from description_pipeline.dynamics_assessment.api import AssessmentApi
 from description_pipeline.dynamics_assessment.contracts import AssessmentConflict, dispatch_conf
@@ -40,6 +44,96 @@ def upload_api(case, archive, *, access_override=None, **extra):
 
 
 class BundleDatabaseTests(PostgresCase):
+    def test_registry_waits_for_concurrent_admission_close_and_does_not_insert(self):
+        case = build_native_case(self.database)
+        service, _executor, _access, bundle, *_ = case
+        store = service.store
+        connect = store.connect
+        closing = connect()
+        pool = ThreadPoolExecutor(max_workers=1)
+        pid_ready = threading.Event()
+        worker = {}
+
+        def observed_connect():
+            connection = connect()
+            with connection.cursor() as cursor:
+                cursor.execute("SET lock_timeout='3s'")
+            connection.commit()
+            worker["pid"] = connection.get_backend_pid()
+            pid_ready.set()
+            return connection
+
+        try:
+            with closing.cursor() as cursor:
+                cursor.execute("UPDATE admission SET state='closed' WHERE id=1")
+            with mock.patch.object(store, "connect", observed_connect):
+                future = pool.submit(store.register_input_bundle, bundle)
+                self.assertTrue(pid_ready.wait(1))
+                deadline = time.monotonic() + 1
+                waiting = False
+                while time.monotonic() < deadline:
+                    with connect() as monitor, monitor.cursor() as cursor:
+                        cursor.execute("SELECT wait_event_type FROM pg_stat_activity WHERE pid=%s", (worker["pid"],))
+                        waiting = cursor.fetchone() == ("Lock",)
+                    if waiting:
+                        break
+                    time.sleep(0.01)
+                self.assertTrue(waiting, "The registry must share-lock the actual admission row")
+                self.assertFalse(future.done())
+                closing.commit()
+                with self.assertRaisesRegex(ValueError, "admission.*closed") as rejected:
+                    future.result(timeout=2)
+                self.assertEqual(rejected.exception.retained_artifact, bundle)
+            with store.transaction() as cursor:
+                cursor.execute("SELECT count(*) FROM artifact WHERE artifact_id=%s", (bundle.artifact_id,))
+                self.assertEqual(cursor.fetchone()[0], 0)
+            store.artifacts.verify(bundle)
+        finally:
+            closing.rollback()
+            closing.close()
+            pool.shutdown(wait=True)
+
+    def test_closed_upload_rejects_before_reading_body(self):
+        case = build_native_case(self.database)
+        service, _executor, access, *_ = case
+        self.close_admission()
+
+        def unread(_limit):
+            self.fail("Closed admission must reject before archive body IO")
+
+        with self.assertRaisesRegex(ValueError, "admission.*closed"):
+            service.upload_bundle(access, "source-dag-run", unread)
+
+    def test_admission_close_during_read_preserves_sealed_input_without_registry_entry(self):
+        case = build_native_case(self.database)
+        service, _executor, access, _bundle, original_inputs, *_ = case
+        archive = archive_case(case)
+        with service.store.transaction() as cursor:
+            cursor.execute("SELECT count(*) FROM artifact")
+            before = cursor.fetchone()[0]
+
+        def read_then_close(_limit):
+            self.close_admission()
+            return archive
+
+        with self.assertRaisesRegex(ValueError, "admission.*closed") as rejected:
+            service.upload_bundle(access, "source-dag-run", read_then_close)
+        retained = getattr(rejected.exception, "retained_artifact", None)
+        self.assertIsNotNone(retained)
+        service.store.artifacts.verify(retained)
+        detached = self.root / "retained-upload"
+        service.store.artifacts.materialize(retained, detached)
+        for path in original_inputs.rglob("*"):
+            if path.is_file():
+                self.assertEqual((detached / path.relative_to(original_inputs)).read_bytes(), path.read_bytes())
+        with service.store.transaction() as cursor:
+            cursor.execute("SELECT count(*) FROM artifact")
+            self.assertEqual(cursor.fetchone()[0], before)
+            cursor.execute("SELECT count(*) FROM assessment_request")
+            self.assertEqual(cursor.fetchone()[0], 0)
+            cursor.execute("SELECT count(*) FROM assessment_attempt")
+            self.assertEqual(cursor.fetchone()[0], 0)
+
     def test_uploaded_archive_executes_real_native_run_and_independent_verify(self):
         case = build_native_case(self.database)
         service, executor, access, *_ = case

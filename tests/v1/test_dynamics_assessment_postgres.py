@@ -20,7 +20,6 @@ from description_pipeline.dynamics_assessment.contracts import (
     project_attempt,
 )
 from description_pipeline.dynamics_assessment.executor import AssessmentExecutor
-from description_pipeline.owned_process import process_identity, process_state, resource_state, terminate_owned
 from description_pipeline.dynamics_assessment.runtime import (
     ProcessLimits,
     TeleopProcess,
@@ -28,6 +27,7 @@ from description_pipeline.dynamics_assessment.runtime import (
 from description_pipeline.dynamics_assessment.service import AssessmentService
 from description_pipeline.dynamics_assessment.store import AssessmentStore
 from description_pipeline.io import canonical, digest
+from description_pipeline.owned_process import process_identity, process_state, resource_state, terminate_owned
 from tests.v1.test_dynamics_assessment_contracts import AssessmentCase, request_case
 from tests.v1.test_dynamics_assessment_runtime import fork_after_proc_listing, owned_group, reap_group
 
@@ -141,8 +141,59 @@ class PostgresCase(AssessmentCase):
         super().setUp()
         self.database = self.enterContext(database_case(self.root, self.server))
 
+    def close_admission(self):
+        with self.database[0].transaction() as cursor:
+            cursor.execute("SET LOCAL lock_timeout='2s'")
+            cursor.execute("UPDATE admission SET state='closed' WHERE id=1")
+
 
 class PostgresDatabaseTests(PostgresCase):
+    def test_closed_admission_does_not_block_original_result_commit(self):
+        store, request, root = self.database
+        attempt, owner = owned_attempt(store, request, root)
+        artifact = result(store, request, root, attempt, "failed")
+        self.close_admission()
+        finished = store.finish(
+            attempt["attempt_id"], owner, state="failed", artifact=artifact, detail={"error": "original-settlement"}
+        )
+        self.assertTrue(finished["resources_settled"])
+        self.assertEqual(store.result_artifact(attempt["attempt_id"]), artifact)
+
+    def test_closed_request_registration_does_not_register_new_artifact(self):
+        store, request, root = self.database
+        with store.transaction() as cursor:
+            cursor.execute("SELECT count(*) FROM artifact")
+            before = cursor.fetchone()[0]
+        self.close_admission()
+        with self.assertRaisesRegex(ValueError, "admission.*closed"):
+            register(store, request, root, key="closed-request")
+        with store.transaction() as cursor:
+            cursor.execute("SELECT count(*) FROM artifact")
+            self.assertEqual(cursor.fetchone()[0], before)
+            cursor.execute("SELECT count(*) FROM assessment_request")
+            self.assertEqual(cursor.fetchone()[0], 0)
+
+    def test_closed_admission_does_not_add_first_attempt(self):
+        store, request, root = self.database
+        request_id = register(store, request, root)
+        self.close_admission()
+        with self.assertRaisesRegex(ValueError, "admission.*closed"):
+            store.new_attempt(request_id)
+        self.assertIsNone(store.latest(request_id))
+
+    def test_closed_admission_does_not_add_retry_or_rewrite_original_failure(self):
+        store, request, root = self.database
+        attempt, owner = owned_attempt(store, request, root)
+        original = result(store, request, root, attempt, "failed")
+        store.finish(attempt["attempt_id"], owner, state="failed", artifact=original, detail={"error": "original"})
+        before = store.attempt(attempt["attempt_id"])
+        self.close_admission()
+        with self.assertRaisesRegex(ValueError, "admission.*closed"):
+            store.new_attempt(attempt["request_id"], retry=True)
+        self.assertEqual(store.new_attempt(attempt["request_id"])["attempt_id"], attempt["attempt_id"])
+        self.assertEqual(store.attempt(attempt["attempt_id"]), before)
+        self.assertEqual(store.result_artifact(attempt["attempt_id"]), original)
+
     def test_expired_attempt_read_preserves_database_state_and_lease(self):
         store, request, root = self.database
         attempt, _owner = owned_attempt(store, request, root)

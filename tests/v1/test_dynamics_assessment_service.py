@@ -7,7 +7,7 @@ from description_pipeline.dynamics_assessment.api import AssessmentApi
 from description_pipeline.dynamics_assessment.contracts import DAG_ID, AssessmentConflict, SourceNotReady
 from description_pipeline.dynamics_assessment.service import AssessmentAccess, AssessmentService
 from tests.v1.test_dynamics_assessment_contracts import AssessmentCase
-from tests.v1.test_dynamics_assessment_postgres import PostgresCase
+from tests.v1.test_dynamics_assessment_postgres import PostgresCase, register
 
 
 class Transport:
@@ -45,6 +45,66 @@ def configured(database):
 
 
 class ServiceDatabaseTests(PostgresCase):
+    def test_closed_admission_rejects_new_request_without_registering_artifacts(self):
+        service, access = configured(self.database)
+        with service.store.transaction() as cursor:
+            cursor.execute("SELECT count(*) FROM artifact")
+            before = cursor.fetchone()[0]
+        objects = set(service.store.artifacts.objects.iterdir())
+        self.close_admission()
+        with self.assertRaisesRegex(ValueError, "admission.*closed"):
+            service.create(access, "source-dag-run", "closed-new", None, Transport())
+        self.assertEqual(set(service.store.artifacts.objects.iterdir()), objects)
+        with service.store.transaction() as cursor:
+            cursor.execute("SELECT count(*) FROM artifact")
+            self.assertEqual(cursor.fetchone()[0], before)
+            cursor.execute("SELECT count(*) FROM assessment_request")
+            self.assertEqual(cursor.fetchone()[0], 0)
+
+    def test_closed_incomplete_registration_replays_then_resumes_only_after_open(self):
+        service, access = configured(self.database)
+        store, request, root = self.database
+        request_id = register(store, request, root, key="incomplete")
+        self.close_admission()
+        transport = Transport()
+        replay = service.create(access, "source-dag-run", "incomplete", None, transport)
+        self.assertEqual(replay["request_id"], request_id)
+        self.assertIsNone(replay["attempt"])
+        self.assertEqual(transport.sends, 0)
+        with store.transaction() as cursor:
+            cursor.execute("UPDATE admission SET state='open' WHERE id=1")
+        resumed = service.create(access, "source-dag-run", "incomplete", None, transport)
+        self.assertEqual(resumed["request_id"], request_id)
+        self.assertEqual(resumed["attempt"]["attempt_number"], 1)
+        self.assertEqual(transport.sends, 1)
+
+    def test_closed_admission_preserves_existing_cancel_and_dispatch_reconciliation(self):
+        service, access = configured(self.database)
+        transport = Transport()
+        public = service.create(access, "source-dag-run", "existing-settlement", None, transport)
+        attempt_id = public["attempt"]["attempt_id"]
+        original = service.store.request(public["request_id"]).to_record()
+        self.close_admission()
+        reconciled = service.reconcile_dispatch(access, attempt_id, transport)
+        self.assertEqual(reconciled["attempt"]["state"], "queued")
+        self.assertTrue(reconciled["attempt"]["dispatch_accepted"])
+        cancelled = service.cancel(access, attempt_id)
+        self.assertEqual(cancelled["attempt"]["state"], "cancelled")
+        self.assertTrue(cancelled["attempt"]["resources_settled"])
+        self.assertEqual(service.store.request(public["request_id"]).to_record(), original)
+        self.assertEqual(transport.sends, 1)
+
+    def test_closed_admission_replays_original_registered_request_without_dispatch(self):
+        service, access = configured(self.database)
+        transport = Transport(accepted=False)
+        public = service.create(access, "source-dag-run", "closed-replay", None, transport)
+        service.reconcile_dispatch(access, public["attempt"]["attempt_id"], transport)
+        self.close_admission()
+        repeated = service.create(access, "source-dag-run", "closed-replay", None, transport)
+        self.assertEqual(repeated["attempt"]["attempt_id"], public["attempt"]["attempt_id"])
+        self.assertEqual(repeated["attempt"]["state"], "registered")
+        self.assertEqual(transport.sends, 1)
+
     def test_accepted_dispatch_cannot_be_forgotten_after_repeated_authoritative_absence(self):
         service, access = configured(self.database)
         transport = Transport()
@@ -133,6 +193,8 @@ class ServiceDatabaseTests(PostgresCase):
         assert resolved["attempt"]["state"] == "registered" and transport.sends == 1
         repeated = service.create(access, "source-dag-run", "absent-reply", None, transport)
         assert repeated["attempt"]["attempt_id"] == public["attempt"]["attempt_id"]
+        self.assertEqual(transport.sends, 1)
+        service.dispatch_registered(access, public["attempt"]["attempt_id"], transport)
         assert transport.sends == 2
 
     def test_wrong_observed_conf_stays_unknown_and_cannot_create_new_attempt(self):
@@ -190,6 +252,11 @@ class ServiceDatabaseTests(PostgresCase):
 
 
 class ServiceTests(AssessmentCase):
+    def test_capacity_matches_platform_one_to_eight_contract(self):
+        self.assertEqual(AssessmentService(None, capacity=8).capacity, 8)
+        with self.assertRaisesRegex(ValueError, "capacity"):
+            AssessmentService(None, capacity=9)
+
     def test_disabled_feature_has_no_database_source_or_dispatch_side_effects(self):
 
         def forbidden(*_args):

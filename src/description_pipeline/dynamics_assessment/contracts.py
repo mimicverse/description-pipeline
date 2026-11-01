@@ -40,6 +40,17 @@ class AssessmentDisabled(AssessmentError):
     """The optional assessment feature is disabled."""
 
 
+class AssessmentAdmissionClosed(AssessmentConflict):
+    """New business is closed; existing facts and sealed evidence remain intact."""
+
+    def __init__(self, retained_artifact: ArtifactRef | None = None):
+        self.retained_artifact = retained_artifact
+        message = "Platform admission is closed"
+        if retained_artifact is not None:
+            message += "; sealed input evidence retained: " + retained_artifact.artifact_id
+        super().__init__(message)
+
+
 class SourceNotReady(AssessmentError):
     """An authorized source has no complete engineering artifact/certificate pair yet."""
 

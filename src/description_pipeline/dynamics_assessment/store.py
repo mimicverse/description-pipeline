@@ -13,6 +13,7 @@ from ..platform.facts import FactStore
 from .contracts import (
     RESULT_SCHEMA,
     TERMINAL_STATES,
+    AssessmentAdmissionClosed,
     AssessmentConflict,
     AssessmentRequest,
     auxiliary_dag_run_id,
@@ -51,6 +52,19 @@ def _detail_update(detail: dict) -> str:
     return json.dumps(detail, allow_nan=False)
 
 
+def _require_admission_open(cursor) -> None:
+    cursor.execute("SELECT state FROM admission WHERE id=1 FOR SHARE")
+    if cursor.fetchone() != ("open",):
+        raise AssessmentAdmissionClosed()
+
+
+def _latest_attempt(cursor, request_id: str) -> dict | None:
+    cursor.execute(
+        "SELECT * FROM assessment_attempt WHERE request_id=%s ORDER BY attempt_number DESC LIMIT 1", (request_id,)
+    )
+    return _row(cursor)
+
+
 class AssessmentStore:
     """Reuse the platform artifact registry; store no duplicate artifact bytes."""
 
@@ -68,6 +82,40 @@ class AssessmentStore:
         finally:
             connection.close()
 
+    def require_admission_open(self) -> None:
+        """Check before input IO, releasing the row lock before reading the body."""
+        with self.transaction() as cursor:
+            _require_admission_open(cursor)
+
+    def register_input_bundle(self, artifact: ArtifactRef) -> ArtifactRef:
+        """Register sealed input atomically with the one admission row lock."""
+        require(
+            artifact.kind == "dynamics_execution_bundle" and artifact.producer_stage is None,
+            "Assessment input must be a sealed execution bundle",
+        )
+        try:
+            with self.transaction() as cursor:
+                _require_admission_open(cursor)
+                return self.platform._insert_artifact(cursor, artifact)
+        except AssessmentAdmissionClosed as error:
+            raise AssessmentAdmissionClosed(artifact) from error
+
+    def matching_request(self, key: str, request: AssessmentRequest) -> str | None:
+        """Find the immutable original without re-registering input or dispatching."""
+        principal = request.record["principal"]
+        request_id = digest({"principal": principal, "key": key})
+        with self.transaction() as cursor:
+            cursor.execute(
+                "SELECT request_id,request_sha256 FROM assessment_request WHERE principal=%s AND idempotency_key=%s",
+                (principal, key),
+            )
+            existing = cursor.fetchone()
+        if existing is None:
+            return None
+        if existing != (request_id, request.sha256):
+            raise AssessmentConflict("Assessment idempotency key names another immutable request")
+        return request_id
+
     def register(self, key: str, request: AssessmentRequest, artifact: ArtifactRef) -> str:
         text(key, "Assessment idempotency key")
         require(len(key) <= 128, "Assessment idempotency key is too long")
@@ -83,7 +131,6 @@ class AssessmentStore:
             "Registered request bytes differ from their identity",
         )
         self.artifacts.verify(artifact)
-        self.platform.register_artifact(artifact)
         principal = request.record["principal"]
         request_id = digest({"principal": principal, "key": key})
         require(artifact.producer_run_id == request_id, "Request artifact belongs to another assessment")
@@ -98,8 +145,10 @@ class AssessmentStore:
                 if existing != (request_id, request.sha256, artifact.artifact_id):
                     raise AssessmentConflict("Assessment idempotency key names another immutable request")
                 return request_id
-            cursor.execute("SELECT state FROM admission WHERE id=1 FOR SHARE")
-            require(cursor.fetchone() == ("open",), "Platform admission is closed")
+            _require_admission_open(cursor)
+            if request.bundle is not None:
+                self.platform._insert_artifact(cursor, request.bundle)
+            self.platform._insert_artifact(cursor, artifact)
             cursor.execute(
                 "INSERT INTO assessment_request(request_id,principal,idempotency_key,source_run_id,"
                 "request_sha256,request_artifact_id) VALUES(%s,%s,%s,%s,%s,%s) "
@@ -146,13 +195,14 @@ class AssessmentStore:
     def new_attempt(self, request_id: str, *, retry: bool = False) -> dict:
         self.request(request_id)
         with self.transaction() as cursor:
+            previous = _latest_attempt(cursor, request_id)
+            if previous is not None and not retry:
+                return previous
+            # New work takes the admission lock before its request row lock.
+            _require_admission_open(cursor)
             cursor.execute("SELECT request_id FROM assessment_request WHERE request_id=%s FOR UPDATE", (request_id,))
             require(cursor.fetchone() is not None, "Assessment request does not exist")
-            cursor.execute(
-                "SELECT * FROM assessment_attempt WHERE request_id=%s ORDER BY attempt_number DESC LIMIT 1",
-                (request_id,),
-            )
-            previous = _row(cursor)
+            previous = _latest_attempt(cursor, request_id)
             if previous is not None:
                 if not retry:
                     return previous
@@ -185,17 +235,12 @@ class AssessmentStore:
 
     def latest(self, request_id: str) -> dict | None:
         with self.transaction() as cursor:
-            cursor.execute(
-                "SELECT * FROM assessment_attempt WHERE request_id=%s ORDER BY attempt_number DESC LIMIT 1",
-                (request_id,),
-            )
-            latest = _row(cursor)
+            latest = _latest_attempt(cursor, request_id)
         return self.attempt(latest["attempt_id"]) if latest is not None else None
 
     def begin_dispatch(self, attempt_id: str) -> bool:
         with self.transaction() as cursor:
-            cursor.execute("SELECT state FROM admission WHERE id=1 FOR SHARE")
-            require(cursor.fetchone() == ("open",), "Platform admission is closed")
+            _require_admission_open(cursor)
             cursor.execute(
                 "UPDATE assessment_attempt SET state='dispatching',"
                 "detail=detail-'dispatch_observation',updated_at=now() "
