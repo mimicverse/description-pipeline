@@ -296,6 +296,11 @@ def derive(
             },
             sort_keys=True,
         )
+    if "assessment" in operator:
+        assessment = dict(operator["assessment"])
+        if assessment["enabled"]:
+            assessment["root"] = str(Path(state_root) / "assessments")
+        env["ASSESSMENT_CONFIG_JSON"] = json.dumps(assessment, sort_keys=True)
     # The one env encoding (render_operator.encode_env_lines): values that are not shell-safe
     # - the libpq DSNs' "&" and "?" above all - are single-quoted so that a shell `source`
     # and the KEY=VALUE parser read the identical bytes.

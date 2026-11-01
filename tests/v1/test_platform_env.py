@@ -99,6 +99,26 @@ def platform_document(root: Path) -> dict:
 
 
 class PlatformEnvTests(unittest.TestCase):
+    def test_assessment_environment_uses_the_validated_snapshot(self):
+        for value in ({"enabled": False},
+                      {"enabled": True, "python": "/opt/teleop/bin/python", "capacity": 2,
+                       "limits": {"wall_seconds": 60, "memory_bytes": 2147483648,
+                                  "cpu_seconds": 120, "output_bytes": 16777216}}):
+            with self.subTest(value=value):
+                snapshot = json.loads(json.dumps(self.snapshot))
+                snapshot["resolved"]["operator"]["assessment"] = value
+                path = self.root / "assessment-snapshot.json"
+                path.write_bytes(pipeline_io.canonical(snapshot))
+                result = platform_env.derive(
+                    path.read_bytes(), install_id="gen-1", snapshot_path=path,
+                    tree_root=self.tree, release=self.release, wheel=self.wheel,
+                )
+                actual = json.loads(result["env"]["ASSESSMENT_CONFIG_JSON"])
+                expected = dict(value)
+                if value["enabled"]:
+                    expected["root"] = str(self.root / "state" / "assessments")
+                self.assertEqual(actual, expected)
+
     def test_teleop_snapshot_derives_the_same_portal_configuration(self):
         snapshot = json.loads(json.dumps(self.snapshot))
         snapshot["resolved"]["operator"]["teleop"] = {"python": "/opt/teleop/bin/python", "capacity": 2}

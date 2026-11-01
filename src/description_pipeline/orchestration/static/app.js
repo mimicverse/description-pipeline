@@ -2048,6 +2048,7 @@ async function rerunFromStage(stageId) {
   if (!run || !runId || !row || row.eligible !== true || run.can_manage !== true || run.deleted || state.rerunningRunId !== null) return;
   const draft = stageRerunDraft(run, row);
   if (draft.error) return;
+  const newlyPrepared = !draft.key;
   if (!draft.key) {
     if (draft.body.simulation !== undefined) {
       try { JSON.parse(draft.body.simulation); } catch {
@@ -2059,6 +2060,7 @@ async function rerunFromStage(stageId) {
   try {
     sessionStorage.setItem(rerunStorageKey(runId, stageId), JSON.stringify(draft));
   } catch {
+    if (newlyPrepared) draft.key = null;
     state.rerunError = "The browser could not preserve this request. No stage request was sent.";
     renderRerunPanel(run); return;
   }

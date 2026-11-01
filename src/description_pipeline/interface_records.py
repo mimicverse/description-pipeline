@@ -758,7 +758,9 @@ def validate_config_snapshot(snapshot) -> dict:
     operator = resolved["operator"]
     _exact_keys(
         operator,
-        {"origin", "certificate_file", "private_key_file"} | ({"teleop"} if "teleop" in operator else set()),
+        {"origin", "certificate_file", "private_key_file"}
+        | ({"teleop"} if "teleop" in operator else set())
+        | ({"assessment"} if "assessment" in operator else set()),
         code,
         "resolved.operator",
     )
@@ -771,6 +773,24 @@ def validate_config_snapshot(snapshot) -> dict:
             code,
             {"where": "resolved.operator.teleop.capacity"},
         )
+    if "assessment" in operator:
+        assessment = operator["assessment"]
+        _require(isinstance(assessment, dict) and type(assessment.get("enabled")) is bool,
+                 code, {"where": "resolved.operator.assessment.enabled"})
+        keys = {"enabled", "python", "capacity", "limits"} if assessment["enabled"] else {"enabled"}
+        _exact_keys(assessment, keys, code, "resolved.operator.assessment")
+        if assessment["enabled"]:
+            _absolute_path(assessment["python"], code, "resolved.operator.assessment.python")
+            _require(type(assessment["capacity"]) is int and 1 <= assessment["capacity"] <= 8,
+                     code, {"where": "resolved.operator.assessment.capacity"})
+            limits = assessment["limits"]
+            names = {"wall_seconds", "memory_bytes", "cpu_seconds", "output_bytes"}
+            _exact_keys(limits, names, code, "resolved.operator.assessment.limits")
+            _require(type(limits["wall_seconds"]) in (int, float) and 0 < limits["wall_seconds"] <= 86400,
+                     code, {"where": "resolved.operator.assessment.limits.wall_seconds"})
+            for name in names - {"wall_seconds"}:
+                _require(type(limits[name]) is int and limits[name] > 0,
+                         code, {"where": "resolved.operator.assessment.limits." + name})
     match = _ORIGIN.match(operator["origin"] if isinstance(operator["origin"], str) else "")
     _require(match is not None, code, {"where": "resolved.operator.origin"})
     origin_port = int(match.group(2)) if match.group(2) else 443

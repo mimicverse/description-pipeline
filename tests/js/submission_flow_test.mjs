@@ -260,6 +260,18 @@ for (const stage of ["freeze", "discover", "capture", "generate", "verify", "mjc
   assert.equal(calls[2].body, first.body);
   assert.equal(p.storage.size, 0, "Acknowledged requests release the browser transport record");
 }
+// Storage failure happens before transport and does not freeze an unsent draft.
+{
+  const p = page(); let calls = 0;
+  const run = { dag_run_id: "storage-failure", can_manage: true,
+    stage_reruns: [{stage: "publish", name: "Publish", eligible: true}] };
+  p.app.state.dagRunId = run.dag_run_id; p.app.state.lastRun = run;
+  p.context.sessionStorage.setItem = () => { throw new Error("Storage unavailable"); };
+  p.context.fetch = async () => { calls++; return response(500, {}); };
+  await p.app.rerunFromStage("publish");
+  assert.equal(calls, 0); assert.equal(p.app.stageRerunDraft(run, run.stage_reruns[0]).key, null);
+  assert.match(p.app.state.rerunError, /No stage request was sent/);
+}
 // An explicitly selected downstream endpoint becomes part of the immutable body.
 {
   const p = page(); let sent;

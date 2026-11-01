@@ -174,7 +174,7 @@ def validate_platform(document) -> dict:
     )
 
     operator = document["operator"]
-    require_keys(operator, allowed=_OPERATOR_KEYS | {"teleop"}, required=_OPERATOR_KEYS, where="operator")
+    require_keys(operator, allowed=_OPERATOR_KEYS | {"teleop", "assessment"}, required=_OPERATOR_KEYS, where="operator")
     origin = text(operator["origin"], "operator.origin")
     match = _ORIGIN.match(origin)
     require(match is not None, f"operator.origin must be an https origin, got {origin!r}")
@@ -190,6 +190,28 @@ def validate_platform(document) -> dict:
             type(teleop["capacity"]) is int and 1 <= teleop["capacity"] <= 8,
             "operator.teleop.capacity must be between 1 and 8",
         )
+
+    assessment = operator.get("assessment")
+    if "assessment" in operator:
+        require_keys(assessment, allowed={"enabled", "python", "capacity", "limits"},
+                     required={"enabled"}, where="operator.assessment")
+        require(type(assessment["enabled"]) is bool, "operator.assessment.enabled must be a boolean")
+        if assessment["enabled"]:
+            require_keys(assessment, allowed={"enabled", "python", "capacity", "limits"},
+                         required={"enabled", "python", "capacity", "limits"}, where="operator.assessment")
+            absolute_path(assessment["python"], "operator.assessment.python")
+            require(type(assessment["capacity"]) is int and 1 <= assessment["capacity"] <= 8,
+                    "operator.assessment.capacity must be between 1 and 8")
+            limits = assessment["limits"]
+            names = {"wall_seconds", "memory_bytes", "cpu_seconds", "output_bytes"}
+            require_keys(limits, allowed=names, required=names, where="operator.assessment.limits")
+            require(type(limits["wall_seconds"]) in (int, float) and 0 < limits["wall_seconds"] <= 86400,
+                    "operator.assessment.limits.wall_seconds is invalid")
+            for name in names - {"wall_seconds"}:
+                require(type(limits[name]) is int and limits[name] > 0,
+                        "operator.assessment.limits." + name + " must be a positive integer")
+        else:
+            require(set(assessment) == {"enabled"}, "Disabled assessment must not carry execution settings")
 
     storage = document["storage"]
     require_keys(storage, allowed=set(_STORAGE_KEYS), required=set(_STORAGE_KEYS), where="storage")
@@ -300,6 +322,7 @@ def validate_platform(document) -> dict:
             "certificate_file": str(operator["certificate_file"]),
             "private_key_file": str(operator["private_key_file"]),
             **({"teleop": dict(teleop)} if teleop is not None else {}),
+            **({"assessment": dict(assessment)} if assessment is not None else {}),
         },
         "storage": {name: str(storage_paths[name]) for name in _STORAGE_KEYS},
         "database": {"dsn_file": str(database["dsn_file"])},
