@@ -664,8 +664,7 @@ class PortalConfig:
     #: One production ingestion closure over the shared StageApplication, artifact
     #: store, native operation client and immutable config snapshot.
     production_admission_loader: Callable[[Any], Any] | None = None
-    production_freeze_successor_loader: Callable[[Any], Any] | None = None
-    production_mjcf_successor_loader: Callable[[Any], Any] | None = None
+    production_stage_rerun_loader: Callable[[Any], Any] | None = None
     production_application: Any | None = None
     production_native_client: Any | None = None
     production_config_snapshot: Path | None = None
@@ -724,7 +723,6 @@ def _production_admission_runtime(
 ) -> tuple[
     Callable[[Any], Any] | None,
     Callable[[Any], Any] | None,
-    Callable[[Any], Any] | None,
     Any | None,
     Any | None,
     Path | None,
@@ -774,7 +772,7 @@ def _production_admission_runtime(
             NativeOperationToolProvider,
         )
         from ..pipeline.ingestion import load_production_admission
-        from ..pipeline.ingestion import load_production_freeze_successor
+        from ..pipeline.ingestion import load_production_stage_rerun
         from ..pipeline.native_target import (
             load_registered_native_target,
         )
@@ -811,25 +809,13 @@ def _production_admission_runtime(
             work_root=work_root,
         )
 
-    def load_successor(request):
-        return load_production_freeze_successor(
-            application,
-            request,
-            artifacts=artifacts,
-            platform_snapshot=snapshot,
-            native_tool_provider=tool_provider,
-            work_root=work_root,
-        )
-
-    def load_mjcf_successor(request):
-        from ..pipeline.ingestion import load_production_mjcf_successor
-
-        return load_production_mjcf_successor(
+    def load_stage_rerun(request):
+        return load_production_stage_rerun(
             application, request, artifacts=artifacts, platform_snapshot=snapshot,
             native_tool_provider=tool_provider, work_root=work_root,
         )
 
-    return load, load_successor, load_mjcf_successor, application, client, snapshot
+    return load, load_stage_rerun, application, client, snapshot
 
 
 def load_portal_config(path: Path) -> PortalConfig:
@@ -863,8 +849,7 @@ def load_portal_config(path: Path) -> PortalConfig:
             )
     (
         production_loader,
-        production_freeze_successor_loader,
-        production_mjcf_successor_loader,
+        production_stage_rerun_loader,
         production_application,
         production_native_client,
         production_snapshot,
@@ -879,8 +864,7 @@ def load_portal_config(path: Path) -> PortalConfig:
         pipeline_repositories=pipeline_repositories,
         pipeline_targets=pipeline_targets,
         production_admission_loader=production_loader,
-        production_freeze_successor_loader=production_freeze_successor_loader,
-        production_mjcf_successor_loader=production_mjcf_successor_loader,
+        production_stage_rerun_loader=production_stage_rerun_loader,
         production_application=production_application,
         production_native_client=production_native_client,
         production_config_snapshot=production_snapshot,
@@ -2402,9 +2386,9 @@ class PortalApp:
             **self._metadata_overlay(dag_run_id),
         }
         if isinstance(projection, dict):
-            payload["stage_reruns"] = [
-                self._freeze_successor_row(projection), self._mjcf_successor_row(projection, principal=principal),
-            ]
+            payload["stage_reruns"] = self._stage_rerun_rows(projection["run_id"], principal)
+            payload["execution_scope"] = projection.get("execution_scope")
+            payload["delivery_complete"] = projection.get("delivery_complete") is True
         return _json_response(start_response, 200, payload, self.config)
 
     def _retry_run(self, environ: dict, start_response: Callable, dag_run_id: str) -> Iterable[bytes]:
@@ -2557,384 +2541,23 @@ class PortalApp:
         )
 
     # ------------------------------------------------------------- rerun
-    @staticmethod
-    def _freeze_successor_row(projection: dict) -> dict:
-        request = projection.get("request")
-        request = request if isinstance(request, Mapping) else {}
-        stages = projection.get("stages")
-        stages = stages if isinstance(stages, Mapping) else {}
-        freeze = stages.get("freeze")
-        freeze = freeze if isinstance(freeze, Mapping) else {}
-        originals = request.get("originals")
-        originals = originals if isinstance(originals, Mapping) else {}
-        members = originals.get("members")
-        options = sorted(
-            {
-                item.get("path")
-                for item in members or ()
-                if isinstance(item, Mapping)
-                and isinstance(item.get("path"), str)
-                and item["path"].casefold().endswith(".sldasm")
-            }
-        )
-        eligible = bool(
-            freeze.get("state") == StageStatus.COMPLETED.value
-            and options
-            and request.get("from_stage") != "mjcf"
-            and request.get("purpose") in REQUEST_PURPOSES
-            and isinstance(request.get("target_hardware"), str)
-            and isinstance(request.get("change_summary"), str)
-        )
-        return {
-            "stage": "freeze",
-            "name": _STAGE_NAMES["freeze"],
-            "eligible": eligible,
-            "reason": "ready" if eligible else "sealed_freeze_unavailable",
-            "message": (
-                "Create a new request from the sealed CAD originals under the "
-                "current rules, configuration, target and native release."
-                if eligible
-                else "Open the original source run to create a new Freeze request."
-                if request.get("from_stage") == "mjcf"
-                else "A completed sealed Freeze closure is required to create a new request."
-            ),
-            "main_assembly_options": options,
-            "recomputes": list(_STAGE_IDS),
-            "retains": [
-                {
-                    "availability": "sealed",
-                    "label": "Parent Freeze CAD originals",
-                }
+    def _stage_rerun_rows(self, source_run_id: str, principal: str) -> list[dict]:
+        application = self.config.production_application
+        if application is None:
+            return [
+                {"stage": stage, "name": _STAGE_NAMES[stage], "eligible": False,
+                 "reason": "stage_rerun_unavailable", "message": "Stage rerun service is unavailable."}
+                for stage in _STAGE_IDS
             ]
-            if eligible
-            else [],
-            "prerequisites": {
-                "inputs": "ok" if eligible else "missing",
-                "tool": "current" if eligible else "missing",
-                "dependency": "sealed" if eligible else "missing",
-                "target": "current" if eligible else "missing",
-                "receipt": "ok" if eligible else "missing",
-                "earliest_required": "freeze",
-            },
-        }
+        return application.stage_rerun_options(source_run_id, principal)
 
-    def _mjcf_successor_row(self, projection: dict, *, principal: str | None = None) -> dict:
-        """Describe the restricted entry; the application rechecks every source fact."""
-        request = projection.get("request") or {}
-        source_id = request.get("parent_run_id") if request.get("from_stage") == "mjcf" else projection["run_id"]
-        source = self._read_projection(source_id) if source_id != projection["run_id"] else projection
-        verify = ((source or {}).get("stages") or {}).get("verify") or {}
-        eligible = bool(
-            source and source.get("state") in {"succeeded", "failed", "cancelled"}
-            and (source.get("scope") or {}).get("kind") == "formal"
-            and verify.get("state") == "completed" and verify.get("formal_eligible") is True
-        )
-        owner_matches = principal is None or principal == ((source or {}).get("request") or {}).get("principal")
-        eligible = eligible and owner_matches
-        return {
-            "stage": "mjcf", "name": _STAGE_NAMES["mjcf"], "eligible": eligible,
-            "reason": ("ready" if eligible else "source_owner_mismatch"
-                       if not owner_matches else "verified_source_unavailable"),
-            "message": "Reuse the verified URDF and meshes; rerun MJCF and publication in a new request."
-                       if eligible else "Only the original initiator can rerun MJCF over this source."
-                       if not owner_matches
-                       else "A settled formal run with a qualified URDF verification is required.",
-            "source_run_id": source_id, "source_dag_run_id": (source or {}).get("request_id"),
-            "simulation": request.get("simulation", "{}\n"),
-            "recomputes": ["mjcf", "publish"],
-            "retains": [{"label": "Verified URDF and meshes", "availability": "sealed"}] if eligible else [],
-        }
-
-    def _mjcf_successor_attempt(
-        self, start_response, session, principal, dag_run_id, body, submission_key,
-    ):
-        """Admit and dispatch a new immutable MJCF request over its original URDF source."""
-        with self._rerun_lock:
-            if self._metadata_overlay(dag_run_id)["deleted"]:
-                return self._rerun_refusal(start_response, "deleted", "Restore the run before rerunning", None)
-            projection = self._read_projection(native_run_id(dag_run_id))
-            if projection is None:
-                return self._rerun_refusal(
-                    start_response, "registration_missing", "Canonical run facts are unavailable", None,
-                )
-            row = self._mjcf_successor_row(projection, principal=principal)
-            if row["eligible"] is not True:
-                return self._rerun_refusal(start_response, row["reason"], row["message"], "freeze")
-            loader = self.config.production_mjcf_successor_loader
-            application = self.config.production_application
-            if not callable(loader) or application is None:
-                raise PortalError(HTTPStatus.SERVICE_UNAVAILABLE, "MJCF successor composition is unavailable")
-            new_dag_run_id = "portal-mjcf-" + submission_key
-            new_run_id = native_run_id(new_dag_run_id)
-            request = projection["request"]
-            try:
-                from ..pipeline.ingestion import ProductionMJCFSuccessorRequest
-
-                existing = application.load_admission_outcome(new_run_id)
-                outcome = loader(ProductionMJCFSuccessorRequest(
-                    run_id=new_run_id, request_id=new_dag_run_id, parent_run_id=row["source_run_id"],
-                    principal=principal, change_summary=body.get("change_summary", request["change_summary"]),
-                    simulation=body.get("simulation", row["simulation"]),
-                ))
-            except Exception as error:
-                return self._rerun_refusal(
-                    start_response, str(getattr(error, "code", "admission_refused")), str(error)[:512], None,
-                )
-            command = getattr(outcome, "dispatch_command", None)
-            if command is None or command.run_id != new_run_id or command.dag_run_id != new_dag_run_id:
-                return self._rerun_refusal(
-                    start_response, "admission_identity_mismatch", "MJCF dispatch identity differs", None,
-                )
-            try:
-                dispatched = self._dispatch_technical(session, command.command_id, retry_absent=existing is not None)
-            except AirflowAuthError as error:
-                raise PortalError(HTTPStatus.UNAUTHORIZED, "Feishu session expired; sign in again") from error
-            except (AirflowApiError, PipelineError, ValueError) as error:
-                return self._rerun_refusal(start_response, "dispatch_start_unconfirmed", str(error)[:512], None)
-            if dispatched.state is not EffectState.SATISFIED:
-                return _json_response(start_response, HTTPStatus.BAD_GATEWAY, {
-                    "error": "Start state is unconfirmed; reconcile the registered dispatch effect.",
-                    "dag_run_id": new_dag_run_id, "trigger": dispatched.state.value,
-                }, self.config)
-        return self._accepted_attempt(start_response, new_dag_run_id, row["source_dag_run_id"], "mjcf", "queued")
-
-    @staticmethod
-    def _attempt_payload(new_run_id: str, parent_dag_run_id: str, stage: str, state: str) -> dict:
-        return {
-            "dag_run_id": new_run_id,
-            "parent_dag_run_id": parent_dag_run_id,
-            "resume_from": stage,
-            "resume_from_name": _STAGE_NAMES.get(stage, stage),
-            "state": state,
-        }
-
-    def _accepted_attempt(
-        self, start_response: Callable, attempt_id: str, parent_dag_run_id: str, stage: str, state: object
-    ) -> Iterable[bytes]:
-        return _json_response(
-            start_response,
-            HTTPStatus.ACCEPTED,
-            self._attempt_payload(attempt_id, parent_dag_run_id, stage, _optional_str(state) or "queued"),
-            self.config,
-        )
-
-    def _rerun_refusal(
-        self,
-        start_response: Callable,
-        reason: str,
-        message: str,
-        earliest_required: str | None,
-        *,
-        active_dag_run_id: str | None = None,
-    ) -> Iterable[bytes]:
-        payload = {
-            "error": message,
-            "reason": reason,
-            "message": message,
-            "earliest_required": earliest_required,
-        }
-        if active_dag_run_id is not None:
-            payload["active_dag_run_id"] = active_dag_run_id
-        return _json_response(start_response, HTTPStatus.CONFLICT, payload, self.config)
-
-    def _freeze_successor_attempt(
-        self,
-        start_response: Callable,
-        session: PortalSession,
-        principal: str,
-        dag_run_id: str,
-        body: dict,
-        submission_key: str,
-    ) -> Iterable[bytes]:
-        """Create one current-generation request from a completed parent Freeze."""
-
-        with self._rerun_lock:
-            if self._metadata_overlay(dag_run_id)["deleted"]:
-                return self._rerun_refusal(
-                    start_response,
-                    "deleted",
-                    "Deleted runs cannot be reused; restore first",
-                    None,
-                )
-            parent_run_id = native_run_id(dag_run_id)
-            projection = self._read_projection(parent_run_id)
-            if projection is None:
-                return self._rerun_refusal(
-                    start_response,
-                    "registration_missing",
-                    "The parent run has no canonical admission facts",
-                    None,
-                )
-            row = self._freeze_successor_row(projection)
-            if row.get("eligible") is not True:
-                return self._rerun_refusal(
-                    start_response,
-                    str(row.get("reason") or "sealed_freeze_unavailable"),
-                    str(row.get("message") or "The parent Freeze closure is unavailable"),
-                    "freeze",
-                )
-            parent_request = projection.get("request")
-            parent_request = (
-                parent_request if isinstance(parent_request, Mapping) else {}
-            )
-            scope = projection.get("scope")
-            if not isinstance(scope, Mapping) or scope.get("kind") != "formal":
-                return self._rerun_refusal(
-                    start_response,
-                    "diagnostic_parent",
-                    "A diagnostic run cannot create a formal successor",
-                    None,
-                )
-
-            target_hardware = (
-                body.get("target_hardware")
-                if "target_hardware" in body
-                else parent_request.get("target_hardware")
-            )
-            if (
-                not isinstance(target_hardware, str)
-                or target_hardware not in (self.config.pipeline_targets or {})
-            ):
-                raise PortalError(
-                    HTTPStatus.BAD_REQUEST,
-                    "Publication target is required and must be configured",
-                )
-            change_summary = (
-                body.get("change_summary")
-                if "change_summary" in body
-                else parent_request.get("change_summary")
-            )
-            change_summary = (
-                normalize_change_summary(change_summary).strip()
-                if isinstance(change_summary, str)
-                else ""
-            )
-            if not change_summary:
-                raise PortalError(
-                    HTTPStatus.BAD_REQUEST,
-                    "Change summary is required when creating a new request",
-                )
-            purpose = parent_request.get("purpose")
-            if purpose not in REQUEST_PURPOSES:
-                return self._rerun_refusal(
-                    start_response,
-                    "incomplete",
-                    "The parent run has no valid frozen purpose",
-                    None,
-                )
-            options = row["main_assembly_options"]
-            main_assembly = (
-                body.get("main_assembly")
-                if "main_assembly" in body
-                else parent_request.get("main_assembly")
-            )
-            if not isinstance(main_assembly, str) or main_assembly not in options:
-                raise PortalError(
-                    HTTPStatus.BAD_REQUEST,
-                    "Select a main assembly from the parent's sealed Freeze originals",
-                )
-
-            new_dag_run_id = "portal-freeze-" + submission_key
-            new_run_id = native_run_id(new_dag_run_id)
-            loader = self.config.production_freeze_successor_loader
-            if not callable(loader) or self.config.production_application is None:
-                raise PortalError(
-                    HTTPStatus.SERVICE_UNAVAILABLE,
-                    "The production Freeze successor composition is unavailable",
-                )
-            try:
-                from ..pipeline.ingestion import (
-                    ProductionFreezeSuccessorRequest,
-                )
-
-                existing_outcome = self.config.production_application.load_admission_outcome(new_run_id)
-                outcome = loader(
-                    ProductionFreezeSuccessorRequest(
-                        run_id=new_run_id,
-                        request_id=new_dag_run_id,
-                        parent_run_id=parent_run_id,
-                        main_assembly=main_assembly,
-                        target_hardware=target_hardware,
-                        purpose=purpose,
-                        change_summary=change_summary,
-                        principal=principal,
-                    )
-                )
-            except Exception as error:
-                code = str(getattr(error, "code", ""))
-                if code == "admission_ingestion.intent_conflict":
-                    return self._rerun_refusal(
-                        start_response,
-                        "attempt_mismatch",
-                        "A new request with this identity already exists with different parameters",
-                        None,
-                    )
-                return self._rerun_refusal(
-                    start_response,
-                    code or "admission_refused",
-                    str(error)[:512],
-                    None,
-                )
-            dispatch_command = getattr(outcome, "dispatch_command", None)
-            if (
-                dispatch_command is None
-                or getattr(dispatch_command, "run_id", None) != new_run_id
-                or getattr(dispatch_command, "dag_run_id", None) != new_dag_run_id
-            ):
-                return self._rerun_refusal(
-                    start_response,
-                    "admission_identity_mismatch",
-                    "The new request returned another dispatch identity",
-                    None,
-                )
-            try:
-                dispatch_result = self._dispatch_technical(
-                    session,
-                    dispatch_command.command_id,
-                    retry_absent=existing_outcome is not None,
-                )
-            except AirflowAuthError as error:
-                raise PortalError(
-                    HTTPStatus.UNAUTHORIZED,
-                    "Feishu session expired; sign in again",
-                ) from error
-            except (AirflowApiError, PipelineError, ValueError) as error:
-                return self._rerun_refusal(
-                    start_response,
-                    "dispatch_start_unconfirmed",
-                    str(error)[:512],
-                    None,
-                )
-            if dispatch_result.state is not EffectState.SATISFIED:
-                return _json_response(
-                    start_response,
-                    HTTPStatus.BAD_GATEWAY,
-                    {
-                        "error": (
-                            "Start state is unconfirmed; do not submit again. "
-                            "Reconcile the registered dispatch effect."
-                        ),
-                        "dag_run_id": new_dag_run_id,
-                        "trigger": dispatch_result.state.value,
-                    },
-                    self.config,
-                )
-        log.info(
-            "portal freeze successor parent=%s child=%s principal=%s",
-            dag_run_id,
-            new_dag_run_id,
-            principal,
-        )
-        return self._accepted_attempt(
-            start_response,
-            new_dag_run_id,
-            dag_run_id,
-            "freeze",
-            "queued",
-        )
+    def _rerun_refusal(self, start_response, reason: str, message: str) -> Iterable[bytes]:
+        return _json_response(start_response, HTTPStatus.CONFLICT, {
+            "error": message, "reason": reason, "message": message,
+        }, self.config)
 
     def _rerun_attempt(self, environ: dict, start_response: Callable, dag_run_id: str) -> Iterable[bytes]:
-        """Create a new formal request only from a verified parent Freeze closure."""
+        """Admit a new immutable execution range over verified sealed inputs."""
         session = self._session(environ, csrf=True)
         principal = session.principal or ""
         if not principal:
@@ -2944,63 +2567,79 @@ class PortalApp:
         submission_key = str(environ.get("HTTP_IDEMPOTENCY_KEY") or "").strip()
         if not submission_key or _RUN_ID.fullmatch(submission_key) is None or len(submission_key) > 110:
             raise PortalError(
-                HTTPStatus.BAD_REQUEST,
-                "Idempotency-Key must be a non-empty safe identifier of at most 110 characters",
+                HTTPStatus.BAD_REQUEST, "Idempotency-Key must be a safe identifier of at most 110 characters"
             )
         body = self._body(environ)
-        stage = body.get("stage")
-        keys = ({"stage", "change_summary", "simulation"} if stage == "mjcf" else
-                {"stage", "target_hardware", "change_summary", "main_assembly"})
-        if set(body) - keys or stage not in {"freeze", "mjcf"}:
-            raise PortalError(
-                HTTPStatus.BAD_REQUEST,
-                "New requests must start from Freeze or the restricted MJCF entry",
-            )
-        for key in ("target_hardware", "change_summary", "main_assembly", "simulation"):
-            if key in body and not isinstance(body[key], str):
-                raise PortalError(
-                    HTTPStatus.BAD_REQUEST,
-                    "Only text request parameters are accepted",
-                )
+        if set(body) - {"from_stage", "through_stage", "change_summary", "main_assembly", "simulation"}:
+            raise PortalError(HTTPStatus.BAD_REQUEST, "Stage rerun parameters are invalid")
+        stage = body.get("from_stage")
+        through = body.get("through_stage", stage)
+        if stage not in _STAGE_IDS or through not in _STAGE_IDS or _STAGE_IDS.index(through) < _STAGE_IDS.index(stage):
+            raise PortalError(HTTPStatus.BAD_REQUEST, "Stage rerun execution range is invalid")
+        for name in ("change_summary", "main_assembly", "simulation"):
+            if name in body and not isinstance(body[name], str):
+                raise PortalError(HTTPStatus.BAD_REQUEST, "Stage rerun parameters must be text")
         try:
-            airflow_run = self.config.airflow.dag_run(
-                session.token,
-                self.config.dag_id,
-                dag_run_id,
-            )
-            if not self._can_manage(session, airflow_run):
-                raise PortalError(
-                    HTTPStatus.FORBIDDEN,
-                    "Only the initiator or a platform administrator can create a new request",
-                )
+            airflow_run = self.config.airflow.dag_run(session.token, self.config.dag_id, dag_run_id)
         except AirflowAuthError as error:
-            forbidden = (
-                isinstance(error.__cause__, urlerror.HTTPError)
-                and error.__cause__.code == 403
-            )
-            raise PortalError(
-                HTTPStatus.FORBIDDEN if forbidden else HTTPStatus.UNAUTHORIZED,
-                str(error),
-            ) from error
+            raise PortalError(HTTPStatus.UNAUTHORIZED, "Feishu session expired; sign in again") from error
         except AirflowApiError as error:
-            code = (
-                error.__cause__.code
-                if isinstance(error.__cause__, urlerror.HTTPError)
-                else None
-            )
-            raise PortalError(
-                code if code in {404, 409} else HTTPStatus.BAD_GATEWAY,
-                str(error),
-            ) from error
-        attempt = self._mjcf_successor_attempt if stage == "mjcf" else self._freeze_successor_attempt
-        return attempt(
-            start_response,
-            session,
-            principal,
-            dag_run_id,
-            body,
-            submission_key,
-        )
+            raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
+        if not self._can_manage(session, airflow_run):
+            raise PortalError(HTTPStatus.FORBIDDEN, "Only the initiator or a platform administrator can rerun a stage")
+        loader = self.config.production_stage_rerun_loader
+        application = self.config.production_application
+        if loader is None or application is None:
+            raise PortalError(HTTPStatus.SERVICE_UNAVAILABLE, "Stage rerun composition is unavailable")
+        with self._rerun_lock:
+            if self._metadata_overlay(dag_run_id)["deleted"]:
+                return self._rerun_refusal(start_response, "deleted", "Restore the delivery before rerunning a stage")
+            source_id = native_run_id(dag_run_id)
+            projection = self._read_projection(source_id)
+            if projection is None:
+                return self._rerun_refusal(
+                    start_response, "registration_missing", "Canonical source facts are unavailable"
+                )
+            new_dag_run_id = "portal-" + stage + "-" + submission_key
+            new_run_id = native_run_id(new_dag_run_id)
+            from ..pipeline.ingestion import ProductionStageRerunRequest
+
+            try:
+                existing = application.load_admission_outcome(new_run_id)
+                outcome = loader(ProductionStageRerunRequest(
+                    run_id=new_run_id, request_id=new_dag_run_id, parent_run_id=source_id,
+                    principal=principal, from_stage=stage, through_stage=through,
+                    change_summary=body.get("change_summary", projection["request"]["change_summary"]),
+                    main_assembly=body.get("main_assembly"), simulation=body.get("simulation"),
+                ))
+            except (PipelineError, ValueError) as error:
+                return self._rerun_refusal(
+                    start_response, str(getattr(error, "code", "admission_refused")), str(error)[:512]
+                )
+            command = outcome.dispatch_command
+            if command.run_id != new_run_id or command.dag_run_id != new_dag_run_id:
+                return self._rerun_refusal(
+                    start_response, "admission_identity_mismatch", "Stage dispatch identity differs"
+                )
+            try:
+                dispatched = self._dispatch_technical(session, command.command_id, retry_absent=existing is not None)
+            except AirflowAuthError as error:
+                raise PortalError(HTTPStatus.UNAUTHORIZED, "Feishu session expired; sign in again") from error
+            except (AirflowApiError, PipelineError, ValueError) as error:
+                return _json_response(start_response, HTTPStatus.BAD_GATEWAY, {
+                    "error": str(error)[:512], "dag_run_id": new_dag_run_id,
+                    "reason": "dispatch_start_unconfirmed",
+                }, self.config)
+            settled = dispatched.state is EffectState.SATISFIED
+        return _json_response(start_response, HTTPStatus.ACCEPTED if settled else HTTPStatus.BAD_GATEWAY, {
+            "dag_run_id": new_dag_run_id, "parent_dag_run_id": dag_run_id,
+            "resume_from": stage, "resume_from_name": _STAGE_NAMES[stage],
+            "through_stage": through, "state": "queued" if settled else "unresolved",
+            "trigger": dispatched.state.value,
+            **({} if settled else {
+                "error": "Start state is unconfirmed; retry this same immutable request to reconcile it."
+            }),
+        }, self.config)
 
     # --------------------------------------------------------------- preview
     def _authorize_run(self, session: PortalSession, dag_run_id: str) -> str:
@@ -3060,8 +2699,9 @@ class PortalApp:
             return projection
         try:
             command = StageCommand.from_record(command_record)
-            if command.run_id != projection["run_id"]:
-                raise PipelineError("MJCF entry command belongs to another run")
+            producer_run = (row.get("reuse") or {}).get("source_run", projection["run_id"])
+            if command.run_id != producer_run:
+                raise PipelineError("MJCF command differs from its registered source producer")
             refs = mjcf_source_refs(command)
             by_stage = dict(projection.get("by_stage") or {})
             members = dict(projection.get("members") or {})

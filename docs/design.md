@@ -75,7 +75,7 @@ CAD 有值时先读取、保留和检查，再按有据规则修正。规则不�
 
 完整上传、选定原生依赖闭包、prepared package、artifact 集合、tool source、完整 tool record 和交付 subject 的摘要属于不同语义域。逐域核验，不能因两个摘要不同就认定内容冲突，也不能以其中一个代替另一个。
 
-新的 CAD 输入从 Freeze 接纳；仅转换重跑可使用受限 `from_stage=mjcf` 后继。首次上传封存新 originals；Freeze successor 仅复用父运行已验证的 originals，当前请求、规则、配置、目标、Git 基线和工具要求重新封存，重新执行七阶段。Freeze successor 不得继承父运行下游 decision 或成功资格。同一已登记命令的受控重试与新建运行是两种操作，详见[状态与恢复](contracts.md#recovery)。
+新的 CAD 输入按 Freeze→Publish 完整接纳；七阶段均可用同一后继机制独立重跑。不可变请求以 `from_stage/through_stage` 封存实际执行范围，单阶段默认两者相同。范围前的必要来源逐项核验并保留真实 producer，不复制为本次决定；范围后的旧成功不继承。独立新结果可继续建立新的验证/发布后继，仍通过同一 application/FactStore/engine。范围成功与交付完成分别表达。同 command 只恢复原执行，不改旧终态或工具。详见[状态与恢复](contracts.md#recovery)。
 
 门户每次有意新建请求使用新的 `Idempotency-Key`；结果未确认时保留同一键重试，不能由相同表单值推断这是旧请求。运行列表来自已接纳事实，尚未创建 Airflow DagRun 的请求同样可见；详情及重试读取原不可变请求。浏览器只维护当前请求的读取生命周期，列表、分页和详情的过期响应不得覆盖新读取；读取失败撤下旧成功与预览，不据缓存重判业务状态。
 
@@ -175,6 +175,6 @@ CAD 排他来自实际资源所有权，不来自 Airflow 并发数字。只能�
 
 MJCF 后继固定直接引用原始完整运行的 Generate/Capture/Verify 闭包，保留来源字节、用途、所有者、规则与平台身份；不追踪多跳后继链。接纳、claim、candidate 提交和 Publish 各自重验来源及 effect 结算。碰撞代理和仿真参数是带来源 warning 的派生策略，不回写 URDF，不建立第二规范化机器人模型。
 
-`execution_stage_ids` 从不可变 `from_stage` 推导范围；共同查询给出 `execution_scope`，复用上游的 command/decision 为 null，真实来源位于 source/reuse。Portal 仅渲染。Airflow 保持七任务，MJCF 使用 `none_failed`，MJCF 后继的上游五任务 skipped；调度跳过不能代替 FactStore 前驱资格。
+`execution_stage_ids` 从不可变 `from_stage/through_stage` 推导范围；共同查询给出 `execution_scope` 与 `delivery_complete`。复用上游的真实来源位于 source/reuse，本次 command/decision 不伪造；未执行后缀标为 out_of_scope。Portal 只渲染共同事实。Airflow 保持同一七任务图并从该范围决定跳过和执行；调度 skipped 不能代替 FactStore 前驱资格。
 
 执行中取消复用共同引擎及原 claim/fence，保全候选与原失败；已完成决定不改写，UNKNOWN/CONFLICT 先对账。具体锁序、通知及请求身份见[系统契约](contracts.md#受限-mjcf-后继与执行范围)，本层不维护另一套终态或执行范围。

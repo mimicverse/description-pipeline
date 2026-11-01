@@ -31,6 +31,12 @@ Teleop 提供唯一的 PICO 解码、稳定中性标定、clutch、IK、限位/�
 
 新增 SQL 会话属于交互业务事实，独立于阶段决策。数据库 advisory lock 与本机文件锁分别保证唯一主管和目录所有权。维护 admission 关闭后拒绝新会话并停止现有 worker；生命周期排空包含活动/未决会话。录制进入原有 artifact 表及恢复引用集合，不建立第二份产物状态库。
 
+## 接口身份与失败恢复
+
+交互消费者的 schema 分别为 `solidworks-to-urdf.teleop-runtime/v1`、`solidworks-to-urdf.teleop-recording/v1`、`solidworks-to-urdf.recording-verification/v1`，由同一 `simulation/schemas.py` 定义，生产者、录制器与验证器共同使用，不接纳退役 namespace。
+
+启动探针失败须释放自有文件锁；取消等待数据库锁时，要回收实际取得的连接和锁。缺少可核验 process identity 时保持未知，不能当作已退出；主管遗留的不完整录制保留原 runtime，不改绑定为当前工具。正常退出、失败、UNKNOWN 与录制完整性分别展示，后续新包不覆盖原失败证据。
+
 ## 固定运行环境
 
 服务端使用 Python 3.12、MuJoCo 3.13.0，Teleop 固定源为 `8b402482559c02534668bf2cb4338c0b8d628e14`。`simulation/teleop-runtime.json` 绑定本次审查 wheel 的 SHA-256 与全部包文件，启动时拒绝 editable 或字节漂移。平台保留 NumPy 2.5.3；worker 按独立 lock 使用 NumPy 2.4.1 / Pin 4.1.0。

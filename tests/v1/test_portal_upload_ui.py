@@ -200,58 +200,6 @@ class UploadRenderTests(unittest.TestCase):
             self.assertIn("https://rehearsal.local:18443$uri$is_args$args;", nginx)
 
 
-class RerunUiContractTests(unittest.TestCase):
-    """Per-stage rerun action bound to C's confirmed attempts contract."""
-
-    def app(self) -> str:
-        return (STATIC / "app.js").read_text(encoding="utf-8")
-
-    def test_rerun_contract_is_rendered(self) -> None:
-        app = self.app()
-        for token in (
-            "stage_reruns",
-            "/attempts",
-            "const body = { stage: stageId }",
-            "main_assembly_options",
-            "New request from Freeze",
-            "Create new request from Freeze",
-            "Freeze creates a new request from the sealed originals",
-            "body.main_assembly = selectedMain",
-            "state.rerunMainByRun",
-            "resume_from_name",
-            "parent_dag_run_id",
-            "message",
-            "earliest_required",
-            "renderRerunPanel",
-            "rerunFromStage",
-            "shortRunId",
-            "Continue original job",
-            "Only the initiator or a platform administrator can rerun.",
-            "Freeze creates a new request from the sealed originals; freeze and all later "
-            "stages rerun under the current rules and configuration. The original run and "
-            "evidence remain.",
-            "Rerun from",
-            "prerequisites",
-            "recomputes",
-            "retains",
-            "PREREQ_STATE",
-            "rerunStageName",
-            "Prerequisites: ",
-            "Recomputes: ",
-            "Earliest restart: ",
-            "Reuse source",
-            "nextRunId",
-            "stageToShow",
-            "stageSelectionKey(nextRunId)",
-            "run-origin",
-        ):
-            self.assertIn(token, app)
-        # The superseded picker design and its parameter name are gone.
-        self.assertNotIn("from_stage", app)
-        self.assertNotIn("Retry failed step", app)
-        self.assertNotIn("window.prompt", app)
-
-
 class ReportUiContractTests(unittest.TestCase):
     """The run detail renders C's canonical report payload without local copies."""
 

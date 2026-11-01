@@ -56,3 +56,16 @@ GRANT SELECT ON
     :"platform_schema".effect_fact,
     :"platform_schema".execution_claim
     TO operator_ro;
+
+-- Optional assessment facts reuse the service identity and immutable artifact registry.
+GRANT SELECT, INSERT ON
+    :"platform_schema".assessment_request,
+    :"platform_schema".assessment_attempt
+    TO platform_service;
+GRANT UPDATE (state, owner_token, owner_process, lease_until, process,
+              cancel_requested, resources_settled, result_artifact_id, detail, updated_at)
+    ON :"platform_schema".assessment_attempt TO platform_service;
+GRANT SELECT ON
+    :"platform_schema".assessment_request,
+    :"platform_schema".assessment_attempt
+    TO operator_ro;

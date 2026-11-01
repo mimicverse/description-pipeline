@@ -150,6 +150,10 @@ print(json.dumps(sorted(
                 "numpy==2.5.3",
                 "jsonschema==4.26.0",
                 "python-multipart==0.0.32",
+                "starlette==1.6.0",
+                "uvicorn==0.52.4",
+                "a2wsgi==1.10.10",
+                "websockets==16.1.1",
             },
         )
         self.assertEqual(project["scripts"], {"description": "description_pipeline.cli:main"})

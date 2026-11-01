@@ -399,3 +399,40 @@ CREATE TABLE IF NOT EXISTS :"platform_schema".simulation_command (
     created_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (session_id, command_id)
 );
+
+-- Optional dynamics requests and owned attempts are independent of engineering decisions.
+CREATE TABLE IF NOT EXISTS :"platform_schema".assessment_request (
+    request_id text PRIMARY KEY CHECK (request_id ~ '^[0-9a-f]{64}$'),
+    principal text NOT NULL CHECK (principal <> ''),
+    idempotency_key text NOT NULL CHECK (length(idempotency_key) BETWEEN 1 AND 128),
+    source_run_id text NOT NULL REFERENCES :"platform_schema".run_admission(run_id),
+    request_sha256 char(64) NOT NULL CHECK (request_sha256 ~ '^[0-9a-f]{64}$'),
+    request_artifact_id text NOT NULL REFERENCES :"platform_schema".artifact(artifact_id),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE(principal,idempotency_key)
+);
+CREATE TABLE IF NOT EXISTS :"platform_schema".assessment_attempt (
+    attempt_id text PRIMARY KEY CHECK (attempt_id ~ '^[0-9a-f]{64}$'),
+    request_id text NOT NULL REFERENCES :"platform_schema".assessment_request(request_id),
+    attempt_number integer NOT NULL CHECK (attempt_number > 0),
+    dag_run_id text NOT NULL UNIQUE,
+    state text NOT NULL CHECK (state IN (
+        'registered','dispatching','queued','running','verifying','sealing','unknown',
+        'completed','unsupported','failed','cancelled','timeout'
+    )),
+    owner_token char(64) CHECK (owner_token ~ '^[0-9a-f]{64}$'),
+    owner_process jsonb,
+    lease_until timestamptz,
+    process jsonb,
+    cancel_requested boolean NOT NULL DEFAULT false,
+    resources_settled boolean NOT NULL DEFAULT false,
+    result_artifact_id text REFERENCES :"platform_schema".artifact(artifact_id),
+    detail jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE(request_id,attempt_number),
+    CHECK ((owner_token IS NULL) = (owner_process IS NULL)),
+    CHECK (state NOT IN ('running','verifying','sealing')
+           OR (owner_token IS NOT NULL AND lease_until IS NOT NULL)),
+    CHECK (resources_settled = (state IN ('completed','unsupported','failed','cancelled','timeout')))
+);

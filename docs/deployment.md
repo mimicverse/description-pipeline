@@ -237,17 +237,7 @@ fact/decision、不取消外部操作。401/403、`native_operation_identity_mis
    `native_target_mismatch` 保持同一 wait 继续 poll，不得切换到其他 operation。
 6. 必要来源缺失、未授权包外来源、错误配置、坏证据及验证失败阻断下游；获准的已知缺失引用须保留详细 warning 后继续，诊断与未验证预览的身份清晰。
    发布失败保留验证结果，未知外部结果通过对账恢复。
-7. 新 CAD 输入与 Freeze successor 从 `freeze` 接纳；Freeze successor 只复用父运行已验证
-   `freeze_originals`，当前 rules/config/target/Git/native requirement 与双端工具
-   重新封存，不继承父 Discover 及后续 decision、成功或 qualification。仅转换重跑使用
-   直接绑定原始 Verify 闭包的受限 MJCF 后继，旧下游决定不复制。已登记 command
-   的安全重试保留原证据时间、producer、effect 及封存请求身份；当前执行权按
-   canonical claim 规则取得新 fence，不改写外部请求中的旧 fence。删除/恢复显示
-   台账不移除证据。每次 successor/claim/decision/send 都重算 immediate 与 supporting
-   predecessor qualification、result/failure metadata 和 effect ledger；跨运行复用只
-   经已验证父 Freeze originals 或直接绑定原始 Verify 的受限 MJCF 后继进行。
-   服务重启后请求、历史、准入和发布状态从 canonical facts 经唯一共同业务 projector
-   恢复；单个诊断目标不能计入正式七阶段。
+7. 新 CAD 输入按 Freeze→Publish 完整接纳；七阶段均可通过统一的有界后继独立重跑，默认只执行所选阶段。新请求封存 `from_stage/through_stage`，复核必要前缀的原件、command/decision、producer、证书和完整 effect；不复制本次范围及其下游的旧成功。输入变化从受影响的最早阶段重新建立结果，独立新结果可继续后续验证及发布。已有 command 的安全恢复保留原 tool、target、effect 与原失败；UNKNOWN 先精确对账。服务重启仍从 canonical facts 与共同 projector 恢复，界面区分范围成功与完整交付，不以 skipped 或 diagnostic 取得正式资格。
 8. 使用实际连接写入端与正式健康/DAG消费者验证同一配置引用，并证明切换后已冻结运行的配置身份不变；演练首次安装、启停和第二主机安装失败，注入配置漂移，核对仓库规则允许追加且禁止非 fast-forward，完成凭据轮换及备份恢复；全部维护路径使用同一生命周期和资源域。
 9. 为 native 输入传输注入一种可恢复窗口：原 operation 已 accepted、input 未 admitted、
    传输响应丢失。验证只有同一 command/effect/envelope/request/payload/archive/tool 且
@@ -290,18 +280,7 @@ fact/decision、不取消外部操作。401/403、`native_operation_identity_mis
 
 操作员在同一入口明确选择工程或检查预览用途；冻结记录使用唯一 `request/v2` 并保留选择。逐组核验输入、原工程请求、本次转换/发布请求、运行、两份独立证书、实际关节预览与 `main` 候选 PR 的绑定，不能跨用途代跑。MJCF 后继保留原工程请求字节，当前说明从本次 Publish intent 核对，不要求与父 `input/request.json.change_summary` 相等。两种用途均以当前 CAD 和明确的适用规则建立交付；检查预览可按[用途契约](contracts.md#purpose)的 `inspection_rotation_full_turn/v1` 使用全周窗口，必须验证适用条件并显式显示原生范围缺项与策略来源，不得抄入手工结果或冒称机械限位。已有有效 CAD 范围不得被窗口覆盖。缺失驱动按 `drive.missing_zero/v1` 填零占位，明确显示平台默认来源及驱动能力未建立；报告、URDF、预览和 PR 一致显示参数来源与资格。必需检查和原生事实要求不因用途减弱。不同用途的候选与发布恢复身份按[发布协议](contracts.md#publication)隔离。
 
-需要从已有运行改用封存 CAD 原件时，`/api/runs/<parent>/attempts` 的 CAD 重跑使用
-`stage=freeze`，调用 `load_production_freeze_successor(...)`。该入口通过
-`StageApplication.load_verified_freeze_origins(parent)` 重验父 Freeze
-decision/result、`inputs.json`、originals ref 和 CAS bytes，只复用
-`spec.originals`；当前 rules、config snapshot、target、RepositorySnapshot、Git
-baseline、native requirement、portable/native closure 与七阶段 executor 重新接纳，
-随后调用同一 `StageApplication.admit`。返回的 technical dispatch command 交给同一
-`StageApplication.dispatch(command_id, adapter)` facade；facade 内的
-`TechnicalDispatchService` 先取得 claim/fence、提交 `dispatch_authorized`，再调用
-Airflow trigger。实际 Freeze task 只绑定启动后的真实 task context，不授权自己的
-创建。Portal 不接收或构造 `VerifiedArtifact`，不实例化第二 Factory，不保留 Discover
-及后续阶段任意起点旁路；受限 MJCF 重跑单独固定到原始 Verify 来源。
+从已有运行重跑阶段时，`/api/runs/<parent>/attempts` 提交 `from_stage/through_stage`，调用唯一 `load_production_stage_rerun(...)`。Freeze 只复用已核 originals；其他阶段沿同一来源职责核验实际必要前缀及 producer。所有入口仍经 `StageApplication.admit/dispatch`、共同 claim/fence 与 technical dispatch 授权。Portal 不构造 `VerifiedArtifact`，不创建第二 Factory，不把 GUI 的 eligible 或调度 skipped 当作资格。提交响应未知时保留同一正文、幂等键和原 DagRun，刷新后继续精确对账；不能编辑待确认正文并另建执行。
 
 方向验收绑定本次 CAD、规则版本、固定代码提交及实际交付：先核对全部关节的原值、作者声明绑定、必要坐标转换和未解决项，再通过门户预览执行有效范围内的非零运动，验证 CAD 运动语义、零位及范围的一致性。当前不发布基于右手定则或功能动作的新正向推导规则，历史试算不作为通过证据。必须注入共享 `status=local_class_aligned` 而作者正向证据仍缺失的负例，证明 Discovery、Generate、独立验证、模型来源、URDF、报告、预览和 PR 均保留同一
 `direction.semantics_unresolved` warning；同时核对 axis／xyz／rpy／limits、封存
@@ -445,6 +424,6 @@ sealed archive/receipt 消费、独立 `admit_capture`/`verify_transfer` 和资�
 
 Linux 发行必须包含锁定的 MuJoCo 运行依赖、官方 WASM/JS、许可证及完整浏览器资源，逐文件绑定实际包与服务字节。Windows 不新增 MuJoCo 或碰撞依赖。转换和独立检查各在有 CPU、内存及时限的子进程执行。默认组件凸包策略为 config schema 2、256顶点预算、相对源组件凸包 `0.00025 m` 质量门，每次独立计算；不冒称凹 CAD 表面完整等价。
 
-正式验收补充：从新 Freeze 完成七阶段并同时交付 URDF/MJCF；单独 MJCF 重跑在无 CAD endpoint/token 的新进程和实际 Airflow 中执行，上游五任务 skipped、仅 MJCF/Publish 产生新决定；核验来源与原终态不变。覆盖转换失败、执行中取消、UNKNOWN、来源冲突和误标 skipped 不放行 Publish。页面只渲染共同范围，复用标记、键盘名称、阶段证据和来源链接一致。
+正式验收补充：新 Freeze 完成七阶段并交付 URDF/MJCF；七阶段各自在独立进程和实际 Airflow 中按 from=through 执行，核验正确复用前缀、未执行后缀与真实 producer。实际走通独立 Generate→Verify→MJCF→Publish 链，及明确延续到下游终点的范围；Generate 以后的重算不需要 CAD endpoint/token。覆盖坏来源、篡改后重绑、失败、取消、UNKNOWN、错误 skipped、错 tool/target、并发和丢回执；旧下游成功不能放行新发布。GUI、CLI、receipt 与共同 execution_scope 一致，单范围完成不冒称交付完成。
 
 浏览器对同一交付实际加载 URDF 与 MJCF，核验 visual/collision/overlay、非零关节调姿、播放/暂停、单步、复位、下载和摘要拒绝；碰撞显示为引擎实际接触代理，交互不回写结果。独立 worktree 的 8878 开发实例使用离线夹具、独立 PostgreSQL/Airflow/CAS/cookie 和受控 Git/PR，仅建立开发证据；不能代替固定 main 同发行的真实 CAD、正式调度器、双端身份、独立审查及发布验收。
