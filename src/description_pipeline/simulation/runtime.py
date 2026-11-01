@@ -13,9 +13,6 @@ import sys
 RUNTIME_IDENTITY_SCHEMA = "solidworks-to-urdf.teleop-runtime-identity/v1"
 RUNTIME_CONTRACT_SCHEMA = "solidworks-to-urdf.teleop-runtime/v1"
 
-TELEOP_RECORDING_SCHEMA = "solidworks-to-urdf.teleop-recording/v1"
-RECORDING_VERIFICATION_SCHEMA = "solidworks-to-urdf.recording-verification/v1"
-
 
 def _hex(value, length):
     return isinstance(value, str) and re.fullmatch(f"[0-9a-f]{{{length}}}", value) is not None
@@ -96,6 +93,7 @@ def load_runtime_contract(path: Path | bytes, *, consumer: str) -> dict:
                 raise ValueError("Assessment requires its MuJoCo 3.10 actuator-model closure")
             _wheel(asset, "actuator-model", versions["actuator-model"])
     return {"schema_version": contract["schema_version"], **common, **consumers[consumer]}
+
 
 def installed_runtime(names: list[str]) -> dict:
     """Read installed RECORDs and native versions after parent registration."""

@@ -24,6 +24,7 @@ from ..owned_process import module_command, process_identity, resource_state, te
 from .store import SimulationConflict, SimulationStore
 from .recording import (
     VerificationUnresolved,
+    prepare_bound,
     prepare_source,
     recording_binding,
     run_verification,
@@ -470,8 +471,6 @@ class SimulationService:
 
             async def register_process(identity):
                 await self._verification_transition(session_id, command_id, self.owner, "running", process=identity)
-
-            from .verify_recording import prepare_bound
 
             preparing = asyncio.create_task(
                 asyncio.to_thread(

@@ -48,7 +48,7 @@ if SESSION_TESTS:
     from description_pipeline.owned_process import process_identity, resource_state
     from description_pipeline.simulation.service import RunningSession, SimulationService
     from description_pipeline.simulation.store import SimulationConflict, SimulationStore
-    from description_pipeline.simulation.verify_recording import prepare_bound
+    from description_pipeline.simulation.recording import prepare_bound
     from description_pipeline.simulation.recording import recording_binding, run_verification, verification_execution
     from description_pipeline.simulation import recording as recording_module
     from description_pipeline.simulation.recording import VerificationUnresolved, session_identity
@@ -281,6 +281,51 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
     async def start_service(self):
         await self.service.start()
         self.request["runtime"] = self.service.runtime_identity
+
+    async def exercise_fresh_parent_helper_drift(self, kind):
+        import description_pipeline
+
+        destination = Path(os.environ.get("PICO_PARENT_IMPORT_EVIDENCE", self.root)) / kind
+        config = {
+            "root": str(destination),
+            "package": str(Path(description_pipeline.__file__).parent),
+            "worker": WORKER,
+            "kind": kind,
+        }
+        child = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-B",
+            str(ROOT / "tests/v1/pico_parent_import_probe.py"),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(child.communicate(canonical(config)), 40)
+        self.assertEqual(0, child.returncode, (stdout + stderr).decode())
+        result = json.loads(stdout)
+        self.assertFalse(result["marker_executed"])
+        self.assertTrue(result["original_release_inventory_preserved"])
+        self.assertFalse(result["parent_runtime_imported_after"])
+        self.assertFalse(result["parent_recording_imported_after"])
+        if kind == "cold_runtime":
+            self.assertIn("Installed release files differ", result["error"])
+            self.assertEqual(0, result["helpers"])
+        else:
+            self.assertIn("helper bytes changed", result["error"])
+            self.assertEqual(result["original_helper_sha256"], result["expected_helper_sha256"])
+            self.assertEqual(1, result["helpers"])
+            self.assertTrue(result["helpers_dead"])
+            self.assertFalse(result["parent_runtime_imported_before"])
+            self.assertFalse(result["parent_recording_imported_before"])
+
+    async def test_fresh_parent_cold_runtime_import_rejects_marker_before_execution(self):
+        await self.exercise_fresh_parent_helper_drift("cold_runtime")
+
+    async def test_fresh_parent_late_runtime_drift_keeps_original_inventory_and_cold_gate(self):
+        await self.exercise_fresh_parent_helper_drift("late_runtime")
+
+    async def test_fresh_parent_late_recording_import_rejects_marker_before_execution(self):
+        await self.exercise_fresh_parent_helper_drift("late_recording")
 
     @contextmanager
     def synthetic_release_consumer(self):
@@ -1485,7 +1530,7 @@ sys.stdin.buffer.read(1)
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await asyncio.wait_for(cli.communicate(), 30)
-        self.assertEqual(0, cli.returncode, stderr.decode())
+        self.assertEqual(0, cli.returncode, (stdout + stderr).decode())
         cli_result = json.loads(stdout)
         self.assertEqual(bound["binding"], cli_result["binding"])
         self.assertEqual(cli.pid, cli_result["verifier_pid"])

@@ -14,8 +14,50 @@ from ..io import canonical, digest
 from ..owned_process import process_identity, resource_state, terminate_owned
 from ..pipeline.contracts import ArtifactRef
 from .store import SimulationConflict
-from .runtime import TELEOP_RECORDING_SCHEMA, RECORDING_VERIFICATION_SCHEMA
 from .warnings import warning_inventory, verify_warning_inventory
+
+
+INPUT_LIMIT = 4 * 1024 * 1024
+TELEOP_RECORDING_SCHEMA = "solidworks-to-urdf.teleop-recording/v1"
+RECORDING_VERIFICATION_SCHEMA = "solidworks-to-urdf.recording-verification/v1"
+
+
+def prepare_bound(binding: dict, artifacts, source: Path, *, commands: list, execution: dict) -> dict:
+    """Check platform facts before handing non-secret immutable data to native code."""
+
+    if binding.get("schema_version") != RECORDING_VERIFICATION_SCHEMA:
+        raise ValueError("Recording verification binding is unsupported")
+    artifact = ArtifactRef.from_record(binding["recording_artifact"])
+    if artifact.kind != "teleop_recording" or artifact.producer_tool_sha256 != binding["runtime_digest"]:
+        raise ValueError("Recording artifact producer differs from the registered session")
+    inventory = {item["path"]: item["sha256"] for item in artifacts.verify(artifact)["members"]}
+    inventory["manifest.json"] = artifact.manifest_sha256
+    root = artifacts.objects / artifact.artifact_id
+    identity = json.loads((root / "session.json").read_bytes())
+    expected_identity = {key: value for key, value in binding.items() if key != "recording_artifact"}
+    expected_identity["schema_version"] = TELEOP_RECORDING_SCHEMA
+    if identity != expected_identity:
+        raise ValueError("Recording session identity differs from the registered session")
+    request = json.loads((root / "request.json").read_bytes())
+    if digest(request) != binding["request_digest"]:
+        raise ValueError("Recording request differs from the registered session")
+    if digest(request["runtime"]) != binding["runtime_digest"]:
+        raise ValueError("Recording runtime differs from the registered session")
+    outcome = json.loads((root / "outcome.json").read_bytes())
+    if set(outcome) != {"complete", "error"} or type(outcome["complete"]) is not bool:
+        raise ValueError("Recording completion metadata is invalid")
+    warning_identity = verify_warning_inventory(request["source"], source)
+    return {
+        "binding": binding,
+        "recording": str(root),
+        "source": str(source),
+        "request": request,
+        "inventory": inventory,
+        "commands": commands,
+        "execution": execution,
+        "outcome": outcome,
+        "warning_inventory": warning_identity,
+    }
 
 
 def materialize_source(destination: Path, source: dict, members: dict, read_member) -> Path:
@@ -97,7 +139,6 @@ class VerificationUnresolved(SimulationConflict):
 
 def verification_execution(*, consumer="pico") -> dict:
     from .. import runtime as product_runtime
-    from .runtime import load_runtime_contract
 
     tool = product_runtime.tool_record(role="portable")
     release = tool["release"]
@@ -115,10 +156,13 @@ def verification_execution(*, consumer="pico") -> dict:
         if actual != expected:
             raise ValueError("Consumer bytes differ from the installed release inventory")
         snapshots[name] = (content, expected)
+    helper = directory / "runtime.py"
+    namespace = {"__file__": str(helper), "__name__": "verified_consumer_contract"}
+    exec(compile(snapshots["runtime.py"][0], str(helper), "exec"), namespace)
     return {
         "helper_sha256": snapshots["verify_recording.py"][1],
         "runtime_helper_sha256": snapshots["runtime.py"][1],
-        "runtime_contract": load_runtime_contract(snapshots["teleop-runtime.json"][0], consumer=consumer),
+        "runtime_contract": namespace["load_runtime_contract"](snapshots["teleop-runtime.json"][0], consumer=consumer),
         "pipeline_source_sha256": tool["source_sha256"],
         "release_inventory_bound": release is not None,
     }
@@ -135,8 +179,9 @@ def _helper_command(python: Path, nonce: str, helper: Path, expected: str, opera
 from pathlib import Path
 payload = None
 try:
-    raw = sys.stdin.buffer.read(4194305)
-    if not raw or len(raw) > 4194304:
+    limit = int(sys.argv[4])
+    raw = sys.stdin.buffer.read(limit + 1)
+    if not raw or len(raw) > limit:
         raise ValueError('Recording verifier initialization is missing or oversized')
     payload = json.loads(raw)
     path = Path(sys.argv[1])
@@ -158,9 +203,21 @@ except Exception as error:
     raise SystemExit(1)
 """
     return [
-        limiter, "--as=4294967296", "--nofile=128", "--cpu=180", "--",
-        str(python), "-I", "-B", "-c", entry,
-        str(helper), expected, operation, nonce,
+        limiter,
+        "--as=4294967296",
+        "--nofile=128",
+        "--cpu=180",
+        "--",
+        str(python),
+        "-I",
+        "-B",
+        "-c",
+        entry,
+        str(helper),
+        expected,
+        operation,
+        str(INPUT_LIMIT),
+        nonce,
     ]
 
 
@@ -177,8 +234,6 @@ def runtime_command(python: Path, nonce: str, execution: dict) -> list[str]:
 
 
 async def run_verification(payload: dict, python: Path, *, register_process) -> dict:
-    from .verify_recording import INPUT_LIMIT
-
     content = canonical(payload)
     if len(content) > INPUT_LIMIT:
         raise ValueError("Recording verifier initialization exceeds its input budget")
@@ -238,3 +293,59 @@ async def run_verification(payload: dict, python: Path, *, register_process) -> 
                     raise
             if not quiescent:
                 raise VerificationUnresolved("Recording verifier process group is unresolved")
+
+
+def main():
+    import argparse
+    from contextlib import closing
+    import tempfile
+
+    from ..artifacts import ArtifactStore
+    from .store import SimulationStore
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--session", required=True, help="Registered simulation session identity")
+    parser.add_argument("--python", required=True, type=Path, help="Absolute fixed PICO interpreter")
+    args = parser.parse_args()
+    dsn = os.environ.get("PLATFORM_OPERATOR_DSN")
+    if not dsn:
+        parser.error("PLATFORM_OPERATOR_DSN is required to read the registered verification identity")
+    import psycopg2
+    from ..platform.queries import read_run_projection
+
+    store = SimulationStore(lambda: psycopg2.connect(dsn))
+    artifacts = ArtifactStore.from_environment(os.environ)
+    row = store.get(args.session)
+    binding = recording_binding(row)
+    with closing(psycopg2.connect(dsn)) as connection:
+        projection = read_run_projection(connection, row["source_run_id"], artifacts=artifacts)
+
+    def read_member(name, member):
+        ref = ArtifactRef.from_record(member["artifact"])
+        return artifacts.read_metadata_member(ref, name, max_bytes=64 * 1024 * 1024)[0]
+
+    temporary = Path(tempfile.mkdtemp(prefix="teleop-recording-verification-"))
+    try:
+        source = materialize_source(temporary / "source", row["request"]["source"], projection["members"], read_member)
+        payload = prepare_bound(
+            binding, artifacts, source, commands=store.worker_commands(args.session), execution=verification_execution()
+        )
+        payload["cleanup"] = str(temporary)
+        content = canonical(payload)
+        if len(content) > INPUT_LIMIT:
+            raise ValueError("Recording verifier initialization exceeds its input budget")
+        with tempfile.TemporaryFile(dir=temporary) as stream:
+            stream.write(content)
+            stream.flush()
+            stream.seek(0)
+            os.dup2(stream.fileno(), 0)
+            argv = evidence_command(args.python, os.urandom(24).hex(), payload["execution"])
+            # exec keeps one PID/group and gives the helper cleanup ownership on success.
+            os.execve(
+                argv[0],
+                argv,
+                {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1"},
+            )
+    finally:
+        # Runs only when materialization, preparation or exec fails.
+        shutil.rmtree(temporary)

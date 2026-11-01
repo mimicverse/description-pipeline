@@ -2,59 +2,12 @@
 
 from __future__ import annotations
 
-import argparse
-from contextlib import closing
 import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
-import tempfile
 import xml.etree.ElementTree as ET
-
-INPUT_LIMIT = 4 * 1024 * 1024
-
-
-def prepare_bound(binding: dict, artifacts, source: Path, *, commands: list, execution: dict) -> dict:
-    """Check platform facts before handing non-secret immutable data to native code."""
-    from ..io import digest
-    from ..pipeline.contracts import ArtifactRef
-    from .runtime import TELEOP_RECORDING_SCHEMA, RECORDING_VERIFICATION_SCHEMA
-    from .warnings import verify_warning_inventory
-
-    if binding.get("schema_version") != RECORDING_VERIFICATION_SCHEMA:
-        raise ValueError("Recording verification binding is unsupported")
-    artifact = ArtifactRef.from_record(binding["recording_artifact"])
-    if artifact.kind != "teleop_recording" or artifact.producer_tool_sha256 != binding["runtime_digest"]:
-        raise ValueError("Recording artifact producer differs from the registered session")
-    inventory = {item["path"]: item["sha256"] for item in artifacts.verify(artifact)["members"]}
-    inventory["manifest.json"] = artifact.manifest_sha256
-    root = artifacts.objects / artifact.artifact_id
-    identity = json.loads((root / "session.json").read_bytes())
-    expected_identity = {key: value for key, value in binding.items() if key != "recording_artifact"}
-    expected_identity["schema_version"] = TELEOP_RECORDING_SCHEMA
-    if identity != expected_identity:
-        raise ValueError("Recording session identity differs from the registered session")
-    request = json.loads((root / "request.json").read_bytes())
-    if digest(request) != binding["request_digest"]:
-        raise ValueError("Recording request differs from the registered session")
-    if digest(request["runtime"]) != binding["runtime_digest"]:
-        raise ValueError("Recording runtime differs from the registered session")
-    outcome = json.loads((root / "outcome.json").read_bytes())
-    if set(outcome) != {"complete", "error"} or type(outcome["complete"]) is not bool:
-        raise ValueError("Recording completion metadata is invalid")
-    warning_identity = verify_warning_inventory(request["source"], source)
-    return {
-        "binding": binding,
-        "recording": str(root),
-        "source": str(source),
-        "request": request,
-        "inventory": inventory,
-        "commands": commands,
-        "execution": execution,
-        "outcome": outcome,
-        "warning_inventory": warning_identity,
-    }
 
 
 def _independent_fk(recording: Path, source: Path, request: dict, manifest: dict) -> int:
@@ -292,58 +245,9 @@ def worker_main(payload: dict):
 
 
 def main():
-    from ..artifacts import ArtifactStore
-    from ..io import canonical
-    from ..pipeline.contracts import ArtifactRef
-    from .recording import evidence_command, materialize_source, recording_binding, verification_execution
-    from .store import SimulationStore
+    from .recording import main as recording_main
 
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--session", required=True, help="Registered simulation session identity")
-    parser.add_argument("--python", required=True, type=Path, help="Absolute fixed PICO interpreter")
-    args = parser.parse_args()
-    dsn = os.environ.get("PLATFORM_OPERATOR_DSN")
-    if not dsn:
-        parser.error("PLATFORM_OPERATOR_DSN is required to read the registered verification identity")
-    import psycopg2
-    from ..platform.queries import read_run_projection
-
-    store = SimulationStore(lambda: psycopg2.connect(dsn))
-    artifacts = ArtifactStore.from_environment(os.environ)
-    row = store.get(args.session)
-    binding = recording_binding(row)
-    with closing(psycopg2.connect(dsn)) as connection:
-        projection = read_run_projection(connection, row["source_run_id"], artifacts=artifacts)
-
-    def read_member(name, member):
-        ref = ArtifactRef.from_record(member["artifact"])
-        return artifacts.read_metadata_member(ref, name, max_bytes=64 * 1024 * 1024)[0]
-
-    temporary = Path(tempfile.mkdtemp(prefix="teleop-recording-verification-"))
-    try:
-        source = materialize_source(temporary / "source", row["request"]["source"], projection["members"], read_member)
-        payload = prepare_bound(
-            binding, artifacts, source, commands=store.worker_commands(args.session), execution=verification_execution()
-        )
-        payload["cleanup"] = str(temporary)
-        content = canonical(payload)
-        if len(content) > INPUT_LIMIT:
-            raise ValueError("Recording verifier initialization exceeds its input budget")
-        with tempfile.TemporaryFile(dir=temporary) as stream:
-            stream.write(content)
-            stream.flush()
-            stream.seek(0)
-            os.dup2(stream.fileno(), 0)
-            argv = evidence_command(args.python, os.urandom(24).hex(), payload["execution"])
-            # exec keeps one PID/group and gives the helper cleanup ownership on success.
-            os.execve(
-                argv[0],
-                argv,
-                {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1"},
-            )
-    finally:
-        # Runs only when materialization, preparation or exec fails.
-        shutil.rmtree(temporary)
+    recording_main()
 
 
 if __name__ == "__main__":
