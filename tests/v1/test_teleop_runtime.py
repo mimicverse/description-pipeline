@@ -1,14 +1,20 @@
 """Consumer isolation, fixed wheel origins and public installed API calls."""
 
 from copy import deepcopy
+import base64
+import csv
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+import uuid
 
 from description_pipeline.simulation.runtime import load_runtime_contract
 from description_pipeline.simulation import runtime as runtime_helper
@@ -24,6 +30,33 @@ ASSESSMENT = os.environ.get("TELEOP_ASSESSMENT_PYTHON")
 
 
 class TeleopRuntimeTests(unittest.TestCase):
+    def owned_probe(self, python, execution):
+        nonce = uuid.uuid4().hex
+        process = subprocess.Popen(
+            runtime_command(Path(python), nonce, execution),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1"},
+        )
+        identity = {"pid": process.pid, "nonce": nonce}
+        try:
+            identity = owned_process.process_identity(process.pid, nonce)
+            stdout, stderr = process.communicate(json.dumps(execution), timeout=30)
+        finally:
+            self.assertTrue(owned_process.terminate_owned(identity, reap=process.poll))
+            process.wait(timeout=5)
+        self.assertEqual("dead", owned_process.resource_state(identity))
+        return {
+            "returncode": process.returncode,
+            "stdout": stdout,
+            "stderr": stderr,
+            "process": identity,
+            "group": "dead",
+        }
+
     def test_role_locks_match_each_selected_closure_and_fixed_root_assets(self):
         for role in ("pico", "assessment"):
             with self.subTest(role=role):
@@ -50,6 +83,8 @@ class TeleopRuntimeTests(unittest.TestCase):
         for mutate in (
             lambda d: d["consumers"]["pico"]["dependency_versions"].update({"mujoco": "3.10.0"}),
             lambda d: d["consumers"]["assessment"].update({"actuator_model": None}),
+            lambda d: d["consumers"]["assessment"]["actuator_model"].pop("record_payload_sha256"),
+            lambda d: d["consumers"]["assessment"]["actuator_model"].update({"record_payload_sha256": "invalid"}),
             lambda d: d["common"]["files"].update({"teleop/../outside.py": "a" * 64}),
             lambda d: d["common"].update({"wheel_sha256": "invalid"}),
         ):
@@ -108,15 +143,9 @@ class TeleopRuntimeTests(unittest.TestCase):
     def inspect_installed(self, role, python):
         contract = load_runtime_contract(CONTRACT, consumer=role)
         execution = verification_execution(consumer=role)
-        checked = subprocess.run(
-            runtime_command(Path(python), "role-runtime-probe", execution),
-            input=json.dumps(execution),
-            text=True,
-            capture_output=True,
-            timeout=30,
-        )
-        self.assertEqual(0, checked.returncode, checked.stdout + checked.stderr)
-        identity = json.loads(checked.stdout)
+        checked = self.owned_probe(python, execution)
+        self.assertEqual(0, checked["returncode"], checked["stdout"] + checked["stderr"])
+        identity = json.loads(checked["stdout"])
         raw = {**identity, "teleop_files": contract["files"]}
         self.assertEqual(identity, validate_runtime_identity(raw, contract))
         altered = deepcopy(raw)
@@ -129,6 +158,91 @@ class TeleopRuntimeTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "commit conflicts"):
                 validate_runtime_identity(conflicting, contract)
         return identity
+
+    @unittest.skipUnless(ASSESSMENT, "TELEOP_ASSESSMENT_PYTHON is required")
+    def test_real_assessment_rejects_coherent_record_stale_record_shadow_and_archive(self):
+        original = Path(ASSESSMENT).parent.parent
+        site = original / "lib/python3.12/site-packages"
+        package = site / "actuator_model"
+        dist = next(site.glob("actuator_model-*.dist-info"))
+
+        def inventory():
+            return {
+                path.relative_to(site).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                for directory in (package, dist)
+                for path in directory.rglob("*")
+                if path.is_file() and "__pycache__" not in path.parts
+            }
+
+        before = inventory()
+        self.evidence = {"original_inventory": before, "cases": {}}
+        execution = verification_execution(consumer="assessment")
+        with tempfile.TemporaryDirectory() as directory:
+            private = Path(directory) / "environment"
+
+            def copy_member(source, destination):
+                path = Path(source)
+                return (
+                    shutil.copy2(source, destination)
+                    if any(path.is_relative_to(p) for p in (package, dist))
+                    else os.link(source, destination)
+                )
+
+            shutil.copytree(original, private, symlinks=True, copy_function=copy_member)
+            private_site = private / site.relative_to(original)
+            private_dist = private_site / dist.name
+            parameter = private_site / "actuator_model/_parameters/hd1910/sampled_pd_v1_20261019/m5.json"
+            record, direct = private_dist / "RECORD", private_dist / "direct_url.json"
+            originals = {path: path.read_bytes() for path in (parameter, record, direct)}
+            for path in originals:
+                self.assertNotEqual(path.stat().st_ino, (original / path.relative_to(private)).stat().st_ino)
+
+            def probe(name, error=None):
+                observed = self.owned_probe(private / "bin/python", execution)
+                self.evidence["cases"][name] = observed
+                if error is None:
+                    self.assertEqual(0, observed["returncode"], observed)
+                else:
+                    self.assertNotEqual(0, observed["returncode"], observed)
+                    self.assertRegex(json.loads(observed["stdout"])["error"], error)
+
+            def coherent_record(path):
+                rows = list(csv.reader(io.StringIO(originals[record].decode())))
+                row = next(row for row in rows if row[0] == path.relative_to(private_site).as_posix())
+                data = path.read_bytes()
+                row[1:] = [
+                    "sha256=" + base64.urlsafe_b64encode(hashlib.sha256(data).digest()).decode().rstrip("="),
+                    str(len(data)),
+                ]
+                output = io.StringIO(newline="")
+                csv.writer(output).writerows(rows)
+                record.write_text(output.getvalue())
+
+            probe("baseline")
+            value = json.loads(originals[parameter])
+            value["kt"] *= 1.125
+            parameter.write_text(json.dumps(value, indent=2) + "\n")
+            self.evidence["parameter_original_sha256"] = hashlib.sha256(originals[parameter]).hexdigest()
+            self.evidence["parameter_altered_sha256"] = hashlib.sha256(parameter.read_bytes()).hexdigest()
+            probe("stale_record", "bytes differ from RECORD")
+            coherent_record(parameter)
+            self.assertEqual(originals[direct], direct.read_bytes())
+            probe("coherent_record", "artifact differs from the fixed consumer asset")
+            parameter.write_bytes(originals[parameter])
+            record.write_bytes(originals[record])
+            origin = json.loads(originals[direct])
+            origin["archive_info"] = {"hashes": {"sha256": "0" * 64}}
+            direct.write_text(json.dumps(origin))
+            coherent_record(direct)
+            probe("wrong_archive", "archive differs from the fixed consumer asset")
+            direct.write_bytes(originals[direct])
+            record.write_bytes(originals[record])
+            foreign = private / "foreign"
+            shutil.copytree(private_site / "actuator_model", foreign / "actuator_model")
+            (private_site / "w3_shadow_probe.pth").write_text(f"import sys; sys.path.insert(0, {str(foreign)!r})\n")
+            probe("module_shadow", "module file is outside the selected distribution root")
+        self.assertEqual(before, inventory())
+        self.evidence["original_unchanged"] = True
 
     @unittest.skipUnless(PICO, "TELEOP_PICO_PYTHON is required")
     def test_real_pico_closure_and_protocol_replay_after_source_relocation(self):
@@ -180,6 +294,7 @@ class TeleopRuntimeTests(unittest.TestCase):
                 "assessment",
                 owned_process.__file__,
             ],
+            input=json.dumps(identity),
             capture_output=True,
             text=True,
             timeout=20,

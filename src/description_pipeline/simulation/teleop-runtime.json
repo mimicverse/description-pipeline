@@ -14,7 +14,7 @@
       "teleop/backends/mujoco/upper_body_worker.py": "a739ea522c468e292606b60aa1bc2b94752e0d310fed4cf813594a99e0e9194c",
       "teleop/core/__init__.py": "915fac7f90bd75b49f4d5fd23b92447fbd30834138177588da294fdb22b01930",
       "teleop/core/_bounded_step_cy.c": "64addbf95e8b5e1653109cbac0e5d5b71a2d76eda876923a441b055f5395e86c",
-      "teleop/core/_bounded_step_cy.cpython-312-x86_64-linux-gnu.so": "423d42ce9ad6569872f12c965990800649af43eb7391c49cc52e5a9d8fbf7a88",
+      "teleop/core/_bounded_step_cy.cpython-312-x86_64-linux-gnu.so": "44868ff6d773ab71dfba30f81da4f9d3f6928b4fee030b49a0ba53803044bd85",
       "teleop/core/calibration.py": "1210b1ee5757ba6e316cb314f44ef85a371375c905045f934d57ac3c92fb8525",
       "teleop/core/constrained_step.py": "7b435797b1f8021c00ded5de81e041db9ca7e99268dfb008aa8cf9838912d0b8",
       "teleop/core/control_clock.py": "f693b31531737a38b8879fd86c5178b7d19ce839fd6c9188886c2bc4c0bcee31",
@@ -41,17 +41,17 @@
       "teleop/evaluation/continuous/run_continuous.py": "2c8b34ec749a09aa106f3bd9a369ea68cb102c0ab8b2c7dad901caa0db8b693e",
       "teleop/evaluation/continuous/servo.py": "ba262c7b86b23d89628e9da9925e1aff7dfdf3d1bc61dac64b862eca24ae6b1b",
       "teleop/evaluation/continuous/verify_run.py": "e44267670e7f6a4e7eb9a1734a644f867634bc5d86b21117738bebd9e21e2d10",
-      "teleop/evaluation/continuous_dynamics/__init__.py": "43dd6b131dd5c156ea3bc780b3f69b2950dcb5d2e4957dc97e1861d6a3393b90",
-      "teleop/evaluation/continuous_dynamics/actuator_model.py": "3127da0e0e074f6c15c865eb8ce0c8131f1012e4e4e228c68c3255f7412760ff",
+      "teleop/evaluation/continuous_dynamics/__init__.py": "1699e7c71ee6ba7cded7c635b95ffd7a52664542e888d680bdaf513311d95721",
+      "teleop/evaluation/continuous_dynamics/actuator_model.py": "3ff140e5fac205f3c3c2e329955a632ee2bf1fb9f42d93a25509cea2c6445ddf",
       "teleop/evaluation/continuous_dynamics/binding.py": "cac2be616b5eac1dd52d56d237159321bf3edfc533e2f3b1565fa01915842531",
       "teleop/evaluation/continuous_dynamics/compare.py": "fa268144bf3311046c225c258856fc8d1ba77d5081c164f14650c11954728de5",
       "teleop/evaluation/continuous_dynamics/metrics.py": "e468a457e161845cabbc8dfc215a3abe9380b223115ac2cb8e3545a1dd353227",
       "teleop/evaluation/continuous_dynamics/oracle.py": "6989daca820c310e173be65fabad5083d0d99af8a83d405341bf126dfd00ecf9",
-      "teleop/evaluation/continuous_dynamics/plan.py": "916ffc334f39301c8ae8d1c9c3e033eef90fd748101d3022a7f730d08e4d0eb3",
-      "teleop/evaluation/continuous_dynamics/records.py": "b3c4a98e334357bb700766eb4289cd4030fff665814b292b0dfa5ab3da727a3a",
-      "teleop/evaluation/continuous_dynamics/runner.py": "0baffce10a6502b02f062e559b5c4435aabf53092aeea4125fdb06c15448e15b",
+      "teleop/evaluation/continuous_dynamics/plan.py": "ff54c5459add483faefdb9c31546e8f06c15fea1e9f7df19104a3070fd74409d",
+      "teleop/evaluation/continuous_dynamics/records.py": "3efe440ed4dbb3e551abfd5c9ee27e0314a72a50a8bc976ae904dc2bac59a47c",
+      "teleop/evaluation/continuous_dynamics/runner.py": "469f6347b88fffab7d0999ab8ecb85c1b60cf9a1e275a95d9ed8259f52ca90b5",
       "teleop/evaluation/continuous_dynamics/tasks.py": "60ea6c05645159889257ece0c25aeb607de33ec92a7d0dae262e6132a2ed8087",
-      "teleop/evaluation/continuous_dynamics/verify.py": "bff94a1b42db98cc48bf8bc6afc91181f267a2c8ebfa78d8ad742c9c9c9665ae",
+      "teleop/evaluation/continuous_dynamics/verify.py": "891a54a7943d38ff13215557cb46c6e8fa583a2e0c4c3f1d622bf3445cb99579",
       "teleop/evaluation/continuous_dynamics/warnings.py": "d8b797413f52edb2d7e54530724bfa06cd097e006d19b5e7137ed34d435bb302",
       "teleop/evaluation/contracts.py": "7640b868005529a0dca40d2a5336daceac8b3ea951e9cc2ea47fcc4cb98e9fcf",
       "teleop/evaluation/controller_tuning.py": "f0827a1786bac1d0d7ed25273e702a1a1231b680de0abdf7a99fb14180356cf5",
@@ -135,14 +135,16 @@
       "teleop/robots/profiles/m3.0.3.json": "7ff0fd2ededdaf2c4945d20560169dc09e0b9fde75e3723928ac3abcf915347f",
       "teleop/robots/profiles/m3.0.json": "1664c8bfbdd1899450781543799355e0c38087affb0aba52579ddb94b9fecf2f"
     },
-    "source_commit": "e0324deb90163d43c7962898c9ef9fdf7938b41f",
-    "source_tree": "f3effafcfd97b20eae09ef7cd47a41bcb5381d38",
+    "source_commit": "33908ccc39ac427a178855927f43924d6bd58d6c",
+    "source_tree": "dcc6c458d50abaf7663c13c8800c84173b51ad40",
     "wheel_filename": "robot_teleop-0.3.0-cp312-cp312-linux_x86_64.whl",
-    "wheel_sha256": "74e6a87eae31ea63fe1a4f4812cafcafb9f35de2e85aee72b9e6daf810fc8b42"
+    "wheel_sha256": "6f148d7ce435820e618c4fad88e505c5407259c260fd2164f55cee29518ae108"
   },
   "consumers": {
     "assessment": {
       "actuator_model": {
+        "distribution": "actuator-model",
+        "record_payload_sha256": "dad80bd9bf0b8b31cf87724f03206088b264ffdc1ec801199e6aa98576e7549d",
         "source_commit": "32a65a43bc168eba6af30bd3cb725784f87b5250",
         "wheel_filename": "actuator_model-1.3.0-py3-none-any.whl",
         "wheel_sha256": "cce06aee648f639a8ca47d40cc2b02e57c1ec7d0b4fd33ad6f90c846f0147975"

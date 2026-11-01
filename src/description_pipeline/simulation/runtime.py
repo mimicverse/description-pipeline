@@ -32,6 +32,17 @@ def _wheel(record, package, version):
         raise ValueError("Runtime wheel identity is invalid")
 
 
+def _actuator_asset(asset, version):
+    if (
+        not isinstance(asset, dict)
+        or set(asset) != {"distribution", "source_commit", "wheel_filename", "wheel_sha256", "record_payload_sha256"}
+        or asset["distribution"] != "actuator-model"
+        or not _hex(asset["record_payload_sha256"], 64)
+    ):
+        raise ValueError("Assessment requires the complete fixed actuator-model artifact")
+    _wheel(asset, "actuator-model", version)
+
+
 def load_runtime_contract(path: Path | bytes, *, consumer: str) -> dict:
     """Project one explicit consumer from a path or already verified bytes."""
     if consumer not in {"pico", "assessment"}:
@@ -84,18 +95,13 @@ def load_runtime_contract(path: Path | bytes, *, consumer: str) -> dict:
             if asset is not None or "actuator-model" in versions or versions["mujoco"].split(".")[:2] != ["3", "13"]:
                 raise ValueError("PICO requires its MuJoCo 3.13 closure without actuator-model")
         else:
-            if (
-                not isinstance(asset, dict)
-                or set(asset) != {"source_commit", "wheel_filename", "wheel_sha256"}
-                or "actuator-model" not in versions
-                or versions["mujoco"].split(".")[:2] != ["3", "10"]
-            ):
+            if "actuator-model" not in versions or versions["mujoco"].split(".")[:2] != ["3", "10"]:
                 raise ValueError("Assessment requires its MuJoCo 3.10 actuator-model closure")
-            _wheel(asset, "actuator-model", versions["actuator-model"])
+            _actuator_asset(asset, versions["actuator-model"])
     return {"schema_version": contract["schema_version"], **common, **consumers[consumer]}
 
 
-def installed_runtime(names: list[str]) -> dict:
+def installed_runtime(names: list[str], *, actuator_asset: dict | None) -> dict:
     """Read installed RECORDs and native versions after parent registration."""
     import mujoco
     import teleop
@@ -135,19 +141,25 @@ def installed_runtime(names: list[str]) -> dict:
     try:
         metadata.distribution("actuator-model")
     except metadata.PackageNotFoundError:
-        actuator = None
+        actuator, actual_asset = None, None
     else:
         if "actuator-model" not in names:
             raise ValueError("PICO runtime must not install actuator-model")
-        import actuator_model
+        if actuator_asset is None:
+            raise ValueError("Assessment requires a frozen actuator-model artifact")
+        from teleop.evaluation.continuous_dynamics.actuator_model import installed_actuator_model_identity
 
-        actuator = actuator_model.package_info()
+        observed = installed_actuator_model_identity(
+            source_commit=actuator_asset["source_commit"], distribution=actuator_asset["distribution"]
+        )
+        actuator, actual_asset = observed["package"], observed["artifact"]
     return {
         "schema_version": RUNTIME_IDENTITY_SCHEMA,
         "packages": packages,
         "teleop_files": files,
         "engine": mujoco.mj_versionString(),
         "actuator_model": actuator,
+        "actuator_model_asset": actual_asset,
     }
 
 
@@ -164,7 +176,7 @@ def validate_runtime_identity(identity: dict, contract: dict) -> dict:
         raise ValueError("Installed Teleop archive differs from the fixed source wheel")
     actuator = identity["actuator_model"]
     if contract["actuator_model"] is None:
-        if actuator is not None:
+        if actuator is not None or identity["actuator_model_asset"] is not None:
             raise ValueError("PICO runtime must not install actuator-model")
     elif (
         not isinstance(actuator, dict)
@@ -178,11 +190,12 @@ def validate_runtime_identity(identity: dict, contract: dict) -> dict:
         actuator.get("git_commit") is not None and actuator["git_commit"] != contract["actuator_model"]["source_commit"]
     ):
         raise ValueError("Installed actuator-model commit conflicts with the fixed consumer asset")
+    elif identity["actuator_model_asset"] != contract["actuator_model"]:
+        raise ValueError("Installed actuator-model artifact differs from the fixed consumer asset")
     return {
         **{key: value for key, value in identity.items() if key != "teleop_files"},
         "source_commit": contract["source_commit"],
         "wheel_sha256": contract["wheel_sha256"],
-        "actuator_model_asset": contract["actuator_model"],
     }
 
 
@@ -208,7 +221,11 @@ def verify_runtime_contract(contract: dict) -> dict:
         }
     ):
         raise ValueError("An explicit current consumer runtime projection is required")
-    return validate_runtime_identity(installed_runtime(list(contract["dependency_versions"])), contract)
+    if contract["actuator_model"] is not None:
+        _actuator_asset(contract["actuator_model"], contract["dependency_versions"]["actuator-model"])
+    return validate_runtime_identity(
+        installed_runtime(list(contract["dependency_versions"]), actuator_asset=contract["actuator_model"]), contract
+    )
 
 
 if __name__ == "__main__":
