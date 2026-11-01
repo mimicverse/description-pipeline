@@ -278,6 +278,15 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
                 ),
             )
 
+    def canonical_projection(self):
+        from description_pipeline.platform.queries import read_run_projection
+
+        connection = self.store.connect()
+        try:
+            return read_run_projection(connection, self.run_id, artifacts=self.artifacts)
+        finally:
+            connection.close()
+
     def cli_config(self, python=WORKER):
         path = self.root / ("portal-cli-" + uuid.uuid4().hex + ".json")
         path.write_bytes(
@@ -2288,7 +2297,8 @@ sys.stdin.buffer.read(1)
             "triggering_user_name": build_actor_name("app:tenant:operator", "Operator")
         }
         portal._preview_payload = lambda *_args: {"mjcf": self.request["source"]}
-        portal._read_fact_projection = lambda *_args: {"members": self.members}
+        self.register_cli_source_fixture()
+        portal._read_fact_projection = lambda *_args: self.canonical_projection()
         session = portal.sessions.create("Operator", "external-token", principal="app:tenant:operator")
         listener = socket.socket()
         listener.bind(("127.0.0.1", 0))
