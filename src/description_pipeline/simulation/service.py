@@ -89,28 +89,17 @@ class SimulationService:
             raise ValueError("Simulation root or worker interpreter is invalid")
         if shutil.which("prlimit") is None:
             raise ValueError("Native worker resource control requires prlimit")
-        self._lock = (self.root / "supervisor.lock").open("a+")
+        descriptor = os.open(self.root / "supervisor.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        self._lock = os.fdopen(descriptor, "r+")
         try:
             fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             self._lock.close()
             self._lock = None
             raise ValueError("Another simulation supervisor owns this root") from None
-        self._lock.seek(0)
-        previous_probe = self._lock.read(32769)
-        if previous_probe:
-            record = json.loads(previous_probe)
-            if (
-                len(previous_probe) > 32768
-                or not isinstance(record, dict)
-                or set(record) != {"schema_version", "process_identity"}
-                or record["schema_version"] != "solidworks-to-urdf.simulation-probe/v1"
-                or not isinstance(record["process_identity"], dict)
-            ):
-                raise SimulationConflict("Startup ownership metadata is unresolved")
-            self._probe_identity = record["process_identity"]
-            if not await self._close_probe():
-                raise SimulationConflict("Previous startup process group is unresolved")
+        self._probe_identity = self._read_probe_identity()
+        if self._probe_identity is not None and not await self._close_probe():
+            raise SimulationConflict("Previous startup process group is unresolved")
         contract = load_runtime_contract(Path(__file__).with_name("teleop-runtime.json"))
         nonce = secrets.token_hex(24)
         self._probe_identity = {"nonce": nonce}
@@ -202,24 +191,53 @@ class SimulationService:
                     recording=recording,
                 )
 
-    def _write_probe_identity(self):
+    def _read_probe_identity(self):
         self._lock.seek(0)
-        self._lock.truncate()
+        previous = self._lock.read(32769)
+        if not previous:
+            return None
+        try:
+            record = json.loads(previous)
+        except ValueError:
+            raise SimulationConflict("Startup ownership metadata is unresolved") from None
+        if (
+            len(previous) > 32768
+            or not isinstance(record, dict)
+            or set(record) != {"schema_version", "process_identity"}
+            or record["schema_version"] != "solidworks-to-urdf.simulation-probe/v1"
+            or not isinstance(record["process_identity"], dict)
+        ):
+            raise SimulationConflict("Startup ownership metadata is unresolved")
+        return record["process_identity"]
+
+    def _write_probe_identity(self):
+        payload = ""
         if self._probe_identity is not None:
-            self._lock.write(
-                json.dumps(
-                    {
-                        "schema_version": "solidworks-to-urdf.simulation-probe/v1",
-                        "process_identity": self._probe_identity,
-                    }
-                )
+            previous = self._read_probe_identity()
+            if previous is not None and any(self._probe_identity.get(key) != value for key, value in previous.items()):
+                raise SimulationConflict("Startup operation identity cannot change during receipt update")
+            payload = json.dumps(
+                {
+                    "schema_version": "solidworks-to-urdf.simulation-probe/v1",
+                    "process_identity": self._probe_identity,
+                }
             )
+        # Keep the same locked inode and a nonempty intent until its replacement
+        # is durable. A crash may leave an unresolved fragment, never an empty gap.
+        self._lock.seek(0)
+        if self._lock.write(payload) != len(payload):
+            raise OSError("Startup ownership metadata write is incomplete")
+        self._lock.flush()
+        os.fsync(self._lock.fileno())
+        self._lock.truncate(len(payload))
         self._lock.flush()
         os.fsync(self._lock.fileno())
 
     async def _close_probe(self):
         if self._lock is None:
             return True
+        if self._probe_identity is None:
+            self._probe_identity = self._read_probe_identity()
         if self._probe_identity is not None:
             if not await self._terminate_identity(self._probe_identity):
                 return False
