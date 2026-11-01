@@ -14,9 +14,9 @@ import shutil
 import signal
 import subprocess
 import time
+import unittest
 from pathlib import Path
-
-import pytest
+from unittest import mock
 
 from description_pipeline.dynamics_assessment.contracts import (
     BUNDLE_SCHEMA,
@@ -35,7 +35,7 @@ from description_pipeline.dynamics_assessment.runtime import (
 )
 from description_pipeline.dynamics_assessment.service import AssessmentAccess, AssessmentService
 from description_pipeline.io import canonical, digest, file_digest
-from tests.v1.test_dynamics_assessment_postgres import database, postgres_server  # noqa: F401
+from tests.v1.test_dynamics_assessment_postgres import PostgresCase
 
 
 class Dispatch:
@@ -53,15 +53,13 @@ class Dispatch:
         return self.runs.get(dag_run_id)
 
 
-@pytest.fixture
-def native_case(request):
+def build_native_case(database, modes=None):
     fixture = os.environ.get("ASSESSMENT_TEST_TELEOP_PLAN")
     interpreter = os.environ.get("ASSESSMENT_TEST_TELEOP_PYTHON")
     pin_path = os.environ.get("ASSESSMENT_TEST_RUNTIME_PIN")
     if not all((fixture, interpreter, pin_path)):
-        pytest.skip("A fixed installed Teleop runtime and independent software input are required")
-    store, _old_request, root = request.getfixturevalue("database")
-    modes = getattr(request, "param", None)
+        raise unittest.SkipTest("A fixed installed Teleop runtime and independent software input are required")
+    store, _old_request, root = database
     modes = {modes} if isinstance(modes, str) else set(modes or ())
     plan_path = Path(fixture)
     plan = json.loads(plan_path.read_bytes())
@@ -163,7 +161,7 @@ def native_case(request):
         return source
 
     access = AssessmentAccess("tenant:owner", False, authorized)
-    return service, AssessmentExecutor(service, process), access, bundle, copied, original
+    return (service, AssessmentExecutor(service, process), access, bundle, copied, original)
 
 
 def execute_case(native_case, bundle_override=False):
@@ -175,90 +173,7 @@ def execute_case(native_case, bundle_override=False):
     result = executor.execute(
         attempt["attempt_id"], dispatch_conf(public["request_id"], attempt["attempt_id"], request)
     )
-    return public, result
-
-
-@pytest.mark.parametrize("native_case", [None, "large_certificates"], indirect=True)
-def test_actual_native_execution_verification_and_detached_archive(native_case, tmp_path):
-    service, _executor, access, _bundle, copied, original = native_case
-    public, result = execute_case(native_case)
-    assert result["state"] == "completed"
-    summary_bytes, _member = service.read_result(access, result["attempt_id"])
-    summary = json.loads(summary_bytes)
-    assert summary["operations"]["run"]["exit_code"] == summary["operations"]["verify"]["exit_code"] == 0
-    assert summary["canonical_axes_modified"] is False and summary["publish_dependency"] is False
-    receipt_bytes, _member = service.read_result(access, result["attempt_id"], "verify.stdout.json")
-    receipt = json.loads(receipt_bytes)
-    assert receipt["pass"] and receipt["coverage_complete"] and receipt["records_checked"] > 0
-    reference = service.store.result_artifact(result["attempt_id"])
-    archive = tmp_path / "detached"
-    service.store.artifacts.materialize(reference, archive)
-    shutil.rmtree(copied)
-    shutil.rmtree(original)
-    records = [json.loads(line) for line in (archive / "run/records.jsonl").read_text().splitlines()]
-    assert len(records) == receipt["records_checked"]
-    assert {row["verification"] for row in records} == {"unchecked"}
-    request_bytes = (archive / "request.json").read_bytes()
-    assert len(request_bytes) < 1024 * 1024
-    assert "warnings" not in json.loads(request_bytes)["source"]
-    for role, path in summary["source_certificate_members"].items():
-        declared = json.loads(request_bytes)["source"]["certificates"][role]
-        data = (archive / path).read_bytes()
-        assert len(data) == declared["bytes"] and hashlib.sha256(data).hexdigest() == declared["sha256"]
-        assert json.loads(data)["warnings"]
-    command = [
-        os.environ["ASSESSMENT_TEST_TELEOP_PYTHON"],
-        "-I",
-        "-B",
-        "-m",
-        "teleop.evaluation",
-        "verify",
-        "--run",
-        str(archive / "run"),
-    ]
-    verified = subprocess.run(command, cwd=archive, capture_output=True, timeout=120, check=False)
-    assert verified.returncode == 0, verified.stderr.decode()
-    assert json.loads(verified.stdout)["pass"] is True
-    assert service.get(access, public["request_id"])["attempt"]["state"] == "completed"
-
-
-def test_real_source_without_execution_bundle_is_explicitly_unsupported(native_case):
-    service, _executor, access, *_ = native_case
-    _public, result = execute_case(native_case, bundle_override=True)
-    assert result["state"] == "unsupported"
-    data, _member = service.read_result(access, result["attempt_id"])
-    summary = json.loads(data)
-    assert summary["detail"]["missing"] == ["sealed_execution_bundle"]
-    assert summary["operations"] == {}
-    assert summary["verification_receipt"] is None
-
-
-def test_wrong_installed_runtime_refuses_before_model_execution(native_case):
-    service, executor, access, _bundle, *_ = native_case
-    record = service.runtime.to_record()
-    name = next(iter(record["files"]))
-    record["files"][name] = "0" * 64
-    service.runtime = RuntimePin(record)
-    executor.process = TeleopProcess(executor.process.python, service.runtime, executor.process.limits)
-    public, result = execute_case(native_case)
-    assert result["state"] == "failed"
-    data, _member = service.read_result(access, result["attempt_id"], "run.stdout.json")
-    assert json.loads(data)["assessment_error"] == "runtime_identity"
-    assert service.get(access, public["request_id"])["attempt"]["resources_settled"] is True
-
-
-def test_result_reads_reauthorize_and_reject_cross_operator(native_case):
-    service, _executor, access, *_ = native_case
-    _public, result = execute_case(native_case, bundle_override=True)
-    other = AssessmentAccess("tenant:other", False, access.source)
-    with pytest.raises(PermissionError, match="another operator"):
-        service.read_result(other, result["attempt_id"])
-
-    def revoked(_dag, _control):
-        raise PermissionError("Source access was revoked")
-
-    with pytest.raises(PermissionError, match="revoked"):
-        service.read_result(AssessmentAccess(access.principal, False, revoked), result["attempt_id"])
+    return (public, result)
 
 
 def start_controller(native_case):
@@ -267,11 +182,10 @@ def start_controller(native_case):
     attempt_id = public["attempt"]["attempt_id"]
     request = service.store.request(public["request_id"])
     controller = multiprocessing.get_context("fork").Process(
-        target=executor.execute,
-        args=(attempt_id, dispatch_conf(public["request_id"], attempt_id, request)),
+        target=executor.execute, args=(attempt_id, dispatch_conf(public["request_id"], attempt_id, request))
     )
     controller.start()
-    return public, attempt_id, controller
+    return (public, attempt_id, controller)
 
 
 def wait_for_attempt(service, attempt_id, controller, predicate):
@@ -282,7 +196,7 @@ def wait_for_attempt(service, attempt_id, controller, predicate):
             return attempt
         assert controller.is_alive(), attempt
         time.sleep(0.005)
-    pytest.fail("The native controller did not reach the expected interruption point")
+    unittest.TestCase().fail("The native controller did not reach the expected interruption point")
 
 
 def cleanup_controller(service, attempt_id, controller):
@@ -294,140 +208,245 @@ def cleanup_controller(service, attempt_id, controller):
         assert terminate_owned(identity), identity
 
 
-@pytest.mark.parametrize("native_case", ["long_run"], indirect=True)
-@pytest.mark.parametrize("phase", ["running", "verifying"])
-def test_owned_native_cancel_preserves_partial_evidence(native_case, phase):
-    service, _executor, access, *_ = native_case
-    _public, attempt_id, controller = start_controller(native_case)
-    records = service.work_root / attempt_id / "result/run/records.jsonl"
-    try:
-
-        def executing(attempt):
-            return (
-                attempt["state"] == phase
-                and attempt["process"] is not None
-                and records.is_file()
-                and records.stat().st_size > 0
-            )
-
-        attempt = wait_for_attempt(service, attempt_id, controller, executing)
-        identity = attempt["process"]
-        service.cancel(access, attempt_id)
-        controller.join(timeout=20)
-        assert not controller.is_alive() and controller.exitcode == 0
-        assert process_state(identity) == "dead"
-        settled = service.store.attempt(attempt_id)
-        assert settled["state"] == "cancelled" and settled["resources_settled"]
-        data, _member = service.read_result(access, attempt_id)
-        summary = json.loads(data)
-        operation = "run" if phase == "running" else "verify"
-        assert summary["operations"][operation]["reason"] == "cancelled"
-        assert summary["canonical_axes_modified"] is False
-        archive = service.work_root / (attempt_id + "-detached")
-        service.store.artifacts.materialize(service.store.result_artifact(attempt_id), archive)
-        assert (archive / "run/records.jsonl").read_bytes() == records.read_bytes()
-    finally:
-        cleanup_controller(service, attempt_id, controller)
-
-
-@pytest.mark.parametrize("native_case", ["long_run", ("long_run", "large_certificates")], indirect=True)
-def test_native_controller_sigkill_requires_original_orphan_reconciliation(native_case):
-    service, executor, access, *_ = native_case
-    public, attempt_id, controller = start_controller(native_case)
-    records = service.work_root / attempt_id / "result/run/records.jsonl"
-    try:
-        attempt = wait_for_attempt(
-            service,
-            attempt_id,
-            controller,
-            lambda row: (
-                row["state"] == "running"
-                and row["process"] is not None
-                and records.is_file()
-                and records.stat().st_size > 0
-            ),
-        )
-        child = attempt["process"]
-        assert process_state(child) == "alive"
-        os.kill(child["pid"], signal.SIGSTOP)
-        controller.kill()
-        controller.join(timeout=5)
-        assert controller.exitcode == -signal.SIGKILL
-        original = records.read_bytes()
-        with service.store.transaction() as cursor:
-            cursor.execute(
-                "UPDATE assessment_attempt SET lease_until=now()-interval '1 second' WHERE attempt_id=%s",
-                (attempt_id,),
-            )
-        assert service.get(access, public["request_id"])["attempt"]["state"] == "unknown"
-        with pytest.raises(ValueError, match="settled"):
-            service.retry(access, public["request_id"], Dispatch())
-        result = executor.reconcile(attempt_id)
-        assert result["state"] == "failed"
-        assert process_state(child) == "dead"
-        assert records.read_bytes() == original
-        summary = json.loads(service.read_result(access, attempt_id)[0])
-        assert summary["detail"]["phase"] == "orphan_reconciliation"
-        assert summary["detail"]["previous_process"] == child
-        assert summary["operations"] == {}
+class NativeDatabaseTests(PostgresCase):
+    def _check_actual_native_execution_verification_and_detached_archive(self, case_modes):
+        tmp_path = self.root
+        native_case = build_native_case(self.database, case_modes)
+        service, _executor, access, _bundle, copied, original = native_case
+        public, result = execute_case(native_case)
+        assert result["state"] == "completed"
+        summary_bytes, _member = service.read_result(access, result["attempt_id"])
+        summary = json.loads(summary_bytes)
+        assert summary["operations"]["run"]["exit_code"] == summary["operations"]["verify"]["exit_code"] == 0
+        assert summary["canonical_axes_modified"] is False and summary["publish_dependency"] is False
+        receipt_bytes, _member = service.read_result(access, result["attempt_id"], "verify.stdout.json")
+        receipt = json.loads(receipt_bytes)
+        assert receipt["pass"] and receipt["coverage_complete"] and (receipt["records_checked"] > 0)
+        reference = service.store.result_artifact(result["attempt_id"])
+        archive = tmp_path / "detached"
+        service.store.artifacts.materialize(reference, archive)
+        shutil.rmtree(copied)
+        shutil.rmtree(original)
+        records = [json.loads(line) for line in (archive / "run/records.jsonl").read_text().splitlines()]
+        assert len(records) == receipt["records_checked"]
+        assert {row["verification"] for row in records} == {"unchecked"}
+        request_bytes = (archive / "request.json").read_bytes()
+        assert len(request_bytes) < 1024 * 1024
+        assert "warnings" not in json.loads(request_bytes)["source"]
         for role, path in summary["source_certificate_members"].items():
-            original_certificate = native_case[-1] / (role + "-source.json")
-            assert service.read_result(access, attempt_id, path)[0] == original_certificate.read_bytes()
-        assert service.store.attempt(attempt_id)["resources_settled"]
-        assert executor.reconcile(attempt_id)["state"] == "failed"
-    finally:
-        cleanup_controller(service, attempt_id, controller)
+            declared = json.loads(request_bytes)["source"]["certificates"][role]
+            data = (archive / path).read_bytes()
+            assert len(data) == declared["bytes"] and hashlib.sha256(data).hexdigest() == declared["sha256"]
+            assert json.loads(data)["warnings"]
+        command = [
+            os.environ["ASSESSMENT_TEST_TELEOP_PYTHON"],
+            "-I",
+            "-B",
+            "-m",
+            "teleop.evaluation",
+            "verify",
+            "--run",
+            str(archive / "run"),
+        ]
+        verified = subprocess.run(command, cwd=archive, capture_output=True, timeout=120, check=False)
+        assert verified.returncode == 0, verified.stderr.decode()
+        assert json.loads(verified.stdout)["pass"] is True
+        assert service.get(access, public["request_id"])["attempt"]["state"] == "completed"
 
+    def test_actual_native_execution_verification_and_detached_archive_case_1(self):
+        self._check_actual_native_execution_verification_and_detached_archive(None)
 
-@pytest.mark.parametrize("native_case", [None, "large_certificates"], indirect=True)
-def test_cancel_during_real_sealing_retains_interrupted_summary(native_case, monkeypatch):
-    service, _executor, access, *_ = native_case
-    seal = service.store.artifacts.seal_tree
-    interrupted = []
+    def test_actual_native_execution_verification_and_detached_archive_case_2(self):
+        self._check_actual_native_execution_verification_and_detached_archive("large_certificates")
 
-    def cancel_at_seal(root, **kwargs):
-        if kwargs["kind"] == "dynamics_result" and not interrupted:
-            interrupted.append((root / "assessment_result.json").read_bytes())
-            attempt_id = json.loads(interrupted[0])["attempt_id"]
+    def test_real_source_without_execution_bundle_is_explicitly_unsupported(self):
+        native_case = build_native_case(self.database, None)
+        service, _executor, access, *_ = native_case
+        _public, result = execute_case(native_case, bundle_override=True)
+        assert result["state"] == "unsupported"
+        data, _member = service.read_result(access, result["attempt_id"])
+        summary = json.loads(data)
+        assert summary["detail"]["missing"] == ["sealed_execution_bundle"]
+        assert summary["operations"] == {}
+        assert summary["verification_receipt"] is None
+
+    def test_wrong_installed_runtime_refuses_before_model_execution(self):
+        native_case = build_native_case(self.database, None)
+        service, executor, access, _bundle, *_ = native_case
+        record = service.runtime.to_record()
+        name = next(iter(record["files"]))
+        record["files"][name] = "0" * 64
+        service.runtime = RuntimePin(record)
+        executor.process = TeleopProcess(executor.process.python, service.runtime, executor.process.limits)
+        public, result = execute_case(native_case)
+        assert result["state"] == "failed"
+        data, _member = service.read_result(access, result["attempt_id"], "run.stdout.json")
+        assert json.loads(data)["assessment_error"] == "runtime_identity"
+        assert service.get(access, public["request_id"])["attempt"]["resources_settled"] is True
+
+    def test_result_reads_reauthorize_and_reject_cross_operator(self):
+        native_case = build_native_case(self.database, None)
+        service, _executor, access, *_ = native_case
+        _public, result = execute_case(native_case, bundle_override=True)
+        other = AssessmentAccess("tenant:other", False, access.source)
+        with self.assertRaisesRegex(PermissionError, "another operator"):
+            service.read_result(other, result["attempt_id"])
+
+        def revoked(_dag, _control):
+            raise PermissionError("Source access was revoked")
+
+        with self.assertRaisesRegex(PermissionError, "revoked"):
+            service.read_result(AssessmentAccess(access.principal, False, revoked), result["attempt_id"])
+
+    def _check_owned_native_cancel_preserves_partial_evidence(self, case_modes, phase):
+        native_case = build_native_case(self.database, case_modes)
+        service, _executor, access, *_ = native_case
+        _public, attempt_id, controller = start_controller(native_case)
+        records = service.work_root / attempt_id / "result/run/records.jsonl"
+        try:
+
+            def executing(attempt):
+                return (
+                    attempt["state"] == phase
+                    and attempt["process"] is not None
+                    and records.is_file()
+                    and (records.stat().st_size > 0)
+                )
+
+            attempt = wait_for_attempt(service, attempt_id, controller, executing)
+            identity = attempt["process"]
             service.cancel(access, attempt_id)
-        return seal(root, **kwargs)
+            controller.join(timeout=20)
+            assert not controller.is_alive() and controller.exitcode == 0
+            assert process_state(identity) == "dead"
+            settled = service.store.attempt(attempt_id)
+            assert settled["state"] == "cancelled" and settled["resources_settled"]
+            data, _member = service.read_result(access, attempt_id)
+            summary = json.loads(data)
+            operation = "run" if phase == "running" else "verify"
+            assert summary["operations"][operation]["reason"] == "cancelled"
+            assert summary["canonical_axes_modified"] is False
+            archive = service.work_root / (attempt_id + "-detached")
+            service.store.artifacts.materialize(service.store.result_artifact(attempt_id), archive)
+            assert (archive / "run/records.jsonl").read_bytes() == records.read_bytes()
+        finally:
+            cleanup_controller(service, attempt_id, controller)
 
-    monkeypatch.setattr(service.store.artifacts, "seal_tree", cancel_at_seal)
-    _public, result = execute_case(native_case)
-    assert result["state"] == "cancelled"
-    summary = json.loads(service.read_result(access, result["attempt_id"])[0])
-    assert summary["detail"]["phase"] == "before_result_commit"
-    retained = "interrupted/" + hashlib.sha256(interrupted[0]).hexdigest() + ".json"
-    assert service.read_result(access, result["attempt_id"], retained)[0] == interrupted[0]
-    assert json.loads(interrupted[0])["state"] == "completed"
-    for role, path in summary["source_certificate_members"].items():
-        assert (
-            service.read_result(access, result["attempt_id"], path)[0]
-            == (native_case[-1] / (role + "-source.json")).read_bytes()
+    def test_owned_native_cancel_preserves_partial_evidence_case_1(self):
+        self._check_owned_native_cancel_preserves_partial_evidence("long_run", "running")
+
+    def test_owned_native_cancel_preserves_partial_evidence_case_2(self):
+        self._check_owned_native_cancel_preserves_partial_evidence("long_run", "verifying")
+
+    def _check_native_controller_sigkill_requires_original_orphan_reconciliation(self, case_modes):
+        native_case = build_native_case(self.database, case_modes)
+        service, executor, access, *_ = native_case
+        public, attempt_id, controller = start_controller(native_case)
+        records = service.work_root / attempt_id / "result/run/records.jsonl"
+        try:
+            attempt = wait_for_attempt(
+                service,
+                attempt_id,
+                controller,
+                lambda row: (
+                    row["state"] == "running"
+                    and row["process"] is not None
+                    and records.is_file()
+                    and (records.stat().st_size > 0)
+                ),
+            )
+            child = attempt["process"]
+            assert process_state(child) == "alive"
+            os.kill(child["pid"], signal.SIGSTOP)
+            controller.kill()
+            controller.join(timeout=5)
+            assert controller.exitcode == -signal.SIGKILL
+            original = records.read_bytes()
+            with service.store.transaction() as cursor:
+                cursor.execute(
+                    "UPDATE assessment_attempt SET lease_until=now()-interval '1 second' WHERE attempt_id=%s",
+                    (attempt_id,),
+                )
+            assert service.get(access, public["request_id"])["attempt"]["state"] == "unknown"
+            with self.assertRaisesRegex(ValueError, "settled"):
+                service.retry(access, public["request_id"], Dispatch())
+            result = executor.reconcile(attempt_id)
+            assert result["state"] == "failed"
+            assert process_state(child) == "dead"
+            assert records.read_bytes() == original
+            summary = json.loads(service.read_result(access, attempt_id)[0])
+            assert summary["detail"]["phase"] == "orphan_reconciliation"
+            assert summary["detail"]["previous_process"] == child
+            assert summary["operations"] == {}
+            for role, path in summary["source_certificate_members"].items():
+                original_certificate = native_case[-1] / (role + "-source.json")
+                assert service.read_result(access, attempt_id, path)[0] == original_certificate.read_bytes()
+            assert service.store.attempt(attempt_id)["resources_settled"]
+            assert executor.reconcile(attempt_id)["state"] == "failed"
+        finally:
+            cleanup_controller(service, attempt_id, controller)
+
+    def test_native_controller_sigkill_requires_original_orphan_reconciliation_case_1(self):
+        self._check_native_controller_sigkill_requires_original_orphan_reconciliation("long_run")
+
+    def test_native_controller_sigkill_requires_original_orphan_reconciliation_case_2(self):
+        self._check_native_controller_sigkill_requires_original_orphan_reconciliation(
+            ("long_run", "large_certificates")
         )
 
+    def _check_cancel_during_real_sealing_retains_interrupted_summary(self, case_modes):
+        native_case = build_native_case(self.database, case_modes)
+        service, _executor, access, *_ = native_case
+        seal = service.store.artifacts.seal_tree
+        interrupted = []
 
-def test_native_wall_budget_cannot_report_completion(native_case):
-    _service, executor, _access, *_ = native_case
-    executor.process = TeleopProcess(
-        executor.process.python,
-        executor.process.runtime,
-        ProcessLimits(0.01, 2 * 1024**3, 60, 256 * 1024**2),
-    )
-    _public, result = execute_case(native_case)
-    assert result["state"] == "timeout"
+        def cancel_at_seal(root, **kwargs):
+            if kwargs["kind"] == "dynamics_result" and (not interrupted):
+                interrupted.append((root / "assessment_result.json").read_bytes())
+                attempt_id = json.loads(interrupted[0])["attempt_id"]
+                service.cancel(access, attempt_id)
+            return seal(root, **kwargs)
 
+        self.enterContext(mock.patch.object(service.store.artifacts, "seal_tree", cancel_at_seal))
+        _public, result = execute_case(native_case)
+        assert result["state"] == "cancelled"
+        summary = json.loads(service.read_result(access, result["attempt_id"])[0])
+        assert summary["detail"]["phase"] == "before_result_commit"
+        retained = "interrupted/" + hashlib.sha256(interrupted[0]).hexdigest() + ".json"
+        assert service.read_result(access, result["attempt_id"], retained)[0] == interrupted[0]
+        assert json.loads(interrupted[0])["state"] == "completed"
+        for role, path in summary["source_certificate_members"].items():
+            assert (
+                service.read_result(access, result["attempt_id"], path)[0]
+                == (native_case[-1] / (role + "-source.json")).read_bytes()
+            )
 
-@pytest.mark.parametrize("native_case", ["long_run"], indirect=True)
-def test_native_output_budget_cannot_report_completion(native_case):
-    service, executor, access, *_ = native_case
-    executor.process = TeleopProcess(
-        executor.process.python,
-        executor.process.runtime,
-        ProcessLimits(120, 2 * 1024**3, 60, 128 * 1024),
-    )
-    _public, result = execute_case(native_case)
-    assert result["state"] == "failed"
-    summary = json.loads(service.read_result(access, result["attempt_id"])[0])
-    assert summary["operations"]["run"]["exit_code"] != 0
-    assert summary["independent_verification"] is None
+    def test_cancel_during_real_sealing_retains_interrupted_summary_case_1(self):
+        self._check_cancel_during_real_sealing_retains_interrupted_summary(None)
+
+    def test_cancel_during_real_sealing_retains_interrupted_summary_case_2(self):
+        self._check_cancel_during_real_sealing_retains_interrupted_summary("large_certificates")
+
+    def test_native_wall_budget_cannot_report_completion(self):
+        native_case = build_native_case(self.database, None)
+        _service, executor, _access, *_ = native_case
+        executor.process = TeleopProcess(
+            executor.process.python, executor.process.runtime, ProcessLimits(0.01, 2 * 1024**3, 60, 256 * 1024**2)
+        )
+        _public, result = execute_case(native_case)
+        assert result["state"] == "timeout"
+
+    def _check_native_output_budget_cannot_report_completion(self, case_modes):
+        native_case = build_native_case(self.database, case_modes)
+        service, executor, access, *_ = native_case
+        executor.process = TeleopProcess(
+            executor.process.python, executor.process.runtime, ProcessLimits(120, 2 * 1024**3, 60, 128 * 1024)
+        )
+        _public, result = execute_case(native_case)
+        assert result["state"] == "failed"
+        summary = json.loads(service.read_result(access, result["attempt_id"])[0])
+        assert summary["operations"]["run"]["exit_code"] != 0
+        assert summary["independent_verification"] is None
+
+    def test_native_output_budget_cannot_report_completion_case_1(self):
+        self._check_native_output_budget_cannot_report_completion("long_run")
