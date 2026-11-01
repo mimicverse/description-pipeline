@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager, suppress
+from copy import deepcopy
 import ctypes
 from datetime import datetime, UTC
 import hashlib
@@ -13,17 +14,19 @@ import os
 from pathlib import Path
 import socket
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import uuid
 import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKER = os.environ.get("TELEOP_PICO_PYTHON")
-LINK = os.environ.get("PICO_LINK_PYTHON", WORKER)
+LINK = os.environ.get("PICO_LINK_PYTHON")
 SESSION_TESTS = bool(WORKER) and sys.platform == "linux"
 
 if SESSION_TESTS:
@@ -45,7 +48,8 @@ if SESSION_TESTS:
     from description_pipeline.owned_process import process_identity, resource_state
     from description_pipeline.simulation.service import RunningSession, SimulationService
     from description_pipeline.simulation.store import SimulationConflict, SimulationStore
-    from description_pipeline.simulation.verify_recording import verify
+    from description_pipeline.simulation.verify_recording import prepare_bound
+    from description_pipeline.simulation.recording import recording_binding, run_verification, verification_execution
     from description_pipeline.simulation.recording import VerificationUnresolved, session_identity
     from description_pipeline.pipeline.contracts import ArtifactRef
     from description_pipeline.platform.facts import FactStore
@@ -426,6 +430,8 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
             {**self.request, "record": False},
             previous_owner,
         )
+        unissued = {"type": "estop", "command_id": "unissued-orphan"}
+        self.store.authorize_command(unresolved["session_id"], unissued["command_id"], "app:tenant:operator", unissued)
         previous = self.store.create(
             "app:tenant:operator",
             "orphan-with-recording",
@@ -452,11 +458,13 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
         recording.mkdir(parents=True)
         (recording / "request.json").write_bytes(canonical(previous["request"]))
         (recording / "session.json").write_bytes(canonical(session_identity(previous)))
-        (recording / "ticks.jsonl").write_bytes(b"")
+        (recording / "native").mkdir()
+        (recording / "native/records.jsonl").write_bytes(b"")
 
         await self.start_service()
         with self.subTest(branch="missing-process-identity"):
             self.assertEqual("unresolved", self.store.get(unresolved["session_id"])["state"])
+            self.assertEqual("not_sent", self.store.worker_commands(unresolved["session_id"])[0]["result"]["state"])
         recovered = self.store.get(previous["session_id"])
         self.assertEqual("failed", recovered["state"])
         self.assertEqual(previous_owner, recovered["owner_nonce"])
@@ -528,7 +536,8 @@ sys.stdin.buffer.read(1)
             (recording / "request.json").write_bytes(canonical(self.request))
             if row is not None:
                 (recording / "session.json").write_bytes(canonical(session_identity(row)))
-            (recording / "ticks.jsonl").write_bytes(b"original partial\n")
+            (recording / "native").mkdir()
+            (recording / "native/records.jsonl").write_bytes(b"original partial\n")
             current = RunningSession(process, recording.parent, identity=identity)
             if exit_leader:
                 process.stdin.close()
@@ -588,7 +597,7 @@ sys.stdin.buffer.read(1)
             self.assertEqual(current.identity, unresolved["process_identity"])
             self.assertIsNone(unresolved["recording_artifact"])
             self.assertTrue(Path(f"/proc/{child}").exists())
-            self.assertEqual(b"original partial\n", (current.root / "recording/ticks.jsonl").read_bytes())
+            self.assertEqual(b"original partial\n", (current.root / "recording/native/records.jsonl").read_bytes())
             self.assertFalse((current.root / "recording/outcome.json").exists())
             with self.assertRaisesRegex(SimulationConflict, "capacity"):
                 self.store.create(
@@ -1327,10 +1336,11 @@ sys.stdin.buffer.read(1)
         self.assertIsNone(self.service._database_lock)
         self.assertIsNone(self.service._lock)
 
+    @unittest.skipUnless(LINK, "PICO_LINK_PYTHON with the explicit link closure is required")
     async def test_real_pico_link_preserves_transitions_and_rejects_gaps(self):
         result = await asyncio.to_thread(
             subprocess.run,
-            [LINK, "-I", "-B", str(ROOT / "tests/v1/pico_link_probe.py")],
+            [LINK, "-I", "-B", str(ROOT / "tests/v1/pico_link_probe.py"), str(Path(LINK).parent.parent / "libexec/pico_pipeline_link.py")],
             capture_output=True,
             text=True,
             timeout=15,
@@ -1376,25 +1386,30 @@ sys.stdin.buffer.read(1)
         bound = await self.service.verify_recording(sid, self.members, self.read_member)
         self.assertEqual(self.store.get(sid)["request_digest"], bound["binding"]["request_digest"])
         self.assertTrue(bound["recording_complete"])
-        self.assertFalse(bound["control_replay_verified"])
+        self.assertTrue(bound["control_replay_verified"])
+        self.assertTrue(bound["replay"]["source_root_overridden"])
         self.register_cli_source_fixture()
-        cli = await asyncio.to_thread(
-            subprocess.run,
-            [sys.executable, "-m", "description_pipeline.simulation.verify_recording", "--session", sid],
+        cli_temporary = self.root / "cli-temporary"
+        cli_temporary.mkdir()
+        cli = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "description_pipeline.simulation.verify_recording", "--session", sid, "--python", WORKER,
             env={
                 **os.environ,
-                "PYTHONPATH": str(ROOT / "src"),
+                "TMPDIR": str(cli_temporary),
                 "PLATFORM_ARTIFACT_ROOT": str(self.artifacts.root),
                 "PLATFORM_OPERATOR_DSN": psycopg2.extensions.make_dsn(
                     self.pg.get_uri(), options=f"-csearch_path={self.schema}"
                 ),
             },
-            capture_output=True,
-            text=True,
-            timeout=30,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        self.assertEqual(0, cli.returncode, cli.stderr)
-        self.assertEqual(bound["binding"], json.loads(cli.stdout)["binding"])
+        stdout, stderr = await asyncio.wait_for(cli.communicate(), 30)
+        self.assertEqual(0, cli.returncode, stderr.decode())
+        cli_result = json.loads(stdout)
+        self.assertEqual(bound["binding"], cli_result["binding"])
+        self.assertEqual(cli.pid, cli_result["verifier_pid"])
+        self.assertEqual([], list(cli_temporary.iterdir()))
         other = await self.service.create(
             "app:tenant:other",
             "other-recording",
@@ -1420,21 +1435,31 @@ sys.stdin.buffer.read(1)
                 "UPDATE simulation_session SET recording_artifact=%s::jsonb WHERE session_id=%s",
                 (json.dumps(original_ref), sid),
             )
-        recording = self.service.root / sid / "recording"
-        verified = await asyncio.to_thread(
-            verify, recording, self.root / "model", expected_request_digest=self.store.get(sid)["request_digest"]
+        self.assertGreater(bound["ticks"], 0)
+        payload = prepare_bound(
+            recording_binding(self.store.get(sid)), self.artifacts, self.service.root / sid / "source",
+            commands=self.store.worker_commands(sid), execution=verification_execution(),
         )
-        self.assertGreater(verified["ticks"], 0)
-        path = recording / "ticks.jsonl"
+        recording = self.root / "diagnostic-recording"
+        shutil.copytree(payload["recording"], recording)
+        payload["recording"] = str(recording)
+        path = recording / "native/records.jsonl"
         lines = path.read_text().splitlines()
         tampered = json.loads(lines[0])
-        tampered["result"]["report"]["arms"]["left"]["applied_pose"]["position_m"][0] += 0.1
+        tampered["extension"]["pico_session"]["state"]["report"]["arms"]["left"]["applied_pose"]["position_m"][0] += 0.1
         lines[0] = json.dumps(tampered)
         path.write_text("\n".join(lines) + "\n")
+        # This private diagnostic bypasses only the archive hash, to reach independent FK.
+        # The real CAS artifact and registered session remain untouched.
+        payload["inventory"]["native/records.jsonl"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        identities = []
+
+        async def register(identity):
+            identities.append(identity)
+
         with self.assertRaisesRegex(ValueError, "TCP differs"):
-            await asyncio.to_thread(
-                verify, recording, self.root / "model", expected_request_digest=self.store.get(sid)["request_digest"]
-            )
+            await run_verification(payload, Path(WORKER), register_process=register)
+        self.assertEqual("dead", resource_state(identities[0]))
         saved = self.store.previous_profile("app:tenant:operator", self.request["source"]["subject_sha256"])
         self.assertEqual(self.request["profile"], saved["profile"])
         with self.store.transaction() as cursor:
@@ -1472,6 +1497,347 @@ sys.stdin.buffer.read(1)
         self.assertIsNotNone(row["recording_artifact"])
         self.assertNotIn(sid, self.service.running)
         await self.service.stop(sid)
+
+    async def exercise_worker1_operator_receipt(self, *, cancel):
+        from unittest.mock import patch
+
+        await self.start_service()
+        row = await self.service.create(
+            "app:tenant:operator",
+            "worker1-control",
+            self.run_id,
+            self.request,
+            self.members,
+            self.read_member,
+        )
+        sid = row["session_id"]
+        await self.wait_ready(sid)
+        body = {"type": "estop", "command_id": "operator-estop"}
+        self.assertIsNone(self.store.authorize_command(sid, body["command_id"], "app:tenant:operator", body))
+        entered, release = asyncio.Event(), asyncio.Event()
+        original = self.service._response
+
+        async def pause_after_acceptance(session, current, message):
+            await original(session, current, message)
+            if message["type"] == "accepted" and message["kind"] == "estop":
+                entered.set()
+                await release.wait()
+
+        with patch.object(self.service, "_response", pause_after_acceptance):
+            sending = asyncio.create_task(self.service.send(sid, {"type": "estop"}, command_id=body["command_id"]))
+            try:
+                await asyncio.wait_for(entered.wait(), 5)
+                accepted = self.store.worker_commands(sid)[0]["result"]
+                self.assertEqual("accepted", accepted["state"])
+                self.assertIs(accepted["response"]["applied"], False)
+                self.assertFalse(sending.done())
+                envelope = accepted["envelope"]
+                if cancel:
+                    sending.cancel()
+                    await asyncio.sleep(0)
+                    self.assertFalse(sending.done())
+            finally:
+                release.set()
+            if cancel:
+                with self.assertRaises(asyncio.CancelledError):
+                    await sending
+            else:
+                receipt = await sending
+                self.assertEqual("applied", receipt["type"])
+                self.assertEqual("estop_latched", receipt["reason"])
+        applied = self.store.worker_commands(sid)[0]["result"]
+        self.assertEqual("applied", applied["state"])
+        self.assertEqual(envelope, applied["envelope"])
+        retried = await self.service.send(sid, {"type": "estop"}, command_id=body["command_id"])
+        self.assertEqual(applied["response"], retried)
+        self.assertEqual(applied, self.store.authorize_command(sid, body["command_id"], "app:tenant:operator", body))
+        with self.assertRaisesRegex(SimulationConflict, "another request"):
+            self.store.authorize_command(sid, body["command_id"], "app:tenant:operator", {**body, "type": "stop"})
+        stop = {"type": "stop", "command_id": "operator-stop"}
+        self.store.authorize_command(sid, stop["command_id"], "app:tenant:operator", stop)
+        await self.service.stop(sid, command_id=stop["command_id"])
+        self.assert_stopped(sid)
+        recording = self.service.root / sid / "recording"
+        raw = [json.loads(line)["raw"] for line in (recording / "native/raw-input.jsonl").read_text().splitlines()]
+        self.assertEqual(1, sum(item.get("id") == envelope["id"] for item in raw))
+        self.assertTrue(json.loads((recording / "outcome.json").read_bytes())["complete"])
+        self.assertEqual(["applied", "applied"], [item["result"]["state"] for item in self.store.worker_commands(sid)])
+
+    async def test_worker1_acceptance_waits_for_applied_and_retry_preserves_original_envelope(self):
+        await self.exercise_worker1_operator_receipt(cancel=False)
+
+    async def test_worker1_cancelled_request_preserves_eventual_applied_evidence(self):
+        await self.exercise_worker1_operator_receipt(cancel=True)
+
+    async def test_native_verifier_rejects_changed_release_bytes_runtime_and_receipts(self):
+        await self.start_service()
+        row = await self.service.create(
+            "app:tenant:operator", "verifier-gates", self.run_id, self.request, self.members, self.read_member
+        )
+        sid = row["session_id"]
+        await self.wait_ready(sid)
+        body = {"type": "estop", "command_id": "gate-estop"}
+        self.store.authorize_command(sid, body["command_id"], "app:tenant:operator", body)
+        await self.service.send(sid, {"type": "estop"}, command_id=body["command_id"])
+        await self.service.stop(sid)
+        payload = prepare_bound(
+            recording_binding(self.store.get(sid)), self.artifacts, self.service.root / sid / "source",
+            commands=self.store.worker_commands(sid), execution=verification_execution(),
+        )
+        original = deepcopy(payload["inventory"])
+        cases = []
+        value = deepcopy(payload)
+        value["execution"]["helper_sha256"] = "0" * 64
+        cases.append((value, "Recording helper bytes changed"))
+        value = deepcopy(payload)
+        value["execution"]["runtime_helper_sha256"] = "0" * 64
+        cases.append((value, "Runtime helper differs"))
+        value = deepcopy(payload)
+        value["request"]["runtime"]["source_commit"] = "0" * 40
+        cases.append((value, "original fixed runtime"))
+        value = deepcopy(payload)
+        value["commands"][0]["result"]["envelope"]["received_monotonic_ns"] += 1
+        cases.append((value, "immutable registered envelope"))
+        value = deepcopy(payload)
+        value["commands"][0]["result"]["response"]["state_digest"] = "0" * 64
+        cases.append((value, "state digest differs"))
+        identities = []
+
+        async def register(identity):
+            identities.append(identity)
+
+        for value, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    await run_verification(value, Path(WORKER), register_process=register)
+                self.assertEqual("dead", resource_state(identities[-1]))
+        verified = await self.service.verify_recording(sid, self.members, self.read_member)
+        self.assertTrue(verified["control_replay_verified"])
+        artifact = ArtifactRef.from_record(self.store.get(sid)["recording_artifact"])
+        after = {item["path"]: item["sha256"] for item in self.artifacts.verify(artifact)["members"]}
+        after["manifest.json"] = artifact.manifest_sha256
+        self.assertEqual(original, after)
+
+    async def test_native_verifier_cancellation_before_stdin_gate_reaps_actual_helper(self):
+        await self.start_service()
+        row = await self.service.create(
+            "app:tenant:operator", "native-verifier-cancel", self.run_id, self.request, self.members, self.read_member
+        )
+        sid = row["session_id"]
+        await self.wait_ready(sid)
+        await self.service.stop(sid)
+        payload = prepare_bound(
+            recording_binding(self.store.get(sid)), self.artifacts, self.service.root / sid / "source",
+            commands=self.store.worker_commands(sid), execution=verification_execution(),
+        )
+        registered = asyncio.Event()
+        identities = []
+
+        async def hold_registration(identity):
+            identities.append(identity)
+            registered.set()
+            await asyncio.Future()
+
+        checking = asyncio.create_task(run_verification(payload, Path(WORKER), register_process=hold_registration))
+        await asyncio.wait_for(registered.wait(), 5)
+        self.assertEqual("alive", resource_state(identities[0]))
+        checking.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await checking
+        self.assertEqual("dead", resource_state(identities[0]))
+
+    async def test_recording_cli_cleans_handoff_on_exec_and_native_runtime_failure(self):
+        await self.start_service()
+        row = await self.service.create(
+            "app:tenant:operator", "cli-error-handoff", self.run_id, self.request, self.members, self.read_member
+        )
+        sid = row["session_id"]
+        await self.wait_ready(sid)
+        await self.service.stop(sid)
+        self.register_cli_source_fixture()
+        directory = self.root / "cli-errors"
+        directory.mkdir()
+        environment = {
+            **os.environ, "TMPDIR": str(directory),
+            "PLATFORM_ARTIFACT_ROOT": str(self.artifacts.root),
+            "PLATFORM_OPERATOR_DSN": psycopg2.extensions.make_dsn(
+                self.pg.get_uri(), options=f"-csearch_path={self.schema}"
+            ),
+        }
+        for python, message in ((self.root / "absent-python", "absolute fixed PICO"), (Path(sys.executable), "teleop")):
+            with self.subTest(python=str(python)):
+                child = await asyncio.create_subprocess_exec(
+                    sys.executable, "-m", "description_pipeline.simulation.verify_recording",
+                    "--session", sid, "--python", str(python), env=environment,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(child.communicate(), 20)
+                self.assertNotEqual(0, child.returncode)
+                self.assertIn(message, (stdout + stderr).decode())
+                self.assertEqual([], list(directory.iterdir()))
+
+    async def test_unsaved_worker1_session_cleans_only_after_clean_stop(self):
+        await self.start_service()
+        row = await self.service.create(
+            "app:tenant:operator",
+            "unsaved-clean",
+            self.run_id,
+            {**self.request, "record": False},
+            self.members,
+            self.read_member,
+        )
+        sid = row["session_id"]
+        await self.wait_ready(sid)
+        self.assertTrue((self.service.root / sid / "recording/native/raw-input.jsonl").is_file())
+        await self.service.stop(sid)
+        self.assertEqual("stopped", self.store.get(sid)["state"])
+        self.assertIsNone(self.store.get(sid)["recording_artifact"])
+        self.assertFalse((self.service.root / sid / "recording").exists())
+
+    async def test_unsaved_worker1_parent_eof_keeps_failure_evidence(self):
+        await self.start_service()
+        row = await self.service.create(
+            "app:tenant:operator",
+            "unsaved-eof",
+            self.run_id,
+            {**self.request, "record": False},
+            self.members,
+            self.read_member,
+        )
+        sid = row["session_id"]
+        await self.wait_ready(sid)
+        current = self.service.running[sid]
+        current.process.stdin.close()
+        async with asyncio.timeout(10):
+            while sid in self.service.running:
+                await asyncio.sleep(0.05)
+        self.assertEqual("failed", self.store.get(sid)["state"])
+        self.assertIsNone(self.store.get(sid)["recording_artifact"])
+        self.assertEqual("dead", resource_state(current.identity))
+        self.assertTrue((current.root / "recording/native/raw-input.jsonl").is_file())
+        self.assertFalse(json.loads((current.root / "recording/outcome.json").read_bytes())["complete"])
+
+    async def test_unsaved_worker1_cleanup_failure_retains_native_evidence(self):
+        await self.start_service()
+        row = await self.service.create(
+            "app:tenant:operator",
+            "unsaved-cleanup-failure",
+            self.run_id,
+            {**self.request, "record": False},
+            self.members,
+            self.read_member,
+        )
+        sid = row["session_id"]
+        await self.wait_ready(sid)
+        native = self.service.root / sid / "recording/native"
+        current = self.service.running[sid]
+        seal = self.service._seal_recording
+
+        async def prevent_cleanup(*args, **kwargs):
+            self.assertEqual("dead", resource_state(current.identity))
+            self.assertTrue((native / "session-manifest.json").is_file())
+            native.chmod(0o500)
+            return await seal(*args, **kwargs)
+
+        self.service._seal_recording = prevent_cleanup
+        try:
+            await self.service.stop(sid)
+            settled = self.store.get(sid)
+            self.assertEqual("failed", settled["state"])
+            self.assertIn("cleanup failed", settled["error"])
+            self.assertIsNone(settled["recording_artifact"])
+            self.assertEqual("dead", resource_state(settled["process_identity"]))
+            self.assertTrue((native / "raw-input.jsonl").is_file())
+        finally:
+            native.chmod(0o700)
+
+    async def test_unsaved_active_supervisor_crash_reconciles_original_native_evidence(self):
+        libc = ctypes.CDLL(None, use_errno=True)
+        previous = ctypes.c_int()
+        self.assertEqual(0, libc.prctl(37, ctypes.byref(previous), 0, 0, 0))
+        self.assertEqual(0, libc.prctl(36, 1, 0, 0, 0))
+        parent, descriptor, identity, reaped = None, None, None, False
+        try:
+            parent = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-B",
+                str(ROOT / "tests/v1/pico_session_crash.py"),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            config = {
+                "dsn": psycopg2.extensions.make_dsn(self.pg.get_uri(), options=f"-csearch_path={self.schema}"),
+                "artifacts": str(self.artifacts.root),
+                "root": str(self.service.root),
+                "python": WORKER,
+                "request": self.request,
+                "run_id": self.run_id,
+                "members": self.members,
+            }
+            parent.stdin.write(canonical(config))
+            await parent.stdin.drain()
+            parent.stdin.close()
+            raw = await asyncio.wait_for(parent.stdout.readline(), 20)
+            if not raw:
+                self.fail((await parent.stderr.read()).decode())
+            started = json.loads(raw)
+            sid, identity = started["session_id"], started["identity"]
+            descriptor = os.pidfd_open(identity["pid"])
+            self.assertEqual("alive", resource_state(identity))
+            original = self.store.get(sid)
+            applied = self.store.worker_commands(sid)[0]["result"]
+            self.assertEqual("applied", applied["state"])
+            for identifier in ("never-dispatched", "registered-pending"):
+                body = {"type": "estop", "command_id": identifier}
+                self.store.authorize_command(sid, identifier, "app:tenant:operator", body)
+            pending_envelope = {
+                "protocol": "teleop.upper-body.worker/1", "type": "estop",
+                "id": "operator-" + hashlib.sha256(b"registered-pending").hexdigest(),
+                "source_session_id": "supervisor-" + original["owner_nonce"],
+                "sequence": 1000000, "received_monotonic_ns": time.monotonic_ns(),
+            }
+            self.store.bind_worker_command(sid, "registered-pending", original["owner_nonce"], pending_envelope)
+            parent.kill()
+            await asyncio.wait_for(parent.wait(), 5)
+            async with asyncio.timeout(10):
+                while True:
+                    pid, _status = os.waitpid(identity["pid"], os.WNOHANG)
+                    if pid:
+                        reaped = True
+                        break
+                    await asyncio.sleep(0.02)
+            self.assertEqual("dead", resource_state(identity))
+            native = self.service.root / sid / "recording/native"
+            before = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in native.iterdir() if p.is_file()}
+            self.assertIn("raw-input.jsonl", before)
+            await self.start_service()
+            settled = self.store.get(sid)
+            self.assertEqual("failed", settled["state"])
+            self.assertIsNone(settled["recording_artifact"])
+            self.assertEqual(identity, settled["process_identity"])
+            self.assertEqual(original["request"], settled["request"])
+            results = {item["command_id"]: item["result"] for item in self.store.worker_commands(sid)}
+            self.assertEqual(applied, results["before-crash-estop"])
+            self.assertEqual("not_sent", results["never-dispatched"]["state"])
+            self.assertIsNone(results["never-dispatched"]["envelope"])
+            self.assertEqual("unknown", results["registered-pending"]["state"])
+            self.assertEqual(pending_envelope, results["registered-pending"]["envelope"])
+            self.assertEqual(before, {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in native.iterdir() if p.is_file()})
+            self.assertFalse(json.loads((native.parent / "outcome.json").read_bytes())["complete"])
+        finally:
+            if parent is not None and parent.returncode is None:
+                parent.kill()
+                await parent.wait()
+            if descriptor is not None:
+                try:
+                    if not reaped:
+                        with suppress(ProcessLookupError):
+                            signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+                        await asyncio.to_thread(os.waitpid, identity["pid"], 0)
+                finally:
+                    os.close(descriptor)
+            self.assertEqual(0, libc.prctl(36, previous.value, 0, 0, 0))
 
     async def test_http_websocket_authentication_and_exclusive_viewer(self):
         await self.start_service()
@@ -1651,14 +2017,13 @@ sys.stdin.buffer.read(1)
                     f"/api/simulations/{sid}/commands", headers=headers, json={"type": "stop", "command_id": "stop"}
                 )
                 self.assertEqual(200, response.status_code, response.text)
-                self.assertEqual({"stopped": True, "state": "stopped", "error": None}, response.json())
+                stopped = response.json()
+                self.assertTrue(stopped["stopped"])
+                self.assertEqual("stopped", stopped["state"])
+                self.assertIsNone(stopped["error"])
+                self.assertEqual("applied", stopped["command_state"])
+                self.assertTrue(stopped["response"]["applied"])
                 self.assert_stopped(sid)
-                await asyncio.to_thread(
-                    verify,
-                    self.service.root / sid / "recording",
-                    self.root / "model",
-                    expected_request_digest=self.store.get(sid)["request_digest"],
-                )
                 response = await client.post(
                     f"/api/simulations/{sid}/recording/verify", headers=headers, json={"request_digest": "0" * 64}
                 )
@@ -1667,6 +2032,7 @@ sys.stdin.buffer.read(1)
                 self.assertEqual(200, response.status_code, response.text)
                 self.assertEqual(sid, response.json()["binding"]["session_id"])
                 verified = response.json()
+                self.assertTrue(verified["control_replay_verified"])
                 inspected = await client.get(f"/api/simulations/{sid}")
                 self.assertEqual("completed", inspected.json()["verification"]["state"])
                 self.assertEqual(verified, inspected.json()["verification"]["value"])
@@ -1684,14 +2050,14 @@ sys.stdin.buffer.read(1)
                 await self.wait_ready(failed_sid)
                 native_send = self.service.send
 
-                async def kill_during_stop(session_id, command):
+                async def kill_during_stop(session_id, command, **kwargs):
                     if session_id == failed_sid and command["type"] == "stop":
                         process = self.service.running[session_id].process
                         process.kill()
                         await process.wait()
                         self.assertEqual(-9, process.returncode)
                     else:
-                        await native_send(session_id, command)
+                        return await native_send(session_id, command, **kwargs)
 
                 self.service.send = kill_during_stop
                 try:

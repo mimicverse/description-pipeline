@@ -133,7 +133,7 @@ async function inspect() {
   return row;
 }
 function showVerification(result) {
-  $("verification-status").textContent = `${result.recording_complete ? "Complete" : "Partial"} recording: ${result.ticks} ticks checked against the registered source. Control-input replay is not covered.`;
+  $("verification-status").textContent = `${result.recording_complete ? "Complete" : "Partial"} recording: ${result.ticks} ticks verified with control-input replay, original runtime/source and independent FK. This is kinematic evidence.`;
 }
 async function command(type) {
   const result = await api(`/api/simulations/${sessionId}/commands`, { method: "POST", body: JSON.stringify({ type, command_id: crypto.randomUUID() }) });
@@ -143,7 +143,9 @@ async function command(type) {
     for (const name of ["estop", "stop", "pair"]) $(name).disabled = true;
     $("pairing").textContent = "";
   }
-  if (type === "estop") $("status").textContent = "Emergency stop requested; inspect the live latched state.";
+  if (type === "estop") $("status").textContent = result.state === "applied" && result.response?.reason === "estop_latched"
+    ? `Emergency stop latched at tick ${result.response.effective_tick}.`
+    : `Emergency stop ${result.state}. Effective control is not confirmed.`;
 }
 $("verify-recording").onclick = async () => {
   $("verify-recording").disabled = true;

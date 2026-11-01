@@ -10,11 +10,13 @@ import sys
 import tempfile
 import unittest
 
-from description_pipeline.simulation.schemas import load_runtime_contract
+from description_pipeline.simulation.runtime import load_runtime_contract
+from description_pipeline.simulation import runtime as runtime_helper
 from description_pipeline.simulation.runtime import validate_runtime_identity
+from description_pipeline import owned_process
 
 ROOT = Path(__file__).resolve().parents[2]
-CONTRACT = ROOT / "src/description_pipeline/simulation/teleop-runtime.json"
+CONTRACT = Path(runtime_helper.__file__).with_name("teleop-runtime.json")
 INSTALLER = ROOT / "scripts/install_teleop_worker.py"
 PICO = os.environ.get("TELEOP_PICO_PYTHON")
 ASSESSMENT = os.environ.get("TELEOP_ASSESSMENT_PYTHON")
@@ -105,7 +107,7 @@ class TeleopRuntimeTests(unittest.TestCase):
     def inspect_installed(self, role, python):
         contract = load_runtime_contract(CONTRACT, consumer=role)
         result = subprocess.run(
-            [python, "-I", "-B", str(ROOT / "src/description_pipeline/simulation/runtime.py")],
+            [python, "-I", "-B", str(Path(runtime_helper.__file__))],
             input=json.dumps(list(contract["dependency_versions"])),
             text=True,
             capture_output=True,
@@ -119,7 +121,7 @@ class TeleopRuntimeTests(unittest.TestCase):
             "print(json.dumps(api['verify_runtime_contract'](json.load(sys.stdin))))"
         )
         checked = subprocess.run(
-            [python, "-I", "-B", "-c", bootstrap, str(ROOT / "src/description_pipeline/simulation/runtime.py")],
+            [python, "-I", "-B", "-c", bootstrap, str(Path(runtime_helper.__file__))],
             input=json.dumps(contract),
             text=True,
             capture_output=True,
@@ -162,7 +164,7 @@ class TeleopRuntimeTests(unittest.TestCase):
                 "record_dir": str(Path(directory) / "records"),
             }
             result = subprocess.run(
-                [PICO, "-I", "-B", str(ROOT / "tests/v1/teleop_consumer_probe.py"), "pico"],
+                [PICO, "-I", "-B", str(ROOT / "tests/v1/teleop_consumer_probe.py"), "pico", owned_process.__file__],
                 input=json.dumps(config),
                 text=True,
                 capture_output=True,
@@ -180,7 +182,7 @@ class TeleopRuntimeTests(unittest.TestCase):
         self.assertEqual("3.10.0", identity["engine"])
         self.assertEqual({"version": "1.3.0", "git_commit": None, "editable": False}, identity["actuator_model"])
         result = subprocess.run(
-            [ASSESSMENT, "-I", "-B", str(ROOT / "tests/v1/teleop_consumer_probe.py"), "assessment"],
+            [ASSESSMENT, "-I", "-B", str(ROOT / "tests/v1/teleop_consumer_probe.py"), "assessment", owned_process.__file__],
             capture_output=True,
             text=True,
             timeout=20,

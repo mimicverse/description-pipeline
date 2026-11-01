@@ -4,12 +4,13 @@ import asyncio
 import hashlib
 import json
 from pathlib import Path
+import runpy
 import sys
 import time
 import uuid
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
-from description_pipeline.owned_process import module_command, process_identity, terminate_owned
+owned = runpy.run_path(sys.argv[2])
+module_command, process_identity, terminate_owned = (owned[key] for key in ("module_command", "process_identity", "terminate_owned"))
 
 
 async def pico(config):

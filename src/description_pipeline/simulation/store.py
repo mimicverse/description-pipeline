@@ -145,6 +145,8 @@ class SimulationStore:
             row = cursor.fetchone()
             if row is None or row[0] not in allowed[state]:
                 raise SimulationConflict("Session ownership or lifecycle changed")
+            if state in {"stopped", "failed", "unresolved"}:
+                self._settle_worker_commands(cursor, session_id)
             if recording is not None:
                 ref = ArtifactRef.from_record(recording)
                 cursor.execute(
@@ -208,8 +210,8 @@ class SimulationStore:
                 if existing[0] != digest(request):
                     raise SimulationConflict("Command identity names another request")
                 return existing[1] or {"state": "pending"}
-            if row[1] not in {"starting", "ready", "stopping"}:
-                raise SimulationConflict("Session is terminal or unresolved")
+            if row[1] not in {"starting", "ready"}:
+                raise SimulationConflict("Session is not accepting new commands")
             cursor.execute(
                 "INSERT INTO simulation_command(session_id,command_id,request_digest,request) "
                 "VALUES(%s,%s,%s,%s::jsonb)",
@@ -224,6 +226,116 @@ class SimulationStore:
                 "AND result IS NULL",
                 (json.dumps(result), session_id, command_id),
             )
+
+    def bind_worker_command(self, session_id, command_id, owner, envelope):
+        with self.transaction() as cursor:
+            cursor.execute(
+                "SELECT owner_nonce,state FROM simulation_session WHERE session_id=%s FOR UPDATE",
+                (session_id,),
+            )
+            row = cursor.fetchone()
+            if row is None or row[0] != owner or row[1] not in {"starting", "ready", "stopping"}:
+                raise SimulationConflict("Worker command ownership is unavailable")
+            cursor.execute(
+                "SELECT request_digest,request,result FROM simulation_command "
+                "WHERE session_id=%s AND command_id=%s FOR UPDATE",
+                (session_id, command_id),
+            )
+            command = cursor.fetchone()
+            if (
+                command is None
+                or digest(command[1]) != command[0]
+                or command[1].get("type") not in {"estop", "stop"}
+                or envelope["type"] != command[1]["type"]
+            ):
+                raise SimulationConflict("Worker command differs from its authorized request")
+            if command[2] is not None:
+                if "envelope" not in command[2]:
+                    raise SimulationConflict("Worker command has another result kind")
+                return command[2]
+            result = {"state": "pending", "envelope": envelope, "response": None, "error": None}
+            cursor.execute(
+                "UPDATE simulation_command SET result=%s::jsonb WHERE session_id=%s AND command_id=%s",
+                (json.dumps(result), session_id, command_id),
+            )
+        return result
+
+    def worker_result(self, session_id, command_id, state, *, response=None, error=None):
+        if state not in {"accepted", "applied", "rejected", "unknown"}:
+            raise ValueError("Invalid worker command result")
+        with self.transaction() as cursor:
+            cursor.execute(
+                "SELECT result FROM simulation_command WHERE session_id=%s AND command_id=%s FOR UPDATE",
+                (session_id, command_id),
+            )
+            row = cursor.fetchone()
+            if row is None or not isinstance(row[0], dict) or "envelope" not in row[0]:
+                raise SimulationConflict("Worker command has no registered envelope")
+            previous = row[0]
+            if previous["state"] == "not_sent":
+                raise SimulationConflict("Command never had worker dispatch authorization")
+            if previous["state"] in {"applied", "rejected"}:
+                if state in {"applied", "rejected"} and response != previous["response"]:
+                    raise SimulationConflict("Worker returned conflicting terminal command evidence")
+                return previous
+            if response is not None and (
+                response.get("command_id") != previous["envelope"]["id"]
+                or response.get("kind", previous["envelope"]["type"]) != previous["envelope"]["type"]
+            ):
+                raise SimulationConflict("Worker response differs from its registered envelope")
+            result = {
+                **previous,
+                "state": state,
+                "response": response if response is not None else previous["response"],
+                "error": error,
+            }
+            cursor.execute(
+                "UPDATE simulation_command SET result=%s::jsonb WHERE session_id=%s AND command_id=%s",
+                (json.dumps(result), session_id, command_id),
+            )
+        return result
+
+    def worker_commands(self, session_id):
+        with self.transaction() as cursor:
+            cursor.execute(
+                "SELECT command_id,request_digest,request,result FROM simulation_command WHERE session_id=%s "
+                "AND request->>'type' IN ('estop','stop') ORDER BY created_at,command_id",
+                (session_id,),
+            )
+            rows = cursor.fetchall()
+        results = []
+        for command, sha, request, result in rows:
+            if digest(request) != sha:
+                raise SimulationConflict("Stored worker command request is inconsistent")
+            results.append({"command_id": command, "result": result})
+        return results
+
+    @staticmethod
+    def _settle_worker_commands(cursor, session_id):
+        cursor.execute(
+            "UPDATE simulation_command SET result=CASE WHEN result IS NULL THEN %s::jsonb "
+            "ELSE result || %s::jsonb END WHERE session_id=%s AND request->>'type' IN ('estop','stop') "
+            "AND (result IS NULL OR result->>'state' IN ('pending','accepted'))",
+            (
+                json.dumps({
+                    "state": "not_sent", "envelope": None, "response": None,
+                    "error": "Worker dispatch was never registered before session closure",
+                }),
+                json.dumps({"state": "unknown", "error": "Session closed before a terminal command receipt"}),
+                session_id,
+            ),
+        )
+
+    def settle_worker_commands(self, session_id, owner):
+        with self.transaction() as cursor:
+            cursor.execute(
+                "SELECT owner_nonce,state FROM simulation_session WHERE session_id=%s FOR UPDATE",
+                (session_id,),
+            )
+            row = cursor.fetchone()
+            if row is None or row[0] != owner or row[1] not in {"stopping", "unresolved"}:
+                raise SimulationConflict("Worker command admission is not closed")
+            self._settle_worker_commands(cursor, session_id)
 
     def orphaned(self, owner: str) -> list[dict]:
         with self.transaction() as cursor:
@@ -243,6 +355,8 @@ class SimulationStore:
                 "AND state NOT IN ('stopped','failed')",
                 (session_id, previous_owner),
             )
+            if cursor.rowcount:
+                self._settle_worker_commands(cursor, session_id)
 
     def begin_verification(self, session_id, command_id, request, owner):
         """The existing command row owns one global managed verification slot."""

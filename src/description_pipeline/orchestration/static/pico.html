@@ -20,7 +20,8 @@
 <form id="setup"><h2>Session configuration</h2>
 <p>A profile binds explicit joints, TCP frames, home pose and input rotation to this exact model revision. It does not change the delivered model.</p>
 <div id="profile-editor"></div>
-<label><input type="checkbox" id="record">Record raw inputs and control ticks</label>
+<label><input type="checkbox" id="record">Save recording</label>
+<p>Unsaved sessions are removed after a clean stop. Failed or unresolved sessions retain diagnostic evidence.</p>
 <button id="launch" disabled>Start Session</button></form>
 <h2>Live control state</h2><p id="live-status">No active session</p><div id="arms"></div>
 <p id="head"></p><details><summary>Detailed control report</summary><pre id="state">No active session</pre></details>
