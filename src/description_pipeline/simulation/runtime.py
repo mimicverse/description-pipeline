@@ -8,7 +8,6 @@ from importlib import metadata
 import json
 from pathlib import Path, PurePosixPath
 import re
-import sys
 
 RUNTIME_IDENTITY_SCHEMA = "solidworks-to-urdf.teleop-runtime-identity/v1"
 RUNTIME_CONTRACT_SCHEMA = "solidworks-to-urdf.teleop-runtime/v1"
@@ -35,11 +34,11 @@ def _wheel(record, package, version):
         raise ValueError("Runtime wheel identity is invalid")
 
 
-def load_runtime_contract(path: Path, *, consumer: str) -> dict:
-    """Validate the common inventory once and project one explicit consumer."""
+def load_runtime_contract(path: Path | bytes, *, consumer: str) -> dict:
+    """Project one explicit consumer from a path or already verified bytes."""
     if consumer not in {"pico", "assessment"}:
         raise ValueError("Runtime consumer must be pico or assessment")
-    contract = json.loads(path.read_bytes())
+    contract = json.loads(path if isinstance(path, bytes) else path.read_bytes())
     if (
         not isinstance(contract, dict)
         or set(contract) != {"schema_version", "common", "consumers"}
@@ -214,5 +213,4 @@ def verify_runtime_contract(contract: dict) -> dict:
 
 
 if __name__ == "__main__":
-    # The supervisor captures and persists the process identity before sending.
-    print(json.dumps(installed_runtime(json.load(sys.stdin))))
+    raise SystemExit("Load the runtime helper through its registered byte gate")

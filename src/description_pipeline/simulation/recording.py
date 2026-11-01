@@ -95,23 +95,41 @@ class VerificationUnresolved(SimulationConflict):
     """A managed verifier still owns its original partial inputs and capacity."""
 
 
-def verification_execution() -> dict:
+def verification_execution(*, consumer="pico") -> dict:
+    from .. import runtime as product_runtime
     from .runtime import load_runtime_contract
 
+    tool = product_runtime.tool_record(role="portable")
+    release = tool["release"]
     directory = Path(__file__).parent
+    snapshots = {}
+    for name in ("verify_recording.py", "runtime.py", "teleop-runtime.json"):
+        path = directory / name
+        if path.is_symlink():
+            raise ValueError("A consumer resource must not be a symbolic link")
+        content = path.read_bytes()
+        actual = hashlib.sha256(content).hexdigest()
+        # Installed production uses the existing package inventory. Source-mode
+        # software tests retain their existing unqualified, construction-time basis.
+        expected = release["package_files"].get("simulation/" + name) if release is not None else actual
+        if actual != expected:
+            raise ValueError("Consumer bytes differ from the installed release inventory")
+        snapshots[name] = (content, expected)
     return {
-        "helper_sha256": hashlib.sha256((directory / "verify_recording.py").read_bytes()).hexdigest(),
-        "runtime_helper_sha256": hashlib.sha256((directory / "runtime.py").read_bytes()).hexdigest(),
-        "runtime_contract": load_runtime_contract(directory / "teleop-runtime.json", consumer="pico"),
+        "helper_sha256": snapshots["verify_recording.py"][1],
+        "runtime_helper_sha256": snapshots["runtime.py"][1],
+        "runtime_contract": load_runtime_contract(snapshots["teleop-runtime.json"][0], consumer=consumer),
+        "pipeline_source_sha256": tool["source_sha256"],
+        "release_inventory_bound": release is not None,
     }
 
 
-def evidence_command(python: Path, nonce: str, execution: dict) -> list[str]:
+def _helper_command(python: Path, nonce: str, helper: Path, expected: str, operation: str) -> list[str]:
     if not python.is_absolute() or not python.is_file():
-        raise ValueError("Recording verification requires an absolute fixed PICO interpreter")
+        raise ValueError("Native verification requires an absolute fixed PICO interpreter")
     limiter = shutil.which("prlimit")
     if limiter is None:
-        raise ValueError("Recording verification requires native resource control")
+        raise ValueError("Native verification requires resource control")
     # Only standard-library bootstrap code runs before the registered stdin gate.
     entry = """import hashlib,json,shutil,sys
 from pathlib import Path
@@ -124,10 +142,13 @@ try:
     path = Path(sys.argv[1])
     code = path.read_bytes()
     if hashlib.sha256(code).hexdigest() != sys.argv[2]:
-        raise ValueError('Recording helper bytes changed')
-    scope = {'__file__': str(path), '__name__': 'recording_native_helper'}
+        raise ValueError(('Runtime' if sys.argv[3] == 'runtime' else 'Recording') + ' helper bytes changed')
+    scope = {'__file__': str(path), '__name__': 'consumer_native_helper'}
     exec(compile(code, str(path), 'exec'), scope)
-    raise SystemExit(scope['worker_main'](payload))
+    if sys.argv[3] == 'runtime':
+        print(json.dumps(scope['verify_runtime_contract'](payload['runtime_contract'])))
+    else:
+        raise SystemExit(scope['worker_main'](payload))
 except Exception as error:
     if isinstance(payload, dict) and payload.get('cleanup') is not None:
         cleanup = Path(payload['cleanup'])
@@ -139,8 +160,18 @@ except Exception as error:
     return [
         limiter, "--as=4294967296", "--nofile=128", "--cpu=180", "--",
         str(python), "-I", "-B", "-c", entry,
-        str(Path(__file__).with_name("verify_recording.py")), execution["helper_sha256"], nonce,
+        str(helper), expected, operation, nonce,
     ]
+
+
+def evidence_command(python: Path, nonce: str, execution: dict) -> list[str]:
+    return _helper_command(
+        python, nonce, Path(__file__).with_name("verify_recording.py"), execution["helper_sha256"], "recording"
+    )
+
+
+def runtime_command(python: Path, nonce: str, execution: dict) -> list[str]:
+    return _helper_command(python, nonce, Path(__file__).with_name("runtime.py"), execution["runtime_helper_sha256"], "runtime")
 
 
 async def run_verification(payload: dict, python: Path, *, register_process) -> dict:

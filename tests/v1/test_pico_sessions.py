@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager, contextmanager, suppress
 from copy import deepcopy
 import ctypes
 from datetime import datetime, UTC
@@ -50,6 +50,7 @@ if SESSION_TESTS:
     from description_pipeline.simulation.store import SimulationConflict, SimulationStore
     from description_pipeline.simulation.verify_recording import prepare_bound
     from description_pipeline.simulation.recording import recording_binding, run_verification, verification_execution
+    from description_pipeline.simulation import recording as recording_module
     from description_pipeline.simulation.recording import VerificationUnresolved, session_identity
     from description_pipeline.pipeline.contracts import ArtifactRef
     from description_pipeline.platform.facts import FactStore
@@ -280,6 +281,73 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
     async def start_service(self):
         await self.service.start()
         self.request["runtime"] = self.service.runtime_identity
+
+    @contextmanager
+    def synthetic_release_consumer(self):
+        from unittest.mock import patch
+
+        directory = self.root / "synthetic-release-consumer"
+        directory.mkdir()
+        inventory = {}
+        for name in ("runtime.py", "verify_recording.py", "teleop-runtime.json"):
+            content = Path(recording_module.__file__).with_name(name).read_bytes()
+            (directory / name).write_bytes(content)
+            inventory["simulation/" + name] = hashlib.sha256(content).hexdigest()
+        # Only the existing product inventory trust boundary is a fixture.
+        # Hashing, child execution, stdin, ownership and marker refusal are real.
+        tool = {"release": {"package_files": inventory}, "source_sha256": digest(inventory)}
+        with (
+            patch.object(recording_module, "__file__", str(directory / "recording.py")),
+            patch("description_pipeline.runtime.tool_record", return_value=tool),
+        ):
+            yield directory
+
+    async def test_cold_consumer_helper_marker_is_rejected_by_original_release_inventory(self):
+        marker = self.root / "cold-helper-executed"
+        with self.synthetic_release_consumer() as directory:
+            runtime = directory / "runtime.py"
+            runtime.write_bytes(runtime.read_bytes() + f"\nPath({str(marker)!r}).write_text('executed')\n".encode())
+            with self.assertRaisesRegex(ValueError, "installed release inventory"):
+                SimulationService(self.store, self.artifacts, self.service.root, Path(WORKER))
+        self.assertFalse(marker.exists())
+
+    async def test_startup_gate_refuses_constructor_late_drift_before_cold_top_level_marker(self):
+        marker = self.root / "late-runtime-executed"
+        with self.synthetic_release_consumer() as directory:
+            self.service = SimulationService(self.store, self.artifacts, self.service.root, Path(WORKER))
+            basis = deepcopy(self.service._consumer_execution)
+            runtime = directory / "runtime.py"
+            runtime.write_bytes(runtime.read_bytes() + f"\nPath({str(marker)!r}).write_text('executed')\n".encode())
+            with self.assertRaisesRegex(ValueError, "Runtime helper bytes changed"):
+                await self.service.start()
+            self.assertEqual(basis, self.service._consumer_execution)
+            self.assertIsNone(self.service.runtime_identity)
+            self.assertIsNone(self.service._lock)
+            self.assertIsNone(self.service._probe)
+            self.assertEqual(b"", (self.service.root / "supervisor.lock").read_bytes())
+        self.assertFalse(marker.exists())
+
+    async def test_recording_gate_reuses_constructor_release_basis_after_helper_drift(self):
+        marker = self.root / "late-recording-executed"
+        with self.synthetic_release_consumer() as directory:
+            self.service = SimulationService(self.store, self.artifacts, self.service.root, Path(WORKER))
+            await self.start_service()
+            row = await self.service.create(
+                "app:tenant:operator", "recording-drift", self.run_id, self.request, self.members, self.read_member
+            )
+            sid = row["session_id"]
+            await self.wait_ready(sid)
+            await self.service.stop(sid)
+            original = self.store.get(sid)["recording_artifact"]
+            helper = directory / "verify_recording.py"
+            helper.write_bytes(helper.read_bytes() + f"\nPath({str(marker)!r}).write_text('executed')\n".encode())
+            with self.assertRaisesRegex(ValueError, "Recording helper bytes changed"):
+                await self.service.verify_recording(sid, self.members, self.read_member)
+            attempt = self.store.verification_attempts(sid)[-1]
+            self.assertEqual("failed", attempt["result"]["state"])
+            self.assertEqual("dead", resource_state(attempt["result"]["process_identity"]))
+            self.assertEqual(original, self.store.get(sid)["recording_artifact"])
+        self.assertFalse(marker.exists())
 
     async def test_failed_supervisor_probe_releases_root_ownership(self):
         import fcntl
