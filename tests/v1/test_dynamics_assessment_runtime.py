@@ -439,10 +439,10 @@ class NativeRuntimeGateTests(AssessmentCase):
 
 
     def clone_native_runtime(self):
-        temporary = tempfile.TemporaryDirectory(prefix="assessment-runtime-", dir=Path(__file__).resolve().parents[2])
+        temporary = tempfile.TemporaryDirectory(prefix="assessment-runtime-")
         self.addCleanup(temporary.cleanup)
         clone = Path(temporary.name) / "runtime"
-        shutil.copytree(self.python.parent.parent, clone, symlinks=True, copy_function=os.link)
+        shutil.copytree(self.python.parent.parent, clone, symlinks=True)
         self.python = clone / "bin/python"
         info = subprocess.run(
             [str(self.python), "-I", "-B", "-c",
@@ -464,7 +464,7 @@ class NativeRuntimeGateTests(AssessmentCase):
         origin = json.loads(origin_path.read_bytes())
         change(origin)
         data = json.dumps(origin).encode()
-        # Atomic replacement breaks the clone's hard links before mutation.
+        # Replace only the private metadata; the original installation stays unchanged.
         replacement = origin_path.with_suffix(".replacement")
         replacement.write_bytes(data)
         replacement.replace(origin_path)
