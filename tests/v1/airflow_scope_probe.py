@@ -33,7 +33,7 @@ from unittest.mock import patch
 from psycopg2.extensions import make_dsn
 from description_pipeline.orchestration.airflow_client import native_run_id
 from description_pipeline.orchestration.portal import AirflowDispatchAdapter
-from description_pipeline.pipeline.ingestion import ProductionAdmissionFactory, ProductionMJCFSuccessorRequest
+from description_pipeline.pipeline.ingestion import ProductionAdmissionFactory, ProductionStageRerunRequest
 from description_pipeline.platform.queries import read_run_projection
 from tests.v1 import test_real_six_stage_chain as fixtures
 from tests.v1.test_mjcf_portal import DevelopmentAirflow
@@ -77,10 +77,18 @@ def main():
             app.dispatch(source.dispatch_command.command_id, AirflowDispatchAdapter(transport, "isolated-review"))
             assert app.execute_run(source_request.run_id).outcome == "completed"
             dag_run_id = "refactor-mjcf-" + uuid.uuid4().hex
-            rerun = factory.admit_mjcf(app, ProductionMJCFSuccessorRequest(
-                run_id=native_run_id(dag_run_id), request_id=dag_run_id, parent_run_id=source_request.run_id,
-                principal=source_request.principal, change_summary="Validate scoped Airflow execution",
-            ))
+            rerun = factory.admit_stage_rerun(
+                app,
+                ProductionStageRerunRequest(
+                    from_stage="mjcf",
+                    through_stage="publish",
+                    run_id=native_run_id(dag_run_id),
+                    request_id=dag_run_id,
+                    parent_run_id=source_request.run_id,
+                    principal=source_request.principal,
+                    change_summary="Validate scoped Airflow execution",
+                ),
+            )
             app.dispatch(rerun.dispatch_command.command_id, AirflowDispatchAdapter(transport, "isolated-review"))
             native_keys = ("SOLIDWORKS_ENDPOINT_URL", "TUNNEL_LOOPBACK_PORT",
                            "ENDPOINT_TOKEN_FILE", "PLATFORM_CONFIG_SNAPSHOT")

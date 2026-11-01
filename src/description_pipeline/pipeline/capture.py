@@ -719,17 +719,6 @@ class CaptureInputs:
                 "capture.native_history_binding",
                 {"where": "native.observation"},
             )
-        if command.diagnostic_scope is None and (
-            historical_source_sha256 != request.native_tool_source_sha256
-            or digest(native_tool) != request.native_tool_record_sha256
-        ):
-            raise ProtocolError(
-                "capture.native_requirement_binding",
-                {
-                    "source": request.native_tool_source_sha256,
-                    "record": request.native_tool_record_sha256,
-                },
-            )
         if (
             discover_request.get("freeze_artifact_id") != freeze.artifact_id
             or discover_request.get("main_assembly") != request.main_assembly
@@ -1256,6 +1245,25 @@ def _invoke_native_operation(
             reason,
         )
     return NativeCaptureResult("unknown", None, None, result, False, "capture.native_unknown")
+
+
+def validate_source_inputs(command: StageCommand, artifacts: ArtifactStore) -> None:
+    """Use the existing adjacent-input parser without a native operation."""
+    with tempfile.TemporaryDirectory(prefix="capture-source-inputs-") as temporary:
+        workspace = StageWorkspace(
+            root=Path(temporary),
+            inputs={
+                ref.artifact_id: artifacts.materialize(ref, Path(temporary) / ref.artifact_id)
+                for ref in command.input_artifacts
+            },
+        )
+        try:
+            CaptureInputs.resolve(command, workspace, CaptureRequest.from_command(command))
+        except ProtocolError as error:
+            for stage in ("freeze", "discover"):
+                if error.code.startswith(f"capture.{stage}"):
+                    error.detail.setdefault("earliest_stage", stage)
+            raise
 
 
 class CaptureHandler:

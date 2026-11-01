@@ -41,7 +41,7 @@ from description_pipeline.pipeline.admission import (
     validate_stage_command,
     validate_verify_command,
     validate_store_command,
-    validate_mjcf_successor,
+    validate_source_successor,
 )
 from description_pipeline.pipeline.admission import ADMISSION_SPEC_SCHEMA
 from description_pipeline.pipeline.contracts import (
@@ -374,21 +374,21 @@ class AdmissionHarness:
 
 
 class AdmissionProjectionTests(unittest.TestCase):
-    def test_mjcf_successor_preserves_sources_and_rejects_chains(self):
+    def test_successor_preserves_sources_and_allows_valid_chains(self):
         source = self.harness.spec
         successor = replace(
             source, run_id="mjcf-rerun", request_id="mjcf-rerun-request", parent_run_id=source.run_id,
             from_stage="mjcf", simulation='{"collision":{"max_vertices":128}}',
         )
-        validate_mjcf_successor(successor, source)
+        validate_source_successor(successor, source)
         for field, value in (("purpose", "inspection_preview" if source.purpose != "inspection_preview" else "release"),
                              ("platform_config_sha256", "1" * 64), ("principal", "another-owner")):
             with self.subTest(field=field), self.assertRaises(ProtocolError):
-                validate_mjcf_successor(replace(successor, **{field: value}), source)
-        with self.assertRaises(ProtocolError):
-            validate_mjcf_successor(
-                replace(successor, run_id="another-rerun", parent_run_id=successor.run_id), successor,
-            )
+                validate_source_successor(replace(successor, **{field: value}), source)
+        validate_source_successor(
+            replace(successor, run_id="another-rerun", parent_run_id=successor.run_id),
+            successor,
+        )
 
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="admission-projection-")

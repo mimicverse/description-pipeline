@@ -575,7 +575,7 @@ def component_proxy_path(link: str, component: str) -> str:
     return "mjcf/collision/" + digest({"link": link, "component": component}) + ".obj"
 
 
-def binding_for_projection(root: Path) -> dict:
+def binding_for_projection(root: Path, *, tool: dict | None = None, engine: dict | None = None) -> dict:
     """Bind checker input bytes; the stage caller separately verifies their ArtifactRefs."""
     files = {}
     for directory in ("urdf", "meshes", "mjcf"):
@@ -586,12 +586,15 @@ def binding_for_projection(root: Path) -> dict:
     if components is not None:
         content = confined(root, components).read_bytes()
         files[components] = {"bytes": len(content), "sha256": hashlib.sha256(content).hexdigest()}
-    return binding_for_files(files, components=components)
+    return binding_for_files(files, components=components, tool=tool, engine=engine)
 
 
-def binding_for_files(files: dict, *, components: str | None) -> dict:
+def binding_for_files(
+    files: dict, *, components: str | None, tool: dict | None = None, engine: dict | None = None
+) -> dict:
     """Use the same binding format for stage views and registered serving inventories."""
     return {"schema_version": INPUT_BINDING_SCHEMA,
             "source": {"urdf": URDF_NAME, "meshes": sorted(p for p in files if p.startswith("meshes/")),
                        "components": components},
-            "files": files, "tool": tool_identity(), "engine": engine_identity()}
+            "files": files, "tool": tool_identity() if tool is None else dict(tool),
+            "engine": engine_identity() if engine is None else dict(engine)}

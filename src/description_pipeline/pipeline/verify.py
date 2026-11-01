@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import tempfile
 import uuid
@@ -36,6 +37,7 @@ from .contracts import (
     DiagnosticReplayScope,
     ExecutionClaim,
     ProtocolError,
+    SourceInputError,
     StageCandidate,
     StageCommand,
     StageExecution,
@@ -332,7 +334,8 @@ def _generate_receipt(
         raise PipelineError("Generate receipt names a different Capture artifact")
     if (
         receipt.get("config_snapshot_sha256") != command.config_snapshot_sha256
-        or receipt.get("contract_sha256") != command.contract_sha256
+        or not isinstance(receipt.get("contract_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", receipt["contract_sha256"]) is None
         or receipt.get("required_executor_sha256") != generate.artifact.producer_tool_sha256
         or receipt.get("actual_executor_sha256") != generate.artifact.producer_tool_sha256
     ):
@@ -406,6 +409,45 @@ def _pair_subject_digest(generate: _ArtifactInput, capture: _ArtifactInput) -> s
     return digest(files)
 
 
+def _source_pair(
+    request: VerifyDomainRequest,
+    *,
+    workspace: StageWorkspace,
+    command: StageCommand,
+) -> tuple[_ArtifactInput, _ArtifactInput, dict]:
+    generate_root = workspace.inputs.get(request.generate_artifact.artifact_id)
+    capture_root = workspace.inputs.get(request.capture_artifact.artifact_id)
+    if (
+        set(workspace.inputs)
+        != {
+            request.generate_artifact.artifact_id,
+            request.capture_artifact.artifact_id,
+        }
+        or generate_root is None
+        or capture_root is None
+    ):
+        raise ProtocolError("verify.input_closure", {"command_id": command.command_id})
+    try:
+        capture = _verify_artifact_tree(Path(capture_root), request.capture_artifact)
+        request_record, _request_sha = read_request_evidence(capture.root / "input/request.json")
+        if request_record.get("purpose") != request.purpose:
+            raise PipelineError("Verify purpose differs from the frozen request")
+        if request_record.get("platform_config_digest") != request.config_snapshot_sha256:
+            raise PipelineError("Verify configuration closure differs from the frozen request")
+    except ProtocolError:
+        raise
+    except PipelineError as error:
+        raise SourceInputError("capture", error) from error
+    try:
+        generate = _verify_artifact_tree(Path(generate_root), request.generate_artifact)
+        receipt = _generate_receipt(generate.root, command=command, generate=generate, capture=capture)
+    except ProtocolError:
+        raise
+    except PipelineError as error:
+        raise SourceInputError("generate", error) from error
+    return generate, capture, receipt
+
+
 def _prepare(
     request: VerifyDomainRequest,
     *,
@@ -420,31 +462,10 @@ def _prepare(
             {"actual": verifier_sha256, "expected": request.expected_verifier_sha256},
         )
     verifier_record_sha256 = digest(verifier)
-    generate_root = workspace.inputs.get(request.generate_artifact.artifact_id)
-    capture_root = workspace.inputs.get(request.capture_artifact.artifact_id)
-    if (
-        set(workspace.inputs)
-        != {
-            request.generate_artifact.artifact_id,
-            request.capture_artifact.artifact_id,
-        }
-        or generate_root is None
-        or capture_root is None
-    ):
-        raise ProtocolError("verify.input_closure", {"command_id": command.command_id})
-    generate = _verify_artifact_tree(Path(generate_root), request.generate_artifact)
-    capture = _verify_artifact_tree(Path(capture_root), request.capture_artifact)
-    receipt = _generate_receipt(
-        generate.root,
-        command=command,
-        generate=generate,
-        capture=capture,
-    )
-    request_record, _request_sha = read_request_evidence(capture.root / "input/request.json")
-    if request_record.get("purpose") != request.purpose:
-        raise PipelineError("Verify purpose differs from the frozen request")
-    if request_record.get("platform_config_digest") != request.config_snapshot_sha256:
-        raise PipelineError("Verify configuration closure differs from the frozen request")
+    try:
+        generate, capture, receipt = _source_pair(request, workspace=workspace, command=command)
+    except SourceInputError as error:
+        raise error.cause from error
     if request.contract_sha256 != CONTRACT_SHA256 or request.policy_sha256 != check_policy_digest():
         raise PipelineError("Verify contract or policy differs from the current verifier")
     closure = digest(
@@ -740,6 +761,33 @@ class VerifyHandler:
         ):
             raise ProtocolError("verify.candidate_identity_mismatch", {"command_id": command.command_id})
         return candidate
+
+
+def validate_source_inputs(command: StageCommand, artifacts) -> None:
+    """Read the supported exact source pair without executing the verifier."""
+    with tempfile.TemporaryDirectory(prefix="verify-source-inputs-") as temporary:
+        workspace = StageWorkspace(
+            root=Path(temporary),
+            inputs={
+                ref.artifact_id: artifacts.materialize(ref, Path(temporary) / ref.artifact_id)
+                for ref in command.input_artifacts
+            },
+        )
+        request, _roots = VerifyHandler().request_from_command(command, workspace)
+        _source_pair(request, workspace=workspace, command=command)
+
+
+def validate_generate_source(command: StageCommand, output: ArtifactRef, artifacts) -> None:
+    """Requalify a producer receipt under its original command identity."""
+    capture_ref = next(
+        ref for ref in command.input_artifacts if ref.artifact_id == command.request["capture_artifact_id"]
+    )
+    with tempfile.TemporaryDirectory(prefix="generate-source-result-") as temporary:
+        generate = _verify_artifact_tree(artifacts.materialize(output, Path(temporary) / "generate"), output)
+        capture = _verify_artifact_tree(artifacts.materialize(capture_ref, Path(temporary) / "capture"), capture_ref)
+        receipt = _generate_receipt(generate.root, command=command, generate=generate, capture=capture)
+        if receipt["contract_sha256"] != command.contract_sha256:
+            raise PipelineError("Generate receipt differs from its original command contract")
 
 
 def validate_certificate_structure(certificate: Mapping[str, Any]) -> None:

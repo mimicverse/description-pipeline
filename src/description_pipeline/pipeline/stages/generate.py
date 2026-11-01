@@ -14,10 +14,12 @@ from ...runtime import tool_record
 from ...schemas import ENGINEERING_MODEL_SCHEMA, GENERATE_REQUEST_SCHEMA, GENERATE_RESULT_SCHEMA, TOOL_SCHEMA
 from ...sources.snapshot import verify_snapshot
 from ...sources.solidworks.captured import derive_engineering_input
+from ...sources.solidworks.capture_projection import load_native_capture_observation
 from ..contracts import (
     ArtifactRef,
     ExecutionClaim,
     ProtocolError,
+    SourceInputError,
     StageCandidate,
     StageCommand,
     StageExecution,
@@ -254,6 +256,20 @@ def _validate_output_closure(
     if checks_sha256 != result.checks_sha256:
         raise ProtocolError("generate.candidate_checks", {"command_id": command.command_id})
     return checks_sha256
+
+
+def validate_source_inputs(command: StageCommand, artifacts: ArtifactStore) -> None:
+    """Read the current supported Capture contract without deriving a model."""
+    capture = _capture_ref(command)
+    with tempfile.TemporaryDirectory(prefix="generate-source-inputs-") as temporary:
+        root = artifacts.materialize(capture, Path(temporary) / "capture")
+        try:
+            verify_snapshot(root / "evidence")
+            load_native_capture_observation(root / "evidence")
+        except ProtocolError:
+            raise
+        except PipelineError as error:
+            raise SourceInputError("capture", error) from error
 
 
 class GenerateHandler:

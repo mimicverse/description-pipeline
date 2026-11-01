@@ -249,13 +249,7 @@ def _bound_artifacts(command: StageCommand, request: Mapping[str, Any]) -> dict[
             )
         bound[role] = artifact
     freeze = bound["freeze"]
-    if (
-        freeze.producer_stage != "freeze"
-        or (
-            command.diagnostic_scope is None
-            and freeze.producer_run_id != command.run_id
-        )
-    ):
+    if freeze.producer_stage != "freeze":
         raise NativeDiscoverRefusal("discover.freeze_binding_mismatch", "Freeze artifact belongs to another run")
     if bound["ruleset"].set_sha256 != request["ruleset_catalog_sha256"]:
         raise NativeDiscoverRefusal("discover.ruleset_binding_mismatch", "Ruleset artifact differs from the request")

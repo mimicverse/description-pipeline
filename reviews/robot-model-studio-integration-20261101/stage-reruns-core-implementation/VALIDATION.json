@@ -1,0 +1,128 @@
+{
+  "recorded_at": "2026-11-01T13:01:58.650137+00:00",
+  "base_commit": "f0b1d67a2373e15e4d402603e8ba31f3fb294b85",
+  "source_bytes": "SOURCE-BYTES.json",
+  "source_sha256": "8c60f5b75140a6489e12cdb2014d9b3c1d1f64bfb4d7de205b6caa127e343b04",
+  "current_source_unchanged_after_tests": true,
+  "python": "3.12.14 (main, Aug 25 2026, 14:00:49) [Clang 22.1.3 ]",
+  "tests": [
+    {
+      "name": "core",
+      "command": [
+        "/home/andy/Work/.tmp-verify-airflow-venv/bin/python",
+        "-B",
+        "-m",
+        "unittest",
+        "tests.v1.test_pipeline_admission",
+        "tests.v1.test_production_admission",
+        "tests.v1.test_pipeline_application",
+        "tests.v1.test_airflow_stage_operator",
+        "tests.v1.test_mjcf_airflow_scope",
+        "tests.v1.test_platform_facts",
+        "tests.v1.test_pipeline_publish",
+        "tests.v1.test_pipeline_verify",
+        "tests.v1.test_mjcf_handler",
+        "tests.v1.test_stages"
+      ],
+      "environment": {
+        "PYTHONPATH": "src"
+      },
+      "tests": 178,
+      "seconds": 181.095,
+      "passed": true,
+      "log": "FINAL-CORE-TESTS.log",
+      "log_sha256": "a81de42b60d06828e6ab1cf12977c3dffe551f0d7f06a59f469679e32f73b407",
+      "source_sha256": "24cb2358dca44387c69702bf559cd16fe67fbfbf0b2e9bca1ec882610b2b45f1",
+      "inherited_after_delta": "Only the recovery parent-reader prefix and its targeted test changed; all other code is byte-identical."
+    },
+    {
+      "name": "process_and_concurrency",
+      "command": [
+        "/home/andy/Work/.tmp-verify-airflow-venv/bin/python",
+        "-B",
+        "-m",
+        "unittest",
+        "tests.v1.test_real_six_stage_chain.RealSixStageChainTests.test_chained_native_and_publication_claims_use_one_ancestor_lock_order",
+        "tests.v1.test_real_six_stage_chain.RealSixStageChainTests.test_current_policy_reuses_sealed_prefix_while_unrelated_suffix_is_pending",
+        "tests.v1.test_real_six_stage_chain.RealSixStageChainTests.test_unsupported_generate_source_and_wrong_capture_pair_identify_recompute_stage",
+        "tests.v1.test_real_six_stage_chain.RealSixStageChainTests.test_independent_ranges_and_chained_sources_execute_in_separate_processes",
+        "tests.v1.test_real_six_stage_chain.RealSixStageChainTests.test_freeze_successor_reuses_originals_and_runs_all_six_stages"
+      ],
+      "environment": {
+        "PYTHONPATH": "src"
+      },
+      "tests": 5,
+      "seconds": 169.3,
+      "passed": true,
+      "log": "FINAL-PROCESS-TESTS.log",
+      "log_sha256": "e5e568e650c5ce755521470064d54ad2cbcafb56b034fc40bda17c34db81a99b",
+      "source_sha256": "24cb2358dca44387c69702bf559cd16fe67fbfbf0b2e9bca1ec882610b2b45f1",
+      "inherited_after_delta": "Only the recovery parent-reader prefix and its targeted test changed; all other code is byte-identical."
+    },
+    {
+      "name": "recovery_prefix_and_lock_regressions",
+      "command": [
+        "/home/andy/Work/.tmp-verify-airflow-venv/bin/python",
+        "-B",
+        "-m",
+        "unittest",
+        "tests.v1.test_real_six_stage_chain.RealSixStageChainTests.test_recovery_qualifies_only_the_required_source_prefix",
+        "tests.v1.test_real_six_stage_chain.RealSixStageChainTests.test_chained_native_and_publication_claims_use_one_ancestor_lock_order",
+        "tests.v1.test_linked_run_ownership"
+      ],
+      "environment": {
+        "PYTHONPATH": "src"
+      },
+      "tests": 15,
+      "seconds": 16.693,
+      "passed": true,
+      "log": "FINAL-RECOVERY-PREFIX-TESTS.log",
+      "log_sha256": "4439138480ebaeda6494d3871b08d27fb336ee47e0f7a4c4ee7f3d5622af6269",
+      "source_sha256": "8c60f5b75140a6489e12cdb2014d9b3c1d1f64bfb4d7de205b6caa127e343b04"
+    }
+  ],
+  "limitations": [
+    "Isolated fixture native backend and local Git/PR endpoints only.",
+    "No independent approval, shared-checkout integration, formal CAD, deployment or production E2E is claimed."
+  ],
+  "failure_history": [
+    {
+      "log": "IDENTITY-FAILURE.log",
+      "cause": "Historical MJCF binding injected the current publisher tool identity.",
+      "fix": "Rebind exact files with the sealed command-bound tool/engine; new MJCF still checks actual runtime identity."
+    },
+    {
+      "log": "INITIAL-CORE-FAILURES.log",
+      "cause": "Two actual executor hashes changed while source files were edited during tests; Verify source attribution also changed the original runtime failure message.",
+      "fix": "Freeze source bytes during final tests and preserve the original runtime cause; admission retains earliest-stage attribution."
+    },
+    {
+      "log": "ADMISSION-REPLAY-FAILURES.log",
+      "cause": "An early replay lookup ran before the initial target gate and changed conflict classification.",
+      "fix": "Keep the initial target/artifact gates and canonical FactConflict while preserving immutable replay semantics."
+    },
+    {
+      "log": "LOCK-DEADLOCK-FAILURE.log",
+      "cause": "Multi-hop source owner resolution acquired run locks in reverse ancestry order.",
+      "fix": "Pure owner resolution plus one root-to-leaf ancestry order for existing run locks.",
+      "original_source": "PRE-LOCK-FACTS.py.txt.gz",
+      "original_source_manifest": "PRE-LOCK-SOURCE-BYTES.json"
+    },
+    {
+      "log": "PREFIX-RECOVERY-FAILURE.log",
+      "proof": "PREFIX-RECOVERY-FAILURE.json",
+      "cause": "The recovery authority reader requalified an unrelated full parent suffix after the correct child-prefix projection.",
+      "fix": "Use the same read_run_projection parser with the selected required prefix for both reads.",
+      "original_source": "PRE-PREFIX-RUN-OWNERSHIP.py.txt.gz",
+      "original_source_manifest": "PRE-PREFIX-FIX-SOURCE-BYTES.json"
+    }
+  ],
+  "approved_delta_inheritance": {
+    "source_manifest": "PRE-PREFIX-FIX-SOURCE-BYTES.json",
+    "changed_files": [
+      "src/description_pipeline/orchestration/run_ownership.py",
+      "tests/v1/test_real_six_stage_chain.py"
+    ],
+    "delta_coverage": "recovery_prefix_and_lock_regressions"
+  }
+}
