@@ -9,7 +9,6 @@ import json
 import os
 from pathlib import Path
 import shutil
-import sys
 import tempfile
 import xml.etree.ElementTree as ET
 
@@ -106,7 +105,8 @@ def _independent_fk(recording: Path, source: Path, request: dict, manifest: dict
                 raise ValueError("Recorded motion exceeds its joint-rate budget")
             for index in range(model.njnt):
                 if model.jnt_limited[index] and int(model.jnt_type[index]) in {
-                    int(mujoco.mjtJoint.mjJNT_HINGE), int(mujoco.mjtJoint.mjJNT_SLIDE)
+                    int(mujoco.mjtJoint.mjJNT_HINGE),
+                    int(mujoco.mjtJoint.mjJNT_SLIDE),
                 }:
                     value = q[model.jnt_qposadr[index]]
                     if not model.jnt_range[index, 0] - 1e-8 <= value <= model.jnt_range[index, 1] + 1e-8:
@@ -119,7 +119,9 @@ def _independent_fk(recording: Path, source: Path, request: dict, manifest: dict
                 for key in ("geom_xpos", "geom_xmat", "xpos", "xmat", "site_xpos", "site_xmat")
             }
             display["ncon"] = int(data.ncon)
-            display_sha = hashlib.sha256(json.dumps(display, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            display_sha = hashlib.sha256(
+                json.dumps(display, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
             if display_sha != extension["display_digest"]:
                 raise ValueError("Recorded display differs from independent forward kinematics")
             basis = data.xmat[base].reshape(3, 3)
@@ -176,12 +178,19 @@ def verify_native(payload: dict) -> dict:
     if manifest["session_id"] != payload["binding"]["session_id"] or init["session_id"] != manifest["session_id"]:
         raise ValueError("Native recording belongs to another registered session")
     for key, value in {
-        "protocol": "teleop.upper-body.worker/1", "mode": "kinematic_ik", "profile": request["profile"],
-        "inventory": request["source"]["files"], "entry": request["source"]["entry"], **request["settings"]
+        "protocol": "teleop.upper-body.worker/1",
+        "mode": "kinematic_ik",
+        "profile": request["profile"],
+        "inventory": request["source"]["files"],
+        "entry": request["source"]["entry"],
+        **request["settings"],
     }.items():
         if init.get(key) != value:
             raise ValueError(f"Native recording initialization differs from its registered request: {key}")
-    if manifest["source"]["inventory"] != request["source"]["files"] or manifest["source"]["entry"] != request["source"]["entry"]:
+    if (
+        manifest["source"]["inventory"] != request["source"]["files"]
+        or manifest["source"]["entry"] != request["source"]["entry"]
+    ):
         raise ValueError("Native source differs from its registered artifact")
     from teleop.backends.mujoco.upper_body import validate_source
 
@@ -242,13 +251,24 @@ def verify_native(payload: dict) -> dict:
         raise ValueError("Recording completion differs from native worker termination")
     check_inventory()
     return {
-        "binding": payload["binding"], "ticks": ticks, "engine": runtime["engine"], "mode": "kinematic_ik",
-        "recording_complete": payload["outcome"]["complete"], "recording_error": payload["outcome"]["error"],
-        "control_replay_verified": True, "warning_inventory": payload["warning_inventory"],
+        "binding": payload["binding"],
+        "ticks": ticks,
+        "engine": runtime["engine"],
+        "mode": "kinematic_ik",
+        "recording_complete": payload["outcome"]["complete"],
+        "recording_error": payload["outcome"]["error"],
+        "control_replay_verified": True,
+        "warning_inventory": payload["warning_inventory"],
         "execution": {key: value for key, value in execution.items() if key != "runtime_contract"},
         "verifier_pid": os.getpid(),
-        "replay": {key: replay[key] for key in ("schema_version", "records_checked", "ticks_replayed", "source_root_overridden")},
-        "scope": "Original runtime/source, command receipts, canonical control replay, limits/rates, fixed joints, display and TCP FK",
+        "replay": {
+            key: replay[key]
+            for key in ("schema_version", "records_checked", "ticks_replayed", "source_root_overridden")
+        },
+        "scope": (
+            "Original runtime/source, command receipts, canonical control replay, "
+            "limits/rates, fixed joints, display and TCP FK"
+        ),
     }
 
 
@@ -316,7 +336,11 @@ def main():
             os.dup2(stream.fileno(), 0)
             argv = evidence_command(args.python, os.urandom(24).hex(), payload["execution"])
             # exec keeps one PID/group and gives the helper cleanup ownership on success.
-            os.execve(argv[0], argv, {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1"})
+            os.execve(
+                argv[0],
+                argv,
+                {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1"},
+            )
     finally:
         # Runs only when materialization, preparation or exec fails.
         shutil.rmtree(temporary)

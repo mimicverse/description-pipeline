@@ -21,7 +21,14 @@ import zipfile
 from ..io import digest, canonical
 from ..owned_process import module_command, process_identity, resource_state, terminate_owned
 from .store import SimulationConflict, SimulationStore
-from .recording import VerificationUnresolved, prepare_source, recording_binding, run_verification, session_identity, verification_execution
+from .recording import (
+    VerificationUnresolved,
+    prepare_source,
+    recording_binding,
+    run_verification,
+    session_identity,
+    verification_execution,
+)
 from .runtime import load_runtime_contract
 from .runtime import validate_runtime_identity
 from .warnings import warning_inventory
@@ -462,11 +469,16 @@ class SimulationService:
 
             from .verify_recording import prepare_bound
 
-            preparing = asyncio.create_task(asyncio.to_thread(
-                prepare_bound, binding, self.artifacts, source,
-                commands=await asyncio.to_thread(self.store.worker_commands, session_id),
-                execution=request["execution"],
-            ))
+            preparing = asyncio.create_task(
+                asyncio.to_thread(
+                    prepare_bound,
+                    binding,
+                    self.artifacts,
+                    source,
+                    commands=await asyncio.to_thread(self.store.worker_commands, session_id),
+                    execution=request["execution"],
+                )
+            )
             try:
                 payload = await asyncio.shield(preparing)
             except asyncio.CancelledError:

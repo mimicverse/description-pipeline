@@ -182,7 +182,14 @@ class TeleopRuntimeTests(unittest.TestCase):
         self.assertEqual("3.10.0", identity["engine"])
         self.assertEqual({"version": "1.3.0", "git_commit": None, "editable": False}, identity["actuator_model"])
         result = subprocess.run(
-            [ASSESSMENT, "-I", "-B", str(ROOT / "tests/v1/teleop_consumer_probe.py"), "assessment", owned_process.__file__],
+            [
+                ASSESSMENT,
+                "-I",
+                "-B",
+                str(ROOT / "tests/v1/teleop_consumer_probe.py"),
+                "assessment",
+                owned_process.__file__,
+            ],
             capture_output=True,
             text=True,
             timeout=20,

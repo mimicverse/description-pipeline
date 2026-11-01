@@ -10,7 +10,9 @@ import time
 import uuid
 
 owned = runpy.run_path(sys.argv[2])
-module_command, process_identity, terminate_owned = (owned[key] for key in ("module_command", "process_identity", "terminate_owned"))
+module_command, process_identity, terminate_owned = (
+    owned[key] for key in ("module_command", "process_identity", "terminate_owned")
+)
 
 
 async def pico(config):

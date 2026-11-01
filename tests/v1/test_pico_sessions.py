@@ -1340,7 +1340,13 @@ sys.stdin.buffer.read(1)
     async def test_real_pico_link_preserves_transitions_and_rejects_gaps(self):
         result = await asyncio.to_thread(
             subprocess.run,
-            [LINK, "-I", "-B", str(ROOT / "tests/v1/pico_link_probe.py"), str(Path(LINK).parent.parent / "libexec/pico_pipeline_link.py")],
+            [
+                LINK,
+                "-I",
+                "-B",
+                str(ROOT / "tests/v1/pico_link_probe.py"),
+                str(Path(LINK).parent.parent / "libexec/pico_pipeline_link.py"),
+            ],
             capture_output=True,
             text=True,
             timeout=15,
@@ -1392,7 +1398,13 @@ sys.stdin.buffer.read(1)
         cli_temporary = self.root / "cli-temporary"
         cli_temporary.mkdir()
         cli = await asyncio.create_subprocess_exec(
-            sys.executable, "-m", "description_pipeline.simulation.verify_recording", "--session", sid, "--python", WORKER,
+            sys.executable,
+            "-m",
+            "description_pipeline.simulation.verify_recording",
+            "--session",
+            sid,
+            "--python",
+            WORKER,
             env={
                 **os.environ,
                 "TMPDIR": str(cli_temporary),
@@ -1437,8 +1449,11 @@ sys.stdin.buffer.read(1)
             )
         self.assertGreater(bound["ticks"], 0)
         payload = prepare_bound(
-            recording_binding(self.store.get(sid)), self.artifacts, self.service.root / sid / "source",
-            commands=self.store.worker_commands(sid), execution=verification_execution(),
+            recording_binding(self.store.get(sid)),
+            self.artifacts,
+            self.service.root / sid / "source",
+            commands=self.store.worker_commands(sid),
+            execution=verification_execution(),
         )
         recording = self.root / "diagnostic-recording"
         shutil.copytree(payload["recording"], recording)
@@ -1581,8 +1596,11 @@ sys.stdin.buffer.read(1)
         await self.service.send(sid, {"type": "estop"}, command_id=body["command_id"])
         await self.service.stop(sid)
         payload = prepare_bound(
-            recording_binding(self.store.get(sid)), self.artifacts, self.service.root / sid / "source",
-            commands=self.store.worker_commands(sid), execution=verification_execution(),
+            recording_binding(self.store.get(sid)),
+            self.artifacts,
+            self.service.root / sid / "source",
+            commands=self.store.worker_commands(sid),
+            execution=verification_execution(),
         )
         original = deepcopy(payload["inventory"])
         cases = []
@@ -1627,8 +1645,11 @@ sys.stdin.buffer.read(1)
         await self.wait_ready(sid)
         await self.service.stop(sid)
         payload = prepare_bound(
-            recording_binding(self.store.get(sid)), self.artifacts, self.service.root / sid / "source",
-            commands=self.store.worker_commands(sid), execution=verification_execution(),
+            recording_binding(self.store.get(sid)),
+            self.artifacts,
+            self.service.root / sid / "source",
+            commands=self.store.worker_commands(sid),
+            execution=verification_execution(),
         )
         registered = asyncio.Event()
         identities = []
@@ -1658,7 +1679,8 @@ sys.stdin.buffer.read(1)
         directory = self.root / "cli-errors"
         directory.mkdir()
         environment = {
-            **os.environ, "TMPDIR": str(directory),
+            **os.environ,
+            "TMPDIR": str(directory),
             "PLATFORM_ARTIFACT_ROOT": str(self.artifacts.root),
             "PLATFORM_OPERATOR_DSN": psycopg2.extensions.make_dsn(
                 self.pg.get_uri(), options=f"-csearch_path={self.schema}"
@@ -1667,9 +1689,16 @@ sys.stdin.buffer.read(1)
         for python, message in ((self.root / "absent-python", "absolute fixed PICO"), (Path(sys.executable), "teleop")):
             with self.subTest(python=str(python)):
                 child = await asyncio.create_subprocess_exec(
-                    sys.executable, "-m", "description_pipeline.simulation.verify_recording",
-                    "--session", sid, "--python", str(python), env=environment,
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                    sys.executable,
+                    "-m",
+                    "description_pipeline.simulation.verify_recording",
+                    "--session",
+                    sid,
+                    "--python",
+                    str(python),
+                    env=environment,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
                 )
                 stdout, stderr = await asyncio.wait_for(child.communicate(), 20)
                 self.assertNotEqual(0, child.returncode)
@@ -1792,10 +1821,12 @@ sys.stdin.buffer.read(1)
                 body = {"type": "estop", "command_id": identifier}
                 self.store.authorize_command(sid, identifier, "app:tenant:operator", body)
             pending_envelope = {
-                "protocol": "teleop.upper-body.worker/1", "type": "estop",
+                "protocol": "teleop.upper-body.worker/1",
+                "type": "estop",
                 "id": "operator-" + hashlib.sha256(b"registered-pending").hexdigest(),
                 "source_session_id": "supervisor-" + original["owner_nonce"],
-                "sequence": 1000000, "received_monotonic_ns": time.monotonic_ns(),
+                "sequence": 1000000,
+                "received_monotonic_ns": time.monotonic_ns(),
             }
             self.store.bind_worker_command(sid, "registered-pending", original["owner_nonce"], pending_envelope)
             parent.kill()
@@ -1823,7 +1854,9 @@ sys.stdin.buffer.read(1)
             self.assertIsNone(results["never-dispatched"]["envelope"])
             self.assertEqual("unknown", results["registered-pending"]["state"])
             self.assertEqual(pending_envelope, results["registered-pending"]["envelope"])
-            self.assertEqual(before, {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in native.iterdir() if p.is_file()})
+            self.assertEqual(
+                before, {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in native.iterdir() if p.is_file()}
+            )
             self.assertFalse(json.loads((native.parent / "outcome.json").read_bytes())["complete"])
         finally:
             if parent is not None and parent.returncode is None:
