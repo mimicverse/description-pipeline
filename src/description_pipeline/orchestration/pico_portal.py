@@ -24,6 +24,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 from ..orchestration.airflow_client import native_run_id
 from ..simulation.service import SimulationService
 from ..simulation.store import SimulationConflict
+from ..simulation.warnings import bind_warning_source
 from .portal import PortalApp, PortalError
 
 log = logging.getLogger(__name__)
@@ -90,8 +91,9 @@ class PicoPortal:
                 raise ValueError("The profile requires an explicit head joint list")
             source = {
                 key: descriptor[key]
-                for key in ("files", "entry", "engine", "subject_sha256", "warnings", "verification_scope")
+                for key in ("files", "entry", "engine", "subject_sha256", "warning_inventory", "verification_scope")
             }
+            source = bind_warning_source(source)
             source["portal_run_id"] = dag
             body = {
                 "source": source,
@@ -196,7 +198,7 @@ class PicoPortal:
                 "saved": profile,
                 "subject_sha256": source["subject_sha256"],
                 "model": choices,
-                "warnings": source["warnings"],
+                "warning_inventory": source["warning_inventory"],
                 "verification_scope": source["verification_scope"],
             })
         except Exception as error:

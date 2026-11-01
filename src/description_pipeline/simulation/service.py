@@ -20,6 +20,7 @@ from ..io import digest, canonical
 from .store import SimulationConflict, SimulationStore
 from .recording import prepare_source, recording_binding, run_verification, session_identity
 from .schemas import load_runtime_contract
+from .warnings import warning_inventory
 
 log = logging.getLogger(__name__)
 
@@ -153,6 +154,7 @@ class SimulationService:
             raise ValueError("A bounded idempotency key is required")
         if self.runtime_identity is None or request.get("runtime") != self.runtime_identity:
             raise ValueError("Simulation request runtime differs from the active fixed worker")
+        warning_inventory(request["source"])
         async with self.gate:
             row = await asyncio.to_thread(
                 self.store.create, actor, key, run_id, request, self.owner, capacity=self.capacity
@@ -164,7 +166,6 @@ class SimulationService:
             source = session_root / "source"
             try:
                 await prepare_source(source, request["source"], members, read_member)
-                (session_root / "request.json").write_bytes(canonical(request) + b"\n")
                 config = {
                     "root": str(source),
                     "inventory": request["source"]["files"],

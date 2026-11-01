@@ -21,6 +21,7 @@ from ..pipeline.contracts import ArtifactRef
 from .recording import materialize_source, recording_binding, run_verification
 from .store import SimulationStore
 from .schemas import TELEOP_RECORDING_SCHEMA, RECORDING_VERIFICATION_SCHEMA
+from .warnings import verify_warning_inventory
 
 
 def verify(recording: Path, source: Path, *, expected_request_digest: str) -> dict:
@@ -29,6 +30,7 @@ def verify(recording: Path, source: Path, *, expected_request_digest: str) -> di
         raise ValueError("Recording request differs from the registered session")
     inventory, profile = request["source"]["files"], request["profile"]
     source = source.resolve()
+    warning_identity = verify_warning_inventory(request["source"], source)
     for name, sha in inventory.items():
         path = (source / name).resolve()
         if not path.is_relative_to(source) or hashlib.sha256(path.read_bytes()).hexdigest() != sha:
@@ -126,6 +128,7 @@ def verify(recording: Path, source: Path, *, expected_request_digest: str) -> di
         "ticks": count,
         "engine": mujoco.mj_versionString(),
         "scope": "Source identity, joint limits/rates, fixed joints, render transforms and applied arm TCP FK",
+        "warning_inventory": warning_identity,
     }
 
 

@@ -14,10 +14,14 @@ from ..io import canonical, digest
 from ..pipeline.contracts import ArtifactRef
 from .store import SimulationConflict
 from .schemas import TELEOP_RECORDING_SCHEMA, RECORDING_VERIFICATION_SCHEMA
+from .warnings import warning_inventory, verify_warning_inventory
 
 
 def materialize_source(destination: Path, source: dict, members: dict, read_member) -> Path:
     files = source["files"]
+    certificate = warning_inventory(source)["certificate"]
+    if files.get(certificate["path"]) != certificate["sha256"]:
+        raise ValueError("Source files do not bind the original warning certificate")
     if len(files) > 2048:
         raise ValueError("Simulation source exceeds the file-count budget")
     destination.mkdir(parents=True, exist_ok=False, mode=0o700)
@@ -33,7 +37,8 @@ def materialize_source(destination: Path, source: dict, members: dict, read_memb
             or ":" in name
         ):
             raise ValueError("Simulation source path is invalid")
-        content = read_member(name, members[name])
+        member = certificate if name == certificate["path"] else members[name]
+        content = read_member(name, member)
         total += len(content)
         if len(content) > 64 * 1024 * 1024 or total > 1024 * 1024 * 1024:
             raise ValueError("Simulation source exceeds the materialization budget")
@@ -43,6 +48,7 @@ def materialize_source(destination: Path, source: dict, members: dict, read_memb
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content)
         path.chmod(0o400)
+    verify_warning_inventory(source, destination)
     return destination
 
 
