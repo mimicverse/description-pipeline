@@ -34,6 +34,7 @@ def main():
         "tests.v1.test_pico_sessions.PicoSessionTests",
         "tests.v1.test_teleop_runtime.TeleopRuntimeTests.test_real_pico_closure_and_protocol_replay_after_source_relocation",
         "tests.v1.test_teleop_runtime.TeleopRuntimeTests.test_real_assessment_closure_public_controller_and_delay",
+        "tests.v1.test_teleop_runtime.TeleopRuntimeTests.test_real_assessment_rejects_coherent_record_stale_record_shadow_and_archive",
     ]
     suite = unittest.defaultTestLoader.loadTestsFromNames(names)
     result = unittest.TextTestRunner(verbosity=2).run(suite)
