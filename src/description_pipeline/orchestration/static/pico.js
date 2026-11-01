@@ -2,6 +2,7 @@ import * as THREE from "/static/vendor/three.module.min.js";
 import { createViewer, disposeRobot } from "/static/viewer.js";
 import { compiledGeometry, frameCompiledGeometry } from "/static/mjcf_viewer.js";
 import { createProfileEditor } from "/static/pico_profile.js";
+import { downloadLinkSetup } from "/static/pico_link.js";
 const $ = (id) => document.getElementById(id);
 const run = new URL(location.href).searchParams.get("run");
 const launchSaved = new URL(location.href).searchParams.get("launch") === "1";
@@ -107,6 +108,7 @@ async function connect() {
 }
 async function inspect() {
   const row = await api(`/api/simulations/${sessionId}`);
+  $("link-setup").disabled = !["starting", "ready"].includes(row.state);
   $("source").textContent = JSON.stringify({ session_id: row.session_id, request_digest: row.request_digest, source: row.source, runtime: row.runtime }, null, 2);
   $("warnings").textContent = JSON.stringify({ warnings: row.source.warnings, scope: row.source.verification_scope }, null, 2);
   $("recording").hidden = !row.recording_artifact;
@@ -134,6 +136,12 @@ $("verify-recording").onclick = async () => {
   finally { $("verify-recording").disabled = false; }
 };
 $("mode").onchange = () => { mode = $("mode").value; };
+$("link-setup").onclick = async () => {
+  try {
+    downloadLinkSetup(location.origin, await inspect());
+    $("link-help").textContent = "Open this setup file with the installed pico-link launcher, then enter a fresh code from Pair PICO Link. The setup file contains no pairing code.";
+  } catch (error) { failure(error); }
+};
 for (const type of ["estop", "stop", "pair"]) $(type).onclick = () => command(type).catch(failure);
 $("setup").onsubmit = async (event) => {
   event.preventDefault(); $("error").textContent = ""; $("launch").disabled = true;
