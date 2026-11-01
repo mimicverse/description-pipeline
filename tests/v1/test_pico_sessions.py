@@ -336,7 +336,71 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
         self.register_cli_source_fixture()
         return row
 
-    async def launch_managed_cli(self, sid, python):
+    def cli_environment(self):
+        environment = dict(os.environ)
+        environment.pop("PLATFORM_OPERATOR_DSN", None)
+        environment.pop("PLATFORM_SERVICE_DSN", None)
+        environment["PLATFORM_ARTIFACT_ROOT"] = str(self.artifacts.root)
+        environment["PLATFORM_SERVICE_DSN"] = getattr(
+            self,
+            "cli_service_dsn",
+            psycopg2.extensions.make_dsn(self.pg.get_uri(), options=f"-csearch_path={self.schema}"),
+        )
+        if hasattr(self, "cli_operator_dsn"):
+            environment["PLATFORM_OPERATOR_DSN"] = self.cli_operator_dsn
+        return environment
+
+    def install_deployed_cli_roles(self):
+        """Replace only this private test schema using actual deployment ownership and grants."""
+        from tests.v1.test_platform_schema_postgres import _sql, PlatformSchemaPostgresTests
+
+        airflow_schema = "cli_airflow_" + uuid.uuid4().hex
+        with self.store.connect() as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT current_database()")
+            database = cursor.fetchone()[0]
+            cursor.execute(f'DROP SCHEMA "{self.schema}" CASCADE')
+            cursor.execute(
+                _sql("bootstrap.sql", platform_schema=self.schema, airflow_schema=airflow_schema, database=database)
+            )
+        fixture = PlatformSchemaPostgresTests()
+        fixture.server, fixture.schema, fixture.airflow_schema, fixture.database = (
+            self.pg,
+            self.schema,
+            airflow_schema,
+            database,
+        )
+        fixture._create_airflow_tables()
+        with (
+            psycopg2.connect(
+                self.pg.get_uri(), user="platform_migrate", options=f"-csearch_path={self.schema},pg_catalog"
+            ) as connection,
+            connection.cursor() as cursor,
+        ):
+            for name in ("schema.sql", "views.sql", "roles.sql"):
+                cursor.execute(
+                    _sql(name, platform_schema=self.schema, airflow_schema=airflow_schema, database=database)
+                )
+        with self.store.transaction() as cursor:
+            cursor.execute("UPDATE admission SET state='open'")
+            admission = RunAdmission.create(
+                run_id=self.run_id,
+                request_id="source-request",
+                request={},
+                parent_run_id=None,
+                from_stage=None,
+                created_at=datetime.now(UTC),
+            )
+            cursor.execute(
+                "INSERT INTO run_admission(run_id,request_id,request,request_digest) VALUES(%s,%s,%s::jsonb,%s)",
+                (self.run_id, admission.request_id, "{}", admission.request_digest),
+            )
+        self.cli_service_dsn = psycopg2.extensions.make_dsn(self.pg.get_uri(), user="platform_service")
+        self.cli_operator_dsn = psycopg2.extensions.make_dsn(self.pg.get_uri(), user="operator_ro")
+        with psycopg2.connect(self.cli_service_dsn) as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT current_user")
+            self.assertEqual("platform_service", cursor.fetchone()[0])
+
+    async def launch_managed_cli(self, sid, python, *, environment=None):
         return await asyncio.create_subprocess_exec(
             sys.executable,
             "-B",
@@ -346,13 +410,7 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
             sid,
             "--config",
             self.cli_config(python),
-            env={
-                **os.environ,
-                "PLATFORM_ARTIFACT_ROOT": str(self.artifacts.root),
-                "PLATFORM_OPERATOR_DSN": psycopg2.extensions.make_dsn(
-                    self.pg.get_uri(), options=f"-csearch_path={self.schema}"
-                ),
-            },
+            env=self.cli_environment() if environment is None else environment,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -376,6 +434,9 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
         slot.close()
 
     async def test_live_managed_cli_survives_real_service_restart_and_sigterm_cleans_its_exact_helper(self):
+        await self.exercise_live_managed_cli_service_restart()
+
+    async def exercise_live_managed_cli_service_restart(self):
         row = await self.software_recording_for_cli()
         sid = row["session_id"]
         wrapper = self.root / "blocked-native-entry"
@@ -405,6 +466,7 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(SimulationConflict, "capacity"):
                 await restarted.verify_recording(sid, self.members, self.read_member)
             await restarted.close()
+
             self.assertEqual("alive", resource_state(identity))
             child.send_signal(signal.SIGTERM)
             stdout, stderr = await asyncio.wait_for(child.communicate(), 15)
@@ -425,6 +487,56 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
             if identity is not None:
                 await self.service._terminate_identity(identity)
             await restarted.close()
+
+    async def test_managed_cli_deployed_roles_write_attempts_and_reject_missing_or_read_only_service_identity(self):
+        self.install_deployed_cli_roles()
+        row = await self.software_recording_for_cli()
+        sid = row["session_id"]
+        source = ArtifactRef.from_record(row["recording_artifact"])
+        original = self.artifacts.verify(source)
+        reader = SimulationStore(lambda: psycopg2.connect(self.cli_service_dsn))
+        child = await self.launch_managed_cli(sid, self.root / "missing-role-python")
+        stdout, stderr = await asyncio.wait_for(child.communicate(), 15)
+        self.assertNotEqual(0, child.returncode)
+        self.assertIn("absolute fixed PICO", (stdout + stderr).decode())
+        attempts = reader.verification_attempts(sid)
+        self.assertEqual(1, len(attempts))
+        self.assertEqual("failed", attempts[0]["result"]["state"])
+        self.assertIsNone(attempts[0]["result"]["process_identity"])
+
+        for statement in (
+            "SELECT * FROM simulation_command LIMIT 0",
+            "UPDATE simulation_session SET error=error WHERE false",
+        ):
+            with psycopg2.connect(self.cli_operator_dsn) as connection:
+                with self.assertRaises(psycopg2.errors.InsufficientPrivilege) as denied, connection.cursor() as cursor:
+                    cursor.execute(statement)
+                self.assertEqual("42501", denied.exception.pgcode)
+
+        missing = self.cli_environment()
+        missing.pop("PLATFORM_SERVICE_DSN")
+        child = await self.launch_managed_cli(sid, Path(WORKER), environment=missing)
+        stdout, stderr = await asyncio.wait_for(child.communicate(), 15)
+        self.assertEqual(2, child.returncode)
+        self.assertIn("PLATFORM_SERVICE_DSN is required", stderr.decode())
+        self.assertEqual(attempts, reader.verification_attempts(sid))
+
+        wrong_role = self.cli_environment()
+        wrong_role["PLATFORM_SERVICE_DSN"] = self.cli_operator_dsn
+        child = await self.launch_managed_cli(sid, Path(WORKER), environment=wrong_role)
+        stdout, stderr = await asyncio.wait_for(child.communicate(), 15)
+        self.assertNotEqual(0, child.returncode)
+        self.assertIn("permission denied for table simulation_command", stderr.decode())
+        self.assertEqual(attempts, reader.verification_attempts(sid))
+        self.assertEqual(original, self.artifacts.verify(source))
+        self.assertFalse(list(self.service.root.glob("recording-verification-*")))
+        slot = reader.acquire_verification_slot()
+        self.assertIsNotNone(slot)
+        slot.close()
+
+    async def test_managed_cli_deployed_service_role_records_running_and_cancelled_receipts(self):
+        self.install_deployed_cli_roles()
+        await self.exercise_live_managed_cli_service_restart()
 
     async def start_service(self):
         await self.service.start()
@@ -1806,14 +1918,7 @@ sys.stdin.buffer.read(1)
             sid,
             "--config",
             self.cli_config(),
-            env={
-                **os.environ,
-                "TMPDIR": str(cli_temporary),
-                "PLATFORM_ARTIFACT_ROOT": str(self.artifacts.root),
-                "PLATFORM_OPERATOR_DSN": psycopg2.extensions.make_dsn(
-                    self.pg.get_uri(), options=f"-csearch_path={self.schema}"
-                ),
-            },
+            env={**self.cli_environment(), "TMPDIR": str(cli_temporary)},
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -2083,14 +2188,7 @@ sys.stdin.buffer.read(1)
         self.register_cli_source_fixture()
         directory = self.root / "cli-errors"
         directory.mkdir()
-        environment = {
-            **os.environ,
-            "TMPDIR": str(directory),
-            "PLATFORM_ARTIFACT_ROOT": str(self.artifacts.root),
-            "PLATFORM_OPERATOR_DSN": psycopg2.extensions.make_dsn(
-                self.pg.get_uri(), options=f"-csearch_path={self.schema}"
-            ),
-        }
+        environment = {**self.cli_environment(), "TMPDIR": str(directory)}
         for python, message in ((self.root / "absent-python", "absolute fixed PICO"), (Path(sys.executable), "teleop")):
             with self.subTest(python=str(python)):
                 child = await asyncio.create_subprocess_exec(
