@@ -288,6 +288,18 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.service._lock)
         self.assertIsNone(self.service.runtime_identity)
 
+    async def test_probe_definite_exec_failure_clears_intent_before_releasing_ownership(self):
+        interpreter = self.root / "nonexecutable-worker"
+        interpreter.write_text("Fixture executable permission failure\n")
+        interpreter.chmod(0o600)
+        self.service.python = interpreter
+        with self.assertRaises(PermissionError):
+            await self.service.start()
+        self.assertEqual(b"", (self.service.root / "supervisor.lock").read_bytes())
+        self.assertIsNone(self.service._probe)
+        self.assertIsNone(self.service._lock)
+        self.assertIsNone(self.service._database_lock)
+
     async def test_fast_exit_probe_without_full_identity_retains_original_ownership(self):
         from unittest.mock import patch
 
@@ -866,6 +878,11 @@ sys.stdin.buffer.read(1)
                 await self.service.start()
             self.assertIsNotNone(self.service._lock)
             self.assertEqual(record, json.loads(lock_path.read_bytes()))
+            self.service._probe_identity = {**current.identity, "nonce": "changed-operation"}
+            with self.assertRaisesRegex(SimulationConflict, "operation identity cannot change"):
+                self.service._write_probe_identity()
+            self.assertEqual(record, json.loads(lock_path.read_bytes()))
+            self.service._probe_identity = current.identity
             self.assertTrue(Path(f"/proc/{child}").exists())
             replacement = SimulationService(self.store, self.artifacts, self.service.root, Path(WORKER))
             with self.assertRaisesRegex(ValueError, "Another simulation supervisor"):
@@ -938,6 +955,159 @@ sys.stdin.buffer.read(1)
                 self.service._write_probe_identity()
                 await self.service.close()
             self.assertEqual(0, libc.prctl(36, previous.value, 0, 0, 0))
+
+    async def exercise_probe_metadata_write_crash(self, point, *, accepted):
+        libc = ctypes.CDLL(None, use_errno=True)
+        previous = ctypes.c_int()
+        self.assertEqual(0, libc.prctl(37, ctypes.byref(previous), 0, 0, 0))
+        self.assertEqual(0, libc.prctl(36, 1, 0, 0, 0))
+        marker = self.root / "probe-write-crash.json"
+        controller, identity, result = None, None, None
+        try:
+            controller = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-B",
+                str(ROOT / "tests/v1/pico_probe_write_crash.py"),
+                str(self.service.root),
+                WORKER,
+                str(marker),
+                point,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(controller.communicate(), 15)
+            self.assertEqual(73, controller.returncode, (stdout, stderr))
+            crashed = json.loads(marker.read_bytes())
+            identity = crashed["identity"]
+            lock_path = self.service.root / "supervisor.lock"
+            original = lock_path.read_bytes()
+            self.assertFalse(crashed["append"])
+            self.assertEqual(crashed["inode"], lock_path.stat().st_ino)
+            before = resource_state(identity) if identity is not None else "not_spawned"
+            if accepted:
+                self.assertEqual("dead", before)
+                await self.start_service()
+                self.assertIsNotNone(self.service._database_lock)
+                self.assertIsNotNone(self.service.runtime_identity)
+                self.assertEqual(b"", lock_path.read_bytes())
+            else:
+                self.assertGreater(len(original), 0)
+                if point == "receipt_partial":
+                    with self.assertRaises(json.JSONDecodeError):
+                        json.loads(original)
+                elif identity is not None:
+                    self.assertEqual(identity["nonce"], json.loads(original)["process_identity"]["nonce"])
+                with self.assertRaisesRegex(SimulationConflict, "unresolved"):
+                    await self.service.start()
+                self.assertEqual(original, lock_path.read_bytes())
+                self.assertIsNone(self.service._database_lock)
+                self.assertIsNone(self.service.runtime_identity)
+                self.assertIsNotNone(self.service._lock)
+                if identity is not None:
+                    self.assertEqual("alive", before)
+                    self.assertEqual("alive", resource_state(identity))
+                with self.assertRaisesRegex(SimulationConflict, "unresolved"):
+                    await self.service.close()
+                self.assertEqual(original, lock_path.read_bytes())
+            self.assertEqual(crashed["inode"], os.fstat(self.service._lock.fileno()).st_ino)
+            result = {
+                "point": point,
+                "controller_exit_code": controller.returncode,
+                "ownership_bytes_after_crash": len(original),
+                "inode": crashed["inode"],
+                "append": crashed["append"],
+                "old_group_before_replacement": before,
+                "replacement_accepted": accepted,
+                "old_group_after_replacement": resource_state(identity) if identity is not None else "not_spawned",
+            }
+            evidence = os.environ.get("PICO_PROBE_WRITE_EVIDENCE")
+            if evidence:
+                destination = Path(evidence)
+                destination.mkdir(parents=True, exist_ok=True)
+                (destination / f"{point}-ownership.bin").write_bytes(original)
+                result["ownership_sha256"] = hashlib.sha256(original).hexdigest()
+        finally:
+            if controller is not None and controller.returncode is None:
+                controller.kill()
+                await controller.wait()
+            if identity is not None and resource_state(identity) != "dead":
+                descriptor = os.pidfd_open(identity["pid"])
+                try:
+                    self.assertEqual(identity, process_identity(identity["pid"], identity["nonce"]))
+                    signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+                finally:
+                    os.close(descriptor)
+                await asyncio.to_thread(os.waitpid, identity["pid"], 0)
+            if self.service._lock is not None:
+                if identity is not None:
+                    # Audit-only recovery uses the fixture's exact captured identity.
+                    self.service._probe_identity = identity
+                else:
+                    # This fixture crashed before the first spawn; no child exists.
+                    self.service._lock.seek(0)
+                    self.service._lock.truncate(0)
+                    self.service._lock.flush()
+                    os.fsync(self.service._lock.fileno())
+                    self.service._probe_identity = None
+                await self.service.close()
+            if result is not None:
+                result["old_group_after_audit_cleanup"] = resource_state(identity) if identity else "not_spawned"
+                if os.environ.get("PICO_PROBE_WRITE_EVIDENCE"):
+                    (Path(os.environ["PICO_PROBE_WRITE_EVIDENCE"]) / f"{point}-result.json").write_text(
+                        json.dumps(result, indent=2) + "\n"
+                    )
+            self.assertEqual(0, libc.prctl(36, previous.value, 0, 0, 0))
+
+    async def test_probe_intent_crash_retains_nonempty_unknown_on_same_inode(self):
+        await self.exercise_probe_metadata_write_crash("intent_truncate", accepted=False)
+
+    async def test_probe_receipt_truncate_crash_retains_original_operation_on_same_inode(self):
+        await self.exercise_probe_metadata_write_crash("receipt_truncate", accepted=False)
+
+    async def test_probe_partial_receipt_write_crash_retains_unknown_fragment(self):
+        await self.exercise_probe_metadata_write_crash("receipt_partial", accepted=False)
+
+    async def test_probe_clear_before_truncate_crash_reconciles_proven_dead_group(self):
+        await self.exercise_probe_metadata_write_crash("clear_before_truncate", accepted=True)
+
+    async def test_probe_clear_after_truncate_crash_accepts_only_proven_dead_group(self):
+        await self.exercise_probe_metadata_write_crash("clear_after_truncate", accepted=True)
+
+    async def test_probe_clear_failure_keeps_lock_and_retries_original_identity(self):
+        await self.start_service()
+        async with self.exited_leader_group(marked=True, register=False) as (_, current, child):
+            self.service._probe_identity = current.identity
+            self.service._write_probe_identity()
+            lock_path = self.service.root / "supervisor.lock"
+            original, inode = lock_path.read_bytes(), lock_path.stat().st_ino
+
+            class FailFirstClear:
+                def __init__(self, stream):
+                    self.stream, self.failed = stream, False
+
+                def __getattr__(self, name):
+                    return getattr(self.stream, name)
+
+                def truncate(self, size=None):
+                    if size == 0 and not self.failed:
+                        self.failed = True
+                        raise OSError("Fixture clear failure before truncate")
+                    return self.stream.truncate(size)
+
+            self.service._lock = FailFirstClear(self.service._lock)
+            with self.assertRaisesRegex(OSError, "Fixture clear failure"):
+                await self.service.close()
+            self.assertIsNotNone(self.service._database_lock)
+            self.assertIsNotNone(self.service.runtime_identity)
+            self.assertEqual(inode, lock_path.stat().st_ino)
+            self.assertEqual(original, lock_path.read_bytes())
+            self.assertFalse(Path(f"/proc/{child}").exists())
+            self.assertEqual("dead", resource_state(current.identity))
+            await self.service.close()
+            self.assertEqual(b"", lock_path.read_bytes())
+            self.assertEqual(inode, lock_path.stat().st_ino)
+            self.assertIsNone(self.service._database_lock)
+            self.assertIsNone(self.service._lock)
 
     async def exercise_verifier_group_cancellation(self, *, marked):
         from unittest.mock import patch
