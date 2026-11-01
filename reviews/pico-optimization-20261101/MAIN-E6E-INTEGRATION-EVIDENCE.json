@@ -209,5 +209,12 @@
     "Daily lightweight link launch packaging",
     "Human PICO and same-release offline/formal pipeline E2E",
     "Independent review and applicable CI of the new merge head"
-  ]
+  ],
+  "actual_integration_commit": "2242b05dd1f5a7b478b2f77705c133929e20e47a",
+  "actual_integration_tree": "c860634d6a4c70babe990dff2d9c737dedf05810",
+  "actual_merge_parents": [
+    "d109cfbc4e5d149135a1640e81f160a9b9fd1066",
+    "e6e7851af873df7357eae3448312665e700d8d12"
+  ],
+  "source_code_qualification": "Product source and applicable test bytes are unchanged from the validated integration commit; this follow-up records the actual Git identity."
 }
