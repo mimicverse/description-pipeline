@@ -151,6 +151,7 @@ print(json.dumps(sorted(
                 "jsonschema==4.26.0",
                 "python-multipart==0.0.32",
                 "starlette==1.6.0",
+                "anyio==4.15.1",
                 "uvicorn==0.52.4",
                 "a2wsgi==1.10.10",
                 "websockets==16.1.1",
