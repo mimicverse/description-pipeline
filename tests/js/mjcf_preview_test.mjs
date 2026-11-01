@@ -12,8 +12,27 @@ const viewerUrl = `data:text/javascript;base64,${Buffer.from(viewerSource).toStr
 const source = readFileSync(new URL("mjcf_viewer.js", staticDir), "utf8")
   .replace('"/static/vendor/three.module.min.js"', JSON.stringify(three))
   .replace('"/static/viewer.js"', JSON.stringify(viewerUrl));
-const { loadMJCF } = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
+const { loadMJCF, compiledGeometry, frameCompiledGeometry } = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
 const THREE = await import(three);
+const meshRecord = {type: "mjGEOM_MESH", positions: [0, 0, 0, 0.4, 0, 0, 0, 0.3, 0], indices: [0, 1, 2]};
+const mesh = new THREE.Mesh(compiledGeometry(meshRecord), new THREE.MeshBasicMaterial());
+mesh.position.set(4, -2, 0.4);
+const floor = new THREE.Mesh(new THREE.PlaneGeometry(1000, 1000), new THREE.MeshBasicMaterial());
+const fitView = {robotRoot: new THREE.Group(), camera: new THREE.PerspectiveCamera(45, 0.25, 0.01, 500),
+  orbit: {target: new THREE.Vector3()}, resize() {}, updateCamera() {
+    this.camera.position.copy(this.orbit.target).add(new THREE.Vector3(0, 0, this.orbit.radius));
+    this.camera.lookAt(this.orbit.target); this.camera.updateMatrixWorld();
+  }};
+fitView.robotRoot.add(mesh, floor);
+frameCompiledGeometry(fitView, [{object: mesh, record: meshRecord}, {object: floor, record: {type: "mjGEOM_PLANE"}}]);
+assert.ok(fitView.orbit.radius < 10, "The environment floor must not determine the robot framing radius");
+for (let index = 0; index < 3; index++) {
+  const projected = new THREE.Vector3().fromBufferAttribute(mesh.geometry.attributes.position, index)
+    .applyMatrix4(mesh.matrixWorld).project(fitView.camera);
+  assert.ok(Math.abs(projected.x) < 1 && Math.abs(projected.y) < 1 && projected.z > -1 && projected.z < 1,
+    "Every native JSON mesh vertex must remain visible in a narrow viewport");
+}
+mesh.geometry.dispose(); mesh.material.dispose(); floor.geometry.dispose(); floor.material.dispose();
 const original = { Worker: globalThis.Worker, fetch: globalThis.fetch, DOMParser: globalThis.DOMParser };
 const bytes = new TextEncoder().encode("<mujoco/>");
 const sha = createHash("sha256").update(bytes).digest("hex");

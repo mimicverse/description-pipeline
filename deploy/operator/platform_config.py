@@ -174,13 +174,22 @@ def validate_platform(document) -> dict:
     )
 
     operator = document["operator"]
-    require_keys(operator, allowed=_OPERATOR_KEYS, required=_OPERATOR_KEYS, where="operator")
+    require_keys(operator, allowed=_OPERATOR_KEYS | {"teleop"}, required=_OPERATOR_KEYS, where="operator")
     origin = text(operator["origin"], "operator.origin")
     match = _ORIGIN.match(origin)
     require(match is not None, f"operator.origin must be an https origin, got {origin!r}")
     origin_port = tcp_port(int(match.group(2)) if match.group(2) else 443, "operator.origin port")
     absolute_path(operator["certificate_file"], "operator.certificate_file")
     absolute_path(operator["private_key_file"], "operator.private_key_file")
+
+    teleop = operator.get("teleop")
+    if "teleop" in operator:
+        require_keys(teleop, allowed={"python", "capacity"}, required={"python", "capacity"}, where="operator.teleop")
+        absolute_path(teleop["python"], "operator.teleop.python")
+        require(
+            type(teleop["capacity"]) is int and 1 <= teleop["capacity"] <= 8,
+            "operator.teleop.capacity must be between 1 and 8",
+        )
 
     storage = document["storage"]
     require_keys(storage, allowed=set(_STORAGE_KEYS), required=set(_STORAGE_KEYS), where="storage")
@@ -290,6 +299,7 @@ def validate_platform(document) -> dict:
             "origin": origin,
             "certificate_file": str(operator["certificate_file"]),
             "private_key_file": str(operator["private_key_file"]),
+            **({"teleop": dict(teleop)} if teleop is not None else {}),
         },
         "storage": {name: str(storage_paths[name]) for name in _STORAGE_KEYS},
         "database": {"dsn_file": str(database["dsn_file"])},

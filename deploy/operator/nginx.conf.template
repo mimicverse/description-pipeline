@@ -74,6 +74,18 @@ http {
             proxy_set_header X-Forwarded-Proto $scheme;
         }
 
+        # Native session state and paired PICO input share the existing TLS origin.
+        location ^~ /api/simulations/ {
+            proxy_pass http://@OPERATOR_UPSTREAM@;
+            proxy_http_version 1.1;
+            proxy_set_header Host $http_host;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_buffering off;
+            proxy_read_timeout 300s;
+        }
+
         # Streaming folder upload: Content-Length required, no request buffering for multi-GB bodies.
         location ^~ /api/runs {
             proxy_pass http://@OPERATOR_UPSTREAM@;
