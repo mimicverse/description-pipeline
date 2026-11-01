@@ -43,6 +43,14 @@ def _row(cursor) -> dict | None:
     return dict(zip((field[0] for field in cursor.description), value, strict=True)) if value else None
 
 
+def _detail_update(detail: dict) -> str:
+    require(
+        isinstance(detail, dict) and "dispatch_accepted" not in detail,
+        "Assessment detail cannot replace dispatch acceptance",
+    )
+    return json.dumps(detail, allow_nan=False)
+
+
 class AssessmentStore:
     """Reuse the platform artifact registry; store no duplicate artifact bytes."""
 
@@ -194,8 +202,10 @@ class AssessmentStore:
             cursor.execute("SELECT state FROM admission WHERE id=1 FOR SHARE")
             require(cursor.fetchone() == ("open",), "Platform admission is closed")
             cursor.execute(
-                "UPDATE assessment_attempt SET state='dispatching',updated_at=now() "
-                "WHERE attempt_id=%s AND state='registered' AND NOT cancel_requested RETURNING attempt_id",
+                "UPDATE assessment_attempt SET state='dispatching',"
+                "detail=detail-'dispatch_observation',updated_at=now() "
+                "WHERE attempt_id=%s AND state='registered' AND NOT cancel_requested "
+                "AND NOT (detail ? 'dispatch_accepted') RETURNING attempt_id",
                 (attempt_id,),
             )
             return cursor.fetchone() is not None
@@ -203,30 +213,34 @@ class AssessmentStore:
     def dispatched(self, attempt_id: str) -> None:
         with self.transaction() as cursor:
             cursor.execute(
-                "UPDATE assessment_attempt SET state='queued',updated_at=now() "
-                "WHERE attempt_id=%s AND state IN ('dispatching','unknown') AND owner_token IS NULL",
+                "UPDATE assessment_attempt SET "
+                "detail=jsonb_set(detail-'dispatch_observation','{dispatch_accepted}','true'::jsonb),"
+                "state=CASE WHEN state IN ('registered','dispatching','unknown') AND owner_token IS NULL "
+                "AND NOT cancel_requested THEN 'queued' ELSE state END,updated_at=now() WHERE attempt_id=%s",
                 (attempt_id,),
             )
 
     def unknown(self, attempt_id: str, detail: dict, *, owner: str | None = None) -> None:
         with self.transaction() as cursor:
             cursor.execute(
-                "UPDATE assessment_attempt SET state='unknown',detail=%s::jsonb,updated_at=now() "
+                "UPDATE assessment_attempt SET state='unknown',detail=detail || %s::jsonb,updated_at=now() "
                 "WHERE attempt_id=%s "
                 "AND state NOT IN ('completed','unsupported','failed','cancelled','timeout') "
                 "AND owner_token IS NOT DISTINCT FROM %s",
-                (json.dumps(detail, allow_nan=False), attempt_id, owner),
+                (_detail_update(detail), attempt_id, owner),
             )
 
-    def dispatch_absent(self, attempt_id: str) -> None:
+    def dispatch_absent(self, attempt_id: str) -> bool:
         """An authenticated exact-DAG absence observation permits the same dispatch."""
         with self.transaction() as cursor:
             cursor.execute(
-                "UPDATE assessment_attempt SET state='registered',detail=%s::jsonb,updated_at=now() "
-                "WHERE attempt_id=%s AND state IN ('dispatching','unknown') "
-                "AND owner_token IS NULL AND process IS NULL",
+                "UPDATE assessment_attempt SET state='registered',detail=detail || %s::jsonb,updated_at=now() "
+                "WHERE attempt_id=%s AND state IN ('registered','dispatching','unknown') "
+                "AND owner_token IS NULL AND process IS NULL AND NOT (detail ? 'dispatch_accepted') "
+                "RETURNING attempt_id",
                 (json.dumps({"dispatch_observation": "absent"}), attempt_id),
             )
+            return cursor.fetchone() is not None
 
     def claim(self, attempt_id: str, owner: str, *, controller: dict, lease_seconds: float = 30) -> dict:
         sha(owner, "Assessment owner token")
@@ -234,6 +248,7 @@ class AssessmentStore:
         with self.transaction() as cursor:
             cursor.execute(
                 "UPDATE assessment_attempt SET state='running',owner_token=%s,owner_process=%s::jsonb,"
+                "detail=jsonb_set(detail-'dispatch_observation','{dispatch_accepted}','true'::jsonb),"
                 "lease_until=now()+%s,updated_at=now() WHERE attempt_id=%s "
                 "AND state IN ('dispatching','queued') AND owner_token IS NULL "
                 "AND NOT cancel_requested RETURNING *",
@@ -252,7 +267,7 @@ class AssessmentStore:
                 "lease_until=now()+interval '30 seconds',"
                 "updated_at=now() WHERE attempt_id=%s AND owner_token=%s "
                 "AND state IN ('running','verifying','sealing') AND lease_until>now() RETURNING *",
-                (phase, json.dumps(process), attempt_id, owner),
+                (phase, json.dumps(process) if process is not None else None, attempt_id, owner),
             )
             result = _row(cursor)
         if result is None:
@@ -312,11 +327,12 @@ class AssessmentStore:
         with self.transaction() as cursor:
             cursor.execute(
                 "UPDATE assessment_attempt SET state=%s,"
-                "result_artifact_id=%s,detail=%s::jsonb,resources_settled=true,process=NULL,lease_until=NULL,"
+                "result_artifact_id=%s,detail=detail || %s::jsonb,resources_settled=true,process=NULL,lease_until=NULL,"
                 "updated_at=now() WHERE attempt_id=%s AND owner_token=%s "
                 "AND state IN ('running','verifying','sealing') AND lease_until>now() "
+                "AND process IS NULL "
                 "AND (NOT cancel_requested OR %s='cancelled') RETURNING *",
-                (state, artifact.artifact_id, json.dumps(detail, allow_nan=False), attempt_id, owner, state),
+                (state, artifact.artifact_id, _detail_update(detail), attempt_id, owner, state),
             )
             result = _row(cursor)
         if result is None:
@@ -340,7 +356,7 @@ class AssessmentStore:
         with self.transaction() as cursor:
             cursor.execute(
                 "UPDATE assessment_attempt SET state='sealing',owner_token=%s,owner_process=%s::jsonb,"
-                "process=NULL,lease_until=now()+interval '30 seconds',updated_at=now() "
+                "lease_until=now()+interval '30 seconds',updated_at=now() "
                 "WHERE attempt_id=%s AND owner_token=%s AND NOT resources_settled "
                 "AND state IN ('running','verifying','sealing','unknown') RETURNING attempt_id",
                 (owner, json.dumps(controller, allow_nan=False), attempt_id, previous_owner),

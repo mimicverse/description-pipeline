@@ -74,7 +74,7 @@ class AssessmentApi:
         return parse_json(data)
 
     def handle(self, environ, *, action: str, identity: str) -> ApiResponse:
-        mutating = action in {"bundle", "create", "retry", "cancel", "reconcile"}
+        mutating = action in {"bundle", "create", "retry", "cancel", "reconcile", "dispatch"}
         try:
             method = "POST" if mutating else "GET"
             if environ.get("REQUEST_METHOD") != method:
@@ -120,7 +120,7 @@ class AssessmentApi:
                     access, identity, environ.get("HTTP_IDEMPOTENCY_KEY", ""), bundle, transport
                 )
                 return ApiResponse.json(result, 202)
-            if action in {"retry", "cancel", "reconcile"}:
+            if action in {"retry", "cancel", "reconcile", "dispatch"}:
                 require(
                     not self._body(environ, empty=True), "Assessment control has no client-supplied identity fields"
                 )
@@ -128,6 +128,8 @@ class AssessmentApi:
                     result = self.service.retry(access, identity, transport)
                 elif action == "cancel":
                     result = self.service.cancel(access, identity)
+                elif action == "dispatch":
+                    result = self.service.dispatch_registered(access, identity, transport)
                 else:
                     result = self.service.reconcile(access, identity, transport, self.runtime_reconciler)
                 return ApiResponse.json(result, 202)

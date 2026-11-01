@@ -146,7 +146,7 @@ export function mountDynamicsAssessment({ container, runId, requestJson, getBund
       const checkbox = element("input");
       checkbox.type = "checkbox";
       checkbox.checked = selected;
-      checkbox.disabled = busy || !canManage;
+      checkbox.disabled = busy || !canManage || pendingSubmission !== null;
       checkbox.addEventListener("change", () => { selected = checkbox.checked; render(); });
       label.append(checkbox, element("span", "Select optional dynamics assessment"));
       panel.append(label);
@@ -175,6 +175,8 @@ export function mountDynamicsAssessment({ container, runId, requestJson, getBund
       }
       const unresolved = assessments.some(item => ACTIVE.has(item.attempt?.state));
       panel.append(button("Run assessment", start, !canManage || !selected || !sourceReady || busy || unresolved));
+      if (pendingSubmission) panel.append(button("Reconcile submitted request", () =>
+        mutate(sourceUrl, pendingSubmission.body, pendingSubmission.key), busy || !canManage || !sourceReady));
       for (const item of assessments) {
         const attempt = item.attempt;
         if (!attempt) continue;
@@ -189,8 +191,11 @@ export function mountDynamicsAssessment({ container, runId, requestJson, getBund
         if (ACTIVE.has(attempt.state)) {
           article.append(button("Cancel assessment", () => mutate(`${attemptUrl}/cancel`), busy || !canManage));
         }
-        if (attempt.state === "unknown") {
+        if (attempt.state === "unknown" || (attempt.state === "registered" && attempt.detail?.dispatch_observation !== "absent")) {
           article.append(button("Reconcile original attempt", () => mutate(`${attemptUrl}/reconcile`), busy || !canManage));
+        }
+        if (attempt.state === "registered" && attempt.dispatch_accepted !== true && attempt.detail?.dispatch_observation === "absent") {
+          article.append(button("Send original attempt", () => mutate(`${attemptUrl}/dispatch`), busy || !canManage));
         }
         if (["failed", "cancelled", "timeout"].includes(attempt.state) && attempt.resources_settled) {
           article.append(button("Retry in a new attempt", () => mutate(

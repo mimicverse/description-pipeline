@@ -83,6 +83,9 @@ def process_identity(pid: int, nonce: str) -> dict:
         "pid": pid,
         "start_ticks": fields[19],
         "nonce": nonce,
+        "pgid": int(fields[2]),
+        "session_id": int(fields[3]),
+        "uid": Path(f"/proc/{pid}").stat().st_uid,
     }
 
 
@@ -92,6 +95,8 @@ def process_state(identity: dict) -> str:
         return "foreign"
     try:
         boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        if not isinstance(identity.get("boot_id"), str) or not identity["boot_id"]:
+            return "unknown"
         if identity.get("boot_id") != boot:
             return "dead"
         pid = identity["pid"]
@@ -106,36 +111,133 @@ def process_state(identity: dict) -> str:
         return "unknown"
 
 
-def terminate_owned(identity: dict, *, grace_seconds: float = 2) -> bool:
-    """Stop only the exact gated child process group, retaining unresolved identity."""
-    state = process_state(identity)
-    if state == "dead":
-        return True
-    if state != "alive":
-        return False
-    pid = identity["pid"]
+def _group_snapshot(identity: dict) -> tuple[str, list[dict]]:
+    """Observe every live member of the recorded private session and group.
+
+    An exited leader does not prove that its resources have exited. A member
+    needs the original session, UID, time ordering and gated argv nonce before
+    this host may signal it. Unknown membership remains unresolved.
+    """
+    if identity.get("host") != socket.gethostname():
+        return "foreign", []
     try:
-        argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
-        if identity["nonce"].encode() not in argv or os.getpgid(pid) != pid:
-            return False
-        os.killpg(pid, signal.SIGTERM)
-        deadline = time.monotonic() + grace_seconds
-        while time.monotonic() < deadline:
-            if process_state(identity) == "dead":
-                return True
-            time.sleep(0.02)
-        if process_state(identity) == "alive":
-            os.killpg(pid, signal.SIGKILL)
-        deadline = time.monotonic() + grace_seconds
-        while time.monotonic() < deadline:
-            if process_state(identity) == "dead":
-                return True
-            time.sleep(0.02)
-        return process_state(identity) == "dead"
-    except ProcessLookupError:
-        return process_state(identity) == "dead"
-    except (OSError, KeyError):
+        pid = identity["pid"]
+        if (
+            type(pid) is not int
+            or pid <= 0
+            or identity.get("pgid") != pid
+            or identity.get("session_id") != pid
+            or identity.get("uid") != os.geteuid()
+            or not isinstance(identity.get("start_ticks"), str)
+            or not identity["start_ticks"].isdecimal()
+            or not isinstance(identity.get("nonce"), str)
+            or not identity["nonce"]
+            or not isinstance(identity.get("boot_id"), str)
+            or not identity["boot_id"]
+        ):
+            return "unknown", []
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        if identity["boot_id"] != boot:
+            return "dead", []
+        members = []
+        leader_reused = False
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdecimal():
+                continue
+            try:
+                stat = (entry / "stat").read_text()
+                fields = stat[stat.rfind(")") + 2 :].split()
+                member_pid = int(entry.name)
+                if member_pid == pid and fields[19] != identity["start_ticks"]:
+                    leader_reused = True
+                if int(fields[2]) != pid and int(fields[3]) != pid:
+                    continue
+                if fields[0] in {"Z", "X"}:
+                    continue
+                if (
+                    int(fields[2]) != pid
+                    or int(fields[3]) != pid
+                    or int(fields[19]) < int(identity["start_ticks"])
+                    or entry.stat().st_uid != identity["uid"]
+                    or identity["nonce"].encode() not in (entry / "cmdline").read_bytes().split(b"\0")
+                ):
+                    return "unknown", []
+                members.append({**identity, "pid": member_pid, "start_ticks": fields[19]})
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+        if leader_reused and members:
+            return "unknown", []
+        if members:
+            return "alive", members
+        # /proc enumeration is not atomic: a leader may fork after the listing.
+        # Only kernel-confirmed group absence closes the empty-snapshot case.
+        try:
+            os.killpg(pid, 0)
+        except ProcessLookupError:
+            return "dead", []
+        return "unknown", []
+    except (OSError, KeyError, TypeError, ValueError, IndexError):
+        return "unknown", []
+
+
+def resource_state(identity: dict) -> str:
+    """The whole owned group, rather than its leader, is the resource boundary."""
+    return _group_snapshot(identity)[0]
+
+
+def _signal_members(members: list[dict], number: int) -> bool:
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
         return False
+    for member in members:
+        descriptor = None
+        try:
+            descriptor = os.pidfd_open(member["pid"])
+            if process_identity(member["pid"], member["nonce"]) != member:
+                return False
+            argv = Path(f"/proc/{member['pid']}/cmdline").read_bytes().split(b"\0")
+            if member["nonce"].encode() not in argv:
+                return False
+            signal.pidfd_send_signal(descriptor, number)
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except (OSError, KeyError):
+            return False
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+    return True
+
+
+def terminate_owned(identity: dict, *, grace_seconds: float = 2, reap=None) -> bool:
+    """Signal pidfd-bound members; success requires kernel group absence.
+
+    A caller owning a Popen object supplies its nonblocking poll method so that
+    its exit status remains with that object. Other children require their real
+    parent or OS reaper; an existing zombie-only group remains unresolved.
+    """
+
+    def observe():
+        if reap is not None:
+            try:
+                reap()
+            except Exception:
+                return "unknown", []
+        return _group_snapshot(identity)
+
+    for number in (signal.SIGTERM, signal.SIGKILL):
+        deadline = time.monotonic() + grace_seconds
+        while True:
+            state, members = observe()
+            if state == "dead":
+                return True
+            if state == "foreign":
+                return False
+            if state == "alive" and not _signal_members(members, number):
+                return False
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.02)
+    return observe()[0] == "dead"
 
 
 @dataclass(frozen=True)
@@ -245,16 +347,20 @@ class TeleopProcess:
                         if generated_bytes > self.limits.output_bytes:
                             reason = "output_limit"
                         last_size_check = time.monotonic()
-                    if reason and not terminate_owned(identity):
+                    if reason and not terminate_owned(identity, reap=process.poll):
                         raise AssessmentConflict("Assessment subprocess termination could not be settled")
                     time.sleep(0.05)
+                if resource_state(identity) != "dead":
+                    reason = reason or "residual_processes"
+                    if not terminate_owned(identity, reap=process.poll):
+                        raise AssessmentConflict("Assessment process group exit could not be settled")
                 checkpoint(None)
             except BaseException:
                 if process is not None and process.stdin is not None and not process.stdin.closed:
                     # Closing an unreleased gate lets that child exit without a signal.
                     process.stdin.close()
                 if identity is not None:
-                    terminate_owned(identity)
+                    terminate_owned(identity, reap=process.poll)
                 if process is not None:
                     with suppress(subprocess.TimeoutExpired):
                         process.wait(timeout=3)
@@ -262,7 +368,7 @@ class TeleopProcess:
             finally:
                 if process is not None and process.stdin is not None and not process.stdin.closed:
                     process.stdin.close()
-        if identity is None or process_state(identity) != "dead":
+        if identity is None or resource_state(identity) != "dead":
             raise AssessmentConflict("Assessment subprocess exit could not be settled")
         process.wait()
         if reason is None and process.returncode == -signal.SIGXFSZ:

@@ -23,7 +23,7 @@ from .contracts import (
     require,
 )
 from .bundle import validate_bundle
-from .runtime import TeleopProcess, process_identity, process_state, terminate_owned
+from .runtime import TeleopProcess, process_identity, process_state, resource_state, terminate_owned
 from .service import AssessmentService
 
 
@@ -230,6 +230,9 @@ class AssessmentExecutor:
 
     def _seal(self, attempt, request, owner, output, state, detail, operations, derivation):
         attempt_id = attempt["attempt_id"]
+        observed = self.store.attempt(attempt_id)["process"]
+        if observed is not None and resource_state(observed) != "dead":
+            raise AssessmentConflict("Assessment process group is unresolved before result sealing")
         self.store.heartbeat(attempt_id, owner, phase="sealing", process=None)
         limitations = [
             "Assessment is limited to the supplied model and declared parameter provenance.",
@@ -373,19 +376,27 @@ class AssessmentExecutor:
             )
             return {"attempt_id": attempt_id, "state": "unknown"}
         state = "cancelled" if attempt["cancel_requested"] else "failed"
-        return self._seal(
-            attempt,
-            request,
-            owner,
-            output,
-            state,
-            {
-                "phase": "orphan_reconciliation",
-                "error": "Interrupted attempt had no committed result",
-                "previous_owner": attempt["owner_token"],
-                "previous_controller": controller,
-                "previous_process": attempt["process"],
-            },
-            {},
-            None,
-        )
+        try:
+            return self._seal(
+                attempt,
+                request,
+                owner,
+                output,
+                state,
+                {
+                    "phase": "orphan_reconciliation",
+                    "error": "Interrupted attempt had no committed result",
+                    "previous_owner": attempt["owner_token"],
+                    "previous_controller": controller,
+                    "previous_process": attempt["process"],
+                },
+                {},
+                None,
+            )
+        except Exception as error:
+            self.store.unknown(
+                attempt_id,
+                {"phase": "reconciliation_sealing", "error": safe_process_output(str(error))["text"]},
+                owner=owner,
+            )
+            return {"attempt_id": attempt_id, "state": "unknown"}
