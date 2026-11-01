@@ -1659,6 +1659,11 @@ def _maintenance_probe(connection) -> dict:
         "recovery_database_readback_failed",
         "maintenance probe requires a consistent caller snapshot",
     )
+    require(
+        _connection_scalar(connection, "SHOW transaction_read_only") == "on",
+        "recovery_database_readback_failed",
+        "maintenance probe requires a read-only caller snapshot",
+    )
     return _maintenance_probe_snapshot(connection)
 
 

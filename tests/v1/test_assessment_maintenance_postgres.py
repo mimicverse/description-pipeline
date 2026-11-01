@@ -223,6 +223,23 @@ class AssessmentMaintenancePostgresTests(AssessmentCase):
             self.assertEqual(cursor.fetchone(), ("registered",))
         self.assertTrue(self._probe()["settled"])
 
+    def test_read_write_snapshot_cannot_hide_committed_assessment_work(self):
+        attempt = self._attempt()
+        self._close()
+        with self.connect() as connection, connection.cursor() as cursor:
+            connection.set_session(isolation_level="REPEATABLE READ", readonly=False)
+            cursor.execute(
+                "UPDATE assessment_attempt SET state='cancelled',resources_settled=true WHERE attempt_id=%s",
+                (attempt["attempt_id"],),
+            )
+            with self.assertRaisesRegex(recovery.RecoveryError, "read-only caller snapshot"):
+                recovery._maintenance_probe(connection)
+            cursor.execute("SELECT state FROM assessment_attempt")
+            self.assertEqual(cursor.fetchone(), ("cancelled",))
+            self.assertEqual(self.store.attempt(attempt["attempt_id"])["state"], "registered")
+            connection.rollback()
+        self.assertFalse(self._probe()["settled"])
+
     def _bundle_request(self, *, register_bundle=True):
         folder = self.root / "unique-bundle"
         folder.mkdir()
