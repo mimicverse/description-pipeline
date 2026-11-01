@@ -5,14 +5,20 @@ from __future__ import annotations
 import asyncio
 import copy
 import errno
+import io
 import json
 import os
+import secrets
+import socket
+import socketserver
 import sqlite3
 import tempfile
 import threading
 import time
 import unittest
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from email.message import Message
 from http.server import ThreadingHTTPServer
@@ -64,6 +70,7 @@ from description_pipeline.orchestration.native_operation_runtime import (
     build_operation_record,
 )
 import description_pipeline.pipeline.capture as capture_module
+import description_pipeline.orchestration.native_operation_server as native_server_module
 from description_pipeline.pipeline.capture import CaptureEffectDispatch
 from description_pipeline.pipeline.contracts import (
     ArtifactRef,
@@ -218,11 +225,12 @@ def _sealed_capture_dispatch(
 
 
 class _Server:
-    def __init__(self, runtime: NativeOperationRuntime) -> None:
+    def __init__(self, runtime: NativeOperationRuntime, *, token: str = TOKEN) -> None:
         self.runtime = runtime
+        self.token = token
         self.httpd = ThreadingHTTPServer(
             ("127.0.0.1", 0),
-            windows_handler(runtime, TOKEN),
+            windows_handler(runtime, token),
         )
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
@@ -231,7 +239,7 @@ class _Server:
 
     def client(self) -> NativeOperationClient:
         return NativeOperationClient(
-            NativeOperationEndpoint(self.base_url, TOKEN, timeout=5.0),
+            NativeOperationEndpoint(self.base_url, self.token, timeout=5.0),
             target_id=self.runtime.target_identity.target_id,
         )
 
@@ -611,6 +619,460 @@ class NativeOperationRuntimeTests(unittest.TestCase):
             for failure in ("source_open", "copy", "size", "hash", "replace"):
                 with self.subTest(stage=stage, failure=failure):
                     self._assert_atomic_staging_failure(stage, failure)
+
+    def _http_diagnostic_fixture(self, label):
+        runtime = NativeOperationRuntime(
+            state_root=self.root / label,
+            native_tool_factory=lambda: NATIVE_TOOL,
+            executors={},
+        )
+        self.addCleanup(runtime.close)
+        token = "diagnostic-" + secrets.token_hex(24)
+        self.assertFalse(any(token in value for value in os.environ.values()))
+        server = _Server(runtime, token=token)
+        self.addCleanup(server.close)
+        return runtime, server, runtime.runtime_root / "http-errors.jsonl"
+
+    def _http_diagnostic_request(self, server, path, *, data=None, headers=None):
+        return urlrequest.Request(
+            server.base_url + path,
+            data=data,
+            headers={
+                "Authorization": "Bearer " + server.token,
+                "X-Native-Target-ID": server.runtime.target_identity.target_id,
+                **(headers or {}),
+            },
+        )
+
+    def test_unexpected_http_500_retains_redacted_exception_without_request_data(self) -> None:
+        runtime, server, path = self._http_diagnostic_fixture("http-unexpected")
+        operation_id = "operation-http-diagnostic"
+        request = copy.deepcopy(_operation(operation_id, self.archive)["request"])
+        request["request_evidence"]["change_summary"] = "BODY-MARKER-DO-NOT-COLLECT"
+        envelope = _operation(operation_id, self.archive, request=request)
+        error = FileNotFoundError(errno.ENOENT, "native archive unavailable", server.token + ".zip")
+        error.winerror = 206
+        stderr, stdout = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(runtime, "_connect", side_effect=error),
+            redirect_stderr(stderr), redirect_stdout(stdout),
+            self.assertRaises(urlerror.HTTPError) as failed,
+        ):
+            urlrequest.urlopen(self._http_diagnostic_request(
+                server, "/operations", data=canonical(envelope),
+                headers={"Content-Type": "application/json", "X-Test-Marker": "HEADER-MARKER-DO-NOT-COLLECT"},
+            ), timeout=5)
+        with failed.exception as response:
+            self.assertEqual(response.code, 500)
+            self.assertEqual(json.load(response), {
+                "error": "FileNotFoundError", "error_code": "native_operation_server_error"
+            })
+            self.assertEqual(response.headers["X-Native-Target-ID"], TEST_TARGET_ID)
+        raw = path.read_text(encoding="utf-8")
+        records = [json.loads(line) for line in raw.splitlines()]
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(record["error_type"], "FileNotFoundError")
+        self.assertEqual((record["errno"], record["winerror"]), (errno.ENOENT, 206))
+        self.assertEqual((record["method"], record["path"]), ("POST", "/operations"))
+        self.assertEqual(record["planned_status"], 500)
+        self.assertEqual(record["error_code"], "native_operation_server_error")
+        self.assertIn("native_operation_runtime.py", record["traceback"])
+        self.assertIn("[REDACTED]", record["traceback"])
+        self.assertNotIn(server.token, raw)
+        self.assertNotIn("BODY-MARKER-DO-NOT-COLLECT", raw)
+        self.assertNotIn("HEADER-MARKER-DO-NOT-COLLECT", raw)
+        self.assertEqual((stderr.getvalue(), stdout.getvalue()), ("", ""))
+        with self.assertRaises(NativeOperationError) as missing:
+            runtime.view(operation_id)
+        self.assertEqual(missing.exception.status, 404)
+
+    def _assert_http_broken_pipe_closes_without_second_response(self, method):
+        _runtime, server, path = self._http_diagnostic_fixture("http-broken-" + method.lower())
+        handler = server.httpd.RequestHandlerClass
+        send_response = handler.send_response
+        attempted_statuses = []
+
+        def observed_response(instance, status, message=None):
+            attempted_statuses.append(status)
+            return send_response(instance, status, message)
+
+        escaped = method == "POST"
+        target = "/operations?QUERY-MARKER-OMIT#FRAGMENT-MARKER-OMIT" if escaped else "/target"
+        authorization = "invalid" if escaped else server.token
+        wire = (
+            f"{method} {target} HTTP/1.1\r\nHost: localhost\r\n"
+            f"Authorization: Bearer {authorization}\r\n"
+            f"X-Native-Target-ID: {TEST_TARGET_ID}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        ).encode("ascii")
+        stderr, stdout = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(handler, "send_response", new=observed_response),
+            mock.patch(
+                "socketserver._SocketWriter.write", side_effect=BrokenPipeError(errno.EPIPE, "closed peer")
+            ) as write,
+            mock.patch.object(server.httpd, "handle_error", wraps=server.httpd.handle_error) as fallback,
+            redirect_stderr(stderr), redirect_stdout(stdout),
+            socket.create_connection(server.httpd.server_address, timeout=5) as connection,
+        ):
+            connection.sendall(wire)
+            self.assertEqual(connection.recv(1024), b"")
+            self.assertEqual(write.call_count, 1)
+            fallback.assert_not_called()
+        self.assertEqual(attempted_statuses, [401 if escaped else 200])
+        records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["error_type"], "BrokenPipeError")
+        self.assertEqual(records[0]["errno"], errno.EPIPE)
+        self.assertIsNone(records[0]["winerror"])
+        self.assertEqual(records[0]["planned_status"], attempted_statuses[0])
+        self.assertEqual(records[0]["path"], "/operations" if escaped else "/target")
+        self.assertNotIn("QUERY-MARKER-OMIT", path.read_text(encoding="utf-8"))
+        self.assertNotIn("FRAGMENT-MARKER-OMIT", path.read_text(encoding="utf-8"))
+        self.assertEqual((stderr.getvalue(), stdout.getvalue()), ("", ""))
+
+    def test_http_broken_pipe_logs_once_in_failure_and_handle_boundaries(self) -> None:
+        for method in ("GET", "POST"):
+            with self.subTest(method=method):
+                self._assert_http_broken_pipe_closes_without_second_response(method)
+
+    def _assert_http_response_boundary(self, label, mode, failure):
+        runtime, server, path = self._http_diagnostic_fixture(label)
+        handler = server.httpd.RequestHandlerClass
+        send_response, send_header = handler.send_response, handler.send_header
+        statuses, buffers, partial_bodies = [], [], []
+        original_write = socketserver._SocketWriter.write
+        artifact = self.root / f"{label}.zip"
+        archive_bytes = b"complete archive bytes for response boundary"
+        artifact.write_bytes(archive_bytes)
+        metadata = {"name": artifact.name, "sha256": file_digest(artifact)}
+        buffered_failure = False
+
+        def observe_response(instance, status, message=None):
+            statuses.append(status)
+            buffers.append(b"".join(getattr(instance, "_headers_buffer", [])))
+            return send_response(instance, status, message)
+
+        def fail_buffered_header(instance, keyword, value):
+            nonlocal buffered_failure
+            if keyword == "Content-Type" and not buffered_failure:
+                buffered_failure = True
+                raise failure
+            return send_header(instance, keyword, value)
+
+        def fail_stream(source, destination, *, length):
+            self.assertEqual(length, 1024 * 1024)
+            destination.write(b"ZIP-PARTIAL")
+            raise failure
+
+        def fail_json_write(writer, payload):
+            if mode == "auth_headers" or not payload.startswith(b"HTTP/1.1 "):
+                if mode != "auth_headers":
+                    partial_bodies.append(payload[:7])
+                    original_write(writer, payload[:7])
+                raise failure
+            return original_write(writer, payload)
+
+        if mode == "artifact_lookup":
+            fault = mock.patch.object(runtime, "artifact_path", side_effect=failure)
+        elif mode == "artifact_stream":
+            fault = mock.patch.object(native_server_module.shutil, "copyfileobj", side_effect=fail_stream)
+        elif mode == "header_buffer":
+            fault = mock.patch.object(handler, "send_header", new=fail_buffered_header)
+        elif mode == "json_encode":
+            fault = mock.patch.object(runtime, "view", return_value={"unserializable": object()})
+        else:
+            fault = mock.patch("socketserver._SocketWriter.write", new=fail_json_write)
+        authorized = not mode.startswith("auth_")
+        method = "GET" if authorized else "POST"
+        if mode.startswith("artifact_"):
+            route = "/operations/boundary-operation/artifact"
+        elif mode == "json_encode":
+            route = "/operations/boundary-operation"
+        else:
+            route = "/target" if authorized else "/operations"
+        request = (
+            f"{method} {route} HTTP/1.1\r\nHost: localhost\r\n"
+            f"Authorization: Bearer {server.token if authorized else 'invalid'}\r\n"
+            f"X-Native-Target-ID: {TEST_TARGET_ID}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        ).encode("ascii")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        chunks = []
+        with (
+            mock.patch.object(runtime, "artifact_path", return_value=(artifact, metadata)),
+            fault,
+            mock.patch.object(handler, "send_response", new=observe_response),
+            mock.patch.object(server.httpd, "handle_error", wraps=server.httpd.handle_error) as fallback,
+            redirect_stdout(stdout), redirect_stderr(stderr),
+            socket.create_connection(server.httpd.server_address, timeout=5) as connection,
+        ):
+            connection.sendall(request)
+            while chunk := connection.recv(4096):
+                chunks.append(chunk)
+            fallback.assert_not_called()
+        raw = b"".join(chunks)
+        before_write = mode in {"artifact_lookup", "header_buffer", "json_encode"}
+        expected_status = 500 if before_write else (200 if authorized else 401)
+        self.assertEqual(statuses, [200, 500] if mode == "header_buffer" else [expected_status])
+        self.assertEqual(raw.count(b"HTTP/1.1 "), 0 if mode == "auth_headers" else 1)
+        if mode == "auth_headers":
+            self.assertEqual(raw, b"")
+        else:
+            self.assertTrue(raw.startswith(f"HTTP/1.1 {expected_status} ".encode("ascii")))
+            headers, body = raw.split(b"\r\n\r\n", 1)
+            if before_write:
+                self.assertEqual(json.loads(body), {
+                    "error": "TypeError" if mode == "json_encode" else type(failure).__name__,
+                    "error_code": "native_operation_server_error",
+                })
+                self.assertNotIn(b"200 OK", headers)
+            else:
+                self.assertEqual(body, b"ZIP-PARTIAL" if mode == "artifact_stream" else partial_bodies[0])
+        if mode == "header_buffer":
+            self.assertEqual(buffers[-1], b"")
+        diagnostic = path.read_bytes()
+        self.assertLessEqual(len(diagnostic), native_server_module._HTTP_DIAGNOSTIC_RECORD_BYTES)
+        records = [json.loads(line.decode("utf-8")) for line in diagnostic.splitlines()]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["planned_status"], expected_status)
+        self.assertEqual(records[0]["error_type"], "TypeError" if mode == "json_encode" else type(failure).__name__)
+        self.assertEqual(records[0]["error_code"], "native_operation_server_error" if before_write else None)
+        self.assertEqual(records[0]["path"], route)
+        self.assertNotIn(server.token.encode(), diagnostic)
+        if label == "json-stream-eio":
+            self.assertTrue(records[0]["traceback_truncated"])
+        self.assertEqual(artifact.read_bytes(), archive_bytes)
+        self.assertEqual((stdout.getvalue(), stderr.getvalue()), ("", ""))
+        return {
+            "label": label, "mode": mode, "method": method,
+            "attempted_statuses": statuses,
+            "wire_status_line_count": raw.count(b"HTTP/1.1 "),
+            "wire_bytes": raw, "diagnostic_bytes": diagnostic,
+            "planned_status": records[0]["planned_status"],
+            "diagnostic_records": len(records),
+            "artifact_unchanged": True, "stdout": stdout.getvalue(), "stderr": stderr.getvalue(),
+            "fallback_calls": fallback.call_count,
+        }
+
+    def test_http_response_started_boundary_preserves_error_response_and_closes_partial_writes(self) -> None:
+        self.http_response_boundary_samples = []
+        cases = [
+            ("artifact-stream-eio", "artifact_stream", OSError(errno.EIO, "artifact stream failed")),
+            ("artifact-stream-timeout", "artifact_stream", TimeoutError(errno.ETIMEDOUT, "artifact stream timeout")),
+            ("artifact-lookup-connectionerror", "artifact_lookup", ConnectionError(errno.ECONNRESET, "lookup failed")),
+            ("json-stream-eio", "json_stream", OSError(errno.EIO, "é\x00" * 40000)),
+            ("json-stream-valueerror", "json_stream", ValueError("closed response writer")),
+            ("post-auth-timeout", "auth_stream", TimeoutError(errno.ETIMEDOUT, "authorization body timeout")),
+            (
+                "post-auth-header-timeout", "auth_headers",
+                TimeoutError(errno.ETIMEDOUT, "authorization headers timeout"),
+            ),
+            ("buffer-before-write", "header_buffer", OSError(errno.EIO, "header construction failed")),
+            ("json-before-write", "json_encode", None),
+        ]
+        for label, mode, failure in cases:
+            with self.subTest(label=label):
+                self.http_response_boundary_samples.append(self._assert_http_response_boundary(label, mode, failure))
+
+    def _assert_expect_continue(self, label, body, *, failure=None, partial_write=False):
+        runtime, server, path = self._http_diagnostic_fixture(label)
+        handler = server.httpd.RequestHandlerClass
+        send_response_only = handler.send_response_only
+        original_write = socketserver._SocketWriter.write
+        statuses = []
+
+        def observe_status(instance, code, message=None):
+            statuses.append(int(code))
+            return send_response_only(instance, code, message)
+
+        def write_response(writer, payload):
+            if failure is not None and payload.startswith(b"HTTP/1.1 100 "):
+                if partial_write:
+                    original_write(writer, payload[:7])
+                raise failure
+            return original_write(writer, payload)
+
+        request = (
+            "POST /operations HTTP/1.1\r\nHost: localhost\r\n"
+            f"Authorization: Bearer {server.token}\r\nX-Native-Target-ID: {TEST_TARGET_ID}\r\n"
+            f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n"
+            "Expect: 100-continue\r\nConnection: close\r\n\r\n"
+        ).encode("ascii")
+        chunks = []
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(handler, "send_response_only", new=observe_status),
+            mock.patch("socketserver._SocketWriter.write", new=write_response),
+            mock.patch.object(runtime, "create", wraps=runtime.create) as create,
+            mock.patch.object(server.httpd, "handle_error", wraps=server.httpd.handle_error) as fallback,
+            redirect_stdout(stdout), redirect_stderr(stderr),
+            socket.create_connection(server.httpd.server_address, timeout=5) as connection,
+        ):
+            connection.sendall(request)
+            if failure is None:
+                interim = b""
+                while b"\r\n\r\n" not in interim:
+                    chunk = connection.recv(4096)
+                    self.assertTrue(chunk, "The endpoint must preserve the 100 Continue handshake")
+                    interim += chunk
+                self.assertEqual(interim, b"HTTP/1.1 100 Continue\r\n\r\n")
+                chunks.append(interim)
+                connection.sendall(body)
+            while chunk := connection.recv(4096):
+                chunks.append(chunk)
+            fallback.assert_not_called()
+        raw = b"".join(chunks)
+        wire_statuses = [int(line.split()[1]) for line in raw.splitlines() if line.startswith(b"HTTP/1.1 ")]
+        diagnostic = path.read_bytes() if path.exists() else b""
+        if failure is None:
+            expected = 400 if body == b"{" else 202
+            self.assertEqual(statuses, [100, expected])
+            self.assertEqual(wire_statuses, [100, expected])
+            final = raw.split(b"\r\n\r\n", 1)[1]
+            response = json.loads(final.split(b"\r\n\r\n", 1)[1])
+            if expected == 400:
+                self.assertEqual(response["error_code"], "native_operation_invalid")
+                self.assertEqual(response["error"], "Request body is not valid JSON")
+                create.assert_not_called()
+            else:
+                envelope = json.loads(body)
+                self.assertEqual(response["operation_id"], envelope["operation_id"])
+                self.assertEqual(response["request_sha256"], envelope["request_sha256"])
+                self.assertEqual(response["state"], "accepted")
+                self.assertEqual(runtime.view(envelope["operation_id"])["state"], "accepted")
+                create.assert_called_once()
+            self.assertEqual(diagnostic, b"")
+        else:
+            self.assertEqual(statuses, [100])
+            self.assertEqual(raw, b"HTTP/1." if partial_write else b"")
+            self.assertEqual(wire_statuses, [])
+            create.assert_not_called()
+            records = [json.loads(line) for line in diagnostic.splitlines()]
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["planned_status"], 100)
+            self.assertEqual(records[0]["error_type"], type(failure).__name__)
+            self.assertEqual(records[0]["errno"], failure.errno)
+            self.assertIsNone(records[0]["error_code"])
+        self.assertEqual((stdout.getvalue(), stderr.getvalue()), ("", ""))
+        return {
+            "label": label, "wire_bytes": raw, "diagnostic_bytes": diagnostic, "body": body,
+            "attempted_statuses": statuses, "wire_statuses": wire_statuses,
+            "fallback_calls": fallback.call_count, "stdout": stdout.getvalue(), "stderr": stderr.getvalue(),
+        }
+
+    def test_expect_continue_preserves_malformed_refusal_and_valid_acceptance(self) -> None:
+        envelope = _operation("operation-expect-valid", self.archive)
+        self.expect_continue_samples = []
+        for label, body in (("expect-invalid-json", b"{"), ("expect-valid-json", canonical(envelope))):
+            with self.subTest(label=label):
+                self.expect_continue_samples.append(self._assert_expect_continue(label, body))
+
+    def test_expect_continue_write_failures_close_with_one_diagnostic(self) -> None:
+        self.expect_continue_samples = []
+        cases = (
+            ("expect-timeout", TimeoutError(errno.ETIMEDOUT, "Continue write timed out"), False),
+            ("expect-partial-eio", OSError(errno.EIO, "Continue write failed"), True),
+        )
+        for label, failure, partial in cases:
+            with self.subTest(label=label):
+                self.expect_continue_samples.append(self._assert_expect_continue(
+                    label, b"{", failure=failure, partial_write=partial,
+                ))
+
+    def test_http_diagnostics_bound_utf8_records_and_file_under_concurrent_requests(self) -> None:
+        runtime, server, path = self._http_diagnostic_fixture("http-capacity")
+        opened = []
+        path_open = Path.open
+
+        def observed_open(candidate, *args, **kwargs):
+            stream = path_open(candidate, *args, **kwargs)
+            if candidate == path and args == ("a+b",):
+                opened.append(stream)
+            return stream
+
+        def request_failure(_index):
+            try:
+                urlrequest.urlopen(self._http_diagnostic_request(server, "/operations/operation-capacity"), timeout=5)
+            except urlerror.HTTPError as response:
+                with response:
+                    self.assertEqual(response.code, 500)
+                    self.assertEqual(json.load(response)["error_code"], "native_operation_server_error")
+            else:
+                self.fail("The forced unexpected error must retain HTTP 500")
+            self.assertLessEqual(path.stat().st_size, native_server_module._HTTP_DIAGNOSTIC_BYTES)
+
+        def fail_view(*args, **kwargs):
+            raise ValueError("é\x00" * 40000 + server.token)
+
+        stderr, stdout = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(runtime, "view", side_effect=fail_view),
+            mock.patch.object(Path, "open", new=observed_open),
+            redirect_stderr(stderr), redirect_stdout(stdout),
+            ThreadPoolExecutor(max_workers=4) as clients,
+        ):
+            list(clients.map(request_failure, range(192)))
+        raw = path.read_bytes()
+        self.assertLessEqual(len(raw), native_server_module._HTTP_DIAGNOSTIC_BYTES)
+        records = [json.loads(line.decode("utf-8")) for line in raw.splitlines(keepends=True)]
+        self.assertGreater(len(records), 0)
+        self.assertLess(len(records), 192)
+        self.assertTrue(all(record["traceback_truncated"] for record in records))
+        self.assertTrue(all(record["errno"] is None and record["winerror"] is None for record in records))
+        self.assertTrue(all(
+            len(line) <= native_server_module._HTTP_DIAGNOSTIC_RECORD_BYTES for line in raw.splitlines(keepends=True)
+        ))
+        self.assertNotIn(server.token.encode(), raw)
+        self.assertEqual(len(opened), 192)
+        self.assertTrue(all(stream.closed for stream in opened))
+        self.assertEqual((stderr.getvalue(), stdout.getvalue()), ("", ""))
+        self.http_diagnostic_capacity = {
+            "file_limit_bytes": native_server_module._HTTP_DIAGNOSTIC_BYTES,
+            "record_limit_bytes": native_server_module._HTTP_DIAGNOSTIC_RECORD_BYTES,
+            "retained_file_bytes": len(raw),
+            "largest_retained_record_bytes": max(map(len, raw.splitlines(keepends=True))),
+            "retained_records": len(records),
+            "requests": 192,
+            "parallel_clients": 4,
+            "opened_sink_streams": len(opened),
+            "all_sink_streams_closed": all(stream.closed for stream in opened),
+            "stdout": stdout.getvalue(), "stderr": stderr.getvalue(),
+        }
+
+    def _assert_http_diagnostic_sink_failure(self, failure):
+        runtime, server, path = self._http_diagnostic_fixture("http-sink-" + failure)
+        path_open = Path.open
+        opened = []
+
+        def refuse_sink(candidate, *args, **kwargs):
+            if candidate == path:
+                if failure == "open":
+                    raise PermissionError(errno.EACCES, "diagnostic sink unavailable")
+                stream = path_open(candidate, *args, **kwargs)
+                stream.write = mock.Mock(side_effect=OSError(errno.ENOSPC, "diagnostic sink full"))
+                opened.append(stream)
+                return stream
+            return path_open(candidate, *args, **kwargs)
+
+        stderr, stdout = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(runtime, "view", side_effect=OSError(errno.EIO, "original operation IO failure")),
+            mock.patch.object(Path, "open", new=refuse_sink),
+            redirect_stderr(stderr), redirect_stdout(stdout),
+            self.assertRaises(urlerror.HTTPError) as failed,
+        ):
+            urlrequest.urlopen(self._http_diagnostic_request(server, "/operations/operation-sink-failure"), timeout=5)
+        with failed.exception as response:
+            self.assertEqual(response.code, 500)
+            self.assertEqual(json.load(response), {"error": "OSError", "error_code": "native_operation_server_error"})
+        self.assertEqual(path.exists(), failure == "write")
+        self.assertTrue(all(stream.closed for stream in opened))
+        self.assertEqual((stderr.getvalue(), stdout.getvalue()), ("", ""))
+
+    def test_http_diagnostic_sink_failure_preserves_original_response_without_stderr(self) -> None:
+        for failure in ("open", "write"):
+            with self.subTest(failure=failure):
+                self._assert_http_diagnostic_sink_failure(failure)
 
     def test_submit_operation_returns_the_current_state_without_polling_or_resend(self) -> None:
         entered = threading.Event()

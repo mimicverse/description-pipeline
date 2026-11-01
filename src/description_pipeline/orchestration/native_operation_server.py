@@ -8,6 +8,8 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
+import traceback
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
@@ -18,7 +20,7 @@ from ..interface_records import (
     resource_policy_v1_digest,
     validate_health,
 )
-from ..io import PipelineError, canonical, digest, parse_data
+from ..io import PipelineError, canonical, digest, parse_data, safe_process_output
 from ..schemas import (
     HEALTH_SCHEMA,
     NATIVE_TOOL_IDENTITY_SCHEMA,
@@ -29,6 +31,8 @@ from .native_operation_runtime import NativeOperationError, NativeOperationRunti
 
 MAX_JSON_BYTES = 8 * 1024**2
 MAX_ARCHIVE_BYTES = 16 * 1024**3
+_HTTP_DIAGNOSTIC_BYTES = 1024 * 1024
+_HTTP_DIAGNOSTIC_RECORD_BYTES = 16 * 1024
 
 
 def _health(runtime: NativeOperationRuntime) -> dict:
@@ -184,25 +188,120 @@ def native_operation_handler(runtime: NativeOperationRuntime, token: str):
     if not isinstance(token, str) or len(token) < 32:
         raise ValueError("token must contain at least 32 characters")
 
+    diagnostic_path = runtime.runtime_root / "http-errors.jsonl"
+    diagnostic_lock = threading.Lock()
+
+    def record_error(handler, error, *, status, error_code):
+        try:
+            def safe_text(value, limit):
+                return safe_process_output(str(value).replace(token, "[REDACTED]"))["text"][:limit]
+
+            try:
+                path = urlsplit(getattr(handler, "path", "")).path
+            except ValueError:
+                path = "<invalid>"
+            trace = safe_process_output(
+                "".join(traceback.format_exception(error)).replace(token, "[REDACTED]")
+            )
+            error_number = getattr(error, "errno", None)
+            windows_error = getattr(error, "winerror", None)
+            record = {
+                "error_type": safe_text(type(error).__name__, 128),
+                "traceback": trace["text"],
+                "traceback_truncated": trace["truncated"],
+                "errno": error_number if type(error_number) is int else None,
+                "winerror": windows_error if type(windows_error) is int else None,
+                "method": safe_text(getattr(handler, "command", ""), 32),
+                "path": safe_text(path, 512),
+                "planned_status": status,
+                "error_code": None if error_code is None else safe_text(error_code, 128),
+            }
+            while True:
+                payload = (json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
+                if len(payload) <= _HTTP_DIAGNOSTIC_RECORD_BYTES:
+                    break
+                text = record["traceback"]
+                quarter = len(text) // 4
+                record["traceback"] = text[:quarter] + "\n[TRACE TRUNCATED]\n" + text[-quarter:]
+                record["traceback_truncated"] = True
+            with diagnostic_lock, diagnostic_path.open("a+b") as stream:
+                stream.seek(0, os.SEEK_END)
+                if stream.tell() + len(payload) > _HTTP_DIAGNOSTIC_BYTES:
+                    stream.seek(0)
+                    stream.truncate()
+                stream.write(payload)
+        except Exception:
+            # Diagnostics must never affect the response or the endpoint launcher.
+            return
+
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+
+        def handle(self):
+            self._diagnostic_status = None
+            self._diagnostic_error_code = None
+            self._response_started = False
+            try:
+                super().handle()
+            except Exception as error:
+                record_error(
+                    self, error,
+                    status=self._diagnostic_status,
+                    error_code=self._diagnostic_error_code,
+                )
+                self.close_connection = True
 
         def log_message(self, format, *args):
             return
 
-        def _reply(self, status: int, data: dict) -> None:
-            payload = (json.dumps(data, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(payload)))
-            self.send_header("Cache-Control", "no-store")
-            self.send_header(
-                "X-Native-Target-ID",
-                runtime.target_identity.target_id,
-            )
-            self.send_header("Connection", "close")
-            self.end_headers()
+        def send_response_only(self, code, message=None):
+            self._diagnostic_status = code
+            return super().send_response_only(code, message)
+
+        def handle_expect_100(self):
+            try:
+                return super().handle_expect_100()
+            except Exception as error:
+                record_error(self, error, status=100, error_code=None)
+                self.close_connection = True
+                return False
+
+        def _write_response(self, payload):
+            # A failed write may already have sent part of the response.
+            if self._diagnostic_status is None or not 100 <= self._diagnostic_status < 200:
+                self._response_started = True
             self.wfile.write(payload)
+
+        def flush_headers(self):
+            if hasattr(self, "_headers_buffer"):
+                payload = b"".join(self._headers_buffer)
+                self._headers_buffer = []
+                if payload:
+                    self._write_response(payload)
+                    if self._diagnostic_status is not None and 100 <= self._diagnostic_status < 200:
+                        self._diagnostic_status = None
+                        self._diagnostic_error_code = None
+
+        def _reply(self, status: int, data: dict) -> None:
+            self._diagnostic_status = status
+            self._diagnostic_error_code = data.get("error_code")
+            try:
+                payload = (json.dumps(data, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header(
+                    "X-Native-Target-ID",
+                    runtime.target_identity.target_id,
+                )
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self._write_response(payload)
+            except Exception as error:
+                if not self._response_started:
+                    raise
+                self._failure(error)
             self.close_connection = True
 
         def _authorized(self, *, require_target: bool = True) -> bool:
@@ -227,6 +326,15 @@ def native_operation_handler(runtime: NativeOperationRuntime, token: str):
             return True
 
         def _failure(self, error: Exception) -> None:
+            if self._response_started:
+                record_error(
+                    self, error,
+                    status=self._diagnostic_status,
+                    error_code=self._diagnostic_error_code,
+                )
+                self.close_connection = True
+                return
+            self._headers_buffer = []
             if isinstance(error, NativeOperationError):
                 self._reply(
                     error.status,
@@ -237,6 +345,7 @@ def native_operation_handler(runtime: NativeOperationRuntime, token: str):
                     },
                 )
                 return
+            record_error(self, error, status=500, error_code="native_operation_server_error")
             self._reply(500, {"error": type(error).__name__, "error_code": "native_operation_server_error"})
 
         def _json_body(self) -> dict:
@@ -333,6 +442,8 @@ def native_operation_handler(runtime: NativeOperationRuntime, token: str):
                             ),
                         )
                         with path.open("rb") as stream:
+                            self._diagnostic_status = 200
+                            self._diagnostic_error_code = None
                             self.send_response(200)
                             self.send_header("Content-Type", "application/zip")
                             self.send_header("Content-Length", str(path.stat().st_size))
@@ -366,9 +477,9 @@ def native_operation_handler(runtime: NativeOperationRuntime, token: str):
                 self._failure(error)
 
         def do_POST(self) -> None:
-            if not self._authorized():
-                return
             try:
+                if not self._authorized():
+                    return
                 path = self._route_path()
                 if path == "/operations":
                     self._reply(202, runtime.create(self._json_body()))
