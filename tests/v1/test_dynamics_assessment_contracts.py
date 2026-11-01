@@ -106,9 +106,11 @@ class ContractsTests(AssessmentCase):
         record = runtime_pin().to_record()
         record["dependency_versions"]["actuator-model"] = "1.3.0"
         asset = {
+            "distribution": "actuator-model",
             "source_commit": "f" * 40,
             "wheel_filename": "actuator_model-1.3.0-py3-none-any.whl",
             "wheel_sha256": "1" * 64,
+            "record_payload_sha256": "2" * 64,
         }
         record["actuator_model"] = asset
         pin = RuntimePin(record)
@@ -117,6 +119,34 @@ class ContractsTests(AssessmentCase):
         asset["source_commit"] = "0" * 40
         self.assertEqual(pin.record["actuator_model"]["source_commit"], "f" * 40)
         self.assertNotIn("git_commit", pin.record["actuator_model"])
+
+    def test_runtime_rejects_retired_three_field_actuator_asset(self):
+        record = runtime_pin().to_record()
+        record["dependency_versions"]["actuator-model"] = "1.3.0"
+        record["actuator_model"] = {
+            "source_commit": "f" * 40,
+            "wheel_filename": "actuator_model-1.3.0-py3-none-any.whl",
+            "wheel_sha256": "1" * 64,
+        }
+        with self.assertRaisesRegex(AssessmentError, "missing or unknown fields"):
+            RuntimePin(record)
+
+    def test_runtime_actuator_asset_requires_distribution_and_record_payload_identity(self):
+        record = runtime_pin().to_record()
+        record["dependency_versions"]["actuator-model"] = "1.3.0"
+        record["actuator_model"] = {
+            "distribution": "another-package",
+            "source_commit": "f" * 40,
+            "wheel_filename": "actuator_model-1.3.0-py3-none-any.whl",
+            "wheel_sha256": "1" * 64,
+            "record_payload_sha256": "2" * 64,
+        }
+        with self.assertRaisesRegex(AssessmentError, "distribution is invalid"):
+            RuntimePin(record)
+        record["actuator_model"]["distribution"] = "actuator-model"
+        record["actuator_model"]["record_payload_sha256"] = "invalid"
+        with self.assertRaisesRegex(AssessmentError, "RECORD payload"):
+            RuntimePin(record)
 
     def test_runtime_rejects_old_schema_or_missing_explicit_asset(self):
         record = runtime_pin().to_record()
@@ -135,9 +165,11 @@ class ContractsTests(AssessmentCase):
             RuntimePin(record)
         del record["dependency_versions"]["actuator-model"]
         record["actuator_model"] = {
+            "distribution": "actuator-model",
             "source_commit": "f" * 40,
             "wheel_filename": "actuator_model-1.3.0-py3-none-any.whl",
             "wheel_sha256": "1" * 64,
+            "record_payload_sha256": "2" * 64,
         }
         with self.assertRaisesRegex(AssessmentError, "requires its fixed dependency version"):
             RuntimePin(record)

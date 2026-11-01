@@ -283,8 +283,11 @@ class RuntimePin(_ImmutableRecord):
             require("actuator-model" not in versions, "Actuator-model dependency requires its fixed asset")
         else:
             asset = object_record(
-                actuator, {"source_commit", "wheel_filename", "wheel_sha256"}, "Actuator-model runtime asset"
+                actuator,
+                {"distribution", "source_commit", "wheel_filename", "wheel_sha256", "record_payload_sha256"},
+                "Actuator-model runtime asset",
             )
+            require(asset["distribution"] == "actuator-model", "Actuator-model distribution is invalid")
             require(
                 isinstance(asset["source_commit"], str) and _COMMIT.fullmatch(asset["source_commit"]),
                 "Actuator-model source commit is invalid",
@@ -292,6 +295,7 @@ class RuntimePin(_ImmutableRecord):
             filename = relative(asset["wheel_filename"], "Actuator-model wheel filename")
             require("/" not in filename and filename.endswith(".whl"), "Actuator-model wheel filename is invalid")
             sha(asset["wheel_sha256"], "Actuator-model wheel")
+            sha(asset["record_payload_sha256"], "Actuator-model RECORD payload")
             require("actuator-model" in versions, "Actuator-model asset requires its fixed dependency version")
         self._freeze(value)
 
