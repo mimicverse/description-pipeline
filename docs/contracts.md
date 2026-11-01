@@ -856,8 +856,8 @@ reports/mjcf-certificate.json
 
 主体清单覆盖 `input/`、`evidence/`、`model/`、`urdf/`、`meshes/`、`mjcf/` 与 `tool.json`
 的全部文件。`manifest.json` 和阶段自有的 `reports/` 收据不进入主体；它们由各自
-schema、receipt 与 artifact identity 验证，不能把自身纳入摘要形成循环。原 URDF Verify subject 只覆盖其 Generate/Capture 内容；MJCF projection subject 绑定转换输入、仿真策略及实际 MJCF 输出；组合 publication subject 才覆盖两种格式。三者分别核验，不要求摘要相等，也不修改旧证书扩展覆盖范围。Verify
-certificate 绑定 Generate/Capture pair、verifier、contract、policy 与原 URDF subject；
+schema、receipt 与 artifact identity 验证，不能把自身纳入摘要形成循环。URDF certificate 的 `subject_sha256` 是 Generate artifact 的 set digest，`evaluation_subject_sha256` 绑定独立评估的 Generate/Capture pair。MJCF certificate 通过 `source_artifacts` 和 `input_binding` 绑定转换输入及策略，`projection_sha256` 只绑定实际 `mjcf/` 输出成员（含 simulation 配置）。组合 `publication_subject_sha256` 才覆盖两种格式的交付主体。各摘要域分别核验，不要求相等，也不修改旧证书扩展覆盖范围。Verify
+certificate 另绑定 verifier、contract 与 policy；
 execution receipt 绑定该 certificate，仅以 `execution_details` 保全 `check.details` 直接层的原始进程输出与退出信息，不重复保存检查和 warning 全表。该分离不递归改写 warning、diagnostic 或资格中的来源扩展；完整记录按规范字节去重，证书拒绝重复的顶层 diagnostics。URDF 检查、warning 与资格的唯一交付依据为其 certificate；MJCF 的派生策略、检查及 warning 由独立 MJCF certificate 承载，PR 和预览分别读取两者，不合成第三份质量真值；URDF、PR 和浏览器引用实际登记的证书路径，展示保留对象、字段、来源、规则及未建立资格的原值。PR 摘要达到长度上限时明确给出未展开数量与完整证书位置，不生成另一份 quality 或 structural-team 报告。Publish receipt 再绑定 publication subject、
 publication plan、候选 commit/tree 与 Git/PR effect。
 
