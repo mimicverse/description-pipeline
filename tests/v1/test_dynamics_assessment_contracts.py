@@ -68,9 +68,12 @@ def runtime_pin():
         {
             "schema": RUNTIME_SCHEMA,
             "source_commit": "a" * 40,
+            "source_tree": "e" * 40,
+            "wheel_filename": "robot_teleop-0.3.0-cp312-cp312-linux_x86_64.whl",
             "wheel_sha256": "b" * 64,
             "files": {"teleop/__init__.py": "c" * 64},
             "dependency_versions": {"robot-teleop": "0.3.0", "mujoco": "3.13.0", "numpy": "2.4.1"},
+            "actuator_model": None,
         }
     )
 
@@ -99,6 +102,46 @@ class AssessmentCase(unittest.TestCase):
 
 
 class ContractsTests(AssessmentCase):
+    def test_runtime_v2_retains_actuator_asset_without_aliasing_or_native_commit_fabrication(self):
+        record = runtime_pin().to_record()
+        record["dependency_versions"]["actuator-model"] = "1.3.0"
+        asset = {
+            "source_commit": "f" * 40,
+            "wheel_filename": "actuator_model-1.3.0-py3-none-any.whl",
+            "wheel_sha256": "1" * 64,
+        }
+        record["actuator_model"] = asset
+        pin = RuntimePin(record)
+        self.assertEqual(pin.record["actuator_model"], asset)
+        self.assertEqual(pin.record["source_tree"], "e" * 40)
+        asset["source_commit"] = "0" * 40
+        self.assertEqual(pin.record["actuator_model"]["source_commit"], "f" * 40)
+        self.assertNotIn("git_commit", pin.record["actuator_model"])
+
+    def test_runtime_rejects_old_schema_or_missing_explicit_asset(self):
+        record = runtime_pin().to_record()
+        record["schema"] = "description.assessment-runtime/v1"
+        with self.assertRaisesRegex(AssessmentError, "schema is unsupported"):
+            RuntimePin(record)
+        record = runtime_pin().to_record()
+        del record["actuator_model"]
+        with self.assertRaisesRegex(AssessmentError, "missing or unknown fields"):
+            RuntimePin(record)
+
+    def test_runtime_asset_and_dependency_version_must_be_declared_together(self):
+        record = runtime_pin().to_record()
+        record["dependency_versions"]["actuator-model"] = "1.3.0"
+        with self.assertRaisesRegex(AssessmentError, "requires its fixed asset"):
+            RuntimePin(record)
+        del record["dependency_versions"]["actuator-model"]
+        record["actuator_model"] = {
+            "source_commit": "f" * 40,
+            "wheel_filename": "actuator_model-1.3.0-py3-none-any.whl",
+            "wheel_sha256": "1" * 64,
+        }
+        with self.assertRaisesRegex(AssessmentError, "requires its fixed dependency version"):
+            RuntimePin(record)
+
     def test_original_engineering_certificate_capacity_and_exact_byte_preservation(self):
         location = os.environ.get("ASSESSMENT_TEST_ORIGINAL_MJCF_CERTIFICATE")
         if not location:

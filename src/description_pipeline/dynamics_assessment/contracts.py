@@ -17,7 +17,7 @@ from ..pipeline.contracts import ArtifactRef
 SOURCE_SCHEMA = "description.assessment-source/v1"
 REQUEST_SCHEMA = "description.dynamics-assessment-request/v1"
 BUNDLE_SCHEMA = "description.dynamics-execution-bundle/v1"
-RUNTIME_SCHEMA = "description.assessment-runtime/v1"
+RUNTIME_SCHEMA = "description.assessment-runtime/v2"
 RESULT_SCHEMA = "description.dynamics-assessment-result/v1"
 DAG_ID = "upper_body_dynamics"
 POOL_ID = "dynamics_assessment"
@@ -240,13 +240,30 @@ class RuntimePin(_ImmutableRecord):
     def __init__(self, record: dict):
         value = copy.deepcopy(record)
         object_record(
-            value, {"schema", "source_commit", "wheel_sha256", "files", "dependency_versions"}, "Assessment runtime"
+            value,
+            {
+                "schema",
+                "source_commit",
+                "source_tree",
+                "wheel_filename",
+                "wheel_sha256",
+                "files",
+                "dependency_versions",
+                "actuator_model",
+            },
+            "Assessment runtime",
         )
         require(value["schema"] == RUNTIME_SCHEMA, "Assessment runtime schema is unsupported")
         require(
             isinstance(value["source_commit"], str) and _COMMIT.fullmatch(value["source_commit"]),
             "Runtime source commit is invalid",
         )
+        require(
+            isinstance(value["source_tree"], str) and _COMMIT.fullmatch(value["source_tree"]),
+            "Runtime source tree is invalid",
+        )
+        filename = relative(value["wheel_filename"], "Runtime wheel filename")
+        require("/" not in filename and filename.endswith(".whl"), "Runtime wheel filename is invalid")
         sha(value["wheel_sha256"], "Runtime wheel")
         require(isinstance(value["files"], dict) and bool(value["files"]), "Runtime file closure is required")
         for name, value_digest in value["files"].items():
@@ -261,6 +278,21 @@ class RuntimePin(_ImmutableRecord):
         for name, version in versions.items():
             text(name, "Dependency name")
             text(version, "Dependency version")
+        actuator = value["actuator_model"]
+        if actuator is None:
+            require("actuator-model" not in versions, "Actuator-model dependency requires its fixed asset")
+        else:
+            asset = object_record(
+                actuator, {"source_commit", "wheel_filename", "wheel_sha256"}, "Actuator-model runtime asset"
+            )
+            require(
+                isinstance(asset["source_commit"], str) and _COMMIT.fullmatch(asset["source_commit"]),
+                "Actuator-model source commit is invalid",
+            )
+            filename = relative(asset["wheel_filename"], "Actuator-model wheel filename")
+            require("/" not in filename and filename.endswith(".whl"), "Actuator-model wheel filename is invalid")
+            sha(asset["wheel_sha256"], "Actuator-model wheel")
+            require("actuator-model" in versions, "Actuator-model asset requires its fixed dependency version")
         self._freeze(value)
 
     def to_record(self) -> dict:
