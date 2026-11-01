@@ -8,9 +8,11 @@ import json
 import os
 from pathlib import Path
 import shutil
+import secrets
 import sys
 
 from ..io import canonical, digest
+from ..owned_process import process_identity, resource_state, terminate_owned
 from ..pipeline.contracts import ArtifactRef
 from .store import SimulationConflict
 from .schemas import TELEOP_RECORDING_SCHEMA, RECORDING_VERIFICATION_SCHEMA
@@ -90,7 +92,11 @@ async def prepare_source(destination: Path, source: dict, members: dict, read_me
         raise
 
 
-async def run_verification(binding: dict, artifacts_root: Path, source: Path) -> dict:
+class VerificationUnresolved(SimulationConflict):
+    """A managed verifier still owns its original partial inputs and capacity."""
+
+
+async def run_verification(binding: dict, artifacts_root: Path, source: Path, *, register_process) -> dict:
     limiter = shutil.which("prlimit")
     if limiter is None:
         raise ValueError("Recording verification requires native resource control")
@@ -101,41 +107,68 @@ async def run_verification(binding: dict, artifacts_root: Path, source: Path) ->
         "from description_pipeline.simulation.verify_recording import worker_main;"
         "raise SystemExit(worker_main())"
     )
-    process = await asyncio.create_subprocess_exec(
-        limiter,
-        "--as=4294967296",
-        "--nofile=128",
-        "--cpu=180",
-        "--",
-        sys.executable,
-        "-I",
-        "-B",
-        "-c",
-        entry,
-        str(package_root),
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        start_new_session=True,
-        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1"},
+    nonce = secrets.token_hex(24)
+    spawning = asyncio.create_task(
+        asyncio.create_subprocess_exec(
+            limiter,
+            "--as=4294967296",
+            "--nofile=128",
+            "--cpu=180",
+            "--",
+            sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            entry,
+            str(package_root),
+            nonce,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1"},
+        )
     )
     payload = {"binding": binding, "artifact_root": str(artifacts_root), "source": str(source)}
+    process = None
+    identity = None
     try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(canonical(payload) + b"\n"), 240)
-    except BaseException:
-        if process.returncode is None:
-            process.kill()
-            await process.wait()
-        raise
-    if len(stdout) > 128 * 1024 or len(stderr) > 128 * 1024:
-        raise ValueError("Recording verifier exceeded its output budget")
-    if process.returncode != 0:
+        interrupted = False
         try:
-            error = json.loads(stdout)["error"]
-        except (ValueError, KeyError, TypeError):
-            error = f"Native recording verifier exited: {process.returncode}"
-        raise ValueError(error)
-    result = json.loads(stdout)
-    if result.get("binding") != binding:
-        raise ValueError("Recording verifier returned a different session binding")
-    return result
+            process = await asyncio.shield(spawning)
+        except asyncio.CancelledError:
+            process = await spawning
+            interrupted = True
+        identity = {"pid": process.pid, "nonce": nonce}
+        try:
+            identity = process_identity(process.pid, nonce)
+        finally:
+            await register_process(identity)
+        if interrupted:
+            raise asyncio.CancelledError
+        stdout, stderr = await asyncio.wait_for(process.communicate(canonical(payload) + b"\n"), 240)
+        if len(stdout) > 128 * 1024 or len(stderr) > 128 * 1024:
+            raise ValueError("Recording verifier exceeded its output budget")
+        if process.returncode != 0:
+            try:
+                error = json.loads(stdout)["error"]
+            except (ValueError, KeyError, TypeError):
+                error = f"Native recording verifier exited: {process.returncode}"
+            raise ValueError(error)
+        result = json.loads(stdout)
+        if result.get("binding") != binding:
+            raise ValueError("Recording verifier returned a different session binding")
+        if await asyncio.to_thread(resource_state, identity) != "dead":
+            raise ValueError("Recording verifier process group did not exit cleanly")
+        return result
+    finally:
+        if process is not None:
+            terminating = asyncio.create_task(asyncio.to_thread(terminate_owned, identity))
+            try:
+                quiescent = await asyncio.shield(terminating)
+            except asyncio.CancelledError:
+                quiescent = await terminating
+                if quiescent:
+                    raise
+            if not quiescent:
+                raise VerificationUnresolved("Recording verifier process group is unresolved")

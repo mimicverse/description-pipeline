@@ -125,7 +125,15 @@ async function inspect() {
   $("recording").hidden = !row.recording_artifact;
   $("verify-recording").hidden = !row.recording_artifact;
   if (row.recording_artifact) { $("recording").hidden = false; $("recording").href = `/api/simulations/${sessionId}/recording`; }
+  const verification = row.verification;
+  if (verification?.state === "unknown") $("verification-status").textContent = "Recording check is unresolved. Its capacity and partial inputs are retained; retry to reconcile after the process exits.";
+  else if (["starting", "running"].includes(verification?.state)) $("verification-status").textContent = "Recording check is running.";
+  else if (["failed", "cancelled"].includes(verification?.state)) $("verification-status").textContent = `Recording check ${verification.state}: ${verification.error || "No result available"}`;
+  else if (verification?.state === "completed") showVerification(verification.value);
   return row;
+}
+function showVerification(result) {
+  $("verification-status").textContent = `${result.recording_complete ? "Complete" : "Partial"} recording: ${result.ticks} ticks checked against the registered source. Control-input replay is not covered.`;
 }
 async function command(type) {
   const result = await api(`/api/simulations/${sessionId}/commands`, { method: "POST", body: JSON.stringify({ type, command_id: crypto.randomUUID() }) });
@@ -142,9 +150,9 @@ $("verify-recording").onclick = async () => {
   $("verification-status").textContent = "Checking the registered recording and source…";
   try {
     const result = await api(`/api/simulations/${sessionId}/recording/verify`, { method: "POST" });
-    $("verification-status").textContent = `${result.recording_complete ? "Complete" : "Partial"} recording: ${result.ticks} ticks checked against the registered source. Control-input replay is not covered.`;
+    showVerification(result);
   } catch (error) { $("verification-status").textContent = "Recording check failed."; failure(error); }
-  finally { $("verify-recording").disabled = false; }
+  finally { $("verify-recording").disabled = false; try { await inspect(); } catch (error) { failure(error); } }
 };
 $("mode").onchange = () => { mode = $("mode").value; };
 $("link-setup").onclick = async () => {

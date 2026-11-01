@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import os
 import sys
 import tempfile
@@ -12,19 +11,19 @@ import json
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
-import mujoco
-import numpy as np
-
 from ..artifacts import ArtifactStore
 from ..io import digest
 from ..pipeline.contracts import ArtifactRef
-from .recording import materialize_source, recording_binding, run_verification
+from .recording import materialize_source, recording_binding
 from .store import SimulationStore
 from .schemas import TELEOP_RECORDING_SCHEMA, RECORDING_VERIFICATION_SCHEMA
 from .warnings import verify_warning_inventory
 
 
 def verify(recording: Path, source: Path, *, expected_request_digest: str) -> dict:
+    import mujoco
+    import numpy as np
+
     request = json.loads((recording / "request.json").read_bytes())
     if digest(request) != expected_request_digest:
         raise ValueError("Recording request differs from the registered session")
@@ -205,7 +204,7 @@ def main():
         source = materialize_source(
             Path(temporary) / "source", row["request"]["source"], projection["members"], read_member
         )
-        print(json.dumps(asyncio.run(run_verification(binding, artifacts.root, source))))
+        print(json.dumps(verify_bound(binding, artifacts, source)))
 
 
 if __name__ == "__main__":

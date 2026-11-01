@@ -243,3 +243,103 @@ class SimulationStore:
                 "AND state NOT IN ('stopped','failed')",
                 (session_id, previous_owner),
             )
+
+    def begin_verification(self, session_id, command_id, request, owner):
+        """The existing command row owns one global managed verification slot."""
+        with self.transaction() as cursor:
+            cursor.execute("SELECT pg_advisory_xact_lock(738204164)")
+            cursor.execute(
+                "SELECT 1 FROM simulation_command WHERE request->>'type'='verify_recording' "
+                "AND COALESCE(result->>'state','unknown') NOT IN ('completed','failed','cancelled') LIMIT 1"
+            )
+            if cursor.fetchone():
+                raise SimulationConflict("Recording verification capacity is occupied or unresolved")
+            cursor.execute(
+                "SELECT request_digest,recording_artifact,state FROM simulation_session WHERE session_id=%s FOR UPDATE",
+                (session_id,),
+            )
+            row = cursor.fetchone()
+            binding = request["binding"]
+            if (
+                row is None
+                or row[:2] != (binding["request_digest"], binding["recording_artifact"])
+                or row[2]
+                not in {
+                    "stopped",
+                    "failed",
+                }
+            ):
+                raise SimulationConflict("Recording verification binding changed")
+            cursor.execute(
+                "INSERT INTO simulation_command(session_id,command_id,request_digest,request,result) "
+                "VALUES(%s,%s,%s,%s::jsonb,%s::jsonb)",
+                (
+                    session_id,
+                    command_id,
+                    digest(request),
+                    json.dumps(request),
+                    json.dumps(
+                        {
+                            "state": "starting",
+                            "owner_nonce": owner,
+                            "process_identity": None,
+                            "error": None,
+                            "value": None,
+                        }
+                    ),
+                ),
+            )
+
+    def verification_attempts(self, session_id=None):
+        with self.transaction() as cursor:
+            cursor.execute(
+                "SELECT session_id,command_id,request_digest,request,result FROM simulation_command "
+                "WHERE request->>'type'='verify_recording' "
+                "AND (%s::text IS NULL OR session_id=%s) ORDER BY created_at,command_id",
+                (session_id, session_id),
+            )
+            rows = cursor.fetchall()
+        attempts = []
+        for session, command, sha, request, result in rows:
+            if (
+                digest(request) != sha
+                or not isinstance(result, dict)
+                or set(result) != {"state", "owner_nonce", "process_identity", "error", "value"}
+                or result["state"] not in {"starting", "running", "unknown", "completed", "failed", "cancelled"}
+                or not isinstance(result["owner_nonce"], str)
+                or not result["owner_nonce"]
+                or (result["process_identity"] is not None and not isinstance(result["process_identity"], dict))
+            ):
+                raise SimulationConflict("Recording verification command integrity is inconsistent")
+            attempts.append({"session_id": session, "command_id": command, "request": request, "result": result})
+        return attempts
+
+    def transition_verification(self, session_id, command_id, owner, state, *, process=None, error=None, value=None):
+        allowed = {
+            "running": {"starting", "running"},
+            "unknown": {"starting", "running", "unknown"},
+            "completed": {"running"},
+            "failed": {"starting", "running", "unknown"},
+            "cancelled": {"starting", "running"},
+        }
+        if state not in allowed:
+            raise ValueError("Invalid recording verification transition")
+        with self.transaction() as cursor:
+            cursor.execute(
+                "SELECT request_digest,request,result FROM simulation_command "
+                "WHERE session_id=%s AND command_id=%s FOR UPDATE",
+                (session_id, command_id),
+            )
+            row = cursor.fetchone()
+            if row is None or digest(row[1]) != row[0] or row[1].get("type") != "verify_recording":
+                raise SimulationConflict("Recording verification command identity changed")
+            previous = row[2]
+            if previous["owner_nonce"] != owner or previous["state"] not in allowed[state]:
+                raise SimulationConflict("Recording verification ownership or lifecycle changed")
+            result = {**previous, "state": state, "error": error, "value": value}
+            if process is not None:
+                result["process_identity"] = process
+            cursor.execute(
+                "UPDATE simulation_command SET result=%s::jsonb WHERE session_id=%s AND command_id=%s",
+                (json.dumps(result), session_id, command_id),
+            )
