@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from anyio import CancelScope
 
 
 async def settle_task(task: asyncio.Task) -> bool:
@@ -13,8 +14,20 @@ async def settle_task(task: asyncio.Task) -> bool:
             await asyncio.shield(task)
         except asyncio.CancelledError:
             interrupted = True
+            break
         except BaseException:
             break
+    if not task.done():
+        # An enclosing AnyIO scope otherwise reissues cancellation at every
+        # checkpoint. Shield only the remaining owned work, then rethrow it.
+        with CancelScope(shield=True):
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    interrupted = True
+                except BaseException:
+                    break
     return interrupted
 
 
