@@ -20,6 +20,7 @@ from ..io import digest
 from ..pipeline.contracts import ArtifactRef
 from .recording import materialize_source, recording_binding, run_verification
 from .store import SimulationStore
+from .schemas import TELEOP_RECORDING_SCHEMA, RECORDING_VERIFICATION_SCHEMA
 
 
 def verify(recording: Path, source: Path, *, expected_request_digest: str) -> dict:
@@ -129,7 +130,7 @@ def verify(recording: Path, source: Path, *, expected_request_digest: str) -> di
 
 
 def verify_bound(binding: dict, artifacts: ArtifactStore, source: Path) -> dict:
-    if binding.get("schema_version") != "description.recording-verification/1":
+    if binding.get("schema_version") != RECORDING_VERIFICATION_SCHEMA:
         raise ValueError("Recording verification binding is unsupported")
     artifact = ArtifactRef.from_record(binding["recording_artifact"])
     if artifact.kind != "teleop_recording" or artifact.producer_tool_sha256 != binding["runtime_digest"]:
@@ -138,7 +139,7 @@ def verify_bound(binding: dict, artifacts: ArtifactStore, source: Path) -> dict:
     root = artifacts.objects / artifact.artifact_id
     identity = json.loads((root / "session.json").read_bytes())
     expected_identity = {key: value for key, value in binding.items() if key != "recording_artifact"}
-    expected_identity["schema_version"] = "description.teleop-recording/1"
+    expected_identity["schema_version"] = TELEOP_RECORDING_SCHEMA
     if identity != expected_identity:
         raise ValueError("Recording session identity differs from the registered session")
     result = verify(root, source, expected_request_digest=binding["request_digest"])

@@ -19,6 +19,7 @@ import zipfile
 from ..io import digest, canonical
 from .store import SimulationConflict, SimulationStore
 from .recording import prepare_source, recording_binding, run_verification, session_identity
+from .schemas import load_runtime_contract
 
 log = logging.getLogger(__name__)
 
@@ -70,7 +71,7 @@ class SimulationService:
             self._lock.close()
             self._lock = None
             raise ValueError("Another simulation supervisor owns this root") from None
-        contract = json.loads(Path(__file__).with_name("teleop-runtime.json").read_bytes())
+        contract = load_runtime_contract(Path(__file__).with_name("teleop-runtime.json"))
         probe = await asyncio.create_subprocess_exec(
             str(self.python),
             "-I",

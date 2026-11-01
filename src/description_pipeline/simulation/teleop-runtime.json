@@ -1,5 +1,5 @@
 {
-  "schema_version": "description.teleop-runtime/v1",
+  "schema_version": "solidworks-to-urdf.teleop-runtime/v1",
   "source_commit": "8b402482559c02534668bf2cb4338c0b8d628e14",
   "wheel_filename": "robot_teleop-0.3.0-cp312-cp312-linux_x86_64.whl",
   "wheel_sha256": "944d29b6a9730833b119cfe3d0f9873f6a8d5772a3ff24b3cb7ee1d609b98e54",

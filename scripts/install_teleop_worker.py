@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 from pathlib import Path
 import subprocess
 import sys
@@ -21,7 +20,10 @@ def main():
     )
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
-    contract = json.loads((root / "src/description_pipeline/simulation/teleop-runtime.json").read_bytes())
+    sys.path.insert(0, str(root / "src"))
+    from description_pipeline.simulation.schemas import load_runtime_contract
+
+    contract = load_runtime_contract(root / "src/description_pipeline/simulation/teleop-runtime.json")
     if sys.version_info[:2] != (3, 12) or sys.platform != "linux":
         parser.error("The worker requires Linux and CPython 3.12")
     wheel = args.wheel.resolve()

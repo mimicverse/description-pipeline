@@ -13,6 +13,7 @@ import sys
 from ..io import canonical, digest
 from ..pipeline.contracts import ArtifactRef
 from .store import SimulationConflict
+from .schemas import TELEOP_RECORDING_SCHEMA, RECORDING_VERIFICATION_SCHEMA
 
 
 def materialize_source(destination: Path, source: dict, members: dict, read_member) -> Path:
@@ -49,7 +50,7 @@ def session_identity(row: dict) -> dict:
     if digest(row["request"]) != row["request_digest"]:
         raise SimulationConflict("Stored simulation request digest is inconsistent")
     return {
-        "schema_version": "description.teleop-recording/1",
+        "schema_version": TELEOP_RECORDING_SCHEMA,
         "session_id": row["session_id"],
         "actor": row["actor"],
         "source_run_id": row["source_run_id"],
@@ -68,7 +69,7 @@ def recording_binding(row: dict) -> dict:
         raise SimulationConflict("Recording producer differs from the registered session runtime")
     return {
         **identity,
-        "schema_version": "description.recording-verification/1",
+        "schema_version": RECORDING_VERIFICATION_SCHEMA,
         "recording_artifact": artifact.to_record(),
     }
 
