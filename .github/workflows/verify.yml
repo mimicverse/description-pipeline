@@ -215,6 +215,7 @@ jobs:
       - name: Fetch the exact model wheels
         uses: ./.github/actions/fetch-teleop-assets
         with:
+          token: ${{ secrets.TELEOP_ASSETS_TOKEN }}
           destination: ${{ runner.temp }}/model-assets
       - name: Ambient negative control binds the release identity to the source closure
         run: |

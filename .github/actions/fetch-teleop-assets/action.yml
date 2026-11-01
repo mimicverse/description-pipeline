@@ -1,6 +1,9 @@
 name: Fetch fixed Teleop assets
 description: Download the model wheels bound by the current consumer contract.
 inputs:
+  token:
+    description: Read-only GitHub credential for private Teleop release assets.
+    required: true
   destination:
     description: Fresh directory for the two fixed model wheels.
     required: true
@@ -10,7 +13,7 @@ runs:
     - shell: bash
       env:
         MODEL_ASSET_DESTINATION: ${{ inputs.destination }}
-        GH_TOKEN: ${{ github.token }}
+        GH_TOKEN: ${{ inputs.token }}
       run: |
         python - <<'PY'
         import hashlib
@@ -19,6 +22,9 @@ runs:
         import subprocess
 
         from description_pipeline.simulation.runtime import load_runtime_contract
+
+        if not os.environ.get("GH_TOKEN", "").strip():
+            raise SystemExit("TELEOP_ASSETS_TOKEN is required to read private mimicverse/teleop release assets")
 
         contract = load_runtime_contract(
             Path("src/description_pipeline/simulation/teleop-runtime.json"), consumer="assessment"
