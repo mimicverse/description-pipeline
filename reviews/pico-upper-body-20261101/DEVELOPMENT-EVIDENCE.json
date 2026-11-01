@@ -10,7 +10,7 @@
     "deploy/operator/render_operator.py": "104322f5c97e9e75d0d9c81d3b4531534c6b5aacc7ac26a87994967c1a0563af",
     "deploy/platform/roles.sql": "a4b34195e30e872b89f57cf88c0e6fb2f3e0db951f218227a7b9446eb00b2aca",
     "deploy/platform/schema.sql": "8dbd826667029c2d7d8ec0ee2d29817987531a2300fa4ce732f22b466c6cd58b",
-    "docs/pico-upper-body.md": "5a7e0ea17b30e7cddf25c3467cf0aee6d853bb8338983e80e2c7f8e9c03f68b2",
+    "docs/pico-upper-body.md": "5d519c19466332a2553c4c0b09d01e42647e1c8a29c333b669afed3ebd88267c",
     "pyproject.toml": "34609ec067d41fd97b72435e21bfa8919912a6ae3e6ef734272107575bd46b1f",
     "requirements/linux-py312.lock": "071c3e703789a41d4e8d4af6aa2822a4d0e8cd51d26bbb8759bbfa8a9b201f8a",
     "requirements/pico-link-py312.lock": "21919f264b16c07820618577ab8a900ecc3ede0bfb2dfd33aea6527e0134cd3e",
@@ -77,7 +77,13 @@
     "browser": "Actual native geometry, saved-profile launch, refresh, head state, latched e-stop, stop and recording entry verified with isolated fixtures",
     "saved_profile_request_digest": "Verified before reuse; inconsistent saved requests are rejected",
     "browser_recordings": "Two native fixture recordings sealed with complete=true and error=null; owned server stopped",
-    "native_test_discovery": "Four opt-in Linux cases skip cleanly without optional native/portal dependencies when no worker is configured"
+    "native_test_discovery": "Four opt-in Linux cases skip cleanly without optional native/portal dependencies when no worker is configured",
+    "optimization_plan": {
+      "date": "2026-11-01",
+      "status": "Planned; not implemented",
+      "implementation_evidence_inherited_from": "428c64706940f5366a5859017602b2f82f3056c6",
+      "product_bytes_changed": false
+    }
   },
   "logs": {
     "pipeline-broad.log": {
