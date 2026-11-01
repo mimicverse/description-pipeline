@@ -18,7 +18,6 @@ import stat
 import zipfile
 from pathlib import Path
 
-from packaging.tags import compatible_tags, cpython_tags
 from packaging.utils import canonicalize_name, parse_wheel_filename
 
 from description_pipeline.cli import CLI_VERSION_PREFIX
@@ -33,6 +32,13 @@ from description_pipeline.io import (
 )
 from description_pipeline.interface_records import release_domain_identity
 from description_pipeline.runtime import LINUX_PLATFORMS, TARGET_ABI, TARGET_PYTHON, WINDOWS_PLATFORMS
+from description_pipeline.simulation.schemas import load_runtime_contract
+
+if __package__:
+    from .release_consumers import CONSUMER_LOCKS, CONSUMER_POOL_PREFIX, target_tags, verify_consumer_pool
+else:
+    from release_consumers import CONSUMER_LOCKS, CONSUMER_POOL_PREFIX, target_tags, verify_consumer_pool
+
 
 def safe_members(names):
     keys = []
@@ -99,12 +105,7 @@ def _target_tags(system: str) -> set:
     """
 
     platforms = WINDOWS_PLATFORMS if system == "windows" else LINUX_PLATFORMS
-    python_version = tuple(int(part) for part in TARGET_PYTHON.split("."))
-    tags = set(
-        cpython_tags(python_version=python_version, abis=[TARGET_ABI, "abi3", "none"], platforms=platforms)
-    )
-    tags |= set(compatible_tags(python_version=python_version, interpreter=TARGET_ABI, platforms=platforms))
-    return tags
+    return target_tags(platforms, TARGET_PYTHON, TARGET_ABI)
 
 
 def verify_release(directory, identity):
@@ -157,6 +158,13 @@ def verify_release(directory, identity):
         if members != identity.get("deployment_files"):
             raise PipelineError("Deployment members do not come from this source release")
         validate_deployment_boundary(payloads)
+        try:
+            consumer_locks = {role: payloads[path] for role, path in CONSUMER_LOCKS.items()}
+            for script in ("scripts/install_teleop_worker.py", "scripts/pico_pipeline_link.py"):
+                if script not in payloads:
+                    raise PipelineError("Deployment lacks its consumer installation scripts")
+        except KeyError as error:
+            raise PipelineError("Deployment lacks its source consumer locks") from error
         source_locks = {}
         for platform in ("linux", "windows"):
             lock = f"requirements/{platform}-py312.lock"
@@ -168,6 +176,15 @@ def verify_release(directory, identity):
                 source_locks[platform] = payloads["deploy/airflow/requirements.lock"]
             else:
                 source_locks[platform] = archive.read(lock)
+    with zipfile.ZipFile(directory / wheel_name) as archive:
+        contract_name = "simulation/teleop-runtime.json"
+        data = archive.read("description_pipeline/" + contract_name)
+        if hashlib.sha256(data).hexdigest() != identity["package_files"].get(contract_name):
+            raise PipelineError("Consumer contract differs from the product source inventory")
+    with tempfile.TemporaryDirectory(prefix="description-consumer-contract-") as temporary:
+        path = Path(temporary) / "teleop-runtime.json"
+        path.write_bytes(data)
+        contracts = {role: load_runtime_contract(path, consumer=role) for role in ("pico", "assessment")}
     product = canonicalize_name("mimicverse-description")
     roles = {
         f"description-{version}-linux-cp312-x86_64.zip": "linux",
@@ -202,7 +219,7 @@ def verify_release(directory, identity):
                 deployment = {
                     member: checksum
                     for member, checksum in relative.items()
-                    if member.split("/", 1)[0] in {"deploy", "docs", "requirements"}
+                    if member.split("/", 1)[0] in {"deploy", "docs", "requirements", "scripts"}
                     or member in {"README.md", "LICENSE", "CODE_OF_CONDUCT.md", "CONTRIBUTING.md", "RELEASING.md"}
                 }
                 if deployment != identity.get("deployment_files"):
@@ -228,17 +245,24 @@ def verify_release(directory, identity):
                         and member.endswith(".whl")
                         and len(artifact_path_parts(member)) == 2
                     ]
+                    consumer_members = [
+                        member
+                        for member in archive.namelist()
+                        if roles[name] == "linux"
+                        and member.startswith(CONSUMER_POOL_PREFIX)
+                        and member.endswith(".whl")
+                        and len(artifact_path_parts(member)) == 3
+                    ]
                     expected_members = {
                         *wheel_members,
+                        *consumer_members,
                         "requirements.lock",
                         "README.md",
                         "files.json",
                     }
                     unexpected_members = sorted(set(archive.namelist()) - expected_members)
                     if unexpected_members:
-                        raise PipelineError(
-                            f"Role archive {name} carries unexpected members: {unexpected_members}"
-                        )
+                        raise PipelineError(f"Role archive {name} carries unexpected members: {unexpected_members}")
                     wheels = {}
                     for wheel_member in wheel_members:
                         parsed, wheel_version, _, tags = parse_wheel_filename(Path(wheel_member).name)
@@ -247,9 +271,8 @@ def verify_release(directory, identity):
                                 f"Role archive {name} carries a wheel for another target: {wheel_member}"
                             )
                         wheels[canonicalize_name(parsed)] = (str(wheel_version), wheel_member)
-                    if (
-                        {key: value[0] for key, value in wheels.items()} != expected
-                        or len(wheel_members) != len(expected)
+                    if {key: value[0] for key, value in wheels.items()} != expected or len(wheel_members) != len(
+                        expected
                     ):
                         raise PipelineError(f"Role archive {name} does not carry exactly its locked wheel set")
                     member = f"wheels/{wheel_name}"
@@ -280,6 +303,19 @@ def verify_release(directory, identity):
                     for key, (_, checksum) in pins.items():
                         if checksum != hashlib.sha256(archive.read(wheels[key][1])).hexdigest():
                             raise PipelineError(f"Role archive {name} lock hash differs for {key}")
+                    if roles[name] == "linux":
+                        try:
+                            verify_consumer_pool(
+                                {
+                                    member.removeprefix(CONSUMER_POOL_PREFIX): archive.read(member)
+                                    for member in consumer_members
+                                },
+                                consumer_locks,
+                                contracts,
+                                _target_tags("linux"),
+                            )
+                        except ValueError as error:
+                            raise PipelineError(str(error)) from error
                 if "files.json" in archive.namelist():
                     expected = json.loads(archive.read("files.json"))
                     actual = {
