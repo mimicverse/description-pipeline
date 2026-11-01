@@ -1,0 +1,122 @@
+{
+  "schema_version": "description.pico-gui-main-integration/1",
+  "target_main": "22cf0a91c169d26b4005894c4fcf190b0d0109e6",
+  "target_main_tree": "1c564725cb4ba737f7e51f88cb1bfc7dd9e45fdd",
+  "original_feature_head": "52fe3b11cd0b1214e358bb6dc56deb74438718a9",
+  "scope": "Own isolated feature branch only; no protected main, deployment, CAD or publisher execution",
+  "preserved_main_files": {
+    "src/description_pipeline/orchestration/static/style.css": "8f18e27d366ebfbaeecc1566707216dd2a9a075d87b837d9db5f71bfe6069daa",
+    "src/description_pipeline/orchestration/static/index.html": "1e3ace800b5878745208961bd935aba49146e7496d3914cf84038d206280c4df",
+    "src/description_pipeline/orchestration/static/viewer.js": "fd0e6d4cbd73fb9601bf1fd3ad6481e2641492459cd549d20926dc8a4e716ef8",
+    "src/description_pipeline/orchestration/static/activity.js": "b412ededcbb76e4ac362c3886b2e9fbc494b9298179c4720c6a8b69a8d07f6bf",
+    "src/description_pipeline/orchestration/feishu_auth.py": "afbc035739e1a41d1416292d2c30742e170e672b33e36275dbd1d54adff11d99",
+    "docs/design.md": "a1807774fd47d9aa0328473ac1725d4949f214f3796abe7a14dedbc3cfb63501"
+  },
+  "unchanged_backend_files": {
+    "src/description_pipeline/simulation/service.py": "5ad37d74ea93daeb2c243fb8fd7c1263c02b92d13da25f5191845848c8083d59",
+    "src/description_pipeline/simulation/store.py": "4104f76754573ff91fa5b994996ead7157d2f46c61590c5dba69ef8c5459788f",
+    "src/description_pipeline/simulation/recording.py": "616d103e2be3528a5f57a54f3d7cbeeedaa3c3cabd7b7acc7d7492940822c3df",
+    "src/description_pipeline/simulation/verify_recording.py": "fdf8ad9fec0f43598a0c8f2e17aeb5dadce71a4e6e5f4f0c407e838c1de1485d",
+    "src/description_pipeline/orchestration/pico_portal.py": "b280ae241bd98e79d10a5af0efcd792eae25a5bb6c9b43e78b553a080d1a7f1a"
+  },
+  "source_files": {
+    "deploy/operator/health.sh": "da1a28e05e26c0aa381a445922d293ae30530e8991de5e1a6456f073781ae3c9",
+    "deploy/operator/nginx.conf.template": "0ecd6871628c9e223050b05ec7515f86ed5c12a67ce52cde669efda9adaeb02f",
+    "deploy/operator/platform_config.py": "e147ab859ac21685bdbf077a3af6935f3b1712aad4cba6568429a46efac47e99",
+    "deploy/operator/platform_env.py": "54e45606f9c0ead9bac90530730484078ee8bf66206d46cbb7585ed0fcab2c9e",
+    "deploy/operator/recovery.py": "9b11b0df6004cd3c01a9071ae71af24f40b2f9590995dc486d8210fa3a4a11b8",
+    "deploy/operator/render_operator.py": "104322f5c97e9e75d0d9c81d3b4531534c6b5aacc7ac26a87994967c1a0563af",
+    "deploy/platform/roles.sql": "a4b34195e30e872b89f57cf88c0e6fb2f3e0db951f218227a7b9446eb00b2aca",
+    "deploy/platform/schema.sql": "8dbd826667029c2d7d8ec0ee2d29817987531a2300fa4ce732f22b466c6cd58b",
+    "docs/pico-upper-body.md": "2d45959ce107ee7f53c7251708964c32334c3bae96019cd44f7df215a16dff3b",
+    "pyproject.toml": "34609ec067d41fd97b72435e21bfa8919912a6ae3e6ef734272107575bd46b1f",
+    "requirements/linux-py312.lock": "071c3e703789a41d4e8d4af6aa2822a4d0e8cd51d26bbb8759bbfa8a9b201f8a",
+    "requirements/pico-link-py312.lock": "21919f264b16c07820618577ab8a900ecc3ede0bfb2dfd33aea6527e0134cd3e",
+    "requirements/teleop-worker-py312.lock": "f6c2d987df75d1b1c99e271b7bd31e9bbb0c09aaeb8317f636fb6ba6d1dd908e",
+    "reviews/pico-optimization-20261101/M1-RECORDING-EVIDENCE.json": "473b1672bf4d8a2278db42a4a70727918ae3612876bf7f5eff4096125e74ff8d",
+    "reviews/pico-optimization-20261101/M2-REAL-MODEL-EVIDENCE.json": "2775abb69e5343f47e4987cf8959cad8bbf823b55f0016a7b95ae5bee34781ba",
+    "reviews/pico-optimization-20261101/M4-PROFILE-EVIDENCE.json": "5faeadb4b0973729766d33c525fadcb810d3f0fa6d9b974ef58a05ca13e52646",
+    "reviews/pico-optimization-20261101/MAIN-E6E-INTEGRATION-EVIDENCE.json": "88c999748bd656617f06ebc5f9a2bfa8c72effea8d86fe6e6bb572cae59c6448",
+    "reviews/pico-upper-body-20261101/DEVELOPMENT-EVIDENCE.json": "b5c403e6955bfa3568d3ba58d75f8010f7ab611a010b389317c2f535ad728643",
+    "scripts/install_teleop_worker.py": "8c8bbfb14f2099b4db7524a155e5af2bd358f277551cf8ae8ab27bc13fd3a372",
+    "scripts/pico_pipeline_link.py": "9acc4db8fd5bc841312a3597b1e2b3944a95f7f1e0df53fc5be0f97e8992c6d4",
+    "src/description_pipeline/interface_records.py": "0b1daf76bd69172237a81bab1cf2b5d27b81bb354f2c7604baa55c3e4fd31f2a",
+    "src/description_pipeline/orchestration/lifecycle_state.py": "7c88d826e63eece4a7b1cdc6ab98d6edf76428a74ecaaab2fefc2718ccabe176",
+    "src/description_pipeline/orchestration/pico_portal.py": "b280ae241bd98e79d10a5af0efcd792eae25a5bb6c9b43e78b553a080d1a7f1a",
+    "src/description_pipeline/orchestration/portal.py": "98b404c1bcaab234403d0e4b97a92c8b4b470f3bedc741c034131da7bafc4652",
+    "src/description_pipeline/orchestration/static/app.js": "abc23de0fade3b064f3d67966f032cce94d7c33652058e77241ebb35e68ac437",
+    "src/description_pipeline/orchestration/static/mjcf_viewer.js": "edd3c35ed58bbeda34862eaa06df83bb82b231b6a230ffa2b47d62ce85628ba2",
+    "src/description_pipeline/orchestration/static/pico.css": "289e4fc8b0a611bde56e2452e179ff88bcad97d1a2ba3ed3fca48001312f074c",
+    "src/description_pipeline/orchestration/static/pico.html": "417296506a3578e26a44c6e5517535f2d67391de5dd080ab58df2501f131e69e",
+    "src/description_pipeline/orchestration/static/pico.js": "f883d2fd870ce401426f08d717cc07ca15d02ba642dfe7fea400c2ce8dd1b43b",
+    "src/description_pipeline/orchestration/static/pico_profile.js": "b33c5ada9cf273c4b83a719c73c8c73b8c54299f2275cffb9d022f6d5b5144eb",
+    "src/description_pipeline/runtime.py": "7b573e39f65ab2f2e88445e8fa857794bcd744d96ae3216976c37fa71b398537",
+    "src/description_pipeline/simulation/__init__.py": "743ce12c616924eca5a410d3ec0039bd7bbe7583a606c358c26ae7e8c573ea03",
+    "src/description_pipeline/simulation/recording.py": "616d103e2be3528a5f57a54f3d7cbeeedaa3c3cabd7b7acc7d7492940822c3df",
+    "src/description_pipeline/simulation/service.py": "5ad37d74ea93daeb2c243fb8fd7c1263c02b92d13da25f5191845848c8083d59",
+    "src/description_pipeline/simulation/store.py": "4104f76754573ff91fa5b994996ead7157d2f46c61590c5dba69ef8c5459788f",
+    "src/description_pipeline/simulation/teleop-runtime.json": "713547476f6cee014e65904b987ca571aef283f980ccec478224af32cbda95fc",
+    "src/description_pipeline/simulation/verify_recording.py": "fdf8ad9fec0f43598a0c8f2e17aeb5dadce71a4e6e5f4f0c407e838c1de1485d",
+    "tests/js/mjcf_preview_test.mjs": "65082f355edc420a588d02886d359f704c2edd7cd381f1c45922d246e55eafa9",
+    "tests/v1/pico_link_probe.py": "1fd3d76b59342e4fa0b67e0e2559a6c70ad665a5a4b20f9a68f7d022c1049070",
+    "tests/v1/test_operator_assets.py": "6c66a0704b2170d9a00d90ab2e3a35f22710bc6fe56aacc52e46fe7ce317e485",
+    "tests/v1/test_pico_sessions.py": "58760d3fff76c9044ab03f737c0980d86e59a545c8cace92058451a0fc5aae01",
+    "tests/v1/test_platform_config.py": "a7049681452b0429f91317e0344e6b0ebd195334ee3c3aefd77257eac94e2a0b",
+    "tests/v1/test_platform_env.py": "2993a030f3550ef444f9bf9db701120f331cc1fb1a637695b04a9205061abda1"
+  },
+  "validation": {
+    "javascript_entrypoints": 9,
+    "minimal_gui_auth_suite": {
+      "run": 67,
+      "passed": 46,
+      "skipped": 21,
+      "seconds": 0.694,
+      "reason": "Airflow is absent from the private minimal environment"
+    },
+    "complete_airflow_auth_rerun": {
+      "run": 21,
+      "passed": 21,
+      "skipped": 0,
+      "seconds": 0.493
+    },
+    "browser": "Registered source profile loaded; native model rendered using the main lighting/framing; normal stop and two complete sealed fixture recordings",
+    "inherited": "Unchanged native, registered source, deployment and stop-failure checks from MAIN-E6E-INTEGRATION-EVIDENCE.json. Prior maintenance anomaly remains open.",
+    "static_checks": [
+      "Ruff src/tests/tools/deploy passed",
+      "git diff --check passed"
+    ]
+  },
+  "artifacts": {
+    "BEFORE-INTEGRATION.json": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/main-22cf-integration/BEFORE-INTEGRATION.json",
+      "sha256": "e201a9339abcb17dc7859d33bd823bd5e014deed1546a5f6d3afa51ec52f22f8"
+    },
+    "javascript-tests.log": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/main-22cf-integration/javascript-tests.log",
+      "sha256": "c110f019cdf54fdf993238a9919f731445d247fa744d6195a7fe432cd6c69862"
+    },
+    "gui-auth-tests.log": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/main-22cf-integration/gui-auth-tests.log",
+      "sha256": "4af282a0701e3b3d9e5722419684d2a0d3d929ce881bd67566bee2b3714bb378"
+    },
+    "feishu-auth-full-env-tests.log": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/main-22cf-integration/feishu-auth-full-env-tests.log",
+      "sha256": "8fbb64f1627de99914fe7aff25bec8b85a16ab4a6cde2c3d5decd7f43f35934c"
+    },
+    "browser-session-outcomes.json": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/main-22cf-integration/browser-session-outcomes.json",
+      "sha256": "d48b99bca0f07b5a528fcec8452d9d05d4aeac34e119cb82236d4383c7ab2050"
+    },
+    "browser-native.png": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/main-22cf-integration/browser-native.png",
+      "sha256": "7a0540cc5a195641c5942b1d5e50202519942109e73f62980786625f313184ae"
+    }
+  },
+  "pending": [
+    "Applicable CI and independent review of the final feature head",
+    "Fixed new Teleop protocol, effective tick and event replay",
+    "Original intermittent maintenance failure cause",
+    "Full head following and formal two-revision closure",
+    "Long-run performance, daily link launcher, human PICO and same-release formal E2E"
+  ]
+}

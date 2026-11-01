@@ -370,3 +370,32 @@ DROP TRIGGER IF EXISTS reject_truncate
 CREATE TRIGGER reject_truncate
     BEFORE TRUNCATE ON :"platform_schema".effect_fact
     FOR EACH STATEMENT EXECUTE FUNCTION :"platform_schema".reject_immutable_fact_mutation();
+
+-- Interactive consumers do not create stage decisions or scheduler state.
+CREATE TABLE IF NOT EXISTS :"platform_schema".simulation_session (
+    session_id text PRIMARY KEY,
+    actor text NOT NULL,
+    request_key text NOT NULL,
+    source_run_id text NOT NULL REFERENCES :"platform_schema".run_admission(run_id),
+    request_digest text NOT NULL CHECK (request_digest ~ '^[0-9a-f]{64}$'),
+    request jsonb NOT NULL,
+    owner_nonce text NOT NULL,
+    state text NOT NULL CHECK (state IN ('starting','ready','stopping','stopped','failed','unresolved')),
+    revision bigint NOT NULL DEFAULT 1 CHECK (revision > 0),
+    error text,
+    process_identity jsonb,
+    recording_artifact jsonb,
+    ready_at timestamptz,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (actor, request_key)
+);
+CREATE TABLE IF NOT EXISTS :"platform_schema".simulation_command (
+    session_id text NOT NULL REFERENCES :"platform_schema".simulation_session(session_id),
+    command_id text NOT NULL,
+    request_digest text NOT NULL CHECK (request_digest ~ '^[0-9a-f]{64}$'),
+    request jsonb NOT NULL,
+    result jsonb,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (session_id, command_id)
+);

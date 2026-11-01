@@ -16,3 +16,12 @@ referencing==0.37.0
 rpds-py==2026.6.3
 typing-extensions==4.16.0
 zipp==4.1.0
+
+a2wsgi==1.10.10
+anyio==4.15.1
+click==8.5.0
+h11==0.16.0
+idna==3.19
+starlette==1.6.0
+uvicorn==0.52.4
+websockets==16.1.1

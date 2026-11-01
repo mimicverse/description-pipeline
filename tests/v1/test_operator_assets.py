@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import threading
 import unittest
 
@@ -27,7 +28,8 @@ class BrowserAssetHealthTests(unittest.TestCase):
                 name = self.path.removeprefix("/static/")
                 body = (STATIC / name).read_bytes()
                 status, content_type = 200, "application/javascript"
-                if fault == "missing" and name == "vendor/three.core.min.js":
+                if ((fault == "missing" and name == "vendor/three.core.min.js")
+                        or (fault == "missing_profile" and name == "pico_profile.js")):
                     status, body = 404, b"missing"
                 elif fault == "html" and name == "viewer.js":
                     content_type = "text/html"
@@ -39,13 +41,18 @@ class BrowserAssetHealthTests(unittest.TestCase):
                 self.end_headers()
                 self.wfile.write(body)
 
-        with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        with tempfile.TemporaryDirectory(prefix="empty-browser-assets-") as empty_root, \
+                ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:
                 return subprocess.run(
                     [sys.executable, "-", str(server.server_port)],
-                    input=PROBE,
+                    input=(
+                        "import description_pipeline; "
+                        f"description_pipeline.__file__={str(Path(empty_root) / '__init__.py')!r}\n"
+                        if fault == "empty_inventory" else ""
+                    ) + PROBE,
                     env={
                         **os.environ,
                         "PYTHONPATH": str(ROOT / "src"),
@@ -73,6 +80,16 @@ class BrowserAssetHealthTests(unittest.TestCase):
         result = self.probe("html")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("viewer.js: expected JavaScript", result.stdout)
+
+    def test_missing_optional_profile_module_fails(self):
+        result = self.probe("missing_profile")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("404", result.stdout)
+
+    def test_empty_installed_module_inventory_fails(self):
+        result = self.probe("empty_inventory")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Installed browser modules are missing", result.stdout)
 
     def test_changed_served_bytes_fail(self):
         result = self.probe("changed")

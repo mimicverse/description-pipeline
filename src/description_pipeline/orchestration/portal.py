@@ -647,6 +647,7 @@ class PortalConfig:
     max_body_bytes: int = 64 * 1024
     upload_root: Path | None = None
     upload_concurrency: int = 2
+    simulation: dict | None = None
     #: Split-pipeline routing: the model-repository checkouts.
     pipeline_repositories: dict[str, Path] | None = None
     #: Configured publication targets used by the upload selector and conf validation.
@@ -687,7 +688,7 @@ class PortalConfig:
 _CONFIG_KEYS = {
     "airflow": {"url"},
     "endpoint": {"url", "token_file"},
-    "portal": {"host", "port", "upload_root", "upload_concurrency"},
+    "portal": {"host", "port", "upload_root", "upload_concurrency", "simulation"},
     "pipeline": {"repositories", "targets", "discovery"},
 }
 
@@ -704,6 +705,9 @@ def _read_config(path: Path) -> dict:
         raise AirflowApiError(f"portal config {path} is not valid JSON: {error}") from error
     if not isinstance(data, dict):
         raise AirflowApiError("portal config must be one JSON object")
+    unknown = set(data) - set(_CONFIG_KEYS)
+    if unknown:
+        raise AirflowApiError(f"portal config has unknown sections: {sorted(unknown)}")
     return data
 
 
@@ -839,9 +843,6 @@ def load_portal_config(path: Path) -> PortalConfig:
     rendered file (this package ships no example copy of it).
     """
     data = _read_config(path)
-    unknown = set(data) - set(_CONFIG_KEYS)
-    if unknown:
-        raise AirflowApiError(f"portal config has unknown sections: {sorted(unknown)}")
     airflow_section = _section(data, "airflow")
     portal_section = _section(data, "portal")
     endpoint_section = _section(data, "endpoint")
@@ -874,6 +875,7 @@ def load_portal_config(path: Path) -> PortalConfig:
         port=int(portal_section.get("port", PORTAL_HTTP_PORT)),
         upload_root=_upload_root(portal_section),
         upload_concurrency=_upload_concurrency(portal_section),
+        simulation=_simulation_config(portal_section),
         pipeline_repositories=pipeline_repositories,
         pipeline_targets=pipeline_targets,
         production_admission_loader=production_loader,
@@ -883,6 +885,25 @@ def load_portal_config(path: Path) -> PortalConfig:
         production_native_client=production_native_client,
         production_config_snapshot=production_snapshot,
     )
+
+
+def _simulation_config(section: dict) -> dict | None:
+    value = section.get("simulation")
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {"root", "python", "capacity"}:
+        raise AirflowApiError("portal.simulation requires root, python and capacity")
+    if type(value["capacity"]) is not int or not 1 <= value["capacity"] <= 8:
+        raise AirflowApiError("Simulation capacity must be between 1 and 8")
+    for key in ("root", "python"):
+        if not isinstance(value[key], str) or not Path(value[key]).is_absolute():
+            raise AirflowApiError("Simulation paths must be absolute")
+    return value
+
+
+def load_simulation_config(path: Path) -> dict | None:
+    """Read shared simulation settings without constructing portal services or credentials."""
+    return _simulation_config(_section(_read_config(path), "portal"))
 
 
 def _upload_root(section: dict) -> Path | None:
@@ -1505,6 +1526,9 @@ class PortalApp:
             return self._static(start_response, "index.html")
         if path.startswith("/static/") and method == "GET":
             return self._static(start_response, path[len("/static/") :])
+        if path == "/api/simulation-capability" and method == "GET":
+            self._session(environ)
+            return _json_response(start_response, 200, {"available": self.config.simulation is not None}, self.config)
         if path == "/api/targets" and method == "GET":
             return self._targets(environ, start_response)
         if path == "/api/session":
@@ -4193,6 +4217,20 @@ class _QuietHandler(WSGIRequestHandler):
 def serve(config: PortalConfig) -> None:
     """Serve the portal until interrupted (deployment owns the reverse proxy and TLS)."""
     app = PortalApp(config)
+    if config.simulation is not None:
+        import uvicorn
+        from .pico_portal import create_app
+        from ..simulation.service import SimulationService
+        from ..simulation.store import SimulationStore
+        from ..platform.facts import AdmissionControlStore
+
+        connection_factory = AdmissionControlStore.from_environment(os.environ)._connect
+        settings = config.simulation
+        service = SimulationService(SimulationStore(connection_factory), app._artifact_store(),
+                                    Path(settings["root"]), Path(settings["python"]), capacity=settings["capacity"])
+        uvicorn.run(create_app(app, service), host=config.host, port=config.port, workers=1,
+                    ws_max_size=128 * 1024, log_level="info")
+        return
     with make_server(
         config.host, config.port, app, server_class=_ThreadingWSGIServer, handler_class=_QuietHandler
     ) as server:

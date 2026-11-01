@@ -2006,6 +2006,8 @@ RECOVERY_ROOT_QUERY = (
     "UNION SELECT result_record_artifact_id FROM platform.stage_candidate "
     "UNION SELECT result_record_artifact_id FROM platform.stage_decision "
     "WHERE result_record_artifact_id IS NOT NULL "
+    "UNION SELECT recording_artifact->>'artifact_id' FROM platform.simulation_session "
+    "WHERE recording_artifact IS NOT NULL "
     "UNION SELECT outbound_artifact_id FROM platform.effect_intent "
     "UNION SELECT payload_artifact_id FROM platform.effect_fact "
     "WHERE payload_artifact_id IS NOT NULL "

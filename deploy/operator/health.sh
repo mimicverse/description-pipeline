@@ -283,8 +283,8 @@ else
   report FAIL "operator URL failed verified TLS or origin-host identity: ${TLS_DIAG:-no response}"
 fi
 
-# Check the complete current browser module bundle against installed bytes. A
-# working login page alone does not establish that the URDF viewer can start.
+# Check installed JavaScript module bytes, including optional browser features.
+# A working login page alone does not establish that their modules are served.
 if [ -x "${AIRFLOW_VENV:-}/bin/python" ]; then
   if ASSET_DIAG="$("$AIRFLOW_VENV/bin/python" - "$PORTAL_PORT" <<'ASSETS'
 import hashlib
@@ -296,8 +296,12 @@ import description_pipeline
 
 root = Path(description_pipeline.__file__).resolve().parent / "orchestration" / "static"
 try:
-    for name in ("app.js", "run_history.js", "viewer.js", "vendor/three.module.min.js", "vendor/three.core.min.js"):
-        expected = (root / name).read_bytes()
+    modules = sorted(root.rglob("*.js"))
+    if not modules:
+        raise ValueError("Installed browser modules are missing")
+    for path in modules:
+        name = path.relative_to(root).as_posix()
+        expected = path.read_bytes()
         with urlopen(f"http://127.0.0.1:{sys.argv[1]}/static/{name}", timeout=10) as response:
             if response.status != 200 or response.headers.get_content_type() not in {
                 "application/javascript", "text/javascript"

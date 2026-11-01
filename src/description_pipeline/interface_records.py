@@ -108,6 +108,7 @@ HEALTH_KEYS = (
     "readiness",
 )
 
+
 def _require(condition, code: str, detail: dict | None = None) -> None:
     if not condition:
         raise InterfaceRecordError(code, detail)
@@ -708,8 +709,7 @@ def _auth_string_list(value, code: str, where: str, *, allow_empty: bool) -> lis
     items = _string_list(value, code, where, allow_empty=allow_empty)
     _require(
         all(
-            not _CONTROL.search(item)
-            and not any(character == "," or character.isspace() for character in item)
+            not _CONTROL.search(item) and not any(character == "," or character.isspace() for character in item)
             for item in items
         ),
         code,
@@ -756,7 +756,21 @@ def validate_config_snapshot(snapshot) -> dict:
     )
     _require(resolved["schema_version"] == PLATFORM_CONFIG_SCHEMA, code, {"where": "resolved.schema_version"})
     operator = resolved["operator"]
-    _exact_keys(operator, {"origin", "certificate_file", "private_key_file"}, code, "resolved.operator")
+    _exact_keys(
+        operator,
+        {"origin", "certificate_file", "private_key_file"} | ({"teleop"} if "teleop" in operator else set()),
+        code,
+        "resolved.operator",
+    )
+    if "teleop" in operator:
+        teleop = operator["teleop"]
+        _exact_keys(teleop, {"python", "capacity"}, code, "resolved.operator.teleop")
+        _absolute_path(teleop["python"], code, "resolved.operator.teleop.python")
+        _require(
+            type(teleop["capacity"]) is int and 1 <= teleop["capacity"] <= 8,
+            code,
+            {"where": "resolved.operator.teleop.capacity"},
+        )
     match = _ORIGIN.match(operator["origin"] if isinstance(operator["origin"], str) else "")
     _require(match is not None, code, {"where": "resolved.operator.origin"})
     origin_port = int(match.group(2)) if match.group(2) else 443
