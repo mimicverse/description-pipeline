@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 import unittest
 import uuid
@@ -12,9 +13,13 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from description_pipeline.dynamics_assessment.contracts import RESULT_SCHEMA, AssessmentConflict, AssessmentRequest
+from description_pipeline.dynamics_assessment.executor import AssessmentExecutor
+from description_pipeline.dynamics_assessment.runtime import ProcessLimits, TeleopProcess, terminate_owned
+from description_pipeline.dynamics_assessment.service import AssessmentService
 from description_pipeline.dynamics_assessment.store import AssessmentStore
 from description_pipeline.io import canonical, digest
 from tests.v1.test_dynamics_assessment_contracts import AssessmentCase, request_case
+from tests.v1.test_dynamics_assessment_runtime import owned_group
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -128,6 +133,58 @@ class PostgresCase(AssessmentCase):
 
 
 class PostgresDatabaseTests(PostgresCase):
+    def test_commit_cannot_clear_live_group_identity_as_resource_proof(self):
+        store, request, root = self.database
+        attempt, owner = owned_attempt(store, request, root)
+        with owned_group(root) as (_leader, identity, _child):
+            store.heartbeat(attempt["attempt_id"], owner, phase="running", process=identity)
+            artifact = result(store, request, root, attempt, "failed")
+            with self.assertRaises(AssessmentConflict):
+                store.finish(attempt["attempt_id"], owner, state="failed", artifact=artifact, detail={})
+            current = store.attempt(attempt["attempt_id"])
+            self.assertEqual(current["process"], identity)
+            self.assertFalse(current["resources_settled"])
+            self.assertTrue(terminate_owned(identity, grace_seconds=0.1))
+            store.heartbeat(attempt["attempt_id"], owner, phase="sealing", process=None)
+            settled = store.finish(attempt["attempt_id"], owner, state="failed", artifact=artifact, detail={})
+            self.assertTrue(settled["resources_settled"])
+
+    def test_unknown_group_preserves_owner_process_through_seal_cancel_and_orphan_reconcile(self):
+        store, request, root = self.database
+        request_id = register(store, request, root)
+        attempt = store.new_attempt(request_id)
+        store.begin_dispatch(attempt["attempt_id"])
+        work = root / "resource-work"
+        work.mkdir()
+        service = AssessmentService(
+            store,
+            enabled=True,
+            runtime=request.runtime,
+            executor_sha256=request.record["executor_sha256"],
+            work_root=work,
+        )
+        executor = AssessmentExecutor(
+            service, TeleopProcess(Path(sys.executable), request.runtime, ProcessLimits(10, 1024**3, 10, 1024**2))
+        )
+        with owned_group(root, unbound=True) as (leader, identity, _child):
+            owner = digest({"fixture": "resource-owner"})
+            store.claim(attempt["attempt_id"], owner, controller=identity)
+            store.heartbeat(attempt["attempt_id"], owner, phase="running", process=identity)
+            with self.assertRaisesRegex(AssessmentConflict, "process group is unresolved"):
+                executor._seal(attempt, request, owner, root, "failed", {}, {}, None)
+            self.assertEqual(store.attempt(attempt["attempt_id"])["process"], identity)
+            leader.kill()
+            leader.wait(timeout=5)
+            store.unknown(attempt["attempt_id"], {"phase": "original_orphan_observation"}, owner=owner)
+            before = store.attempt(attempt["attempt_id"])
+            self.assertEqual(executor.reconcile(attempt["attempt_id"])["state"], "unknown")
+            self.assertFalse(executor.cancel_owned(attempt["attempt_id"]))
+            after = store.attempt(attempt["attempt_id"])
+            for key in ("owner_token", "owner_process", "process", "lease_until", "detail"):
+                self.assertEqual(after[key], before[key])
+            self.assertFalse(after["resources_settled"])
+            self.assertTrue(after["cancel_requested"])
+
     def test_registration_is_idempotent_and_conflicting_payload_is_refused(self):
         database = self.database
         store, request, root = database

@@ -252,7 +252,7 @@ class AssessmentStore:
                 "lease_until=now()+interval '30 seconds',"
                 "updated_at=now() WHERE attempt_id=%s AND owner_token=%s "
                 "AND state IN ('running','verifying','sealing') AND lease_until>now() RETURNING *",
-                (phase, json.dumps(process), attempt_id, owner),
+                (phase, json.dumps(process) if process is not None else None, attempt_id, owner),
             )
             result = _row(cursor)
         if result is None:
@@ -315,6 +315,7 @@ class AssessmentStore:
                 "result_artifact_id=%s,detail=%s::jsonb,resources_settled=true,process=NULL,lease_until=NULL,"
                 "updated_at=now() WHERE attempt_id=%s AND owner_token=%s "
                 "AND state IN ('running','verifying','sealing') AND lease_until>now() "
+                "AND process IS NULL "
                 "AND (NOT cancel_requested OR %s='cancelled') RETURNING *",
                 (state, artifact.artifact_id, json.dumps(detail, allow_nan=False), attempt_id, owner, state),
             )
