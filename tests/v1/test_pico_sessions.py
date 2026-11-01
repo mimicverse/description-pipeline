@@ -41,7 +41,7 @@ if SESSION_TESTS:
     from description_pipeline.simulation.service import SimulationService
     from description_pipeline.simulation.store import SimulationConflict, SimulationStore
     from description_pipeline.simulation.verify_recording import verify
-    from description_pipeline.simulation.recording import run_verification
+    from description_pipeline.simulation.recording import run_verification, session_identity
     from description_pipeline.pipeline.contracts import ArtifactRef
     from description_pipeline.platform.facts import FactStore
     from description_pipeline.schemas import STAGE_RESULT_SCHEMA
@@ -255,6 +255,96 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
     async def start_service(self):
         await self.service.start()
         self.request["runtime"] = self.service.runtime_identity
+
+    async def test_failed_supervisor_probe_releases_root_ownership(self):
+        import fcntl
+
+        self.service.python = Path("/bin/false").resolve()
+        with self.assertRaisesRegex(ValueError, "Teleop runtime identity failed"):
+            await self.service.start()
+        with (self.service.root / "supervisor.lock").open("a") as lease:
+            fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.assertIsNone(self.service._lock)
+        self.assertIsNone(self.service.runtime_identity)
+
+    async def test_cancelled_supervisor_acquisition_releases_real_database_lease(self):
+        from unittest.mock import patch
+
+        entered, release = threading.Event(), threading.Event()
+        acquired = {}
+        acquire = self.store.acquire_supervisor
+
+        def delayed_acquire():
+            connection = acquire()
+            acquired["connection"] = connection
+            entered.set()
+            if not release.wait(5):
+                connection.close()
+                raise TimeoutError("Fixture database acquisition was not released")
+            return connection
+
+        try:
+            with patch.object(self.store, "acquire_supervisor", delayed_acquire):
+                starting = asyncio.create_task(self.service.start())
+                try:
+                    self.assertTrue(await asyncio.to_thread(entered.wait, 10))
+                    starting.cancel()
+                finally:
+                    release.set()
+                    await asyncio.gather(starting, return_exceptions=True)
+                self.assertTrue(starting.cancelled())
+            self.assertTrue(acquired["connection"].closed)
+            self.assertIsNone(self.service._lock)
+            self.assertIsNone(self.service.runtime_identity)
+            replacement = await asyncio.to_thread(acquire)
+            replacement.close()
+        finally:
+            release.set()
+            if "connection" in acquired:
+                acquired["connection"].close()
+
+    async def test_orphan_reconciliation_preserves_unknown_and_recording_identity(self):
+        previous_owner = "previous-inspection-supervisor"
+        unresolved = self.store.create(
+            "app:tenant:operator", "orphan-without-process", self.run_id,
+            {**self.request, "record": False}, previous_owner,
+        )
+        previous = self.store.create(
+            "app:tenant:operator", "orphan-with-recording", self.run_id, self.request, previous_owner,
+        )
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, "-I", "-c", "import sys;sys.stdin.buffer.read(1)", stdin=asyncio.subprocess.PIPE,
+        )
+        try:
+            identity = {
+                "pid": process.pid,
+                "owner": previous_owner,
+                "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+                "start_time": Path(f"/proc/{process.pid}/stat").read_text().split(") ", 1)[1].split()[19],
+            }
+            self.store.transition(previous["session_id"], previous_owner, "starting", process=identity)
+        finally:
+            process.stdin.close()
+            await process.wait()
+        recording = self.service.root / previous["session_id"] / "recording"
+        recording.mkdir(parents=True)
+        (recording / "request.json").write_bytes(canonical(previous["request"]))
+        (recording / "session.json").write_bytes(canonical(session_identity(previous)))
+        (recording / "ticks.jsonl").write_bytes(b"")
+
+        await self.start_service()
+        with self.subTest(branch="missing-process-identity"):
+            self.assertEqual("unresolved", self.store.get(unresolved["session_id"])["state"])
+        recovered = self.store.get(previous["session_id"])
+        self.assertEqual("failed", recovered["state"])
+        self.assertEqual(previous_owner, recovered["owner_nonce"])
+        ref = ArtifactRef.from_record(recovered["recording_artifact"])
+        with self.subTest(branch="recording-producer-identity"):
+            self.assertEqual(digest(previous["request"]["runtime"]), ref.producer_tool_sha256)
+        self.artifacts.verify(ref)
+        sealed = self.artifacts.objects / ref.artifact_id
+        self.assertEqual(session_identity(previous), json.loads((sealed / "session.json").read_bytes()))
+        self.assertFalse(json.loads((sealed / "outcome.json").read_bytes())["complete"])
 
     async def wait_ready(self, sid):
         async with asyncio.timeout(20):

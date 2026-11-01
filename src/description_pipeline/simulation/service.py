@@ -59,6 +59,15 @@ class SimulationService:
         self._database_lock = None
 
     async def start(self) -> None:
+        if self._lock is not None or self._database_lock is not None:
+            raise SimulationConflict("Simulation supervisor is already started")
+        try:
+            await self._start()
+        except BaseException:
+            await self.close()
+            raise
+
+    async def _start(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         if self.root.is_symlink() or not self.python.is_absolute() or not self.python.is_file():
             raise ValueError("Simulation root or worker interpreter is invalid")
@@ -89,7 +98,6 @@ class SimulationService:
             if probe.returncode is None:
                 probe.kill()
                 await probe.wait()
-            await self.close()
             raise
         if probe.returncode != 0:
             raise ValueError(f"Teleop runtime identity failed: {stderr.decode(errors='replace')[-1000:]}")
@@ -102,15 +110,25 @@ class SimulationService:
             raise ValueError("Installed Teleop package differs from the fixed source wheel")
         self.runtime_identity["source_commit"] = contract["source_commit"]
         self.runtime_identity["wheel_sha256"] = contract["wheel_sha256"]
-        self._database_lock = await asyncio.to_thread(self.store.acquire_supervisor)
+        acquiring = asyncio.create_task(asyncio.to_thread(self.store.acquire_supervisor))
+        try:
+            self._database_lock = await asyncio.shield(acquiring)
+        except asyncio.CancelledError:
+            # The database call continues in its thread; cleanup must own its returned lease.
+            result, = await asyncio.gather(acquiring, return_exceptions=True)
+            if not isinstance(result, BaseException):
+                self._database_lock = result
+            raise
         for row in await asyncio.to_thread(self.store.orphaned, self.owner):
             identity = row["process_identity"]
             if identity is not None and self._process_exists(identity):
                 await asyncio.sleep(5.5)
-            if identity is not None and self._process_exists(identity):
+            if identity is None or self._process_exists(identity):
                 await asyncio.to_thread(self.store.reconcile_orphan, row["session_id"], row["owner_nonce"])
             else:
-                recording = await self._seal_recording(self.root / row["session_id"], False, "Supervisor interrupted")
+                recording = await self._seal_recording(
+                    self.root / row["session_id"], False, "Supervisor interrupted", runtime=row["request"]["runtime"]
+                )
                 await asyncio.to_thread(
                     self.store.transition,
                     row["session_id"],
@@ -307,7 +325,9 @@ class SimulationService:
                     or current.failure
                     or (None if terminal == "stopped" else f"Worker exited: {current.process.returncode}")
                 )
-                recording = await self._seal_recording(current.root, terminal == "stopped", error)
+                recording = await self._seal_recording(
+                    current.root, terminal == "stopped", error, runtime=row["request"]["runtime"]
+                )
                 if row["state"] not in {"stopped", "failed"}:
                     await asyncio.to_thread(
                         self.store.transition,
@@ -325,7 +345,7 @@ class SimulationService:
                 for task in current.tasks[1:2]:
                     task.cancel()
 
-    async def _seal_recording(self, root, complete, error):
+    async def _seal_recording(self, root, complete, error, *, runtime):
         directory = root / "recording"
         if not directory.is_dir():
             return None
@@ -336,7 +356,7 @@ class SimulationService:
             kind="teleop_recording",
             producer_run_id=None,
             producer_stage=None,
-            producer_tool_sha256=digest(self.runtime_identity),
+            producer_tool_sha256=digest(runtime),
         )
         return artifact.to_record()
 
@@ -450,6 +470,7 @@ class SimulationService:
             if self._database_lock is not None:
                 self._database_lock.close()
                 self._database_lock = None
+            self.runtime_identity = None
 
 
 _IDENTITY_PROBE = """
