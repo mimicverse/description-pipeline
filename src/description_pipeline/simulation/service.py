@@ -19,7 +19,7 @@ import zipfile
 from ..io import digest, canonical
 from ..owned_process import module_command, process_identity, resource_state, terminate_owned
 from .store import SimulationConflict, SimulationStore
-from .recording import prepare_source, recording_binding, run_verification, session_identity
+from .recording import VerificationUnresolved, prepare_source, recording_binding, run_verification, session_identity
 from .schemas import load_runtime_contract
 from .warnings import warning_inventory
 
@@ -62,15 +62,26 @@ class SimulationService:
         self.verification_gate = asyncio.Semaphore(1)
         self._lock = None
         self._database_lock = None
+        self._probe = None
+        self._probe_identity = None
+        self._verification_task = None
+        self._lifecycle_lock = asyncio.Lock()
+        self._lifecycle_state = "closed"
 
     async def start(self) -> None:
-        if self._lock is not None or self._database_lock is not None:
-            raise SimulationConflict("Simulation supervisor is already started")
-        try:
-            await self._start()
-        except BaseException:
-            await self.close()
-            raise
+        async with self._lifecycle_lock:
+            if self._lock is not None or self._database_lock is not None:
+                raise SimulationConflict("Simulation supervisor is already started")
+            self._lifecycle_state = "starting"
+            try:
+                await self._start()
+            except BaseException:
+                self._lifecycle_state = "closing"
+                async with self.gate:
+                    await self._close_owned()
+                raise
+            if self._lifecycle_state == "starting":
+                self._lifecycle_state = "open"
 
     async def _start(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -78,34 +89,80 @@ class SimulationService:
             raise ValueError("Simulation root or worker interpreter is invalid")
         if shutil.which("prlimit") is None:
             raise ValueError("Native worker resource control requires prlimit")
-        self._lock = (self.root / "supervisor.lock").open("a")
+        self._lock = (self.root / "supervisor.lock").open("a+")
         try:
             fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             self._lock.close()
             self._lock = None
             raise ValueError("Another simulation supervisor owns this root") from None
+        self._lock.seek(0)
+        previous_probe = self._lock.read(32769)
+        if previous_probe:
+            record = json.loads(previous_probe)
+            if (
+                len(previous_probe) > 32768
+                or not isinstance(record, dict)
+                or set(record) != {"schema_version", "process_identity"}
+                or record["schema_version"] != "solidworks-to-urdf.simulation-probe/v1"
+                or not isinstance(record["process_identity"], dict)
+            ):
+                raise SimulationConflict("Startup ownership metadata is unresolved")
+            self._probe_identity = record["process_identity"]
+            if not await self._close_probe():
+                raise SimulationConflict("Previous startup process group is unresolved")
         contract = load_runtime_contract(Path(__file__).with_name("teleop-runtime.json"))
-        probe = await asyncio.create_subprocess_exec(
-            str(self.python),
-            "-I",
-            "-B",
-            "-c",
-            _IDENTITY_PROBE,
-            json.dumps(list(contract["dependency_versions"])),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+        nonce = secrets.token_hex(24)
+        self._probe_identity = {"nonce": nonce}
+        self._write_probe_identity()
+        spawning = asyncio.create_task(
+            asyncio.create_subprocess_exec(
+                str(self.python),
+                "-I",
+                "-B",
+                "-c",
+                _IDENTITY_PROBE,
+                nonce,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+                start_new_session=True,
+            )
         )
+        interrupted = False
         try:
-            stdout, stderr = await asyncio.wait_for(probe.communicate(), 30)
-        except BaseException:
-            if probe.returncode is None:
-                probe.kill()
-                await probe.wait()
+            try:
+                probe = await asyncio.shield(spawning)
+            except asyncio.CancelledError:
+                probe = await spawning
+                interrupted = True
+        except Exception:
+            self._probe_identity = None
+            self._write_probe_identity()
             raise
+        self._probe = probe
+        self._probe_identity = {"pid": probe.pid, "nonce": nonce}
+        self._write_probe_identity()
+        self._probe_identity = process_identity(probe.pid, nonce)
+        self._write_probe_identity()
+        if interrupted:
+            raise asyncio.CancelledError
+        if self._lifecycle_state != "starting":
+            raise SimulationConflict("Simulation supervisor closed during startup")
+        stdout, stderr = await asyncio.wait_for(
+            probe.communicate(canonical(list(contract["dependency_versions"])) + b"\n"),
+            30,
+        )
+        clean = await asyncio.to_thread(resource_state, self._probe_identity) == "dead"
+        if not await self._close_probe():
+            raise SimulationConflict("Startup process group is unresolved")
+        if not clean:
+            raise SimulationConflict("Startup process group did not exit cleanly")
         if probe.returncode != 0:
             raise ValueError(f"Teleop runtime identity failed: {stderr.decode(errors='replace')[-1000:]}")
+        if self._lifecycle_state != "starting":
+            raise SimulationConflict("Simulation supervisor closed during startup")
         self.runtime_identity = json.loads(stdout)
         if {name: item["version"] for name, item in self.runtime_identity["packages"].items()} != contract[
             "dependency_versions"
@@ -124,6 +181,9 @@ class SimulationService:
             if not isinstance(result, BaseException):
                 self._database_lock = result
             raise
+        if self._lifecycle_state != "starting":
+            raise SimulationConflict("Simulation supervisor closed during startup")
+        await self._reconcile_verifications()
         for row in await asyncio.to_thread(self.store.orphaned, self.owner):
             identity = row["process_identity"]
             quiescent = identity is not None and await self._terminate_identity(identity)
@@ -142,23 +202,85 @@ class SimulationService:
                     recording=recording,
                 )
 
+    def _write_probe_identity(self):
+        self._lock.seek(0)
+        self._lock.truncate()
+        if self._probe_identity is not None:
+            self._lock.write(
+                json.dumps(
+                    {
+                        "schema_version": "solidworks-to-urdf.simulation-probe/v1",
+                        "process_identity": self._probe_identity,
+                    }
+                )
+            )
+        self._lock.flush()
+        os.fsync(self._lock.fileno())
+
+    async def _close_probe(self):
+        if self._lock is None:
+            return True
+        if self._probe_identity is not None:
+            if not await self._terminate_identity(self._probe_identity):
+                return False
+            self._probe_identity = None
+            self._probe = None
+            self._write_probe_identity()
+        self._lock.seek(0)
+        return not self._lock.read(1)
+
     async def create(self, actor: str, key: str, run_id: str, request: dict, members: dict, read_member) -> dict:
+        if self._lifecycle_state != "open":
+            raise SimulationConflict("Simulation supervisor is not accepting sessions")
         if not key or len(key) > 128:
             raise ValueError("A bounded idempotency key is required")
         if self.runtime_identity is None or request.get("runtime") != self.runtime_identity:
             raise ValueError("Simulation request runtime differs from the active fixed worker")
         warning_inventory(request["source"])
         async with self.gate:
-            row = await asyncio.to_thread(
-                self.store.create, actor, key, run_id, request, self.owner, capacity=self.capacity
+            if self._lifecycle_state != "open":
+                raise SimulationConflict("Simulation supervisor is not accepting sessions")
+            admitting = asyncio.create_task(
+                asyncio.to_thread(
+                    self.store.create,
+                    actor,
+                    key,
+                    run_id,
+                    request,
+                    self.owner,
+                    capacity=self.capacity,
+                )
             )
+            interrupted = False
+            try:
+                row = await asyncio.shield(admitting)
+            except asyncio.CancelledError:
+                row = await admitting
+                interrupted = True
             session_id = row["session_id"]
+            if interrupted:
+                if (
+                    row["owner_nonce"] == self.owner
+                    and row["state"] == "starting"
+                    and row["process_identity"] is None
+                    and session_id not in self.running
+                ):
+                    await asyncio.to_thread(
+                        self.store.transition,
+                        session_id,
+                        self.owner,
+                        "failed",
+                        error="Session admission was cancelled",
+                    )
+                raise asyncio.CancelledError
             if session_id in self.running or row["state"] != "starting" or row["owner_nonce"] != self.owner:
                 return self.public(row)
             session_root = self.root / session_id
             source = session_root / "source"
             try:
                 await prepare_source(source, request["source"], members, read_member)
+                if self._lifecycle_state != "open":
+                    raise SimulationConflict("Simulation supervisor is closing")
                 config = {
                     "root": str(source),
                     "inventory": request["source"]["files"],
@@ -208,6 +330,8 @@ class SimulationService:
                 current.identity = process_identity(process.pid, nonce)
                 if interrupted:
                     raise asyncio.CancelledError
+                if self._lifecycle_state != "open":
+                    raise SimulationConflict("Simulation supervisor is closing")
                 await asyncio.to_thread(
                     self.store.transition, session_id, self.owner, "starting", process=current.identity
                 )
@@ -261,15 +385,118 @@ class SimulationService:
             raise
 
     async def verify_recording(self, session_id, members, read_member):
+        if self._lifecycle_state != "open":
+            raise SimulationConflict("Simulation supervisor is not accepting verification")
         if self.verification_gate.locked():
             raise SimulationConflict("A recording verification is already running; retry after it finishes")
         async with self.verification_gate:
-            row = await asyncio.to_thread(self.store.get, session_id)
-            binding = recording_binding(row)
-            with tempfile.TemporaryDirectory(prefix="recording-verification-", dir=self.root) as temporary:
-                source = Path(temporary) / "source"
-                await prepare_source(source, row["request"]["source"], members, read_member)
-                return await run_verification(binding, self.artifacts.root, source)
+            self._verification_task = asyncio.current_task()
+            try:
+                return await self._verify_recording(session_id, members, read_member)
+            finally:
+                self._verification_task = None
+
+    async def _verify_recording(self, session_id, members, read_member):
+        row = await asyncio.to_thread(self.store.get, session_id)
+        binding = recording_binding(row)
+        command_id = "verify-" + secrets.token_hex(16)
+        request = {
+            "type": "verify_recording",
+            "binding": binding,
+            "partial": "recording-verification-" + command_id,
+        }
+        temporary = self._verification_partial(command_id, request)
+        admitted = False
+        retained = False
+        try:
+            await self._reconcile_verifications()
+            admitting = asyncio.create_task(
+                asyncio.to_thread(
+                    self.store.begin_verification,
+                    session_id,
+                    command_id,
+                    request,
+                    self.owner,
+                )
+            )
+            try:
+                await asyncio.shield(admitting)
+            except asyncio.CancelledError:
+                await admitting
+                admitted = True
+                raise
+            admitted = True
+            temporary.mkdir(mode=0o700)
+            source = temporary / "source"
+            await prepare_source(source, row["request"]["source"], members, read_member)
+
+            async def register_process(identity):
+                await self._verification_transition(session_id, command_id, self.owner, "running", process=identity)
+
+            result = await run_verification(binding, self.artifacts.root, source, register_process=register_process)
+            await self._verification_transition(session_id, command_id, self.owner, "completed", value=result)
+            return result
+        except BaseException as error:
+            if admitted:
+                retained = isinstance(error, VerificationUnresolved)
+                state = (
+                    "unknown" if retained else "cancelled" if isinstance(error, asyncio.CancelledError) else "failed"
+                )
+                latest = next(
+                    item
+                    for item in await asyncio.to_thread(self.store.verification_attempts, session_id)
+                    if item["command_id"] == command_id
+                )
+                if latest["result"]["state"] not in {"completed", "failed", "cancelled"}:
+                    await self._verification_transition(
+                        session_id,
+                        command_id,
+                        self.owner,
+                        state,
+                        error=str(error) or type(error).__name__,
+                    )
+            raise
+        finally:
+            if admitted and not retained:
+                await asyncio.to_thread(shutil.rmtree, temporary, True)
+
+    def _verification_partial(self, command_id, request):
+        name = "recording-verification-" + command_id
+        if request.get("partial") != name or Path(name).name != name:
+            raise SimulationConflict("Recording verification partial identity is invalid")
+        path = self.root / name
+        if path.is_symlink():
+            raise SimulationConflict("Recording verification partial must not be a symlink")
+        return path
+
+    async def _verification_transition(self, *args, **kwargs):
+        changing = asyncio.create_task(asyncio.to_thread(self.store.transition_verification, *args, **kwargs))
+        try:
+            return await asyncio.shield(changing)
+        except asyncio.CancelledError:
+            await changing
+            raise
+
+    async def _reconcile_verifications(self):
+        for attempt in await asyncio.to_thread(self.store.verification_attempts):
+            result = attempt["result"]
+            partial = self._verification_partial(attempt["command_id"], attempt["request"])
+            if result["state"] in {"completed", "failed", "cancelled"}:
+                await asyncio.to_thread(shutil.rmtree, partial, True)
+                continue
+            identity = result["process_identity"]
+            quiescent = identity is not None and await self._terminate_identity(identity)
+            await self._verification_transition(
+                attempt["session_id"],
+                attempt["command_id"],
+                result["owner_nonce"],
+                "failed" if quiescent else "unknown",
+                error="Verification interrupted; process group is absent"
+                if quiescent
+                else "Verification process group ownership is unresolved",
+            )
+            if quiescent:
+                await asyncio.to_thread(shutil.rmtree, partial, True)
 
     async def send(self, session_id: str, command: dict) -> None:
         current = self.running.get(session_id)
@@ -508,13 +735,27 @@ class SimulationService:
             raise SimulationConflict("Session process group is unresolved; recording and capacity are retained")
 
     async def close(self) -> None:
+        self._lifecycle_state = "closing"
+        async with self._lifecycle_lock:
+            async with self.gate:
+                await self._close_owned()
+            self._lifecycle_state = "closed"
+
+    async def _close_owned(self) -> None:
         try:
+            if self._verification_task is not None and self._verification_task is not asyncio.current_task():
+                self._verification_task.cancel()
+                await asyncio.gather(self._verification_task, return_exceptions=True)
             await asyncio.gather(*(self.stop(key) for key in list(self.running)), return_exceptions=True)
         finally:
             for current in list(self.running.values()):
                 await self._terminate(current)
             for session_id, current in list(self.running.items()):
                 await self._settle(session_id, current)
+            if self._database_lock is not None:
+                await self._reconcile_verifications()
+            if not await self._close_probe():
+                raise SimulationConflict("Startup process group is unresolved; startup ownership is retained")
             if self._lock is not None:
                 self._lock.close()
                 self._lock = None
@@ -526,9 +767,10 @@ class SimulationService:
 
 _IDENTITY_PROBE = """
 import base64,hashlib,importlib.metadata as m,json,sys
+dependencies=json.load(sys.stdin)
 import mujoco,teleop
 packages={}
-for name in json.loads(sys.argv[1]):
+for name in dependencies:
     d=m.distribution(name)
     rows=[]
     for f in d.files or []:

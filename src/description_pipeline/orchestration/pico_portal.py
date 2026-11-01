@@ -194,13 +194,15 @@ class PicoPortal:
                     for joint in robot.findall("joint")
                 ],
             }
-            return JSONResponse({
-                "saved": profile,
-                "subject_sha256": source["subject_sha256"],
-                "model": choices,
-                "warning_inventory": source["warning_inventory"],
-                "verification_scope": source["verification_scope"],
-            })
+            return JSONResponse(
+                {
+                    "saved": profile,
+                    "subject_sha256": source["subject_sha256"],
+                    "model": choices,
+                    "warning_inventory": source["warning_inventory"],
+                    "verification_scope": source["verification_scope"],
+                }
+            )
         except Exception as error:
             return self.error(error)
 
@@ -211,6 +213,15 @@ class PicoPortal:
             result["source"] = row["request"]["source"]
             result["runtime"] = row["request"]["runtime"]
             result["recording_artifact"] = row["recording_artifact"]
+            attempts = await asyncio.to_thread(self.service.store.verification_attempts, row["session_id"])
+            result["verification"] = (
+                {
+                    "command_id": attempts[-1]["command_id"],
+                    **{key: attempts[-1]["result"][key] for key in ("state", "error", "value")},
+                }
+                if attempts
+                else None
+            )
             return JSONResponse(result)
         except Exception as error:
             return self.error(error)
@@ -238,7 +249,9 @@ class PicoPortal:
                 await self.service.stop(session_id)
                 settled = await asyncio.to_thread(self.service.store.get, session_id)
                 result = {
-                    "stopped": settled["state"] == "stopped", "state": settled["state"], "error": settled["error"]
+                    "stopped": settled["state"] == "stopped",
+                    "state": settled["state"],
+                    "error": settled["error"],
                 }
             await asyncio.to_thread(self.service.store.complete_command, session_id, body["command_id"], result)
             return JSONResponse(result)

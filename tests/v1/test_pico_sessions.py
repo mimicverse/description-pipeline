@@ -46,7 +46,7 @@ if SESSION_TESTS:
     from description_pipeline.simulation.service import RunningSession, SimulationService
     from description_pipeline.simulation.store import SimulationConflict, SimulationStore
     from description_pipeline.simulation.verify_recording import verify
-    from description_pipeline.simulation.recording import run_verification, session_identity
+    from description_pipeline.simulation.recording import VerificationUnresolved, session_identity
     from description_pipeline.pipeline.contracts import ArtifactRef
     from description_pipeline.platform.facts import FactStore
     from description_pipeline.schemas import STAGE_RESULT_SCHEMA
@@ -280,13 +280,78 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_supervisor_probe_releases_root_ownership(self):
         import fcntl
 
-        self.service.python = Path("/bin/false").resolve()
+        self.service.python = Path(sys.executable)
         with self.assertRaisesRegex(ValueError, "Teleop runtime identity failed"):
             await self.service.start()
         with (self.service.root / "supervisor.lock").open("a") as lease:
             fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
         self.assertIsNone(self.service._lock)
         self.assertIsNone(self.service.runtime_identity)
+
+    async def test_fast_exit_probe_without_full_identity_retains_original_ownership(self):
+        from unittest.mock import patch
+
+        self.service.python = Path("/bin/false").resolve()
+        spawn = asyncio.create_subprocess_exec
+        spawned = []
+
+        async def reaped_spawn(*args, **options):
+            process = await spawn(*args, **options)
+            spawned.append(process)
+            await process.wait()
+            return process
+
+        try:
+            with (
+                patch("description_pipeline.simulation.service.asyncio.create_subprocess_exec", reaped_spawn),
+                self.assertRaisesRegex(SimulationConflict, "Startup process group is unresolved"),
+            ):
+                await self.service.start()
+            self.assertIsNotNone(self.service._lock)
+            record = json.loads((self.service.root / "supervisor.lock").read_bytes())
+            self.assertEqual(spawned[0].pid, record["process_identity"]["pid"])
+            self.assertNotIn("start_ticks", record["process_identity"])
+            self.assertIsNone(self.service.runtime_identity)
+        finally:
+            if spawned:
+                self.assertIsNotNone(spawned[0].returncode)
+                with self.assertRaises(ProcessLookupError):
+                    os.killpg(spawned[0].pid, 0)
+                # Only the fixture clears its own proven-absent fast-exit sample.
+                self.service._probe_identity = None
+                self.service._write_probe_identity()
+                await self.service.close()
+
+    async def test_probe_vendor_import_waits_for_parent_identity_registration(self):
+        from unittest.mock import patch
+
+        self.service.python = Path(sys.executable)
+        entered, release = asyncio.Event(), asyncio.Event()
+        spawn = asyncio.create_subprocess_exec
+        spawned = []
+
+        async def held_response(*args, **options):
+            process = await spawn(*args, **options)
+            spawned.append((process, process_identity(process.pid, args[-1])))
+            entered.set()
+            await release.wait()
+            return process
+
+        with patch("description_pipeline.simulation.service.asyncio.create_subprocess_exec", held_response):
+            starting = asyncio.create_task(self.service.start())
+            try:
+                await asyncio.wait_for(entered.wait(), 5)
+                await asyncio.sleep(0.1)
+                self.assertIsNone(spawned[0][0].returncode)
+                self.assertEqual("alive", resource_state(spawned[0][1]))
+                pending = json.loads((self.service.root / "supervisor.lock").read_bytes())
+                self.assertEqual({"nonce"}, set(pending["process_identity"]))
+            finally:
+                release.set()
+            with self.assertRaisesRegex(ValueError, "Teleop runtime identity failed"):
+                await starting
+        self.assertEqual("dead", resource_state(spawned[0][1]))
+        self.assertIsNone(self.service._lock)
 
     async def test_inline_warning_inventory_is_rejected_before_database_admission(self):
         await self.start_service()
@@ -392,7 +457,7 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(json.loads((sealed / "outcome.json").read_bytes())["complete"])
 
     @asynccontextmanager
-    async def exited_leader_group(self, *, marked, owner=None):
+    async def exited_leader_group(self, *, marked, owner=None, register=True, exit_leader=True):
         """Own and reap a real descendant without changing the host reaper."""
         libc = ctypes.CDLL(None, use_errno=True)
         previous = ctypes.c_int()
@@ -435,26 +500,35 @@ sys.stdin.buffer.read(1)
             child = int(await asyncio.wait_for(process.stdout.readline(), 3))
             descriptor = os.pidfd_open(child)
             identity = process_identity(process.pid, nonce)
-            row = self.store.create(
-                "app:tenant:operator",
-                nonce,
-                self.run_id,
-                self.request,
-                owner or self.service.owner,
-            )
-            self.store.transition(row["session_id"], row["owner_nonce"], "starting", process=identity)
-            self.store.transition(row["session_id"], row["owner_nonce"], "stopping")
-            recording = self.service.root / row["session_id"] / "recording"
+            row = None
+            if register:
+                row = self.store.create(
+                    "app:tenant:operator",
+                    nonce,
+                    self.run_id,
+                    self.request,
+                    owner or self.service.owner,
+                )
+                self.store.transition(row["session_id"], row["owner_nonce"], "starting", process=identity)
+                self.store.transition(row["session_id"], row["owner_nonce"], "stopping")
+            recording = self.service.root / (row["session_id"] if row else nonce) / "recording"
             recording.mkdir(parents=True)
             (recording / "request.json").write_bytes(canonical(self.request))
-            (recording / "session.json").write_bytes(canonical(session_identity(row)))
+            if row is not None:
+                (recording / "session.json").write_bytes(canonical(session_identity(row)))
             (recording / "ticks.jsonl").write_bytes(b"original partial\n")
             current = RunningSession(process, recording.parent, identity=identity)
-            process.stdin.close()
-            await self.service._wait_leader(current, 3)
-            self.assertEqual(0, process.returncode)
+            if exit_leader:
+                process.stdin.close()
+                await self.service._wait_leader(current, 3)
+                self.assertEqual(0, process.returncode)
             self.assertEqual("alive" if marked else "unknown", resource_state(identity))
-            reaping = asyncio.create_task(asyncio.to_thread(os.waitpid, child, 0))
+
+            async def reap_descendant():
+                await self.service._wait_leader(current, 60)
+                return await asyncio.to_thread(os.waitpid, child, 0)
+
+            reaping = asyncio.create_task(reap_descendant())
             yield row, current, child
         finally:
             if descriptor is not None:
@@ -592,6 +666,351 @@ sys.stdin.buffer.read(1)
         self.assertFalse(json.loads((self.service.root / sid / "recording/outcome.json").read_bytes())["complete"])
         self.assertFalse(self.service.running)
 
+    async def test_cancelled_probe_spawn_retains_handle_until_group_is_reaped(self):
+        from unittest.mock import patch
+
+        entered, release = asyncio.Event(), asyncio.Event()
+        actual_spawn = asyncio.create_subprocess_exec
+        spawned = []
+
+        async def delayed_probe(*args, **options):
+            process = await actual_spawn(
+                sys.executable,
+                "-I",
+                "-c",
+                "import time;time.sleep(60)",
+                args[-1],
+                **options,
+            )
+            spawned.append(process)
+            entered.set()
+            await release.wait()
+            return process
+
+        with patch("description_pipeline.simulation.service.asyncio.create_subprocess_exec", delayed_probe):
+            starting = asyncio.create_task(self.service.start())
+            try:
+                await asyncio.wait_for(entered.wait(), 5)
+                starting.cancel()
+                await asyncio.sleep(0)
+            finally:
+                release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await starting
+        self.assertIsNotNone(spawned[0].returncode)
+        self.assertFalse(Path(f"/proc/{spawned[0].pid}").exists())
+        self.assertIsNone(self.service._lock)
+        self.assertIsNone(self.service._probe_identity)
+        self.assertEqual("", (self.service.root / "supervisor.lock").read_text())
+
+    async def exercise_close_during_worker_spawn(self, *, cancel):
+        from unittest.mock import patch
+
+        await self.start_service()
+        entered, release = asyncio.Event(), asyncio.Event()
+        actual_spawn = asyncio.create_subprocess_exec
+        spawned = []
+
+        async def delayed_spawn(*args, **options):
+            process = await actual_spawn(*args, **options)
+            spawned.append((process, process_identity(process.pid, args[-1])))
+            entered.set()
+            await release.wait()
+            return process
+
+        closing = None
+        with patch("description_pipeline.simulation.service.asyncio.create_subprocess_exec", delayed_spawn):
+            creating = asyncio.create_task(
+                self.service.create(
+                    "app:tenant:operator",
+                    "close-during-real-spawn",
+                    self.run_id,
+                    self.request,
+                    self.members,
+                    self.read_member,
+                )
+            )
+            try:
+                await asyncio.wait_for(entered.wait(), 5)
+                closing = asyncio.create_task(self.service.close())
+                await asyncio.sleep(0)
+                self.assertFalse(closing.done())
+                self.assertIsNotNone(self.service._lock)
+                self.assertIsNotNone(self.service._database_lock)
+                self.assertIsNotNone(self.service.runtime_identity)
+                self.assertEqual("alive", resource_state(spawned[0][1]))
+                with self.assertRaisesRegex(SimulationConflict, "not accepting"):
+                    await self.service.create(
+                        "app:tenant:operator",
+                        "late-session",
+                        self.run_id,
+                        self.request,
+                        self.members,
+                        self.read_member,
+                    )
+                if cancel:
+                    creating.cancel()
+            finally:
+                release.set()
+            with self.assertRaises(asyncio.CancelledError if cancel else SimulationConflict):
+                await creating
+            await asyncio.wait_for(closing, 10)
+        with self.store.transaction() as cursor:
+            cursor.execute("SELECT session_id FROM simulation_session WHERE request_key='close-during-real-spawn'")
+            sid = cursor.fetchone()[0]
+        self.assertEqual("failed", self.store.get(sid)["state"])
+        self.assertEqual(spawned[0][1], self.store.get(sid)["process_identity"])
+        self.assertEqual("dead", resource_state(spawned[0][1]))
+        self.assertIsNone(self.service._lock)
+        self.assertIsNone(self.service._database_lock)
+        self.assertIsNone(self.service.runtime_identity)
+        self.assertFalse(self.service.running)
+        await self.service.close()
+
+    async def test_close_waits_for_real_worker_spawn_before_releasing_ownership(self):
+        await self.exercise_close_during_worker_spawn(cancel=False)
+
+    async def test_close_and_cancel_wait_for_real_worker_spawn_before_releasing_ownership(self):
+        await self.exercise_close_during_worker_spawn(cancel=True)
+
+    async def test_close_waits_for_real_probe_spawn_before_releasing_startup_lock(self):
+        from unittest.mock import patch
+
+        entered, release = asyncio.Event(), asyncio.Event()
+        actual_spawn = asyncio.create_subprocess_exec
+        spawned = []
+
+        async def delayed_probe(*args, **options):
+            process = await actual_spawn(
+                sys.executable,
+                "-I",
+                "-c",
+                "import time;time.sleep(60)",
+                args[-1],
+                **options,
+            )
+            spawned.append((process, process_identity(process.pid, args[-1])))
+            entered.set()
+            await release.wait()
+            return process
+
+        with patch("description_pipeline.simulation.service.asyncio.create_subprocess_exec", delayed_probe):
+            starting = asyncio.create_task(self.service.start())
+            try:
+                await asyncio.wait_for(entered.wait(), 5)
+                closing = asyncio.create_task(self.service.close())
+                await asyncio.sleep(0)
+                self.assertFalse(closing.done())
+                self.assertIsNotNone(self.service._lock)
+                self.assertEqual("alive", resource_state(spawned[0][1]))
+            finally:
+                release.set()
+            with self.assertRaisesRegex(SimulationConflict, "closed during startup"):
+                await starting
+            await asyncio.wait_for(closing, 10)
+        self.assertIsNone(self.service._lock)
+        self.assertEqual("dead", resource_state(spawned[0][1]))
+        await self.service.close()
+
+    async def test_close_and_cancel_wait_for_database_admission_before_releasing_ownership(self):
+        from unittest.mock import patch
+
+        await self.start_service()
+        entered, release = threading.Event(), threading.Event()
+        admit = self.store.create
+        admitted = []
+
+        def delayed_admission(*args, **kwargs):
+            row = admit(*args, **kwargs)
+            admitted.append(row)
+            entered.set()
+            if not release.wait(5):
+                raise TimeoutError("Fixture admission was not released")
+            return row
+
+        with patch.object(self.store, "create", delayed_admission):
+            creating = asyncio.create_task(
+                self.service.create(
+                    "app:tenant:operator",
+                    "cancel-pg-admission",
+                    self.run_id,
+                    self.request,
+                    self.members,
+                    self.read_member,
+                )
+            )
+            try:
+                self.assertTrue(await asyncio.to_thread(entered.wait, 5))
+                creating.cancel()
+                closing = asyncio.create_task(self.service.close())
+                await asyncio.sleep(0)
+                self.assertFalse(closing.done())
+                self.assertIsNotNone(self.service._database_lock)
+            finally:
+                release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await creating
+            await asyncio.wait_for(closing, 10)
+        settled = self.store.get(admitted[0]["session_id"])
+        self.assertEqual("failed", settled["state"])
+        self.assertIsNone(settled["process_identity"])
+        self.assertIsNone(self.service._database_lock)
+        self.assertIsNone(self.service._lock)
+
+    async def test_unknown_probe_retains_startup_lock_and_original_group_across_retry(self):
+        async with self.exited_leader_group(marked=False, register=False) as (_, current, child):
+            record = {"schema_version": "solidworks-to-urdf.simulation-probe/v1", "process_identity": current.identity}
+            lock_path = self.service.root / "supervisor.lock"
+            lock_path.write_bytes(canonical(record))
+            with self.assertRaisesRegex(SimulationConflict, "Startup process group is unresolved"):
+                await self.service.start()
+            self.assertIsNotNone(self.service._lock)
+            self.assertEqual(record, json.loads(lock_path.read_bytes()))
+            self.assertTrue(Path(f"/proc/{child}").exists())
+            replacement = SimulationService(self.store, self.artifacts, self.service.root, Path(WORKER))
+            with self.assertRaisesRegex(ValueError, "Another simulation supervisor"):
+                await replacement.start()
+            self.assertIsNone(replacement._lock)
+            with self.assertRaisesRegex(SimulationConflict, "already started"):
+                await self.service.start()
+        await self.service.close()
+        await self.start_service()
+        self.assertEqual("", lock_path.read_text())
+
+    async def test_owned_probe_orphan_is_reaped_before_a_new_runtime_probe(self):
+        async with self.exited_leader_group(marked=True, register=False) as (_, current, child):
+            (self.service.root / "supervisor.lock").write_bytes(
+                canonical(
+                    {
+                        "schema_version": "solidworks-to-urdf.simulation-probe/v1",
+                        "process_identity": current.identity,
+                    }
+                )
+            )
+            await self.start_service()
+            self.assertFalse(Path(f"/proc/{child}").exists())
+            self.assertEqual("dead", resource_state(current.identity))
+            self.assertEqual("", (self.service.root / "supervisor.lock").read_text())
+
+    async def test_probe_lost_spawn_response_remains_unknown_after_owner_process_crash(self):
+        libc = ctypes.CDLL(None, use_errno=True)
+        previous = ctypes.c_int()
+        self.assertEqual(0, libc.prctl(37, ctypes.byref(previous), 0, 0, 0))
+        self.assertEqual(0, libc.prctl(36, 1, 0, 0, 0))
+        parent = None
+        descriptor = None
+        child = None
+        try:
+            parent = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-B",
+                str(ROOT / "tests/v1/pico_probe_crash.py"),
+                str(self.service.root),
+                WORKER,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            child = int(await asyncio.wait_for(parent.stdout.readline(), 5))
+            descriptor = os.pidfd_open(child)
+            lock_path = self.service.root / "supervisor.lock"
+            original = lock_path.read_bytes()
+            self.assertEqual({"nonce"}, set(json.loads(original)["process_identity"]))
+            parent.kill()
+            await asyncio.wait_for(parent.wait(), 5)
+            with self.assertRaisesRegex(SimulationConflict, "Startup process group is unresolved"):
+                await self.service.start()
+            self.assertEqual(original, lock_path.read_bytes())
+            self.assertTrue(Path(f"/proc/{child}").exists())
+            self.assertIsNone(self.service.runtime_identity)
+        finally:
+            if parent is not None and parent.returncode is None:
+                parent.kill()
+                await parent.wait()
+            if descriptor is not None:
+                with suppress(ProcessLookupError):
+                    signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+                os.close(descriptor)
+                await asyncio.to_thread(os.waitpid, child, 0)
+            # Fixture cleanup uses the actual captured child pidfd and reap proof.
+            # Production deliberately cannot resolve a lost PID from a nonce alone.
+            if self.service._lock is not None:
+                self.service._probe_identity = None
+                self.service._write_probe_identity()
+                await self.service.close()
+            self.assertEqual(0, libc.prctl(36, previous.value, 0, 0, 0))
+
+    async def exercise_verifier_group_cancellation(self, *, marked):
+        from unittest.mock import patch
+
+        await self.start_service()
+        row = await self.service.create(
+            "app:tenant:operator",
+            "verifier-group",
+            self.run_id,
+            self.request,
+            self.members,
+            self.read_member,
+        )
+        sid = row["session_id"]
+        await self.wait_ready(sid)
+        await self.service.stop(sid)
+        original_recording = self.store.get(sid)["recording_artifact"]
+        async with self.exited_leader_group(marked=marked, register=False, exit_leader=False) as (_, current, child):
+
+            async def existing_group(*_args, **_kwargs):
+                return current.process
+
+            with (
+                patch(
+                    "description_pipeline.simulation.recording.secrets.token_hex",
+                    return_value=current.identity["nonce"],
+                ),
+                patch("description_pipeline.simulation.recording.asyncio.create_subprocess_exec", existing_group),
+            ):
+                checking = asyncio.create_task(self.service.verify_recording(sid, self.members, self.read_member))
+                async with asyncio.timeout(5):
+                    while (
+                        not (attempts := self.store.verification_attempts(sid))
+                        or attempts[-1]["result"]["state"] != "running"
+                    ):
+                        if checking.done():
+                            checking.result()
+                        await asyncio.sleep(0.02)
+                checking.cancel()
+                with self.assertRaises(asyncio.CancelledError if marked else VerificationUnresolved):
+                    await checking
+            attempt = self.store.verification_attempts(sid)[-1]
+            self.assertEqual(current.identity, attempt["result"]["process_identity"])
+            self.assertEqual("cancelled" if marked else "unknown", attempt["result"]["state"])
+            self.assertEqual(original_recording, self.store.get(sid)["recording_artifact"])
+            partial = self.service.root / attempt["request"]["partial"]
+            if marked:
+                self.assertFalse(partial.exists())
+                self.assertFalse(Path(f"/proc/{child}").exists())
+                return
+            original_source = (partial / "source/mjcf/robot.xml").read_bytes()
+            self.assertTrue(Path(f"/proc/{child}").exists())
+            with self.assertRaisesRegex(SimulationConflict, "capacity"):
+                self.store.begin_verification(sid, "second-check", attempt["request"], self.service.owner)
+            await self.service.close()
+            await self.start_service()
+            restarted = self.store.verification_attempts(sid)[-1]
+            self.assertEqual(attempt["result"]["process_identity"], restarted["result"]["process_identity"])
+            self.assertEqual("unknown", restarted["result"]["state"])
+            self.assertEqual(original_source, (partial / "source/mjcf/robot.xml").read_bytes())
+        verified = await self.service.verify_recording(sid, self.members, self.read_member)
+        self.assertTrue(verified["recording_complete"])
+        attempts = self.store.verification_attempts(sid)
+        self.assertEqual(["failed", "completed"], [item["result"]["state"] for item in attempts])
+        self.assertFalse(partial.exists())
+        self.assertEqual(original_recording, self.store.get(sid)["recording_artifact"])
+
+    async def test_owned_verifier_descendant_is_reaped_on_cancellation(self):
+        await self.exercise_verifier_group_cancellation(marked=True)
+
+    async def test_unknown_verifier_retains_pg_slot_partial_and_identity_across_restart(self):
+        await self.exercise_verifier_group_cancellation(marked=False)
+
     async def wait_ready(self, sid):
         async with asyncio.timeout(20):
             while (row := await asyncio.to_thread(self.store.get, sid))["state"] == "starting":
@@ -650,18 +1069,30 @@ sys.stdin.buffer.read(1)
     async def test_cancelled_verifier_reaps_its_real_process(self):
         from unittest.mock import patch
 
+        await self.start_service()
+        row = await self.service.create(
+            "app:tenant:operator",
+            "verifier-cancel",
+            self.run_id,
+            self.request,
+            self.members,
+            self.read_member,
+        )
+        sid = row["session_id"]
+        await self.wait_ready(sid)
+        await self.service.stop(sid)
         actual_spawn = asyncio.create_subprocess_exec
         spawned = asyncio.Event()
         child = None
 
-        async def fixture_spawn(*_args, **options):
+        async def fixture_spawn(*args, **options):
             nonlocal child
-            child = await actual_spawn(sys.executable, "-I", "-c", "import time;time.sleep(30)", **options)
+            child = await actual_spawn(sys.executable, "-I", "-c", "import time;time.sleep(30)", args[-1], **options)
             spawned.set()
             return child
 
         with patch("description_pipeline.simulation.recording.asyncio.create_subprocess_exec", fixture_spawn):
-            task = asyncio.create_task(run_verification({}, self.artifacts.root, self.root / "model"))
+            task = asyncio.create_task(self.service.verify_recording(sid, self.members, self.read_member))
             await asyncio.wait_for(spawned.wait(), 2)
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):
@@ -669,6 +1100,62 @@ sys.stdin.buffer.read(1)
         self.assertIsNotNone(child.returncode)
         with self.assertRaises(ProcessLookupError):
             os.kill(child.pid, 0)
+        attempt = self.store.verification_attempts(sid)[-1]
+        self.assertEqual("cancelled", attempt["result"]["state"])
+        self.assertEqual("dead", resource_state(attempt["result"]["process_identity"]))
+        self.assertFalse((self.service.root / attempt["request"]["partial"]).exists())
+
+    async def test_close_during_verifier_spawn_waits_for_handle_and_settles_attempt(self):
+        from unittest.mock import patch
+
+        await self.start_service()
+        row = await self.service.create(
+            "app:tenant:operator",
+            "close-verifier-spawn",
+            self.run_id,
+            self.request,
+            self.members,
+            self.read_member,
+        )
+        sid = row["session_id"]
+        await self.wait_ready(sid)
+        await self.service.stop(sid)
+        entered, release = asyncio.Event(), asyncio.Event()
+        actual_spawn = asyncio.create_subprocess_exec
+        spawned = []
+
+        async def delayed_spawn(*args, **options):
+            process = await actual_spawn(
+                sys.executable,
+                "-I",
+                "-c",
+                "import time;time.sleep(60)",
+                args[-1],
+                **options,
+            )
+            spawned.append((process, process_identity(process.pid, args[-1])))
+            entered.set()
+            await release.wait()
+            return process
+
+        with patch("description_pipeline.simulation.recording.asyncio.create_subprocess_exec", delayed_spawn):
+            checking = asyncio.create_task(self.service.verify_recording(sid, self.members, self.read_member))
+            try:
+                await asyncio.wait_for(entered.wait(), 5)
+                closing = asyncio.create_task(self.service.close())
+                await asyncio.sleep(0)
+                self.assertFalse(closing.done())
+                self.assertIsNotNone(self.service._database_lock)
+                self.assertEqual("alive", resource_state(spawned[0][1]))
+            finally:
+                release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await checking
+            await asyncio.wait_for(closing, 10)
+        self.assertEqual("dead", resource_state(spawned[0][1]))
+        self.assertEqual("cancelled", self.store.verification_attempts(sid)[-1]["result"]["state"])
+        self.assertIsNone(self.service._database_lock)
+        self.assertIsNone(self.service._lock)
 
     async def test_real_pico_link_preserves_transitions_and_rejects_gaps(self):
         result = await asyncio.to_thread(
@@ -1009,6 +1496,11 @@ sys.stdin.buffer.read(1)
                 response = await client.post(f"/api/simulations/{sid}/recording/verify", headers=headers)
                 self.assertEqual(200, response.status_code, response.text)
                 self.assertEqual(sid, response.json()["binding"]["session_id"])
+                verified = response.json()
+                inspected = await client.get(f"/api/simulations/{sid}")
+                self.assertEqual("completed", inspected.json()["verification"]["state"])
+                self.assertEqual(verified, inspected.json()["verification"]["value"])
+                self.assertNotIn("owner_nonce", inspected.json()["verification"])
                 response = await client.get(f"/api/simulations/{sid}/recording")
                 self.assertEqual(200, response.status_code, response.text[:100] if response.status_code != 200 else "")
                 self.assertTrue(response.content.startswith(b"PK"))
