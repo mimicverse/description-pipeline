@@ -71,11 +71,15 @@ worker 必需的临时控制证据遵守同一私有目录和容量限制。未�
 
 录制保留原始输入、命令/事件、实际时间、控制状态与 canonical RunRecord；来源、请求、会话、runtime、完整性和 ArtifactRef 共同绑定。封存后的原件不因版本更新而改写。source root 可重定位，原始来源字节和事件身份不可改写。
 
-复验先从数据库和 CAS 核验登记事实，再使用固定 PICO 环境执行公共事件回放与独立 MuJoCo FK，检查状态、关节范围/速率、固定关节、显示变换和实际 TCP。与运行态分开的受管进程不继承 CAD、Git 或数据库秘密。API 和 CLI 复用同一验证核心，保留原录制的引擎和包身份；不把当前 runtime 替换到旧证据中。
+封存前在原会话目录核验原进程组已退出、完整目录容量和原生 manifest 自身字节，并将绑定该 manifest 的核验结果保存在外置 outcome。离线复验只消费封存的 proof、manifest、CAS 清单和明确的 source root，不重新访问历史绝对目录，也不修改原 manifest。缺少有效封存证明时无法建立封存资格，不补写或推断为成功。
+
+复验先从数据库和 CAS 核验登记事实，再使用固定 PICO 环境执行公共事件回放与独立 MuJoCo FK，检查状态、关节范围/速率、固定关节、显示变换和实际 TCP。与运行态分开的受管进程不继承 CAD、Git 或数据库秘密。API 和 CLI 共用受管验证能力，登记同一类执行事实、占用同一容量并按实际进程清场；保留原录制的引擎和包身份，不把当前 runtime 替换到旧证据中。下载直接流式读取经核验的 CAS；断开或取消后，先等待实际读取结束再关闭，不额外复制录制或创建临时 ZIP。
+
+独立 CLI 使用已安装平台的 Python 和本次安装生成的环境，其中 `PLATFORM_SERVICE_DSN` 提供受管验证所需的服务身份。原生 Python 路径与工作目录从正式生成的 `portal.json` 读取；只读运维身份不承担执行事实写入，不另传 `--python` 或手写第二份配置。
 
 ```sh
 python -m description_pipeline.simulation.verify_recording \
-  --session <registered-session-id> --python /absolute/path/pico-runtime/bin/python
+  --session <registered-session-id> --config /absolute/path/rendered/portal.json
 ```
 
 运动学一致性、完整事件回放、真实设备输入、持续性能与硬件资格分别验收。软件夹具或原始帧重放不能替代真人 PICO；凸代理接触不能等同于真实曲面干涉。真实模型、设备和性能证据按同发行验收要求给出，不能用绿色 CI 或预览成功代替。
