@@ -171,7 +171,9 @@ def evidence_command(python: Path, nonce: str, execution: dict) -> list[str]:
 
 
 def runtime_command(python: Path, nonce: str, execution: dict) -> list[str]:
-    return _helper_command(python, nonce, Path(__file__).with_name("runtime.py"), execution["runtime_helper_sha256"], "runtime")
+    return _helper_command(
+        python, nonce, Path(__file__).with_name("runtime.py"), execution["runtime_helper_sha256"], "runtime"
+    )
 
 
 async def run_verification(payload: dict, python: Path, *, register_process) -> dict:

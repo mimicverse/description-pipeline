@@ -8,6 +8,7 @@ from importlib import metadata
 import json
 from pathlib import Path, PurePosixPath
 import re
+import sys
 
 RUNTIME_IDENTITY_SCHEMA = "solidworks-to-urdf.teleop-runtime-identity/v1"
 RUNTIME_CONTRACT_SCHEMA = "solidworks-to-urdf.teleop-runtime/v1"

@@ -115,7 +115,7 @@ class TeleopRuntimeTests(unittest.TestCase):
             capture_output=True,
             timeout=30,
         )
-        self.assertEqual(0, checked.returncode, checked.stderr)
+        self.assertEqual(0, checked.returncode, checked.stdout + checked.stderr)
         identity = json.loads(checked.stdout)
         raw = {**identity, "teleop_files": contract["files"]}
         self.assertEqual(identity, validate_runtime_identity(raw, contract))
