@@ -14,7 +14,7 @@
       "teleop/backends/mujoco/upper_body_worker.py": "458169662d6cdff9ac66e2aeee85a7de7938d9349c0e35c068649c447834fe40",
       "teleop/core/__init__.py": "915fac7f90bd75b49f4d5fd23b92447fbd30834138177588da294fdb22b01930",
       "teleop/core/_bounded_step_cy.c": "64addbf95e8b5e1653109cbac0e5d5b71a2d76eda876923a441b055f5395e86c",
-      "teleop/core/_bounded_step_cy.cpython-312-x86_64-linux-gnu.so": "6445ba4a911b5044175acf7a16ffb95d181100a3299adc81e44a2303ab5f0f11",
+      "teleop/core/_bounded_step_cy.cpython-312-x86_64-linux-gnu.so": "1d817f928c31c6659855963a4828cdb30a91d1cc0b1a35f6781eb0471d02a7f4",
       "teleop/core/calibration.py": "1210b1ee5757ba6e316cb314f44ef85a371375c905045f934d57ac3c92fb8525",
       "teleop/core/constrained_step.py": "7b435797b1f8021c00ded5de81e041db9ca7e99268dfb008aa8cf9838912d0b8",
       "teleop/core/control_clock.py": "f693b31531737a38b8879fd86c5178b7d19ce839fd6c9188886c2bc4c0bcee31",
@@ -135,10 +135,10 @@
       "teleop/robots/profiles/m3.0.3.json": "7ff0fd2ededdaf2c4945d20560169dc09e0b9fde75e3723928ac3abcf915347f",
       "teleop/robots/profiles/m3.0.json": "1664c8bfbdd1899450781543799355e0c38087affb0aba52579ddb94b9fecf2f"
     },
-    "source_commit": "9bd779d0f5d0e7f620de173379d85a49c567ee4e",
+    "source_commit": "b4793e63b160fb7b42975ea6b53270cfa55aebcd",
     "source_tree": "b4014fdf1ac9b61d000bb69290d414298f7a6f84",
     "wheel_filename": "robot_teleop-0.3.0-cp312-cp312-linux_x86_64.whl",
-    "wheel_sha256": "a3a97085e9bfb3a4386ac1eb0d08cadf59d551b3065a5f173576265e587f8dcc"
+    "wheel_sha256": "92eb6f6e8e9208c4c7913993331d67ab4bbafab35a6634d7e6252b1ca0a25464"
   },
   "consumers": {
     "assessment": {
