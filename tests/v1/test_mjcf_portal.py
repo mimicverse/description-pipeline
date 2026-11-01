@@ -30,6 +30,7 @@ from description_pipeline.platform.queries import read_run_projection
 from tests.v1 import test_real_six_stage_chain as chain_tests
 from description_pipeline.pipeline.contracts import DispatchConf
 from description_pipeline.schemas import AIRFLOW_DISPATCH_CONF_SCHEMA
+from description_pipeline.stages import STAGE_IDS
 
 
 class DevelopmentAirflow:
@@ -122,6 +123,10 @@ class MJCFPortalTests(unittest.TestCase):
             unsettled = projection(source_id)
             self.assertEqual("unresolved", unsettled["state"])
             self.assertEqual(unsettled["state"], chain.facts.get_admitted_run(source_id).state)
+            unsettled_options = application.stage_rerun_options(source_id, request.principal)
+            self.assertEqual(list(STAGE_IDS), [row["stage"] for row in unsettled_options])
+            self.assertTrue(all(row["eligible"] for row in unsettled_options), unsettled_options)
+            self.assertTrue(all(row["execution_authorized"] is False for row in unsettled_options))
             application.dispatch(admitted.dispatch_command.command_id, AirflowDispatchAdapter(airflow, "dev-only"))
             airflow = DevelopmentAirflow(application, request.principal)
             portal = PortalApp(
@@ -135,11 +140,7 @@ class MJCFPortalTests(unittest.TestCase):
                     session_cookie="mjcf_development_session",
                 )
             )
-            self.assertFalse(
-                portal._mjcf_successor_row({**unsettled, "stages": {row["stage"]: row for row in unsettled["stages"]}})[
-                    "eligible"
-                ]
-            )
+            self.assertEqual(unsettled_options, portal._stage_rerun_rows(source_id, request.principal))
             session = portal.sessions.create("Development operator", "development-only", principal=request.principal)
 
             def call(method, path, body=None, key="portal-boundary"):
@@ -184,6 +185,7 @@ class MJCFPortalTests(unittest.TestCase):
             self.assertTrue(encoding_warnings)
             self.assertTrue(all(warning in chain.pull_requests.rows[0].body for warning in encoding_warnings))
             original = projection(source_id)
+            original_admission = chain.facts.load_admission(source_id)
             source_decisions = [row["decision"] for row in original["stages"]]
             rerun_body = {"from_stage": "mjcf", "through_stage": "publish", "simulation": "{}\n"}
             status, body = call("POST", f"/api/runs/{dag_id}/attempts", rerun_body)
@@ -262,9 +264,17 @@ class MJCFPortalTests(unittest.TestCase):
             status, body = call("GET", f"/api/runs/{successor_dag}")
             self.assertEqual(200, status, body)
             view = json.loads(body)
-            self.assertFalse(view["stage_reruns"][0]["eligible"])
-            self.assertFalse(portal._mjcf_successor_row(expanded, principal="cli:tenant:other")["eligible"])
-            self.assertEqual(["freeze", "mjcf"], [row["stage"] for row in view["stage_reruns"]])
+            options = view["stage_reruns"]
+            self.assertEqual(list(STAGE_IDS), [row["stage"] for row in options])
+            self.assertEqual(application.stage_rerun_options(successor_id, request.principal), options)
+            self.assertTrue(all(row["eligible"] for row in options), options)
+            self.assertTrue(all(row["execution_authorized"] is False for row in options))
+            other_options = portal._stage_rerun_rows(successor_id, principal="cli:tenant:other")
+            self.assertEqual(list(STAGE_IDS), [row["stage"] for row in other_options])
+            self.assertTrue(all(row["eligible"] is False for row in other_options), other_options)
+            self.assertTrue(all(row["reason"] == "application.source_owner_mismatch" for row in other_options))
+            self.assertEqual(original_admission, chain.facts.load_admission(source_id))
+            self.assertEqual(source_decisions, [row["decision"] for row in projection(source_id)["stages"]])
             self.assertEqual("passed", view["report"]["overall"]["state"])
             self.assertEqual(2, view["report"]["overall"]["stages_completed"])
             self.assertEqual(2, view["report"]["overall"]["stages_total"])
