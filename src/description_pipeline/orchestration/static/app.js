@@ -1612,7 +1612,6 @@ function updatePreviewLayout() {
   const workspace = document.querySelector(".run-workspace");
   if (!workspace) return;
   const has = Boolean(state.previewSubject);
-  workspace.classList.toggle("has-preview", has);
   workspace.classList.toggle("no-preview", !has);
 }
 
