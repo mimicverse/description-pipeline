@@ -952,7 +952,7 @@ def _joint(node, authored, canonical, datums, body_datums, diagnostics, *, previ
         if missing_drive else None
     )
     _require(
-        (canonical.get("provenance") or {}).get("drive_defaults") == expected_defaults,
+        digest((canonical.get("provenance") or {}).get("drive_defaults")) == digest(expected_defaults),
         "Missing drive defaults have absent or inconsistent provenance",
     )
     _require(all(math.isfinite(value) for value in limits.values()), "Invalid joint limits")
@@ -992,6 +992,10 @@ def _joint(node, authored, canonical, datums, body_datums, diagnostics, *, previ
             limits.get("lower") == -PREVIEW_WINDOW_RAD and limits.get("upper") == PREVIEW_WINDOW_RAD,
             "The inspection-preview window does not equal the frozen full-turn radius",
         )
+        _require(
+            digest(provenance.get("preview_policy")) == digest(policy),
+            "The inspection-preview window provenance differs from the independent source policy",
+        )
     elif limit_source == "default_policy":
         policy = authored.get("default_policy")
         _require(
@@ -1019,7 +1023,7 @@ def _joint(node, authored, canonical, datums, body_datums, diagnostics, *, previ
             "The engineering default window does not equal the frozen full-turn radius",
         )
         _require(
-            provenance.get("default_policy") == policy,
+            digest(provenance.get("default_policy")) == digest(policy),
             "The engineering default window provenance differs from the independent source policy",
         )
 
@@ -1028,7 +1032,7 @@ def _joint(node, authored, canonical, datums, body_datums, diagnostics, *, previ
         model_evidence = provenance.get(model_key)
         _require(
             isinstance(source_evidence, dict)
-            and source_evidence == model_evidence
+            and digest(source_evidence) == digest(model_evidence)
             and source_evidence.get("kind") in {"controlled_record", "native_declaration"}
             and re.fullmatch(r"[0-9a-f]{64}", str(source_evidence.get("sha256") or "")) is not None
             and all(
@@ -2968,7 +2972,7 @@ def _value_warning_gate(
         if joint.get("limit_source") == "declared_author":
             if joint.get("type") != "continuous":
                 _require(
-                    model_provenance.get("limits_evidence") == limit_evidence,
+                    digest(model_provenance.get("limits_evidence")) == digest(limit_evidence),
                     "Model limits evidence is missing, foreign, or differs from the controlled record",
                 )
                 observe_evidence(limit_evidence, ("lower", "upper"), selected=True)
@@ -2995,7 +2999,7 @@ def _value_warning_gate(
                 )
         elif limit_evidence:
             _require(
-                model_provenance.get("limits_evidence") == limit_evidence,
+                digest(model_provenance.get("limits_evidence")) == digest(limit_evidence),
                 "Model native-selected limits evidence is missing, foreign, or forged",
             )
             observe_evidence(limit_evidence, ("lower", "upper"), selected=False)
@@ -3005,7 +3009,7 @@ def _value_warning_gate(
         )
         if drive_evidence:
             _require(
-                model_provenance.get("drive_evidence") == drive_evidence,
+                digest(model_provenance.get("drive_evidence")) == digest(drive_evidence),
                 "Model drive evidence is missing, foreign, or differs from the controlled record",
             )
         for field in ("effort", "velocity"):

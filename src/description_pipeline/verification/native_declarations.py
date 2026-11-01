@@ -16,6 +16,7 @@ import re
 import numpy as np
 
 from ..interface_records import PURPOSE_ENGINEERING, PURPOSE_INSPECTION_PREVIEW
+from ..io import digest
 from ..sources.solidworks.session_artifacts import (
     SESSION_DOCUMENT_API,
     session_materialization_under_root,
@@ -1391,11 +1392,14 @@ def verify_declarations(raw: dict, source: dict | None = None, *, purpose: str |
                         "generated joint limit source differs from native evidence",
                         joint=name,
                     )
-                    if expected_source == "default_policy":
+                    if expected_source in {"default_policy", "preview_policy"}:
+                        policies = state[
+                            "default_policies" if expected_source == "default_policy" else "preview_policies"
+                        ]
                         _require(
-                            observed.get("default_policy") == state["default_policies"].get(name),
+                            digest(observed.get(expected_source)) == digest(policies.get(name)),
                             "v14.claims",
-                            "generated joint default policy differs from native evidence",
+                            "generated joint rotation policy differs from native evidence",
                             joint=name,
                         )
         return {"bodies": len(bodies), "joints": len(joints)}

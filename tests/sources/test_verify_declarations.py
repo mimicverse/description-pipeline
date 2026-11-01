@@ -1149,6 +1149,13 @@ class NativeDeclarationsTests(unittest.TestCase):
         report = verify_declarations(raw, purpose=PURPOSE_INSPECTION_PREVIEW)
         self.assertTrue(report["passed"], report["errors"])
         self.assertEqual(report["carrier"]["joints"][0]["limit_source"], "preview_policy")
+        preview_source = copy.deepcopy(report["carrier"])
+        preview_baseline = verify_declarations(raw, preview_source, purpose=PURPOSE_INSPECTION_PREVIEW)
+        self.assertTrue(preview_baseline["passed"], preview_baseline["errors"])
+        preview_source["joints"][0]["preview_policy"]["hardware_qualified"] = 0
+        preview_forged = verify_declarations(raw, preview_source, purpose=PURPOSE_INSPECTION_PREVIEW)
+        self.assertFalse(preview_forged["passed"])
+        self.assertIn("v14.claims", {item["code"] for item in preview_forged["errors"]})
 
         engineering = verify_declarations(raw, purpose=PURPOSE_ENGINEERING)
         self.assertTrue(engineering["passed"], engineering["errors"])
@@ -1162,6 +1169,14 @@ class NativeDeclarationsTests(unittest.TestCase):
         self.assertIs(joint["default_policy"]["engineering_position_range_qualified"], False)
         self.assertEqual(joint["default_policy"]["native_observation_errors"], [])
         self.assertIn("v14.default_policy", {item["code"] for item in engineering["diagnostics"]})
+
+        source = copy.deepcopy(engineering["carrier"])
+        baseline = verify_declarations(raw, source, purpose=PURPOSE_ENGINEERING)
+        self.assertTrue(baseline["passed"], baseline["errors"])
+        source["joints"][0]["default_policy"]["author_limits"]["lower"] = False
+        forged = verify_declarations(raw, source, purpose=PURPOSE_ENGINEERING)
+        self.assertFalse(forged["passed"])
+        self.assertIn("v14.claims", {item["code"] for item in forged["errors"]})
 
         native = copy.deepcopy(raw)
         native["mates"] = [
