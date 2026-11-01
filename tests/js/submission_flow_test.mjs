@@ -22,7 +22,7 @@ const response = (status, payload, raw = false) => ({
 });
 function element(id = "") {
   const node = {
-    id, hidden: false, disabled: false, value: "", textContent: "", children: [], handlers: {}, style: {}, dataset: {},
+    id, dataset: {}, hidden: false, disabled: false, value: "", textContent: "", children: [], handlers: {}, style: {},
     classList: { toggle() {}, add() {}, remove() {} },
     addEventListener(name, handler) { this.handlers[name] = handler; },
     append(...children) { this.children.push(...children); },
@@ -74,7 +74,7 @@ function page() {
     shouldRefreshRunList: () => false,
     fetch: async () => response(200, { runs: [] }),
   });
-  vm.runInContext(`${source}\nglobalThis.app = {state, wire, api, poll, selectRun, showUploadView, clearSession, stopRunRead, refreshRuns, loadMoreRuns, submitRun, retryRun, rerunFromStage, renderRerunPanel, buildRunItem, renderRun, folderPick, changeSubmission, loadTargets};`, context);
+  vm.runInContext(`${source}\nglobalThis.app = {state, wire, api, poll, selectRun, showUploadView, clearSession, stopRunRead, refreshRuns, loadMoreRuns, submitRun, retryRun, rerunFromStage, renderRerunPanel, buildRunItem, renderRun, folderPick, changeSubmission, loadTargets, renderPreviewDiagnostic};`, context);
   context.clearPreview = () => {};
   context.renderRun = (run) => { context.displayed = run; };
   context.loadPreview = async () => {};
@@ -500,3 +500,123 @@ for (const automaticState of ["waiting", "unresolved"]) {
   assert.equal(p.timeouts.size, 1);
 }
 console.log("unfinished preview and activity polling OK");
+
+// Polling keeps the selected stage and its expanded DOM stable, but updates changed evidence.
+{
+  const p = page();
+  const stage = { id: "freeze", name: "Freeze", state: "running", state_label: "Running", counts: {} };
+  const run = { dag_run_id: "stable-dom", state: "running", automatic: { state: "pending" }, report: { stages: [stage] }, findings: [{id: "source.warning", severity: "warning", message: "Source warning"}] };
+  p.app.state.dagRunId = run.dag_run_id; p.app.state.lastRun = run;
+  p.app.renderRun(run);
+  const button = p.$("stages").children[0];
+  const detail = p.$("stage-detail").children[0];
+  const finding = p.$("findings").children[0];
+  finding.children[0].open = true;
+  p.$("stage-panel").open = false;
+  p.app.renderRun(run);
+  assert.equal(p.$("stages").children[0], button, "An unchanged poll must retain the focused stage button");
+  assert.equal(p.$("stage-detail").children[0], detail, "An unchanged poll must retain expanded evidence DOM");
+  assert.equal(p.$("stage-panel").open, false, "Polling must respect a collapsed inspector");
+  assert.equal(p.$("findings").children[0], finding, "Polling must retain opened finding evidence");
+  assert.equal(finding.children[0].open, true);
+  run.findings[0].message = "Changed source warning"; p.app.renderRun(run);
+  assert.notEqual(p.$("findings").children[0], finding, "Changed findings must replace stale evidence");
+  stage.state = "unresolved"; p.app.renderRun(run);
+  const unresolved = p.$("stage-detail").children[0];
+  run.automatic.state = "waiting"; p.app.renderRun(run);
+  assert.notEqual(p.$("stage-detail").children[0], unresolved, "A qualification display change must invalidate rendered details");
+}
+// Polling must preserve a Freeze assembly selection, but permission changes replace the controls.
+{
+  const p = page();
+  const run = {dag_run_id: "freeze-selection", state: "success", main_assembly: "a.SLDASM", can_manage: true,
+    stage_reruns: [{stage: "freeze", eligible: true, main_assembly_options: ["a.SLDASM", "b.SLDASM"]}],
+    report: {stages: [{id: "freeze", name: "Freeze", state: "completed", counts: {}}]}};
+  p.app.state.dagRunId = run.dag_run_id; p.app.state.lastRun = run;
+  p.app.renderRun(run); const form = p.$("stage-rerun").children[0];
+  p.app.state.rerunMainByRun[run.dag_run_id] = "b.SLDASM";
+  p.app.renderRun(run); assert.equal(p.$("stage-rerun").children[0], form);
+  run.can_manage = false; p.app.renderRun(run);
+  assert.notEqual(p.$("stage-rerun").children[0], form);
+}
+// MJCF policy input survives polling while request identity and eligibility still refresh.
+{
+  const p = page();
+  const run = {dag_run_id: "mjcf-policy", state: "success", can_manage: true,
+    stage_reruns: [{stage: "mjcf", eligible: true, simulation: "{}"}],
+    report: {stages: [{id: "mjcf", name: "MJCF", state: "completed", counts: {}}]}};
+  p.app.state.dagRunId = run.dag_run_id; p.app.state.lastRun = run;
+  p.app.renderRun(run);
+  const policy = p.$("stage-rerun").children[2].children[1].children[0];
+  policy.value = '{"gravity":[0,0,0]}'; policy.oninput();
+  p.app.renderRun(run);
+  assert.equal(p.$("stage-rerun").children[2].children[1].children[0], policy);
+  assert.equal(policy.value, '{"gravity":[0,0,0]}');
+  p.app.state.rerunKeyByRun[`${run.dag_run_id}:mjcf`] = "unconfirmed-key";
+  p.app.renderRun(run);
+  assert.equal(p.$("stage-rerun").children[0].textContent, "Retry same MJCF request");
+  run.can_manage = false; p.app.renderRun(run);
+  assert.equal(p.$("stage-rerun").children[0].disabled, true);
+}
+// The Generate stage reports the URDF delivery subject independently of the selected preview format.
+{
+  const p = page();
+  const run = {dag_run_id: "subject-domains", state: "success", report: {measured: {subject_sha256: "registered-urdf-subject"},
+    stages: [{id: "generate", name: "Generate", state: "completed", counts: {}}]}};
+  p.app.state.dagRunId = run.dag_run_id; p.app.state.lastRun = run;
+  p.app.state.previewSubject = "selected-mjcf-subject"; p.app.renderRun(run);
+  const text = (node) => node.textContent + node.children.filter(x => typeof x === "object").map(text).join(" ");
+  assert.match(text(p.$("stage-detail")), /registered-urdf-subject/);
+  assert.doesNotMatch(text(p.$("stage-detail")), /selected-mjcf-subject/);
+}
+// Registering a certificate must refresh its stage link without any stage or subject change.
+{
+  const p = page();
+  const run = {dag_run_id: "certificate-refresh", state: "failed", automatic: {state: "failed"}, verification_reports: [],
+    report: {stages: [{id: "verify", name: "Verify", state: "failed", counts: {warnings: 1},
+      warnings: [{code: "source.warning", message: "Recorded warning", records_total: 1, objects: []}]}]}};
+  p.app.state.dagRunId = run.dag_run_id; p.app.state.lastRun = run;
+  const hasCertificate = (node) => node.textContent === "Open complete verification certificate" ||
+    node.children.some((child) => child && typeof child === "object" && hasCertificate(child));
+  p.app.renderRun(run); assert.equal(hasCertificate(p.$("stage-detail")), false);
+  run.verification_reports = [{path: "verification-certificate.json", url: "/api/runs/certificate-refresh/artifacts/verification-certificate.json"}];
+  p.app.renderRun(run); assert.equal(hasCertificate(p.$("stage-detail")), true);
+}
+// Warning disclosure survives identical subjects, while a changed qualification always refreshes.
+{
+  const p = page(); p.app.state.dagRunId = "diagnostic-dom";
+  const preview = {verified: true, subject_sha256: "same-subject", warnings: [{code: "source.warning", message: "Recorded warning"}], warnings_total: 1};
+  p.app.renderPreviewDiagnostic(preview);
+  const warning = p.$("preview-diagnostic").children[0]; warning.open = true;
+  p.app.renderPreviewDiagnostic(preview);
+  assert.equal(p.$("preview-diagnostic").children[0], warning);
+  assert.equal(warning.open, true);
+  preview.verified = false; preview.reason = "run_unresolved";
+  p.app.renderPreviewDiagnostic(preview);
+  assert.notEqual(p.$("preview-diagnostic").children[0], warning);
+  assert.match(p.$("preview-diagnostic").children[0].textContent, /unresolved external effects/);
+}
+// Diagnostic qualification follows the selected format even when resource subjects do not change.
+{
+  const p = page(); p.app.state.dagRunId = "selected-qualification";
+  const preview = {verified: true, subject_sha256: "same-urdf", mjcf: {verified: false, subject_sha256: "same-mjcf"}};
+  p.app.state.previewFormat = "urdf"; p.app.renderPreviewDiagnostic(preview);
+  assert.equal(p.$("preview-diagnostic").hidden, true);
+  p.app.state.previewFormat = "mjcf"; p.app.renderPreviewDiagnostic(preview);
+  assert.match(p.$("preview-diagnostic").children[0].textContent, /MJCF preview is diagnostic only/);
+  preview.mjcf.verified = true; p.app.renderPreviewDiagnostic(preview);
+  assert.equal(p.$("preview-diagnostic").hidden, true);
+}
+// Retrying target discovery retains the selected folder and never submits another upload.
+{
+  const p = page(); uploadReady(p); const pick = p.app.state.folderPick;
+  let calls = 0;
+  p.context.fetch = async () => ++calls === 1 ? response(503, {error: "Target lookup unavailable"}) : response(200, {targets: [{hardware_id: "target-a", repository_slug: "example/description", base: "main"}]});
+  await p.app.loadTargets(pick);
+  assert.equal(p.$("targets-retry").hidden, false);
+  await p.$("targets-retry").handlers.click();
+  assert.equal(p.app.state.folderPick, pick);
+  assert.equal(p.$("targets-retry").hidden, true);
+  assert.equal(p.requests.length, 0, "A target GET retry must not create a submission");
+}
+console.log("single-page inspector and target retry OK");

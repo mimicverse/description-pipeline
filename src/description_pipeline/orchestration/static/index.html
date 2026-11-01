@@ -3,226 +3,118 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>SolidWorks2URDF Delivery Portal</title>
+  <title>Robot delivery</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
   <header class="topbar">
-    <div class="brand">
-      <span class="brand-mark" aria-hidden="true"></span>
-      <h1>SolidWorks2URDF Delivery Portal</h1>
-    </div>
-    <div id="account" class="account" hidden>
-      <span id="account-user"></span>
-      <button id="logout" type="button" class="ghost">Sign out</button>
-    </div>
+    <div class="brand"><span class="brand-mark" aria-hidden="true"></span><h1>Robot delivery</h1></div>
+    <div id="account" class="account" hidden><span id="account-user"></span><button id="logout" type="button" class="ghost">Sign out</button></div>
   </header>
-
   <main>
     <section id="login-card" class="login-shell">
       <div class="card narrow">
         <h2>Sign in</h2>
-        <p class="muted">Sign in with your enterprise Feishu account.</p>
+        <p class="muted">Use your enterprise account to create and review deliveries.</p>
         <a id="feishu-login" class="button" href="/auth/feishu/login">Sign in with Feishu</a>
         <p id="login-error" class="error" role="alert" hidden></p>
       </div>
     </section>
-
     <section id="workspace" class="workspace" hidden>
-      <aside class="sidebar" aria-label="Runs">
-        <button type="button" id="new-run-button" class="button primary sidebar-action">+ New delivery</button>
-        <div class="runs-views" role="group" aria-label="Run views">
-          <button type="button" id="runs-view-active" class="runs-view active" aria-pressed="true">Recent runs</button>
-          <button type="button" id="runs-view-deleted" class="runs-view" aria-pressed="false">Deleted</button>
+      <aside class="sidebar" aria-label="Deliveries">
+        <button type="button" id="new-run-button" class="button primary sidebar-action">New delivery</button>
+        <div class="runs-views" role="group" aria-label="Delivery history">
+          <button type="button" id="runs-view-active" class="runs-view active" aria-pressed="true">Recent</button>
+          <button type="button" id="runs-view-deleted" class="runs-view" aria-pressed="false">Hidden</button>
         </div>
-        <ul id="runs" class="runs"><li class="muted">No runs</li></ul>
+        <ul id="runs" class="runs"><li class="muted">No deliveries yet</li></ul>
         <p id="runs-error" class="error small" role="alert" hidden></p>
-        <details class="runs-help">
-          <summary>About run history</summary>
-          <p class="muted small">
-            The title defaults to the main assembly name. Renaming affects only
-            the list display; leave it empty to restore the default. Delete moves a
-            run to the Deleted view and it can be restored at any time; models,
-            evidence, and PRs remain. Earlier integration runs remain in the list.
-          </p>
-        </details>
+        <p class="history-note muted small">Hidden deliveries keep their files and PRs.</p>
       </aside>
-
       <div class="content">
-        <section id="upload-view" class="card upload-card">
-          <h2>New delivery run</h2>
-          <p class="muted small">Select a complete local SolidWorks engineering folder. It is frozen after upload and then runs the seven engineering stages.</p>
+        <section id="upload-view" class="card upload-card" aria-labelledby="upload-heading">
+          <div class="section-heading"><h2 id="upload-heading" tabindex="-1">New delivery</h2><p class="muted">Choose a SolidWorks folder, then review the details.</p></div>
           <form id="run-form">
             <input id="folder-input" type="file" webkitdirectory directory multiple class="hidden-input">
-            <label class="dropzone" for="folder-input">
-              <strong>Select engineering folder...</strong>
-              <span class="muted small">Supports Chrome and Edge. Files stay local until you select Start.</span>
-            </label>
-            <div id="target-row" class="assembly-row" hidden>
-              <label for="target-select" class="muted small">Publication target (required)</label>
-              <select id="target-select" hidden></select>
-              <label for="purpose-select" class="muted small">Purpose (required)</label>
-              <select id="purpose-select">
-                <option value="">Select a purpose</option>
-                <option value="engineering">Engineering delivery</option>
-                <option value="inspection_preview">Inspection preview</option>
-              </select>
-              <textarea id="change-summary" rows="3" placeholder="Change summary (required)" hidden></textarea>
-              <p id="target-note" class="muted small" hidden></p>
-            </div>
-            <div id="assembly-row" class="assembly-row" hidden>
+            <button id="choose-button" type="button" class="folder-picker">
+              <strong>Choose engineering folder</strong><span class="muted small">Include the main assembly and its referenced files.</span>
+            </button>
+            <p id="folder-summary" class="folder-summary" hidden></p>
+            <div id="assembly-row" class="form-field" hidden>
               <label for="assembly-select" class="muted small">Main assembly</label>
-              <select id="assembly-select" hidden></select>
-              <p id="assembly-note" class="muted small" hidden></p>
+              <select id="assembly-select" hidden></select><p id="assembly-note" class="muted small" hidden></p>
             </div>
-            <div class="upload-row">
-              <button type="button" id="choose-button" class="button">Select folder...</button>
-              <button type="submit" id="start-button" disabled>Start</button>
-              <button type="button" id="cancel-button" class="ghost" hidden>Cancel upload</button>
-              <span id="folder-summary" class="folder-summary muted" hidden></span>
+            <div id="target-row" class="form-grid" hidden>
+              <div class="form-field"><label for="target-select" class="muted small">Publication target (required)</label><select id="target-select" hidden></select></div>
+              <div class="form-field"><label for="purpose-select" class="muted small">Purpose (required)</label><select id="purpose-select"><option value="">Select a purpose</option><option value="engineering">Engineering delivery</option><option value="inspection_preview">Inspection preview</option></select></div>
+              <div class="form-field full-width"><p id="target-note" class="muted small" hidden></p><button id="targets-retry" type="button" class="ghost" hidden>Reload targets</button></div>
+              <div class="form-field full-width"><label for="change-summary" class="muted small">Change summary (required)</label><textarea id="change-summary" rows="3" placeholder="Change summary (required)" aria-describedby="summary-help" hidden></textarea><p id="summary-help" class="muted small">Appears at the start of the delivery PR.</p></div>
             </div>
-            <p id="upload-status" class="muted" hidden></p>
             <p id="run-error" class="error" role="alert" hidden></p>
-            <details class="requirements">
-              <summary>File requirements</summary>
-              <p class="muted small">
-                Limits: <span id="upload-limits">2 GB total, 4096 files, 512 MB per file</span> (platform settings are authoritative).
-                Empty subfolders are not uploaded. Uploads containing ~$ temporary lock files are rejected; close SolidWorks or remove them first.
-                Do not include platform-generated source.json or discovery identity records.
-              </p>
-            </details>
+            <p id="upload-status" class="muted" role="status" hidden></p>
+            <div class="upload-row"><button type="submit" id="start-button" disabled>Start delivery</button><button type="button" id="cancel-button" class="ghost" hidden>Cancel upload</button></div>
+            <details class="requirements"><summary>File requirements</summary><p class="muted small">Limits: <span id="upload-limits">2 GB total, 4096 files, 512 MB per file</span>. Folder selection requires Chrome or Edge. Empty subfolders are omitted. Temporary ~$ lock files cannot be uploaded; close SolidWorks before selecting the folder.</p></details>
           </form>
         </section>
-
         <section id="detail-card" class="card run-card" hidden>
           <header class="run-header">
-            <div class="run-title">
-              <span id="run-dot" class="dot idle" aria-hidden="true"></span>
-              <h2 id="run-heading">Run status</h2>
-              <span id="run-state-label" class="muted"></span>
-            </div>
-            <div class="run-header-side">
-              <span id="run-initiator" class="muted small"></span>
-              <span id="run-origin" class="run-origin muted small" hidden></span>
-              <span id="run-deleted" class="tombstone" hidden></span>
-              <span id="run-actions" class="run-actions-host"></span>
-              <div id="pr" class="pr" hidden></div>
-              <div id="retry-panel" class="run-actions" hidden>
-                <button id="retry-button" type="button" hidden>Retry</button>
-                <p id="retry-note" class="muted small"></p>
-                <p id="retry-error" class="error" role="alert" hidden></p>
-              </div>
-            </div>
+            <div class="run-title"><span id="run-dot" class="dot idle" aria-hidden="true"></span><h2 id="run-heading" tabindex="-1">Delivery</h2><span id="run-state-label" class="state-label"></span></div>
+            <div class="run-header-side"><div id="pr" class="pr" hidden></div><span id="run-actions" class="run-actions-host"></span></div>
           </header>
-
-          <p id="run-error-detail" class="error" role="alert" hidden></p>
-          <p id="run-loading" class="muted" role="status" hidden></p>
+          <div class="run-context"><span id="run-purpose" class="muted small"></span><span id="run-initiator" class="muted small"></span><span id="run-origin" class="run-origin muted small" hidden></span><span id="run-deleted" class="tombstone" hidden></span></div>
+          <p id="run-error-detail" class="error" role="alert" hidden></p><p id="run-loading" class="muted" role="status" hidden></p>
           <div id="run-content" class="run-content">
-          <p id="run-headline" class="headline" hidden></p>
-          <div id="failure-card" class="fail-card" hidden></div>
-
-          <nav id="stages" class="stepper" aria-label="Engineering stages"></nav>
-          <p id="preview-note" class="viewer-note" hidden></p>
-
-          <div class="run-workspace no-preview">
-            <div class="pane pane-preview">
-              <div id="viewer-card" hidden>
-                <div class="viewer-head">
-                  <span class="viewer-title">Interactive model preview</span>
-                  <button id="preview-collapse" type="button" class="ghost" aria-expanded="true" hidden>Collapse preview</button>
-                </div>
-                <div class="viewer-toolbar">
-                  <label>Format <select id="preview-format"><option value="urdf">URDF</option><option value="mjcf" disabled>MJCF</option></select></label>
-                  <span id="mjcf-tools" hidden>
-                    <label>Geometry <select id="mjcf-mode"><option value="visual">Visual</option><option value="collision">Collision</option><option value="overlay">Overlay</option></select></label>
-                    <label>Link <select id="mjcf-link"><option value="">All links</option></select></label>
-                    <label><input id="mjcf-markers" type="checkbox"> Frames, COM and contacts</label>
-                    <button id="mjcf-play" type="button">Play</button>
-                    <button id="mjcf-step" type="button">Step</button>
-                    <button id="mjcf-reset" type="button">Reset simulation</button>
-                  </span>
-                </div>
-                <p id="mjcf-status" class="muted small" hidden></p>
-                <details id="mjcf-evidence" hidden><summary>Collision approximation and source warnings</summary><div id="mjcf-collision-info"></div><ul id="mjcf-warnings"></ul></details>
-                <div id="viewer" class="viewer"></div>
-                <div id="inspection-controls" class="inspection-controls"></div>
-                <p class="muted small" id="preview-meta"></p>
-                <dl class="meta preview-info" id="preview-info"></dl>
-                <div id="preview-diagnostic" class="viewer-note diagnostic-note" hidden></div>
-                <p class="viewer-note" id="viewer-note" hidden></p>
-                <div class="viewer-footer">
-                  <div class="panel-block">
-                    <p class="panel-title" id="joints-title">Joint controls</p>
-                    <div id="joint-controls" class="joint-controls"></div>
-                    <button id="reset-joints" type="button" class="ghost">Reset to zero</button>
+            <p id="run-headline" class="headline" hidden></p>
+            <div id="failure-card" class="fail-card" hidden></div>
+            <nav id="stages" class="stepper" aria-label="Engineering stages"></nav>
+            <div id="automatic" class="automatic-summary"></div>
+            <div id="activity-overview" class="activity-host"></div>
+            <div id="retry-panel" class="run-actions" hidden><button id="retry-button" type="button" hidden>Retry</button><p id="retry-note" class="muted small"></p><p id="retry-error" class="error" role="alert" hidden></p></div>
+            <p id="preview-note" class="viewer-note" hidden></p>
+            <div class="run-workspace no-preview">
+              <div class="pane pane-preview">
+                <div id="viewer-card" hidden>
+                  <div class="viewer-head"><h3 class="viewer-title">Model preview</h3><button id="preview-collapse" type="button" class="ghost" aria-expanded="true" hidden>Collapse preview</button></div>
+                  <div id="preview-diagnostic" class="viewer-note diagnostic-note" hidden></div>
+                  <p class="viewer-note" id="viewer-note" hidden></p>
+                  <p id="mjcf-status" class="muted small" hidden></p>
+                  <details id="mjcf-evidence" hidden><summary>Collision approximation and source warnings</summary><div id="mjcf-collision-info"></div><ul id="mjcf-warnings"></ul></details>
+                  <div class="preview-body">
+                    <div class="viewer-toolbar">
+                      <label>Format <select id="preview-format"><option value="urdf">URDF</option><option value="mjcf" disabled>MJCF</option></select></label>
+                      <span id="mjcf-tools" hidden>
+                        <button id="mjcf-play" type="button">Play</button><button id="mjcf-step" type="button" class="ghost">Step</button><button id="mjcf-reset" type="button" class="ghost">Reset simulation</button>
+                        <details><summary>Display options</summary><div class="viewer-toolbar">
+                          <label>Geometry <select id="mjcf-mode"><option value="visual">Visual</option><option value="collision">Collision</option><option value="overlay">Overlay</option></select></label>
+                          <label>Link <select id="mjcf-link"><option value="">All links</option></select></label>
+                          <label><input id="mjcf-markers" type="checkbox"> Frames, COM and contacts</label>
+                        </div></details>
+                      </span>
+                    </div>
+                    <div id="viewer" class="viewer"></div>
+                    <div id="inspection-controls" class="inspection-controls"></div>
+                    <details class="joint-panel"><summary id="joints-title">Joint controls</summary><div id="joint-controls" class="joint-controls"></div><button id="reset-joints" type="button" class="ghost">Reset to zero</button></details>
+                    <details class="model-details"><summary>Model data and sources</summary><p class="muted small" id="preview-meta"></p><dl class="meta preview-info" id="preview-info"></dl><div id="preview-panels" class="preview-panels">
+                      <details class="preview-panel"><summary id="links-title">Link mass and inertia</summary><div class="panel-table" id="panel-links"></div></details>
+                      <details class="preview-panel"><summary id="limits-title">Joint limits and axes</summary><div class="panel-table" id="panel-limits"></div></details>
+                      <details class="preview-panel"><summary id="frames-title">Frames and physical closure</summary><div class="panel-table" id="panel-frames"></div><div class="panel-table" id="panel-closure"></div></details>
+                    </div></details>
                   </div>
                 </div>
-                <div id="preview-panels" class="preview-panels">
-                  <details class="preview-panel" open>
-                    <summary id="links-title">Link/body mass and inertia</summary>
-                    <div class="panel-table" id="panel-links"></div>
-                  </details>
-                  <details class="preview-panel" open>
-                    <summary id="limits-title">Limits and axis readings</summary>
-                    <div class="panel-table" id="panel-limits"></div>
-                  </details>
-                  <details class="preview-panel" open>
-                    <summary id="frames-title">Frames, interface poses, and physical closure</summary>
-                    <div class="panel-table" id="panel-frames"></div>
-                    <div class="panel-table" id="panel-closure"></div>
-                  </details>
-                </div>
+                <p id="viewer-placeholder" class="muted small viewer-placeholder">The model preview will appear after generation.</p>
               </div>
-              <p id="viewer-placeholder" class="muted small viewer-placeholder">The URDF preview appears here after generation. A delivery that failed independent verification is shown only as a clearly marked diagnostic preview.</p>
+              <aside class="pane pane-inspect" aria-label="Delivery details">
+                <section class="findings-section"><h3>Warnings and findings</h3><ul id="findings" class="findings"></ul></section>
+                <details id="stage-panel" class="detail-section"><summary>Stage details <span id="stage-selection-label" class="muted"></span></summary><div id="stage-detail"></div><div id="stage-rerun" class="stage-rerun" hidden></div></details>
+                <details class="detail-section"><summary>Engineering review scope</summary><div id="confirmations" class="confirmations"></div></details>
+                <details class="detail-section"><summary>Delivery records</summary><dl class="meta" id="run-meta"></dl><p id="run-ident" class="muted small"></p><div id="task-progress" class="progress"></div></details>
+              </aside>
             </div>
-
-            <div class="pane pane-inspect">
-              <nav id="inspect-tabs" class="tabs" aria-label="Inspection views">
-                <button type="button" class="tab active" data-tab="overview">Overview</button>
-                <button type="button" class="tab" data-tab="stage">Stages</button>
-                <button type="button" class="tab" data-tab="checks">Checks</button>
-                <button type="button" class="tab" data-tab="engineering">Engineering</button>
-              </nav>
-
-              <section id="tab-overview" class="tab-pane">
-                <div id="activity-overview" class="activity-host"></div>
-                <dl class="meta" id="run-meta"></dl>
-                <details class="meta-more">
-                  <summary>Run identity</summary>
-                  <p id="run-ident" class="muted small"></p>
-                </details>
-                <details class="meta-more">
-                  <summary>Tasks and transfer</summary>
-                  <div id="task-progress" class="progress"></div>
-                </details>
-                <h3>Issues and findings</h3>
-                <ul id="findings" class="findings"></ul>
-              </section>
-
-              <section id="tab-stage" class="tab-pane" hidden>
-                <p class="muted small">Select a stage above to view its check summary and results. Raw evidence and file digests are collapsed by default.</p>
-                <div id="activity-stage" class="activity-host"></div>
-                <div id="stage-detail"></div>
-                <div id="stage-rerun" class="stage-rerun" hidden></div>
-              </section>
-
-              <section id="tab-checks" class="tab-pane" hidden>
-                <h3>Automatic checks</h3>
-                <div id="automatic" class="automatic"></div>
-              </section>
-
-              <section id="tab-engineering" class="tab-pane" hidden>
-                <h3>Engineering review scope</h3>
-                <div id="confirmations" class="confirmations"></div>
-              </section>
-            </div>
-          </div>
           </div>
         </section>
       </div>
     </section>
   </main>
-
   <script type="module" src="/static/app.js"></script>
 </body>
 </html>

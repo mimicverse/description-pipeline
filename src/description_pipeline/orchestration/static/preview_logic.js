@@ -6,7 +6,7 @@
 export const MACHINE_FIELD_KEYS = ["run_id", "subject_sha256", "tool_identity", "purpose"];
 
 export function purposeLabel(value) {
-  return value === "engineering" || value === "inspection_preview" ? value : "not recorded";
+  return value === "engineering" ? "Engineering delivery" : value === "inspection_preview" ? "Inspection preview" : "not recorded";
 }
 
 export function registeredVerificationArtifact(preview, runId) {
