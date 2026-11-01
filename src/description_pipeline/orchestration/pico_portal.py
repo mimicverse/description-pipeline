@@ -140,6 +140,22 @@ class PicoPortal:
         except Exception as error:
             return self.error(error)
 
+    async def verify_recording(self, request: Request):
+        try:
+            if await _json_request(request, 1024, allow_empty=True):
+                raise ValueError("Recording verification identity comes from the registered session")
+            session_id = request.path_params["session_id"]
+            _, _, row = await self.authorized(session_id, request.headers, csrf=True)
+            projection = await asyncio.to_thread(self.portal._read_fact_projection, row["source_run_id"])
+            result = await self.service.verify_recording(
+                session_id,
+                projection["members"],
+                self.portal._registered_member_bytes,
+            )
+            return JSONResponse(result)
+        except Exception as error:
+            return self.error(error)
+
     async def previous_profile(self, request: Request):
         try:
             session, principal = await self.actor(request.headers)
@@ -340,6 +356,7 @@ def create_app(portal: PortalApp, service: SimulationService):
             Route("/api/simulations/{session_id}", routes.get, methods=["GET"]),
             Route("/api/simulations/{session_id}/commands", routes.command, methods=["POST"]),
             Route("/api/simulations/{session_id}/recording", routes.recording, methods=["GET"]),
+            Route("/api/simulations/{session_id}/recording/verify", routes.verify_recording, methods=["POST"]),
             WebSocketRoute("/api/simulations/{session_id}/stream", routes.viewer),
             WebSocketRoute("/api/simulations/{session_id}/input", routes.input),
             Mount("/", WSGIMiddleware(portal, workers=10)),
@@ -347,7 +364,7 @@ def create_app(portal: PortalApp, service: SimulationService):
     )
 
 
-async def _json_request(request: Request, limit: int):
+async def _json_request(request: Request, limit: int, *, allow_empty=False):
     parts = []
     size = 0
     async for part in request.stream():
@@ -355,7 +372,7 @@ async def _json_request(request: Request, limit: int):
         if size > limit:
             raise ValueError("Request exceeds its byte budget")
         parts.append(part)
-    value = json.loads(b"".join(parts))
+    value = json.loads(b"".join(parts)) if size or not allow_empty else {}
     if not isinstance(value, dict):
         raise ValueError("Request must be a JSON object")
     return value

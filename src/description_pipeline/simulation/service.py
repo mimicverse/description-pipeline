@@ -18,6 +18,7 @@ import zipfile
 
 from ..io import digest, canonical
 from .store import SimulationConflict, SimulationStore
+from .recording import prepare_source, recording_binding, run_verification, session_identity
 
 log = logging.getLogger(__name__)
 
@@ -52,6 +53,7 @@ class SimulationService:
         self.runtime_identity = None
         self.running: dict[str, RunningSession] = {}
         self.gate = asyncio.Lock()
+        self.verification_gate = asyncio.Semaphore(1)
         self._lock = None
         self._database_lock = None
 
@@ -130,6 +132,8 @@ class SimulationService:
     async def create(self, actor: str, key: str, run_id: str, request: dict, members: dict, read_member) -> dict:
         if not key or len(key) > 128:
             raise ValueError("A bounded idempotency key is required")
+        if self.runtime_identity is None or request.get("runtime") != self.runtime_identity:
+            raise ValueError("Simulation request runtime differs from the active fixed worker")
         async with self.gate:
             row = await asyncio.to_thread(
                 self.store.create, actor, key, run_id, request, self.owner, capacity=self.capacity
@@ -140,24 +144,7 @@ class SimulationService:
             session_root = self.root / session_id
             source = session_root / "source"
             try:
-                if len(request["source"]["files"]) > 2048:
-                    raise ValueError("Simulation source exceeds the file-count budget")
-                source.mkdir(parents=True, exist_ok=False, mode=0o700)
-                source_bytes = 0
-                for name, sha in request["source"]["files"].items():
-                    parts = Path(name)
-                    if parts.is_absolute() or ".." in parts.parts or "\\" in name:
-                        raise ValueError("Simulation source path is invalid")
-                    content = await asyncio.to_thread(read_member, name, members[name])
-                    source_bytes += len(content)
-                    if len(content) > 64 * 1024 * 1024 or source_bytes > 1024 * 1024 * 1024:
-                        raise ValueError("Simulation source exceeds the materialization budget")
-                    if hashlib.sha256(content).hexdigest() != sha:
-                        raise ValueError("Simulation source digest changed")
-                    path = source / name
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    path.write_bytes(content)
-                    path.chmod(0o400)
+                await prepare_source(source, request["source"], members, read_member)
                 (session_root / "request.json").write_bytes(canonical(request) + b"\n")
                 config = {
                     "root": str(source),
@@ -170,6 +157,7 @@ class SimulationService:
                     output = session_root / "recording"
                     output.mkdir(mode=0o700)
                     (output / "request.json").write_bytes(canonical(request) + b"\n")
+                    (output / "session.json").write_bytes(canonical(session_identity(row)) + b"\n")
                     config["record_path"] = str(output / "ticks.jsonl")
                 environment = {key: os.environ[key] for key in ("PATH", "LANG", "LC_ALL") if key in os.environ}
                 environment.update({"PYTHONUNBUFFERED": "1", "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1"})
@@ -212,18 +200,27 @@ class SimulationService:
                 await self.send(session_id, config)
                 await self.send(session_id, {"type": "connection", "connected": False})
                 return self.public(row)
-            except Exception as error:
-                if session_id in self.running:
-                    await self._terminate(self.running[session_id])
-                    if self.running[session_id].tasks:
-                        await self.running[session_id].tasks[0]
+            except BaseException as error:
+                current = self.running.get(session_id)
+                if current is not None:
+                    await self._terminate(current)
+                    if current.tasks:
+                        await asyncio.shield(current.tasks[0])
                     else:
                         self.running.pop(session_id, None)
                         await asyncio.to_thread(
                             self.store.transition, session_id, self.owner, "failed", error=str(error)
                         )
                 else:
-                    await asyncio.to_thread(self.store.transition, session_id, self.owner, "failed", error=str(error))
+                    latest = await asyncio.to_thread(self.store.get, session_id)
+                    if latest["state"] not in {"stopped", "failed"}:
+                        await asyncio.to_thread(
+                            self.store.transition,
+                            session_id,
+                            self.owner,
+                            "failed",
+                            error=str(error) or type(error).__name__,
+                        )
                 raise
 
     @staticmethod
@@ -245,6 +242,17 @@ class SimulationService:
         except BaseException:
             temporary.cleanup()
             raise
+
+    async def verify_recording(self, session_id, members, read_member):
+        if self.verification_gate.locked():
+            raise SimulationConflict("A recording verification is already running; retry after it finishes")
+        async with self.verification_gate:
+            row = await asyncio.to_thread(self.store.get, session_id)
+            binding = recording_binding(row)
+            with tempfile.TemporaryDirectory(prefix="recording-verification-", dir=self.root) as temporary:
+                source = Path(temporary) / "source"
+                await prepare_source(source, row["request"]["source"], members, read_member)
+                return await run_verification(binding, self.artifacts.root, source)
 
     async def send(self, session_id: str, command: dict) -> None:
         current = self.running.get(session_id)

@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import os
+import sys
+import tempfile
 import hashlib
 import json
 from pathlib import Path
@@ -11,9 +15,17 @@ import xml.etree.ElementTree as ET
 import mujoco
 import numpy as np
 
+from ..artifacts import ArtifactStore
+from ..io import digest
+from ..pipeline.contracts import ArtifactRef
+from .recording import materialize_source, recording_binding, run_verification
+from .store import SimulationStore
 
-def verify(recording: Path, source: Path) -> dict:
+
+def verify(recording: Path, source: Path, *, expected_request_digest: str) -> dict:
     request = json.loads((recording / "request.json").read_bytes())
+    if digest(request) != expected_request_digest:
+        raise ValueError("Recording request differs from the registered session")
     inventory, profile = request["source"]["files"], request["profile"]
     source = source.resolve()
     for name, sha in inventory.items():
@@ -30,7 +42,9 @@ def verify(recording: Path, source: Path) -> dict:
             if "file" not in node.attrib:
                 continue
             directory = (
-                compiler.get("meshdir" if node.tag == "mesh" else "texturedir", "") if compiler is not None else ""
+                compiler.get("meshdir" if node.tag == "mesh" else "texturedir", compiler.get("assetdir", ""))
+                if compiler is not None and node.tag != "include"
+                else ""
             )
             target = (path.parent / directory / node.get("file")).resolve()
             if not target.is_relative_to(source) or target.relative_to(source).as_posix() not in inventory:
@@ -63,6 +77,8 @@ def verify(recording: Path, source: Path) -> dict:
     with (recording / "ticks.jsonl").open() as stream:
         for line in stream:
             result = json.loads(line)["result"]
+            if result.get("schema_version") != "teleop.upper-body/v1" or result.get("mode") != "kinematic_ik":
+                raise ValueError("Recording schema or mode is unsupported by this verifier")
             q = np.asarray(result["qpos"], dtype=float)
             dt = float(result["control"]["dt_s"])
             if q.shape != (model.nq,) or not np.isfinite(q).all() or not np.isfinite(dt) or dt < 0:
@@ -112,12 +128,80 @@ def verify(recording: Path, source: Path) -> dict:
     }
 
 
+def verify_bound(binding: dict, artifacts: ArtifactStore, source: Path) -> dict:
+    if binding.get("schema_version") != "description.recording-verification/1":
+        raise ValueError("Recording verification binding is unsupported")
+    artifact = ArtifactRef.from_record(binding["recording_artifact"])
+    if artifact.kind != "teleop_recording" or artifact.producer_tool_sha256 != binding["runtime_digest"]:
+        raise ValueError("Recording artifact producer differs from the registered session")
+    artifacts.verify(artifact)
+    root = artifacts.objects / artifact.artifact_id
+    identity = json.loads((root / "session.json").read_bytes())
+    expected_identity = {key: value for key, value in binding.items() if key != "recording_artifact"}
+    expected_identity["schema_version"] = "description.teleop-recording/1"
+    if identity != expected_identity:
+        raise ValueError("Recording session identity differs from the registered session")
+    result = verify(root, source, expected_request_digest=binding["request_digest"])
+    request = json.loads((root / "request.json").read_bytes())
+    if digest(request["runtime"]) != binding["runtime_digest"]:
+        raise ValueError("Recording runtime differs from the registered session")
+    outcome = json.loads((root / "outcome.json").read_bytes())
+    if type(outcome.get("complete")) is not bool or set(outcome) != {"complete", "error"}:
+        raise ValueError("Recording completion metadata is invalid")
+    result.update(
+        binding=binding,
+        recording_complete=outcome["complete"],
+        recording_error=outcome["error"],
+        mode="kinematic_ik",
+        control_replay_verified=False,
+    )
+    return result
+
+
+def worker_main():
+    try:
+        raw = sys.stdin.buffer.readline(128 * 1024 + 1)
+        if not raw or len(raw) > 128 * 1024:
+            raise ValueError("Recording verifier initialization is missing or oversized")
+        payload = json.loads(raw)
+        if set(payload) != {"binding", "artifact_root", "source"}:
+            raise ValueError("Recording verifier initialization is invalid")
+        result = verify_bound(
+            payload["binding"], ArtifactStore(Path(payload["artifact_root"])), Path(payload["source"])
+        )
+        print(json.dumps(result, allow_nan=False))
+        return 0
+    except Exception as error:
+        print(json.dumps({"error": str(error)[:4000]}, allow_nan=False))
+        return 1
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--recording", type=Path, required=True)
-    parser.add_argument("--source", type=Path, required=True)
+    parser.add_argument("--session", required=True, help="Registered simulation session identity")
     args = parser.parse_args()
-    print(json.dumps(verify(args.recording, args.source)))
+    dsn = os.environ.get("PLATFORM_OPERATOR_DSN")
+    if not dsn:
+        parser.error("PLATFORM_OPERATOR_DSN is required to read the registered verification identity")
+    import psycopg2
+    from ..platform.queries import read_run_projection
+
+    store = SimulationStore(lambda: psycopg2.connect(dsn))
+    artifacts = ArtifactStore.from_environment(os.environ)
+    row = store.get(args.session)
+    binding = recording_binding(row)
+    with psycopg2.connect(dsn) as connection:
+        projection = read_run_projection(connection, row["source_run_id"], artifacts=artifacts)
+
+    def read_member(name, member):
+        ref = ArtifactRef.from_record(member["artifact"])
+        return artifacts.read_metadata_member(ref, name, max_bytes=64 * 1024 * 1024)[0]
+
+    with tempfile.TemporaryDirectory(prefix="teleop-recording-verification-") as temporary:
+        source = materialize_source(
+            Path(temporary) / "source", row["request"]["source"], projection["members"], read_member
+        )
+        print(json.dumps(asyncio.run(run_verification(binding, artifacts.root, source))))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,70 @@
+{
+  "schema_version": "description.pico-recording-evidence/1",
+  "parent_commit": "d5cda9d0144269e85371334052e3793b43d55f80",
+  "source_files": {
+    "docs/pico-upper-body.md": "3fc2ede131397e57c9e3b5f22028820b219ec7c91d31d943dfdf0423ce3e5932",
+    "src/description_pipeline/orchestration/pico_portal.py": "daccd54586377506594b1b3cb46cfef9a501dc7b75815728c4418f92e9cd1216",
+    "src/description_pipeline/orchestration/static/pico.html": "7b8f090d2253ea52756625dce79395c5277d417f92a791e448b9c7f03f0f0854",
+    "src/description_pipeline/orchestration/static/pico.js": "93a31e218c4851eff88aeb58fa0b0cb4522f3587b3c9107b42bdc57cb73ca334",
+    "src/description_pipeline/simulation/recording.py": "616d103e2be3528a5f57a54f3d7cbeeedaa3c3cabd7b7acc7d7492940822c3df",
+    "src/description_pipeline/simulation/service.py": "5ad37d74ea93daeb2c243fb8fd7c1263c02b92d13da25f5191845848c8083d59",
+    "src/description_pipeline/simulation/store.py": "4104f76754573ff91fa5b994996ead7157d2f46c61590c5dba69ef8c5459788f",
+    "src/description_pipeline/simulation/verify_recording.py": "fdf8ad9fec0f43598a0c8f2e17aeb5dadce71a4e6e5f4f0c407e838c1de1485d",
+    "tests/v1/test_pico_sessions.py": "e388b39486eed9eb681b247a379cf811e3322da7298569ee2c33288a25cb7df3"
+  },
+  "teleop_commit": "8b402482559c02534668bf2cb4338c0b8d628e14",
+  "runtime_contract_sha256": "713547476f6cee014e65904b987ca571aef283f980ccec478224af32cbda95fc",
+  "validation": {
+    "native_integration": {
+      "passed": 6,
+      "failed": 0,
+      "seconds": 25.725,
+      "log": "/home/andy/Work/reviews/pico-optimization-20261101/m1-anchor-tests.log",
+      "sha256": "11c7f3e2ab3a8c0f17d343869b501c5ca4295cfbbe67e0c29de2588fc27374a1"
+    },
+    "related_regression": {
+      "passed": 20,
+      "failed": 0,
+      "seconds": 5.179,
+      "log": "/home/andy/Work/reviews/pico-optimization-20261101/m1-related-tests.log",
+      "sha256": "55e29547cc329e557bbd5b61e2036096008fbee81adaae85c7b758b8d26dc1a4"
+    },
+    "browser": {
+      "ticks": 614,
+      "recording_complete": true,
+      "image": "/home/andy/Work/reviews/pico-optimization-20261101/m1-recording-verified.png",
+      "sha256": "742d9f136d92aaf51acf1366c129c6c74a876a2dd236b5ece7d19ed7d07a7514"
+    },
+    "ruff": "passed",
+    "git_diff_check": "passed",
+    "javascript_syntax": "passed"
+  },
+  "failure_reproduction": {
+    "path": "/home/andy/Work/reviews/pico-optimization-20261101/anchor-failure-repro/REPRO.json",
+    "sha256": "26c8e20b8a92d4f7a8e7bed68fbd674c1ed565b143db5f635661bd9fe2eb4eab",
+    "cause": "The previous verifier trusted the recording request rather than the registered session. An increased joint-speed budget passed the previous verifier.",
+    "scope": "Recording verification HTTP/CLI, request and runtime identity, artifact registration, cross-session replacement, materialization and subprocess cancellation.",
+    "coverage_gap": "Earlier FK tests assumed a trusted recording directory and did not anchor the request to a registered session."
+  },
+  "contract": {
+    "TELEOP-M1-DESIGN-RULING.md": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/TELEOP-M1-DESIGN-RULING.md",
+      "sha256": "b56b6118504a27271260b75e442168ce85006133885fb31fdf5bba846708e6c0"
+    },
+    "PICO-WORKER-CONTRACT.json": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/PICO-WORKER-CONTRACT.json",
+      "sha256": "61f4910c7a8d92f0146e84cfae7978986a0b5e468d9979ddb33c44cb242c496a"
+    }
+  },
+  "scope": "Software integration with real PostgreSQL, native fixed wheel, HTTP/WS/ZMQ, registered ArtifactStore members and CLI source projection; explicit external identity and source stage fixtures.",
+  "not_verified": [
+    "Human PICO operation",
+    "Formal two-revision pipeline product closure",
+    "New worker protocol and effective command acknowledgements",
+    "Control event replay",
+    "Native worker stop with open stdin",
+    "Long-run backpressure and resource budget",
+    "Formal release, deployment and pipeline E2E"
+  ],
+  "historical_evidence": "reviews/pico-upper-body-20261101/DEVELOPMENT-EVIDENCE.json remains unchanged and applies only to its original commit."
+}

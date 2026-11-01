@@ -104,6 +104,7 @@ async function inspect() {
   $("source").textContent = JSON.stringify({ session_id: row.session_id, request_digest: row.request_digest, source: row.source, runtime: row.runtime }, null, 2);
   $("warnings").textContent = JSON.stringify({ warnings: row.source.warnings, scope: row.source.verification_scope }, null, 2);
   $("recording").hidden = !row.recording_artifact;
+  $("verify-recording").hidden = !row.recording_artifact;
   if (row.recording_artifact) { $("recording").hidden = false; $("recording").href = `/api/simulations/${sessionId}/recording`; }
   return row;
 }
@@ -116,6 +117,15 @@ async function command(type) {
   }
   if (type === "estop") $("status").textContent = "Emergency stop requested; inspect the live latched state.";
 }
+$("verify-recording").onclick = async () => {
+  $("verify-recording").disabled = true;
+  $("verification-status").textContent = "Checking the registered recording and source…";
+  try {
+    const result = await api(`/api/simulations/${sessionId}/recording/verify`, { method: "POST" });
+    $("verification-status").textContent = `${result.recording_complete ? "Complete" : "Partial"} recording: ${result.ticks} ticks checked against the registered source. Control-input replay is not covered.`;
+  } catch (error) { $("verification-status").textContent = "Recording check failed."; failure(error); }
+  finally { $("verify-recording").disabled = false; }
+};
 $("mode").onchange = () => { mode = $("mode").value; };
 for (const type of ["estop", "stop", "pair"]) $(type).onclick = () => command(type).catch(failure);
 $("setup").onsubmit = async (event) => {

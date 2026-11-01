@@ -13,6 +13,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import uuid
 import xml.etree.ElementTree as ET
@@ -31,15 +32,19 @@ if SESSION_TESTS:
     from websockets.asyncio.client import connect
 
     from description_pipeline.artifacts import ArtifactStore
-    from description_pipeline.io import digest
+    from description_pipeline.io import digest, canonical
     from description_pipeline.orchestration.pico_portal import create_app
     from description_pipeline.orchestration.airflow_client import native_run_id
     from description_pipeline.orchestration.feishu_oauth import build_actor_name
     from description_pipeline.orchestration.portal import PortalApp, PortalConfig
-    from description_pipeline.pipeline.contracts import RunAdmission
+    from description_pipeline.pipeline.contracts import RunAdmission, StageCommand, StageResult
     from description_pipeline.simulation.service import SimulationService
     from description_pipeline.simulation.store import SimulationConflict, SimulationStore
     from description_pipeline.simulation.verify_recording import verify
+    from description_pipeline.simulation.recording import run_verification
+    from description_pipeline.pipeline.contracts import ArtifactRef
+    from description_pipeline.platform.facts import FactStore
+    from description_pipeline.schemas import STAGE_RESULT_SCHEMA
 
 
 def model_source(root):
@@ -159,17 +164,167 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
             "record": True,
             "runtime": {},
         }
-        self.members = dict.fromkeys(files)
-        self.read_member = lambda name, _ref: (source / name).read_bytes()
+        source_ref = self.artifacts.seal_tree(
+            source, kind="pico_test_source", producer_run_id=None, producer_stage=None, producer_tool_sha256="c" * 64
+        )
+        self.members = {
+            item["path"]: {**item, "artifact": source_ref.to_record()}
+            for item in self.artifacts.verify(source_ref)["members"]
+        }
+        self.read_member = lambda name, member: self.artifacts.read_metadata_member(
+            ArtifactRef.from_record(member["artifact"]), name, max_bytes=64 * 1024 * 1024
+        )[0]
 
     async def asyncTearDown(self):
         await self.service.close()
+
+    def register_cli_source_fixture(self):
+        # Canonical fixture facts exercise CLI reads; they do not claim a production pipeline execution.
+        command = StageCommand.create(
+            command_id="pico-fixture-mjcf",
+            run_id=self.run_id,
+            stage="mjcf",
+            idempotency_key="pico-cli-source",
+            request={"run_id": self.run_id},
+            input_artifacts=(),
+            config_snapshot_sha256="c" * 64,
+            contract_sha256="d" * 64,
+            policy_sha256="e" * 64,
+            expected_executor_sha256="f" * 64,
+            predecessor_decision_id=None,
+        )
+        checks = {
+            "command_id": command.command_id,
+            "request_digest": command.request_digest,
+            "checks": [{"id": "fixture.source", "state": "passed", "details": {"scope": "fixture"}}],
+        }
+        (self.root / "model/checks.json").write_bytes(canonical(checks) + b"\n")
+        output = self.artifacts.seal_tree(
+            self.root / "model",
+            kind="stage_output:mjcf",
+            producer_run_id=self.run_id,
+            producer_stage="mjcf",
+            producer_tool_sha256=command.expected_executor_sha256,
+        )
+        result = StageResult(
+            schema_version=STAGE_RESULT_SCHEMA,
+            command_id=command.command_id,
+            run_id=self.run_id,
+            stage="mjcf",
+            request_digest=command.request_digest,
+            outcome="completed",
+            output_artifact=output,
+            actual_executor_sha256=command.expected_executor_sha256,
+            checks_sha256=digest(checks),
+            resources_settled=True,
+        )
+        result_ref = self.artifacts.seal_stage_result(result)
+        facts = FactStore(self.store.connect, self.artifacts)
+        facts.register_artifact(output)
+        facts.register_artifact(result_ref)
+        with self.store.transaction() as cursor:
+            cursor.execute(
+                "INSERT INTO command(command_id,run_id,kind,stage,idempotency_key,request,request_digest,"
+                "config_snapshot_sha256,contract_sha256,policy_sha256,expected_executor_sha256) "
+                "VALUES(%s,%s,'stage','mjcf',%s,%s::jsonb,%s,%s,%s,%s,%s)",
+                (
+                    command.command_id,
+                    self.run_id,
+                    command.idempotency_key,
+                    json.dumps(command.to_record()["request"]),
+                    command.request_digest,
+                    command.config_snapshot_sha256,
+                    command.contract_sha256,
+                    command.policy_sha256,
+                    command.expected_executor_sha256,
+                ),
+            )
+            cursor.execute(
+                "INSERT INTO stage_decision(decision_id,run_id,stage,command_id,outcome,"
+                "result_record_artifact_id,result_digest,actual_executor_sha256,decided_at) "
+                "VALUES('pico-source-decision',%s,'mjcf',%s,'completed',%s,%s,%s,now())",
+                (
+                    self.run_id,
+                    command.command_id,
+                    result_ref.artifact_id,
+                    result.digest,
+                    command.expected_executor_sha256,
+                ),
+            )
+
+    async def start_service(self):
+        await self.service.start()
+        self.request["runtime"] = self.service.runtime_identity
 
     async def wait_ready(self, sid):
         async with asyncio.timeout(20):
             while (row := await asyncio.to_thread(self.store.get, sid))["state"] == "starting":
                 await asyncio.sleep(0.05)
         self.assertEqual("ready", row["state"], row)
+
+    async def test_cancelled_materialization_settles_admission_and_cleans_verification(self):
+        await self.start_service()
+        entered, release = threading.Event(), threading.Event()
+
+        def slow_member(name, member):
+            entered.set()
+            if not release.wait(5):
+                raise TimeoutError("Fixture reader was not released")
+            return self.read_member(name, member)
+
+        creating = asyncio.create_task(
+            self.service.create(
+                "app:tenant:operator", "cancel-create", self.run_id, self.request, self.members, slow_member
+            )
+        )
+        self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+        creating.cancel()
+        release.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await creating
+        with self.store.transaction() as cursor:
+            cursor.execute("SELECT session_id FROM simulation_session WHERE request_key='cancel-create'")
+            cancelled_id = cursor.fetchone()[0]
+        self.assertEqual("failed", self.store.get(cancelled_id)["state"])
+        self.assertFalse(self.service.running)
+        row = await self.service.create(
+            "app:tenant:operator", "cancel-verify", self.run_id, self.request, self.members, self.read_member
+        )
+        await self.wait_ready(row["session_id"])
+        await self.service.stop(row["session_id"])
+        entered.clear()
+        release.clear()
+        checking = asyncio.create_task(self.service.verify_recording(row["session_id"], self.members, slow_member))
+        self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+        checking.cancel()
+        release.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await checking
+        self.assertFalse(list(self.service.root.glob("recording-verification-*")))
+        self.assertFalse(self.service.verification_gate.locked())
+
+    async def test_cancelled_verifier_reaps_its_real_process(self):
+        from unittest.mock import patch
+
+        actual_spawn = asyncio.create_subprocess_exec
+        spawned = asyncio.Event()
+        child = None
+
+        async def fixture_spawn(*_args, **options):
+            nonlocal child
+            child = await actual_spawn(sys.executable, "-I", "-c", "import time;time.sleep(30)", **options)
+            spawned.set()
+            return child
+
+        with patch("description_pipeline.simulation.recording.asyncio.create_subprocess_exec", fixture_spawn):
+            task = asyncio.create_task(run_verification({}, self.artifacts.root, self.root / "model"))
+            await asyncio.wait_for(spawned.wait(), 2)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertIsNotNone(child.returncode)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(child.pid, 0)
 
     async def test_real_pico_link_preserves_transitions_and_rejects_gaps(self):
         result = await asyncio.to_thread(
@@ -182,7 +337,7 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(0, result.returncode, result.stderr)
 
     async def test_native_lifecycle_identity_recording_and_idempotency(self):
-        await self.service.start()
+        await self.start_service()
         self.request["runtime"] = self.service.runtime_identity
         row = await self.service.create(
             "app:tenant:operator", "one", self.run_id, self.request, self.members, self.read_member
@@ -216,8 +371,56 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
         await self.service.stop(sid)
         self.assertEqual("stopped", self.store.get(sid)["state"])
         self.assertIsNotNone(self.store.get(sid)["recording_artifact"])
+        bound = await self.service.verify_recording(sid, self.members, self.read_member)
+        self.assertEqual(self.store.get(sid)["request_digest"], bound["binding"]["request_digest"])
+        self.assertTrue(bound["recording_complete"])
+        self.assertFalse(bound["control_replay_verified"])
+        self.register_cli_source_fixture()
+        cli = await asyncio.to_thread(
+            subprocess.run,
+            [sys.executable, "-m", "description_pipeline.simulation.verify_recording", "--session", sid],
+            env={
+                **os.environ,
+                "PYTHONPATH": str(ROOT / "src"),
+                "PLATFORM_ARTIFACT_ROOT": str(self.artifacts.root),
+                "PLATFORM_OPERATOR_DSN": psycopg2.extensions.make_dsn(
+                    self.pg.get_uri(), options=f"-csearch_path={self.schema}"
+                ),
+            },
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(0, cli.returncode, cli.stderr)
+        self.assertEqual(bound["binding"], json.loads(cli.stdout)["binding"])
+        other = await self.service.create(
+            "app:tenant:other",
+            "other-recording",
+            self.run_id,
+            self.request,
+            self.members,
+            self.read_member,
+        )
+        await self.wait_ready(other["session_id"])
+        await self.service.stop(other["session_id"])
+        self.assertEqual(self.store.get(sid)["request_digest"], self.store.get(other["session_id"])["request_digest"])
+        original_ref = self.store.get(sid)["recording_artifact"]
+        with self.store.transaction() as cursor:
+            cursor.execute(
+                "UPDATE simulation_session SET recording_artifact=%s::jsonb WHERE session_id=%s",
+                (json.dumps(self.store.get(other["session_id"])["recording_artifact"]), sid),
+            )
+        with self.assertRaisesRegex(ValueError, "registered session"):
+            await self.service.verify_recording(sid, self.members, self.read_member)
+        with self.store.transaction() as cursor:
+            cursor.execute(
+                "UPDATE simulation_session SET recording_artifact=%s::jsonb WHERE session_id=%s",
+                (json.dumps(original_ref), sid),
+            )
         recording = self.service.root / sid / "recording"
-        verified = await asyncio.to_thread(verify, recording, self.root / "model")
+        verified = await asyncio.to_thread(
+            verify, recording, self.root / "model", expected_request_digest=self.store.get(sid)["request_digest"]
+        )
         self.assertGreater(verified["ticks"], 0)
         path = recording / "ticks.jsonl"
         lines = path.read_text().splitlines()
@@ -226,7 +429,9 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
         lines[0] = json.dumps(tampered)
         path.write_text("\n".join(lines) + "\n")
         with self.assertRaisesRegex(ValueError, "TCP differs"):
-            await asyncio.to_thread(verify, recording, self.root / "model")
+            await asyncio.to_thread(
+                verify, recording, self.root / "model", expected_request_digest=self.store.get(sid)["request_digest"]
+            )
         saved = self.store.previous_profile("app:tenant:operator", self.request["source"]["subject_sha256"])
         self.assertEqual(self.request["profile"], saved["profile"])
         with self.store.transaction() as cursor:
@@ -238,7 +443,7 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
             self.store.previous_profile("app:tenant:operator", self.request["source"]["subject_sha256"])
 
     async def test_bad_source_and_maintenance_drain_release_capacity(self):
-        await self.service.start()
+        await self.start_service()
         with self.assertRaisesRegex(ValueError, "digest changed"):
             await self.service.create(
                 "app:tenant:operator", "bad-source", self.run_id, self.request, self.members, lambda *_args: b"changed"
@@ -266,7 +471,7 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
         await self.service.stop(sid)
 
     async def test_http_websocket_authentication_and_exclusive_viewer(self):
-        await self.service.start()
+        await self.start_service()
 
         class Identity:
             def profile(self, _token):
@@ -286,7 +491,6 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
         }
         portal._preview_payload = lambda *_args: {"mjcf": self.request["source"]}
         portal._read_fact_projection = lambda *_args: {"members": self.members}
-        portal._registered_member_bytes = self.read_member
         session = portal.sessions.create("Operator", "external-token", principal="app:tenant:operator")
         listener = socket.socket()
         listener.bind(("127.0.0.1", 0))
@@ -415,7 +619,19 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
                     f"/api/simulations/{sid}/commands", headers=headers, json={"type": "stop", "command_id": "stop"}
                 )
                 self.assertEqual(200, response.status_code, response.text)
-                await asyncio.to_thread(verify, self.service.root / sid / "recording", self.root / "model")
+                await asyncio.to_thread(
+                    verify,
+                    self.service.root / sid / "recording",
+                    self.root / "model",
+                    expected_request_digest=self.store.get(sid)["request_digest"],
+                )
+                response = await client.post(
+                    f"/api/simulations/{sid}/recording/verify", headers=headers, json={"request_digest": "0" * 64}
+                )
+                self.assertEqual(400, response.status_code, response.text)
+                response = await client.post(f"/api/simulations/{sid}/recording/verify", headers=headers)
+                self.assertEqual(200, response.status_code, response.text)
+                self.assertEqual(sid, response.json()["binding"]["session_id"])
                 response = await client.get(f"/api/simulations/{sid}/recording")
                 self.assertEqual(200, response.status_code, response.text[:100] if response.status_code != 200 else "")
                 self.assertTrue(response.content.startswith(b"PK"))

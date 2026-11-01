@@ -105,6 +105,25 @@ class SimulationStore:
             )
             if digest(result["request"]) != result["request_digest"]:
                 raise SimulationConflict("Stored simulation request digest is inconsistent")
+            if result["recording_artifact"] is not None:
+                ref = ArtifactRef.from_record(result["recording_artifact"])
+                cursor.execute(
+                    "SELECT kind,locator,manifest_sha256,set_sha256,producer_run_id,producer_stage,"
+                    "producer_tool_sha256 "
+                    "FROM artifact WHERE artifact_id=%s",
+                    (ref.artifact_id,),
+                )
+                registered = cursor.fetchone()
+                if registered != (
+                    ref.kind,
+                    ref.locator,
+                    ref.manifest_sha256,
+                    ref.set_sha256,
+                    ref.producer_run_id,
+                    ref.producer_stage,
+                    ref.producer_tool_sha256,
+                ):
+                    raise SimulationConflict("Session recording differs from its artifact registration")
             return result
 
     def transition(self, session_id: str, owner: str, state: str, *, error=None, process=None, recording=None) -> dict:

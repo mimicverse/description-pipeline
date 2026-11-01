@@ -74,12 +74,11 @@ link 不使用 CONFLATE。序号缺口、源重启、有界队列溢出或本地
 
 ## 录制与核验
 
-录制保存原始帧、实际 dt、每拍 q、目标、拒绝原因、版本与显示变换。独立核验从同一精确来源重新加载 MuJoCo，检查源摘要、关节范围/速率、固定关节、显示矩阵及 applied TCP。它不调用 IK 的 pose()，也不把跟随成功解释为动力学或硬件资格。
+录制保存原始帧、实际 dt、每拍 q、目标、拒绝原因、版本与显示变换。核验从已登记会话读取不可变请求摘要、运行时身份和封存 ArtifactRef，再从登记来源物化模型；客户端不能覆盖预期身份。独立 MuJoCo 子进程检查源摘要、关节范围/速率、固定关节、显示矩阵及 applied TCP，按完成元数据区分完整/不完整记录。网页停止后可点击 `Check Recording`。这证明所列运动学一致性，外部控制事件的完整重放须等待新版 Teleop 契约，不增加动力学或硬件资格。
 
 ```sh
-python -m description_pipeline.simulation.verify_recording \
-  --recording /absolute/path/extracted-recording \
-  --source /absolute/path/verified-source-tree
+# Use the derived PLATFORM_OPERATOR_DSN and PLATFORM_ARTIFACT_ROOT.
+python -m description_pipeline.simulation.verify_recording --session <registered-session-id>
 ```
 
 异常退出记录标为不完整，未封存原件保留在仿真根。主管崩溃后先等待旧 worker 的管道/watchdog 退出；按 boot ID、PID 和启动时间确认消失后才结算失败。无法确认时保持 unresolved，禁止猜 PID 杀进程；未决记录阻止维护排空。worker 当前每拍记录完整快照，单会话 512 MiB 上限、最长一小时；压缩记录布局是后续 Teleop 差量。
@@ -174,3 +173,11 @@ Linux 离线资产纳入固定 Teleop wheel、全部依赖、私有 worker 环�
 1. 固定 M1 的 worker 协议、命令/事件记录和可信核验接口，向在任 Teleop 设计/实现职责形成可审查差量需求；在取得相应任务安排前，本会话不恢复 Teleop 写权。
 2. 在 pipeline 隔离分支完成外部身份锚定、命令对账、实际版本绑定测试及性能采样入口；与真实模型基线一起提交定向证据。
 3. 按 M2–M5 顺序完成真实模型、性能/体验和真人/发行验收。现任 Teleop 唯一写者、项目负责人及唯一发布者职责保持有效；本计划不改变现场执行权限。
+
+### 执行进展与证据边界
+
+M1 的 pipeline 录制核验已绑定登记会话、不可变请求摘要、运行时、ArtifactRef 及录制内的唯一会话身份，防止请求和预算成组篡改、同配置不同会话串用。核验复用登记来源，在不继承数据库凭据的受限子进程内运行；取消时等待来源读取结束并回收实际子进程，单实例核验不积压。真实 PostgreSQL、固定 worker、HTTP/WS、ZMQ 和 CLI 的六项软件集成通过；浏览器完成停止后 614 tick 的核验。范围与固定字节见 `reviews/pico-optimization-20261101/M1-RECORDING-EVIDENCE.json`；旧 `DEVELOPMENT-EVIDENCE.json` 仅证明其原提交，不覆盖本轮差量。
+
+Teleop 设计负责人已固定 `teleop.upper-body.worker/1`：命令接纳与实际生效分离，事件关联 command ID、来源序号和 effective tick；原始输入、会话事件和 canonical `run-record/3` 职责分开。当前仍使用 `8b402482` wheel。新协议实现、正常开管道退出、原生 applied 回执、UNKNOWN 对账、完整事件回放与背压验证尚未完成，不作为上述录制核验的通过结论。
+
+M2 已由 pipeline 总负责人指定 R03、R04 完整手动导出目录，允许只读固定并离线派生 MJCF。它们是真实模型的软件输入，不是正式 run/ArtifactRef，也不能关联既有 inspection preview 运行。两版各有一个 207,595 面的合法 binary STL，超过 MuJoCo STL decoder 的 200,000 面上限；当前实际派生的独立 `engine.load` 检查均失败，已反馈负责人并保全原件。后续无损编码适配与模型跟随测试分别报告，不能因此跳过正式转换器及独立 Verify。原模型 ±180° 和 effort/velocity=0 是预览占位，机械限位、全行程间隙、实物方向与硬件资格仍未建立。
