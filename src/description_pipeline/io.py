@@ -382,7 +382,7 @@ def read_data(path: Path) -> Any:
 def write_json(path: Path, data: Any) -> None:
     path = Path(_filesystem_path(path))
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    fd, temporary = tempfile.mkstemp(prefix=".part-", dir=path.parent)
     try:
         with os.fdopen(fd, "wb") as stream:
             payload = canonical(data)

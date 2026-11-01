@@ -820,7 +820,7 @@ class NativeOperationClient:
             headers={**self._headers, "Accept": "application/zip"},
         )
         descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{target.name}.",
+            prefix=".part-",
             dir=target.parent,
         )
         temporary = Path(temporary_name)

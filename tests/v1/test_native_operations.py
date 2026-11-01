@@ -23,7 +23,7 @@ from urllib import error as urlerror
 from urllib import request as urlrequest
 
 from description_pipeline.delivery import PIPELINE_ID
-from description_pipeline.io import canonical, digest, file_digest, write_json
+from description_pipeline.io import _filesystem_path, canonical, digest, file_digest, write_json
 from description_pipeline.native_transfer import CAPTURE_TRANSFER_SCHEMA
 from description_pipeline.orchestration.airflow_effect_trigger import (
     _native_wakeable,
@@ -355,11 +355,17 @@ class NativeOperationRuntimeTests(unittest.TestCase):
         self.assertEqual(repeated_upload, finished)
         self.assertEqual(self.calls, 1)
 
-        destination = self.root / "download/result.zip"
+        destination = Path(_filesystem_path(self.root / "download" / ("a" * 246 + ".zip")))
+        self.assertEqual(len(destination.name.encode("ascii")), 250)
+        destination.parent.mkdir(parents=True)
+        destination.write_bytes(b"ordinary destination control")
+        self.assertEqual(destination.read_bytes(), b"ordinary destination control")
+        destination.unlink()
         downloaded = client.download_artifact("operation-roundtrip", destination)
         self.assertEqual(downloaded.path, destination)
         self.assertEqual(destination.read_bytes(), b"sealed native artifact")
         self.assertEqual(downloaded.sha256, file_digest(destination))
+        self.assertEqual([path.name for path in destination.parent.iterdir()], [destination.name])
 
     def test_long_operation_identity_does_not_lengthen_native_workspace(self) -> None:
         workspaces = []
