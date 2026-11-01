@@ -12,7 +12,8 @@
 <p class="pose-legend">Targets: red requested · orange admitted · green applied. Axes show orientation.</p>
 <label>Geometry <select id="mode"><option value="visual">Visual</option><option value="collision">Collision</option><option value="overlay">Overlay</option></select></label>
 <button id="estop" disabled>Emergency Stop</button><button id="stop" disabled>Stop Session</button>
-<button id="pair" disabled>Pair PICO Link</button><a id="recording" hidden>Download Recording</a><button id="verify-recording" hidden>Check Recording</button>
+<button id="link-setup" disabled>Download Link Setup</button><button id="pair" disabled>Pair PICO Link</button><a id="recording" hidden>Download Recording</a><button id="verify-recording" hidden>Check Recording</button>
+<p id="link-help">On the gateway computer, run the installed pico-link launcher with the downloaded setup file. Enter a fresh pairing code when prompted. Keep the SDK in its separate environment.</p>
 <p id="pairing"></p><p id="verification-status" aria-live="polite"></p><details><summary>Immutable source and runtime</summary><pre id="source"></pre></details>
 <details><summary>Source warnings and verification scope</summary><pre id="warnings"></pre></details>
 </section><section class="panel">

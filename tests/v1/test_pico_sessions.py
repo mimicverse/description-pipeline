@@ -37,6 +37,7 @@ if SESSION_TESTS:
     from description_pipeline.orchestration.airflow_client import native_run_id
     from description_pipeline.orchestration.feishu_oauth import build_actor_name
     from description_pipeline.orchestration.portal import PortalApp, PortalConfig
+    from description_pipeline.orchestration.report_view import text_warning_inventory
     from description_pipeline.pipeline.contracts import RunAdmission, StageCommand, StageResult
     from description_pipeline.simulation.service import SimulationService
     from description_pipeline.simulation.store import SimulationConflict, SimulationStore
@@ -155,7 +156,6 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
                 "entry": "mjcf/robot.xml",
                 "engine": {"mujoco": "3.13.0"},
                 "subject_sha256": digest(files),
-                "warnings": ["Inspection fixture"],
                 "verification_scope": "kinematic fixture",
                 "portal_run_id": "source",
             },
@@ -164,6 +164,16 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
             "record": True,
             "runtime": {},
         }
+        warning_path = "reports/mjcf-certificate.json"
+        warnings = ["Inspection fixture"]
+        certificate = {"report": {"checks": [{
+            "id": "provenance.warnings",
+            "details": {"warning_comments": warnings, "warning_sha256": digest(warnings)},
+        }]}}
+        (source / warning_path).parent.mkdir()
+        certificate_bytes = canonical(certificate)
+        (source / warning_path).write_bytes(certificate_bytes)
+        files[warning_path] = hashlib.sha256(certificate_bytes).hexdigest()
         source_ref = self.artifacts.seal_tree(
             source, kind="pico_test_source", producer_run_id=None, producer_stage=None, producer_tool_sha256="c" * 64
         )
@@ -171,6 +181,7 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
             item["path"]: {**item, "artifact": source_ref.to_record()}
             for item in self.artifacts.verify(source_ref)["members"]
         }
+        self.request["source"]["warning_inventory"] = text_warning_inventory(warnings, self.members[warning_path])
         self.read_member = lambda name, member: self.artifacts.read_metadata_member(
             ArtifactRef.from_record(member["artifact"]), name, max_bytes=64 * 1024 * 1024
         )[0]
@@ -266,6 +277,17 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
             fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
         self.assertIsNone(self.service._lock)
         self.assertIsNone(self.service.runtime_identity)
+
+    async def test_inline_warning_inventory_is_rejected_before_database_admission(self):
+        await self.start_service()
+        request = {**self.request, "source": {**self.request["source"], "warnings": ["Inspection fixture"]}}
+        with self.assertRaisesRegex(ValueError, "Inline warning inventories are unsupported"):
+            await self.service.create(
+                "app:tenant:operator", "inline-warning-copy", self.run_id, request, self.members, self.read_member,
+            )
+        with self.store.transaction() as cursor:
+            cursor.execute("SELECT count(*) FROM simulation_session WHERE request_key='inline-warning-copy'")
+            self.assertEqual(0, cursor.fetchone()[0])
 
     async def test_cancelled_supervisor_acquisition_releases_real_database_lease(self):
         from unittest.mock import patch
@@ -456,6 +478,7 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
                 self.read_member,
             )
         current = self.service.running[sid]
+        self.assertFalse((current.root / "request.json").exists())
         self.assertEqual("3.13.0", current.model["engine"])
         self.assertEqual(9, len(current.model["joints"]))
         code = await self.service.pair(sid)
@@ -608,7 +631,7 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
                 descriptor = choices.json()
                 self.assertIsNone(descriptor["saved"])
                 self.assertEqual(self.request["source"]["subject_sha256"], descriptor["subject_sha256"])
-                self.assertEqual(self.request["source"]["warnings"], descriptor["warnings"])
+                self.assertEqual(self.request["source"]["warning_inventory"], descriptor["warning_inventory"])
                 self.assertEqual(self.request["source"]["verification_scope"], descriptor["verification_scope"])
                 self.assertEqual("probe", descriptor["model"]["robot_name"])
                 self.assertEqual(9, len(descriptor["model"]["joints"]))

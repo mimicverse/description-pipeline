@@ -2,6 +2,7 @@ import * as THREE from "/static/vendor/three.module.min.js";
 import { createViewer, disposeRobot } from "/static/viewer.js";
 import { compiledGeometry, frameCompiledGeometry } from "/static/mjcf_viewer.js";
 import { createProfileEditor } from "/static/pico_profile.js";
+import { downloadLinkSetup } from "/static/pico_link.js";
 const $ = (id) => document.getElementById(id);
 const run = new URL(location.href).searchParams.get("run");
 const launchSaved = new URL(location.href).searchParams.get("launch") === "1";
@@ -17,6 +18,17 @@ async function api(path, options = {}) {
   return result;
 }
 function failure(error) { $("error").textContent = error.message; }
+function showWarnings(inventory, scope) {
+  const certificate = inventory.certificate;
+  const lines = [
+    `${inventory.count} warnings · ${inventory.shown} displayed · ${inventory.omitted} not expanded.`,
+    `Complete inventory: ${certificate.path} (${certificate.bytes} bytes).`,
+    `Certificate SHA-256: ${certificate.sha256}`,
+    `Source artifact: ${certificate.artifact.artifact_id} · Scope: ${scope}`,
+    ...inventory.items.map((item) => `${item.excerpt ? "[Excerpt]" : "[Full record]"} ${item.text}`),
+  ];
+  $("warnings").textContent = lines.join("\n\n");
+}
 function pendingControls() {
   for (const input of $("profile-editor").querySelectorAll("input, select, textarea, button")) input.disabled = Boolean(pending) || input.dataset.sourceFixed === "true";
   $("record").disabled = Boolean(pending);
@@ -107,8 +119,9 @@ async function connect() {
 }
 async function inspect() {
   const row = await api(`/api/simulations/${sessionId}`);
+  $("link-setup").disabled = !["starting", "ready"].includes(row.state);
   $("source").textContent = JSON.stringify({ session_id: row.session_id, request_digest: row.request_digest, source: row.source, runtime: row.runtime }, null, 2);
-  $("warnings").textContent = JSON.stringify({ warnings: row.source.warnings, scope: row.source.verification_scope }, null, 2);
+  showWarnings(row.source.warning_inventory, row.source.verification_scope);
   $("recording").hidden = !row.recording_artifact;
   $("verify-recording").hidden = !row.recording_artifact;
   if (row.recording_artifact) { $("recording").hidden = false; $("recording").href = `/api/simulations/${sessionId}/recording`; }
@@ -134,6 +147,12 @@ $("verify-recording").onclick = async () => {
   finally { $("verify-recording").disabled = false; }
 };
 $("mode").onchange = () => { mode = $("mode").value; };
+$("link-setup").onclick = async () => {
+  try {
+    downloadLinkSetup(location.origin, await inspect());
+    $("link-help").textContent = "Open this setup file with the installed pico-link launcher, then enter a fresh code from Pair PICO Link. The setup file contains no pairing code.";
+  } catch (error) { failure(error); }
+};
 for (const type of ["estop", "stop", "pair"]) $(type).onclick = () => command(type).catch(failure);
 $("setup").onsubmit = async (event) => {
   event.preventDefault(); $("error").textContent = ""; $("launch").disabled = true;
@@ -163,7 +182,7 @@ async function initialize() {
   if (!(await api("/api/simulation-capability")).available) throw new Error("The native Teleop worker is not configured on this portal");
   const saved = await api(`/api/runs/${encodeURIComponent(run)}/simulation-profile`);
   $("source").textContent = JSON.stringify({ subject_sha256: saved.subject_sha256, robot_name: saved.model.robot_name }, null, 2);
-  $("warnings").textContent = JSON.stringify({ warnings: saved.warnings, scope: saved.verification_scope }, null, 2);
+  showWarnings(saved.warning_inventory, saved.verification_scope);
   profileEditor = createProfileEditor($("profile-editor"), saved.model, saved.subject_sha256, failure);
   if (saved.saved) { profileEditor.load(saved.saved); $("record").checked = saved.saved.record; }
   $("status").textContent = `Source ${saved.model.robot_name}. Review the profile and software execution budgets.`;
