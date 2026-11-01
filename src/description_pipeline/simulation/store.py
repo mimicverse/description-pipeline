@@ -32,13 +32,16 @@ class SimulationStore:
             raise
 
     @contextmanager
-    def transaction(self):
-        connection = self.connect()
+    def transaction(self, *, connection=None):
+        owned = connection is None
+        if owned:
+            connection = self.connect()
         try:
-            with connection:
-                yield connection.cursor()
+            with connection, connection.cursor() as cursor:
+                yield cursor
         finally:
-            connection.close()
+            if owned:
+                connection.close()
 
     def create(self, actor: str, key: str, source_run: str, request: dict, owner: str, *, capacity: int = 2) -> dict:
         request_digest = digest(request)
@@ -368,9 +371,25 @@ class SimulationStore:
             if cursor.rowcount:
                 self._settle_worker_commands(cursor, session_id)
 
-    def begin_verification(self, session_id, command_id, request, owner):
+    def acquire_verification_slot(self):
+        """Hold the existing verification advisory key for one actual managed owner."""
+        connection = self.connect()
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_try_advisory_lock(738204164)")
+                acquired = cursor.fetchone()[0]
+            connection.commit()
+            if not acquired:
+                connection.close()
+                return None
+            return connection
+        except BaseException:
+            connection.close()
+            raise
+
+    def begin_verification(self, session_id, command_id, request, owner, *, slot=None):
         """The existing command row owns one global managed verification slot."""
-        with self.transaction() as cursor:
+        with self.transaction(connection=slot) as cursor:
             cursor.execute("SELECT pg_advisory_xact_lock(738204164)")
             cursor.execute(
                 "SELECT 1 FROM simulation_command WHERE request->>'type'='verify_recording' "

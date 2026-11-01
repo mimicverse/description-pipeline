@@ -278,6 +278,145 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
                 ),
             )
 
+    def cli_config(self, python=WORKER):
+        path = self.root / ("portal-cli-" + uuid.uuid4().hex + ".json")
+        path.write_bytes(
+            canonical(
+                {
+                    "portal": {
+                        "simulation": {
+                            "root": str(self.service.root),
+                            "python": str(python),
+                            "capacity": self.service.capacity,
+                        }
+                    }
+                }
+            )
+        )
+        return str(path)
+
+    async def software_recording_for_cli(self):
+        """Real source/CAS/PG fixture with explicit completion-proof doubles, not native qualification."""
+        from tests.v1.test_pico_evidence import EvidenceFixture
+
+        await self.start_service()
+        row = self.store.create(
+            "fixture-operator", "cli-software-recording", self.run_id, self.request, self.service.owner
+        )
+        session = self.service.root / row["session_id"]
+        fixture = EvidenceFixture(session)
+        recording_module.materialize_source(session / "source", self.request["source"], self.members, self.read_member)
+        (session / "recording/request.json").write_bytes(canonical(self.request) + b"\n")
+        (session / "recording/session.json").write_bytes(canonical(session_identity(row)) + b"\n")
+        fixture.finalization_fixture()
+        outcome = {
+            "complete": True,
+            "error": None,
+            "container_complete": True,
+            "session_complete": True,
+            "formal_one_hour_qualified": False,
+            "streams": {},
+            "manifest_sha256": hashlib.sha256((fixture.native / "session-manifest.json").read_bytes()).hexdigest(),
+            "finalization_verification": fixture.finalization_result_double(),
+        }
+        async with self.service._storage_gate:
+            record = await asyncio.to_thread(
+                self.service._store_recording_result, session, outcome, self.request["runtime"], True
+            )
+        row = self.store.transition(row["session_id"], self.service.owner, "failed", recording=record)
+        self.register_cli_source_fixture()
+        return row
+
+    async def launch_managed_cli(self, sid, python):
+        return await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-B",
+            "-m",
+            "description_pipeline.simulation.verify_recording",
+            "--session",
+            sid,
+            "--config",
+            self.cli_config(python),
+            env={
+                **os.environ,
+                "PLATFORM_ARTIFACT_ROOT": str(self.artifacts.root),
+                "PLATFORM_OPERATOR_DSN": psycopg2.extensions.make_dsn(
+                    self.pg.get_uri(), options=f"-csearch_path={self.schema}"
+                ),
+            },
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+    async def test_managed_cli_config_path_records_real_exec_failure_and_releases_its_partial_and_slot(self):
+        row = await self.software_recording_for_cli()
+        sid = row["session_id"]
+        ref = ArtifactRef.from_record(row["recording_artifact"])
+        before = self.artifacts.verify(ref)
+        child = await self.launch_managed_cli(sid, self.root / "missing-python")
+        stdout, stderr = await asyncio.wait_for(child.communicate(), 15)
+        self.assertNotEqual(0, child.returncode)
+        self.assertIn("absolute fixed PICO", (stdout + stderr).decode())
+        attempt = self.store.verification_attempts(sid)[-1]
+        self.assertEqual("failed", attempt["result"]["state"])
+        self.assertIsNone(attempt["result"]["process_identity"])
+        self.assertFalse(self.service._verification_partial(attempt["command_id"], attempt["request"]).exists())
+        self.assertEqual(before, self.artifacts.verify(ref))
+        slot = self.store.acquire_verification_slot()
+        self.assertIsNotNone(slot)
+        slot.close()
+
+    async def test_live_managed_cli_survives_real_service_restart_and_sigterm_cleans_its_exact_helper(self):
+        row = await self.software_recording_for_cli()
+        sid = row["session_id"]
+        wrapper = self.root / "blocked-native-entry"
+        wrapper.write_text(
+            "#!" + sys.executable + "\nimport os,sys\nos.execv(sys.executable, "
+            "[sys.executable,'-I','-B','-c','import time;time.sleep(60)',*sys.argv[1:]])\n"
+        )
+        wrapper.chmod(0o700)
+        await self.service.close()
+        child = await self.launch_managed_cli(sid, wrapper)
+        identity = None
+        restarted = SimulationService(self.store, self.artifacts, self.service.root, Path(WORKER))
+        try:
+            async with asyncio.timeout(15):
+                while True:
+                    attempts = self.store.verification_attempts(sid)
+                    if attempts and attempts[-1]["result"]["state"] == "running":
+                        identity = attempts[-1]["result"]["process_identity"]
+                        break
+                    if child.returncode is not None:
+                        stdout, stderr = await child.communicate()
+                        self.fail((stdout + stderr).decode())
+                    await asyncio.sleep(0.02)
+            self.assertEqual("alive", resource_state(identity))
+            await restarted.start()
+            self.assertEqual("alive", resource_state(identity))
+            with self.assertRaisesRegex(SimulationConflict, "capacity"):
+                await restarted.verify_recording(sid, self.members, self.read_member)
+            await restarted.close()
+            self.assertEqual("alive", resource_state(identity))
+            child.send_signal(signal.SIGTERM)
+            stdout, stderr = await asyncio.wait_for(child.communicate(), 15)
+            self.assertEqual(130, child.returncode, (stdout + stderr).decode())
+            self.assertEqual(b"", stdout)
+            attempt = self.store.verification_attempts(sid)[-1]
+            self.assertEqual("cancelled", attempt["result"]["state"])
+            self.assertEqual(identity, attempt["result"]["process_identity"])
+            self.assertEqual("dead", resource_state(identity))
+            self.assertFalse(restarted._verification_partial(attempt["command_id"], attempt["request"]).exists())
+            slot = self.store.acquire_verification_slot()
+            self.assertIsNotNone(slot)
+            slot.close()
+        finally:
+            if child.returncode is None:
+                child.kill()
+                await child.wait()
+            if identity is not None:
+                await self.service._terminate_identity(identity)
+            await restarted.close()
+
     async def start_service(self):
         await self.service.start()
         self.request["runtime"] = self.service.runtime_identity
@@ -325,6 +464,126 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
         self.store.transition(first["session_id"], self.service.owner, "unresolved", error="Fixture unknown ownership")
         self.store.transition(second["session_id"], self.service.owner, "failed", error="Fixture confirmed failure")
         self.assertEqual([first["session_id"]], self.store.active_session_ids())
+
+    async def test_live_cli_slot_prevents_reconciliation_and_owner_crash_allows_exact_group_cleanup(self):
+        from description_pipeline.simulation.verification import ManagedRecordingVerification
+
+        row = self.store.create("fixture-operator", "live-cli-slot", self.run_id, self.request, self.service.owner)
+        recording = self.root / "slot-recording"
+        recording.mkdir()
+        (recording / "scope.txt").write_text(
+            "PG slot and process ownership fixture; no business or native qualification"
+        )
+        ref = self.artifacts.seal_tree(
+            recording,
+            kind="teleop_recording",
+            producer_run_id=None,
+            producer_stage=None,
+            producer_tool_sha256=digest(self.request["runtime"]),
+        )
+        row = self.store.transition(row["session_id"], self.service.owner, "failed", recording=ref.to_record())
+        command = "verify-crashed-cli"
+        request = {
+            "type": "verify_recording",
+            "binding": recording_binding(row),
+            "partial": "recording-verification-" + command,
+            "execution": self.service._consumer_execution,
+        }
+        partial = self.service._verification_partial(command, request)
+        partial.mkdir(parents=True)
+        (partial / "source.bin").write_bytes(b"Original partial bytes")
+        child = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-B",
+            str(ROOT / "tests/v1/pico_verification_slot_owner.py"),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        identity = None
+        try:
+            payload = {
+                "dsn": self.pg.get_uri(),
+                "schema": self.schema,
+                "session": row["session_id"],
+                "command": command,
+                "request": request,
+                "owner": "separate-cli-owner",
+                "nonce": uuid.uuid4().hex,
+            }
+            child.stdin.write(canonical(payload))
+            await child.stdin.drain()
+            # The owner reads one complete request, then keeps its existing PG session lock.
+            child.stdin.write(b"\n")
+            await child.stdin.drain()
+            identity = json.loads(await asyncio.wait_for(child.stdout.readline(), 10))
+            self.assertEqual("alive", resource_state(identity))
+            original = self.store.verification_attempts(row["session_id"])
+            contender = ManagedRecordingVerification(self.store, self.artifacts, self.service.root, Path(WORKER))
+            await contender._reconcile_verifications()
+            self.assertEqual(original, self.store.verification_attempts(row["session_id"]))
+            self.assertEqual(b"Original partial bytes", (partial / "source.bin").read_bytes())
+            with self.assertRaisesRegex(SimulationConflict, "capacity"):
+                await contender.verify_recording(row["session_id"], {}, lambda *_arguments: None)
+            self.assertEqual("alive", resource_state(identity))
+            child.kill()
+            await child.wait()
+            async with asyncio.timeout(10):
+                while self.store.verification_attempts(row["session_id"])[0]["result"]["state"] != "failed":
+                    await contender._reconcile_verifications()
+                    await asyncio.sleep(0.02)
+            actual = self.store.verification_attempts(row["session_id"])[0]
+            self.assertEqual(request, actual["request"])
+            self.assertEqual(identity, actual["result"]["process_identity"])
+            self.assertEqual("dead", resource_state(identity))
+            self.assertFalse(partial.exists())
+            slot = self.store.acquire_verification_slot()
+            self.assertIsNotNone(slot)
+            slot.close()
+        finally:
+            if child.returncode is None:
+                child.kill()
+                await child.wait()
+            if identity is not None:
+                await self.service._terminate_identity(identity)
+
+    async def test_repeated_cancellation_waits_for_the_actual_verification_slot_connection(self):
+        from unittest.mock import patch
+        from description_pipeline.simulation.verification import ManagedRecordingVerification
+
+        entered, release = threading.Event(), threading.Event()
+        acquired = {}
+        actual = self.store.acquire_verification_slot
+
+        def delayed():
+            connection = actual()
+            acquired["connection"] = connection
+            entered.set()
+            if not release.wait(5):
+                connection.close()
+                raise TimeoutError("Verification slot test release was not delivered")
+            return connection
+
+        managed = ManagedRecordingVerification(self.store, self.artifacts, self.service.root, Path(WORKER))
+        with patch.object(self.store, "acquire_verification_slot", delayed):
+            checking = asyncio.create_task(managed.verify_recording("not-admitted", {}, lambda *_arguments: None))
+            try:
+                self.assertTrue(await asyncio.to_thread(entered.wait, 5))
+                for _ in range(3):
+                    checking.cancel()
+                    await asyncio.sleep(0.02)
+                    self.assertFalse(checking.done())
+                    self.assertFalse(acquired["connection"].closed)
+                self.assertIsNone(actual())
+            finally:
+                release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await checking
+        self.assertTrue(acquired["connection"].closed)
+        self.assertEqual([], self.store.verification_attempts())
+        replacement = actual()
+        self.assertIsNotNone(replacement)
+        replacement.close()
 
     async def test_fresh_parent_cold_runtime_import_rejects_marker_before_execution(self):
         await self.exercise_fresh_parent_helper_drift("cold_runtime")
@@ -527,7 +786,11 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
                 starting = asyncio.create_task(self.service.start())
                 try:
                     self.assertTrue(await asyncio.to_thread(entered.wait, 10))
-                    starting.cancel()
+                    for _ in range(3):
+                        starting.cancel()
+                        await asyncio.sleep(0.02)
+                        self.assertFalse(starting.done())
+                        self.assertFalse(acquired["connection"].closed)
                 finally:
                     release.set()
                     await asyncio.gather(starting, return_exceptions=True)
@@ -833,8 +1096,10 @@ sys.stdin.buffer.read(1)
             starting = asyncio.create_task(self.service.start())
             try:
                 await asyncio.wait_for(entered.wait(), 5)
-                starting.cancel()
-                await asyncio.sleep(0)
+                for _ in range(3):
+                    starting.cancel()
+                    await asyncio.sleep(0.02)
+                    self.assertFalse(starting.done())
             finally:
                 release.set()
             with self.assertRaises(asyncio.CancelledError):
@@ -945,11 +1210,17 @@ sys.stdin.buffer.read(1)
                 self.assertFalse(closing.done())
                 self.assertIsNotNone(self.service._lock)
                 self.assertEqual("alive", resource_state(spawned[0][1]))
+                for _ in range(3):
+                    closing.cancel()
+                    await asyncio.sleep(0.02)
+                    self.assertFalse(closing.done())
+                    self.assertIsNotNone(self.service._lock)
             finally:
                 release.set()
             with self.assertRaisesRegex(SimulationConflict, "closed during startup"):
                 await starting
-            await asyncio.wait_for(closing, 10)
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(closing, 10)
         self.assertIsNone(self.service._lock)
         self.assertEqual("dead", resource_state(spawned[0][1]))
         await self.service.close()
@@ -1524,8 +1795,8 @@ sys.stdin.buffer.read(1)
             "description_pipeline.simulation.verify_recording",
             "--session",
             sid,
-            "--python",
-            WORKER,
+            "--config",
+            self.cli_config(),
             env={
                 **os.environ,
                 "TMPDIR": str(cli_temporary),
@@ -1541,7 +1812,11 @@ sys.stdin.buffer.read(1)
         self.assertEqual(0, cli.returncode, (stdout + stderr).decode())
         cli_result = json.loads(stdout)
         self.assertEqual(bound["binding"], cli_result["binding"])
-        self.assertEqual(cli.pid, cli_result["verifier_pid"])
+        cli_attempt = self.store.verification_attempts(sid)[-1]
+        self.assertEqual("completed", cli_attempt["result"]["state"])
+        self.assertEqual(cli_result, cli_attempt["result"]["value"])
+        self.assertEqual(cli_result["verifier_pid"], cli_attempt["result"]["process_identity"]["pid"])
+        self.assertEqual("dead", resource_state(cli_attempt["result"]["process_identity"]))
         self.assertEqual([], list(cli_temporary.iterdir()))
         other = await self.service.create(
             "app:tenant:other",
@@ -1788,7 +2063,7 @@ sys.stdin.buffer.read(1)
             await checking
         self.assertEqual("dead", resource_state(identities[0]))
 
-    async def test_recording_cli_cleans_handoff_on_exec_and_native_runtime_failure(self):
+    async def test_recording_cli_uses_managed_partial_on_exec_and_native_runtime_failure(self):
         await self.start_service()
         row = await self.service.create(
             "app:tenant:operator", "cli-error-handoff", self.run_id, self.request, self.members, self.read_member
@@ -1815,8 +2090,8 @@ sys.stdin.buffer.read(1)
                     "description_pipeline.simulation.verify_recording",
                     "--session",
                     sid,
-                    "--python",
-                    str(python),
+                    "--config",
+                    self.cli_config(python),
                     env=environment,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
