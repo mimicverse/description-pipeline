@@ -238,22 +238,44 @@ class PicoPortal:
             previous = await asyncio.to_thread(
                 self.service.store.authorize_command, session_id, body["command_id"], principal, body
             )
-            if previous is not None:
-                return JSONResponse(previous)
             if body["type"] == "pair":
+                if previous is not None:
+                    return JSONResponse(previous)
                 result = {"pairing_code": await self.service.pair(session_id), "expires_in_s": 60}
+                await asyncio.to_thread(self.service.store.complete_command, session_id, body["command_id"], result)
             elif body["type"] == "estop":
-                await self.service.send(session_id, {"type": "estop"})
-                result = {"accepted": True}
+                if previous is not None and previous.get("state") in {"applied", "rejected", "not_sent"}:
+                    result = previous
+                else:
+                    await self.service.send(session_id, {"type": "estop"}, command_id=body["command_id"])
+                    result = next(
+                        item["result"]
+                        for item in await asyncio.to_thread(
+                            self.service.store.worker_commands,
+                            session_id,
+                        )
+                        if item["command_id"] == body["command_id"]
+                    )
             else:
-                await self.service.stop(session_id)
+                await self.service.stop(session_id, command_id=body["command_id"])
                 settled = await asyncio.to_thread(self.service.store.get, session_id)
+                native = next(
+                    item["result"]
+                    for item in await asyncio.to_thread(
+                        self.service.store.worker_commands,
+                        session_id,
+                    )
+                    if item["command_id"] == body["command_id"]
+                )
                 result = {
                     "stopped": settled["state"] == "stopped",
                     "state": settled["state"],
                     "error": settled["error"],
+                    "command_state": native["state"] if native else "not_sent",
+                    "response": native["response"] if native else None,
                 }
-            await asyncio.to_thread(self.service.store.complete_command, session_id, body["command_id"], result)
+            if "envelope" in result:
+                result = {key: value for key, value in result.items() if key != "envelope"}
             return JSONResponse(result)
         except Exception as error:
             return self.error(error)
@@ -358,9 +380,17 @@ class PicoPortal:
                 ):
                     raise ValueError("PICO input is expired or belongs to another binding")
                 current.input_until = now + 0.25
-                await self.service.send(session_id, {"type": "frame", "frame": message["frame"]})
+                receipt = await self.service.send(session_id, {"type": "frame", "frame": message["frame"]})
                 anchor = time.monotonic()
-                await websocket.send_json({"type": "input_ack", "anchor": anchor})
+                await websocket.send_json(
+                    {
+                        "type": "input_ack",
+                        "anchor": anchor,
+                        **{key: receipt[key] for key in ("command_id", "effective_tick", "state_digest")},
+                        "accepted": True,
+                        "applied": True,
+                    }
+                )
         except (TimeoutError, WebSocketDisconnect):
             pass
         except Exception:

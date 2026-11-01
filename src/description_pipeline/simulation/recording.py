@@ -9,13 +9,12 @@ import os
 from pathlib import Path
 import shutil
 import secrets
-import sys
 
 from ..io import canonical, digest
 from ..owned_process import process_identity, resource_state, terminate_owned
 from ..pipeline.contracts import ArtifactRef
 from .store import SimulationConflict
-from .schemas import TELEOP_RECORDING_SCHEMA, RECORDING_VERIFICATION_SCHEMA
+from .runtime import TELEOP_RECORDING_SCHEMA, RECORDING_VERIFICATION_SCHEMA
 from .warnings import warning_inventory, verify_warning_inventory
 
 
@@ -96,32 +95,64 @@ class VerificationUnresolved(SimulationConflict):
     """A managed verifier still owns its original partial inputs and capacity."""
 
 
-async def run_verification(binding: dict, artifacts_root: Path, source: Path, *, register_process) -> dict:
+def verification_execution() -> dict:
+    from .runtime import load_runtime_contract
+
+    directory = Path(__file__).parent
+    return {
+        "helper_sha256": hashlib.sha256((directory / "verify_recording.py").read_bytes()).hexdigest(),
+        "runtime_helper_sha256": hashlib.sha256((directory / "runtime.py").read_bytes()).hexdigest(),
+        "runtime_contract": load_runtime_contract(directory / "teleop-runtime.json", consumer="pico"),
+    }
+
+
+def evidence_command(python: Path, nonce: str, execution: dict) -> list[str]:
+    if not python.is_absolute() or not python.is_file():
+        raise ValueError("Recording verification requires an absolute fixed PICO interpreter")
     limiter = shutil.which("prlimit")
     if limiter is None:
         raise ValueError("Recording verification requires native resource control")
-    # Resolve the exact package closure used by this portal, including in isolated development tests.
-    package_root = Path(__file__).resolve().parents[2]
-    entry = (
-        "import sys;sys.path.insert(0,sys.argv[1]);"
-        "from description_pipeline.simulation.verify_recording import worker_main;"
-        "raise SystemExit(worker_main())"
-    )
+    # Only standard-library bootstrap code runs before the registered stdin gate.
+    entry = """import hashlib,json,shutil,sys
+from pathlib import Path
+payload = None
+try:
+    raw = sys.stdin.buffer.read(4194305)
+    if not raw or len(raw) > 4194304:
+        raise ValueError('Recording verifier initialization is missing or oversized')
+    payload = json.loads(raw)
+    path = Path(sys.argv[1])
+    code = path.read_bytes()
+    if hashlib.sha256(code).hexdigest() != sys.argv[2]:
+        raise ValueError('Recording helper bytes changed')
+    scope = {'__file__': str(path), '__name__': 'recording_native_helper'}
+    exec(compile(code, str(path), 'exec'), scope)
+    raise SystemExit(scope['worker_main'](payload))
+except Exception as error:
+    if isinstance(payload, dict) and payload.get('cleanup') is not None:
+        cleanup = Path(payload['cleanup'])
+        if not cleanup.is_symlink() and Path(payload['source']).parent == cleanup:
+            shutil.rmtree(cleanup)
+    print(json.dumps({'error': str(error)[:4000]}))
+    raise SystemExit(1)
+"""
+    return [
+        limiter, "--as=4294967296", "--nofile=128", "--cpu=180", "--",
+        str(python), "-I", "-B", "-c", entry,
+        str(Path(__file__).with_name("verify_recording.py")), execution["helper_sha256"], nonce,
+    ]
+
+
+async def run_verification(payload: dict, python: Path, *, register_process) -> dict:
+    from .verify_recording import INPUT_LIMIT
+
+    content = canonical(payload)
+    if len(content) > INPUT_LIMIT:
+        raise ValueError("Recording verifier initialization exceeds its input budget")
     nonce = secrets.token_hex(24)
     spawning = asyncio.create_task(
         asyncio.create_subprocess_exec(
-            limiter,
-            "--as=4294967296",
-            "--nofile=128",
-            "--cpu=180",
-            "--",
-            sys.executable,
-            "-I",
-            "-B",
-            "-c",
-            entry,
-            str(package_root),
-            nonce,
+            *evidence_command(python, nonce, payload["execution"]),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -129,7 +160,6 @@ async def run_verification(binding: dict, artifacts_root: Path, source: Path, *,
             env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1"},
         )
     )
-    payload = {"binding": binding, "artifact_root": str(artifacts_root), "source": str(source)}
     process = None
     identity = None
     try:
@@ -146,7 +176,7 @@ async def run_verification(binding: dict, artifacts_root: Path, source: Path, *,
             await register_process(identity)
         if interrupted:
             raise asyncio.CancelledError
-        stdout, stderr = await asyncio.wait_for(process.communicate(canonical(payload) + b"\n"), 240)
+        stdout, stderr = await asyncio.wait_for(process.communicate(content), 240)
         if len(stdout) > 128 * 1024 or len(stderr) > 128 * 1024:
             raise ValueError("Recording verifier exceeded its output budget")
         if process.returncode != 0:
@@ -156,8 +186,11 @@ async def run_verification(binding: dict, artifacts_root: Path, source: Path, *,
                 error = f"Native recording verifier exited: {process.returncode}"
             raise ValueError(error)
         result = json.loads(stdout)
-        if result.get("binding") != binding:
+        if result.get("binding") != payload["binding"]:
             raise ValueError("Recording verifier returned a different session binding")
+        expected_execution = {key: value for key, value in payload["execution"].items() if key != "runtime_contract"}
+        if result.get("execution") != expected_execution or result.get("verifier_pid") != process.pid:
+            raise ValueError("Recording verifier returned a different execution identity")
         if await asyncio.to_thread(resource_state, identity) != "dead":
             raise ValueError("Recording verifier process group did not exit cleanly")
         return result

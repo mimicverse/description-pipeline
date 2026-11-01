@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from dataclasses import dataclass, field
 import hashlib
 import fcntl
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import secrets
@@ -19,12 +21,13 @@ import zipfile
 from ..io import digest, canonical
 from ..owned_process import module_command, process_identity, resource_state, terminate_owned
 from .store import SimulationConflict, SimulationStore
-from .recording import VerificationUnresolved, prepare_source, recording_binding, run_verification, session_identity
-from .schemas import load_runtime_contract
+from .recording import VerificationUnresolved, prepare_source, recording_binding, run_verification, session_identity, verification_execution
+from .runtime import load_runtime_contract
 from .runtime import validate_runtime_identity
 from .warnings import warning_inventory
 
 log = logging.getLogger(__name__)
+WORKER_PROTOCOL = "teleop.upper-body.worker/1"
 
 
 @dataclass
@@ -41,13 +44,21 @@ class RunningSession:
     input_until: float = 0
     pair_digest: str | None = None
     pair_until: float = 0
-    input_connected: bool = False
+    input_connected: bool | None = None
     source_session: str | None = None
     stdin_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     stop_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     termination_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     settlement_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     tasks: list = field(default_factory=list)
+    commands: dict = field(default_factory=dict)
+    completed: OrderedDict = field(default_factory=OrderedDict)
+    deliveries: set = field(default_factory=set)
+    command_sequence: int = 0
+    stopped: bool = False
+    stop_applied: bool = False
+    ending: bool = False
+    reader_eof: bool = False
     failure: str | None = None
 
 
@@ -172,7 +183,11 @@ class SimulationService:
                 await asyncio.to_thread(self.store.reconcile_orphan, row["session_id"], row["owner_nonce"])
             else:
                 recording = await self._seal_recording(
-                    self.root / row["session_id"], False, "Supervisor interrupted", runtime=row["request"]["runtime"]
+                    self.root / row["session_id"],
+                    False,
+                    "Supervisor interrupted",
+                    runtime=row["request"]["runtime"],
+                    save=row["request"]["record"],
                 )
                 await asyncio.to_thread(
                     self.store.transition,
@@ -292,18 +307,20 @@ class SimulationService:
                 if self._lifecycle_state != "open":
                     raise SimulationConflict("Simulation supervisor is closing")
                 config = {
+                    "protocol": WORKER_PROTOCOL,
+                    "session_id": session_id,
+                    "mode": "kinematic_ik",
                     "root": str(source),
                     "inventory": request["source"]["files"],
                     "entry": request["source"]["entry"],
                     "profile": request["profile"],
                     **request["settings"],
                 }
-                if request["record"]:
-                    output = session_root / "recording"
-                    output.mkdir(mode=0o700)
-                    (output / "request.json").write_bytes(canonical(request) + b"\n")
-                    (output / "session.json").write_bytes(canonical(session_identity(row)) + b"\n")
-                    config["record_path"] = str(output / "ticks.jsonl")
+                output = session_root / "recording"
+                output.mkdir(mode=0o700)
+                (output / "request.json").write_bytes(canonical(request) + b"\n")
+                (output / "session.json").write_bytes(canonical(session_identity(row)) + b"\n")
+                config["record_dir"] = str(output / "native")
                 environment = {key: os.environ[key] for key in ("PATH", "LANG", "LC_ALL") if key in os.environ}
                 environment.update({"PYTHONUNBUFFERED": "1", "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1"})
                 error_log = (session_root / "worker-stderr.log").open("xb")
@@ -345,12 +362,11 @@ class SimulationService:
                 await asyncio.to_thread(
                     self.store.transition, session_id, self.owner, "starting", process=current.identity
                 )
+                await self._write(current, config)
                 current.tasks = [
                     asyncio.create_task(self._read(session_id)),
                     asyncio.create_task(self._watch(session_id)),
                 ]
-                await self.send(session_id, config)
-                await self.send(session_id, {"type": "connection", "connected": False})
                 return self.public(row)
             except BaseException as error:
                 current = self.running.get(session_id)
@@ -414,6 +430,7 @@ class SimulationService:
             "type": "verify_recording",
             "binding": binding,
             "partial": "recording-verification-" + command_id,
+            "execution": verification_execution(),
         }
         temporary = self._verification_partial(command_id, request)
         admitted = False
@@ -443,7 +460,19 @@ class SimulationService:
             async def register_process(identity):
                 await self._verification_transition(session_id, command_id, self.owner, "running", process=identity)
 
-            result = await run_verification(binding, self.artifacts.root, source, register_process=register_process)
+            from .verify_recording import prepare_bound
+
+            preparing = asyncio.create_task(asyncio.to_thread(
+                prepare_bound, binding, self.artifacts, source,
+                commands=await asyncio.to_thread(self.store.worker_commands, session_id),
+                execution=request["execution"],
+            ))
+            try:
+                payload = await asyncio.shield(preparing)
+            except asyncio.CancelledError:
+                await preparing
+                raise
+            result = await run_verification(payload, self.python, register_process=register_process)
             await self._verification_transition(session_id, command_id, self.owner, "completed", value=result)
             return result
         except BaseException as error:
@@ -508,13 +537,164 @@ class SimulationService:
             if quiescent:
                 await asyncio.to_thread(shutil.rmtree, partial, True)
 
-    async def send(self, session_id: str, command: dict) -> None:
+    @staticmethod
+    async def _write(current, message):
+        async with current.stdin_lock:
+            if current.process.returncode is not None:
+                raise SimulationConflict("Native simulation worker is unavailable")
+            current.process.stdin.write(canonical(message) + b"\n")
+            await asyncio.wait_for(current.process.stdin.drain(), timeout=2)
+
+    async def send(self, session_id: str, command: dict, *, command_id=None) -> dict:
         current = self.running.get(session_id)
         if current is None or current.process.returncode is not None:
             raise SimulationConflict("Native simulation worker is unavailable")
-        async with current.stdin_lock:
-            current.process.stdin.write(canonical(command) + b"\n")
-            await asyncio.wait_for(current.process.stdin.drain(), timeout=2)
+        if self._lifecycle_state != "open" and command.get("type") != "stop":
+            raise SimulationConflict("Simulation supervisor is not accepting input")
+        if current.ending and command.get("type") != "stop":
+            raise SimulationConflict("Session is stopping")
+        delivering = asyncio.create_task(self._send(session_id, current, command, command_id))
+        current.deliveries.add(delivering)
+        try:
+            return await asyncio.shield(delivering)
+        except asyncio.CancelledError:
+            # A cancelled HTTP/WS request must still settle its actual dispatch.
+            await asyncio.gather(delivering, return_exceptions=True)
+            raise
+        finally:
+            current.deliveries.discard(delivering)
+
+    async def _send(self, session_id, current, command, command_id):
+        if len(current.commands) >= 256:
+            raise SimulationConflict("Native command window is full")
+        kind = command.get("type")
+        if kind not in {"frame", "connection", "estop", "heartbeat", "stop"}:
+            raise ValueError("Unsupported native command")
+        frame = command.get("frame")
+        if kind == "frame" and not isinstance(frame, dict):
+            raise ValueError("A frame command requires the original frame object")
+        source = frame["source_session_id"] if kind == "frame" else "supervisor-" + self.owner
+        sequence = frame["sequence"] if kind == "frame" else current.command_sequence
+        current.command_sequence += 1
+        envelope = {
+            **command,
+            "protocol": WORKER_PROTOCOL,
+            "id": "operator-" + hashlib.sha256(command_id.encode()).hexdigest()
+            if command_id is not None
+            else "stream-" + secrets.token_hex(24),
+            "source_session_id": source,
+            "sequence": sequence,
+            "received_monotonic_ns": time.monotonic_ns(),
+        }
+        if len(canonical(envelope)) > 64 * 1024:
+            raise ValueError("Native command exceeds its input budget")
+        if command_id is not None:
+            registered = await asyncio.to_thread(
+                self.store.bind_worker_command,
+                session_id,
+                command_id,
+                self.owner,
+                envelope,
+            )
+            if registered["state"] in {"applied", "rejected"}:
+                return registered["response"]
+            if registered["state"] == "not_sent":
+                raise SimulationConflict(registered["error"])
+            envelope = registered["envelope"]
+        if current.ending and kind != "stop":
+            if command_id is not None:
+                await asyncio.to_thread(
+                    self.store.worker_result,
+                    session_id,
+                    command_id,
+                    "unknown",
+                    error="Session ended during command registration",
+                )
+            raise SimulationConflict("Session is stopping")
+        identifier = envelope["id"]
+        pending = current.commands.get(identifier)
+        if pending is None:
+            pending = {
+                "envelope": envelope,
+                "command_id": command_id,
+                "future": asyncio.get_running_loop().create_future(),
+                "accepted": False,
+                "acceptance": None,
+            }
+            current.commands[identifier] = pending
+        elif pending["envelope"] != envelope:
+            raise SimulationConflict("Pending native command identity changed")
+        try:
+            await self._write(current, envelope)
+            response = await asyncio.wait_for(asyncio.shield(pending["future"]), timeout=5)
+        except (TimeoutError, BrokenPipeError, ConnectionResetError, SimulationConflict) as error:
+            if command_id is not None:
+                await asyncio.to_thread(
+                    self.store.worker_result,
+                    session_id,
+                    command_id,
+                    "unknown",
+                    error=str(error) or type(error).__name__,
+                )
+            raise SimulationConflict("Native command outcome is unknown; retry its original identity") from error
+        if response["type"] == "error":
+            raise SimulationConflict(response["message"])
+        return response
+
+    async def _response(self, session_id, current, message):
+        identifier = message.get("command_id")
+        pending = current.commands.get(identifier)
+        if pending is None:
+            if current.completed.get(identifier) == digest(message):
+                return
+            raise ValueError("Worker returned an unmatched command response")
+        if message.get("kind", pending["envelope"]["type"]) != pending["envelope"]["type"]:
+            raise ValueError("Worker command response kind changed")
+        if message["type"] == "accepted":
+            if message.get("accepted") is not True or message.get("applied") is not False:
+                raise ValueError("Worker acceptance is not an effective control result")
+            if type(message.get("accepted_tick")) is not int or message["accepted_tick"] < 0:
+                raise ValueError("Worker acceptance tick is invalid")
+            if pending["acceptance"] is not None and message != pending["acceptance"]:
+                raise ValueError("Worker returned conflicting acceptance evidence")
+            pending["acceptance"] = message
+            state = "accepted"
+            pending["accepted"] = True
+        elif message["type"] == "applied":
+            if (
+                message.get("accepted") is not True
+                or message.get("applied") is not True
+                or message.get("mode") != "kinematic_ik"
+                or type(message.get("effective_tick")) is not int
+                or message["effective_tick"] < 0
+                or type(message.get("effective_time_s")) not in {int, float}
+                or not math.isfinite(message["effective_time_s"])
+                or message["effective_time_s"] < 0
+                or not isinstance(message.get("state_digest"), str)
+                or len(message["state_digest"]) != 64
+                or any(character not in "0123456789abcdef" for character in message["state_digest"])
+            ):
+                raise ValueError("Worker effective command evidence is invalid")
+            state = "applied"
+        else:
+            state = "rejected"
+        if pending["command_id"] is not None:
+            await asyncio.to_thread(
+                self.store.worker_result,
+                session_id,
+                pending["command_id"],
+                state,
+                response=message,
+                error=message.get("message") if state == "rejected" else None,
+            )
+        if state != "accepted":
+            current.commands.pop(identifier)
+            current.completed[identifier] = digest(message)
+            if len(current.completed) > 512:
+                current.completed.popitem(last=False)
+            if state == "applied" and pending["envelope"]["type"] == "stop":
+                current.stop_applied = True
+            pending["future"].set_result(message)
 
     async def _read(self, session_id: str) -> None:
         current = self.running[session_id]
@@ -522,24 +702,37 @@ class SimulationService:
         try:
             while line := await current.process.stdout.readline():
                 message = json.loads(line)
-                if message.get("type") == "model":
+                if message.get("protocol") != WORKER_PROTOCOL:
+                    raise ValueError("Native worker protocol differs from the fixed contract")
+                if message.get("type") == "ready":
                     row = await asyncio.to_thread(self.store.get, session_id)
-                    if message.get("engine") != row["request"]["source"]["engine"]["mujoco"]:
+                    if message.get("session_id") != session_id or message.get("mode") != "kinematic_ik":
+                        raise ValueError("Native worker session identity or mode changed")
+                    if message["model"].get("engine") != row["request"]["source"]["engine"]["mujoco"]:
                         raise ValueError("Native worker engine differs from the verified MJCF engine")
                     if current.model is not None:
                         raise ValueError("Native worker sent duplicate model initialization")
-                    current.model = message
+                    current.model = {"type": "model", **message["model"]}
+                    current.state = message["model"]["state"]
                     if row["state"] == "starting":
                         await asyncio.to_thread(self.store.transition, session_id, self.owner, "ready")
                 elif message.get("type") == "state":
                     current.state = message["state"]
+                elif message.get("type") in {"accepted", "applied"} or (
+                    message.get("type") == "error" and "command_id" in message
+                ):
+                    await self._response(session_id, current, message)
                 elif message.get("type") == "error":
                     error = message["message"]
-                elif message.get("type") != "stopped":
+                elif message.get("type") == "stopped":
+                    current.stopped = True
+                    current.ending = True
+                else:
                     raise ValueError("Native worker returned an unknown protocol message")
                 async with current.condition:
                     current.sequence += 1
                     current.condition.notify_all()
+            current.reader_eof = True
             await self._wait_leader(current, 3)
         except asyncio.CancelledError:
             error = "Supervisor cancelled the state reader"
@@ -550,11 +743,37 @@ class SimulationService:
             await self._settle(session_id, current)
 
     async def _settle(self, session_id, current):
+        settling = asyncio.create_task(self._settle_owned(session_id, current))
+        try:
+            return await asyncio.shield(settling)
+        except asyncio.CancelledError:
+            await settling
+            raise
+
+    async def _settle_owned(self, session_id, current):
         async with current.settlement_lock:
             row = await asyncio.to_thread(self.store.get, session_id)
             if row["state"] in {"stopped", "failed"}:
                 self.running.pop(session_id, None)
                 return
+            current.ending = True
+            if row["state"] in {"starting", "ready"}:
+                row = await asyncio.to_thread(self.store.transition, session_id, self.owner, "stopping")
+            for identifier, pending in list(current.commands.items()):
+                current.failure = current.failure or "Worker exited with an unknown command outcome"
+                if pending["command_id"] is not None:
+                    await asyncio.to_thread(
+                        self.store.worker_result,
+                        session_id,
+                        pending["command_id"],
+                        "unknown",
+                        error=current.failure,
+                    )
+                if not pending["future"].done():
+                    pending["future"].set_result({"type": "error", "message": current.failure})
+                current.commands.pop(identifier)
+            await asyncio.gather(*list(current.deliveries), return_exceptions=True)
+            await asyncio.to_thread(self.store.settle_worker_commands, session_id, self.owner)
             observed = (
                 await asyncio.to_thread(resource_state, current.identity) if current.identity is not None else "unknown"
             )
@@ -574,15 +793,36 @@ class SimulationService:
             else:
                 terminal = (
                     "stopped"
-                    if current.process.returncode == 0 and row["state"] == "stopping" and not current.failure
+                    if current.process.returncode == 0
+                    and row["state"] == "stopping"
+                    and current.stop_applied
+                    and current.stopped
+                    and not current.failure
                     else "failed"
                 )
                 error = current.failure or (
                     None if terminal == "stopped" else f"Worker exited: {current.process.returncode}"
                 )
-                recording = await self._seal_recording(
-                    current.root, terminal == "stopped", error, runtime=row["request"]["runtime"]
-                )
+                unresolved = [
+                    item
+                    for item in await asyncio.to_thread(self.store.worker_commands, session_id)
+                    if item["result"] is not None
+                    and item["result"].get("state") not in {"applied", "rejected", "not_sent"}
+                ]
+                if unresolved:
+                    terminal, error = "failed", "Session has unknown registered command outcomes"
+                try:
+                    recording = await self._seal_recording(
+                        current.root,
+                        terminal == "stopped",
+                        error,
+                        runtime=row["request"]["runtime"],
+                        save=row["request"]["record"],
+                    )
+                except OSError as failure:
+                    if row["request"]["record"]:
+                        raise
+                    terminal, error, recording = "failed", f"Session evidence cleanup failed: {failure}", None
                 await asyncio.to_thread(
                     self.store.transition,
                     session_id,
@@ -599,11 +839,20 @@ class SimulationService:
             for task in current.tasks[1:2]:
                 task.cancel()
 
-    async def _seal_recording(self, root, complete, error, *, runtime):
+    async def _seal_recording(self, root, complete, error, *, runtime, save):
         directory = root / "recording"
         if not directory.is_dir():
             return None
         (directory / "outcome.json").write_bytes(canonical({"complete": complete, "error": error}) + b"\n")
+        if not save:
+            if complete:
+                removing = asyncio.create_task(asyncio.to_thread(shutil.rmtree, directory))
+                try:
+                    await asyncio.shield(removing)
+                except asyncio.CancelledError:
+                    await removing
+                    raise
+            return None
         artifact = await asyncio.to_thread(
             self.artifacts.seal_tree,
             directory,
@@ -645,11 +894,15 @@ class SimulationService:
         checked_admission = 0
         try:
             while True:
+                if current.reader_eof:
+                    return
                 if current.process.returncode is not None:
                     _, pending = await asyncio.wait(current.tasks[:1], timeout=1)
                     if pending:
                         current.failure = "Worker output remained open after its leader exited"
                         current.tasks[0].cancel()
+                    return
+                if current.ending:
                     return
                 if time.monotonic() - checked_admission >= 1:
                     if not await asyncio.to_thread(self.store.admission_open):
@@ -661,12 +914,15 @@ class SimulationService:
                     await self._terminate(current)
                     current.tasks[0].cancel()
                     return
-                recording = current.root / "recording" / "ticks.jsonl"
-                if recording.exists() and recording.stat().st_size > 512 * 1024 * 1024:
+                recording = current.root / "recording"
+                if sum(path.stat().st_size for path in recording.rglob("*") if path.is_file()) > 512 * 1024 * 1024:
                     current.failure = "Simulation exceeded its recording size budget"
                     await self._terminate(current)
                     current.tasks[0].cancel()
                     return
+                if current.model is None:
+                    await asyncio.sleep(0.1)
+                    continue
                 enabled = min(current.viewer_until, current.input_until) > time.monotonic()
                 if current.input_connected != enabled:
                     await self.send(session_id, {"type": "connection", "connected": enabled})
@@ -683,6 +939,8 @@ class SimulationService:
         current = self.running.get(session_id)
         if current is None:
             raise SimulationConflict("Native simulation worker is unavailable")
+        if current.model is None or current.ending:
+            raise SimulationConflict("Native simulation worker is not ready")
         if current.input_until > time.monotonic():
             raise SimulationConflict("A PICO input is already connected")
         code = secrets.token_urlsafe(24)
@@ -706,7 +964,7 @@ class SimulationService:
         current.source_session = binding
         return binding
 
-    async def stop(self, session_id: str) -> None:
+    async def stop(self, session_id: str, *, command_id=None) -> None:
         current = self.running.get(session_id)
         if current is None:
             row = await asyncio.to_thread(self.store.get, session_id)
@@ -714,20 +972,23 @@ class SimulationService:
                 return
             raise SimulationConflict("Session worker ownership is unresolved")
         async with current.stop_lock:
-            await self._stop_current(session_id, current)
+            await self._stop_current(session_id, current, command_id=command_id)
 
-    async def _stop_current(self, session_id, current):
+    async def _stop_current(self, session_id, current, *, command_id=None):
         row = await asyncio.to_thread(self.store.get, session_id)
         if row["state"] in {"stopped", "failed"}:
             return
         if row["state"] != "unresolved":
             await asyncio.to_thread(self.store.transition, session_id, self.owner, "stopping")
+        current.ending = True
+        current.input_until = 0
+        current.source_session = None
         if len(current.tasks) > 1:
             current.tasks[1].cancel()
             await asyncio.gather(current.tasks[1], return_exceptions=True)
         if row["state"] != "unresolved" and current.process.returncode is None:
             try:
-                await self.send(session_id, {"type": "stop"})
+                await self.send(session_id, {"type": "stop"}, command_id=command_id)
                 current.process.stdin.close()
                 await asyncio.wait_for(current.process.stdin.wait_closed(), 2)
                 await self._wait_leader(current, 5)
@@ -740,6 +1001,7 @@ class SimulationService:
                 current.failure = current.failure or "Worker output did not close after stop"
                 current.tasks[0].cancel()
             await asyncio.gather(current.tasks[0], return_exceptions=True)
+        await asyncio.gather(*list(current.deliveries), return_exceptions=True)
         await self._settle(session_id, current)
         if (await asyncio.to_thread(self.store.get, session_id))["state"] == "unresolved":
             raise SimulationConflict("Session process group is unresolved; recording and capacity are retained")
