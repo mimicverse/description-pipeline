@@ -22,7 +22,16 @@ import zipfile
 from ..io import digest, canonical
 from ..owned_process import module_command, process_identity, resource_state, terminate_owned
 from .store import SimulationConflict, SimulationStore
-from .recording import VerificationUnresolved, prepare_source, recording_binding, run_verification, session_identity, verification_execution, runtime_command
+from .recording import (
+    VerificationUnresolved,
+    prepare_bound,
+    prepare_source,
+    recording_binding,
+    run_verification,
+    runtime_command,
+    session_identity,
+    verification_execution,
+)
 from .warnings import warning_inventory
 
 log = logging.getLogger(__name__)
@@ -463,13 +472,16 @@ class SimulationService:
             async def register_process(identity):
                 await self._verification_transition(session_id, command_id, self.owner, "running", process=identity)
 
-            from .verify_recording import prepare_bound
-
-            preparing = asyncio.create_task(asyncio.to_thread(
-                prepare_bound, binding, self.artifacts, source,
-                commands=await asyncio.to_thread(self.store.worker_commands, session_id),
-                execution=request["execution"],
-            ))
+            preparing = asyncio.create_task(
+                asyncio.to_thread(
+                    prepare_bound,
+                    binding,
+                    self.artifacts,
+                    source,
+                    commands=await asyncio.to_thread(self.store.worker_commands, session_id),
+                    execution=request["execution"],
+                )
+            )
             try:
                 payload = await asyncio.shield(preparing)
             except asyncio.CancelledError:

@@ -115,7 +115,7 @@ class TeleopRuntimeTests(unittest.TestCase):
             capture_output=True,
             timeout=30,
         )
-        self.assertEqual(0, checked.returncode, checked.stderr)
+        self.assertEqual(0, checked.returncode, checked.stdout + checked.stderr)
         identity = json.loads(checked.stdout)
         raw = {**identity, "teleop_files": contract["files"]}
         self.assertEqual(identity, validate_runtime_identity(raw, contract))
@@ -172,7 +172,14 @@ class TeleopRuntimeTests(unittest.TestCase):
         self.assertEqual("3.10.0", identity["engine"])
         self.assertEqual({"version": "1.3.0", "git_commit": None, "editable": False}, identity["actuator_model"])
         result = subprocess.run(
-            [ASSESSMENT, "-I", "-B", str(ROOT / "tests/v1/teleop_consumer_probe.py"), "assessment", owned_process.__file__],
+            [
+                ASSESSMENT,
+                "-I",
+                "-B",
+                str(ROOT / "tests/v1/teleop_consumer_probe.py"),
+                "assessment",
+                owned_process.__file__,
+            ],
             capture_output=True,
             text=True,
             timeout=20,

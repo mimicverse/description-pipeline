@@ -39,7 +39,9 @@ def main():
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     report = {
         "test_modules": names,
-        "runtime_helper_sha256": hashlib.sha256(Path(sys.modules["description_pipeline.simulation.runtime"].__file__).read_bytes()).hexdigest(),
+        "runtime_helper_sha256": hashlib.sha256(
+            Path(sys.modules["description_pipeline.simulation.runtime"].__file__).read_bytes()
+        ).hexdigest(),
         "platform_package": sys.modules["description_pipeline"].__file__,
         "tests_run": result.testsRun,
         "skipped": [str(test) for test, _reason in result.skipped],
