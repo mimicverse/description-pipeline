@@ -1,6 +1,6 @@
 // Draw engine-produced geometry and poses. Physics stays in the dedicated MuJoCo worker.
 import * as THREE from "/static/vendor/three.module.min.js";
-import { disposeRobot } from "/static/viewer.js";
+import { disposeRobot, frameBounds } from "/static/viewer.js";
 const hex = (buffer) => [...new Uint8Array(buffer)].map((n) => n.toString(16).padStart(2, "0")).join("");
 function geometry(record) {
   const s = record.size;
@@ -115,16 +115,14 @@ export async function loadMJCF(viewer, { descriptor, artifactUrl, signal, onStat
     };
     worker.onerror = (event) => onStatus?.({ error: event.message || "MuJoCo worker failed" });
     sync(); viewer.robotRoot.updateMatrixWorld(true); viewer.resize();
-    const bounds = new THREE.Box3();
-    for (const { object, environment } of objects) if (!environment) bounds.union(new THREE.Box3().setFromObject(object));
-    if (!bounds.isEmpty()) {
-      viewer.orbit.target.copy(bounds.getCenter(new THREE.Vector3()));
-      const radius = bounds.getSize(new THREE.Vector3()).length() / 2;
-      viewer.orbit.radius = Math.max(0.1, 1.1 * radius / Math.sin(THREE.MathUtils.degToRad(viewer.camera.fov / 2)) * Math.max(1, 1 / viewer.camera.aspect));
-      viewer.frame();
-    }
+    const fit = () => {
+      const bounds = new THREE.Box3();
+      for (const { object, environment } of objects) if (!environment) bounds.union(new THREE.Box3().setFromObject(object));
+      frameBounds(viewer, bounds);
+    };
+    fit();
     return {
-      engineMemoryBytes: initial.memory_bytes,
+      fit, engineMemoryBytes: initial.memory_bytes,
       links: [...new Set(initial.geoms.filter((geom) => geom.collision && geom.type !== "mjGEOM_PLANE").map((geom) => geom.link))],
       joints: initial.joints.map((joint) => ({ ...joint,
         get value() { return snapshot.qpos[joint.q]; },

@@ -10,6 +10,20 @@ import {
   resolveUrdfMesh,
 } from "/static/preview_logic.js";
 
+export function frameBounds(viewer, bounds) {
+  if (bounds.isEmpty()) return;
+  const sphere = bounds.getBoundingSphere(new THREE.Sphere());
+  const radius = Math.max(sphere.radius, 1e-6);
+  const vertical = THREE.MathUtils.degToRad(viewer.camera.fov);
+  const horizontal = 2 * Math.atan(Math.tan(vertical / 2) * viewer.camera.aspect);
+  viewer.orbit.target.copy(sphere.center);
+  viewer.orbit.radius = 1.15 * radius / Math.sin(Math.min(vertical, horizontal) / 2);
+  viewer.camera.near = Math.max(radius / 1000, 1e-6);
+  viewer.camera.far = Math.max(radius * 200, viewer.orbit.radius * 10);
+  viewer.camera.updateProjectionMatrix();
+  viewer.updateCamera();
+}
+
 export function createViewer(container) {
   let viewer = null;
   const scene = new THREE.Scene();
@@ -19,6 +33,8 @@ export function createViewer(container) {
   camera.up.set(0, 0, 1);
 
   const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1;
   renderer.setPixelRatio(window.devicePixelRatio || 1);
   container.appendChild(renderer.domElement);
 
@@ -480,16 +496,9 @@ export async function loadRobot(viewer, { urdfUrl, urdfPath, files, artifactUrl,
     const box = new THREE.Box3().setFromObject(viewer.robotRoot);
     if (box.isEmpty()) warnings.push("URDF contains no displayable geometry");
     else {
-      const center = box.getCenter(new THREE.Vector3());
-      const size = box.getSize(new THREE.Vector3());
-      const span = Math.max(size.x, size.y, size.z, 0.05);
-      viewer.orbit.target.copy(center);
-      viewer.orbit.radius = span * 2.4;
+      viewer.orbit.theta = Math.PI * 0.75;
       viewer.orbit.phi = Math.PI * 0.38;
-      viewer.updateCamera();
-      viewer.camera.near = Math.max(span / 500, 0.001);
-      viewer.camera.far = span * 200;
-      viewer.camera.updateProjectionMatrix();
+      frameBounds(viewer, box);
     }
     viewer.frame();
     if (onWarning) onWarning(warnings);
@@ -517,6 +526,7 @@ export function buildJointControls(container, joints, { onInput } = {}) {
     row.className = "joint-row";
     const label = document.createElement("label");
     label.textContent = joint.name;
+    label.title = joint.name;
     const readout = document.createElement("output");
     const range = document.createElement("input");
     range.type = "range";
@@ -568,10 +578,18 @@ export function buildJointControls(container, joints, { onInput } = {}) {
     display();
     row.append(label, readout, range, numeric, unit);
     container.append(row);
-    rows.push({ joint, display });
+    rows.push({ joint, display, row, numeric });
   }
   return {
     refresh() { for (const row of rows) row.display(); },
+    reveal(name, { focus = false } = {}) {
+      const selected = rows.find((entry) => entry.joint.name === name) || (focus ? rows[0] : null);
+      for (const entry of rows) entry.row.classList.toggle("selected", entry === selected);
+      if (focus && selected) {
+        selected.numeric.focus();
+        selected.numeric.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      }
+    },
     reset() {
       for (const row of rows) {
         row.joint.reset();

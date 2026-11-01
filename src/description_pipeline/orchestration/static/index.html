@@ -81,6 +81,7 @@
                   <details id="mjcf-evidence" hidden><summary>Collision approximation and source warnings</summary><div id="mjcf-collision-info"></div><ul id="mjcf-warnings"></ul></details>
                   <div class="preview-body">
                     <div class="viewer-toolbar">
+                      <button id="fit-preview" type="button" class="ghost">Fit model</button><button id="focus-joints" type="button" class="ghost" disabled>Joints</button>
                       <label>Format <select id="preview-format"><option value="urdf">URDF</option><option value="mjcf" disabled>MJCF</option></select></label>
                       <span id="mjcf-tools" hidden>
                         <button id="mjcf-play" type="button">Play</button><button id="mjcf-step" type="button" class="ghost">Step</button><button id="mjcf-reset" type="button" class="ghost">Reset simulation</button>
@@ -91,9 +92,10 @@
                         </div></details>
                       </span>
                     </div>
+                    <div id="inspection-primary"></div>
                     <div id="viewer" class="viewer"></div>
+                    <details id="joint-panel" class="joint-panel"><summary id="joints-title">Joint controls</summary><div id="joint-controls" class="joint-controls"></div><button id="reset-joints" type="button" class="ghost">Reset to zero</button></details>
                     <div id="inspection-controls" class="inspection-controls"></div>
-                    <details class="joint-panel"><summary id="joints-title">Joint controls</summary><div id="joint-controls" class="joint-controls"></div><button id="reset-joints" type="button" class="ghost">Reset to zero</button></details>
                     <details class="model-details"><summary>Model data and sources</summary><p class="muted small" id="preview-meta"></p><dl class="meta preview-info" id="preview-info"></dl><div id="preview-panels" class="preview-panels">
                       <details class="preview-panel"><summary id="links-title">Link mass and inertia</summary><div class="panel-table" id="panel-links"></div></details>
                       <details class="preview-panel"><summary id="limits-title">Joint limits and axes</summary><div class="panel-table" id="panel-limits"></div></details>

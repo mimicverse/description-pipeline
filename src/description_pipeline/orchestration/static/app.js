@@ -619,6 +619,7 @@ function clearPreview() {
   $("preview-format").value = "urdf";
   $("mjcf-tools").hidden = true;
   $("mjcf-status").hidden = true;
+  $("focus-joints").disabled = true;
   $("viewer-card").hidden = true;
   $("viewer-placeholder").hidden = false;
   $("preview-meta").textContent = "";
@@ -1641,6 +1642,18 @@ function applyPreviewExpansion() {
   button.hidden = !expansion.collapse_control;
   button.textContent = expansion.expanded ? "Collapse preview" : "Expand preview";
   button.setAttribute("aria-expanded", expansion.expanded ? "true" : "false");
+}
+
+function fitPreview() {
+  state.viewer?.resize();
+  if (state.mjcfView) state.mjcfView.fit();
+  else state.viewer?.inspection?.fit();
+}
+
+function revealJoint(name, focus = false) {
+  if (!state.controls) return;
+  $("joint-panel").open = true;
+  state.controls.reveal(name, { focus });
 }
 
 function togglePreviewCollapse() {
@@ -2719,17 +2732,24 @@ async function loadPreview(dagRunId) {
     });
     }
     if (request.signal.aborted || state.dagRunId !== dagRunId) return;
-    note.hidden = true;
+    const warnings = isMJCF ? [] : loaded.warnings;
+    note.textContent = warnings.join("; ");
+    note.hidden = warnings.length === 0;
+    $("inspection-primary").hidden = isMJCF;
     $("inspection-controls").hidden = isMJCF;
     if (!isMJCF) {
-      createInspection(state.viewer, loaded, $("inspection-controls"), {
+      const inspection = createInspection(state.viewer, loaded, $("inspection-controls"), {
         onPoseChange: () => state.controls?.refresh(),
+        onJointSelect: (name) => revealJoint(name),
       });
+      $("inspection-primary").replaceChildren(inspection.primary);
     }
     state.controls = buildJointControls($("joint-controls"), loaded.joints, {
       onInput: () => state.viewer.inspection?.update(),
     });
     $("joints-title").textContent = `Joint controls (${loaded.joints.length})`;
+    $("focus-joints").textContent = `Joints (${loaded.joints.length})`;
+    $("focus-joints").disabled = loaded.joints.length === 0;
     state.previewKey = previewKey;
     state.previewSubject = isMJCF ? preview.mjcf.subject_sha256 : preview.subject_sha256;
     state.previewFiles = preview.files || {};
@@ -2747,9 +2767,9 @@ async function loadPreview(dagRunId) {
     if (state.lastRun) renderRun(state.lastRun);
     $("viewer-card").hidden = false;
     $("viewer-placeholder").hidden = true;
-    applyPreviewExpansion();
-    state.viewer.frame();
     updatePreviewLayout();
+    applyPreviewExpansion();
+    fitPreview();
   } catch (error) {
     if (request.signal.aborted || state.dagRunId !== dagRunId) return;
     if (state.viewer) disposeRobot(state.viewer);
@@ -3020,6 +3040,8 @@ function wire() {
     if (state.controls) state.controls.reset();
   });
   $("preview-collapse").addEventListener("click", togglePreviewCollapse);
+  $("fit-preview").addEventListener("click", fitPreview);
+  $("focus-joints").addEventListener("click", () => revealJoint(state.viewer?.inspection?.selectedJointName, true));
   $("preview-format").addEventListener("change", () => {
     state.previewFormat = $("preview-format").value;
     state.previewRequest?.abort(); state.previewRequest = null;

@@ -8,9 +8,10 @@ const logic = await import(new URL("preview_logic.js", staticDir));
 const source = readFileSync(new URL("viewer.js", staticDir), "utf8")
   .replace('"/static/vendor/three.module.min.js"', JSON.stringify(new URL("vendor/three.module.min.js", staticDir).href))
   .replace('"/static/preview_logic.js"', JSON.stringify(new URL("preview_logic.js", staticDir).href));
-const { loadRobot, buildJointControls, parseStl } = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
+const { loadRobot, buildJointControls, parseStl, frameBounds } = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
 const inspectionSource = readFileSync(new URL("inspection.js", staticDir), "utf8")
-  .replace('"/static/vendor/three.module.min.js"', JSON.stringify(new URL("vendor/three.module.min.js", staticDir).href));
+  .replace('"/static/vendor/three.module.min.js"', JSON.stringify(new URL("vendor/three.module.min.js", staticDir).href))
+  .replace('"/static/viewer.js"', JSON.stringify(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`));
 const { inertiaEllipsoid, createInspection } = await import(`data:text/javascript;base64,${Buffer.from(inspectionSource).toString("base64")}`);
 class Element {
   constructor(tagName, attributes = {}, children = []) { Object.assign(this, { tagName, attributes, children, textContent: "", listeners: {}, style: {} }); }
@@ -39,6 +40,22 @@ function model() {
     e("joint", { name: "axis_joint", type: "revolute" }, e("parent", { link: "base" }), e("child", { link: "moving" }),
       e("limit", { effort: "0", velocity: "0" })),
   );
+}
+// Camera fitting must contain every box corner across portrait and landscape viewports.
+for (const aspect of [0.3, 1, 3]) {
+  const camera = new THREE.PerspectiveCamera(45, aspect, 0.01, 100);
+  const orbit = {target: new THREE.Vector3(), radius: 1};
+  const view = {camera, orbit, updateCamera() {
+    camera.position.copy(orbit.target).addScaledVector(new THREE.Vector3(1, -2, 1).normalize(), orbit.radius);
+    camera.up.set(0, 0, 1); camera.lookAt(orbit.target); camera.updateMatrixWorld();
+  }};
+  const bounds = new THREE.Box3(new THREE.Vector3(-4, -1, -0.5), new THREE.Vector3(3, 2, 5));
+  frameBounds(view, bounds);
+  for (const x of [-4, 3]) for (const y of [-1, 2]) for (const z of [-0.5, 5]) {
+    const point = new THREE.Vector3(x, y, z).project(camera);
+    assert.ok(Math.abs(point.x) <= 1 && Math.abs(point.y) <= 1 && Math.abs(point.z) <= 1,
+      `Camera fit clipped a model corner at aspect ${aspect}`);
+  }
 }
 let current;
 const saved = { DOMParser: globalThis.DOMParser, fetch: globalThis.fetch, document: globalThis.document };
