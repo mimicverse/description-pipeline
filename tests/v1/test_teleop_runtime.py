@@ -182,11 +182,12 @@ class TeleopRuntimeTests(unittest.TestCase):
 
             def copy_member(source, destination):
                 path = Path(source)
-                return (
-                    shutil.copy2(source, destination)
-                    if any(path.is_relative_to(p) for p in (package, dist))
-                    else os.link(source, destination)
-                )
+                if (
+                    any(path.is_relative_to(p) for p in (package, dist))
+                    or path.stat().st_dev != Path(destination).parent.stat().st_dev
+                ):
+                    return shutil.copy2(source, destination)
+                return os.link(source, destination)
 
             shutil.copytree(original, private, symlinks=True, copy_function=copy_member)
             private_site = private / site.relative_to(original)
