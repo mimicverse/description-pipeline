@@ -3965,7 +3965,7 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(report["failure"]["stage"], "capture")
         self.assertEqual(report["failure"]["error_code"], "cad_link_group_payload_invalid")
         self.assertEqual(report["failure"]["title"], "Native link-group mass read rejected")
-        self.assertEqual(report["overall"]["headline"], "Capture evidence stage failed; downstream stages did not run")
+        self.assertEqual(report["overall"]["headline"], "Capture evidence stage failed")
 
     def test_run_page_refuses_a_stage_report_bound_to_another_run(self) -> None:
         self.client.login()

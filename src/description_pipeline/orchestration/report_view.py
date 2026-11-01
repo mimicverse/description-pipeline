@@ -1443,7 +1443,7 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
             f"{first['name']} stage is unresolved; reconcile its external effects",
         )
     elif "failed" in states:
-        overall_state, headline = "failed", f"{first_failed['name']} stage failed; downstream stages did not run"
+        overall_state, headline = "failed", f"{first_failed['name']} stage failed"
     elif "cancelled" in states:
         first = next(stage for stage in stages_out if stage["state"] == "cancelled")
         overall_state, headline = "cancelled", f"{first['name']} stage was cancelled"
