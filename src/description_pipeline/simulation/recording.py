@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import shutil
 import secrets
+from types import MappingProxyType
 
 from ..io import canonical, digest
 from ..owned_process import process_identity, resource_state, terminate_owned
@@ -23,6 +24,15 @@ from .warnings import warning_inventory, verify_warning_inventory
 INPUT_LIMIT = 4 * 1024 * 1024
 TELEOP_RECORDING_SCHEMA = "solidworks-to-urdf.teleop-recording/v1"
 RECORDING_VERIFICATION_SCHEMA = "solidworks-to-urdf.recording-verification/v1"
+NATIVE_VERIFICATION_POLICY = MappingProxyType(
+    {
+        "revision": 1,
+        "cpu_seconds": 900,
+        "recording_wall_seconds": 1200,
+        "address_space_bytes": 4 * 1024**3,
+        "nofile": 128,
+    }
+)
 
 
 def prepare_bound(binding: dict, artifacts, source: Path, *, commands: list, execution: dict) -> dict:
@@ -252,9 +262,9 @@ except Exception as error:
 """
     return [
         limiter,
-        "--as=4294967296",
-        "--nofile=128",
-        "--cpu=180",
+        f"--as={NATIVE_VERIFICATION_POLICY['address_space_bytes']}",
+        f"--nofile={NATIVE_VERIFICATION_POLICY['nofile']}",
+        f"--cpu={NATIVE_VERIFICATION_POLICY['cpu_seconds']}",
         "--",
         str(python),
         "-I",
@@ -333,7 +343,9 @@ async def run_verification(payload: dict, python: Path, *, register_process) -> 
                 await register_process(identity)
         if interrupted:
             raise interrupted
-        stdout, stderr = await asyncio.wait_for(process.communicate(content), 240)
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(content), NATIVE_VERIFICATION_POLICY["recording_wall_seconds"]
+        )
         if len(stdout) > 128 * 1024 or len(stderr) > 128 * 1024:
             raise ValueError("Recording verifier exceeded its output budget")
         if process.returncode != 0:
