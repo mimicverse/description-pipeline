@@ -21,33 +21,29 @@ import tempfile
 import zipfile
 
 from ..io import digest, canonical
-from ..owned_process import module_command, process_identity, resource_state, terminate_owned
+from ..owned_process import module_command, process_identity, resource_state
 from .store import SimulationConflict, SimulationStore
 from .recording import (
-    VerificationUnresolved,
     INPUT_LIMIT,
     declared_source_bytes,
     inspection_command,
     resource_command,
-    prepare_bound,
     prepare_source,
-    recording_binding,
-    run_verification,
     runtime_command,
     session_identity,
-    verification_execution,
 )
 from .resources import (
     SESSION_QUOTA_BYTES,
     SessionResourceError,
     check_session_capacity,
     directory_bytes,
-    require_storage,
     validate_policy,
     validate_ready,
     validate_state,
 )
 from .evidence import RecordingDiagnostic, SessionEvidenceError, verify_manifest_counts, verify_finalization_observation
+from .tasks import settle_task, wait_task, run_thread
+from .verification import ManagedRecordingVerification
 from .warnings import warning_inventory
 
 log = logging.getLogger(__name__)
@@ -91,7 +87,7 @@ class RunningSession:
     last_state_received_ns: int = field(default_factory=time.monotonic_ns)
 
 
-class SimulationService:
+class SimulationService(ManagedRecordingVerification):
     def __init__(
         self,
         store: SimulationStore,
@@ -102,14 +98,10 @@ class SimulationService:
         capacity: int = 2,
         resource_policy: dict | None = None,
     ):
-        self.store, self.artifacts = store, artifacts
-        self.root, self.python = Path(root), Path(python)
+        super().__init__(store, artifacts, root, python)
         self.capacity = capacity
         self._resource_policy_input = deepcopy(resource_policy or {})
         self._probe_gate = asyncio.Lock()
-        self._storage_gate = asyncio.Lock()
-        self._consumer_execution = verification_execution()
-        self.owner = secrets.token_hex(24)
         self.runtime_identity = None
         self.running: dict[str, RunningSession] = {}
         self.gate = asyncio.Lock()
@@ -132,7 +124,7 @@ class SimulationService:
             except BaseException:
                 self._lifecycle_state = "closing"
                 async with self.gate:
-                    await self._close_owned()
+                    await wait_task(asyncio.create_task(self._close_owned()))
                 raise
             if self._lifecycle_state == "starting":
                 self._lifecycle_state = "open"
@@ -165,22 +157,18 @@ class SimulationService:
         if any(self.runtime_identity.get(key) != contract[key] for key in ("source_commit", "wheel_sha256")):
             raise ValueError("Native runtime returned another fixed consumer identity")
         acquiring = asyncio.create_task(asyncio.to_thread(self.store.acquire_supervisor))
-        try:
-            self._database_lock = await asyncio.shield(acquiring)
-        except asyncio.CancelledError:
-            # The database call continues in its thread; cleanup must own its returned lease.
-            (result,) = await asyncio.gather(acquiring, return_exceptions=True)
-            if not isinstance(result, BaseException):
-                self._database_lock = result
-            raise
+        interrupted = await settle_task(acquiring)
+        self._database_lock = acquiring.result()
+        if interrupted:
+            raise asyncio.CancelledError
         if self._lifecycle_state != "starting":
             raise SimulationConflict("Simulation supervisor closed during startup")
         await self._reconcile_verifications()
-        for row in await asyncio.to_thread(self.store.orphaned, self.owner):
+        for row in await run_thread(self.store.orphaned, self.owner):
             identity = row["process_identity"]
             quiescent = identity is not None and await self._terminate_identity(identity)
             if not quiescent:
-                await asyncio.to_thread(self.store.reconcile_orphan, row["session_id"], row["owner_nonce"])
+                await run_thread(self.store.reconcile_orphan, row["session_id"], row["owner_nonce"])
             else:
                 error = "Supervisor interrupted; previous process group is absent"
                 try:
@@ -193,7 +181,7 @@ class SimulationService:
                     )
                 except RecordingDiagnostic as diagnostic:
                     recording, error = diagnostic.recording, str(diagnostic)
-                await asyncio.to_thread(
+                await run_thread(
                     self.store.transition,
                     row["session_id"],
                     row["owner_nonce"],
@@ -231,13 +219,9 @@ class SimulationService:
                         start_new_session=True,
                     )
                 )
-                interrupted = False
                 try:
-                    try:
-                        probe = await asyncio.shield(spawning)
-                    except asyncio.CancelledError:
-                        probe = await spawning
-                        interrupted = True
+                    interrupted = await settle_task(spawning)
+                    probe = spawning.result()
                 except Exception:
                     self._probe_identity = None
                     self._write_probe_identity()
@@ -255,7 +239,7 @@ class SimulationService:
                     probe.communicate(content),
                     timeout,
                 )
-                clean = await asyncio.to_thread(resource_state, self._probe_identity) == "dead"
+                clean = await run_thread(resource_state, self._probe_identity) == "dead"
                 if not await self._close_probe():
                     raise SimulationConflict("Startup process group is unresolved")
                 if not clean:
@@ -353,12 +337,8 @@ class SimulationService:
                     capacity=self.capacity,
                 )
             )
-            interrupted = False
-            try:
-                row = await asyncio.shield(admitting)
-            except asyncio.CancelledError:
-                row = await admitting
-                interrupted = True
+            interrupted = await settle_task(admitting)
+            row = admitting.result()
             session_id = row["session_id"]
             if interrupted:
                 if (
@@ -367,7 +347,7 @@ class SimulationService:
                     and row["process_identity"] is None
                     and session_id not in self.running
                 ):
-                    await asyncio.to_thread(
+                    await run_thread(
                         self.store.transition,
                         session_id,
                         self.owner,
@@ -418,7 +398,7 @@ class SimulationService:
                 ):
                     raise SessionResourceError("Policy resolver changed the frozen session observations")
                 async with self._storage_gate:
-                    await asyncio.to_thread(self._admit_storage, session_root, policy["quota_bytes"], session_id)
+                    await run_thread(self._admit_storage, session_root, policy["quota_bytes"], session_id)
                     await prepare_source(
                         source,
                         request["source"],
@@ -426,7 +406,7 @@ class SimulationService:
                         read_member,
                         max_bytes=policy["source_materialization_limit_bytes"],
                     )
-                if await asyncio.to_thread(directory_bytes, source) != declared:
+                if await run_thread(directory_bytes, source) != declared:
                     raise SessionResourceError("Materialized source differs from its exact artifact member bytes")
                 if self._lifecycle_state != "open":
                     raise SimulationConflict("Simulation supervisor is closing")
@@ -451,7 +431,6 @@ class SimulationService:
                 environment.update({"PYTHONUNBUFFERED": "1", "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1"})
                 error_log = (session_root / "worker-stderr.log").open("xb")
                 nonce = secrets.token_hex(24)
-                interrupted = False
                 try:
                     spawning = asyncio.create_task(
                         asyncio.create_subprocess_exec(
@@ -470,12 +449,8 @@ class SimulationService:
                             limit=64 * 1024 * 1024,
                         )
                     )
-                    try:
-                        process = await asyncio.shield(spawning)
-                    except asyncio.CancelledError:
-                        # The kernel spawn continues: obtain its handle before cleanup.
-                        process = await spawning
-                        interrupted = True
+                    interrupted = await settle_task(spawning)
+                    process = spawning.result()
                 finally:
                     error_log.close()
                 current = RunningSession(
@@ -487,9 +462,7 @@ class SimulationService:
                     raise asyncio.CancelledError
                 if self._lifecycle_state != "open":
                     raise SimulationConflict("Simulation supervisor is closing")
-                await asyncio.to_thread(
-                    self.store.transition, session_id, self.owner, "starting", process=current.identity
-                )
+                await run_thread(self.store.transition, session_id, self.owner, "starting", process=current.identity)
                 await self._write(current, config)
                 current.tasks = [
                     asyncio.create_task(self._read(session_id)),
@@ -507,9 +480,9 @@ class SimulationService:
                         await asyncio.gather(current.tasks[0], return_exceptions=True)
                     await self._settle(session_id, current)
                 else:
-                    latest = await asyncio.to_thread(self.store.get, session_id)
+                    latest = await run_thread(self.store.get, session_id)
                     if latest["state"] not in {"stopped", "failed"}:
-                        await asyncio.to_thread(
+                        await run_thread(
                             self.store.transition,
                             session_id,
                             self.owner,
@@ -517,29 +490,6 @@ class SimulationService:
                             error=str(error) or type(error).__name__,
                         )
                 raise
-
-    def _admit_storage(self, destination, additional_bytes, excluded_session=None):
-        remaining = 0
-        for identifier in self.store.active_session_ids():
-            if identifier == excluded_session:
-                continue
-            if (
-                not isinstance(identifier, str)
-                or not identifier
-                or Path(identifier).name != identifier
-                or identifier in {".", ".."}
-            ):
-                raise SessionResourceError("Active session identity is not a confined workspace name")
-            directory = self.root / identifier
-            observed = directory_bytes(directory) if directory.exists() or directory.is_symlink() else 0
-            if observed > SESSION_QUOTA_BYTES:
-                raise SessionResourceError("An active session already exceeds its complete workspace budget")
-            remaining += SESSION_QUOTA_BYTES - observed
-        if destination.stat().st_dev == self.root.stat().st_dev:
-            require_storage(destination, additional_bytes=additional_bytes + remaining, reserve_bytes=0)
-        else:
-            require_storage(destination, additional_bytes=additional_bytes, reserve_bytes=0)
-            require_storage(self.root, additional_bytes=remaining, reserve_bytes=0)
 
     @staticmethod
     def public(row: dict) -> dict:
@@ -551,18 +501,62 @@ class SimulationService:
         }
 
     def recording_archive(self, ref):
-        temporary = tempfile.TemporaryDirectory(prefix="recording-export-", dir=self.root)
-        try:
-            tree = self.artifacts.materialize(ref, Path(temporary.name) / "source")
-            target = Path(temporary.name) / "recording.zip"
-            with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-                for path in sorted(tree.rglob("*")):
-                    if path.is_file():
-                        archive.write(path, path.relative_to(tree).as_posix())
-            return target, temporary
-        except BaseException:
-            temporary.cleanup()
-            raise
+        """Read CAS directly; payload is bounded to 64KiB plus ZIP member/central-directory metadata."""
+        manifest = self.artifacts.verify(ref)
+        root = self.artifacts.objects / ref.artifact_id
+        members = [
+            *manifest["members"],
+            {
+                "path": "manifest.json",
+                "bytes": (root / "manifest.json").stat().st_size,
+                "sha256": ref.manifest_sha256,
+            },
+        ]
+
+        class Output:
+            def __init__(self):
+                self.position, self.chunks = 0, []
+
+            def write(self, value):
+                if value:
+                    self.chunks.append(value)
+                    self.position += len(value)
+                return len(value)
+
+            def tell(self):
+                return self.position
+
+            def seek(self, *_arguments):
+                raise OSError("ZIP stream is not seekable")
+
+            def flush(self):
+                pass
+
+            def drain(self):
+                chunks, self.chunks = self.chunks, []
+                return chunks
+
+        def stream():
+            output = Output()
+            with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_STORED) as archive:
+                for member in members:
+                    path = root / member["path"]
+                    info = zipfile.ZipInfo.from_file(path, member["path"], strict_timestamps=False)
+                    info.compress_type = zipfile.ZIP_STORED
+                    observed, checksum = 0, hashlib.sha256()
+                    with path.open("rb") as source, archive.open(info, "w") as target:
+                        yield from output.drain()
+                        while chunk := source.read(64 * 1024):
+                            observed += len(chunk)
+                            checksum.update(chunk)
+                            target.write(chunk)
+                            yield from output.drain()
+                    if observed != member["bytes"] or checksum.hexdigest() != member["sha256"]:
+                        raise SessionEvidenceError("Recording export differs from its verified immutable CAS member")
+                    yield from output.drain()
+            yield from output.drain()
+
+        return stream()
 
     async def verify_recording(self, session_id, members, read_member):
         if self._lifecycle_state != "open":
@@ -572,127 +566,9 @@ class SimulationService:
         async with self.verification_gate:
             self._verification_task = asyncio.current_task()
             try:
-                return await self._verify_recording(session_id, members, read_member)
+                return await super().verify_recording(session_id, members, read_member)
             finally:
                 self._verification_task = None
-
-    async def _verify_recording(self, session_id, members, read_member):
-        row = await asyncio.to_thread(self.store.get, session_id)
-        binding = recording_binding(row)
-        command_id = "verify-" + secrets.token_hex(16)
-        request = {
-            "type": "verify_recording",
-            "binding": binding,
-            "partial": "recording-verification-" + command_id,
-            "execution": deepcopy(self._consumer_execution),
-        }
-        temporary = self._verification_partial(command_id, request)
-        admitted = False
-        retained = False
-        try:
-            await self._reconcile_verifications()
-            admitting = asyncio.create_task(
-                asyncio.to_thread(
-                    self.store.begin_verification,
-                    session_id,
-                    command_id,
-                    request,
-                    self.owner,
-                )
-            )
-            try:
-                await asyncio.shield(admitting)
-            except asyncio.CancelledError:
-                await admitting
-                admitted = True
-                raise
-            admitted = True
-            temporary.mkdir(mode=0o700)
-            source = temporary / "source"
-            await prepare_source(source, row["request"]["source"], members, read_member)
-
-            async def register_process(identity):
-                await self._verification_transition(session_id, command_id, self.owner, "running", process=identity)
-
-            preparing = asyncio.create_task(
-                asyncio.to_thread(
-                    prepare_bound,
-                    binding,
-                    self.artifacts,
-                    source,
-                    commands=await asyncio.to_thread(self.store.worker_commands, session_id),
-                    execution=request["execution"],
-                )
-            )
-            try:
-                payload = await asyncio.shield(preparing)
-            except asyncio.CancelledError:
-                await preparing
-                raise
-            result = await run_verification(payload, self.python, register_process=register_process)
-            await self._verification_transition(session_id, command_id, self.owner, "completed", value=result)
-            return result
-        except BaseException as error:
-            if admitted:
-                retained = isinstance(error, VerificationUnresolved)
-                state = (
-                    "unknown" if retained else "cancelled" if isinstance(error, asyncio.CancelledError) else "failed"
-                )
-                latest = next(
-                    item
-                    for item in await asyncio.to_thread(self.store.verification_attempts, session_id)
-                    if item["command_id"] == command_id
-                )
-                if latest["result"]["state"] not in {"completed", "failed", "cancelled"}:
-                    await self._verification_transition(
-                        session_id,
-                        command_id,
-                        self.owner,
-                        state,
-                        error=str(error) or type(error).__name__,
-                    )
-            raise
-        finally:
-            if admitted and not retained:
-                await asyncio.to_thread(shutil.rmtree, temporary, True)
-
-    def _verification_partial(self, command_id, request):
-        name = "recording-verification-" + command_id
-        if request.get("partial") != name or Path(name).name != name:
-            raise SimulationConflict("Recording verification partial identity is invalid")
-        path = self.root / name
-        if path.is_symlink():
-            raise SimulationConflict("Recording verification partial must not be a symlink")
-        return path
-
-    async def _verification_transition(self, *args, **kwargs):
-        changing = asyncio.create_task(asyncio.to_thread(self.store.transition_verification, *args, **kwargs))
-        try:
-            return await asyncio.shield(changing)
-        except asyncio.CancelledError:
-            await changing
-            raise
-
-    async def _reconcile_verifications(self):
-        for attempt in await asyncio.to_thread(self.store.verification_attempts):
-            result = attempt["result"]
-            partial = self._verification_partial(attempt["command_id"], attempt["request"])
-            if result["state"] in {"completed", "failed", "cancelled"}:
-                await asyncio.to_thread(shutil.rmtree, partial, True)
-                continue
-            identity = result["process_identity"]
-            quiescent = identity is not None and await self._terminate_identity(identity)
-            await self._verification_transition(
-                attempt["session_id"],
-                attempt["command_id"],
-                result["owner_nonce"],
-                "failed" if quiescent else "unknown",
-                error="Verification interrupted; process group is absent"
-                if quiescent
-                else "Verification process group ownership is unresolved",
-            )
-            if quiescent:
-                await asyncio.to_thread(shutil.rmtree, partial, True)
 
     @staticmethod
     async def _write(current, message):
@@ -713,11 +589,7 @@ class SimulationService:
         delivering = asyncio.create_task(self._send(session_id, current, command, command_id))
         current.deliveries.add(delivering)
         try:
-            return await asyncio.shield(delivering)
-        except asyncio.CancelledError:
-            # A cancelled HTTP/WS request must still settle its actual dispatch.
-            await asyncio.gather(delivering, return_exceptions=True)
-            raise
+            return await wait_task(delivering)
         finally:
             current.deliveries.discard(delivering)
 
@@ -746,7 +618,7 @@ class SimulationService:
         if len(canonical(envelope)) > 64 * 1024:
             raise ValueError("Native command exceeds its input budget")
         if command_id is not None:
-            registered = await asyncio.to_thread(
+            registered = await run_thread(
                 self.store.bind_worker_command,
                 session_id,
                 command_id,
@@ -760,7 +632,7 @@ class SimulationService:
             envelope = registered["envelope"]
         if current.ending and kind != "stop":
             if command_id is not None:
-                await asyncio.to_thread(
+                await run_thread(
                     self.store.worker_result,
                     session_id,
                     command_id,
@@ -786,7 +658,7 @@ class SimulationService:
             response = await asyncio.wait_for(asyncio.shield(pending["future"]), timeout=5)
         except (TimeoutError, BrokenPipeError, ConnectionResetError, SimulationConflict) as error:
             if command_id is not None:
-                await asyncio.to_thread(
+                await run_thread(
                     self.store.worker_result,
                     session_id,
                     command_id,
@@ -836,7 +708,7 @@ class SimulationService:
         else:
             state = "rejected"
         if pending["command_id"] is not None:
-            await asyncio.to_thread(
+            await run_thread(
                 self.store.worker_result,
                 session_id,
                 pending["command_id"],
@@ -862,7 +734,7 @@ class SimulationService:
                 if message.get("protocol") != WORKER_PROTOCOL:
                     raise ValueError("Native worker protocol differs from the fixed contract")
                 if message.get("type") == "ready":
-                    row = await asyncio.to_thread(self.store.get, session_id)
+                    row = await run_thread(self.store.get, session_id)
                     if message.get("session_id") != session_id or message.get("mode") != "kinematic_ik":
                         raise ValueError("Native worker session identity or mode changed")
                     if message["model"].get("engine") != row["request"]["source"]["engine"]["mujoco"]:
@@ -878,7 +750,7 @@ class SimulationService:
                     current.model = {"type": "model", **message["model"]}
                     current.state = message["model"]["state"]
                     if row["state"] == "starting":
-                        await asyncio.to_thread(self.store.transition, session_id, self.owner, "ready")
+                        await run_thread(self.store.transition, session_id, self.owner, "ready")
                 elif message.get("type") == "state":
                     tick = message["state"]["tick"]
                     if current.ready_evidence is None or (
@@ -920,25 +792,21 @@ class SimulationService:
 
     async def _settle(self, session_id, current):
         settling = asyncio.create_task(self._settle_owned(session_id, current))
-        try:
-            return await asyncio.shield(settling)
-        except asyncio.CancelledError:
-            await settling
-            raise
+        return await wait_task(settling)
 
     async def _settle_owned(self, session_id, current):
         async with current.settlement_lock:
-            row = await asyncio.to_thread(self.store.get, session_id)
+            row = await run_thread(self.store.get, session_id)
             if row["state"] in {"stopped", "failed"}:
                 self.running.pop(session_id, None)
                 return
             current.ending = True
             if row["state"] in {"starting", "ready"}:
-                row = await asyncio.to_thread(self.store.transition, session_id, self.owner, "stopping")
+                row = await run_thread(self.store.transition, session_id, self.owner, "stopping")
             for identifier, pending in list(current.commands.items()):
                 current.failure = current.failure or "Worker exited with an unknown command outcome"
                 if pending["command_id"] is not None:
-                    await asyncio.to_thread(
+                    await run_thread(
                         self.store.worker_result,
                         session_id,
                         pending["command_id"],
@@ -949,16 +817,14 @@ class SimulationService:
                     pending["future"].set_result({"type": "error", "message": current.failure})
                 current.commands.pop(identifier)
             await asyncio.gather(*list(current.deliveries), return_exceptions=True)
-            await asyncio.to_thread(self.store.settle_worker_commands, session_id, self.owner)
-            observed = (
-                await asyncio.to_thread(resource_state, current.identity) if current.identity is not None else "unknown"
-            )
+            await run_thread(self.store.settle_worker_commands, session_id, self.owner)
+            observed = await run_thread(resource_state, current.identity) if current.identity is not None else "unknown"
             if observed != "dead":
                 current.failure = current.failure or "Worker process group did not exit cleanly"
             quiescent = await self._terminate(current)
             if not quiescent:
                 # A writer may still be active: preserve the original partial directory.
-                await asyncio.to_thread(
+                await run_thread(
                     self.store.transition,
                     session_id,
                     self.owner,
@@ -981,7 +847,7 @@ class SimulationService:
                 )
                 unresolved = [
                     item
-                    for item in await asyncio.to_thread(self.store.worker_commands, session_id)
+                    for item in await run_thread(self.store.worker_commands, session_id)
                     if item["result"] is not None
                     and item["result"].get("state") not in {"applied", "rejected", "not_sent"}
                 ]
@@ -1001,7 +867,7 @@ class SimulationService:
                     error, recording = str(diagnostic), diagnostic.recording
                 except OSError as failure:
                     error, recording = f"Session evidence storage failed: {type(failure).__name__}", None
-                await asyncio.to_thread(
+                await run_thread(
                     self.store.transition,
                     session_id,
                     self.owner,
@@ -1042,8 +908,8 @@ class SimulationService:
         }
         evidence_error = None
         try:
-            await asyncio.to_thread(directory_bytes, root)
-            row = await asyncio.to_thread(self.store.get, root.name)
+            await run_thread(directory_bytes, root)
+            row = await run_thread(self.store.get, root.name)
             if (
                 runtime != row["request"]["runtime"]
                 or (directory / "request.json").read_bytes() != canonical(row["request"]) + b"\n"
@@ -1057,7 +923,7 @@ class SimulationService:
                 with manifest_path.open("rb") as stream:
                     return hashlib.file_digest(stream, "sha256").hexdigest()
 
-            manifest_sha = await asyncio.to_thread(manifest_digest)
+            manifest_sha = await run_thread(manifest_digest)
             inspected = await self._native_probe(
                 {
                     "execution": self._consumer_execution,
@@ -1065,7 +931,7 @@ class SimulationService:
                     "native": str(directory / "native"),
                     "session_id": root.name,
                     "manifest_sha256": manifest_sha,
-                    "commands": await asyncio.to_thread(self.store.worker_commands, root.name),
+                    "commands": await run_thread(self.store.worker_commands, root.name),
                 },
                 lifecycle=("starting", "open", "closing"),
                 command=inspection_command,
@@ -1079,11 +945,9 @@ class SimulationService:
             current = self.running.get(root.name)
             if current is not None and manifest["resource_policy"] != current.expected_policy:
                 raise SessionEvidenceError("Native manifest changed the admitted resource policy")
-            await asyncio.to_thread(
-                verify_finalization_observation, root, manifest, inspected["finalization_verification"]
-            )
+            await run_thread(verify_finalization_observation, root, manifest, inspected["finalization_verification"])
             verify_manifest_counts(manifest, inspected["counts"])
-            if await asyncio.to_thread(manifest_digest) != manifest_sha:
+            if await run_thread(manifest_digest) != manifest_sha:
                 raise SessionEvidenceError("Native manifest changed after evidence verification")
             if manifest["status"] != "stopped" or manifest["exit_code"] != 0 or manifest["reason"] != "normal_stop":
                 evidence_error = f"Native session termination is not normal: {manifest['reason']}"
@@ -1106,7 +970,7 @@ class SimulationService:
                 if session_complete:
                     # The inspector does no writes, but remeasure at the final
                     # admission boundary before any seal or discard action.
-                    await asyncio.to_thread(
+                    await run_thread(
                         verify_finalization_observation,
                         root,
                         inspected["manifest"],
@@ -1115,11 +979,7 @@ class SimulationService:
                 storing = asyncio.create_task(
                     asyncio.to_thread(self._store_recording_result, root, outcome, runtime, save)
                 )
-                try:
-                    recording = await asyncio.shield(storing)
-                except asyncio.CancelledError:
-                    await storing
-                    raise
+                recording = await wait_task(storing)
         except RecordingDiagnostic:
             raise
         except (OSError, SessionResourceError) as failure:
@@ -1240,17 +1100,6 @@ class SimulationService:
             return await SimulationService._terminate_identity(current.identity)
 
     @staticmethod
-    async def _terminate_identity(identity):
-        # The event loop owns the subprocess reaper; this synchronous helper
-        # observes the whole group while the loop keeps collecting child exits.
-        terminating = asyncio.create_task(asyncio.to_thread(terminate_owned, identity))
-        try:
-            return await asyncio.shield(terminating)
-        except asyncio.CancelledError:
-            await terminating
-            raise
-
-    @staticmethod
     async def _wait_leader(current, timeout):
         # Process.wait may also wait for a pipe inherited by a surviving child.
         async with asyncio.timeout(timeout):
@@ -1274,7 +1123,7 @@ class SimulationService:
                 if current.ending:
                     return
                 if time.monotonic() - checked_admission >= 1:
-                    if not await asyncio.to_thread(self.store.admission_open):
+                    if not await run_thread(self.store.admission_open):
                         current.tasks.append(asyncio.create_task(self.stop(session_id)))
                         return
                     checked_admission = time.monotonic()
@@ -1286,11 +1135,11 @@ class SimulationService:
                 if current.ready_evidence is not None:
                     if time.monotonic_ns() - current.last_state_received_ns > 60 * 1_000_000_000:
                         raise SessionResourceError("Native control progress stopped within its existing startup budget")
-                    await asyncio.to_thread(check_session_capacity, current.root, current.expected_policy)
+                    await run_thread(check_session_capacity, current.root, current.expected_policy)
                     if current.evidence is not None and current.evidence["run_window"]["minimum_duration_met"]:
                         current.tasks.append(asyncio.create_task(self.stop(session_id)))
                         return
-                elif await asyncio.to_thread(directory_bytes, current.root) > SESSION_QUOTA_BYTES:
+                elif await run_thread(directory_bytes, current.root) > SESSION_QUOTA_BYTES:
                     raise SessionResourceError("Simulation exceeded its complete session workspace budget")
                 if current.model is None:
                     await asyncio.sleep(0.1)
@@ -1337,9 +1186,12 @@ class SimulationService:
         return binding
 
     async def stop(self, session_id: str, *, command_id=None) -> None:
+        return await wait_task(asyncio.create_task(self._stop(session_id, command_id=command_id)))
+
+    async def _stop(self, session_id: str, *, command_id=None) -> None:
         current = self.running.get(session_id)
         if current is None:
-            row = await asyncio.to_thread(self.store.get, session_id)
+            row = await run_thread(self.store.get, session_id)
             if row["state"] in {"stopped", "failed"}:
                 return
             raise SimulationConflict("Session worker ownership is unresolved")
@@ -1347,11 +1199,11 @@ class SimulationService:
             await self._stop_current(session_id, current, command_id=command_id)
 
     async def _stop_current(self, session_id, current, *, command_id=None):
-        row = await asyncio.to_thread(self.store.get, session_id)
+        row = await run_thread(self.store.get, session_id)
         if row["state"] in {"stopped", "failed"}:
             return
         if row["state"] != "unresolved":
-            await asyncio.to_thread(self.store.transition, session_id, self.owner, "stopping")
+            await run_thread(self.store.transition, session_id, self.owner, "stopping")
         current.ending = True
         current.input_until = 0
         current.source_session = None
@@ -1375,11 +1227,14 @@ class SimulationService:
             await asyncio.gather(current.tasks[0], return_exceptions=True)
         await asyncio.gather(*list(current.deliveries), return_exceptions=True)
         await self._settle(session_id, current)
-        if (await asyncio.to_thread(self.store.get, session_id))["state"] == "unresolved":
+        if (await run_thread(self.store.get, session_id))["state"] == "unresolved":
             raise SimulationConflict("Session process group is unresolved; recording and capacity are retained")
 
     async def close(self) -> None:
         self._lifecycle_state = "closing"
+        return await wait_task(asyncio.create_task(self._close()))
+
+    async def _close(self) -> None:
         async with self._lifecycle_lock:
             async with self.gate:
                 await self._close_owned()

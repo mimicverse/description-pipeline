@@ -8,7 +8,6 @@ import json
 import os
 import re
 from pathlib import Path
-import shutil
 import xml.etree.ElementTree as ET
 import zlib
 
@@ -495,15 +494,6 @@ def worker_main(payload: dict):
         status = 0
     except Exception as error:
         result, status = {"error": str(error)[:4000]}, 1
-    # Only the CLI explicitly transfers its private directory to this same PID.
-    if payload.get("cleanup") is not None:
-        try:
-            cleanup = Path(payload["cleanup"])
-            if cleanup.is_symlink() or Path(payload["source"]).parent != cleanup:
-                raise ValueError("Recording verifier cleanup handoff is invalid")
-            shutil.rmtree(cleanup)
-        except Exception as error:
-            result, status = {"error": f"Recording verifier cleanup failed: {error}"[:4000]}, 1
     print(json.dumps(result, allow_nan=False))
     return status
 

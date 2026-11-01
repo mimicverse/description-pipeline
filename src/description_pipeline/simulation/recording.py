@@ -16,6 +16,7 @@ from ..pipeline.contracts import ArtifactRef
 from .store import SimulationConflict
 from .resources import SESSION_QUOTA_BYTES
 from .evidence import validate_finalization_proof
+from .tasks import settle_task, wait_task, run_thread
 from .warnings import warning_inventory, verify_warning_inventory
 
 
@@ -107,8 +108,7 @@ def _source_members(source: dict, members: dict):
             raise ValueError("Simulation source path is invalid")
         member = certificate if name == certificate["path"] else members[name]
         if (
-            member["path"] != name
-            or member["sha256"] != expected
+            member["sha256"] != expected
             or type(member["bytes"]) is not int
             or not 0 <= member["bytes"] <= 64 * 1024 * 1024
         ):
@@ -176,15 +176,7 @@ def recording_binding(row: dict) -> dict:
 async def prepare_source(
     destination: Path, source: dict, members: dict, read_member, *, max_bytes=SESSION_QUOTA_BYTES
 ) -> Path:
-    task = asyncio.create_task(
-        asyncio.to_thread(materialize_source, destination, source, members, read_member, max_bytes=max_bytes)
-    )
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        # A filesystem reader cannot be cancelled halfway through cleanup of its private directory.
-        await asyncio.gather(task, return_exceptions=True)
-        raise
+    return await run_thread(materialize_source, destination, source, members, read_member, max_bytes=max_bytes)
 
 
 class VerificationUnresolved(SimulationConflict):
@@ -231,7 +223,7 @@ def _helper_command(python: Path, nonce: str, helper: Path, expected: str, opera
     if limiter is None:
         raise ValueError("Native verification requires resource control")
     # Only standard-library bootstrap code runs before the registered stdin gate.
-    entry = """import hashlib,json,shutil,sys
+    entry = """import hashlib,json,sys
 from pathlib import Path
 payload = None
 try:
@@ -255,10 +247,6 @@ try:
     else:
         raise SystemExit(scope['worker_main'](payload))
 except Exception as error:
-    if isinstance(payload, dict) and payload.get('cleanup') is not None:
-        cleanup = Path(payload['cleanup'])
-        if not cleanup.is_symlink() and Path(payload['source']).parent == cleanup:
-            shutil.rmtree(cleanup)
     print(json.dumps({'error': str(error)[:4000]}))
     raise SystemExit(1)
 """
@@ -323,17 +311,13 @@ async def run_verification(payload: dict, python: Path, *, register_process) -> 
     process = None
     identity = None
     try:
-        interrupted = False
-        try:
-            process = await asyncio.shield(spawning)
-        except asyncio.CancelledError:
-            process = await spawning
-            interrupted = True
+        interrupted = await settle_task(spawning)
+        process = spawning.result()
         identity = {"pid": process.pid, "nonce": nonce}
         try:
             identity = process_identity(process.pid, nonce)
         finally:
-            await register_process(identity)
+            await wait_task(asyncio.create_task(register_process(identity)))
         if interrupted:
             raise asyncio.CancelledError
         stdout, stderr = await asyncio.wait_for(process.communicate(content), 240)
@@ -351,34 +335,37 @@ async def run_verification(payload: dict, python: Path, *, register_process) -> 
         expected_execution = {key: value for key, value in payload["execution"].items() if key != "runtime_contract"}
         if result.get("execution") != expected_execution or result.get("verifier_pid") != process.pid:
             raise ValueError("Recording verifier returned a different execution identity")
-        if await asyncio.to_thread(resource_state, identity) != "dead":
+        if await run_thread(resource_state, identity) != "dead":
             raise ValueError("Recording verifier process group did not exit cleanly")
         return result
     finally:
         if process is not None:
             terminating = asyncio.create_task(asyncio.to_thread(terminate_owned, identity))
-            try:
-                quiescent = await asyncio.shield(terminating)
-            except asyncio.CancelledError:
-                quiescent = await terminating
-                if quiescent:
-                    raise
+            interrupted = await settle_task(terminating)
+            quiescent = terminating.result()
             if not quiescent:
                 raise VerificationUnresolved("Recording verifier process group is unresolved")
+            if interrupted:
+                raise asyncio.CancelledError
 
 
 def main():
     import argparse
     from contextlib import closing
-    import tempfile
+    import signal
 
     from ..artifacts import ArtifactStore
+    from ..orchestration.portal import load_simulation_config
     from .store import SimulationStore
+    from .verification import ManagedRecordingVerification
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--session", required=True, help="Registered simulation session identity")
-    parser.add_argument("--python", required=True, type=Path, help="Absolute fixed PICO interpreter")
+    parser.add_argument("--config", required=True, type=Path, help="Rendered authoritative portal configuration")
     args = parser.parse_args()
+    simulation = load_simulation_config(args.config)
+    if simulation is None:
+        parser.error("The portal configuration does not enable simulation")
     dsn = os.environ.get("PLATFORM_OPERATOR_DSN")
     if not dsn:
         parser.error("PLATFORM_OPERATOR_DSN is required to read the registered verification identity")
@@ -388,7 +375,6 @@ def main():
     store = SimulationStore(lambda: psycopg2.connect(dsn))
     artifacts = ArtifactStore.from_environment(os.environ)
     row = store.get(args.session)
-    binding = recording_binding(row)
     with closing(psycopg2.connect(dsn)) as connection:
         projection = read_run_projection(connection, row["source_run_id"], artifacts=artifacts)
 
@@ -396,28 +382,19 @@ def main():
         ref = ArtifactRef.from_record(member["artifact"])
         return artifacts.read_metadata_member(ref, name, max_bytes=64 * 1024 * 1024)[0]
 
-    temporary = Path(tempfile.mkdtemp(prefix="teleop-recording-verification-"))
+    verifier = ManagedRecordingVerification(store, artifacts, Path(simulation["root"]), Path(simulation["python"]))
+
+    async def execute():
+        loop = asyncio.get_running_loop()
+        current = asyncio.current_task()
+        loop.add_signal_handler(signal.SIGTERM, current.cancel)
+        try:
+            return await verifier.verify_recording(args.session, projection["members"], read_member)
+        finally:
+            loop.remove_signal_handler(signal.SIGTERM)
+
     try:
-        source = materialize_source(temporary / "source", row["request"]["source"], projection["members"], read_member)
-        payload = prepare_bound(
-            binding, artifacts, source, commands=store.worker_commands(args.session), execution=verification_execution()
-        )
-        payload["cleanup"] = str(temporary)
-        content = canonical(payload)
-        if len(content) > INPUT_LIMIT:
-            raise ValueError("Recording verifier initialization exceeds its input budget")
-        with tempfile.TemporaryFile(dir=temporary) as stream:
-            stream.write(content)
-            stream.flush()
-            stream.seek(0)
-            os.dup2(stream.fileno(), 0)
-            argv = evidence_command(args.python, os.urandom(24).hex(), payload["execution"])
-            # exec keeps one PID/group and gives the helper cleanup ownership on success.
-            os.execve(
-                argv[0],
-                argv,
-                {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1"},
-            )
-    finally:
-        # Runs only when materialization, preparation or exec fails.
-        shutil.rmtree(temporary)
+        result = asyncio.run(execute())
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        raise SystemExit(130) from None
+    print(json.dumps(result, sort_keys=True))

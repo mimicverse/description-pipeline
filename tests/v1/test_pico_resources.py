@@ -5,6 +5,7 @@ import hashlib
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from description_pipeline.simulation.resources import (
     SESSION_QUOTA_BYTES,
@@ -12,6 +13,7 @@ from description_pipeline.simulation.resources import (
     check_session_capacity,
     directory_bytes,
     require_storage,
+    admit_storage,
 )
 from description_pipeline.artifacts import ArtifactStore
 from description_pipeline.io import canonical, digest
@@ -38,6 +40,31 @@ class PicoResourceTests(unittest.TestCase):
         with path.open("xb") as stream:
             stream.truncate(size)
         return path
+
+    def test_host_admission_includes_starting_and_unknown_verification_partials(self):
+        self.sparse("active/source.bin", 4096)
+        self.sparse("recording-verification-pending/source.bin", 8192)
+        self.sparse("recording-verification-unknown/source.bin", 16384)
+
+        class Facts:
+            def active_session_ids(self):
+                return ["active"]
+
+            def verification_attempts(self):
+                return [
+                    {
+                        "command_id": command,
+                        "request": {"partial": "recording-verification-" + command},
+                        "result": {"state": state},
+                    }
+                    for command, state in (("pending", "starting"), ("unknown", "unknown"), ("done", "completed"))
+                ]
+
+        with patch("description_pipeline.simulation.resources.require_storage", wraps=require_storage) as checking:
+            admit_storage(Facts(), self.root, self.root, 100)
+        self.assertEqual(
+            100 + 3 * SESSION_QUOTA_BYTES - 4096 - 8192 - 16384, checking.call_args.kwargs["additional_bytes"]
+        )
 
     def test_rejects_the_original_source_compiled_and_stderr_overquota_cases(self):
         record = self.sparse("recording/native/records.jsonl.gz", 34498)
@@ -156,6 +183,17 @@ class PicoResourceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "materialization budget"):
             materialize_source(rejected, source, members, read_member, max_bytes=admitted - 1)
         self.assertLess(directory_bytes(rejected), admitted)
+
+    def test_materialization_uses_the_canonical_projection_key_as_the_member_path(self):
+        source, members, read_member = self.bound_source()
+        projected = {
+            name: {key: value for key, value in member.items() if key != "path"} for name, member in members.items()
+        }
+        destination = self.root / "projection-copy"
+        materialize_source(destination, source, projected, read_member)
+        self.assertEqual(sum(member["bytes"] for member in members.values()), directory_bytes(destination))
+        for name, expected in source["files"].items():
+            self.assertEqual(expected, hashlib.sha256((destination / name).read_bytes()).hexdigest())
 
     def test_materialization_rejects_an_inaccurate_declared_member_size(self):
         source, members, read_member = self.bound_source()

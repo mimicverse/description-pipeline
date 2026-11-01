@@ -8,6 +8,8 @@ import json
 from pathlib import Path
 import shutil
 import stat
+import asyncio
+import fcntl
 
 from .store import SimulationConflict
 
@@ -18,6 +20,93 @@ PHASES = ("preparing", "ready_unpaired", "running", "stop_finalization", "finali
 
 class SessionResourceError(SimulationConflict):
     """Preserve original session evidence when resource admission cannot succeed."""
+
+
+class StorageGate:
+    """One allocation lock for this root, shared by local tasks and managed CLI processes."""
+
+    def __init__(self, root: Path):
+        self.root = Path(root)
+        self._local = asyncio.Lock()
+        self._descriptor = None
+
+    def locked(self):
+        return self._local.locked()
+
+    async def __aenter__(self):
+        await self._local.acquire()
+        descriptor = None
+        try:
+            if self.root.is_symlink() or not self.root.is_dir():
+                raise SessionResourceError("Allocation root must be a real directory")
+            descriptor = os.open(self.root / "allocation.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise SessionResourceError("Allocation lock must be a regular file")
+            while True:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    await asyncio.sleep(0.02)
+            self._descriptor = descriptor
+            return self
+        except BaseException:
+            if descriptor is not None:
+                os.close(descriptor)
+            self._local.release()
+            raise
+
+    async def __aexit__(self, *_error):
+        os.close(self._descriptor)
+        self._descriptor = None
+        self._local.release()
+
+
+def verification_partial(root: Path, command_id: str, request: dict) -> Path:
+    name = "recording-verification-" + command_id
+    if request.get("partial") != name or Path(name).name != name:
+        raise SessionResourceError("Recording verification partial identity is invalid")
+    path = root / name
+    if path.is_symlink():
+        raise SessionResourceError("Recording verification partial must not be a symlink")
+    return path
+
+
+def admit_storage(
+    store, root: Path, destination: Path, additional_bytes: int, excluded_session=None, *, excluded_verification=None
+):
+    """Derive remaining workspace capacity from the existing durable session and attempt facts."""
+    workspaces = []
+    for identifier in store.active_session_ids():
+        if identifier == excluded_session:
+            continue
+        if (
+            not isinstance(identifier, str)
+            or not identifier
+            or Path(identifier).name != identifier
+            or identifier in {".", ".."}
+        ):
+            raise SessionResourceError("Active session identity is not a confined workspace name")
+        workspaces.append(root / identifier)
+    for attempt in store.verification_attempts():
+        if attempt["command_id"] == excluded_verification or attempt["result"]["state"] in {
+            "completed",
+            "failed",
+            "cancelled",
+        }:
+            continue
+        workspaces.append(verification_partial(root, attempt["command_id"], attempt["request"]))
+    remaining = 0
+    for path in workspaces:
+        observed = directory_bytes(path) if path.exists() or path.is_symlink() else 0
+        if observed > SESSION_QUOTA_BYTES:
+            raise SessionResourceError("An active workspace already exceeds its complete budget")
+        remaining += SESSION_QUOTA_BYTES - observed
+    if destination.stat().st_dev == root.stat().st_dev:
+        require_storage(destination, additional_bytes=additional_bytes + remaining, reserve_bytes=0)
+    else:
+        require_storage(destination, additional_bytes=additional_bytes, reserve_bytes=0)
+        require_storage(root, additional_bytes=remaining, reserve_bytes=0)
 
 
 def directory_bytes(root: Path) -> int:
@@ -145,6 +234,8 @@ def _validate_phase(phase):
 
 def validate_ready(evidence: dict, policy: dict, root: Path) -> dict:
     validate_policy(policy, root)
+    if isinstance(evidence, dict) and "resource_policy" in evidence:
+        validate_policy(evidence["resource_policy"], root)
     if (
         not isinstance(evidence, dict)
         or not {"contract_revision", "phase", "resource_policy", "timing_contract", "files"} <= evidence.keys()

@@ -133,6 +133,18 @@ class PicoProjectionContractTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(SessionResourceError):
                 validate_policy({**self.policy, **change}, self.root)
 
+    def test_ready_rejects_boolean_policy_fields_equal_to_zero_or_one(self):
+        for key, expected, received in (
+            ("compiled_bytes", 0, False),
+            ("compiled_bytes", 1, True),
+            ("traffic_headroom", 1, True),
+        ):
+            policy = {**self.policy, key: expected}
+            ready = deepcopy(self.ready)
+            ready["resource_policy"] = {**policy, key: received}
+            with self.subTest(key=key, expected=expected), self.assertRaises(SessionResourceError):
+                validate_ready(ready, policy, self.root)
+
     def test_idle_has_no_running_clock_and_short_running_is_not_duration_eligible(self):
         idle = self.state(running=False)
         self.assertEqual(idle, validate_state(idle, self.ready, tick=0, previous=None))

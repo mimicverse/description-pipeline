@@ -4,12 +4,15 @@ from copy import deepcopy
 import asyncio
 import hashlib
 import json
+import io
 import os
 from pathlib import Path
 import sys
 import tempfile
 import threading
 import unittest
+import zipfile
+import tracemalloc
 from unittest.mock import patch
 
 from description_pipeline.artifacts import ArtifactStore
@@ -18,6 +21,7 @@ from description_pipeline.pipeline.contracts import ArtifactRef
 from description_pipeline.simulation.evidence import RecordingDiagnostic
 from description_pipeline.simulation.recording import prepare_bound, recording_binding, session_identity
 from description_pipeline.simulation.resources import SessionResourceError, directory_bytes
+from description_pipeline.orchestration.report_view import text_warning_inventory
 from description_pipeline.simulation.service import RunningSession, SimulationService
 from tests.v1.test_pico_evidence import EvidenceFixture
 
@@ -25,6 +29,7 @@ from tests.v1.test_pico_evidence import EvidenceFixture
 class _StoreDouble:
     def __init__(self, row):
         self.row = row
+        self.attempts = []
 
     def get(self, identifier):
         assert identifier == self.row["session_id"]
@@ -33,8 +38,32 @@ class _StoreDouble:
     def worker_commands(self, _identifier):
         return []
 
+    def acquire_verification_slot(self):
+        class Slot:
+            def close(self):
+                pass
+
+        return Slot()
+
     def active_session_ids(self):
-        return [self.row["session_id"]]
+        return [self.row["session_id"]] if self.row["state"] not in {"stopped", "failed"} else []
+
+    def verification_attempts(self, _identifier=None):
+        return deepcopy(self.attempts)
+
+    def begin_verification(self, session_id, command_id, request, owner, *, slot=None):
+        self.attempts.append(
+            {
+                "session_id": session_id,
+                "command_id": command_id,
+                "request": request,
+                "result": {"state": "starting", "owner_nonce": owner, "process_identity": None},
+            }
+        )
+
+    def transition_verification(self, session_id, command_id, owner, state, **options):
+        item = next(row for row in self.attempts if row["command_id"] == command_id)
+        item["result"].update(state=state, **options)
 
 
 class PicoStorageContractTests(unittest.IsolatedAsyncioTestCase):
@@ -121,6 +150,59 @@ class PicoStorageContractTests(unittest.IsolatedAsyncioTestCase):
             (self.session / "worker-stderr.log").read_bytes(),
             (self.artifacts.objects / ref.artifact_id / "worker-stderr.log").read_bytes(),
         )
+
+    async def test_archive_stream_reads_verified_cas_without_disk_copies_and_closes_on_cancellation(self):
+        export = self.root / "export-input"
+        export.mkdir()
+        (export / "payload.bin").write_bytes(b"Original archive bytes\n" * 100000)
+        ref = self.artifacts.seal_tree(
+            export, kind="teleop_recording", producer_run_id=None, producer_stage=None, producer_tool_sha256="c" * 64
+        )
+        cas = self.artifacts.objects / ref.artifact_id
+
+        def snapshot():
+            return {
+                p.relative_to(self.root).as_posix(): (p.stat().st_size, p.stat().st_mtime_ns)
+                for p in self.root.rglob("*")
+                if p.is_file()
+            }
+
+        before = snapshot()
+        with patch.object(self.artifacts, "materialize", side_effect=AssertionError("Export must not copy CAS")):
+            stream = self.service.recording_archive(ref)
+            tracemalloc.start()
+            try:
+                for _chunk in stream:
+                    pass
+                _current, peak = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+                stream.close()
+            self.assertLess(peak, 1024 * 1024)
+            archive_bytes = b"".join(self.service.recording_archive(ref))
+            with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+                self.assertEqual({"manifest.json", "payload.bin"}, set(archive.namelist()))
+                for name in archive.namelist():
+                    self.assertEqual((cas / name).read_bytes(), archive.read(name))
+                    self.assertEqual(zipfile.ZIP_STORED, archive.getinfo(name).compress_type)
+
+            def readers():
+                paths = []
+                for fd in Path("/proc/self/fd").iterdir():
+                    try:
+                        target = os.readlink(fd)
+                    except OSError:
+                        continue
+                    if target.startswith(str(cas) + "/"):
+                        paths.append(target)
+                return paths
+
+            stream = self.service.recording_archive(ref)
+            next(stream)
+            self.assertTrue(readers())
+            stream.close()
+            self.assertEqual([], readers())
+        self.assertEqual(before, snapshot())
 
     async def test_whole_directory_overquota_is_diagnostic_not_success_or_discard(self):
         padding = self.session / "source/padding.bin"
@@ -221,9 +303,12 @@ class PicoStorageContractTests(unittest.IsolatedAsyncioTestCase):
             task = asyncio.create_task(self.seal())
             try:
                 self.assertTrue(await asyncio.to_thread(entered.wait, 5))
-                task.cancel()
-                await asyncio.sleep(0)
-                self.assertFalse(task.done())
+                for _ in range(3):
+                    task.cancel()
+                    await asyncio.sleep(0.02)
+                    self.assertFalse(task.done())
+                    self.assertTrue(self.service._storage_gate.locked())
+                    self.assertFalse(finished.is_set())
             finally:
                 release.set()
             with self.assertRaises(asyncio.CancelledError):
@@ -231,3 +316,108 @@ class PicoStorageContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(finished.is_set())
         self.assertTrue((self.fixture.native / "records.jsonl.gz").exists())
         self.assertEqual([], list(self.artifacts.root.glob("session-result-*")))
+
+    async def test_verification_copy_waits_for_the_common_gate_and_refuses_before_reading_source(self):
+        record = await self.seal()
+        self.store.row.update(state="stopped", recording_artifact=record)
+        original = self.snapshot()
+        self.service._lifecycle_state = "open"
+        calls, reads = [], []
+
+        def refuse(*args, **options):
+            calls.append((args, options))
+            raise SessionResourceError("Storage refused")
+
+        def reader(*args):
+            reads.append(args)
+            raise AssertionError("Source must not be read before admission")
+
+        async with self.service._storage_gate:
+            with patch.object(self.service, "_admit_storage", refuse):
+                task = asyncio.create_task(self.service.verify_recording(self.session.name, {}, reader))
+                await asyncio.sleep(0.05)
+                self.assertFalse(task.done())
+                self.assertEqual([], calls)
+            # Keep the refusal installed while the queued operation enters.
+            replacement = patch.object(self.service, "_admit_storage", refuse)
+            replacement.start()
+        try:
+            with self.assertRaisesRegex(SessionResourceError, "Storage refused"):
+                await task
+        finally:
+            replacement.stop()
+        self.assertEqual(1, len(calls))
+        self.assertEqual([], reads)
+        self.assertEqual(original, self.snapshot())
+        self.assertEqual("failed", self.store.attempts[-1]["result"]["state"])
+        self.assertEqual([], list(self.sessions.glob("recording-verification-*")))
+
+    async def test_verification_copy_survives_repeated_cancellation_until_its_real_writer_finishes(self):
+        certificate = {
+            "report": {
+                "checks": [
+                    {"id": "provenance.warnings", "details": {"warning_comments": [], "warning_sha256": digest([])}}
+                ]
+            }
+        }
+        certificate_bytes = canonical(certificate)
+        contents = {"model.xml": b"<mujoco/>", "certificate.json": certificate_bytes}
+        source_input = self.root / "verification-input"
+        source_input.mkdir()
+        for name, value in contents.items():
+            (source_input / name).write_bytes(value)
+        source_ref = self.artifacts.seal_tree(
+            source_input,
+            kind="pico_test_source",
+            producer_run_id=None,
+            producer_stage=None,
+            producer_tool_sha256="c" * 64,
+        )
+        members = {
+            item["path"]: {**item, "artifact": source_ref.to_record()}
+            for item in self.artifacts.verify(source_ref)["members"]
+        }
+        source = {
+            "files": {name: value["sha256"] for name, value in members.items()},
+            "warning_inventory": text_warning_inventory([], members["certificate.json"]),
+        }
+        self.store.row["request"]["source"] = source
+        self.store.row["request_digest"] = digest(self.store.row["request"])
+        (self.session / "recording/request.json").write_bytes(canonical(self.store.row["request"]) + b"\n")
+        (self.session / "recording/session.json").write_bytes(canonical(session_identity(self.store.row)) + b"\n")
+        self.fixture.finalization_fixture()
+        self.report["finalization_verification"] = self.fixture.finalization_result_double()
+        self.report["manifest_sha256"] = hashlib.sha256(
+            (self.fixture.native / "session-manifest.json").read_bytes()
+        ).hexdigest()
+        record = await self.seal()
+        self.store.row.update(state="stopped", recording_artifact=record)
+        self.service._lifecycle_state = "open"
+        entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+        def reader(name, _member):
+            if name == "model.xml":
+                entered.set()
+                if not release.wait(5):
+                    raise TimeoutError("Source test release was not delivered")
+                finished.set()
+            return contents[name]
+
+        task = asyncio.create_task(self.service.verify_recording(self.session.name, members, reader))
+        try:
+            self.assertTrue(await asyncio.to_thread(entered.wait, 5))
+            for _ in range(3):
+                task.cancel()
+                await asyncio.sleep(0.02)
+                self.assertFalse(task.done())
+                self.assertTrue(self.service._storage_gate.locked())
+                self.assertFalse(finished.is_set())
+                self.assertTrue(list(self.sessions.glob("recording-verification-*")))
+        finally:
+            release.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertTrue(finished.is_set())
+        self.assertFalse(self.service._storage_gate.locked())
+        self.assertEqual("cancelled", self.store.attempts[-1]["result"]["state"])
+        self.assertEqual([], list(self.sessions.glob("recording-verification-*")))
