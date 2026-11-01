@@ -11,13 +11,13 @@ from ..io import digest
 from ..pipeline.contracts import ArtifactRef
 from ..platform.facts import FactStore
 from .contracts import (
-    ACTIVE_STATES,
     RESULT_SCHEMA,
     TERMINAL_STATES,
     AssessmentConflict,
     AssessmentRequest,
     auxiliary_dag_run_id,
     parse_json,
+    project_attempt,
     require,
     sha,
     text,
@@ -181,12 +181,7 @@ class AssessmentStore:
             result = _row(cursor)
         if result is None:
             raise KeyError(attempt_id)
-        require(result["state"] in ACTIVE_STATES | TERMINAL_STATES, "Assessment attempt state is invalid")
-        if result["state"] in {"running", "verifying", "sealing"} and result["lease_expired"]:
-            # A read projects uncertainty; it does not settle resources or grant takeover.
-            result["detail"] = {**result["detail"], "reason": "owner_lease_expired", "previous_phase": result["state"]}
-            result["state"] = "unknown"
-        return result
+        return project_attempt(result)
 
     def latest(self, request_id: str) -> dict | None:
         with self.transaction() as cursor:

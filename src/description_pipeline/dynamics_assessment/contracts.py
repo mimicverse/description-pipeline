@@ -48,6 +48,17 @@ def require(condition: bool, message: str) -> None:
         raise AssessmentError(message)
 
 
+def project_attempt(record: dict) -> dict:
+    """Project lease uncertainty without mutating the row or settling resources."""
+    result = copy.deepcopy(record)
+    require(result["state"] in ACTIVE_STATES | TERMINAL_STATES, "Assessment attempt state is invalid")
+    if result["state"] in {"running", "verifying", "sealing"} and result["lease_expired"]:
+        # A read projects uncertainty; it does not settle resources or grant takeover.
+        result["detail"] = {**result["detail"], "reason": "owner_lease_expired", "previous_phase": result["state"]}
+        result["state"] = "unknown"
+    return result
+
+
 def dispatch_was_accepted(attempt: dict) -> bool:
     """Acceptance is a monotonic attempt fact, independent of projected state."""
     detail = attempt.get("detail")

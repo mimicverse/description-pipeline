@@ -13,7 +13,12 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 
-from description_pipeline.dynamics_assessment.contracts import RESULT_SCHEMA, AssessmentConflict, AssessmentRequest
+from description_pipeline.dynamics_assessment.contracts import (
+    RESULT_SCHEMA,
+    AssessmentConflict,
+    AssessmentRequest,
+    project_attempt,
+)
 from description_pipeline.dynamics_assessment.executor import AssessmentExecutor
 from description_pipeline.owned_process import process_identity, process_state, resource_state, terminate_owned
 from description_pipeline.dynamics_assessment.runtime import (
@@ -138,6 +143,26 @@ class PostgresCase(AssessmentCase):
 
 
 class PostgresDatabaseTests(PostgresCase):
+    def test_expired_attempt_read_preserves_database_state_and_lease(self):
+        store, request, root = self.database
+        attempt, _owner = owned_attempt(store, request, root)
+        with store.transaction() as cursor:
+            cursor.execute(
+                "UPDATE assessment_attempt SET lease_until=now()-interval '1 second' WHERE attempt_id=%s "
+                "RETURNING state,lease_until,resources_settled",
+                (attempt["attempt_id"],),
+            )
+            before = cursor.fetchone()
+        projected = store.attempt(attempt["attempt_id"])
+        self.assertEqual(projected["state"], "unknown")
+        self.assertEqual(projected["detail"]["previous_phase"], "running")
+        with store.transaction() as cursor:
+            cursor.execute(
+                "SELECT state,lease_until,resources_settled FROM assessment_attempt WHERE attempt_id=%s",
+                (attempt["attempt_id"],),
+            )
+            self.assertEqual(cursor.fetchone(), before)
+
     def _dead_controller(self):
         nonce = digest({"controller": self.id()})
         process = subprocess.Popen(
@@ -367,3 +392,25 @@ class PostgresDatabaseTests(PostgresCase):
         assert store.attempt(attempt["attempt_id"])["state"] == "failed"
         self.assertTrue(store.attempt(attempt["attempt_id"])["detail"]["dispatch_accepted"])
         self.assertNotIn("dispatch_accepted", successor["detail"])
+
+
+class AttemptProjectionTests(unittest.TestCase):
+    def test_projection_does_not_alias_input_or_change_unexpired_facts(self):
+        record = {
+            "state": "running",
+            "lease_expired": True,
+            "resources_settled": False,
+            "detail": {"source": ["original"]},
+            "process": {"pid": 1},
+        }
+        projected = project_attempt(record)
+        self.assertEqual(projected["state"], "unknown")
+        self.assertEqual(record["state"], "running")
+        projected["detail"]["source"].append("projection-only")
+        projected["process"]["pid"] = 2
+        self.assertEqual(record["detail"], {"source": ["original"]})
+        self.assertEqual(record["process"], {"pid": 1})
+        record["lease_expired"] = False
+        self.assertEqual(project_attempt(record), record)
+        with self.assertRaisesRegex(ValueError, "state is invalid"):
+            project_attempt({"state": "invalid"})
