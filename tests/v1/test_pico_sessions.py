@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager, suppress
+import ctypes
 from datetime import datetime, UTC
 import hashlib
 import json
@@ -10,6 +12,7 @@ import math
 import os
 from pathlib import Path
 import socket
+import signal
 import subprocess
 import sys
 import tempfile
@@ -39,7 +42,8 @@ if SESSION_TESTS:
     from description_pipeline.orchestration.portal import PortalApp, PortalConfig
     from description_pipeline.orchestration.report_view import text_warning_inventory
     from description_pipeline.pipeline.contracts import RunAdmission, StageCommand, StageResult
-    from description_pipeline.simulation.service import SimulationService
+    from description_pipeline.owned_process import process_identity, resource_state
+    from description_pipeline.simulation.service import RunningSession, SimulationService
     from description_pipeline.simulation.store import SimulationConflict, SimulationStore
     from description_pipeline.simulation.verify_recording import verify
     from description_pipeline.simulation.recording import run_verification, session_identity
@@ -166,10 +170,16 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
         }
         warning_path = "reports/mjcf-certificate.json"
         warnings = ["Inspection fixture"]
-        certificate = {"report": {"checks": [{
-            "id": "provenance.warnings",
-            "details": {"warning_comments": warnings, "warning_sha256": digest(warnings)},
-        }]}}
+        certificate = {
+            "report": {
+                "checks": [
+                    {
+                        "id": "provenance.warnings",
+                        "details": {"warning_comments": warnings, "warning_sha256": digest(warnings)},
+                    }
+                ]
+            }
+        }
         (source / warning_path).parent.mkdir()
         certificate_bytes = canonical(certificate)
         (source / warning_path).write_bytes(certificate_bytes)
@@ -283,7 +293,12 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
         request = {**self.request, "source": {**self.request["source"], "warnings": ["Inspection fixture"]}}
         with self.assertRaisesRegex(ValueError, "Inline warning inventories are unsupported"):
             await self.service.create(
-                "app:tenant:operator", "inline-warning-copy", self.run_id, request, self.members, self.read_member,
+                "app:tenant:operator",
+                "inline-warning-copy",
+                self.run_id,
+                request,
+                self.members,
+                self.read_member,
             )
         with self.store.transaction() as cursor:
             cursor.execute("SELECT count(*) FROM simulation_session WHERE request_key='inline-warning-copy'")
@@ -328,22 +343,30 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
     async def test_orphan_reconciliation_preserves_unknown_and_recording_identity(self):
         previous_owner = "previous-inspection-supervisor"
         unresolved = self.store.create(
-            "app:tenant:operator", "orphan-without-process", self.run_id,
-            {**self.request, "record": False}, previous_owner,
+            "app:tenant:operator",
+            "orphan-without-process",
+            self.run_id,
+            {**self.request, "record": False},
+            previous_owner,
         )
         previous = self.store.create(
-            "app:tenant:operator", "orphan-with-recording", self.run_id, self.request, previous_owner,
+            "app:tenant:operator",
+            "orphan-with-recording",
+            self.run_id,
+            self.request,
+            previous_owner,
         )
         process = await asyncio.create_subprocess_exec(
-            sys.executable, "-I", "-c", "import sys;sys.stdin.buffer.read(1)", stdin=asyncio.subprocess.PIPE,
+            sys.executable,
+            "-I",
+            "-c",
+            "import sys;sys.stdin.buffer.read(1)",
+            previous_owner,
+            stdin=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
         try:
-            identity = {
-                "pid": process.pid,
-                "owner": previous_owner,
-                "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
-                "start_time": Path(f"/proc/{process.pid}/stat").read_text().split(") ", 1)[1].split()[19],
-            }
+            identity = process_identity(process.pid, previous_owner)
             self.store.transition(previous["session_id"], previous_owner, "starting", process=identity)
         finally:
             process.stdin.close()
@@ -367,6 +390,207 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
         sealed = self.artifacts.objects / ref.artifact_id
         self.assertEqual(session_identity(previous), json.loads((sealed / "session.json").read_bytes()))
         self.assertFalse(json.loads((sealed / "outcome.json").read_bytes())["complete"])
+
+    @asynccontextmanager
+    async def exited_leader_group(self, *, marked, owner=None):
+        """Own and reap a real descendant without changing the host reaper."""
+        libc = ctypes.CDLL(None, use_errno=True)
+        previous = ctypes.c_int()
+        self.assertEqual(0, libc.prctl(37, ctypes.byref(previous), 0, 0, 0))
+        self.assertEqual(0, libc.prctl(36, 1, 0, 0, 0))
+        process = None
+        descriptor = None
+        reaping = None
+        try:
+            program = """import os,signal,sys,time
+read_fd,write_fd=os.pipe()
+child=os.fork()
+if child==0:
+ os.close(read_fd)
+ if sys.argv[2]=='unmarked':
+  os.set_inheritable(write_fd,True)
+  script='import os,signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);'
+  script+='os.write('+str(write_fd)+',b"r");os.close('+str(write_fd)+');time.sleep(60)'
+  os.execv(sys.executable,[sys.executable,'-I','-c',script])
+ signal.signal(signal.SIGTERM,signal.SIG_IGN)
+ os.write(write_fd,b'r');os.close(write_fd)
+ while True: time.sleep(1)
+os.close(write_fd);os.read(read_fd,1);os.close(read_fd)
+print(child,flush=True)
+sys.stdin.buffer.read(1)
+"""
+            nonce = uuid.uuid4().hex
+            process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-I",
+                "-B",
+                "-c",
+                program,
+                nonce,
+                "marked" if marked else "unmarked",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+            child = int(await asyncio.wait_for(process.stdout.readline(), 3))
+            descriptor = os.pidfd_open(child)
+            identity = process_identity(process.pid, nonce)
+            row = self.store.create(
+                "app:tenant:operator",
+                nonce,
+                self.run_id,
+                self.request,
+                owner or self.service.owner,
+            )
+            self.store.transition(row["session_id"], row["owner_nonce"], "starting", process=identity)
+            self.store.transition(row["session_id"], row["owner_nonce"], "stopping")
+            recording = self.service.root / row["session_id"] / "recording"
+            recording.mkdir(parents=True)
+            (recording / "request.json").write_bytes(canonical(self.request))
+            (recording / "session.json").write_bytes(canonical(session_identity(row)))
+            (recording / "ticks.jsonl").write_bytes(b"original partial\n")
+            current = RunningSession(process, recording.parent, identity=identity)
+            process.stdin.close()
+            await self.service._wait_leader(current, 3)
+            self.assertEqual(0, process.returncode)
+            self.assertEqual("alive" if marked else "unknown", resource_state(identity))
+            reaping = asyncio.create_task(asyncio.to_thread(os.waitpid, child, 0))
+            yield row, current, child
+        finally:
+            if descriptor is not None:
+                with suppress(ProcessLookupError):
+                    signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+                os.close(descriptor)
+            if process is not None and process.returncode is None:
+                process.kill()
+            if reaping is not None:
+                await asyncio.wait_for(asyncio.shield(reaping), 5)
+            if process is not None:
+                await asyncio.wait_for(process.wait(), 5)
+            self.assertEqual(0, libc.prctl(36, previous.value, 0, 0, 0))
+
+    async def test_exited_leader_owned_descendant_is_reaped_before_sealing(self):
+        await self.start_service()
+        async with self.exited_leader_group(marked=True) as (row, current, child):
+            sid = row["session_id"]
+            self.service.running[sid] = current
+            current.tasks = [
+                asyncio.create_task(self.service._read(sid)),
+                asyncio.create_task(self.service._watch(sid)),
+            ]
+            await asyncio.wait_for(current.tasks[0], 10)
+            settled = self.store.get(sid)
+            self.assertEqual("failed", settled["state"])
+            self.assertEqual("dead", resource_state(current.identity))
+            self.assertFalse(Path(f"/proc/{child}").exists())
+            self.assertIsNotNone(settled["recording_artifact"])
+            self.assertFalse(json.loads((current.root / "recording/outcome.json").read_bytes())["complete"])
+            self.assertNotIn(sid, self.service.running)
+
+    async def test_unknown_group_retains_partial_identity_and_capacity_until_reconciled(self):
+        await self.start_service()
+        async with self.exited_leader_group(marked=False) as (row, current, child):
+            sid = row["session_id"]
+            self.service.running[sid] = current
+            current.tasks = [
+                asyncio.create_task(self.service._read(sid)),
+                asyncio.create_task(self.service._watch(sid)),
+            ]
+            await asyncio.wait_for(current.tasks[0], 10)
+            unresolved = self.store.get(sid)
+            self.assertEqual("unresolved", unresolved["state"])
+            self.assertEqual(current.identity, unresolved["process_identity"])
+            self.assertIsNone(unresolved["recording_artifact"])
+            self.assertTrue(Path(f"/proc/{child}").exists())
+            self.assertEqual(b"original partial\n", (current.root / "recording/ticks.jsonl").read_bytes())
+            self.assertFalse((current.root / "recording/outcome.json").exists())
+            with self.assertRaisesRegex(SimulationConflict, "capacity"):
+                self.store.create(
+                    "app:tenant:operator",
+                    "capacity-after-unknown",
+                    self.run_id,
+                    self.request,
+                    self.service.owner,
+                    capacity=1,
+                )
+            with self.assertRaisesRegex(SimulationConflict, "unresolved"):
+                await self.service.stop(sid)
+            self.assertEqual("unresolved", self.store.get(sid)["state"])
+        await self.service.stop(sid)
+        reconciled = self.store.get(sid)
+        self.assertEqual("failed", reconciled["state"])
+        self.assertIsNotNone(reconciled["recording_artifact"])
+        self.assertFalse(json.loads((current.root / "recording/outcome.json").read_bytes())["complete"])
+
+    async def test_orphan_with_exited_leader_settles_only_after_owned_descendant_reaped(self):
+        async with self.exited_leader_group(marked=True, owner="previous-supervisor") as (row, current, child):
+            await self.start_service()
+            settled = self.store.get(row["session_id"])
+            self.assertEqual("failed", settled["state"])
+            self.assertEqual("dead", resource_state(current.identity))
+            self.assertFalse(Path(f"/proc/{child}").exists())
+            self.assertIsNotNone(settled["recording_artifact"])
+
+    async def test_unknown_orphan_preserves_partial_until_later_supervisor_reconciliation(self):
+        async with self.exited_leader_group(marked=False, owner="previous-supervisor") as (row, current, child):
+            await self.start_service()
+            unresolved = self.store.get(row["session_id"])
+            self.assertEqual("unresolved", unresolved["state"])
+            self.assertEqual(current.identity, unresolved["process_identity"])
+            self.assertIsNone(unresolved["recording_artifact"])
+            self.assertTrue(Path(f"/proc/{child}").exists())
+            self.assertFalse((current.root / "recording/outcome.json").exists())
+        await self.service.close()
+        await self.start_service()
+        settled = self.store.get(row["session_id"])
+        self.assertEqual("failed", settled["state"])
+        self.assertIsNotNone(settled["recording_artifact"])
+
+    async def test_cancellation_during_real_spawn_captures_identity_and_reaps_worker(self):
+        from unittest.mock import patch
+
+        await self.start_service()
+        entered, release = asyncio.Event(), asyncio.Event()
+        actual_spawn = asyncio.create_subprocess_exec
+        spawned = []
+
+        async def delayed_spawn(*args, **options):
+            process = await actual_spawn(*args, **options)
+            spawned.append(process)
+            entered.set()
+            await release.wait()
+            return process
+
+        with patch("description_pipeline.simulation.service.asyncio.create_subprocess_exec", delayed_spawn):
+            creating = asyncio.create_task(
+                self.service.create(
+                    "app:tenant:operator",
+                    "cancel-real-spawn",
+                    self.run_id,
+                    self.request,
+                    self.members,
+                    self.read_member,
+                )
+            )
+            try:
+                await asyncio.wait_for(entered.wait(), 5)
+                creating.cancel()
+                await asyncio.sleep(0)
+            finally:
+                release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await creating
+        with self.store.transaction() as cursor:
+            cursor.execute("SELECT session_id FROM simulation_session WHERE request_key='cancel-real-spawn'")
+            sid = cursor.fetchone()[0]
+        settled = self.store.get(sid)
+        self.assertEqual("failed", settled["state"])
+        self.assertEqual(spawned[0].pid, settled["process_identity"]["pid"])
+        self.assertEqual("dead", resource_state(settled["process_identity"]))
+        self.assertIsNotNone(spawned[0].returncode)
+        self.assertIsNotNone(settled["recording_artifact"])
+        self.assertFalse(json.loads((self.service.root / sid / "recording/outcome.json").read_bytes())["complete"])
+        self.assertFalse(self.service.running)
 
     async def wait_ready(self, sid):
         async with asyncio.timeout(20):
@@ -637,8 +861,14 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(9, len(descriptor["model"]["joints"]))
                 self.assertIn("head_link3", descriptor["model"]["links"])
                 self.assertEqual(
-                    {"name": "left_0", "type": "revolute", "parent": "base", "child": "left_link_0",
-                     "lower": "-1.2", "upper": "1.2"},
+                    {
+                        "name": "left_0",
+                        "type": "revolute",
+                        "parent": "base",
+                        "child": "left_link_0",
+                        "lower": "-1.2",
+                        "upper": "1.2",
+                    },
                     descriptor["model"]["joints"][0],
                 )
                 member_reader = portal._registered_member_bytes
@@ -804,7 +1034,8 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
                 self.service.send = kill_during_stop
                 try:
                     response = await client.post(
-                        f"/api/simulations/{failed_sid}/commands", headers=headers,
+                        f"/api/simulations/{failed_sid}/commands",
+                        headers=headers,
                         json={"type": "stop", "command_id": "failed-stop"},
                     )
                 finally:
@@ -816,7 +1047,8 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(failure["error"])
                 self.assertEqual(self.store.get(failed_sid)["error"], failure["error"])
                 repeated = await client.post(
-                    f"/api/simulations/{failed_sid}/commands", headers=headers,
+                    f"/api/simulations/{failed_sid}/commands",
+                    headers=headers,
                     json={"type": "stop", "command_id": "failed-stop"},
                 )
                 self.assertEqual(failure, repeated.json())

@@ -17,6 +17,7 @@ import tempfile
 import zipfile
 
 from ..io import digest, canonical
+from ..owned_process import module_command, process_identity, resource_state, terminate_owned
 from .store import SimulationConflict, SimulationStore
 from .recording import prepare_source, recording_binding, run_verification, session_identity
 from .schemas import load_runtime_contract
@@ -29,6 +30,7 @@ log = logging.getLogger(__name__)
 class RunningSession:
     process: asyncio.subprocess.Process
     root: Path
+    identity: dict | None = None
     model: dict | None = None
     state: dict | None = None
     condition: asyncio.Condition = field(default_factory=asyncio.Condition)
@@ -42,6 +44,8 @@ class RunningSession:
     source_session: str | None = None
     stdin_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     stop_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    termination_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    settlement_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     tasks: list = field(default_factory=list)
     failure: str | None = None
 
@@ -116,15 +120,14 @@ class SimulationService:
             self._database_lock = await asyncio.shield(acquiring)
         except asyncio.CancelledError:
             # The database call continues in its thread; cleanup must own its returned lease.
-            result, = await asyncio.gather(acquiring, return_exceptions=True)
+            (result,) = await asyncio.gather(acquiring, return_exceptions=True)
             if not isinstance(result, BaseException):
                 self._database_lock = result
             raise
         for row in await asyncio.to_thread(self.store.orphaned, self.owner):
             identity = row["process_identity"]
-            if identity is not None and self._process_exists(identity):
-                await asyncio.sleep(5.5)
-            if identity is None or self._process_exists(identity):
+            quiescent = identity is not None and await self._terminate_identity(identity)
+            if not quiescent:
                 await asyncio.to_thread(self.store.reconcile_orphan, row["session_id"], row["owner_nonce"])
             else:
                 recording = await self._seal_recording(
@@ -135,19 +138,9 @@ class SimulationService:
                     row["session_id"],
                     row["owner_nonce"],
                     "failed",
-                    error="Supervisor interrupted; previous process no longer exists",
+                    error="Supervisor interrupted; previous process group is absent",
                     recording=recording,
                 )
-
-    @staticmethod
-    def _process_exists(identity):
-        try:
-            if identity.get("boot_id") != Path("/proc/sys/kernel/random/boot_id").read_text().strip():
-                return False
-            fields = Path(f"/proc/{int(identity['pid'])}/stat").read_text().split(") ", 1)[1].split()
-            return fields[19] == identity["start_time"] and fields[0] != "Z"
-        except FileNotFoundError:
-            return False
 
     async def create(self, actor: str, key: str, run_id: str, request: dict, members: dict, read_member) -> dict:
         if not key or len(key) > 128:
@@ -182,37 +175,42 @@ class SimulationService:
                 environment = {key: os.environ[key] for key in ("PATH", "LANG", "LC_ALL") if key in os.environ}
                 environment.update({"PYTHONUNBUFFERED": "1", "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1"})
                 error_log = (session_root / "worker-stderr.log").open("xb")
+                nonce = secrets.token_hex(24)
+                interrupted = False
                 try:
-                    process = await asyncio.create_subprocess_exec(
-                        shutil.which("prlimit"),
-                        "--as=4294967296",
-                        "--nofile=256",
-                        "--fsize=536870912",
-                        "--",
-                        str(self.python),
-                        "-I",
-                        "-B",
-                        "-m",
-                        "teleop.backends.mujoco.upper_body_worker",
-                        stdin=asyncio.subprocess.PIPE,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=error_log,
-                        cwd=session_root,
-                        env=environment,
-                        start_new_session=True,
-                        limit=64 * 1024 * 1024,
+                    spawning = asyncio.create_task(
+                        asyncio.create_subprocess_exec(
+                            shutil.which("prlimit"),
+                            "--as=4294967296",
+                            "--nofile=256",
+                            "--fsize=536870912",
+                            "--",
+                            *module_command(self.python, "teleop.backends.mujoco.upper_body_worker", nonce),
+                            stdin=asyncio.subprocess.PIPE,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=error_log,
+                            cwd=session_root,
+                            env=environment,
+                            start_new_session=True,
+                            limit=64 * 1024 * 1024,
+                        )
                     )
+                    try:
+                        process = await asyncio.shield(spawning)
+                    except asyncio.CancelledError:
+                        # The kernel spawn continues: obtain its handle before cleanup.
+                        process = await spawning
+                        interrupted = True
                 finally:
                     error_log.close()
-                current = RunningSession(process, session_root)
+                current = RunningSession(process, session_root, identity={"pid": process.pid, "nonce": nonce})
                 self.running[session_id] = current
-                identity = {
-                    "pid": process.pid,
-                    "owner": self.owner,
-                    "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
-                    "start_time": Path(f"/proc/{process.pid}/stat").read_text().split(") ", 1)[1].split()[19],
-                }
-                await asyncio.to_thread(self.store.transition, session_id, self.owner, "starting", process=identity)
+                current.identity = process_identity(process.pid, nonce)
+                if interrupted:
+                    raise asyncio.CancelledError
+                await asyncio.to_thread(
+                    self.store.transition, session_id, self.owner, "starting", process=current.identity
+                )
                 current.tasks = [
                     asyncio.create_task(self._read(session_id)),
                     asyncio.create_task(self._watch(session_id)),
@@ -223,14 +221,13 @@ class SimulationService:
             except BaseException as error:
                 current = self.running.get(session_id)
                 if current is not None:
+                    current.failure = str(error) or type(error).__name__
                     await self._terminate(current)
                     if current.tasks:
-                        await asyncio.shield(current.tasks[0])
-                    else:
-                        self.running.pop(session_id, None)
-                        await asyncio.to_thread(
-                            self.store.transition, session_id, self.owner, "failed", error=str(error)
-                        )
+                        if not current.tasks[0].done():
+                            current.tasks[0].cancel()
+                        await asyncio.gather(current.tasks[0], return_exceptions=True)
+                    await self._settle(session_id, current)
                 else:
                     latest = await asyncio.to_thread(self.store.get, session_id)
                     if latest["state"] not in {"stopped", "failed"}:
@@ -306,45 +303,64 @@ class SimulationService:
                 async with current.condition:
                     current.sequence += 1
                     current.condition.notify_all()
-            await current.process.wait()
+            await self._wait_leader(current, 3)
         except asyncio.CancelledError:
             error = "Supervisor cancelled the state reader"
-            await self._terminate(current)
         except Exception as failure:
             error = str(failure)
-            await self._terminate(current)
         finally:
-            try:
-                row = await asyncio.to_thread(self.store.get, session_id)
+            current.failure = current.failure or error
+            await self._settle(session_id, current)
+
+    async def _settle(self, session_id, current):
+        async with current.settlement_lock:
+            row = await asyncio.to_thread(self.store.get, session_id)
+            if row["state"] in {"stopped", "failed"}:
+                self.running.pop(session_id, None)
+                return
+            observed = (
+                await asyncio.to_thread(resource_state, current.identity) if current.identity is not None else "unknown"
+            )
+            if observed != "dead":
+                current.failure = current.failure or "Worker process group did not exit cleanly"
+            quiescent = await self._terminate(current)
+            if not quiescent:
+                # A writer may still be active: preserve the original partial directory.
+                await asyncio.to_thread(
+                    self.store.transition,
+                    session_id,
+                    self.owner,
+                    "unresolved",
+                    error=current.failure or "Worker process group ownership is unresolved",
+                    process=current.identity,
+                )
+            else:
                 terminal = (
                     "stopped"
-                    if current.process.returncode == 0 and row["state"] == "stopping" and not error
+                    if current.process.returncode == 0 and row["state"] == "stopping" and not current.failure
                     else "failed"
                 )
-                error = (
-                    error
-                    or current.failure
-                    or (None if terminal == "stopped" else f"Worker exited: {current.process.returncode}")
+                error = current.failure or (
+                    None if terminal == "stopped" else f"Worker exited: {current.process.returncode}"
                 )
                 recording = await self._seal_recording(
                     current.root, terminal == "stopped", error, runtime=row["request"]["runtime"]
                 )
-                if row["state"] not in {"stopped", "failed"}:
-                    await asyncio.to_thread(
-                        self.store.transition,
-                        session_id,
-                        self.owner,
-                        terminal,
-                        error=error,
-                        recording=recording,
-                    )
-            finally:
-                async with current.condition:
-                    current.sequence += 1
-                    current.condition.notify_all()
+                await asyncio.to_thread(
+                    self.store.transition,
+                    session_id,
+                    self.owner,
+                    terminal,
+                    error=error,
+                    recording=recording,
+                    process=current.identity,
+                )
                 self.running.pop(session_id, None)
-                for task in current.tasks[1:2]:
-                    task.cancel()
+            async with current.condition:
+                current.sequence += 1
+                current.condition.notify_all()
+            for task in current.tasks[1:2]:
+                task.cancel()
 
     async def _seal_recording(self, root, complete, error, *, runtime):
         directory = root / "recording"
@@ -363,20 +379,41 @@ class SimulationService:
 
     @staticmethod
     async def _terminate(current):
-        if current.process.returncode is None:
-            current.process.terminate()
-            try:
-                await asyncio.wait_for(current.process.wait(), 3)
-            except TimeoutError:
-                current.process.kill()
-                await current.process.wait()
+        async with current.termination_lock:
+            if current.identity is None:
+                return False
+            return await SimulationService._terminate_identity(current.identity)
+
+    @staticmethod
+    async def _terminate_identity(identity):
+        # The event loop owns the subprocess reaper; this synchronous helper
+        # observes the whole group while the loop keeps collecting child exits.
+        terminating = asyncio.create_task(asyncio.to_thread(terminate_owned, identity))
+        try:
+            return await asyncio.shield(terminating)
+        except asyncio.CancelledError:
+            await terminating
+            raise
+
+    @staticmethod
+    async def _wait_leader(current, timeout):
+        # Process.wait may also wait for a pipe inherited by a surviving child.
+        async with asyncio.timeout(timeout):
+            while current.process.returncode is None:
+                await asyncio.sleep(0.02)
 
     async def _watch(self, session_id: str) -> None:
         current = self.running[session_id]
         started = time.monotonic()
         checked_admission = 0
         try:
-            while current.process.returncode is None:
+            while True:
+                if current.process.returncode is not None:
+                    _, pending = await asyncio.wait(current.tasks[:1], timeout=1)
+                    if pending:
+                        current.failure = "Worker output remained open after its leader exited"
+                        current.tasks[0].cancel()
+                    return
                 if time.monotonic() - checked_admission >= 1:
                     if not await asyncio.to_thread(self.store.admission_open):
                         current.tasks.append(asyncio.create_task(self.stop(session_id)))
@@ -385,11 +422,13 @@ class SimulationService:
                 if (current.model is None and time.monotonic() - started > 60) or time.monotonic() - started > 3600:
                     current.failure = "Simulation exceeded its startup or session time budget"
                     await self._terminate(current)
+                    current.tasks[0].cancel()
                     return
                 recording = current.root / "recording" / "ticks.jsonl"
                 if recording.exists() and recording.stat().st_size > 512 * 1024 * 1024:
                     current.failure = "Simulation exceeded its recording size budget"
                     await self._terminate(current)
+                    current.tasks[0].cancel()
                     return
                 enabled = min(current.viewer_until, current.input_until) > time.monotonic()
                 if current.input_connected != enabled:
@@ -401,6 +440,7 @@ class SimulationService:
             current.failure = f"Simulation supervision failed: {type(error).__name__}"
             log.exception("Simulation supervision failed")
             await self._terminate(current)
+            current.tasks[0].cancel()
 
     async def pair(self, session_id: str) -> str:
         current = self.running.get(session_id)
@@ -443,21 +483,29 @@ class SimulationService:
         row = await asyncio.to_thread(self.store.get, session_id)
         if row["state"] in {"stopped", "failed"}:
             return
-        await asyncio.to_thread(self.store.transition, session_id, self.owner, "stopping")
+        if row["state"] != "unresolved":
+            await asyncio.to_thread(self.store.transition, session_id, self.owner, "stopping")
         if len(current.tasks) > 1:
             current.tasks[1].cancel()
             await asyncio.gather(current.tasks[1], return_exceptions=True)
-        if current.process.returncode is None:
+        if row["state"] != "unresolved" and current.process.returncode is None:
             try:
                 await self.send(session_id, {"type": "stop"})
                 current.process.stdin.close()
-                await current.process.stdin.wait_closed()
-                await asyncio.wait_for(current.process.wait(), 5)
+                await asyncio.wait_for(current.process.stdin.wait_closed(), 2)
+                await self._wait_leader(current, 5)
             except (TimeoutError, BrokenPipeError, ConnectionResetError, SimulationConflict):
+                current.failure = current.failure or "Worker did not acknowledge a clean stop"
                 await self._terminate(current)
         if current.tasks:
-            await current.tasks[0]
-            current.tasks[1].cancel()
+            _, pending = await asyncio.wait(current.tasks[:1], timeout=1)
+            if pending:
+                current.failure = current.failure or "Worker output did not close after stop"
+                current.tasks[0].cancel()
+            await asyncio.gather(current.tasks[0], return_exceptions=True)
+        await self._settle(session_id, current)
+        if (await asyncio.to_thread(self.store.get, session_id))["state"] == "unresolved":
+            raise SimulationConflict("Session process group is unresolved; recording and capacity are retained")
 
     async def close(self) -> None:
         try:
@@ -465,6 +513,8 @@ class SimulationService:
         finally:
             for current in list(self.running.values()):
                 await self._terminate(current)
+            for session_id, current in list(self.running.items()):
+                await self._settle(session_id, current)
             if self._lock is not None:
                 self._lock.close()
                 self._lock = None
