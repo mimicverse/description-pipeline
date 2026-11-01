@@ -41,10 +41,17 @@ export async function loadMJCF(viewer, { descriptor, artifactUrl, signal, onStat
   }
   const worker = new Worker("/static/mjcf_worker.js", { type: "module" });
   let disposed = false, mode = "visual", markers = false, selectedLink = "", snapshot, definition;
+  let requestId = 0;
+  const pendingJoints = new Map();
   const objects = [], helpers = [];
   const matrix = new THREE.Matrix4();
-  const cleanup = () => { if (!disposed) { disposed = true; worker.terminate(); } };
-  const send = (message) => { if (!disposed) worker.postMessage(message); };
+  const cleanup = () => { if (!disposed) { disposed = true; pendingJoints.clear(); worker.terminate(); } };
+  const send = (message, requested = []) => {
+    if (disposed) return;
+    const id = ++requestId;
+    for (const [name, value] of requested) pendingJoints.set(name, { id, value });
+    worker.postMessage({ ...message, requestId: id });
+  };
   const abort = () => cleanup(); signal?.addEventListener("abort", abort, { once: true });
   try {
     const initial = await new Promise((resolve, reject) => {
@@ -110,10 +117,17 @@ export async function loadMJCF(viewer, { descriptor, artifactUrl, signal, onStat
     }
     worker.onmessage = ({ data }) => {
       if (disposed) return;
-      if (data.type === "state") { snapshot = data.state; sync(); }
-      if (data.type === "error") onStatus?.({ error: data.message });
+      if (data.type === "state") {
+        snapshot = data.state;
+        for (const [name, request] of pendingJoints) if (request.id <= data.appliedRequest) pendingJoints.delete(name);
+        sync();
+      }
+      if (data.type === "error") {
+        for (const [name, request] of pendingJoints) if (data.requestId === undefined || request.id <= data.requestId) pendingJoints.delete(name);
+        onStatus?.({ error: data.message });
+      }
     };
-    worker.onerror = (event) => onStatus?.({ error: event.message || "MuJoCo worker failed" });
+    worker.onerror = (event) => { pendingJoints.clear(); onStatus?.({ error: event.message || "MuJoCo worker failed" }); };
     sync(); viewer.robotRoot.updateMatrixWorld(true); viewer.resize();
     const fit = () => {
       const bounds = new THREE.Box3();
@@ -126,12 +140,15 @@ export async function loadMJCF(viewer, { descriptor, artifactUrl, signal, onStat
       links: [...new Set(initial.geoms.filter((geom) => geom.collision && geom.type !== "mjGEOM_PLANE").map((geom) => geom.link))],
       joints: initial.joints.map((joint) => ({ ...joint,
         get value() { return snapshot.qpos[joint.q]; },
-        set(value) { send({ type: "joint", name: joint.name, value }); },
-        reset() { send({ type: "joint-reset", name: joint.name }); },
+        get requestedValue() { return pendingJoints.get(joint.name)?.value; },
+        set(value) { send({ type: "joint", name: joint.name, value }, [[joint.name, value]]); },
+        reset() { send({ type: "joint-reset", name: joint.name }, [[joint.name, joint.resetValue]]); },
       })),
       selectLink(value) { selectedLink = value; sync(); }, setMode(value) { mode = value; sync(); },
       setMarkers(value) { markers = value; sync(); }, togglePlay() { send({ type: "play" }); },
-      step() { send({ type: "step" }); }, reset() { send({ type: "reset" }); }, dispose: cleanup,
+      step() { send({ type: "step" }); },
+      reset() { send({ type: "reset" }, initial.joints.map((joint) => [joint.name, joint.resetValue])); },
+      dispose: cleanup,
     };
   } catch (error) {
     signal?.removeEventListener("abort", abort); cleanup();

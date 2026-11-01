@@ -546,11 +546,12 @@ export function buildJointControls(container, joints, { onInput } = {}) {
     const factor = () => angular && unit.value === "deg" ? 180 / Math.PI : 1;
     const display = (syncInput = true) => {
       const value = joint.value * factor();
+      const inputValue = (joint.requestedValue ?? joint.value) * factor();
       range.min = String((joint.type === "continuous" ? -Math.PI : joint.lower) * factor());
       range.max = String((joint.type === "continuous" ? Math.PI : joint.upper) * factor());
-      if (syncInput || document.activeElement !== range) range.value = String(value);
-      if (syncInput) numeric.value = String(value);
-      readout.textContent = `${value.toFixed(4)} ${unit.value}`;
+      if (syncInput || document.activeElement !== range) range.value = String(inputValue);
+      if (syncInput) numeric.value = String(inputValue);
+      readout.textContent = `${value.toFixed(4)} ${unit.value}${joint.requestedValue === undefined ? "" : " (updating)"}`;
       if (value < Number(range.min) || value > Number(range.max)) {
         readout.textContent += joint.type === "continuous"
           ? " (outside slider window; joint is continuous)"

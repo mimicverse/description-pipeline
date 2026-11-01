@@ -95,9 +95,10 @@ async function rejected(change, pattern) {
 try {
   // Worker-backed joints acknowledge asynchronously; refreshing must preserve active edits.
   {
-    let actual = 0.5, requested = null;
+    let actual = 0.5, requested;
     const joint = {name: "deferred_joint", type: "revolute", lower: -1, upper: 1,
-      get value() { return actual; }, set(value) { requested = value; }, reset() { requested = 0; }};
+      get value() { return actual; }, get requestedValue() { return requested; },
+      set(value) { requested = value; }, reset() { requested = 0.125; }};
     const container = e("container"), controls = buildJointControls(container, [joint]);
     const [, readout, range, numeric, unit] = container.children[0].children;
     unit.value = "rad"; unit.listeners.change();
@@ -106,12 +107,19 @@ try {
     numeric.value = "0.25"; numeric.listeners.change();
     assert.equal(requested, 0.25); assert.equal(Number(numeric.value), 0.25,
       "Committing a request must not substitute the previous worker state");
-    actual = requested; controls.refresh(); assert.match(readout.textContent, /0.2500 rad/);
+    document.activeElement = null; controls.refresh(); assert.equal(Number(numeric.value), 0.25);
+    assert.match(readout.textContent, /0.5000 rad \(updating\)/);
+    unit.value = "deg"; unit.listeners.change(); assert.equal(Number(numeric.value), 0.25 * 180 / Math.PI);
+    unit.value = "rad"; unit.listeners.change();
+    actual = requested; requested = undefined; controls.refresh(); assert.match(readout.textContent, /0.2500 rad$/);
     document.activeElement = range; range.value = "0.75"; range.listeners.input();
     assert.equal(Number(range.value), 0.75, "An active slider must retain the requested position before acknowledgement");
     controls.refresh(); assert.equal(Number(range.value), 0.75);
-    actual = requested; document.activeElement = null; controls.refresh();
+    document.activeElement = null; controls.refresh(); assert.equal(Number(numeric.value), 0.75);
+    actual = requested; requested = undefined; controls.refresh();
     assert.equal(Number(numeric.value), 0.75);
+    controls.reset(); controls.refresh(); assert.equal(Number(numeric.value), 0.125);
+    actual = requested; requested = undefined; controls.refresh(); assert.equal(Number(range.value), 0.125);
   }
   const { result } = await load();
   assert.deepEqual(result.records.joints[0], { name: "axis_joint", type: "revolute", lower: 0, upper: 0, effort: 0, velocity: 0, axis: [1, 0, 0] });
@@ -295,3 +303,4 @@ try {
   assert.ok(parseStl(mesh).getAttribute("position"));
   console.log(`viewer parser: production load/geometry/records/controls passed; ${cases} invalid declarations rejected`);
 } finally { Object.assign(globalThis, saved); }
+await import("./mjcf_preview_test.mjs");

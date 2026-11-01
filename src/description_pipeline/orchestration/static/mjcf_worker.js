@@ -1,6 +1,7 @@
 // The pinned MuJoCo binding runs in this worker, isolated from the page's DOM and CSP.
 import loadMujoco from "/static/vendor/mujoco.js";
 let mj, model, data, joints, playing = false, last = performance.now(), initialized = false;
+let appliedRequest = 0;
 const filesRoot = "/delivery";
 function state() {
   mj.mj_forward(model, data);
@@ -39,7 +40,7 @@ function geometry(index) {
   }
   return record;
 }
-function publish() { self.postMessage({ type: "state", state: state() }); }
+function publish() { self.postMessage({ type: "state", state: state(), appliedRequest }); }
 function step(count) {
   for (let index = 0; index < count; index++) mj.mj_step(model, data);
   if (![...data.qpos, ...data.qvel].every(Number.isFinite)) throw new Error("Simulation produced a non-finite state");
@@ -71,6 +72,7 @@ self.onmessage = async ({ data: message }) => {
           name,
           type: angular ? (limited ? "revolute" : "continuous") : "prismatic",
           lower: model.jnt_range[2 * index], upper: model.jnt_range[2 * index + 1],
+          resetValue: model.qpos0[model.jnt_qposadr[index]],
         });
       }
       self.postMessage({ type: "model", geoms, joints, bodies: model.nbody - 1, sites: model.nsite, memory_bytes: data.qpos.buffer.byteLength, state: state() },
@@ -89,9 +91,10 @@ self.onmessage = async ({ data: message }) => {
         if (!joint) throw new Error("Unknown preview joint");
         playing = false; data.qpos[joint.q] = model.qpos0[joint.q]; data.qvel.fill(0);
       } else throw new Error("Unknown preview command");
+      appliedRequest = message.requestId;
       publish();
     }
-  } catch (error) { playing = false; self.postMessage({ type: "error", message: String(error.message || error) }); }
+  } catch (error) { playing = false; self.postMessage({ type: "error", requestId: message.requestId, message: String(error.message || error) }); }
 };
 setInterval(() => {
   if (!playing || !data) return;

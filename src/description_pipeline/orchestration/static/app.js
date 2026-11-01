@@ -2677,7 +2677,7 @@ async function loadPreview(dagRunId) {
       const { loadMJCF } = await import("/static/mjcf_viewer.js");
       loaded = await loadMJCF(state.viewer, { descriptor: preview.mjcf, artifactUrl, signal: request.signal,
         onStatus: (status) => {
-          if (status.error) { setError($("preview-note"), status.error); return; }
+          if (status.error) { state.controls?.refresh(); setError($("preview-note"), status.error); return; }
           state.controls?.refresh();
           $("mjcf-play").textContent = status.playing ? "Pause" : "Play";
           $("mjcf-status").textContent = `MuJoCo ${preview.mjcf.engine.mujoco} · ${status.time.toFixed(3)} s · ${status.contacts} contacts · ${status.bodies} bodies · ${status.geoms} geoms. No controller qualification.`;
