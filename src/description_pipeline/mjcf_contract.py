@@ -53,6 +53,12 @@ FORMAT_WARNING = (
     "are derived from the source URDF by declared encoding rules, not read directly from CAD. "
     "See reports/mjcf-certificate.json for object and field sources."
 )
+MESH_ENCODING = "float32-exact-indexed-obj/1"
+MESH_ENCODING_PREFIX = "mjcf/meshes/"
+MESH_WARNING_PREFIX = "WARNING mjcf.mesh_encoding: "
+MESH_ENCODING_SCOPE = (
+    "Lossless oriented triangle geometry encoding; STL header, stored normals and attributes remain in the source"
+)
 COLLISION_WARNING_PREFIX = "WARNING mjcf.collision_proxy: "
 COLLISION_SCOPE = "Convex contact approximation; source concavities and hardware contact behaviour are not qualified"
 
@@ -60,6 +66,13 @@ COLLISION_SCOPE = "Convex contact approximation; source concavities and hardware
 def collision_warning(payload: dict) -> str:
     """Encode a provenance record without admitting an XML comment terminator."""
     return COLLISION_WARNING_PREFIX + json.dumps(
+        payload, sort_keys=True, ensure_ascii=True, allow_nan=False, separators=(",", ":")
+    ).replace("--", r"\u002d\u002d")
+
+
+def mesh_encoding_warning(payload: dict) -> str:
+    """Encode the source and derived geometry identities in the shared warning inventory."""
+    return MESH_WARNING_PREFIX + json.dumps(
         payload, sort_keys=True, ensure_ascii=True, allow_nan=False, separators=(",", ":")
     ).replace("--", r"\u002d\u002d")
 

@@ -508,6 +508,33 @@ def _resolve_meshes(
     return contents, meshes
 
 
+def _encode_meshes(document: dict, contents: dict, meshes: dict) -> tuple[dict, dict, list]:
+    """Encode only engine-consumed source meshes without changing their geometry or instances."""
+    used = {surface["geometry"]["path"]
+            for link in document["links"]
+            for surface in (*link["visuals"], *link["projection_collisions"])
+            if surface["geometry"]["kind"] == "mesh" and surface["geometry"]["path"] in contents}
+    files, paths, warnings = {}, {}, []
+    for source in sorted(used):
+        sha = hashlib.sha256(contents[source]).hexdigest()
+        target = contract.MESH_ENCODING_PREFIX + sha + ".obj"
+        paths[source] = target
+        if target not in files:
+            vertices, indices = np.unique(meshes[source], axis=0, return_inverse=True)
+            # Float64 round trips retain the exact decoded float32 coordinates.
+            lines = ["v " + " ".join(repr(float(value)) for value in vertex) for vertex in vertices]
+            lines.extend("f " + " ".join(str(int(index) + 1) for index in face)
+                         for face in indices.reshape(-1, 3))
+            files[target] = ("\n".join(lines) + "\n").encode("ascii")
+        warnings.append(contract.mesh_encoding_warning({
+            "source_file": source, "source_sha256": sha, "target_file": target,
+            "target_sha256": hashlib.sha256(files[target]).hexdigest(),
+            "triangles": len(meshes[source]) // 3, "rule": contract.MESH_ENCODING,
+            "scope": contract.MESH_ENCODING_SCOPE,
+        }))
+    return files, paths, warnings
+
+
 # --------------------------------------------------------------------------
 # Projection
 # --------------------------------------------------------------------------
@@ -1063,7 +1090,7 @@ def _xml_bytes(root: ET.Element) -> bytes:
     return f'<?xml version="1.0" encoding="UTF-8"?>\n{text}\n'.encode()
 
 
-def _project_robot(document: dict, config: dict, derived_sites: list[dict]) -> bytes:
+def _project_robot(document: dict, config: dict, derived_sites: list[dict], encoded_paths: dict) -> bytes:
     root = ET.Element("mujoco")
     root.set("model", document["name"])
     compiler = ET.SubElement(root, "compiler")
@@ -1086,7 +1113,7 @@ def _project_robot(document: dict, config: dict, derived_sites: list[dict]) -> b
     for path, scale in assets.keys:
         mesh = ET.SubElement(asset, "mesh")
         mesh.set("name", assets.name_for(path, scale))
-        mesh.set("file", f"{contract.ASSET_PREFIX}{path}")
+        mesh.set("file", f"{contract.ASSET_PREFIX}{encoded_paths.get(path, path)}")
         mesh.set("inertia", "shell")
         mesh.set("maxhullvert", str(config["collision"]["max_vertices"]))
         if tuple(scale) != contract.UNIT_SCALE:
@@ -1161,15 +1188,16 @@ def project(root: Path, simulation: bytes = contract.EMPTY_CONFIG) -> dict[str, 
                 if (root / contract.COMPONENT_SOURCE).exists() else None)
     _component_groups(document, metadata)
     proxies = _prepare_collisions(document, config, meshes)
+    encoded, encoded_paths, encoding_warnings = _encode_meshes(document, mesh_bytes, meshes)
     derived = _derive_support_sites(document, config, meshes)
-    robot_bytes = _project_robot(document, config, derived["sites"])
+    robot_bytes = _project_robot(document, config, derived["sites"], encoded_paths)
     # Preserve the exact upstream warning comments in both delivered encodings.
     warnings = ET.fromstring(urdf_bytes, parser=ET.XMLParser(target=ET.TreeBuilder(insert_comments=True)))
     robot = ET.fromstring(robot_bytes)
     comments = [item for item in warnings.iter() if item.tag is ET.Comment]
     for comment in reversed(comments):
         robot.insert(0, comment)
-    derived_warnings = [contract.SIMULATION_WARNING, contract.FORMAT_WARNING]
+    derived_warnings = [contract.SIMULATION_WARNING, contract.FORMAT_WARNING, *encoding_warnings]
     for link in document["links"]:
         source_role = config["collision"]["source"]
         if source_role == "auto":
@@ -1186,7 +1214,7 @@ def project(root: Path, simulation: bytes = contract.EMPTY_CONFIG) -> dict[str, 
     for index, warning in enumerate(derived_warnings, len(comments)):
         robot.insert(index, ET.Comment(warning))
     robot_bytes = _xml_bytes(robot)
-    files = {contract.CONFIG_NAME: simulation, contract.ROBOT_NAME: robot_bytes, **proxies}
+    files = {contract.CONFIG_NAME: simulation, contract.ROBOT_NAME: robot_bytes, **encoded, **proxies}
     if config["floor"] is not None:
         height = derived["height"] if config["floor"]["supports"] else config["floor"]["height"]
         files[contract.SCENE_NAME] = _project_scene(config, height)
