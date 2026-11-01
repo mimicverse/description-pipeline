@@ -348,7 +348,7 @@ class NativeDatabaseTests(PostgresCase):
         shutil.rmtree(original)
         records = [json.loads(line) for line in (archive / "run/records.jsonl").read_text().splitlines()]
         assert len(records) == receipt["records_checked"] == 32
-        assert len({row["continuous_dynamics"]["tick_index"] for row in records}) == 8
+        assert len({row["extension"]["continuous_dynamics"]["tick_index"] for row in records}) == 8
         assert {row["verification"] for row in records} == {"unchecked"}
         request_bytes = (archive / "request.json").read_bytes()
         assert len(request_bytes) < 1024 * 1024
