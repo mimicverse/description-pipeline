@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -174,25 +173,23 @@ class ContractsTests(AssessmentCase):
         with self.assertRaisesRegex(AssessmentError, "requires its fixed dependency version"):
             RuntimePin(record)
 
-    def test_original_engineering_certificate_capacity_and_exact_byte_preservation(self):
-        location = os.environ.get("ASSESSMENT_TEST_ORIGINAL_MJCF_CERTIFICATE")
-        if not location:
-            self.skipTest("The original engineering certificate is required for the capacity-only regression")
-        original = Path(location)
-        content = original.read_bytes()
-        expected = "09c46bc375cb41c7731f331ff93147d2258ba6d4e8a0e43fe65b884e02a7d34f"
-        self.assertEqual(len(content), 3161953)
-        self.assertEqual(hashlib.sha256(content).hexdigest(), expected)
+    def test_software_certificate_capacity_and_exact_byte_preservation(self):
+        # Preserve the original failure's byte-size boundary with synthetic data.
+        prefix = b'{"schema":"software-certificate-capacity/v1","scope":"software_regression_only","payload":"'
+        suffix = b'"}\n'
+        content = prefix + b"x" * (3161953 - len(prefix) - len(suffix)) + suffix
+        original = self.root / "software-certificate.json"
+        original.write_bytes(content)
+        expected = hashlib.sha256(content).hexdigest()
         source = json.loads(content)
-        self.assertIn("input_binding", source)
-        self.assertIn("source_artifacts", source)
+        self.assertEqual(source["scope"], "software_regression_only")
         store = ArtifactStore(self.root / "capacity-artifacts")
-        copied = self.root / "original-certificate"
+        copied = self.root / "software-certificate"
         copied.mkdir()
         (copied / "mjcf-certificate.json").write_bytes(content)
         artifact = store.seal_tree(
             copied,
-            kind="original_certificate_capacity_test",
+            kind="software_certificate_capacity_test",
             producer_run_id=None,
             producer_stage=None,
             producer_tool_sha256=digest({"test": "capacity_and_byte_preservation_only"}),
