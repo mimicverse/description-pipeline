@@ -16,13 +16,12 @@ from unittest import mock
 
 from description_pipeline.dynamics_assessment import runtime as runtime_module
 from description_pipeline.dynamics_assessment.contracts import AssessmentConflict
+from description_pipeline.owned_process import (
+    module_command, process_identity, process_state, resource_state, terminate_owned,
+)
 from description_pipeline.dynamics_assessment.runtime import (
     ProcessLimits,
     TeleopProcess,
-    process_identity,
-    process_state,
-    resource_state,
-    terminate_owned,
 )
 from tests.v1.test_dynamics_assessment_contracts import AssessmentCase, runtime_pin
 
@@ -176,6 +175,25 @@ while True:
 
 
 class RuntimeTests(AssessmentCase):
+    def test_module_marker_binds_kernel_argv_without_changing_public_module_arguments(self):
+        nonce = secrets.token_hex(32)
+        process = subprocess.Popen(
+            module_command(Path(sys.executable), "json.tool", nonce),
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        identity = process_identity(process.pid, nonce)
+        try:
+            self.assertEqual(resource_state(identity), "alive")
+            output, error = process.communicate(b'{"value":1}', timeout=5)
+            self.assertEqual(process.returncode, 0, error.decode())
+            self.assertEqual(output, b'{\n    "value": 1\n}\n')
+            self.assertEqual(resource_state(identity), "dead")
+        finally:
+            if process.poll() is None:
+                terminate_owned(identity, grace_seconds=0.1, reap=process.poll)
+            process.communicate(timeout=5)
+
     def test_empty_proc_snapshot_is_unknown_when_kernel_group_still_exists(self):
         with owned_group(self.root, late=True) as (_leader, identity, trigger, record):
             with fork_after_proc_listing(trigger):

@@ -30,11 +30,10 @@ from description_pipeline.dynamics_assessment.contracts import (
     dispatch_conf,
 )
 from description_pipeline.dynamics_assessment.executor import AssessmentExecutor
+from description_pipeline.owned_process import process_state, terminate_owned
 from description_pipeline.dynamics_assessment.runtime import (
     ProcessLimits,
     TeleopProcess,
-    process_state,
-    terminate_owned,
 )
 from description_pipeline.dynamics_assessment.service import AssessmentAccess, AssessmentService
 from description_pipeline.io import canonical, digest, file_digest

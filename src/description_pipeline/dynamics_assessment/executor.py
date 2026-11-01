@@ -23,7 +23,8 @@ from .contracts import (
     require,
 )
 from .bundle import validate_bundle
-from .runtime import TeleopProcess, process_identity, process_state, resource_state, terminate_owned
+from ..owned_process import process_identity, process_state, resource_state, terminate_owned
+from .runtime import TeleopProcess
 from .service import AssessmentService
 
 
