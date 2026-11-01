@@ -16,7 +16,7 @@ from ..pipeline.contracts import ArtifactRef
 from .store import SimulationConflict
 from .resources import SESSION_QUOTA_BYTES
 from .evidence import validate_finalization_proof
-from .tasks import settle_task, wait_task, run_thread
+from .tasks import settle_task, run_thread
 from .warnings import warning_inventory, verify_warning_inventory
 
 
@@ -320,7 +320,17 @@ async def run_verification(payload: dict, python: Path, *, register_process) -> 
         try:
             identity = process_identity(process.pid, nonce)
         finally:
-            await wait_task(asyncio.create_task(register_process(identity)))
+            if interrupted:
+                # Deliver cancellation already captured while acquiring the real
+                # process at the callback's first checkpoint. The callback owns
+                # any durable work it starts; an arbitrary await is cancellable.
+                try:
+                    async with asyncio.timeout(0):
+                        await register_process(identity)
+                except (TimeoutError, asyncio.CancelledError) as error:
+                    raise interrupted from error
+            else:
+                await register_process(identity)
         if interrupted:
             raise interrupted
         stdout, stderr = await asyncio.wait_for(process.communicate(content), 240)
