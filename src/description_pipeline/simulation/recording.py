@@ -369,9 +369,9 @@ def main():
     simulation = load_simulation_config(args.config)
     if simulation is None:
         parser.error("The portal configuration does not enable simulation")
-    dsn = os.environ.get("PLATFORM_OPERATOR_DSN")
+    dsn = os.environ.get("PLATFORM_SERVICE_DSN")
     if not dsn:
-        parser.error("PLATFORM_OPERATOR_DSN is required to read the registered verification identity")
+        parser.error("PLATFORM_SERVICE_DSN is required for managed recording verification")
     import psycopg2
     from ..platform.queries import read_run_projection
 
