@@ -10,6 +10,7 @@ from pathlib import Path
 from ..artifacts import ArtifactStore
 from ..artifacts.store import path_has_link_ancestor
 from ..runtime import scoped_executor_sha256, tool_record
+from ..simulation.schemas import load_runtime_contract
 from .contracts import RUNTIME_SCHEMA, RuntimePin, object_record, parse_json, require, text
 from .executor import AssessmentExecutor
 from .runtime import ProcessLimits, TeleopProcess
@@ -42,11 +43,13 @@ def assessment_executor_from_environment(environment=None) -> AssessmentExecutor
             config["limits"], {"wall_seconds", "memory_bytes", "cpu_seconds", "output_bytes"}, "Assessment limits"
         )
     )
-    installed = parse_json(files("description_pipeline").joinpath("simulation/teleop-runtime.json").read_bytes())
+    installed = load_runtime_contract(
+        files("description_pipeline").joinpath("simulation/teleop-runtime.json"), consumer="assessment"
+    )
     pin = RuntimePin(
         {
             "schema": RUNTIME_SCHEMA,
-            **{key: installed[key] for key in ("source_commit", "wheel_sha256", "files", "dependency_versions")},
+            **{key: value for key, value in installed.items() if key != "schema_version"},
         }
     )
     python = Path(text(config["python"], "Assessment interpreter"))

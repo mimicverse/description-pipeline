@@ -1,15 +1,15 @@
-"""Composition uses a test-installed resource and the existing private stores."""
+"""Composition projects the release consumer and reuses private business stores."""
 
 import json
 import os
 from pathlib import Path
 import tempfile
+import sys
 import unittest
 from unittest import mock
 
 from description_pipeline.dynamics_assessment import composition
 from tests.v1.test_dynamics_assessment_contracts import AssessmentCase
-from tests.v1.test_dynamics_assessment_native import build_native_case
 from tests.v1.test_dynamics_assessment_postgres import PostgresCase
 
 
@@ -56,23 +56,20 @@ class CompositionTests(AssessmentCase):
 
 
 class CompositionDatabaseTests(PostgresCase):
-    def test_enabled_factory_reuses_installed_inventory_and_existing_private_database(self):
+    def test_enabled_factory_projects_the_release_consumer_and_reuses_private_database(self):
         tmp_path = self.root
-        case = build_native_case(self.database)
-        service, process_owner, _access, *_ = case
-        resources = tmp_path / "test-installed-resources"
-        (resources / "simulation").mkdir(parents=True)
-        (resources / "simulation/teleop-runtime.json").write_text(json.dumps(service.runtime.to_record()))
-        self.enterContext(
-            mock.patch.object(composition, "files", lambda name: resources if name == "description_pipeline" else None)
+        store, _request, _root = self.database
+        installed = composition.load_runtime_contract(
+            composition.files("description_pipeline").joinpath("simulation/teleop-runtime.json"),
+            consumer="assessment",
         )
-        with service.store.connect() as connection:
+        with store.connect() as connection:
             dsn = connection.dsn
         root = tmp_path / "private-executor"
         config = {
             "enabled": True,
             "root": str(root),
-            "python": str(process_owner.process.python),
+            "python": sys.executable,
             "capacity": 2,
             "limits": {
                 "wall_seconds": 120,
@@ -84,12 +81,16 @@ class CompositionDatabaseTests(PostgresCase):
         environment = {
             "ASSESSMENT_CONFIG_JSON": json.dumps(config),
             "PLATFORM_SERVICE_DSN": dsn,
-            "PLATFORM_ARTIFACT_ROOT": str(service.store.artifacts.root),
+            "PLATFORM_ARTIFACT_ROOT": str(store.artifacts.root),
         }
         executor = composition.assessment_executor_from_environment(environment)
         self.assertEqual(root.stat().st_mode & 0o777, 0o700)
-        assert executor.service.runtime.sha256 == service.runtime.sha256
-        assert executor.service.store.artifacts.root == service.store.artifacts.root
+        self.assertEqual(
+            executor.service.runtime.to_record(),
+            {"schema": composition.RUNTIME_SCHEMA, **{k: v for k, v in installed.items() if k != "schema_version"}},
+        )
+        self.assertIsNotNone(executor.service.runtime.record["actuator_model"])
+        assert executor.service.store.artifacts.root == store.artifacts.root
         assert executor.service.capacity == 2 and executor.service.input_limit == 64 * 1024**2
         with executor.store.transaction() as cursor:
             cursor.execute("SELECT count(*) FROM run_admission")
