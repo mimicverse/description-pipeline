@@ -2243,6 +2243,56 @@ sys.stdin.buffer.read(1)
         )
         return sid, payload
 
+    async def test_native_verification_policy_sets_actual_child_limits(self):
+        import resource
+
+        _sid, payload = await self.native_verifier_fixture("native-verifier-budget")
+        self.assertEqual(
+            {
+                "revision": 1,
+                "cpu_seconds": 900,
+                "recording_wall_seconds": 1200,
+                "address_space_bytes": 4 * 1024**3,
+                "nofile": 128,
+            },
+            dict(recording_module.NATIVE_VERIFICATION_POLICY),
+        )
+        identities = []
+
+        async def register(identity):
+            identities.append(identity)
+            self.assertEqual((900, 900), resource.prlimit(identity["pid"], resource.RLIMIT_CPU))
+            self.assertEqual((4 * 1024**3, 4 * 1024**3), resource.prlimit(identity["pid"], resource.RLIMIT_AS))
+            self.assertEqual((128, 128), resource.prlimit(identity["pid"], resource.RLIMIT_NOFILE))
+
+        result = await run_verification(payload, Path(WORKER), register_process=register)
+        self.assertTrue(result["control_replay_verified"])
+        self.assertEqual(1, len(identities))
+        self.assertEqual("dead", resource_state(identities[0]))
+
+    async def test_native_verification_policy_parent_timeout_settles_managed_attempt(self):
+        from types import MappingProxyType
+        from unittest.mock import patch
+
+        sid, _payload = await self.native_verifier_fixture("native-verifier-wall-budget")
+        original_recording = self.store.get(sid)["recording_artifact"]
+        policy = dict(recording_module.NATIVE_VERIFICATION_POLICY)
+        policy["recording_wall_seconds"] = 0.001
+        started = time.monotonic()
+        with (
+            patch.object(recording_module, "NATIVE_VERIFICATION_POLICY", MappingProxyType(policy)),
+            self.assertRaises(TimeoutError),
+        ):
+            await self.service.verify_recording(sid, self.members, self.read_member)
+        self.assertLess(time.monotonic() - started, 5)
+        attempt = self.store.verification_attempts(sid)[-1]
+        self.assertEqual("failed", attempt["result"]["state"])
+        self.assertEqual("TimeoutError", attempt["result"]["error"])
+        self.assertIsNotNone(attempt["result"]["process_identity"])
+        self.assertEqual("dead", resource_state(attempt["result"]["process_identity"]))
+        self.assertFalse((self.service.root / attempt["request"]["partial"]).exists())
+        self.assertEqual(original_recording, self.store.get(sid)["recording_artifact"])
+
     async def test_native_verifier_cancellation_before_stdin_gate_reaps_actual_helper(self):
         _sid, payload = await self.native_verifier_fixture("native-verifier-cancel")
         registered = asyncio.Event()
