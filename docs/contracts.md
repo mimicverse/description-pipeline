@@ -859,7 +859,7 @@ reports/mjcf-certificate.json
 schema、receipt 与 artifact identity 验证，不能把自身纳入摘要形成循环。URDF certificate 的 `subject_sha256` 是 Generate artifact 的 set digest，`evaluation_subject_sha256` 绑定独立评估的 Generate/Capture pair。MJCF certificate 通过 `source_artifacts` 和 `input_binding` 绑定转换输入及策略，`projection_sha256` 只绑定实际 `mjcf/` 输出成员（含 simulation 配置）。组合 `publication_subject_sha256` 才覆盖两种格式的交付主体。各摘要域分别核验，不要求相等，也不修改旧证书扩展覆盖范围。Verify
 certificate 另绑定 verifier、contract 与 policy；
 execution receipt 绑定该 certificate，仅以 `execution_details` 保全 `check.details` 直接层的原始进程输出与退出信息，不重复保存检查和 warning 全表。该分离不递归改写 warning、diagnostic 或资格中的来源扩展；完整记录按规范字节去重，证书拒绝重复的顶层 diagnostics。URDF 检查、warning 与资格的唯一交付依据为其 certificate；MJCF 的派生策略、检查及 warning 由独立 MJCF certificate 承载，PR 和预览分别读取两者，不合成第三份质量真值；URDF、PR 和浏览器引用实际登记的证书路径，展示保留对象、字段、来源、规则及未建立资格的原值。PR 摘要达到长度上限时明确给出未展开数量与完整证书位置，不生成另一份 quality 或 structural-team 报告。Publish receipt 再绑定 publication subject、
-publication plan、候选 commit/tree 与 Git/PR effect。
+publication plan、候选 commit/tree 与 Git/PR effect。PR 正文对 URDF 与 MJCF 警告共用 GitHub 正文容量，先完整保留本次变更说明及证书身份，再分配类别计数和有来源的有限实例；未展开记录与类别明确计数，两份证书保留完整明细。必要说明本身无法容纳时，在外部 effect 前明确拒绝，不截断用户说明。Git 提交正文通过标准输入，PR 创建正文通过私有临时文件交给 GitHub CLI，避免操作系统单参数/总参数上限；PR 更新沿 JSON 标准输入，封存计划、重算和远端回读绑定同一最终正文。
 
 证书的顶层 `diagnostics` 是唯一完整诊断库存：Verify 从独立报告及检查明细汇总原记录，按规范字节去重；封装后每项检查仅以 `details.warning_indices`、`details.diagnostic_indices` 的严格整数索引保留分类和归属，不再次序列化完整记录。共享读取边界拒绝布尔、负数、越界、重复索引及旧嵌套记录，核验全部引用和原生 scope 完整性；每条记录须有非空 code 和明确布尔 blocking，PASS 不得携带阻断诊断。来源记录的真实 detail 与全部对象保留，停止人为合成第二份 `detail.objects` 副本。报告、预览和 PR 复用同一库存，Verify 的诊断只用于 Verify 阶段，不能套用到 Freeze 等其他阶段，也不能把未知状态改为 false。运行详情只使用登记证书及 publication receipt，不从旧阶段回执补回检查成功或 PR 身份。
 

@@ -1003,7 +1003,7 @@ elif args[:2] == ["pr", "create"]:
     base = args[args.index("--base") + 1]
     head = args[args.index("--head") + 1]
     title = args[args.index("--title") + 1]
-    body = args[args.index("--body") + 1]
+    body = Path(args[args.index("--body-file") + 1]).read_text(encoding="utf-8")
     listing = subprocess.check_output(
         ["git", "ls-remote", "origin", f"refs/heads/{head}"],
         text=True,
@@ -1170,7 +1170,7 @@ elif args[:2] == ["pr", "create"]:
     base = args[args.index("--base") + 1]
     head = args[args.index("--head") + 1]
     title = args[args.index("--title") + 1]
-    body = args[args.index("--body") + 1]
+    body = Path(args[args.index("--body-file") + 1]).read_text(encoding="utf-8")
     listing = subprocess.check_output(
         ["git", "ls-remote", "origin", f"refs/heads/{head}"],
         text=True,

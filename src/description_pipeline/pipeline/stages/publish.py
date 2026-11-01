@@ -28,6 +28,7 @@ from ...io import (
 )
 from ...repository.publish import (
     CommitSpec,
+    GITHUB_PR_BODY_MAX_CHARACTERS,
     GitHubCliPullRequestClient,
     PreparedCandidate,
     PublicationError,
@@ -37,6 +38,7 @@ from ...repository.publish import (
     clone_publication_repository,
     materialize_repository_snapshot,
     validate_publication_target,
+    validate_pull_request_body,
 )
 from ...runtime import tool_record
 from ...schemas import (
@@ -511,60 +513,100 @@ def _certificate(
     return certificate, execution
 
 
-def _publication_warning_text(certificate: Mapping[str, Any]) -> str:
-    """Render every recorded warning without dropping its source or qualification."""
-
-    validate_certificate_diagnostics(certificate)
-    warnings = [
-        item for item in certificate.get("diagnostics") or []
-        if item.get("blocking") is False
-    ]
-    if not warnings:
+def _warning_summary(
+    *, heading: str, groups: Mapping[str, list], certificate_path: str,
+    record_text, max_characters: int,
+) -> str:
+    """Render located warning excerpts within one caller-owned text budget."""
+    total = sum(len(rows) for rows in groups.values())
+    if not total:
         return ""
-    by_code: dict[str, list[dict]] = {}
-    for item in warnings:
-        by_code.setdefault(item["code"], []).append(item)
-    lines = ["", f"Verification warnings ({len(warnings)} recorded):"]
-    lines.extend(f"- `{code}`: {len(rows)} records." for code, rows in sorted(by_code.items()))
-    lines.append("Complete object details are preserved in `reports/verification-certificate.json`.")
-    remaining = 48000 - sum(len(line) + 1 for line in lines)
+    lines = ["", f"{heading} ({total} recorded):"]
+    reference = f"See `{certificate_path}` for the complete verified evidence."
+    omitted_records = (
+        f"{total} additional warning records are preserved in the certificate; "
+        "this PR summary is abbreviated."
+    )
+    omitted_categories = f"{len(groups)} warning categories are not expanded in this summary."
+    reserved = len(reference) + len(omitted_records) + len(omitted_categories) + 3
+    remaining = max_characters - len("\n".join(lines)) - reserved
+    if remaining < 0:
+        raise PublicationError("publish.pr_text_capacity", {"max_characters": max_characters})
+    categories_shown = 0
+    for code, rows in sorted(groups.items()):
+        line = f"- `{code}`: {len(rows)} records."
+        if len(line) + 1 <= remaining:
+            lines.append(line)
+            remaining -= len(line) + 1
+            categories_shown += 1
     shown = 0
+    ordered = sorted(groups.items())
+    for index, (code, rows) in enumerate(ordered):
+        allowance = remaining // (len(ordered) - index)
+        block = record_text(code, rows[0])
+        if len(block) + 1 > allowance:
+            prefix = f"- `{code}` first record excerpt (full record in the certificate):\n\n```text\n"
+            suffix = "\n[record excerpt truncated]\n```"
+            available = allowance - len(prefix) - len(suffix) - 1
+            if available <= 0:
+                continue
+            block = prefix + block[:available].replace("```", "~~~") + suffix
+        lines.append(block)
+        remaining -= len(block) + 1
+        shown += 1
+    for code, rows in ordered:
+        for item in rows[1:]:
+            block = record_text(code, item)
+            if len(block) + 1 <= remaining:
+                lines.append(block)
+                remaining -= len(block) + 1
+                shown += 1
+    if shown < total:
+        lines.append(
+            f"{total - shown} additional warning records are preserved in the certificate; "
+            "this PR summary is abbreviated."
+        )
+    if categories_shown < len(groups):
+        lines.append(f"{len(groups) - categories_shown} warning categories are not expanded in this summary.")
+    lines.append(reference)
+    return "\n".join(lines)
 
-    def record_text(item):
+
+def _publication_warning_text(certificate: Mapping[str, Any], *, max_characters: int = 48000) -> str:
+    """Summarize the validated URDF warnings; their certificate retains every value."""
+    validate_certificate_diagnostics(certificate)
+    groups: dict[str, list[dict]] = {}
+    for item in certificate.get("diagnostics") or []:
+        if item.get("blocking") is False:
+            groups.setdefault(item["code"], []).append(item)
+
+    def record_text(code, item):
         evidence = {key: value for key, value in item.items() if key not in {"code", "message"}}
         return (
-            f"- `{item['code']}`: {item.get('message') or ''}\n\n```json\n"
+            f"- `{code}`: {item.get('message') or ''}\n\n```json\n"
             + json.dumps(evidence, ensure_ascii=True, sort_keys=True, indent=2)
             + "\n```"
         )
 
-    # Reserve a fair share for one located record of every category before
-    # repeated records can consume the detail budget.
-    for index, (_code, rows) in enumerate(sorted(by_code.items())):
-        block = record_text(rows[0])
-        allowance = remaining // (len(by_code) - index)
-        if len(block) > allowance:
-            prefix = f"- `{rows[0]['code']}` first record excerpt (full record in the certificate):\n\n```text\n"
-            suffix = "\n[record excerpt truncated]\n```"
-            payload = json.dumps(rows[0], ensure_ascii=True, sort_keys=True, indent=2)
-            block = prefix + payload[:max(0, allowance - len(prefix) - len(suffix))] + suffix
-        lines.append(block)
-        remaining -= len(block) + 1
-        shown += 1
-    for _code, rows in sorted(by_code.items()):
-        for item in rows[1:]:
-            block = record_text(item)
-            if len(block) <= remaining:
-                lines.append(block)
-                remaining -= len(block) + 1
-                shown += 1
-    if shown < len(warnings):
-        lines.append(
-            f"{len(warnings) - shown} additional warning records are preserved in the certificate; "
-            "this PR summary is abbreviated."
-        )
-    lines.append("See `reports/verification-certificate.json` for the complete verified evidence.")
-    return "\n".join(lines)
+    return _warning_summary(
+        heading="Verification warnings", groups=groups,
+        certificate_path="reports/verification-certificate.json", record_text=record_text,
+        max_characters=max_characters,
+    )
+
+
+def _mjcf_warning_text(certificate: dict, *, max_characters: int) -> str:
+    groups: dict[str, list[str]] = {}
+    for warning in mjcf_contract.projection_warnings(certificate):
+        match = re.match(r"WARNING ([A-Za-z][A-Za-z0-9_.-]*):", warning)
+        code = match.group(1) if match else "mjcf.projection"
+        groups.setdefault(code, []).append(warning)
+    return _warning_summary(
+        heading="### MJCF projection warnings", groups=groups,
+        certificate_path=mjcf_contract.REPORT_PATH,
+        record_text=lambda _code, warning: "- " + warning,
+        max_characters=max_characters,
+    )
 
 
 def _publication_text(
@@ -575,18 +617,23 @@ def _publication_text(
     subject_sha256: str,
     mjcf_certificate: Mapping[str, Any],
 ) -> tuple[str, str]:
-    body = (
-        request.commit.body.rstrip()
-        + _publication_warning_text(certificate)
-        + "\n\n"
+    description = request.commit.body.rstrip()
+    identity = (
+        "\n\n"
         + f"Verification-Certificate-SHA256: {certificate_sha256}\n"
         + f"Publication-Subject-SHA256: {subject_sha256}\n"
         + f"Repository: {request.repository_slug}\n"
         + f"MJCF-Certificate-SHA256: {request.mjcf_certificate_sha256}\n"
     )
-    body += "\n### MJCF projection warnings\n\n" + "\n".join(
-        "- " + warning for warning in mjcf_contract.projection_warnings(mjcf_certificate)
-    ) + "\n"
+    required = description + identity
+    validate_pull_request_body(required)
+    remaining = GITHUB_PR_BODY_MAX_CHARACTERS - len(required)
+    urdf_warnings = _publication_warning_text(certificate, max_characters=remaining // 2)
+    mjcf_warnings = _mjcf_warning_text(
+        dict(mjcf_certificate), max_characters=remaining - len(urdf_warnings),
+    )
+    body = description + urdf_warnings + identity + mjcf_warnings
+    validate_pull_request_body(body)
     return request.commit.subject, body
 
 
