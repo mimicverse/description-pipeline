@@ -2693,7 +2693,7 @@ async function loadPreview(dagRunId) {
       $("mjcf-warnings").replaceChildren();
       for (const warning of preview.mjcf.warnings || []) { const item = document.createElement("li"); item.textContent = warning; $("mjcf-warnings").append(item); }
       loaded.setMode($("mjcf-mode").value); loaded.setMarkers($("mjcf-markers").checked);
-      $("preview-meta").textContent = `MJCF ${preview.mjcf.entry} · ${preview.mjcf.verified ? "Verified" : "Diagnostic"} · ${preview.mjcf.subject_sha256.slice(0, 12)}...`;
+      $("preview-meta").textContent = `MJCF ${preview.mjcf.entry} · subject ${preview.mjcf.subject_sha256.slice(0, 12)}...`;
       const evidence = document.createElement("a"); evidence.href = artifactUrl(preview.mjcf.certificate.path);
       evidence.textContent = "Collision approximation and source warnings"; evidence.target = "_blank"; evidence.rel = "noopener";
       $("preview-meta").append(" · ", evidence);
