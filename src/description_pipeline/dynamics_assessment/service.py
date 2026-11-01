@@ -21,6 +21,7 @@ from .contracts import (
     SourceBinding,
     SourceNotReady,
     dispatch_conf,
+    dispatch_was_accepted,
     parse_json,
     relative,
     require,
@@ -216,15 +217,24 @@ class AssessmentService:
     def reconcile_dispatch(self, access: AssessmentAccess, attempt_id: str, transport: DispatchTransport) -> dict:
         attempt = self.store.attempt(attempt_id)
         request = self._authorized(access, attempt["request_id"], control=True)
-        if attempt["owner_token"] is not None or attempt["state"] not in {"dispatching", "unknown", "queued"}:
+        if attempt["owner_token"] is not None or attempt["state"] not in {
+            "registered",
+            "dispatching",
+            "unknown",
+            "queued",
+        }:
             return self.get(access, attempt["request_id"])
         conf = dispatch_conf(attempt["request_id"], attempt_id, request)
         try:
             payload = transport.observe(DAG_ID, attempt["dag_run_id"])
             if payload is None:
-                if attempt["state"] == "queued":
+                accepted = dispatch_was_accepted(attempt)
+                if accepted or attempt["state"] == "queued":
+                    if not accepted:
+                        self.store.dispatched(attempt_id)
                     raise AssessmentConflict("A previously accepted assessment DagRun is now absent")
-                self.store.dispatch_absent(attempt_id)
+                if not self.store.dispatch_absent(attempt_id):
+                    raise AssessmentConflict("Assessment ownership or acceptance changed during absence observation")
             else:
                 self._match_dispatch(payload, attempt, conf)
                 self.store.dispatched(attempt_id)
@@ -232,6 +242,20 @@ class AssessmentService:
             self.store.unknown(
                 attempt_id, {"phase": "dispatch_reconciliation", "message": safe_process_output(str(error))["text"]}
             )
+        return self.get(access, attempt["request_id"])
+
+    def dispatch_registered(self, access: AssessmentAccess, attempt_id: str, transport: DispatchTransport) -> dict:
+        """Explicitly send the original request after an authoritative absence."""
+        self._enabled()
+        attempt = self.store.attempt(attempt_id)
+        self._authorized(access, attempt["request_id"], control=True)
+        if (
+            attempt["state"] != "registered"
+            or dispatch_was_accepted(attempt)
+            or attempt["detail"].get("dispatch_observation") != "absent"
+        ):
+            raise AssessmentConflict("Original dispatch requires a never-accepted attempt and confirmed absence")
+        self.dispatch(attempt_id, transport)
         return self.get(access, attempt["request_id"])
 
     def retry(self, access: AssessmentAccess, request_id: str, transport: DispatchTransport) -> dict:
@@ -285,6 +309,7 @@ class AssessmentService:
             "publish_dependency": False,
         }
         if attempt:
+            result["attempt"]["dispatch_accepted"] = dispatch_was_accepted(attempt)
             artifact = self.store.result_artifact(attempt["attempt_id"])
             result["result_artifact"] = artifact.to_record() if artifact else None
         return result

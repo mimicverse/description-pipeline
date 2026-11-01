@@ -48,6 +48,16 @@ def require(condition: bool, message: str) -> None:
         raise AssessmentError(message)
 
 
+def dispatch_was_accepted(attempt: dict) -> bool:
+    """Acceptance is a monotonic attempt fact, independent of projected state."""
+    detail = attempt.get("detail")
+    require(isinstance(detail, dict), "Assessment attempt detail is invalid")
+    if "dispatch_accepted" not in detail:
+        return False
+    require(detail["dispatch_accepted"] is True, "Assessment acceptance fact is invalid")
+    return True
+
+
 def text(value: Any, name: str) -> str:
     require(isinstance(value, str) and bool(value.strip()) and "\x00" not in value, f"{name} is invalid")
     return value

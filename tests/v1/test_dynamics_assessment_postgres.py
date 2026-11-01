@@ -214,6 +214,7 @@ class PostgresDatabaseTests(PostgresCase):
         with ThreadPoolExecutor(max_workers=2) as pool:
             assert sorted(pool.map(claim, [1, 2])) == [False, True]
         assert store.new_attempt(request_id)["attempt_id"] == attempt["attempt_id"]
+        self.assertTrue(store.attempt(attempt["attempt_id"])["detail"]["dispatch_accepted"])
 
     def test_queued_cancel_prevents_any_worker_claim(self):
         database = self.database
@@ -224,6 +225,7 @@ class PostgresDatabaseTests(PostgresCase):
         store.dispatched(attempt["attempt_id"])
         cancelled = store.cancel(attempt["attempt_id"])
         assert cancelled["state"] == "cancelled" and cancelled["resources_settled"]
+        self.assertTrue(cancelled["detail"]["dispatch_accepted"])
         with self.assertRaises(AssessmentConflict):
             store.claim(attempt["attempt_id"], "a" * 64, controller={"fixture": 1})
 
@@ -240,6 +242,7 @@ class PostgresDatabaseTests(PostgresCase):
         final = store.finish(attempt["attempt_id"], owner, state="cancelled", artifact=cancelled, detail={})
         assert final["state"] == "cancelled" and final["resources_settled"]
         assert store.result_artifact(attempt["attempt_id"]) == cancelled
+        self.assertTrue(final["detail"]["dispatch_accepted"])
 
     def test_stale_owner_cannot_commit_or_spawn_again_after_unknown(self):
         database = self.database
@@ -270,3 +273,5 @@ class PostgresDatabaseTests(PostgresCase):
         assert successor["attempt_number"] == 2
         assert store.result_artifact(attempt["attempt_id"]) == failure
         assert store.attempt(attempt["attempt_id"])["state"] == "failed"
+        self.assertTrue(store.attempt(attempt["attempt_id"])["detail"]["dispatch_accepted"])
+        self.assertNotIn("dispatch_accepted", successor["detail"])

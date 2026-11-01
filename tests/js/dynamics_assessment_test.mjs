@@ -145,6 +145,37 @@ const pending = state => ({ request_id: "request", attempt: { attempt_id: "attem
 }
 assert.equal(assessmentStateLabel("unexpected"), "Status unavailable");
 {
+  const host = container(), controls = []; let selections = 0;
+  const item = pending("unknown"); item.attempt.detail = {};
+  const view = mountDynamicsAssessment({ container: host, runId: "source", canManage: true,
+    getBundle: async () => { selections += 1; throw new Error("Original dispatch must not select new inputs"); },
+    requestJson: async (path, options) => {
+      if (options.method === "POST") {
+        controls.push({ path, body: options.body });
+        if (path.endsWith("/reconcile")) {
+          item.attempt.state = "registered";
+          item.attempt.detail = { dispatch_observation: "absent" };
+          item.attempt.dispatch_accepted = false;
+        } else if (path.endsWith("/dispatch")) {
+          item.attempt.state = "queued"; item.attempt.dispatch_accepted = true;
+        } else throw new Error("Unexpected new submission");
+      }
+      return { enabled: true, assessments: [item] };
+    } });
+  await view.ready;
+  await button(host, "Reconcile original attempt").emit("click");
+  assert.equal(button(host, "Run assessment").disabled, true);
+  await button(host, "Send original attempt").emit("click");
+  assert.deepEqual(controls.map(value => value.path), [
+    "/api/dynamics-assessments/attempts/attempt/reconcile",
+    "/api/dynamics-assessments/attempts/attempt/dispatch",
+  ]);
+  assert(controls.every(value => value.body === undefined));
+  assert.equal(selections, 0);
+  assert.equal(button(host, "Send original attempt"), undefined);
+  view.destroy();
+}
+{
   const host = container(), calls = [];
   const bundle = { artifact_id: "admitted-upload" };
   const snapshot = { enabled: true, source_ready: true, source_sha256: "fixed-source", assessments: [], input_limit_bytes: 1024 };
