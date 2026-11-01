@@ -14,6 +14,7 @@ from description_pipeline.simulation.runtime import load_runtime_contract
 from description_pipeline.simulation import runtime as runtime_helper
 from description_pipeline.simulation.runtime import validate_runtime_identity
 from description_pipeline import owned_process
+from description_pipeline.simulation.recording import runtime_command, verification_execution
 
 ROOT = Path(__file__).resolve().parents[2]
 CONTRACT = Path(runtime_helper.__file__).with_name("teleop-runtime.json")
@@ -106,29 +107,18 @@ class TeleopRuntimeTests(unittest.TestCase):
 
     def inspect_installed(self, role, python):
         contract = load_runtime_contract(CONTRACT, consumer=role)
-        result = subprocess.run(
-            [python, "-I", "-B", str(Path(runtime_helper.__file__))],
-            input=json.dumps(list(contract["dependency_versions"])),
-            text=True,
-            capture_output=True,
-            timeout=30,
-        )
-        self.assertEqual(0, result.returncode, result.stderr)
-        raw = json.loads(result.stdout)
-        identity = validate_runtime_identity(raw, contract)
-        bootstrap = (
-            "import runpy,json,sys;api=runpy.run_path(sys.argv[1]);"
-            "print(json.dumps(api['verify_runtime_contract'](json.load(sys.stdin))))"
-        )
+        execution = verification_execution(consumer=role)
         checked = subprocess.run(
-            [python, "-I", "-B", "-c", bootstrap, str(Path(runtime_helper.__file__))],
-            input=json.dumps(contract),
+            runtime_command(Path(python), "role-runtime-probe", execution),
+            input=json.dumps(execution),
             text=True,
             capture_output=True,
             timeout=30,
         )
         self.assertEqual(0, checked.returncode, checked.stderr)
-        self.assertEqual(identity, json.loads(checked.stdout))
+        identity = json.loads(checked.stdout)
+        raw = {**identity, "teleop_files": contract["files"]}
+        self.assertEqual(identity, validate_runtime_identity(raw, contract))
         altered = deepcopy(raw)
         altered["packages"]["robot-teleop"]["archive_sha256"] = "0" * 64
         with self.assertRaises(ValueError):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
+from copy import deepcopy
 from dataclasses import dataclass, field
 import hashlib
 import fcntl
@@ -21,9 +22,7 @@ import zipfile
 from ..io import digest, canonical
 from ..owned_process import module_command, process_identity, resource_state, terminate_owned
 from .store import SimulationConflict, SimulationStore
-from .recording import VerificationUnresolved, prepare_source, recording_binding, run_verification, session_identity, verification_execution
-from .runtime import load_runtime_contract
-from .runtime import validate_runtime_identity
+from .recording import VerificationUnresolved, prepare_source, recording_binding, run_verification, session_identity, verification_execution, runtime_command
 from .warnings import warning_inventory
 
 log = logging.getLogger(__name__)
@@ -67,6 +66,7 @@ class SimulationService:
         self.store, self.artifacts = store, artifacts
         self.root, self.python = Path(root), Path(python)
         self.capacity = capacity
+        self._consumer_execution = verification_execution()
         self.owner = secrets.token_hex(24)
         self.runtime_identity = None
         self.running: dict[str, RunningSession] = {}
@@ -112,17 +112,14 @@ class SimulationService:
         self._probe_identity = self._read_probe_identity()
         if self._probe_identity is not None and not await self._close_probe():
             raise SimulationConflict("Previous startup process group is unresolved")
-        contract = load_runtime_contract(Path(__file__).with_name("teleop-runtime.json"), consumer="pico")
+        execution = self._consumer_execution
+        contract = execution["runtime_contract"]
         nonce = secrets.token_hex(24)
         self._probe_identity = {"nonce": nonce}
         self._write_probe_identity()
         spawning = asyncio.create_task(
             asyncio.create_subprocess_exec(
-                str(self.python),
-                "-I",
-                "-B",
-                str(Path(__file__).with_name("runtime.py")),
-                nonce,
+                *runtime_command(self.python, nonce, execution),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -151,7 +148,7 @@ class SimulationService:
         if self._lifecycle_state != "starting":
             raise SimulationConflict("Simulation supervisor closed during startup")
         stdout, stderr = await asyncio.wait_for(
-            probe.communicate(canonical(list(contract["dependency_versions"])) + b"\n"),
+            probe.communicate(canonical(execution)),
             30,
         )
         clean = await asyncio.to_thread(resource_state, self._probe_identity) == "dead"
@@ -160,10 +157,16 @@ class SimulationService:
         if not clean:
             raise SimulationConflict("Startup process group did not exit cleanly")
         if probe.returncode != 0:
-            raise ValueError(f"Teleop runtime identity failed: {stderr.decode(errors='replace')[-1000:]}")
+            try:
+                error = json.loads(stdout)["error"]
+            except (ValueError, KeyError, TypeError):
+                error = stderr.decode(errors="replace")[-1000:]
+            raise ValueError(f"Teleop runtime identity failed: {error}")
         if self._lifecycle_state != "starting":
             raise SimulationConflict("Simulation supervisor closed during startup")
-        self.runtime_identity = validate_runtime_identity(json.loads(stdout), contract)
+        self.runtime_identity = json.loads(stdout)
+        if any(self.runtime_identity.get(key) != contract[key] for key in ("source_commit", "wheel_sha256")):
+            raise ValueError("Native runtime returned another fixed consumer identity")
         acquiring = asyncio.create_task(asyncio.to_thread(self.store.acquire_supervisor))
         try:
             self._database_lock = await asyncio.shield(acquiring)
@@ -430,7 +433,7 @@ class SimulationService:
             "type": "verify_recording",
             "binding": binding,
             "partial": "recording-verification-" + command_id,
-            "execution": verification_execution(),
+            "execution": deepcopy(self._consumer_execution),
         }
         temporary = self._verification_partial(command_id, request)
         admitted = False
