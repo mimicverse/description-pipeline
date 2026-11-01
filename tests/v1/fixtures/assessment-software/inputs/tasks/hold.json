@@ -1,0 +1,80 @@
+{
+  "schema": "continuous-dynamics-task/1",
+  "task_id": "benchmark_hold",
+  "comparison_task_id": "software.full_upper_body.hold",
+  "family": "hold",
+  "controlled_groups": [
+    "waist",
+    "left_arm",
+    "right_arm",
+    "head"
+  ],
+  "target_mode": "scheduled_joint_configuration_fk",
+  "target_points": [
+    "waist_site",
+    "left_tcp",
+    "right_tcp",
+    "head_tcp"
+  ],
+  "joint_order": [
+    "waist_yaw",
+    "head_yaw",
+    "left_shoulder_pitch",
+    "left_elbow_pitch",
+    "right_shoulder_pitch",
+    "right_elbow_pitch"
+  ],
+  "initial_positions": [
+    0.1,
+    0.05,
+    0.2,
+    -0.25,
+    -0.15,
+    -0.2
+  ],
+  "schedule": [
+    {
+      "time_s": 0.0,
+      "positions": [
+        0.1,
+        0.05,
+        0.2,
+        -0.25,
+        -0.15,
+        -0.2
+      ]
+    },
+    {
+      "time_s": 0.004,
+      "positions": [
+        0.12000000000000001,
+        0.05,
+        0.2,
+        -0.25,
+        -0.15,
+        -0.2
+      ]
+    },
+    {
+      "time_s": 0.016,
+      "positions": [
+        0.12000000000000001,
+        0.05,
+        0.2,
+        -0.25,
+        -0.15,
+        -0.2
+      ]
+    }
+  ],
+  "duration_s": 0.016,
+  "control_period_s": 0.002,
+  "hold_window_s": 0.006,
+  "tolerances": {
+    "joint_position_rad": 0.03,
+    "joint_velocity_rad_s": 0.1,
+    "tcp_position_m": 0.02,
+    "tcp_orientation_rad": 0.05
+  },
+  "timeout_s": 10.0
+}

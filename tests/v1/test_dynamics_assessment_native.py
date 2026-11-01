@@ -9,6 +9,7 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import json
+import math
 import multiprocessing
 import os
 import shutil
@@ -21,7 +22,6 @@ from contextlib import suppress
 from pathlib import Path
 from unittest import mock
 
-from description_pipeline.dynamics_assessment import runtime as runtime_module
 from description_pipeline.dynamics_assessment.contracts import (
     BUNDLE_SCHEMA,
     SOURCE_SCHEMA,
@@ -38,6 +38,7 @@ from description_pipeline.dynamics_assessment.runtime import (
 )
 from description_pipeline.dynamics_assessment.service import AssessmentAccess, AssessmentService
 from description_pipeline.io import canonical, digest, file_digest
+from tests.v1.assessment_fixture import prepare_plan, selected_runtime
 from tests.v1.test_dynamics_assessment_postgres import PostgresCase
 
 
@@ -56,36 +57,22 @@ class Dispatch:
         return self.runs.get(dag_run_id)
 
 
-def fixed_process(python, runtime, limits):
-    checker = os.environ.get("ASSESSMENT_TEST_RUNTIME_CHECKER")
-    if not checker:
-        raise unittest.SkipTest("A fixed release checker snapshot is required")
-    with mock.patch.object(runtime_module, "RUNTIME_CHECKER", Path(checker)):
-        return TeleopProcess(python, runtime, limits)
-
-
 def build_native_case(database, modes=None):
-    fixture = os.environ.get("ASSESSMENT_TEST_TELEOP_PLAN")
-    interpreter = os.environ.get("ASSESSMENT_TEST_TELEOP_PYTHON")
-    pin_path = os.environ.get("ASSESSMENT_TEST_RUNTIME_PIN")
-    checker_path = os.environ.get("ASSESSMENT_TEST_RUNTIME_CHECKER")
-    if not all((fixture, interpreter, pin_path, checker_path)):
-        raise unittest.SkipTest("A fixed installed Teleop runtime and independent software input are required")
+    python, runtime = selected_runtime()
     store, _old_request, root = database
     modes = {modes} if isinstance(modes, str) else set(modes or ())
-    plan_path = Path(fixture)
-    plan = json.loads(plan_path.read_bytes())
-    plan.pop("_plan_path", None)
     copied = root / "software-fixture"
-    copied.mkdir()
-    shutil.copytree(plan_path.parent / plan["input_closure"]["root"], copied / "inputs")
-    plan["input_closure"]["root"] = "inputs"
+    plan = prepare_plan(copied, python, runtime)
     if "long_run" in modes:
         task = copied / "inputs" / plan["tasks"]["hold"]["path"]
         specification = json.loads(task.read_bytes())
         specification["duration_s"] = 2.0
         specification["schedule"][-1]["time_s"] = 2.0
         specification["hold_window_s"] = 0.2
+        plan["runtime"]["max_ticks"] = max(
+            plan["runtime"]["max_ticks"],
+            math.ceil(specification["duration_s"] / plan["runtime"]["control_period_s"]) + 1,
+        )
         task.write_bytes(canonical(specification) + b"\n")
         for member in plan["input_closure"]["files"]:
             if member["path"] == plan["tasks"]["hold"]["path"]:
@@ -160,13 +147,12 @@ def build_native_case(database, modes=None):
         producer_stage=None,
         producer_tool_sha256=digest({"fixture": "bundle"}),
     )
-    runtime = RuntimePin(json.loads(Path(pin_path).read_bytes()))
     work = root / "work"
     work.mkdir()
     module = Path(__file__).resolve().parents[2] / "src/description_pipeline/dynamics_assessment"
     executor_sha = digest({p.name: file_digest(p) for p in sorted(module.glob("*.py"))})
     service = AssessmentService(store, enabled=True, runtime=runtime, executor_sha256=executor_sha, work_root=work)
-    process = fixed_process(Path(interpreter), runtime, ProcessLimits(120, 2 * 1024**3, 60, 256 * 1024**2))
+    process = TeleopProcess(python, runtime, ProcessLimits(120, 2 * 1024**3, 60, 256 * 1024**2))
 
     def authorized(dag, _control):
         assert dag == source.record["dag_run_id"]
@@ -361,7 +347,8 @@ class NativeDatabaseTests(PostgresCase):
         shutil.rmtree(copied)
         shutil.rmtree(original)
         records = [json.loads(line) for line in (archive / "run/records.jsonl").read_text().splitlines()]
-        assert len(records) == receipt["records_checked"]
+        assert len(records) == receipt["records_checked"] == 32
+        assert len({row["continuous_dynamics"]["tick_index"] for row in records}) == 8
         assert {row["verification"] for row in records} == {"unchecked"}
         request_bytes = (archive / "request.json").read_bytes()
         assert len(request_bytes) < 1024 * 1024
@@ -372,7 +359,7 @@ class NativeDatabaseTests(PostgresCase):
             assert len(data) == declared["bytes"] and hashlib.sha256(data).hexdigest() == declared["sha256"]
             assert json.loads(data)["warnings"]
         command = [
-            os.environ["ASSESSMENT_TEST_TELEOP_PYTHON"],
+            os.environ["TELEOP_ASSESSMENT_PYTHON"],
             "-I",
             "-B",
             "-m",
@@ -410,7 +397,7 @@ class NativeDatabaseTests(PostgresCase):
         name = next(iter(record["files"]))
         record["files"][name] = "0" * 64
         service.runtime = RuntimePin(record)
-        executor.process = fixed_process(executor.process.python, service.runtime, executor.process.limits)
+        executor.process = TeleopProcess(executor.process.python, service.runtime, executor.process.limits)
         public, result = execute_case(native_case)
         assert result["state"] == "failed"
         data, _member = service.read_result(access, result["attempt_id"], "run.stdout.json")
@@ -564,7 +551,7 @@ class NativeDatabaseTests(PostgresCase):
     def test_native_wall_budget_cannot_report_completion(self):
         native_case = build_native_case(self.database, None)
         _service, executor, _access, *_ = native_case
-        executor.process = fixed_process(
+        executor.process = TeleopProcess(
             executor.process.python, executor.process.runtime, ProcessLimits(0.01, 2 * 1024**3, 60, 256 * 1024**2)
         )
         _public, result = execute_case(native_case)
@@ -573,7 +560,7 @@ class NativeDatabaseTests(PostgresCase):
     def _check_native_output_budget_cannot_report_completion(self, case_modes):
         native_case = build_native_case(self.database, case_modes)
         service, executor, access, *_ = native_case
-        executor.process = fixed_process(
+        executor.process = TeleopProcess(
             executor.process.python, executor.process.runtime, ProcessLimits(120, 2 * 1024**3, 60, 128 * 1024)
         )
         _public, result = execute_case(native_case)

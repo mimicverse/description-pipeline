@@ -1,0 +1,46 @@
+{
+  "schema": "continuous-dynamics-task/1",
+  "task_id": "benchmark_multi_group",
+  "comparison_task_id": "software.full_upper_body.multi_group",
+  "family": "multi_group",
+  "controlled_groups": ["waist", "left_arm", "right_arm", "head"],
+  "target_mode": "scheduled_joint_configuration_fk",
+  "target_points": ["waist_site", "left_tcp", "right_tcp", "head_tcp"],
+  "joint_order": [
+    "waist_yaw",
+    "head_yaw",
+    "left_shoulder_pitch",
+    "left_elbow_pitch",
+    "right_shoulder_pitch",
+    "right_elbow_pitch"
+  ],
+  "initial_positions": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+  "schedule": [
+    {
+      "time_s": 0.0,
+      "positions": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    },
+    {
+      "time_s": 0.60,
+      "positions": [0.45, -0.30, 0.65, -0.80, -0.60, -0.75]
+    },
+    {
+      "time_s": 1.20,
+      "positions": [-0.35, 0.25, -0.50, 0.60, 0.45, 0.55]
+    },
+    {
+      "time_s": 1.80,
+      "positions": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    }
+  ],
+  "duration_s": 1.80,
+  "control_period_s": 0.002,
+  "hold_window_s": 0.30,
+  "tolerances": {
+    "joint_position_rad": 0.06,
+    "joint_velocity_rad_s": 0.20,
+    "tcp_position_m": 0.04,
+    "tcp_orientation_rad": 0.10
+  },
+  "timeout_s": 15.0
+}

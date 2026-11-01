@@ -1,0 +1,413 @@
+{
+  "schema": "continuous-dynamics-plan/1",
+  "evaluation_mode": "continuous_dynamics",
+  "plan_id": "actuator_model_offline_wheel_native_null_w3_fixture_v1",
+  "seed": 0,
+  "qualification_scope": "software_regression_only",
+  "requested_conclusions": [
+    "software_regression_only",
+    "declared_model_condition"
+  ],
+  "production_engineering_qualification": false,
+  "input_closure": {
+    "root": "inputs",
+    "urdf": {
+      "path": "urdf/upper_body.urdf",
+      "bytes": 5635,
+      "sha256": "ba53508cc23c7c3aff8115bef7f7e68f6c6b710a328b6ad4eef38ad12d9eb4d7"
+    },
+    "mjcf": {
+      "path": "mjcf/upper_body.xml",
+      "bytes": 4794,
+      "sha256": "4e6d1fcad71976fe65a359524c8ec5c67d04fd17fd44f5692e8b78cc7d54c5ed"
+    },
+    "files": [
+      {
+        "path": "urdf/upper_body.urdf",
+        "bytes": 5635,
+        "sha256": "ba53508cc23c7c3aff8115bef7f7e68f6c6b710a328b6ad4eef38ad12d9eb4d7"
+      },
+      {
+        "path": "mjcf/upper_body.xml",
+        "bytes": 4794,
+        "sha256": "4e6d1fcad71976fe65a359524c8ec5c67d04fd17fd44f5692e8b78cc7d54c5ed"
+      },
+      {
+        "path": "sources/benchmark-sources.json",
+        "bytes": 2607,
+        "sha256": "9c7ab9a99a93d528fcad8a0a5a042e3bdbffd60fc40d9e33c828fd911cf78da5"
+      },
+      {
+        "path": "tasks/hold.json",
+        "bytes": 1375,
+        "sha256": "228b866ae203ac5e8b1ef4a0bb1ee91bae95e23dfeb6beccf0b5856a21c5e2fb"
+      },
+      {
+        "path": "tasks/step.json",
+        "bytes": 1228,
+        "sha256": "ee7b99023eebb3fd11df0a5287df394ed71b88dadbd8a34232bdcab825aed20b"
+      },
+      {
+        "path": "tasks/round_trip.json",
+        "bytes": 1262,
+        "sha256": "797c79413fbf673e2621b686352fe445387697a88b54e4cdfa4dca1c00ddd80d"
+      },
+      {
+        "path": "tasks/multi_group.json",
+        "bytes": 1204,
+        "sha256": "621712d743121d1d4d42c5c2f4346b85b09ad02088975cb981c469df71ba47fd"
+      },
+      {
+        "path": "tasks/load_condition.json",
+        "bytes": 1553,
+        "sha256": "d8cb48dd258b5967114ad21ded94be9fb85606750ff59720ab235fb1246eae55"
+      }
+    ],
+    "resource_map": {
+      "urdf/upper_body.urdf": "urdf/upper_body.urdf",
+      "mjcf/upper_body.xml": "mjcf/upper_body.xml",
+      "sources/benchmark-sources.json": "sources/benchmark-sources.json",
+      "tasks/hold.json": "tasks/hold.json",
+      "tasks/step.json": "tasks/step.json",
+      "tasks/round_trip.json": "tasks/round_trip.json",
+      "tasks/multi_group.json": "tasks/multi_group.json",
+      "tasks/load_condition.json": "tasks/load_condition.json"
+    }
+  },
+  "model": {
+    "model_id": "software_full_upper_body_6dof",
+    "root_body": "base_link",
+    "base_mode": "fixed",
+    "semantic_groups": {
+      "waist": {
+        "urdf_links": [
+          "base_link",
+          "waist_link"
+        ],
+        "urdf_joints": [
+          "waist_yaw"
+        ],
+        "active_joints": [
+          "waist_yaw"
+        ],
+        "tcp_sites": [
+          "waist_site"
+        ]
+      },
+      "left_arm": {
+        "urdf_links": [
+          "left_upper_link",
+          "left_forearm_link"
+        ],
+        "urdf_joints": [
+          "left_shoulder_pitch",
+          "left_elbow_pitch"
+        ],
+        "active_joints": [
+          "left_shoulder_pitch",
+          "left_elbow_pitch"
+        ],
+        "tcp_sites": [
+          "left_tcp"
+        ]
+      },
+      "right_arm": {
+        "urdf_links": [
+          "right_upper_link",
+          "right_forearm_link"
+        ],
+        "urdf_joints": [
+          "right_shoulder_pitch",
+          "right_elbow_pitch"
+        ],
+        "active_joints": [
+          "right_shoulder_pitch",
+          "right_elbow_pitch"
+        ],
+        "tcp_sites": [
+          "right_tcp"
+        ]
+      },
+      "head": {
+        "urdf_links": [
+          "head_link"
+        ],
+        "urdf_joints": [
+          "head_yaw"
+        ],
+        "active_joints": [
+          "head_yaw"
+        ],
+        "tcp_sites": [
+          "head_tcp"
+        ]
+      }
+    },
+    "active_joints": [
+      "waist_yaw",
+      "head_yaw",
+      "left_shoulder_pitch",
+      "left_elbow_pitch",
+      "right_shoulder_pitch",
+      "right_elbow_pitch"
+    ],
+    "non_task_joint_policies": {
+      "payload_mount": "fixed_for_assessment"
+    },
+    "mapping": {
+      "links": {
+        "base_link": "base_link",
+        "waist_link": "waist_link",
+        "head_link": "head_link",
+        "left_upper_link": "left_upper_link",
+        "left_forearm_link": "left_forearm_link",
+        "right_upper_link": "right_upper_link",
+        "right_forearm_link": "right_forearm_link",
+        "benchmark_payload_link": "benchmark_payload_link"
+      },
+      "joints": {
+        "waist_yaw": "waist_yaw",
+        "head_yaw": "head_yaw",
+        "left_shoulder_pitch": "left_shoulder_pitch",
+        "left_elbow_pitch": "left_elbow_pitch",
+        "right_shoulder_pitch": "right_shoulder_pitch",
+        "right_elbow_pitch": "right_elbow_pitch"
+      },
+      "fixed_joints": {
+        "payload_mount": {
+          "parent_urdf_link": "left_forearm_link",
+          "child_mjcf_body": "benchmark_payload_link",
+          "origin_xyz_m": [
+            0.0,
+            0.0,
+            -0.16
+          ],
+          "origin_rpy_rad": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "policy": "fixed_for_assessment"
+        }
+      },
+      "actuators": {
+        "waist_yaw": "waist_yaw_motor",
+        "head_yaw": "head_yaw_motor",
+        "left_shoulder_pitch": "left_shoulder_motor",
+        "left_elbow_pitch": "left_elbow_motor",
+        "right_shoulder_pitch": "right_shoulder_motor",
+        "right_elbow_pitch": "right_elbow_motor"
+      },
+      "sites": {
+        "waist_site": "waist_site",
+        "head_tcp": "head_tcp",
+        "left_tcp": "left_tcp",
+        "right_tcp": "right_tcp"
+      }
+    }
+  },
+  "parameter_sources": {
+    "shared_record_path": "sources/benchmark-sources.json",
+    "shared_record_sha256": "9c7ab9a99a93d528fcad8a0a5a042e3bdbffd60fc40d9e33c828fd911cf78da5",
+    "records": [
+      {
+        "parameter": "mass_inertia",
+        "provenance": "nominal_uncalibrated",
+        "source_kind": "synthetic_urdf_fixture",
+        "source_path": "urdf/upper_body.urdf",
+        "source_sha256": "ba53508cc23c7c3aff8115bef7f7e68f6c6b710a328b6ad4eef38ad12d9eb4d7",
+        "locator": "every /robot/link/inertial element",
+        "applies_to": [
+          "base_link",
+          "waist_link",
+          "head_link",
+          "left_upper_link",
+          "left_forearm_link",
+          "right_upper_link",
+          "right_forearm_link",
+          "benchmark_payload_link"
+        ]
+      },
+      {
+        "parameter": "actuator",
+        "provenance": "nominal_uncalibrated",
+        "source_kind": "synthetic_fixture",
+        "source_path": "sources/benchmark-sources.json",
+        "source_sha256": "9c7ab9a99a93d528fcad8a0a5a042e3bdbffd60fc40d9e33c828fd911cf78da5",
+        "locator": "/parameters/actuator/records",
+        "applies_to": [
+          "waist_yaw",
+          "head_yaw",
+          "left_shoulder_pitch",
+          "left_elbow_pitch",
+          "right_shoulder_pitch",
+          "right_elbow_pitch"
+        ]
+      },
+      {
+        "parameter": "joint_dynamics",
+        "provenance": "nominal_uncalibrated",
+        "source_kind": "synthetic_fixture",
+        "source_path": "sources/benchmark-sources.json",
+        "source_sha256": "9c7ab9a99a93d528fcad8a0a5a042e3bdbffd60fc40d9e33c828fd911cf78da5",
+        "locator": "/parameters/joint_dynamics/records",
+        "applies_to": [
+          "waist_yaw",
+          "head_yaw",
+          "left_shoulder_pitch",
+          "left_elbow_pitch",
+          "right_shoulder_pitch",
+          "right_elbow_pitch"
+        ]
+      }
+    ],
+    "not_applicable": {
+      "contact_model": "No contact path or contact-force claim is requested.",
+      "mesh_geometry": "No collision or mesh-contact qualification is requested.",
+      "latency": "No sim-to-real or latency claim is requested."
+    }
+  },
+  "controller": {
+    "kind": "actuator_model",
+    "dt_s": 0.002,
+    "joint_order": [
+      "waist_yaw",
+      "head_yaw",
+      "left_shoulder_pitch",
+      "left_elbow_pitch",
+      "right_shoulder_pitch",
+      "right_elbow_pitch"
+    ],
+    "gain_held_targets": {},
+    "interpolation": "cubic_smoothstep",
+    "actuator_model": {
+      "package": {
+        "version": "1.3.0",
+        "git_commit": null,
+        "editable": false
+      },
+      "selector": {
+        "actuator": "hd1910",
+        "parameter_version": "pd_offset_v1",
+        "friction_model": "m5"
+      },
+      "gains": {
+        "kp_fw": 4,
+        "kd_fw": 2
+      },
+      "supply": {
+        "voltage_v": 6.0,
+        "drop_gain_v_per_nm": 0.0,
+        "min_voltage_v": 5.9
+      },
+      "runtime": {
+        "command_delay_steps": 2,
+        "stiff_frictionloss": true
+      },
+      "ownership": {
+        "armature": "actuator_model",
+        "damping": "actuator_model",
+        "frictionloss": "actuator_model"
+      },
+      "artifact": {
+        "distribution": "actuator-model",
+        "source_commit": "32a65a43bc168eba6af30bd3cb725784f87b5250",
+        "wheel_filename": "actuator_model-1.3.0-py3-none-any.whl",
+        "wheel_sha256": "cce06aee648f639a8ca47d40cc2b02e57c1ec7d0b4fd33ad6f90c846f0147975",
+        "record_payload_sha256": "dad80bd9bf0b8b31cf87724f03206088b264ffdc1ec801199e6aa98576e7549d"
+      }
+    }
+  },
+  "tasks": {
+    "hold": {
+      "path": "tasks/hold.json",
+      "sha256": "228b866ae203ac5e8b1ef4a0bb1ee91bae95e23dfeb6beccf0b5856a21c5e2fb"
+    }
+  },
+  "runtime": {
+    "timestep_s": 0.002,
+    "control_period_s": 0.002,
+    "substeps": 1,
+    "integrator": "RK4",
+    "solver_iterations": 100,
+    "gravity": [
+      0.0,
+      0.0,
+      -9.81
+    ],
+    "seed": 0,
+    "wall_time_limit_s": 120.0,
+    "max_ticks": 8,
+    "write_qpos_during_execution": false,
+    "write_qvel_during_execution": false,
+    "qfrc_applied_allowed": false
+  },
+  "record_binding": {
+    "canonical_schema": "run-record/3",
+    "dynamic_extension_key": "continuous_dynamics",
+    "one_record_per": "control_tick_x_target_point",
+    "shared_control_tick_hash": true,
+    "authoritative_axes": [
+      "execution",
+      "feasibility",
+      "verification"
+    ],
+    "telemetry_cannot_override_canonical_axes": true
+  },
+  "verification": {
+    "strict_implementation": true,
+    "replay_tolerances": {
+      "qpos_absolute": 1e-10,
+      "qvel_absolute": 1e-10,
+      "qacc_absolute": 1e-08,
+      "ctrl_absolute": 1e-12,
+      "actuator_force_absolute": 1e-12
+    },
+    "recompute_metrics": true,
+    "reject_hash_only_tamper": true
+  },
+  "comparison": {
+    "comparison_suite_id": "software_full_upper_body_v1",
+    "task_equivalence": {
+      "mode": "same_mechanism_control_counterfactual",
+      "world_frame": "base_link",
+      "base_to_task_frame_mapping": {
+        "left": {
+          "translation_m": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "rotation_rpy_rad": [
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        "right": {
+          "translation_m": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "rotation_rpy_rad": [
+            0.0,
+            0.0,
+            0.0
+          ]
+        }
+      },
+      "tcp_function": {
+        "left": "left_tcp",
+        "right": "right_tcp"
+      },
+      "target_trajectory_hashes_bound_at_run": true,
+      "role_hash_alone_insufficient": true
+    }
+  },
+  "evidence_references": {
+    "independent_motor_physics": {
+      "scope": "mathematical software baseline only"
+    }
+  }
+}

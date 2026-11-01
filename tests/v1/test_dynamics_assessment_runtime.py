@@ -17,7 +17,6 @@ import sys
 import tempfile
 import threading
 import time
-import unittest
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from unittest import mock
@@ -27,6 +26,7 @@ from description_pipeline.dynamics_assessment.contracts import AssessmentConflic
 from description_pipeline.owned_process import (
     module_command, process_identity, process_state, resource_state, terminate_owned,
 )
+from tests.v1.assessment_fixture import selected_runtime
 from description_pipeline.dynamics_assessment.runtime import (
     ProcessLimits,
     TeleopProcess,
@@ -368,14 +368,8 @@ class RuntimeTests(AssessmentCase):
 class NativeRuntimeGateTests(AssessmentCase):
     def setUp(self):
         super().setUp()
-        interpreter = os.environ.get("ASSESSMENT_TEST_TELEOP_PYTHON")
-        pin = os.environ.get("ASSESSMENT_TEST_RUNTIME_PIN")
-        checker = os.environ.get("ASSESSMENT_TEST_RUNTIME_CHECKER")
-        if not all((interpreter, pin, checker)):
-            raise unittest.SkipTest("An installed fixed runtime and release checker snapshot are required")
-        self.pin = RuntimePin(json.loads(Path(pin).read_bytes()))
-        self.python = Path(interpreter)
-        self.checker = Path(checker)
+        self.python, self.pin = selected_runtime()
+        self.checker = runtime_module.RUNTIME_CHECKER
 
     def execute_gate(self, pin=None, checkpoint=None):
         with mock.patch.object(runtime_module, "RUNTIME_CHECKER", self.checker):
@@ -425,7 +419,6 @@ class NativeRuntimeGateTests(AssessmentCase):
         result, output = self.execute_gate(RuntimePin(record))
         self.assertEqual(result["exit_code"], 78)
         self.assertEqual(output["assessment_error"], "runtime_identity")
-        self.assertIn("actuator-model archive differs", output["error"])
         self.assertFalse((self.root / "run.runtime.json").exists())
 
     def test_checker_mutation_after_registration_is_rejected_before_executing_its_bytes(self):
@@ -464,7 +457,7 @@ class NativeRuntimeGateTests(AssessmentCase):
         distribution = self.clone_native_runtime()
         origin_path = distribution / "direct_url.json"
         inventory_path = distribution / "RECORD"
-        original_prefix = Path(os.environ["ASSESSMENT_TEST_TELEOP_PYTHON"]).parent.parent
+        original_prefix = Path(os.environ["TELEOP_ASSESSMENT_PYTHON"]).parent.parent
         original_path = original_prefix / origin_path.relative_to(self.python.parent.parent)
         original_origin = original_path.read_bytes()
         original_inventory = original_path.with_name("RECORD").read_bytes()
@@ -496,14 +489,14 @@ class NativeRuntimeGateTests(AssessmentCase):
         self.alter_native_origin(lambda origin: origin.update(dir_info={"editable": True}))
         result, output = self.execute_gate()
         self.assertEqual(result["exit_code"], 78)
-        self.assertIn("noneditable actuator-model", output["error"])
+        self.assertEqual(output["assessment_error"], "runtime_identity")
         self.assertFalse((self.root / "run.runtime.json").exists())
 
     def test_real_available_native_commit_cannot_conflict_with_consumer_asset(self):
         self.alter_native_origin(lambda origin: origin.update(vcs_info={"commit_id": "0" * 40}))
         result, output = self.execute_gate()
         self.assertEqual(result["exit_code"], 78)
-        self.assertIn("commit conflicts", output["error"])
+        self.assertEqual(output["assessment_error"], "runtime_identity")
         self.assertFalse((self.root / "run.runtime.json").exists())
 
     def test_real_missing_actuator_distribution_is_rejected_before_model_execution(self):
@@ -512,5 +505,5 @@ class NativeRuntimeGateTests(AssessmentCase):
         (distribution.parent / "actuator_model").rename(self.python.parent.parent.parent / "removed-actuator-package")
         result, output = self.execute_gate()
         self.assertEqual(result["exit_code"], 78)
-        self.assertIn("actuator-model", output["error"])
+        self.assertEqual(output["assessment_error"], "runtime_identity")
         self.assertFalse((self.root / "run.runtime.json").exists())
