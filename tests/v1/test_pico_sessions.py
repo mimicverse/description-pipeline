@@ -2146,10 +2146,10 @@ sys.stdin.buffer.read(1)
         after["manifest.json"] = artifact.manifest_sha256
         self.assertEqual(original, after)
 
-    async def test_native_verifier_cancellation_before_stdin_gate_reaps_actual_helper(self):
+    async def native_verifier_fixture(self, key):
         await self.start_service()
         row = await self.service.create(
-            "app:tenant:operator", "native-verifier-cancel", self.run_id, self.request, self.members, self.read_member
+            "app:tenant:operator", key, self.run_id, self.request, self.members, self.read_member
         )
         sid = row["session_id"]
         await self.wait_ready(sid)
@@ -2161,6 +2161,10 @@ sys.stdin.buffer.read(1)
             commands=self.store.worker_commands(sid),
             execution=verification_execution(),
         )
+        return sid, payload
+
+    async def test_native_verifier_cancellation_before_stdin_gate_reaps_actual_helper(self):
+        _sid, payload = await self.native_verifier_fixture("native-verifier-cancel")
         registered = asyncio.Event()
         identities = []
 
@@ -2175,6 +2179,99 @@ sys.stdin.buffer.read(1)
         checking.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await checking
+        self.assertEqual("dead", resource_state(identities[0]))
+
+    async def test_native_verifier_spawn_cancellation_reaches_pending_registration(self):
+        from unittest.mock import patch
+
+        _sid, payload = await self.native_verifier_fixture("native-verifier-spawn-registration")
+        actual_spawn = asyncio.create_subprocess_exec
+        spawned, release = asyncio.Event(), asyncio.Event()
+        identities = []
+
+        async def delayed_spawn(*args, **options):
+            process = await actual_spawn(*args, **options)
+            spawned.set()
+            await release.wait()
+            return process
+
+        async def hold_registration(identity):
+            identities.append(identity)
+            await asyncio.Future()
+
+        with patch("description_pipeline.simulation.recording.asyncio.create_subprocess_exec", delayed_spawn):
+            checking = asyncio.create_task(run_verification(payload, Path(WORKER), register_process=hold_registration))
+            try:
+                await asyncio.wait_for(spawned.wait(), 5)
+                checking.cancel("cancel-before-spawn-return")
+                await asyncio.sleep(0)
+                self.assertFalse(checking.done())
+            finally:
+                release.set()
+            with self.assertRaises(asyncio.CancelledError) as cancelled:
+                await asyncio.wait_for(checking, 10)
+        self.assertEqual(("cancel-before-spawn-return",), cancelled.exception.args)
+        self.assertEqual(1, len(identities))
+        self.assertEqual("dead", resource_state(identities[0]))
+
+    async def test_native_verifier_cancel_waits_for_real_registration_transaction(self):
+        from unittest.mock import patch
+
+        sid, _payload = await self.native_verifier_fixture("native-verifier-durable-registration")
+        original_recording = self.store.get(sid)["recording_artifact"]
+        original_transition = self.store.transition_verification
+        entered, release = threading.Event(), threading.Event()
+        identities = []
+
+        def blocked_transition(*args, **kwargs):
+            if args[3] == "running":
+                identities.append(kwargs["process"])
+                entered.set()
+                if not release.wait(5):
+                    raise TimeoutError("Registration fixture was not released")
+            return original_transition(*args, **kwargs)
+
+        with patch.object(self.store, "transition_verification", blocked_transition):
+            checking = asyncio.create_task(self.service.verify_recording(sid, self.members, self.read_member))
+            try:
+                self.assertTrue(await asyncio.to_thread(entered.wait, 5))
+                checking.cancel("cancel-during-registration")
+                await asyncio.sleep(0)
+                checking.cancel("repeat-cancel-during-registration")
+                await asyncio.sleep(0)
+                self.assertFalse(checking.done())
+                self.assertEqual("alive", resource_state(identities[0]))
+            finally:
+                release.set()
+            with self.assertRaises(asyncio.CancelledError) as cancelled:
+                await asyncio.wait_for(checking, 10)
+        self.assertEqual(("cancel-during-registration",), cancelled.exception.args)
+        attempt = self.store.verification_attempts(sid)[-1]
+        self.assertEqual("cancelled", attempt["result"]["state"])
+        self.assertEqual(identities[0], attempt["result"]["process_identity"])
+        self.assertEqual("dead", resource_state(identities[0]))
+        self.assertFalse((self.service.root / attempt["request"]["partial"]).exists())
+        self.assertEqual(original_recording, self.store.get(sid)["recording_artifact"])
+        verified = await self.service.verify_recording(sid, self.members, self.read_member)
+        self.assertTrue(verified["control_replay_verified"])
+        completed = self.store.verification_attempts(sid)[-1]
+        self.assertEqual("completed", completed["result"]["state"])
+        self.assertEqual("dead", resource_state(completed["result"]["process_identity"]))
+        self.assertEqual(original_recording, self.store.get(sid)["recording_artifact"])
+
+    async def test_native_verifier_registration_failure_keeps_error_and_reaps_helper(self):
+        _sid, payload = await self.native_verifier_fixture("native-verifier-registration-error")
+        failure = RuntimeError("Registration fixture failed")
+        identities = []
+
+        async def fail_registration(identity):
+            identities.append(identity)
+            raise failure
+
+        with self.assertRaises(RuntimeError) as raised:
+            await run_verification(payload, Path(WORKER), register_process=fail_registration)
+        self.assertIs(failure, raised.exception)
+        self.assertEqual(1, len(identities))
         self.assertEqual("dead", resource_state(identities[0]))
 
     async def test_recording_cli_uses_managed_partial_on_exec_and_native_runtime_failure(self):
