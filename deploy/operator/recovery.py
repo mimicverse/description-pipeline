@@ -2008,6 +2008,9 @@ RECOVERY_ROOT_QUERY = (
     "WHERE result_record_artifact_id IS NOT NULL "
     "UNION SELECT recording_artifact->>'artifact_id' FROM platform.simulation_session "
     "WHERE recording_artifact IS NOT NULL "
+    "UNION SELECT request_artifact_id FROM platform.assessment_request "
+    "UNION SELECT result_artifact_id FROM platform.assessment_attempt "
+    "WHERE result_artifact_id IS NOT NULL "
     "UNION SELECT outbound_artifact_id FROM platform.effect_intent "
     "UNION SELECT payload_artifact_id FROM platform.effect_fact "
     "WHERE payload_artifact_id IS NOT NULL "
@@ -2141,7 +2144,9 @@ def validate_recovery_root(root: object) -> dict:
     return root
 
 
-def _recovery_root(connection) -> dict:
+def _recovery_root(connection, artifact_root: Path) -> dict:
+    from description_pipeline.dynamics_assessment.queries import read_recovery_artifacts
+
     root = validate_recovery_root(_connection_json(connection, RECOVERY_ROOT_QUERY))
     decisions = _checkpoint_references(connection)
     require(
@@ -2149,6 +2154,23 @@ def _recovery_root(connection) -> dict:
         "recovery_database_readback_failed",
         "canonical recovery root decisions differ from the decision read model",
     )
+    try:
+        assessment_artifacts = read_recovery_artifacts(connection, artifact_root)
+    except Exception as error:
+        raise RecoveryError(
+            "recovery_reference_invalid",
+            "assessment recovery references failed verification",
+            {"error": str(error)},
+        ) from error
+    artifacts = {record["artifact_id"]: record for record in root["artifacts"]}
+    for artifact in assessment_artifacts:
+        record = artifact.to_record()
+        require(
+            artifacts.setdefault(artifact.artifact_id, record) == record,
+            "recovery_reference_invalid",
+            "assessment recovery reference differs from the canonical fact root",
+        )
+    root["artifacts"] = [artifacts[key] for key in sorted(artifacts)]
     return root
 
 
@@ -2202,7 +2224,7 @@ def _live_database_data(connection) -> dict:
     }
 
 
-def _database_baseline_snapshot(connection) -> tuple[dict, dict, dict]:
+def _database_baseline_snapshot(connection, artifact_root: Path) -> tuple[dict, dict, dict]:
     legacy_catalog = _connection_json(connection, CATALOG_QUERY)
     full_catalog = _connection_json(connection, FULL_CATALOG_QUERY)
     require(
@@ -2227,7 +2249,7 @@ def _database_baseline_snapshot(connection) -> tuple[dict, dict, dict]:
         "catalog": full_catalog,
     }
     data = _live_database_data(connection)
-    return catalog, data, _recovery_root(connection)
+    return catalog, data, _recovery_root(connection, artifact_root)
 
 
 def pg_control(path: Path, context: CommandContext) -> dict:
@@ -4747,6 +4769,7 @@ def _snapshot_worker(request_path: Path) -> int:
             "schema_version",
             "control_dir",
             "staging",
+            "artifact_root",
             "database",
             "postgres",
             "timeout_seconds",
@@ -4757,11 +4780,13 @@ def _snapshot_worker(request_path: Path) -> int:
     )
     control = Path(request["control_dir"])
     staging = Path(request["staging"])
+    artifact_root = Path(request["artifact_root"])
     database = request["database"]
     postgres = request["postgres"]
     timeout = request["timeout_seconds"]
     require(
-        control.is_absolute() and staging.is_absolute() and type(timeout) is int and timeout > 0,
+        control.is_absolute() and staging.is_absolute() and artifact_root.is_absolute()
+        and type(timeout) is int and timeout > 0,
         "recovery_snapshot_worker_failed",
         "snapshot worker paths/timeout are malformed",
     )
@@ -4823,7 +4848,7 @@ def _snapshot_worker(request_path: Path) -> int:
         snapshot = _db_connect(database)
         snapshot_id = _begin_exported_snapshot(snapshot)
         roles_snapshot_before = _roles_settings_snapshot(snapshot)
-        catalog, data, recovery_root = _database_baseline_snapshot(snapshot)
+        catalog, data, recovery_root = _database_baseline_snapshot(snapshot, artifact_root)
         checkpoint_rows = recovery_root["decisions"]
         sequence_before = data["sequences"]
         atomic_write(
@@ -6754,6 +6779,7 @@ def _backup_command_claimed(
             "schema_version": SNAPSHOT_WORKER_SCHEMA,
             "control_dir": str(control),
             "staging": str(staging),
+            "artifact_root": context.resolved["storage"]["artifact_root"],
             "database": {
                 "socket_dir": str(socket_dir),
                 "port": port,

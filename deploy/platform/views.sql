@@ -27,6 +27,26 @@ WITH bound_claims AS (
      AND task.map_index = claim.map_index
     WHERE claim.task_id IS NOT NULL
        OR claim.map_index IS NOT NULL
+    UNION ALL
+    SELECT
+        attempt.attempt_id,
+        request.source_run_id,
+        'upper_body_dynamics'::text,
+        attempt.dag_run_id,
+        'assess'::text,
+        -1,
+        attempt.updated_at,
+        task.state,
+        COALESCE(task.end_date, task.start_date, attempt.updated_at)
+    FROM :"platform_schema".assessment_attempt AS attempt
+    JOIN :"platform_schema".assessment_request AS request
+      ON request.request_id = attempt.request_id
+    LEFT JOIN :"airflow_schema".task_instance AS task
+      ON task.dag_id = 'upper_body_dynamics'
+     AND task.task_id = 'assess'
+     AND task.run_id = attempt.dag_run_id
+     AND task.map_index = -1
+    WHERE task.dag_id IS NOT NULL OR attempt.owner_token IS NOT NULL
 ),
 scheduling_projection AS (
     SELECT
@@ -78,6 +98,26 @@ dag_run_projection AS (
         dag.start_date,
         dag.end_date,
         command.run_id
+    UNION ALL
+    SELECT
+        'upper_body_dynamics/' || attempt.dag_run_id,
+        request.source_run_id,
+        dag.state,
+        CASE
+            WHEN dag.state::text = ANY (ARRAY['success'::text, 'failed'::text]) THEN 'terminal'
+            WHEN dag.state::text = ANY (ARRAY['queued'::text, 'running'::text]) THEN 'in_flight'
+            ELSE 'unknown'
+        END,
+        COALESCE(dag.end_date, dag.start_date, attempt.updated_at)
+    FROM :"platform_schema".assessment_attempt AS attempt
+    JOIN :"platform_schema".assessment_request AS request
+      ON request.request_id = attempt.request_id
+    LEFT JOIN :"airflow_schema".dag_run AS dag
+      ON dag.dag_id = 'upper_body_dynamics'
+     AND dag.run_id = attempt.dag_run_id
+    WHERE dag.dag_id IS NOT NULL
+       OR attempt.detail @> '{"dispatch_accepted": true}'::jsonb
+       OR attempt.owner_token IS NOT NULL
 )
 SELECT object_kind, object_id, run_id, state, bucket, updated_at
 FROM (
