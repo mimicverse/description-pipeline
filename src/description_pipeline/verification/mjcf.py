@@ -1249,7 +1249,17 @@ def _gate_identity_closure(state: dict) -> dict:
         raise CheckError("the manifest source list differs from the references of the frozen URDF")
     components = manifest["source"]["components"]
     proxies = _expected_collisions(state)
+    encoded = {}
+    for item in _expected_geoms(document, config, policy):
+        geometry = item["surface"]["geometry"]
+        if geometry["kind"] != "mesh":
+            continue
+        reference = _canonical_mesh_path(directory, geometry["filename"], item["name"])
+        if reference in mesh_relative:
+            encoded[reference] = policy["mesh_encoding_prefix"] + manifest["files"][reference]["sha256"] + ".obj"
+    state["encoded_meshes"] = encoded
     expected_files = set(expected_inputs) | {policy["config_name"], policy["robot_name"]} | proxies
+    expected_files.update(encoded.values())
     if components is not None:
         expected_files.add(components)
     if config["floor"] is not None:
@@ -1263,6 +1273,9 @@ def _gate_identity_closure(state: dict) -> dict:
             _confined(root, path).read_bytes(), path
         )
     state["meshes"] = meshes
+    for source, target in encoded.items():
+        vertices, faces = _read_obj(_confined(root, target).read_bytes(), target)
+        _compare_triangles(vertices[faces], meshes[source].reshape(-1, 3, 3), 0.0, 0.0)
     requests, singles = _fk_samples(document, policy)
     state["fk_requests"] = requests
     state["fk_singles"] = singles
@@ -1271,6 +1284,8 @@ def _gate_identity_closure(state: dict) -> dict:
         "input_binding_sha256": state["input_binding_sha256"],
         "files": len(manifest["files"]),
         "meshes": len(mesh_relative),
+        "encoded_meshes": len(set(encoded.values())),
+        "encoded_triangles": sum(len(meshes[source]) // 3 for source in encoded),
         "links": len(document["links"]),
         "joints": len(document["joints"]),
         "samples": len(requests),
@@ -1289,7 +1304,8 @@ def _gate_engine(state: dict) -> dict:
             f"the loaded engine version {mujoco.__version__!r} differs from the locked "
             f"{policy['engine']['mujoco']!r}"
         )
-    sealed = {key for key in manifest["files"] if key.startswith(("meshes/", "mjcf/collision/"))}
+    sealed = {key for key in manifest["files"]
+              if key.startswith((policy["mesh_encoding_prefix"], "mjcf/collision/"))}
     robot_xml = _xml_document(_confined(state["root"], policy["robot_name"]).read_bytes(), policy["robot_name"])
     _checked_syntax(robot_xml, policy, "robot", policy["robot_name"])
     _checked_asset_paths(robot_xml, policy["robot_name"], policy, sealed, state["root"])
@@ -1726,13 +1742,12 @@ def _checked_asset_paths(document: ET.Element, label: str, policy: dict, sealed:
         if canonical not in sealed:
             _fail(f"{label}: <mesh>", f"mesh file {file!r} is not a sealed delivery input")
         asset_path = _confined(root, canonical)
-        if canonical.startswith("mjcf/collision/"):
-            _checked_proxy_obj(asset_path.read_bytes(), canonical)
+        _read_obj(asset_path.read_bytes(), canonical)
 
 
-def _checked_proxy_obj(content: bytes, label: str) -> None:
-    """Reject resource directives before the engine can interpret an OBJ file."""
-    vertices, faces = 0, []
+def _read_obj(content: bytes, label: str) -> tuple[np.ndarray, np.ndarray]:
+    """Independently decode the closed triangle-only encoding before engine access."""
+    vertices, faces = [], []
     for line in content.decode("ascii").splitlines():
         fields = line.split()
         if not fields or fields[0].startswith("#"):
@@ -1740,14 +1755,21 @@ def _checked_proxy_obj(content: bytes, label: str) -> None:
         if fields[0] == "v" and len(fields) == 4:
             values = [float(value) for value in fields[1:]]
             if not all(math.isfinite(value) for value in values):
-                raise CheckError(f"{label}: non-finite proxy vertex")
-            vertices += 1
+                raise CheckError(f"{label}: non-finite OBJ vertex")
+            vertices.append(values)
         elif fields[0] == "f" and len(fields) == 4:
             faces.append(tuple(int(value) for value in fields[1:]))
         else:
             raise CheckError(f"{label}: unsupported OBJ directive")
-    if vertices < 4 or not faces or any(index < 1 or index > vertices for face in faces for index in face):
-        raise CheckError(f"{label}: empty or invalid proxy topology")
+    if not vertices or not faces or any(index < 1 or index > len(vertices) for face in faces for index in face):
+        raise CheckError(f"{label}: empty or invalid OBJ topology")
+    indices = np.asarray(faces, dtype=np.int64) - 1
+    referenced = np.zeros(len(vertices), dtype=bool)
+    referenced[indices] = True
+    if not referenced.all():
+        index = int(np.flatnonzero(~referenced)[0]) + 1
+        raise CheckError(f"{label}: unreferenced OBJ vertex {index} can affect compiled geometry and preview bounds")
+    return np.asarray(vertices, dtype=float), indices
 
 
 def _gate_geometry_instances(state: dict) -> dict:
@@ -1767,7 +1789,8 @@ def _gate_geometry_instances(state: dict) -> dict:
     for item in expected:
         try:
             worst_mesh = _geometry_instance(
-                item, model, data, assets, meshes, directory, poses, referenced_assets, worst_mesh, policy
+                item, model, data, assets, meshes, directory, poses, referenced_assets, worst_mesh, policy,
+                state["encoded_meshes"],
             )
         except CheckError as error:
             raise CheckError(f"{item['name']}: {error}") from error
@@ -1779,7 +1802,8 @@ def _gate_geometry_instances(state: dict) -> dict:
     }
 
 
-def _geometry_instance(item, model, data, assets, meshes, directory, poses, referenced_assets, worst_mesh, policy):
+def _geometry_instance(item, model, data, assets, meshes, directory, poses, referenced_assets, worst_mesh, policy,
+                       encoded_meshes):
     import mujoco
 
     index = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, item["name"])
@@ -1821,7 +1845,7 @@ def _geometry_instance(item, model, data, assets, meshes, directory, poses, refe
                 parts.append(part)
         canonical = "/".join(parts)
         reference = _canonical_mesh_path(directory, surface["geometry"]["filename"], f"mesh geom {item['name']!r}")
-        expected_file = reference
+        expected_file = encoded_meshes.get(reference, reference)
         if canonical != expected_file:
             raise CheckError(f"references {canonical!r} instead of {expected_file!r}")
         if asset["scale"] != tuple(surface["geometry"]["scale"]):
@@ -1835,7 +1859,14 @@ def _geometry_instance(item, model, data, assets, meshes, directory, poses, refe
             return worst_mesh
         source_vertices = meshes[reference] * np.asarray(surface["geometry"]["scale"], dtype=float)
         expected_world = source_vertices @ world[:3, :3].T + world[:3, 3]
-        worst_mesh = max(worst_mesh, _compare_vertex_sets(engine_world, expected_world, policy))
+        first = int(model.mesh_faceadr[mesh_id])
+        count = int(model.mesh_facenum[mesh_id])
+        faces = np.asarray(model.mesh_face[first:first + count], dtype=np.int64)
+        tolerances = policy["tolerances"]
+        worst_mesh = max(worst_mesh, _compare_triangles(
+            engine_world[faces], expected_world.reshape(-1, 3, 3),
+            tolerances["mesh_atol_m"], tolerances["mesh_rtol"],
+        ))
     else:
         expected_type = {"box": "mjGEOM_BOX", "sphere": "mjGEOM_SPHERE", "cylinder": "mjGEOM_CYLINDER"}[kind]
         compiled_type = _geom_type_name(mujoco, model.geom_type[index])
@@ -1861,75 +1892,103 @@ def _geometry_instance(item, model, data, assets, meshes, directory, poses, refe
     return worst_mesh
 
 
-def _compare_vertex_sets(engine: np.ndarray, expected: np.ndarray, policy: dict) -> float:
-    """Welding, reordering and float32 rounding are representation details.
+def _canonical_triangles(triangles: np.ndarray) -> np.ndarray:
+    """Normalize cyclic corner order and face order, retaining orientation and multiplicity."""
+    original = np.asarray(triangles, dtype=float).reshape(-1, 3, 3)
+    best = original.copy().reshape(-1, 9)
+    for offset in (1, 2):
+        candidate = np.roll(original, offset, axis=1).reshape(-1, 9)
+        less, equal = np.zeros(len(best), dtype=bool), np.ones(len(best), dtype=bool)
+        for column in range(9):
+            less |= equal & (candidate[:, column] < best[:, column])
+            equal &= candidate[:, column] == best[:, column]
+        best[less] = candidate[less]
+    return best[np.lexsort(best.T[::-1])].reshape(-1, 3, 3)
 
-    The vertex sets must agree within the declared tolerance in both directions:
-    every engine vertex needs an STL counterpart and every STL vertex needs an
-    engine counterpart (welding may collapse coincident copies on either side).
+
+def _compare_triangles(actual: np.ndarray, expected: np.ndarray, atol: float, rtol: float) -> float:
+    """Match every directed triangle once, including repeated faces, under the existing numeric gate.
+
+    Exact source/OBJ checks have zero tolerance. Compiled geometry may weld or
+    reindex vertices and reorder faces; a spatially bounded bipartite match
+    handles ambiguous numeric ordering without a global all-pairs matrix.
     """
-
-    tolerances = policy["tolerances"]
-    atol, rtol = tolerances["mesh_atol_m"], tolerances["mesh_rtol"]
-    first = np.unique(np.asarray(engine, dtype=float), axis=0)
-    second = np.unique(np.asarray(expected, dtype=float), axis=0)
-    if len(first) == 0 or len(second) == 0:
-        if len(first) != len(second):
-            raise CheckError(f"holds {len(first)} distinct vertices instead of {len(second)}")
-        return 0.0
-    if first.shape == second.shape:
-        residual = np.abs(first - second)
-        allowed = atol + rtol * np.maximum(np.abs(first), np.abs(second))
-        if np.all(residual <= allowed):
-            return float(np.max(residual))
-    scale = max(float(np.max(np.abs(first))), float(np.max(np.abs(second))))
+    if actual.shape != expected.shape or not len(expected):
+        raise CheckError(f"oriented triangle counts differ: {len(actual)} instead of {len(expected)}")
+    # The encoder retains source face order and the engine normally does too.
+    # Check every corner directly before paying for order-independent matching.
+    residuals = np.full(len(expected), np.inf)
+    for offset in (0, 1, 2):
+        target = np.roll(expected, offset, axis=1) if offset else expected
+        delta = np.abs(actual - target)
+        matches = np.all(delta <= atol + rtol * np.maximum(np.abs(actual), np.abs(target)), axis=(1, 2))
+        residuals[matches] = np.minimum(residuals[matches], np.max(delta[matches], axis=(1, 2)))
+        if np.isfinite(residuals).all():
+            return float(np.max(residuals))
+    actual, expected = _canonical_triangles(actual), _canonical_triangles(expected)
+    delta = np.abs(actual - expected)
+    if np.all(delta <= atol + rtol * np.maximum(np.abs(actual), np.abs(expected))):
+        return float(np.max(delta))
+    if atol == 0 and rtol == 0:
+        raise CheckError("OBJ oriented triangle multiset differs from the source STL")
+    scale = max(float(np.max(np.abs(actual))), float(np.max(np.abs(expected))))
     cell = atol + rtol * scale
-    return max(
-        _matched_distance(first, second, cell, atol, rtol, "the delivered mesh"),
-        _matched_distance(second, first, cell, atol, rtol, "the STL"),
-    )
+    buckets = {}
+    for index, key in enumerate(np.floor(expected.mean(axis=1) / cell).astype(np.int64)):
+        buckets.setdefault(tuple(key), []).append(index)
+    keys = np.floor(actual.mean(axis=1) / cell).astype(np.int64)
+    neighbors = {}
 
+    def candidates(index):
+        if index in neighbors:
+            return neighbors[index]
+        possible = []
+        key = keys[index]
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    possible.extend(buckets.get((key[0] + dx, key[1] + dy, key[2] + dz), ()))
+        matched = {}
+        # Bound temporary arrays even for adversarial coincident triangles.
+        for start in range(0, len(possible), 4096):
+            indices = np.asarray(possible[start:start + 4096], dtype=np.int64)
+            for offset in (0, 1, 2):
+                target = np.roll(expected[indices], offset, axis=1)
+                residual = np.abs(actual[index] - target)
+                allowed = atol + rtol * np.maximum(np.abs(actual[index]), np.abs(target))
+                for local in np.flatnonzero(np.all(residual <= allowed, axis=(1, 2))):
+                    matched[int(indices[local])] = float(np.max(residual[local]))
+        neighbors[index] = matched
+        return matched
 
-def _matched_distance(
-    source: np.ndarray, target: np.ndarray, cell: float, atol: float, rtol: float, label: str
-) -> float:
-    """Worst distance of a bijective-in-existence match of source points into target points."""
-
-    keys = np.floor(target / cell).astype(np.int64)
-    origin = keys.min(axis=0)
-    spans = (keys.max(axis=0) - origin) + 3
-    codes = (keys[:, 0] - origin[0]) + spans[0] * ((keys[:, 1] - origin[1]) + spans[1] * (keys[:, 2] - origin[2]))
-    order = np.argsort(codes, kind="stable")
-    sorted_codes = codes[order]
-    sorted_target = target[order]
-    source_keys = np.floor(source / cell).astype(np.int64)
-    matched = np.zeros(len(source), dtype=bool)
-    worst = 0.0
-    for offset in ((dx, dy, dz) for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1)):
-        probe = (
-            (source_keys[:, 0] + offset[0] - origin[0])
-            + spans[0]
-            * (
-                (source_keys[:, 1] + offset[1] - origin[1])
-                + spans[1] * (source_keys[:, 2] + offset[2] - origin[2])
-            )
-        )
-        lower = np.searchsorted(sorted_codes, probe, side="left")
-        upper = np.searchsorted(sorted_codes, probe, side="right")
-        for index in np.nonzero(upper > lower)[0]:
-            if matched[index]:
-                continue
-            candidates = sorted_target[lower[index] : upper[index]]
-            delta = np.abs(candidates - source[index])
-            limits = atol + rtol * np.maximum(np.abs(candidates), np.abs(source[index]))
-            ok = np.all(delta <= limits, axis=1)
-            if ok.any():
-                matched[index] = True
-                worst = max(worst, float(np.max(delta[ok])))
-    if not matched.all():
-        index = int(np.nonzero(~matched)[0][0])
-        raise CheckError(f"{label}: vertex {source[index]} has no counterpart within tolerance")
-    return worst
+    owners = np.full(len(expected), -1, dtype=np.int64)
+    distances = np.zeros(len(expected))
+    for first in range(len(actual)):
+        pending, parents, seen = [first], {}, set()
+        found = False
+        for current in pending:
+            for target, residual in candidates(current).items():
+                if target in seen:
+                    continue
+                seen.add(target)
+                owner = int(owners[target])
+                if owner >= 0:
+                    if owner not in parents and owner != first:
+                        parents[owner] = (current, target, residual)
+                        pending.append(owner)
+                    continue
+                owners[target], distances[target] = current, residual
+                while current != first:
+                    previous, target, residual = parents[current]
+                    owners[target], distances[target] = previous, residual
+                    current = previous
+                found = True
+                break
+            if found:
+                break
+        if not found:
+            raise CheckError(f"compiled oriented triangle {first} has no unused source counterpart within tolerance")
+    return float(np.max(distances))
 
 
 def _gate_joints_config(state: dict) -> dict:
@@ -2540,13 +2599,17 @@ def _derivation_records(state: dict) -> list[dict]:
             originals = set()
             for row in geoms.values():
                 geometry = row["surface"]["geometry"]
-                if (geometry["kind"] != "mesh"
-                        or _canonical_mesh_path(directory, geometry["filename"], name) != filename):
+                if geometry["kind"] != "mesh":
+                    continue
+                reference = _canonical_mesh_path(directory, geometry["filename"], name)
+                if state["encoded_meshes"].get(reference, reference) != filename:
                     continue
                 for surface in row.get("source_surfaces", [row["surface"]]):
                     originals.add(_canonical_mesh_path(directory, surface["geometry"]["filename"], name))
-            sources.extend({"record": original, "fields": ["vertices"]} for original in sorted(originals))
-            rule = "Mesh asset reference, scale and bounded convex preprocessing"
+            sources.extend({"record": original, "fields": ["vertices", "faces"],
+                            "sha256": state["manifest"]["files"][original]["sha256"]}
+                           for original in sorted(originals))
+            rule = "Exact oriented triangle encoding, instance scale and bounded convex preprocessing"
         elif node.tag in {"freejoint", "option", "site", "geom", "light"}:
             sources.append(config_source)
             for support in state["config"]["support_sites"]:
@@ -2581,6 +2644,14 @@ def _gate_provenance_warnings(state: dict) -> dict:
     delivered = warnings(state["policy"]["robot_name"])
     policy, config = state["policy"], state["config"]
     expected = [*source, policy["simulation_warning"], policy["format_warning"]]
+    for original, target in sorted(state["encoded_meshes"].items()):
+        files = state["manifest"]["files"]
+        payload = {"source_file": original, "source_sha256": files[original]["sha256"],
+                   "target_file": target, "target_sha256": files[target]["sha256"],
+                   "triangles": len(state["meshes"][original]) // 3, "rule": policy["mesh_encoding"],
+                   "scope": policy["mesh_encoding_scope"]}
+        encoded = json.dumps(payload, sort_keys=True, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+        expected.append(policy["mesh_warning_prefix"] + encoded.replace("--", r"\u002d\u002d"))
     for link in state["document"]["links"]:
         role = config["collision"]["source"]
         if role == "auto":
@@ -2696,6 +2767,10 @@ def _policy() -> dict:
         "report_scope": contract.REPORT_SCOPE,
         "simulation_warning": contract.SIMULATION_WARNING,
         "format_warning": contract.FORMAT_WARNING,
+        "mesh_encoding": contract.MESH_ENCODING,
+        "mesh_encoding_prefix": contract.MESH_ENCODING_PREFIX,
+        "mesh_warning_prefix": contract.MESH_WARNING_PREFIX,
+        "mesh_encoding_scope": contract.MESH_ENCODING_SCOPE,
         "collision_warning_prefix": contract.COLLISION_WARNING_PREFIX,
         "collision_scope": contract.COLLISION_SCOPE,
         "process_limits": {"cpu_seconds": contract.VERIFIER_CPU_SECONDS,

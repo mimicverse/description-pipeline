@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import io
 import json
 import os
@@ -11,6 +12,7 @@ from datetime import UTC, datetime
 from unittest.mock import patch
 
 from description_pipeline.io import canonical, PipelineError
+from description_pipeline import mjcf_contract
 from description_pipeline.orchestration.airflow_client import native_run_id
 from description_pipeline.orchestration.feishu_oauth import build_actor_name
 from description_pipeline.orchestration.portal import (
@@ -163,6 +165,17 @@ class MJCFPortalTests(unittest.TestCase):
             self.assertTrue(preview["mjcf"]["verified"])
             self.assertIn(preview["mjcf"]["entry"], preview["mjcf"]["files"])
             self.assertTrue(preview["mjcf"]["warnings"])
+            encoded = {path: sha for path, sha in preview['mjcf']['files'].items()
+                       if path.startswith(mjcf_contract.MESH_ENCODING_PREFIX)}
+            self.assertTrue(encoded)
+            for path, sha in encoded.items():
+                status, content = call('GET', f'/api/runs/{dag_id}/artifacts/{path}')
+                self.assertEqual(200, status, content)
+                self.assertEqual(sha, hashlib.sha256(content).hexdigest())
+            encoding_warnings = [warning for warning in preview['mjcf']['warnings']
+                                 if warning.startswith(mjcf_contract.MESH_WARNING_PREFIX)]
+            self.assertTrue(encoding_warnings)
+            self.assertTrue(all(warning in chain.pull_requests.rows[0].body for warning in encoding_warnings))
             original = projection(source_id)
             source_decisions = [row["decision"] for row in original["stages"]]
             status, body = call("POST", f"/api/runs/{dag_id}/attempts", {"stage": "mjcf", "simulation": "{}\n"})
@@ -232,6 +245,10 @@ class MJCFPortalTests(unittest.TestCase):
             self.assertEqual({"mjcf", "publish"}, {row["stage"] for row in current["stages"] if row["decision"]})
             corrupted = copy.deepcopy(expanded)
             corrupted["by_stage"]["mjcf"]["mjcf/robot.xml"]["sha256"] = "f" * 64
+            with self.assertRaises(PipelineError):
+                portal._preview_from_projection(successor_id, corrupted)
+            corrupted = copy.deepcopy(expanded)
+            corrupted['by_stage']['mjcf'][next(iter(encoded))]['sha256'] = 'f' * 64
             with self.assertRaises(PipelineError):
                 portal._preview_from_projection(successor_id, corrupted)
             status, body = call("GET", f"/api/runs/{successor_dag}")

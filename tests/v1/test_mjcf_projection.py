@@ -5,6 +5,7 @@ import hashlib
 import json
 import shutil
 import struct
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,7 +18,7 @@ import numpy as np
 from description_pipeline import mjcf
 from description_pipeline import mjcf_contract as contract
 from description_pipeline.io import PipelineError, inventory
-from description_pipeline.verification.mjcf import evaluate_projection, _directed_convex_distance
+from description_pipeline.verification.mjcf import evaluate_projection, _directed_convex_distance, _compare_triangles
 
 
 def tetrahedron() -> bytes:
@@ -91,6 +92,210 @@ class ProjectionTests(unittest.TestCase):
         tree.find(path).set(attribute, value)
         tree.write(self.root/contract.ROBOT_NAME)
         return evaluate_projection(self.root, self.binding())
+
+    def refresh_encoding_warnings(self):
+        tree = ET.parse(self.root / contract.ROBOT_NAME,
+                        parser=ET.XMLParser(target=ET.TreeBuilder(insert_comments=True)))
+        for node in tree.getroot():
+            if node.tag is ET.Comment and (node.text or '').startswith(contract.MESH_WARNING_PREFIX):
+                record = json.loads(node.text[len(contract.MESH_WARNING_PREFIX):])
+                record['target_sha256'] = hashlib.sha256((self.root / record['target_file']).read_bytes()).hexdigest()
+                node.text = contract.mesh_encoding_warning(record)
+        tree.write(self.root / contract.ROBOT_NAME)
+
+    def test_exact_encoding_reuses_content_across_paths_and_retains_original_metadata(self):
+        content = bytearray(tetrahedron())
+        content[:8] = b'original'
+        struct.pack_into('<3f', content, 84, 3, 2, 1)
+        struct.pack_into('<H', content, 132, 32767)
+        for name in ('part.stl', 'alias.stl'):
+            (self.root / 'meshes' / name).write_bytes(content)
+        source = SOURCE.replace('filename="../meshes/part.stl" scale=', 'filename="../meshes/alias.stl" scale=')
+        (self.root / contract.URDF_NAME).write_text(source)
+        report = self.build()
+        self.assertTrue(report['passed'], report)
+        encoded = list((self.root / 'mjcf/meshes').glob('*.obj'))
+        self.assertEqual(1, len(encoded))
+        self.assertEqual(hashlib.sha256(content).hexdigest(), encoded[0].stem)
+        for name in ('part.stl', 'alias.stl'):
+            self.assertEqual(bytes(content), (self.root / 'meshes' / name).read_bytes())
+        self.assertEqual(source, (self.root / contract.URDF_NAME).read_text())
+        row = next(row for row in report['checks'] if row['id'] == 'provenance.warnings')
+        encodings = [line for line in row['details']['warning_comments']
+                     if line.startswith(contract.MESH_WARNING_PREFIX)]
+        self.assertEqual(2, len(encodings))
+
+    def test_isolated_conversion_crosses_the_native_stl_decoder_face_boundary(self):
+        initial = self.root
+        records = tetrahedron()[84:]
+        for count in (200000, 200001):
+            with self.subTest(triangles=count):
+                self.root = initial / str(count)
+                shutil.copytree(initial / 'urdf', self.root / 'urdf')
+                (self.root / 'meshes').mkdir()
+                payload = bytes(80) + struct.pack('<I', count)
+                payload += records * (count // 4) + records[:50 * (count % 4)]
+                (self.root / 'meshes/part.stl').write_bytes(payload)
+                mjcf.project_isolated(self.root)
+                report = evaluate_projection(self.root, self.binding())
+                self.assertTrue(report['passed'], report)
+                self.assertTrue(set(contract.CHECK_IDS) <= {row['id'] for row in report['checks']})
+                model = mujoco.MjModel.from_xml_path(str(self.root / contract.ROBOT_NAME))
+                self.assertTrue(all(int(value) == count for value in model.mesh_facenum))
+                self.assertEqual(payload, (self.root / 'meshes/part.stl').read_bytes())
+        self.root = initial
+
+    def test_equivalent_obj_reindexing_cyclic_corners_and_face_order_are_accepted(self):
+        self.assertTrue(self.build()['passed'])
+        path = next((self.root / 'mjcf/meshes').glob('*.obj'))
+        lines = path.read_text().splitlines()
+        vertices = [line for line in lines if line.startswith('v ')]
+        faces = [[len(vertices) + 1 - int(value) for value in line.split()[1:]]
+                 for line in lines if line.startswith('f ')]
+        reordered = ['f ' + ' '.join(map(str, face[1:] + face[:1])) for face in reversed(faces)]
+        path.write_text('\n'.join([*reversed(vertices), *reordered]) + '\n')
+        self.refresh_encoding_warnings()
+        report = evaluate_projection(self.root, self.binding())
+        self.assertTrue(report['passed'], report)
+
+    def test_rebound_obj_geometry_and_resource_attacks_are_rejected(self):
+        self.assertTrue(self.build()['passed'])
+        path = next((self.root / 'mjcf/meshes').glob('*.obj'))
+        original = path.read_text()
+        lines = original.splitlines()
+        faces = [index for index, line in enumerate(lines) if line.startswith('f ')]
+        mutations = {}
+        for name in ('coordinate', 'connection', 'winding', 'missing', 'duplicate'):
+            changed = lines.copy()
+            index = faces[0]
+            if name == 'coordinate':
+                changed[0] = 'v 0.123 0 0'
+            elif name == 'connection':
+                changed[index] = 'f 1 2 4'
+            elif name == 'winding':
+                changed[index] = 'f ' + ' '.join(reversed(changed[index].split()[1:]))
+            elif name == 'missing':
+                del changed[index]
+            else:
+                changed[faces[1]] = changed[index]
+            mutations[name] = '\n'.join(changed) + '\n'
+        for directive in ('mtllib ../private.mtl', 'usemtl secret', 'vt 0 0', 'vn 0 0 1', 'vp 1 2',
+                          'p 1', 'l 1 2', 's off', 'g extra', 'o extra', 'v 0 0 0 1',
+                          'f 1/1 2/1 3/1', 'v nan 0 0', 'f 1 2 -1'):
+            mutations[directive] = original + directive + '\n'
+        for name, content in mutations.items():
+            with self.subTest(name=name):
+                path.write_text(content)
+                self.refresh_encoding_warnings()
+                report = evaluate_projection(self.root, self.binding())
+                self.assertFalse(report['passed'])
+                gate = next(row for row in report['checks'] if row['id'] == 'identity.closure')
+                self.assertFalse(gate['passed'], gate)
+        path.write_text(original)
+        self.refresh_encoding_warnings()
+        for attack in ('source-sha', 'missing-asset', 'original-stl-reference'):
+            with self.subTest(attack=attack):
+                binding = self.binding()
+                if attack == 'source-sha':
+                    binding['files']['meshes/part.stl']['sha256'] = '0' * 64
+                elif attack == 'missing-asset':
+                    del binding['files'][path.relative_to(self.root).as_posix()]
+                else:
+                    tree = ET.parse(self.root / contract.ROBOT_NAME,
+                                    parser=ET.XMLParser(target=ET.TreeBuilder(insert_comments=True)))
+                    tree.find('./asset/mesh').set('file', '../meshes/part.stl')
+                    tree.write(self.root / contract.ROBOT_NAME)
+                    binding = self.binding()
+                self.assertFalse(evaluate_projection(self.root, binding)['passed'])
+
+    def test_unused_obj_vertices_cannot_change_engine_or_preview_bounds(self):
+        source = (self.root / contract.URDF_NAME).read_bytes()
+        mesh = (self.root / 'meshes/part.stl').read_bytes()
+        self.assertTrue(self.build({'collision': {'source': 'none'}})['passed'])
+        path = next((self.root / 'mjcf/meshes').glob('*.obj'))
+        original = path.read_text()
+        for extra in ('v 1 2 3', 'v 0 0 0'):
+            with self.subTest(extra=extra):
+                path.write_text(original + extra + '\n')
+                self.refresh_encoding_warnings()
+                report = evaluate_projection(self.root, self.binding())
+                gate = next(row for row in report['checks'] if row['id'] == 'identity.closure')
+                self.assertFalse(gate['passed'], gate)
+                self.assertIn('unreferenced OBJ vertex', gate['details']['error'])
+        self.assertEqual(source, (self.root / contract.URDF_NAME).read_bytes())
+        self.assertEqual(mesh, (self.root / 'meshes/part.stl').read_bytes())
+
+    def test_compiled_triangles_preserve_direction_and_multiplicity_with_ambiguous_numeric_matches(self):
+        triangle = np.array([[[0., 0., 0.], [1., 0., 0.], [0., 0., 1.]]])
+        expected = np.concatenate((triangle, np.add(triangle, (0., 1., 0.))))
+        actual = np.concatenate((np.add(triangle, (0., .4, 0.)), np.add(triangle, (.1, -.3, 0.))))
+        self.assertLessEqual(_compare_triangles(actual, expected, .6, 0), .6)
+        with self.assertRaisesRegex(ValueError, 'triangle'):
+            _compare_triangles(expected[:, ::-1], expected, 1e-6, 1e-6)
+        with self.assertRaisesRegex(ValueError, 'triangle'):
+            _compare_triangles(np.repeat(triangle, 2, axis=0), expected, 0, 0)
+
+    @unittest.skipUnless(shutil.which('node'), 'Node.js is required for the bundled WASM consumer')
+    def test_sealed_obj_loads_through_production_worker_with_official_wasm(self):
+        self.colored_component()
+        report = self.build()
+        self.assertTrue(report['passed'], report)
+        self.check_wasm_projection()
+
+    def check_wasm_projection(self):
+        request = self.root / 'wasm-request.json'
+        joints = ET.parse(self.root / contract.URDF_NAME).getroot().findall('joint')
+        limits = {joint.get('name'): joint.get('type') != 'continuous' for joint in joints
+                  if joint.get('type') in ('revolute', 'continuous', 'prismatic')}
+        request.write_text(json.dumps({'binding': self.binding(), 'jointLimits': limits}))
+        output = self.root / 'wasm-output'
+        subprocess.run(['node', str(Path(__file__).parents[1] / 'js/mjcf_assets_probe.mjs'),
+                        str(self.root), str(request), str(output)], check=True, capture_output=True, timeout=120)
+        result = json.loads((output / 'result.json').read_text())
+        self.assertEqual(contract.engine_identity()['mujoco'], result['engine'])
+        self.assertEqual({path: row['sha256'] for path, row in self.binding()['files'].items()}, result['inputFiles'])
+        model = mujoco.MjModel.from_xml_path(str(self.root / contract.ROBOT_NAME))
+        data = mujoco.MjData(model)
+        mujoco.mj_forward(model, data)
+        self.assertEqual(model.ngeom, len(result['geoms']))
+        for field in ('xpos', 'xmat', 'xipos', 'xanchor', 'xaxis', 'site_xpos', 'site_xmat'):
+            tolerance = contract.ROTATION_ATOL if field.endswith('mat') or field == 'xaxis' \
+                else contract.POSITION_ATOL_M
+            np.testing.assert_allclose(np.array(result['state'][field]).reshape(getattr(data, field).shape),
+                                       getattr(data, field), rtol=0, atol=tolerance)
+        triangle_count = 0
+        for index, geom in enumerate(result['geoms']):
+            self.assertEqual(model.geom(index).name, result['geomNames'][index])
+            self.assertEqual(model.body(int(model.geom_bodyid[index])).name, geom['link'])
+            np.testing.assert_allclose(geom['rgba'], model.geom_rgba[index], rtol=0, atol=contract.RGBA_ATOL)
+            if 'positions' not in geom:
+                continue
+            arrays = {}
+            for field, dtype in (('positions', '<f4'), ('indices', '<i4')):
+                record = geom[field]
+                content = (output / record['file']).read_bytes()
+                self.assertEqual(record['sha256'], hashlib.sha256(content).hexdigest())
+                arrays[field] = np.frombuffer(content, dtype=dtype).reshape(-1, 3)
+            actual = arrays['positions'] @ np.array(result['state']['geom_xmat']).reshape(-1, 3, 3)[index].T
+            actual += np.array(result['state']['geom_xpos']).reshape(-1, 3)[index]
+            mesh = int(model.geom_dataid[index])
+            start, count = int(model.mesh_vertadr[mesh]), int(model.mesh_vertnum[mesh])
+            expected = model.mesh_vert[start:start + count] @ data.geom_xmat[index].reshape(3, 3).T
+            expected += data.geom_xpos[index]
+            if geom['collision']:
+                graph = int(model.mesh_graphadr[mesh])
+                vertices, faces = map(int, model.mesh_graph[graph:graph + 2])
+                first = graph + 2 + 3 * vertices + 3 * faces
+                indices = model.mesh_graph[first:first + 3 * faces].reshape(-1, 3)
+            else:
+                first, count = int(model.mesh_faceadr[mesh]), int(model.mesh_facenum[mesh])
+                indices = model.mesh_face[first:first + count]
+            _compare_triangles(actual[arrays['indices']], expected[indices], contract.MESH_ATOL_M, contract.MESH_RTOL)
+            triangle_count += len(arrays['indices'])
+        config = contract.load_simulation((self.root / contract.CONFIG_NAME).read_bytes())
+        self.assertAlmostEqual(config['simulation']['timestep'], result['steppedTime'])
+        return {'engine': result['engine'], 'geoms': len(result['geoms']),
+                'complete_triangles_checked': triangle_count, 'stepped_time': result['steppedTime']}
 
     def test_mesh_support_reduces_all_vertices_and_directions_with_bounded_scratch(self):
         vertices = np.arange(69, dtype=float).reshape(23, 3) / 17 - 2
@@ -325,11 +530,15 @@ class ProjectionTests(unittest.TestCase):
         self.colored_component()
         self.assertTrue(self.build()['passed'])
         proxy = next((self.root/'mjcf/collision').glob('*.obj'))
-        proxy.write_bytes(proxy.read_bytes()+b'mtllib ../../outside.mtl\n')
-        report = evaluate_projection(self.root, self.binding())
-        self.assertFalse(report['passed'])
-        engine = next(row for row in report['checks'] if row['id'] == 'engine.load')
-        self.assertIn('unsupported OBJ directive', engine['details']['error'])
+        original = proxy.read_bytes()
+        for extra, message in ((b'mtllib ../../outside.mtl\n', 'unsupported OBJ directive'),
+                               (b'v 1 2 3\n', 'unreferenced OBJ vertex')):
+            with self.subTest(extra=extra):
+                proxy.write_bytes(original + extra)
+                report = evaluate_projection(self.root, self.binding())
+                self.assertFalse(report['passed'])
+                engine = next(row for row in report['checks'] if row['id'] == 'engine.load')
+                self.assertIn(message, engine['details']['error'])
 
     def test_changed_component_group_cannot_reuse_a_proxy(self):
         metadata = self.colored_component()
