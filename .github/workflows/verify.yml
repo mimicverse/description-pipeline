@@ -47,8 +47,23 @@ jobs:
         run: |
           python -m pip install --disable-pip-version-check -r requirements/linux-py312.lock -r requirements/build-py312.lock
           python -m pip install --no-deps --no-build-isolation -e .
+      - name: Fetch the exact model wheels
+        uses: ./.github/actions/fetch-teleop-assets
+        with:
+          destination: ${{ runner.temp }}/model-assets
+      - name: Install the isolated native consumers
+        run: |
+          set -eu
+          python scripts/install_teleop_worker.py --role pico --wheel "$TELEOP_WHEEL" \
+            --destination "$RUNNER_TEMP/teleop-pico"
+          python scripts/install_teleop_worker.py --role assessment --wheel "$TELEOP_WHEEL" \
+            --actuator-wheel "$ACTUATOR_WHEEL" --destination "$RUNNER_TEMP/teleop-assessment"
+          python scripts/install_teleop_worker.py --role pico-link --destination "$RUNNER_TEMP/pico-link"
+          echo "TELEOP_PICO_PYTHON=$RUNNER_TEMP/teleop-pico/bin/python" >> "$GITHUB_ENV"
+          echo "TELEOP_ASSESSMENT_PYTHON=$RUNNER_TEMP/teleop-assessment/bin/python" >> "$GITHUB_ENV"
+          echo "PICO_LINK_PYTHON=$RUNNER_TEMP/pico-link/bin/python" >> "$GITHUB_ENV"
       - name: Static checks
-        run: python -m ruff check src tests tools deploy
+        run: python -m ruff check src tests tools deploy scripts
       - name: Install the pinned Node.js
         uses: actions/setup-node@v4
         with:
@@ -212,6 +227,10 @@ jobs:
         run: |
           python -m pip install --disable-pip-version-check -r requirements/linux-py312.lock -r requirements/build-py312.lock
           python -m pip install --no-deps --no-build-isolation -e .
+      - name: Fetch the exact model wheels
+        uses: ./.github/actions/fetch-teleop-assets
+        with:
+          destination: ${{ runner.temp }}/model-assets
       - name: Ambient negative control binds the release identity to the source closure
         run: |
           set -eu
@@ -223,7 +242,8 @@ jobs:
           init = Path("/tmp/ambient-src/description_pipeline/__init__.py")
           init.write_text(re.sub(r'__version__ = "[^"]+"', '__version__ = "0.0.0"', init.read_text()))
           PY
-          PYTHONPATH=/tmp/ambient-src python tools/build_release.py --output "$RUNNER_TEMP/release-a" > "$RUNNER_TEMP/release-a.log"
+          PYTHONPATH=/tmp/ambient-src python tools/build_release.py --output "$RUNNER_TEMP/release-a" \
+            --teleop-wheel "$TELEOP_WHEEL" --actuator-wheel "$ACTUATOR_WHEEL" > "$RUNNER_TEMP/release-a.log"
           python - <<'PY'
           import json
           import os
@@ -238,7 +258,8 @@ jobs:
       - name: A second checkout path builds byte-identical artifacts
         run: |
           set -eu
-          (cd "$RUNNER_TEMP/build-b" && python tools/build_release.py --output "$RUNNER_TEMP/release-b" > "$RUNNER_TEMP/release-b.log")
+          (cd "$RUNNER_TEMP/build-b" && python tools/build_release.py --output "$RUNNER_TEMP/release-b" \
+            --teleop-wheel "$TELEOP_WHEEL" --actuator-wheel "$ACTUATOR_WHEEL" > "$RUNNER_TEMP/release-b.log")
           diff -r "$RUNNER_TEMP/release-a" "$RUNNER_TEMP/release-b"
       - name: The role archives resolve offline for their targets
         run: |
@@ -313,7 +334,7 @@ jobs:
 
   real-chain:
     # The isolated true-chain gate: real PostgreSQL (service container), real portal admission
-    # through the operator HTTP surface, the six scheduled tasks, and SQL settlement assertions.
+    # through the operator HTTP surface, the seven scheduled tasks, and SQL settlement assertions.
     # The mocked native endpoint is transport-only; the control fixture must be rejected by
     # verification and must never reach publication.
     runs-on: ubuntu-24.04
