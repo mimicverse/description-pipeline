@@ -133,6 +133,7 @@ class SimulationStore:
             "stopping": {"starting", "ready", "stopping"},
             "stopped": {"stopping"},
             "failed": {"starting", "ready", "stopping", "unresolved"},
+            "unresolved": {"starting", "ready", "stopping", "unresolved"},
         }
         if state not in allowed:
             raise ValueError("Invalid simulation transition")
