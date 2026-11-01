@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -14,12 +15,19 @@ from pathlib import Path
 
 from description_pipeline.dynamics_assessment.contracts import RESULT_SCHEMA, AssessmentConflict, AssessmentRequest
 from description_pipeline.dynamics_assessment.executor import AssessmentExecutor
-from description_pipeline.dynamics_assessment.runtime import ProcessLimits, TeleopProcess, terminate_owned
+from description_pipeline.dynamics_assessment.runtime import (
+    ProcessLimits,
+    TeleopProcess,
+    process_identity,
+    process_state,
+    resource_state,
+    terminate_owned,
+)
 from description_pipeline.dynamics_assessment.service import AssessmentService
 from description_pipeline.dynamics_assessment.store import AssessmentStore
 from description_pipeline.io import canonical, digest
 from tests.v1.test_dynamics_assessment_contracts import AssessmentCase, request_case
-from tests.v1.test_dynamics_assessment_runtime import owned_group
+from tests.v1.test_dynamics_assessment_runtime import fork_after_proc_listing, owned_group, reap_group
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -133,10 +141,97 @@ class PostgresCase(AssessmentCase):
 
 
 class PostgresDatabaseTests(PostgresCase):
+    def _dead_controller(self):
+        nonce = digest({"controller": self.id()})
+        process = subprocess.Popen(
+            [sys.executable, "-I", "-c", "import sys; sys.stdin.readline()", nonce],
+            stdin=subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            identity = process_identity(process.pid, nonce)
+            process.stdin.close()
+            process.wait(timeout=5)
+            self.assertEqual(process_state(identity), "dead")
+            return identity
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+
+    def _resource_executor(self):
+        store, request, root = self.database
+        work = root / "resource-work"
+        work.mkdir()
+        service = AssessmentService(
+            store,
+            enabled=True,
+            runtime=request.runtime,
+            executor_sha256=request.record["executor_sha256"],
+            work_root=work,
+        )
+        return AssessmentExecutor(
+            service, TeleopProcess(Path(sys.executable), request.runtime, ProcessLimits(10, 1024**3, 10, 1024**2))
+        )
+
+    def test_real_orphan_scan_fork_race_cannot_commit_or_release_process(self):
+        store, request, root = self.database
+        request_id = register(store, request, root)
+        attempt = store.new_attempt(request_id)
+        store.begin_dispatch(attempt["attempt_id"])
+        owner = digest({"owner": "original-orphan"})
+        controller = self._dead_controller()
+        executor = self._resource_executor()
+        with owned_group(root, late=True) as (_leader, identity, trigger, record):
+            store.claim(attempt["attempt_id"], owner, controller=controller)
+            store.heartbeat(attempt["attempt_id"], owner, phase="running", process=identity)
+            store.unknown(attempt["attempt_id"], {"phase": "controller_dead"}, owner=owner)
+            before = store.attempt(attempt["attempt_id"])
+            with fork_after_proc_listing(trigger):
+                response = executor.reconcile(attempt["attempt_id"])
+            self.assertEqual(response["state"], "unknown")
+            after = store.attempt(attempt["attempt_id"])
+            for key in ("owner_token", "owner_process", "process", "lease_until", "detail"):
+                self.assertEqual(after[key], before[key])
+            self.assertFalse(after["resources_settled"])
+            self.assertIsNone(store.result_artifact(attempt["attempt_id"]))
+            self.assertNotEqual(resource_state(identity), "dead")
+            self.assertIn(process_state(record["identity"]), {"alive", "dead"})
+
+    def test_reconciliation_claim_keeps_identity_visible_to_scan_fork_seal_and_commit_gates(self):
+        store, request, root = self.database
+        request_id = register(store, request, root)
+        attempt = store.new_attempt(request_id)
+        store.begin_dispatch(attempt["attempt_id"])
+        owner, next_owner = digest({"owner": "original"}), digest({"owner": "sealer"})
+        controller = self._dead_controller()
+        executor = self._resource_executor()
+        with owned_group(root, late=True) as (_leader, identity, trigger, record):
+            store.claim(attempt["attempt_id"], owner, controller=controller)
+            store.heartbeat(attempt["attempt_id"], owner, phase="running", process=identity)
+            store.claim_reconciliation(
+                attempt["attempt_id"], owner, next_owner, controller=process_identity(os.getpid(), next_owner)
+            )
+            self.assertEqual(store.attempt(attempt["attempt_id"])["process"], identity)
+            with (
+                fork_after_proc_listing(trigger),
+                self.assertRaisesRegex(AssessmentConflict, "process group is unresolved"),
+            ):
+                executor._seal(attempt, request, next_owner, root, "failed", {}, {}, None)
+            artifact = result(store, request, root, attempt, "failed")
+            with self.assertRaises(AssessmentConflict):
+                store.finish(attempt["attempt_id"], next_owner, state="failed", artifact=artifact, detail={})
+            store.unknown(attempt["attempt_id"], {"phase": "reconciliation_group_unresolved"}, owner=next_owner)
+            after = store.attempt(attempt["attempt_id"])
+            self.assertEqual(after["state"], "unknown")
+            self.assertEqual(after["process"], identity)
+            self.assertFalse(after["resources_settled"])
+            self.assertEqual(process_state(record["identity"]), "alive")
+
     def test_commit_cannot_clear_live_group_identity_as_resource_proof(self):
         store, request, root = self.database
         attempt, owner = owned_attempt(store, request, root)
-        with owned_group(root) as (_leader, identity, _child):
+        with owned_group(root) as (leader, identity, child):
             store.heartbeat(attempt["attempt_id"], owner, phase="running", process=identity)
             artifact = result(store, request, root, attempt, "failed")
             with self.assertRaises(AssessmentConflict):
@@ -144,7 +239,7 @@ class PostgresDatabaseTests(PostgresCase):
             current = store.attempt(attempt["attempt_id"])
             self.assertEqual(current["process"], identity)
             self.assertFalse(current["resources_settled"])
-            self.assertTrue(terminate_owned(identity, grace_seconds=0.1))
+            self.assertTrue(terminate_owned(identity, grace_seconds=0.1, reap=lambda: reap_group(leader, child)))
             store.heartbeat(attempt["attempt_id"], owner, phase="sealing", process=None)
             settled = store.finish(attempt["attempt_id"], owner, state="failed", artifact=artifact, detail={})
             self.assertTrue(settled["resources_settled"])

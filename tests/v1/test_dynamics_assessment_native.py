@@ -6,6 +6,7 @@ These tests do not claim formal Airflow, SSO, Publish or robot qualification.
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import multiprocessing
@@ -13,8 +14,10 @@ import os
 import shutil
 import signal
 import subprocess
+import threading
 import time
 import unittest
+from contextlib import suppress
 from pathlib import Path
 from unittest import mock
 
@@ -184,7 +187,16 @@ def start_controller(native_case):
     controller = multiprocessing.get_context("fork").Process(
         target=executor.execute, args=(attempt_id, dispatch_conf(public["request_id"], attempt_id, request))
     )
-    controller.start()
+    libc = ctypes.CDLL(None, use_errno=True)
+    previous = ctypes.c_int()
+    assert libc.prctl(37, ctypes.byref(previous), 0, 0, 0) == 0
+    assert libc.prctl(36, 1, 0, 0, 0) == 0
+    controller._assessment_previous_subreaper = previous.value
+    try:
+        controller.start()
+    except BaseException:
+        libc.prctl(36, previous.value, 0, 0, 0)
+        raise
     return (public, attempt_id, controller)
 
 
@@ -200,12 +212,39 @@ def wait_for_attempt(service, attempt_id, controller, predicate):
 
 
 def cleanup_controller(service, attempt_id, controller):
-    if controller.is_alive():
-        controller.kill()
-    controller.join(timeout=5)
-    identity = service.store.attempt(attempt_id)["process"]
-    if identity is not None:
-        assert terminate_owned(identity), identity
+    try:
+        if controller.is_alive():
+            controller.kill()
+        controller.join(timeout=5)
+        identity = service.store.attempt(attempt_id)["process"]
+        if identity is not None:
+
+            def reap():
+                with suppress(ChildProcessError):
+                    os.waitpid(identity["pid"], os.WNOHANG)
+
+            assert terminate_owned(identity, reap=reap), identity
+    finally:
+        reaper = getattr(controller, "_assessment_reaper", None)
+        if reaper is not None:
+            reaper[0].set()
+            reaper[1].join(timeout=5)
+        ctypes.CDLL(None).prctl(36, controller._assessment_previous_subreaper, 0, 0, 0)
+
+
+def reap_orphan(controller, identity):
+    """Perform real parent reaping so the test can require kernel group absence."""
+    stopped = threading.Event()
+
+    def reap():
+        while not stopped.wait(0.01):
+            with suppress(ChildProcessError):
+                if os.waitpid(identity["pid"], os.WNOHANG)[0] == identity["pid"]:
+                    return
+
+    thread = threading.Thread(target=reap)
+    controller._assessment_reaper = (stopped, thread)
+    thread.start()
 
 
 class NativeDatabaseTests(PostgresCase):
@@ -361,6 +400,7 @@ class NativeDatabaseTests(PostgresCase):
             controller.kill()
             controller.join(timeout=5)
             assert controller.exitcode == -signal.SIGKILL
+            reap_orphan(controller, child)
             original = records.read_bytes()
             with service.store.transaction() as cursor:
                 cursor.execute(

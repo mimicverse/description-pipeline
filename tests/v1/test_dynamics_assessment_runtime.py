@@ -8,6 +8,7 @@ import secrets
 import signal
 import subprocess
 import sys
+import threading
 import time
 from contextlib import contextmanager, suppress
 from pathlib import Path
@@ -38,6 +39,8 @@ GROUP = """
 import os, signal, subprocess, sys, time
 from pathlib import Path
 marker = Path(sys.argv[2])
+if sys.argv[3] == 'late':
+    sys.stdin.readline()
 if sys.argv[3] == 'unbound':
     subprocess.Popen([sys.executable, '-I', '-c', CHILD, str(marker)])
 else:
@@ -49,12 +52,14 @@ else:
             time.sleep(0.05)
 while not marker.exists():
     time.sleep(0.01)
+if sys.argv[3] == 'late':
+    sys.exit(0)
 sys.stdin.readline()
 """
 
 
 @contextmanager
-def owned_group(root, *, unbound=False):
+def owned_group(root, *, unbound=False, late=False):
     """Own and reap every helper process, including orphaned grandchildren."""
     libc = ctypes.CDLL(None, use_errno=True)
     previous = ctypes.c_int()
@@ -70,20 +75,42 @@ def owned_group(root, *, unbound=False):
             "CHILD=" + repr(CHILD) + "\n" + GROUP,
             nonce,
             str(marker),
-            "unbound" if unbound else "bound",
+            "late" if late else ("unbound" if unbound else "bound"),
         ],
         start_new_session=True,
         stdin=subprocess.PIPE,
     )
     identity = process_identity(leader.pid, nonce)
     child = None
-    try:
+    child_record = {}
+
+    def capture_child():
+        nonlocal child
         deadline = time.monotonic() + 5
-        while not marker.exists() and time.monotonic() < deadline:
+        while time.monotonic() < deadline:
+            try:
+                pid = int(marker.read_text())
+                break
+            except (FileNotFoundError, ValueError):
+                pass
             time.sleep(0.01)
-        assert marker.exists()
-        child = process_identity(int(marker.read_text()), nonce)
-        yield leader, identity, child
+        else:
+            raise AssertionError("The owned helper did not report its child")
+        child = process_identity(pid, nonce)
+        child_record["identity"] = child
+
+    def trigger_fork():
+        leader.stdin.write(b"fork\n")
+        leader.stdin.flush()
+        capture_child()
+        leader.wait(timeout=5)
+
+    try:
+        if late:
+            yield leader, identity, trigger_fork, child_record
+        else:
+            capture_child()
+            yield leader, identity, child
     finally:
         for member in (identity, child):
             if member is None or process_state(member) != "alive":
@@ -101,6 +128,31 @@ def owned_group(root, *, unbound=False):
             with suppress(ChildProcessError):
                 os.waitpid(child["pid"], 0)
         assert libc.prctl(36, previous.value, 0, 0, 0) == 0
+
+
+def reap_group(leader, child):
+    leader.poll()
+    with suppress(ChildProcessError):
+        os.waitpid(child["pid"], os.WNOHANG)
+
+
+@contextmanager
+def fork_after_proc_listing(trigger):
+    """Schedule real fork/exit after the real kernel listing has been captured."""
+    original = Path.iterdir
+    armed = True
+
+    def scheduled(directory):
+        nonlocal armed
+        entries = list(original(directory))
+        if directory == Path("/proc") and armed:
+            armed = False
+            trigger()
+        return iter(entries)
+
+    with mock.patch.object(Path, "iterdir", scheduled):
+        yield
+    assert not armed
 
 
 GATED_GROUP = """
@@ -124,6 +176,23 @@ while True:
 
 
 class RuntimeTests(AssessmentCase):
+    def test_empty_proc_snapshot_is_unknown_when_kernel_group_still_exists(self):
+        with owned_group(self.root, late=True) as (_leader, identity, trigger, record):
+            with fork_after_proc_listing(trigger):
+                self.assertEqual(resource_state(identity), "unknown")
+            self.assertEqual(process_state(record["identity"]), "alive")
+            self.assertEqual(resource_state(identity), "alive")
+
+    def test_scan_fork_exit_race_cannot_return_success_before_kernel_group_absence(self):
+        with owned_group(self.root, late=True) as (leader, identity, trigger, record):
+            with fork_after_proc_listing(trigger):
+                self.assertFalse(terminate_owned(identity, grace_seconds=0.1, reap=leader.poll))
+            self.assertNotEqual(resource_state(identity), "dead")
+            os.killpg(identity["pgid"], 0)
+            reap_group(leader, record["identity"])
+            self.assertEqual(resource_state(identity), "dead")
+            self.assertTrue(terminate_owned(identity, grace_seconds=0.1))
+
     def _check_group_counterexample(self, already_exited):
         with owned_group(self.root) as (leader, identity, child):
             if already_exited:
@@ -132,7 +201,7 @@ class RuntimeTests(AssessmentCase):
                 leader.wait(timeout=5)
                 self.assertEqual(process_state(identity), "dead")
                 self.assertEqual(process_state(child), "alive")
-            self.assertTrue(terminate_owned(identity, grace_seconds=0.1))
+            self.assertTrue(terminate_owned(identity, grace_seconds=0.1, reap=lambda: reap_group(leader, child)))
             self.assertEqual(resource_state(identity), "dead")
             self.assertEqual(process_state(child), "dead")
 
@@ -156,6 +225,16 @@ class RuntimeTests(AssessmentCase):
         self.assertEqual(libc.prctl(36, 1, 0, 0, 0), 0)
         marker = self.root / "grandchild.pid"
         identities = []
+        stopped = threading.Event()
+
+        def reap_adopted_child():
+            while not stopped.wait(0.01):
+                if marker.exists():
+                    with suppress(ChildProcessError):
+                        os.waitpid(int(marker.read_text()), os.WNOHANG)
+
+        reaper = threading.Thread(target=reap_adopted_child)
+        reaper.start()
 
         def checkpoint(identity):
             identities.append(identity)
@@ -180,17 +259,21 @@ class RuntimeTests(AssessmentCase):
             self.assertEqual(resource_state(result["identity"]), "dead")
             self.assertIsNone(identities[-1])
         finally:
+            stopped.set()
+            reaper.join(timeout=5)
             if identities and identities[0] is not None:
                 terminate_owned(identities[0], grace_seconds=0.1)
             if marker.exists():
                 pid = int(marker.read_text())
-                fd = os.pidfd_open(pid)
-                try:
-                    with suppress(ProcessLookupError):
-                        signal.pidfd_send_signal(fd, signal.SIGKILL)
-                finally:
-                    os.close(fd)
-                os.waitpid(pid, 0)
+                with suppress(ProcessLookupError):
+                    fd = os.pidfd_open(pid)
+                    try:
+                        with suppress(ProcessLookupError):
+                            signal.pidfd_send_signal(fd, signal.SIGKILL)
+                    finally:
+                        os.close(fd)
+                with suppress(ChildProcessError):
+                    os.waitpid(pid, 0)
             libc.prctl(36, previous.value, 0, 0, 0)
 
     def test_normal_native_entry_exit_settles_group_before_checkpoint_release(self):
@@ -215,8 +298,9 @@ class RuntimeTests(AssessmentCase):
             assert not terminate_owned({**identity, "nonce": "another-child"}, grace_seconds=0.1)
             assert not terminate_owned({**identity, "start_ticks": "0"}, grace_seconds=0.1)
             assert process.poll() is None
-            assert terminate_owned(identity, grace_seconds=0.1)
+            assert terminate_owned(identity, grace_seconds=0.1, reap=process.poll)
             assert process_state(identity) == "dead"
+            self.assertEqual(process.returncode, -signal.SIGTERM)
         finally:
             if process.poll() is None:
                 process.kill()

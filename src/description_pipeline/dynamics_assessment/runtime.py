@@ -167,7 +167,15 @@ def _group_snapshot(identity: dict) -> tuple[str, list[dict]]:
                 continue
         if leader_reused and members:
             return "unknown", []
-        return ("alive" if members else "dead"), members
+        if members:
+            return "alive", members
+        # /proc enumeration is not atomic: a leader may fork after the listing.
+        # Only kernel-confirmed group absence closes the empty-snapshot case.
+        try:
+            os.killpg(pid, 0)
+        except ProcessLookupError:
+            return "dead", []
+        return "unknown", []
     except (OSError, KeyError, TypeError, ValueError, IndexError):
         return "unknown", []
 
@@ -200,25 +208,36 @@ def _signal_members(members: list[dict], number: int) -> bool:
     return True
 
 
-def terminate_owned(identity: dict, *, grace_seconds: float = 2) -> bool:
-    """Signal exact pidfd-bound members and prove complete group settlement."""
+def terminate_owned(identity: dict, *, grace_seconds: float = 2, reap=None) -> bool:
+    """Signal pidfd-bound members; success requires kernel group absence.
+
+    A caller owning a Popen object supplies its nonblocking poll method so that
+    its exit status remains with that object. Other children require their real
+    parent or OS reaper; an existing zombie-only group remains unresolved.
+    """
+
+    def observe():
+        if reap is not None:
+            try:
+                reap()
+            except Exception:
+                return "unknown", []
+        return _group_snapshot(identity)
+
     for number in (signal.SIGTERM, signal.SIGKILL):
-        state, members = _group_snapshot(identity)
-        if state == "dead":
-            return True
-        if state != "alive":
-            return False
-        if not _signal_members(members, number):
-            return False
         deadline = time.monotonic() + grace_seconds
-        while time.monotonic() < deadline:
-            state = resource_state(identity)
+        while True:
+            state, members = observe()
             if state == "dead":
                 return True
-            if state != "alive":
+            if state == "foreign":
                 return False
+            if state == "alive" and not _signal_members(members, number):
+                return False
+            if time.monotonic() >= deadline:
+                break
             time.sleep(0.02)
-    return resource_state(identity) == "dead"
+    return observe()[0] == "dead"
 
 
 @dataclass(frozen=True)
@@ -328,12 +347,12 @@ class TeleopProcess:
                         if generated_bytes > self.limits.output_bytes:
                             reason = "output_limit"
                         last_size_check = time.monotonic()
-                    if reason and not terminate_owned(identity):
+                    if reason and not terminate_owned(identity, reap=process.poll):
                         raise AssessmentConflict("Assessment subprocess termination could not be settled")
                     time.sleep(0.05)
                 if resource_state(identity) != "dead":
                     reason = reason or "residual_processes"
-                    if not terminate_owned(identity):
+                    if not terminate_owned(identity, reap=process.poll):
                         raise AssessmentConflict("Assessment process group exit could not be settled")
                 checkpoint(None)
             except BaseException:
@@ -341,7 +360,7 @@ class TeleopProcess:
                     # Closing an unreleased gate lets that child exit without a signal.
                     process.stdin.close()
                 if identity is not None:
-                    terminate_owned(identity)
+                    terminate_owned(identity, reap=process.poll)
                 if process is not None:
                     with suppress(subprocess.TimeoutExpired):
                         process.wait(timeout=3)

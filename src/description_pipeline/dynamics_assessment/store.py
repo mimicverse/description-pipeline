@@ -356,7 +356,7 @@ class AssessmentStore:
         with self.transaction() as cursor:
             cursor.execute(
                 "UPDATE assessment_attempt SET state='sealing',owner_token=%s,owner_process=%s::jsonb,"
-                "process=NULL,lease_until=now()+interval '30 seconds',updated_at=now() "
+                "lease_until=now()+interval '30 seconds',updated_at=now() "
                 "WHERE attempt_id=%s AND owner_token=%s AND NOT resources_settled "
                 "AND state IN ('running','verifying','sealing','unknown') RETURNING attempt_id",
                 (owner, json.dumps(controller, allow_nan=False), attempt_id, previous_owner),
