@@ -12,6 +12,13 @@ import unittest
 
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures/assessment-software"
+EVIDENCE_ROOT = None
+
+
+def preserve_workspace(test_id, workspace):
+    """Keep actual test artifacts before unittest removes its temporary inputs."""
+    if EVIDENCE_ROOT is not None and workspace.is_dir():
+        shutil.copytree(workspace, EVIDENCE_ROOT / test_id / "work", symlinks=True)
 
 
 def selected_runtime():

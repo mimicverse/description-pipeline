@@ -17,6 +17,7 @@ TEST_NAMES = (
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--evidence-dir", type=Path, help="Optional new directory for actual test artifacts")
     parser.add_argument("tests", nargs="*", help="Optional unittest names; the default runs the native P1 cases")
     args = parser.parse_args(argv)
     location = os.environ.get("TELEOP_ASSESSMENT_PYTHON")
@@ -25,6 +26,11 @@ def main(argv=None) -> int:
     python = Path(location)
     if not python.is_absolute() or not python.is_file():
         parser.error("The fixed assessment interpreter must be an existing absolute file")
+    if args.evidence_dir is not None:
+        from tests.v1 import assessment_fixture
+
+        assessment_fixture.EVIDENCE_ROOT = args.evidence_dir.resolve()
+        assessment_fixture.EVIDENCE_ROOT.mkdir()
     try:
         suite = unittest.defaultTestLoader.loadTestsFromNames(args.tests or TEST_NAMES)
     except unittest.SkipTest as error:

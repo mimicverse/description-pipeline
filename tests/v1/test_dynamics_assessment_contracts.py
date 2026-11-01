@@ -98,6 +98,9 @@ class AssessmentCase(unittest.TestCase):
         self._temporary = tempfile.TemporaryDirectory(prefix="assessment-test-")
         self.addCleanup(self._temporary.cleanup)
         self.root = Path(self._temporary.name)
+        from tests.v1.assessment_fixture import preserve_workspace
+
+        self.addCleanup(preserve_workspace, self.id(), self.root)
 
 
 class ContractsTests(AssessmentCase):
