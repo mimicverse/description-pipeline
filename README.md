@@ -1,4 +1,4 @@
-# SolidWorks to URDF and MJCF
+# Robot Model Studio
 
 将已保存的 SolidWorks 原生工程交付为可追溯、经独立验证的 URDF、MJCF 模型与评审 PR。
 

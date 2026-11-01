@@ -452,8 +452,8 @@ class RunHistoryUiContractTests(unittest.TestCase):
 
     def test_page_title_is_exact(self) -> None:
         page = self.page()
-        self.assertIn("<title>Robot delivery</title>", page)
-        self.assertIn("<h1>Robot delivery</h1>", page)
+        self.assertIn("<title>Robot Model Studio</title>", page)
+        self.assertIn("<h1>Robot Model Studio</h1>", page)
 
     def test_rows_render_name_time_state_actor_and_secondary_rerun_chip(self) -> None:
         app = self.app()
