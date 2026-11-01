@@ -6,36 +6,40 @@ import asyncio
 from datetime import datetime, UTC
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import socket
 import subprocess
+import sys
 import tempfile
 import unittest
 import uuid
 import xml.etree.ElementTree as ET
 
-import httpx
-import mujoco
-import pgserver
-import psycopg2
-import uvicorn
-from websockets.asyncio.client import connect
-
-from description_pipeline.artifacts import ArtifactStore
-from description_pipeline.io import digest
-from description_pipeline.orchestration.pico_portal import create_app
-from description_pipeline.orchestration.airflow_client import native_run_id
-from description_pipeline.orchestration.feishu_oauth import build_actor_name
-from description_pipeline.orchestration.portal import PortalApp, PortalConfig
-from description_pipeline.pipeline.contracts import RunAdmission
-from description_pipeline.simulation.service import SimulationService
-from description_pipeline.simulation.store import SimulationConflict, SimulationStore
-from description_pipeline.simulation.verify_recording import verify
-
 ROOT = Path(__file__).resolve().parents[2]
 WORKER = os.environ.get("TELEOP_WORKER_PYTHON")
 LINK = os.environ.get("PICO_LINK_PYTHON", WORKER)
+SESSION_TESTS = bool(WORKER) and sys.platform == "linux"
+
+if SESSION_TESTS:
+    import httpx
+    import mujoco
+    import pgserver
+    import psycopg2
+    import uvicorn
+    from websockets.asyncio.client import connect
+
+    from description_pipeline.artifacts import ArtifactStore
+    from description_pipeline.io import digest
+    from description_pipeline.orchestration.pico_portal import create_app
+    from description_pipeline.orchestration.airflow_client import native_run_id
+    from description_pipeline.orchestration.feishu_oauth import build_actor_name
+    from description_pipeline.orchestration.portal import PortalApp, PortalConfig
+    from description_pipeline.pipeline.contracts import RunAdmission
+    from description_pipeline.simulation.service import SimulationService
+    from description_pipeline.simulation.store import SimulationConflict, SimulationStore
+    from description_pipeline.simulation.verify_recording import verify
 
 
 def model_source(root):
@@ -96,7 +100,7 @@ def model_source(root):
     return profile, files
 
 
-@unittest.skipUnless(WORKER, "Set TELEOP_WORKER_PYTHON to a noneditable fixed wheel environment")
+@unittest.skipUnless(SESSION_TESTS, "Linux and TELEOP_WORKER_PYTHON with a fixed wheel are required")
 class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls):
@@ -316,7 +320,9 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
                 response = await client.get(f"/api/simulations/{sid}")
                 self.assertEqual(200, response.status_code, response.text)
                 stream = f"ws://127.0.0.1:{port}/api/simulations/{sid}/stream"
-                async with connect(stream, origin=origin, additional_headers={"Cookie": cookie}) as viewer:
+                async with connect(
+                    stream, origin=origin, additional_headers={"Cookie": cookie}, max_queue=512
+                ) as viewer:
                     await viewer.send(json.dumps({"type": "authenticate", "csrf_token": session.csrf_token}))
                     model = json.loads(await asyncio.wait_for(viewer.recv(), 2))
                     self.assertEqual("model", model["type"])
@@ -345,16 +351,71 @@ class PicoSessionTests(unittest.IsolatedAsyncioTestCase):
                             "schema_version": 2,
                             "source_session_id": "test-input",
                         }
+
+                        anchor = paired["anchor"]
+                        # Follow the real raw protocol through calibration, independent arm clutch and head IK.
+                        for sequence in range(1, 81):
+                            progress = max(0, sequence - 40) / 40
+                            pose = [0.02 * progress, 0, 0, 0, 0, 0, 1]
+                            current_frame = {
+                                **frame,
+                                "sequence": sequence,
+                                "device_timestamp_ns": (sequence + 1) * 20_000_000,
+                                "gateway_monotonic_ns": (sequence + 1) * 20_000_000,
+                                "left_grip": 1.0 if sequence > 40 else 0.0,
+                                "right_grip": 1.0 if sequence > 40 else 0.0,
+                                "left_controller_pose_xyzw": pose,
+                                "right_controller_pose_xyzw": [-pose[0], *pose[1:]],
+                                "headset_pose_xyzw": [
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    math.sin(0.05 * progress),
+                                    0,
+                                    math.cos(0.05 * progress),
+                                ],
+                            }
+                            if sequence % 10 == 0:
+                                await viewer.send(json.dumps({"type": "heartbeat"}))
+                            await source.send(
+                                json.dumps({"binding": paired["binding"], "anchor": anchor, "frame": current_frame})
+                            )
+                            reply = json.loads(await source.recv())
+                            self.assertEqual("input_ack", reply["type"])
+                            anchor = reply["anchor"]
+                            await asyncio.sleep(0.02)
+                        await asyncio.sleep(0.05)
+                        current = self.service.running[sid].state
+                        self.assertTrue(current["calibrated"], current["calibration_state"])
+                        for prefix in ("left_", "right_", "head_"):
+                            columns = [joint["q"] for joint in model["joints"] if joint["name"].startswith(prefix)]
+                            self.assertGreater(
+                                max(abs(current["qpos"][column]) for column in columns), 1e-5, current["report"]
+                            )
+                        released = {
+                            **current_frame,
+                            "sequence": 81,
+                            "device_timestamp_ns": 1_640_000_000,
+                            "gateway_monotonic_ns": 1_640_000_000,
+                            "left_grip": 0.0,
+                            "right_grip": 0.0,
+                        }
                         await source.send(
-                            json.dumps({"binding": paired["binding"], "anchor": paired["anchor"], "frame": frame})
+                            json.dumps({"binding": paired["binding"], "anchor": anchor, "frame": released})
                         )
-                        self.assertEqual("input_ack", json.loads(await source.recv())["type"])
+                        await source.recv()
+                        await asyncio.sleep(0.05)
+                        for arm in self.service.running[sid].state["report"]["arms"].values():
+                            self.assertFalse(arm["clutched"])
+
                     self.assertIsNone(self.service.running[sid].source_session)
                 headers = {"X-CSRF-Token": session.csrf_token}
                 response = await client.post(
                     f"/api/simulations/{sid}/commands", headers=headers, json={"type": "stop", "command_id": "stop"}
                 )
                 self.assertEqual(200, response.status_code, response.text)
+                await asyncio.to_thread(verify, self.service.root / sid / "recording", self.root / "model")
                 response = await client.get(f"/api/simulations/{sid}/recording")
                 self.assertEqual(200, response.status_code, response.text[:100] if response.status_code != 200 else "")
                 self.assertTrue(response.content.startswith(b"PK"))

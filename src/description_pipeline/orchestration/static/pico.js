@@ -27,7 +27,7 @@ function draw(state) {
     object.material.transparent = object.material.opacity < 1;
   });
   const { report, session_state, calibrated, calibration_state, collision_available, time, qpos } = state;
-  $("live-status").textContent = `${session_state} · ${calibrated ? "Calibrated" : calibration_state}\n${report?.input_status || "No input"} · Emergency stop ${report?.estop_latched ? "LATCHED" : "clear"}\nCollision ${collision_available ? "geometry available" : "UNKNOWN — inspection only"}`;
+  $("live-status").textContent = `${report?.pose_mode || "unknown"} IK · ${session_state} · ${calibrated ? "Calibrated" : calibration_state}\n${report?.input_status || "No input"} · Emergency stop ${report?.estop_latched ? "LATCHED" : "clear"}\nCollision ${collision_available ? "geometry available" : "UNKNOWN — inspection only"}`;
   $("arms").replaceChildren();
   const errorMetric = (value, scale, digits, unit) => Number.isFinite(value) ? `${(value * scale).toFixed(digits)} ${unit}` : "unknown";
   const xyz = (pose) => pose?.position_m?.map((v) => v.toFixed(4)).join(", ") || "Unavailable";

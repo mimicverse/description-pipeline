@@ -10,7 +10,7 @@
     "deploy/operator/render_operator.py": "104322f5c97e9e75d0d9c81d3b4531534c6b5aacc7ac26a87994967c1a0563af",
     "deploy/platform/roles.sql": "a4b34195e30e872b89f57cf88c0e6fb2f3e0db951f218227a7b9446eb00b2aca",
     "deploy/platform/schema.sql": "8dbd826667029c2d7d8ec0ee2d29817987531a2300fa4ce732f22b466c6cd58b",
-    "docs/pico-upper-body.md": "cd94b2f0c2f823668fd61d4ce82bbaa35c056b834b7a1395eee811c554366690",
+    "docs/pico-upper-body.md": "5a7e0ea17b30e7cddf25c3467cf0aee6d853bb8338983e80e2c7f8e9c03f68b2",
     "pyproject.toml": "34609ec067d41fd97b72435e21bfa8919912a6ae3e6ef734272107575bd46b1f",
     "requirements/linux-py312.lock": "071c3e703789a41d4e8d4af6aa2822a4d0e8cd51d26bbb8759bbfa8a9b201f8a",
     "requirements/pico-link-py312.lock": "21919f264b16c07820618577ab8a900ecc3ede0bfb2dfd33aea6527e0134cd3e",
@@ -25,7 +25,7 @@
     "src/description_pipeline/orchestration/static/mjcf_viewer.js": "5eb0f6693e2953b3d06f190a9741d2988d6d1e322fa846d9685982ab05f3a0c6",
     "src/description_pipeline/orchestration/static/pico.css": "4ee414d888e3cee157d2aab45d8588948ee9a279a54cb055e1176b81f1e67e99",
     "src/description_pipeline/orchestration/static/pico.html": "cbb3199a49dcdad42fffda56f2648b6fe28cc025076d238bd2a422ee2bf71ebf",
-    "src/description_pipeline/orchestration/static/pico.js": "486a02968ebf8b9e0103454ca86583f417f26ce5eb668491a473cef3ab80fa0c",
+    "src/description_pipeline/orchestration/static/pico.js": "7020194d36cb99015f8433814773c9a2264072c93f572d59b659783e934ad1a7",
     "src/description_pipeline/runtime.py": "7b573e39f65ab2f2e88445e8fa857794bcd744d96ae3216976c37fa71b398537",
     "src/description_pipeline/simulation/__init__.py": "743ce12c616924eca5a410d3ec0039bd7bbe7583a606c358c26ae7e8c573ea03",
     "src/description_pipeline/simulation/service.py": "8143390a345cfc6231a522a613b1d29d78dd8b1a0a1a7c66bfeceb1ff79a181b",
@@ -33,7 +33,7 @@
     "src/description_pipeline/simulation/teleop-runtime.json": "713547476f6cee014e65904b987ca571aef283f980ccec478224af32cbda95fc",
     "src/description_pipeline/simulation/verify_recording.py": "5145a69d11a0e90755399f121c4f61421d8111f9264a3c37963c2dba200acaa0",
     "tests/v1/pico_link_probe.py": "1fd3d76b59342e4fa0b67e0e2559a6c70ad665a5a4b20f9a68f7d022c1049070",
-    "tests/v1/test_pico_sessions.py": "2bc8eba1612ecd1f002807f6574eca3bbc7268e073b5bbc2e13be154a30fbc3e",
+    "tests/v1/test_pico_sessions.py": "291e0a2c2861d8aa80584c56ec67b39653f10db1fc4d67db199af1705e42c60c",
     "tests/v1/test_platform_config.py": "a7049681452b0429f91317e0344e6b0ebd195334ee3c3aefd77257eac94e2a0b",
     "tests/v1/test_platform_env.py": "2993a030f3550ef444f9bf9db701120f331cc1fb1a637695b04a9205061abda1"
   },
@@ -60,7 +60,14 @@
     },
     "native_database_http_ws_zmq_fk": {
       "passed": 4,
-      "failed": 0
+      "failed": 0,
+      "calibrated_motion": [
+        "Left arm position IK",
+        "Right arm position IK",
+        "Headset rotation to nonzero head joints",
+        "Released independent arm clutch",
+        "Independent verification of the complete moving recording"
+      ]
     },
     "ruff": "passed",
     "javascript_syntax": "passed",
@@ -69,7 +76,8 @@
     "fixed_worker_install": "passed with hash-locked dependencies",
     "browser": "Actual native geometry, saved-profile launch, refresh, head state, latched e-stop, stop and recording entry verified with isolated fixtures",
     "saved_profile_request_digest": "Verified before reuse; inconsistent saved requests are rejected",
-    "browser_recordings": "Two native fixture recordings sealed with complete=true and error=null; owned server stopped"
+    "browser_recordings": "Two native fixture recordings sealed with complete=true and error=null; owned server stopped",
+    "native_test_discovery": "Four opt-in Linux cases skip cleanly without optional native/portal dependencies when no worker is configured"
   },
   "logs": {
     "pipeline-broad.log": {
@@ -89,7 +97,7 @@
       "path": "/home/andy/Work/reviews/urdf-pico-upper-body-design-20261101/pipeline-env-final.log"
     },
     "pipeline-native-final.log": {
-      "sha256": "c87d722188fffa8438f7b7ee8dbd68b4f38b5201bc76f28f8f496861684ce99e",
+      "sha256": "4ca8d3877af891b02cc09693d8f71ad738a9a3df98167870d0ae01c6cbdb2bcd",
       "path": "/home/andy/Work/reviews/urdf-pico-upper-body-design-20261101/pipeline-native-final.log"
     },
     "pipeline-assets-final.log": {
@@ -97,7 +105,7 @@
       "path": "/home/andy/Work/reviews/urdf-pico-upper-body-design-20261101/pipeline-assets-final.log"
     },
     "pipeline-wheel-build.log": {
-      "sha256": "7cf8d744c8217a57fa7ae44aa0e711e1fff092ce32c2f5878fe7d85a5b1c6d94",
+      "sha256": "0c77391941eeb2dd6dfa1a444fc5ba1d237590a243831857ff6ea9293fb938ec",
       "path": "/home/andy/Work/reviews/urdf-pico-upper-body-design-20261101/pipeline-wheel-build.log"
     },
     "worker-install.log": {
@@ -114,7 +122,7 @@
   ],
   "development_wheel": {
     "file": "mimicverse_description-1.5.1-py3-none-any.whl",
-    "sha256": "ac25ee1ecd4f6f9fe29c5ba7f344423dbcaac2637197718898cc554544214b6b",
+    "sha256": "92e2d195aa98b2fa3910565eeec740d2a4259af3136c03e198c5f974a282ba95",
     "formal_release": false
   }
 }
