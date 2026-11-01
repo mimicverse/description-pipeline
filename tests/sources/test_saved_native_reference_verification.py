@@ -7,6 +7,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from .selection_support import seal_fixture_object_observation
+
 from description_pipeline.verification.saved_native_references import rebuild_saved_native_references as rebuild
 from description_pipeline.verification.native_discovery import _Failure as Failure
 
@@ -27,6 +29,8 @@ def component(name, document=None, parent="", fixed=False):
         "configuration": "Default",
         "transform_raw": transform(),
         "suppressed": False,
+        "suppression_state": 2,
+        "lightweight": False,
         "fixed": fixed,
         "fixed_error": None,
         "solver_observation": {
@@ -85,7 +89,9 @@ def fixture():
         "identity": {"main_assembly": "machine.SLDASM"},
         "saved_configuration": "Default",
         "namespace": "dp",
-        "files": {name + ".SLDPRT": "0" * 64 for name in ("base", "boom", "tool")},
+        "files": {"machine.SLDASM": "f" * 64, **{
+            name + ".SLDPRT": "0" * 64 for name in ("base", "boom", "tool")
+        }},
         "exporter": {
             "state": "absent",
             "document": "machine.SLDASM",
@@ -131,7 +137,7 @@ def fixture():
                 "used_api": "IFeature.GetSpecificFeature2/IRefAxis.GetRefAxisParams",
             }
         )
-    return raw
+    return seal_fixture_object_observation(raw, main_assembly="machine.SLDASM")
 
 
 class SavedNativeTests(unittest.TestCase):
@@ -203,6 +209,8 @@ class SavedNativeTests(unittest.TestCase):
         child = component("boom/plate", "plate.SLDPRT", parent="boom")
         child["solver_observation"]["context"] = context("boom.SLDASM", "boom")
         raw["components"].append(child)
+        raw["files"]["plate.SLDPRT"] = "2" * 64
+        raw = seal_fixture_object_observation(raw, main_assembly="machine.SLDASM")
         result = self.run_fixture(raw)
         self.assertIn(["boom/plate"], [body["components"] for body in result["bodies"]])
         raw["components"][1]["solver_observation"]["solving"]["value"] = False
@@ -252,6 +260,7 @@ class SavedNativeTests(unittest.TestCase):
             raw["datums"].append(datum)
             raw["reference_axes"].append(axis)
             raw["mates"] = [mate(f"edge_{index}", left, right, 1) for index, (left, right) in enumerate(edges)]
+            raw = seal_fixture_object_observation(raw, main_assembly="machine.SLDASM")
             with self.subTest(edges=edges), self.assertRaisesRegex(Failure, "cycle|disconnected"):
                 self.run_fixture(raw)
 
@@ -583,6 +592,7 @@ class SavedNativeTests(unittest.TestCase):
                 endpoint["mate_entity_reference"]["params"][0] = 1
                 if endpoint["reference_name"] == "boom":
                     endpoint.update(reference_name="boom_extension", reference_document="boom_extension.SLDPRT")
+        raw = seal_fixture_object_observation(raw, main_assembly="machine.SLDASM")
         with self.assertRaisesRegex(Failure, "complete geometric binding"):
             self.run_fixture(raw)
         raw["components"][1]["document"] = "boom_20401231.SLDPRT"
@@ -591,6 +601,7 @@ class SavedNativeTests(unittest.TestCase):
             for endpoint in native_mate["entities"]:
                 if endpoint["reference_name"] == "boom_extension":
                     endpoint["reference_document"] = "boom_20401231.SLDPRT"
+        raw = seal_fixture_object_observation(raw, main_assembly="machine.SLDASM")
         self.assertEqual(len(self.run_fixture(raw)["bodies"]), 3)
 
     def test_nested_solver_context_binds_each_immediate_parent(self):
@@ -604,6 +615,9 @@ class SavedNativeTests(unittest.TestCase):
         leaf = component("boom/inner/plate", "plate.SLDPRT", "boom/inner")
         leaf["solver_observation"]["context"] = context("inner.SLDASM", "boom/inner")
         raw["components"].extend((inner, leaf))
+        raw["files"].update({"inner.SLDASM": "2" * 64, "plate.SLDPRT": "3" * 64})
+        raw = seal_fixture_object_observation(raw, main_assembly="machine.SLDASM")
+        inner, leaf = raw["components"][-2:]
         self.assertEqual(len(self.run_fixture(raw)["bodies"]), 3)
         solving = inner["solver_observation"]["solving"]
         for field, value in (

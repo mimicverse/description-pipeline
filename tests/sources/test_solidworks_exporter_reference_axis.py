@@ -373,21 +373,22 @@ class ImportedSourceBindingTests(unittest.TestCase):
             backend = N.SolidWorksBackend(session_factory=lambda: _Session(app))
             real = N._component_source_document
 
-            def forged(component_arg, source_root, **kwargs):
+            def remove_read_source(component_arg, source_root, **kwargs):
                 result = real(component_arg, source_root, **kwargs)
-                provenance = result.get("source_provenance") or {}
-                if provenance.get("state") == "cached_materialization":
-                    provenance["author_imported_in_source_root"] = True
-                    provenance["author_imported_relative"] = "missing-under-root.step"
+                source = root / "imported_part.step"
+                if source.exists():
+                    source.unlink()
                 return result
 
             with (
                 _com_stubs(),
-                patch.object(N, "_component_source_document", side_effect=forged),
+                patch.object(N, "_component_source_document", side_effect=remove_read_source),
                 self.assertRaises(CadError) as caught,
             ):
                 backend.discover_native(root, {"main_assembly": "robot.SLDASM"})
-            self.assertEqual(caught.exception.code, "cad_import_source_unavailable")
+            self.assertEqual(caught.exception.code, "native_discovery_source_changed")
+            self.assertIn("imported_part.step", caught.exception.detail["expected"])
+            self.assertNotIn("imported_part.step", caught.exception.detail["observed"])
 
     def test_current_import_api_records_cached_materialization_with_in_stage_source(self):
         with TemporaryDirectory() as tmp, TemporaryDirectory() as native_tmp:

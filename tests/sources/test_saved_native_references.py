@@ -10,6 +10,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from .selection_support import seal_fixture_object_observation
+
 from description_pipeline.sources.solidworks.discovery import DiscoverySettings, _saved_native_carriers
 from description_pipeline.sources.solidworks.saved_native_references import (
     SavedNativeReferenceError,
@@ -303,6 +305,7 @@ class SavedNativeReferencesTests(unittest.TestCase):
             for component in raw["components"]:
                 component.update(suppression_state=2, lightweight=False)
             raw = support.local_native_record_payload(raw, default_mate_scope=True, fill_missing_parents=True)
+            raw = seal_fixture_object_observation(raw, main_assembly="machine.SLDASM")
             package = root / "delivery"
             support.compose_delivery_inputs(
                 package, main_assembly="machine.SLDASM", configuration="Default", record=raw,
