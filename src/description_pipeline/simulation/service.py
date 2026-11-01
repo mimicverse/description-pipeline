@@ -38,6 +38,7 @@ from .resources import (
     check_session_capacity,
     directory_bytes,
     validate_policy,
+    validate_manifest_policy,
     validate_ready,
     validate_state,
 )
@@ -153,7 +154,7 @@ class SimulationService(ManagedRecordingVerification):
             raise SimulationConflict("Previous startup process group is unresolved")
         execution = self._consumer_execution
         contract = execution["runtime_contract"]
-        self.runtime_identity = await self._native_probe(execution, lifecycle="starting")
+        self.runtime_identity = await self._native_probe({"execution": execution}, lifecycle="starting")
         if any(self.runtime_identity.get(key) != contract[key] for key in ("source_commit", "wheel_sha256")):
             raise ValueError("Native runtime returned another fixed consumer identity")
         acquiring = asyncio.create_task(asyncio.to_thread(self.store.acquire_supervisor))
@@ -190,10 +191,10 @@ class SimulationService(ManagedRecordingVerification):
                     recording=recording,
                 )
 
-    async def _native_probe(self, execution, *, lifecycle, command=None, timeout=30):
+    async def _native_probe(self, payload, *, lifecycle, command=None, timeout=30):
         async with self._probe_gate:
             allowed = (lifecycle,) if isinstance(lifecycle, str) else lifecycle
-            content = canonical(execution)
+            content = canonical(payload)
             if len(content) > INPUT_LIMIT:
                 raise ValueError("Native probe input exceeds its byte budget")
             try:
@@ -202,7 +203,7 @@ class SimulationService(ManagedRecordingVerification):
                 if self._probe_identity is not None and not await self._close_probe():
                     raise SimulationConflict("Previous native probe process group is unresolved")
                 nonce = secrets.token_hex(24)
-                argv = command(self.python, nonce, execution)
+                argv = command(self.python, nonce, payload)
                 self._probe_identity = {"nonce": nonce}
                 self._write_probe_identity()
                 spawning = asyncio.create_task(
@@ -386,7 +387,7 @@ class SimulationService(ManagedRecordingVerification):
                     "request_session_bytes": observed["stderr_request_session_bytes"],
                 }
                 resolved = await self._native_probe(
-                    {**self._consumer_execution, "resource_request": resource_request},
+                    {"execution": self._consumer_execution, "resource_request": resource_request},
                     lifecycle="open",
                     command=resource_command,
                 )
@@ -752,9 +753,12 @@ class SimulationService(ManagedRecordingVerification):
                     if row["state"] == "starting":
                         await run_thread(self.store.transition, session_id, self.owner, "ready")
                 elif message.get("type") == "state":
-                    tick = message["state"]["tick"]
-                    if current.ready_evidence is None or (
-                        current.last_state_tick is not None and tick <= current.last_state_tick
+                    tick = message["tick"]
+                    if (
+                        type(tick) is not int
+                        or tick < 0
+                        or current.ready_evidence is None
+                        or (current.last_state_tick is not None and tick <= current.last_state_tick)
                     ):
                         raise SessionResourceError("Native state arrived before ready or regressed its control tick")
                     current.evidence = validate_state(
@@ -943,8 +947,8 @@ class SimulationService(ManagedRecordingVerification):
                 raise SessionEvidenceError(inspected["error"] or "Native evidence completeness is unproven")
             manifest = inspected["manifest"]
             current = self.running.get(root.name)
-            if current is not None and manifest["resource_policy"] != current.expected_policy:
-                raise SessionEvidenceError("Native manifest changed the admitted resource policy")
+            if current is not None:
+                validate_manifest_policy(manifest["resource_policy"], current.expected_policy, root)
             await run_thread(verify_finalization_observation, root, manifest, inspected["finalization_verification"])
             verify_manifest_counts(manifest, inspected["counts"])
             if await run_thread(manifest_digest) != manifest_sha:

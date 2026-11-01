@@ -239,7 +239,7 @@ try:
     scope = {'__file__': str(path), '__name__': 'consumer_native_helper'}
     exec(compile(code, str(path), 'exec'), scope)
     if sys.argv[3] == 'runtime':
-        print(json.dumps(scope['verify_runtime_contract'](payload['runtime_contract'])))
+        print(json.dumps(scope['verify_runtime_contract'](payload['execution']['runtime_contract'])))
     elif sys.argv[3] == 'resources':
         print(json.dumps(scope['resolve_resources'](payload)))
     elif sys.argv[3] == 'inspect':
@@ -269,28 +269,31 @@ except Exception as error:
     ]
 
 
-def evidence_command(python: Path, nonce: str, execution: dict) -> list[str]:
-    return _helper_command(
-        python, nonce, Path(__file__).with_name("verify_recording.py"), execution["helper_sha256"], "recording"
-    )
+def _consumer_command(python: Path, nonce: str, payload: dict, operation: str) -> list[str]:
+    """All operations carry the same nested immutable execution binding."""
+    name, digest_key = {
+        "runtime": ("runtime.py", "runtime_helper_sha256"),
+        "resources": ("runtime.py", "runtime_helper_sha256"),
+        "inspect": ("verify_recording.py", "helper_sha256"),
+        "recording": ("verify_recording.py", "helper_sha256"),
+    }[operation]
+    return _helper_command(python, nonce, Path(__file__).with_name(name), payload["execution"][digest_key], operation)
 
 
-def runtime_command(python: Path, nonce: str, execution: dict) -> list[str]:
-    return _helper_command(
-        python, nonce, Path(__file__).with_name("runtime.py"), execution["runtime_helper_sha256"], "runtime"
-    )
+def evidence_command(python: Path, nonce: str, payload: dict) -> list[str]:
+    return _consumer_command(python, nonce, payload, "recording")
 
 
-def resource_command(python: Path, nonce: str, execution: dict) -> list[str]:
-    return _helper_command(
-        python, nonce, Path(__file__).with_name("runtime.py"), execution["runtime_helper_sha256"], "resources"
-    )
+def runtime_command(python: Path, nonce: str, payload: dict) -> list[str]:
+    return _consumer_command(python, nonce, payload, "runtime")
 
 
-def inspection_command(python: Path, nonce: str, execution: dict) -> list[str]:
-    return _helper_command(
-        python, nonce, Path(__file__).with_name("verify_recording.py"), execution["helper_sha256"], "inspect"
-    )
+def resource_command(python: Path, nonce: str, payload: dict) -> list[str]:
+    return _consumer_command(python, nonce, payload, "resources")
+
+
+def inspection_command(python: Path, nonce: str, payload: dict) -> list[str]:
+    return _consumer_command(python, nonce, payload, "inspect")
 
 
 async def run_verification(payload: dict, python: Path, *, register_process) -> dict:
@@ -300,7 +303,7 @@ async def run_verification(payload: dict, python: Path, *, register_process) -> 
     nonce = secrets.token_hex(24)
     spawning = asyncio.create_task(
         asyncio.create_subprocess_exec(
-            *evidence_command(python, nonce, payload["execution"]),
+            *evidence_command(python, nonce, payload),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,

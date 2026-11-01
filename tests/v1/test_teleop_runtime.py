@@ -32,8 +32,9 @@ ASSESSMENT = os.environ.get("TELEOP_ASSESSMENT_PYTHON")
 class TeleopRuntimeTests(unittest.TestCase):
     def owned_probe(self, python, execution):
         nonce = uuid.uuid4().hex
+        payload = {"execution": execution}
         process = subprocess.Popen(
-            runtime_command(Path(python), nonce, execution),
+            runtime_command(Path(python), nonce, payload),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -44,7 +45,7 @@ class TeleopRuntimeTests(unittest.TestCase):
         identity = {"pid": process.pid, "nonce": nonce}
         try:
             identity = owned_process.process_identity(process.pid, nonce)
-            stdout, stderr = process.communicate(json.dumps(execution), timeout=30)
+            stdout, stderr = process.communicate(json.dumps(payload), timeout=30)
         finally:
             self.assertTrue(owned_process.terminate_owned(identity, reap=process.poll))
             process.wait(timeout=5)
