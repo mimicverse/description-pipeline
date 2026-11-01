@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import errno
 import json
+import os
 import sqlite3
 import tempfile
 import threading
@@ -386,6 +388,223 @@ class NativeOperationRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(workspaces, [runtime.workspace_root / claim_id])
         self.assertFalse((runtime.workspace_root / operation_id).exists())
+
+    def _atomic_staging_fixture(self, kind, label, *, executor=None):
+        operation_id = f"atomic-{kind}-{label}"
+        output_contract = (
+            NATIVE_OBSERVATION_SCHEMA if kind == DISCOVER_KIND else OUTPUT_CONTRACT
+        )
+        request = None
+        if kind == DISCOVER_KIND:
+            files = {"cad/robot.SLDASM": "a" * 64}
+            request = NativeDiscoverRequest(
+                schema_version=NATIVE_REQUEST_SCHEMA,
+                operation_id=operation_id,
+                command_id=operation_id,
+                run_id="atomic-staging-run",
+                request_digest=digest({"request": operation_id}),
+                source_files=files,
+                source_inventory_sha256=digest(files),
+                main_assembly="cad/robot.SLDASM",
+                purpose="engineering",
+                expected_native_tool_sha256=TOOL_SHA256,
+                expected_native_tool_record_sha256=digest(NATIVE_TOOL),
+                native_tool_requirement_artifact_id="atomic-tool-fixture",
+            ).to_record()
+        envelope = _operation(
+            operation_id, self.archive, kind=kind,
+            request=request, output_contract=output_contract,
+        )
+        relative = (
+            Path("native-operations") / "inputs" / operation_id
+            / f"{envelope['input']['archive_sha256']}.zip"
+        )
+        component_length = 242 - len(str(self.root / relative)) - 1
+        prefix = f"{kind}-{label}-"
+        self.assertGreater(component_length, len(prefix))
+        state_root = self.root / (prefix + "s" * (component_length - len(prefix)))
+        runtime = NativeOperationRuntime(
+            state_root=state_root,
+            native_tool_factory=lambda: NATIVE_TOOL,
+            executors={} if executor is None else {kind: executor},
+        )
+        self.addCleanup(runtime.close)
+        runtime.create(envelope)
+        destination = runtime._input_path(
+            operation_id, envelope["input"]["archive_sha256"]
+        )
+        self.assertEqual(len(str(destination)), 242)
+        return runtime, envelope, destination
+
+    def _assert_atomic_staging_path_budget(self, kind):
+        path_open, os_open, replace_file = Path.open, os.open, os.replace
+        output_contract = (
+            NATIVE_OBSERVATION_SCHEMA if kind == DISCOVER_KIND else OUTPUT_CONTRACT
+        )
+
+        def executor(request, source_archive, workspace, native_tool):
+            self.assertEqual(source_archive.read_bytes(), self.archive.read_bytes())
+            artifact = workspace / "result.zip"
+            artifact.write_bytes(b"sealed atomic artifact")
+            return NativeOperationResult(
+                artifact_path=artifact, artifact_name=artifact.name,
+                output_contract=output_contract, resource_terminated=True,
+            )
+
+        runtime, envelope, destination = self._atomic_staging_fixture(
+            kind, "budget", executor=executor
+        )
+        operation_id = envelope["operation_id"]
+        artifact_directory = runtime.artifact_root / operation_id
+        staged = []
+        replaced = []
+
+        def require_path_budget(path):
+            if len(os.fspath(path)) > 259:
+                raise FileNotFoundError(errno.ENOENT, "Windows path budget", path)
+
+        def guarded_path_open(path, *args, **kwargs):
+            require_path_budget(path)
+            return path_open(path, *args, **kwargs)
+
+        def guarded_os_open(path, flags, *args, **kwargs):
+            require_path_budget(path)
+            if flags & os.O_CREAT and Path(path).parent in {
+                destination.parent, artifact_directory
+            }:
+                self.assertTrue(flags & os.O_EXCL)
+                staged.append(Path(path))
+            return os_open(path, flags, *args, **kwargs)
+
+        def guarded_replace(source, target):
+            require_path_budget(source)
+            require_path_budget(target)
+            self.assertEqual(Path(source).parent, Path(target).parent)
+            replaced.append((Path(source), Path(target)))
+            return replace_file(source, target)
+
+        module = "description_pipeline.orchestration.native_operation_runtime"
+        try:
+            with (
+                mock.patch.object(Path, "open", new=guarded_path_open),
+                mock.patch(module + ".os.open", new=guarded_os_open),
+                mock.patch(module + ".os.replace", new=guarded_replace),
+            ):
+                runtime.admit_input(operation_id, self.archive)
+                _wait_for(lambda: runtime.view(operation_id)["state"] == "satisfied")
+            view = runtime.view(operation_id)
+            self.assertEqual(view["kind"], kind)
+            self.assertEqual(view["target_id"], TEST_TARGET_ID)
+            self.assertEqual(view["request_sha256"], envelope["request_sha256"])
+            self.assertEqual(destination.read_bytes(), self.archive.read_bytes())
+            artifacts = list(artifact_directory.iterdir())
+            self.assertEqual(len(artifacts), 1)
+            self.assertEqual(len(str(artifacts[0])), 245)
+            self.assertEqual(artifacts[0].read_bytes(), b"sealed atomic artifact")
+            self.assertEqual(view["artifact"]["sha256"], file_digest(artifacts[0]))
+            self.assertEqual({path.parent for path in staged}, {
+                destination.parent, artifact_directory
+            })
+            self.assertEqual({target for _source, target in replaced}, {
+                destination, artifacts[0]
+            })
+            self.assertTrue(all(not path.exists() for path in staged))
+            self.assertEqual(list(destination.parent.iterdir()), [destination])
+        finally:
+            runtime.close()
+
+    def test_atomic_staging_fits_the_valid_input_and_artifact_path_budgets(self) -> None:
+        for kind in (DISCOVER_KIND, CAPTURE_KIND):
+            with self.subTest(kind=kind):
+                self._assert_atomic_staging_path_budget(kind)
+
+    def _assert_atomic_staging_failure(self, stage, failure):
+        module = "description_pipeline.orchestration.native_operation_runtime"
+        mkstemp, path_open = tempfile.mkstemp, Path.open
+        runtime, envelope, destination = self._atomic_staging_fixture(
+            CAPTURE_KIND, f"{stage}-{failure}"
+        )
+        operation_id = envelope["operation_id"]
+        directory = (
+            destination.parent if stage == "input"
+            else runtime.artifact_root / operation_id
+        )
+        directory.mkdir(parents=True, exist_ok=True)
+        sentinel = directory / "unrelated"
+        sentinel.write_bytes(b"retain unrelated bytes")
+        previous_input = stage == "input" and failure == "replace"
+        if previous_input:
+            destination.write_bytes(b"previous input bytes")
+        allocated = []
+
+        def allocate(*args, **kwargs):
+            descriptor, name = mkstemp(*args, **kwargs)
+            allocated.append((descriptor, Path(name)))
+            return descriptor, name
+
+        def fail_source_open(path, *args, **kwargs):
+            if path == self.archive:
+                raise OSError("source open failed")
+            return path_open(path, *args, **kwargs)
+
+        def changed_copy(source, target, *, length):
+            self.assertGreater(length, 0)
+            target.write(b"x" * (
+                self.archive.stat().st_size if failure == "hash" else 1
+            ))
+            if failure == "copy":
+                raise OSError("copy failed after a partial write")
+
+        expected_error = (
+            NativeOperationError if stage == "input" else NativeOperationUnresolved
+        ) if failure in {"size", "hash"} else OSError
+        if failure == "source_open":
+            fault = mock.patch.object(Path, "open", new=fail_source_open)
+        elif failure == "replace":
+            fault = mock.patch(
+                module + ".os.replace", side_effect=OSError("replace failed")
+            )
+        else:
+            fault = mock.patch(module + ".shutil.copyfileobj", side_effect=changed_copy)
+        with (
+            mock.patch(module + ".tempfile.mkstemp", side_effect=allocate),
+            fault,
+            self.assertRaises(expected_error) as raised,
+        ):
+            if stage == "input":
+                runtime.admit_input(operation_id, self.archive)
+            else:
+                runtime._install_artifact(operation_id, NativeOperationResult(
+                    artifact_path=self.archive, artifact_name="result.zip",
+                    output_contract=OUTPUT_CONTRACT, resource_terminated=True,
+                ))
+        if failure in {"size", "hash"}:
+            self.assertEqual(raised.exception.code, (
+                "input_archive_mismatch" if stage == "input" else "native_result_changed"
+            ))
+        self.assertEqual(len(allocated), 1)
+        for descriptor, path in allocated:
+            self.assertFalse(path.exists())
+            with self.assertRaises(OSError) as closed:
+                os.fstat(descriptor)
+            self.assertEqual(closed.exception.errno, errno.EBADF)
+        expected_files = {sentinel, destination} if previous_input else {sentinel}
+        self.assertEqual(set(directory.iterdir()), expected_files)
+        self.assertEqual(sentinel.read_bytes(), b"retain unrelated bytes")
+        if previous_input:
+            self.assertEqual(destination.read_bytes(), b"previous input bytes")
+        self.assertEqual(self.archive.read_bytes(), b"complete input archive")
+        self.assertEqual(
+            [event["type"] for event in runtime._events(operation_id)],
+            ["accepted"],
+        )
+        runtime.close()
+
+    def test_atomic_staging_failures_close_descriptors_and_remove_only_partials(self) -> None:
+        for stage in ("input", "artifact"):
+            for failure in ("source_open", "copy", "size", "hash", "replace"):
+                with self.subTest(stage=stage, failure=failure):
+                    self._assert_atomic_staging_failure(stage, failure)
 
     def test_submit_operation_returns_the_current_state_without_polling_or_resend(self) -> None:
         entered = threading.Event()
