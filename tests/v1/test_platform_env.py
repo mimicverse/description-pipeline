@@ -99,6 +99,11 @@ def platform_document(root: Path) -> dict:
 
 
 class PlatformEnvTests(unittest.TestCase):
+    def test_omitted_optional_features_have_explicit_disabled_environment_values(self):
+        result = self.emit(self.snapshot, install_id="gen-1", wheel=self.wheel)
+        self.assertEqual(result["env"]["SIMULATION_CONFIG_JSON"], "")
+        self.assertEqual(json.loads(result["env"]["ASSESSMENT_CONFIG_JSON"]), {"enabled": False})
+
     def test_assessment_environment_uses_the_validated_snapshot(self):
         for value in ({"enabled": False},
                       {"enabled": True, "python": "/opt/teleop/bin/python", "capacity": 2,
@@ -420,6 +425,7 @@ class PlatformEnvTests(unittest.TestCase):
         import subprocess
 
         samples = {
+            "empty": "",
             "plain": "m3.0",
             "ampersand_dsn": "postgresql://role@/db?host=/srv/socket&port=5433",
             "spaces": "two words and more",
@@ -436,11 +442,12 @@ class PlatformEnvTests(unittest.TestCase):
         env_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
         decoded = {key: render_operator.decode_env_value(raw) for key, raw in (line.split("=", 1) for line in lines)}
         self.assertEqual(decoded, {f"VALUE_{key.upper()}": value for key, value in samples.items()})
-        # A clean bash source (no inherited environment) observes the same bytes.
+        # The declaration also clears an inherited value instead of silently retaining it.
         # The format stays single-quoted: an unquoted \0 is quote-removed to a literal "0".
         reads = " ; ".join(f"printf '%s\\0' \"${{VALUE_{key.upper()}}}\"" for key in samples)
         result = subprocess.run(
-            ["env", "-i", "bash", "-c", 'set -a ; source "$1" ; set +a ; ' + reads, "boundary", str(env_file)],
+            ["env", "-i", "VALUE_EMPTY=ambient", "bash", "-c",
+             'set -a ; source "$1" ; set +a ; ' + reads, "boundary", str(env_file)],
             capture_output=True,
         )
         self.assertEqual(result.returncode, 0, result.stderr)

@@ -537,9 +537,14 @@ airflow_wait_dag_identity() {
 }
 
 airflow_set_dag_paused() {
-  local paused="$1" verb
+  local paused="$1" verb dag_ids dag_id status=0
   if [ "$paused" = "true" ]; then verb=pause; else verb=unpause; fi
-  AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/airflow" dags "$verb" solidworks_to_urdf
+  dag_ids="$("$AIRFLOW_VENV/bin/python" "$HERE/runtime_dag.py" --state-root "$STATE_ROOT" --dag-ids)" \
+    || return 1
+  while IFS= read -r dag_id; do
+    AIRFLOW_HOME="$AIRFLOW_HOME" "$AIRFLOW_VENV/bin/airflow" dags "$verb" "$dag_id" || status=1
+  done <<< "$dag_ids"
+  return "$status"
 }
 
 verify_airflow_connection() {
@@ -926,8 +931,11 @@ case "$ACTION" in
     if [ -n "$KEEP_ADMISSION_CLOSED" ]; then
       echo "start complete: services are healthy; DAG and admission stay closed"
     else
-      airflow_set_dag_paused false \
-        || die "the DAG could not be unpaused; admission stays closed"
+      if ! airflow_set_dag_paused false; then
+        airflow_set_dag_paused true \
+          || echo "operatorctl: a DAG could not be repaused after unpause failed" >&2
+        die "the configured DAGs could not be unpaused; admission stays closed"
+      fi
       if ! platform_open_admission; then
         airflow_set_dag_paused true \
           || echo "operatorctl: admission open failed and the DAG could not be repaused" >&2

@@ -286,6 +286,8 @@ def derive(
         "MODEL_REPOSITORIES_FILE": str(repositories_file),
         "MODEL_TARGETS_FILE": str(targets_file),
         "DISCOVERY_SETTINGS_FILE": str(discovery_file),
+        "SIMULATION_CONFIG_JSON": "",
+        "ASSESSMENT_CONFIG_JSON": json.dumps({"enabled": False}, sort_keys=True),
     }
     if "teleop" in operator:
         env["SIMULATION_CONFIG_JSON"] = json.dumps(

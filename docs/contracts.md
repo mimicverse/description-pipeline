@@ -920,6 +920,12 @@ Generate 的本地转换、输出表示及 Verify 的本地评估若明确抛出
 
 警告中的数值与模型文件使用同一 canonical JSON 规则，包含负零归一和非有限数拒绝；URDF 注释仅额外执行 XML 安全转义，独立验证仍核完整来源与资格，不按排版补真值。Verify 内的有效实例物性读取与 mass closure 共用一处原始测量投影，保留有效值及其独立零件对照测量；两者不混用，整记录与工程数值校验继续严格执行。
 
+## 可选动力学评估
+
+辅助评估不属于七阶段范围。`assessment_request` 封存认证用户、工程来源 MemberRef、原证书、执行 bundle、固定运行时与执行器；`assessment_attempt` 保留每次受控执行、分发接受事实、所有权、进程身份、结果引用和资源是否归还。读侧共用 `project_attempt`：过期的执行 lease 投影为 UNKNOWN，不修改原状态或授权接管。新增 request、attempt 和上传最终登记复用同一 admission 行锁；既有请求的只读重放、取消和对账不被关闭接单阻断。
+
+维护门在同一只读一致快照读取主链、评估事实和精确辅助 DagRun/task 原始证据。辅助业务终态不代表调度已停止；已接受但不可读的调度结果仍阻塞清场。备份从封存请求展开 bundle、URDF/MJCF、原证书和结果的完整 ArtifactRef，核对 registry 与 CAS，并纳入原恢复选择集；临时工作目录不替代引用原件。
+
 ## 七阶段独立重跑与执行范围
 
 `ProductionStageRerunRequest` 经统一 attempts 入口接纳 `from_stage/through_stage`，使用新的不可变 request/run。七阶段均可独立选择，默认仅执行所选阶段，也可明确指定下游终点。来源可以是完整运行或前次有界执行，必要前缀须具有完整 formal 字节、command、decision、证书、producer/executor 与 supporting predecessors；不要求父无关后缀全部结束。复用前缀按其原封存合同、规则、策略和配置核验，所选阶段采用当前工具及适用策略。部署路由或 TLS 等执行 metadata 变化不冒充工程输入变化；不能只比较整份配置 digest 就强迫重做 CAD。诊断来源、未决 effect、缺失或错绑来源拒绝。原失败和原 artifact 不改写，旧所选阶段及下游决定不继承。

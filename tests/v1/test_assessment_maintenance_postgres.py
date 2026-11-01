@@ -63,7 +63,9 @@ class AssessmentMaintenancePostgresTests(AssessmentCase):
         self.database = self._new_database()
         with self.connect() as connection, connection.cursor() as cursor:
             cursor.execute("CREATE SCHEMA platform; CREATE SCHEMA airflow")
-            cursor.execute((ROOT / "deploy/platform/schema.sql").read_text().replace(':"platform_schema"', '"platform"'))
+            cursor.execute(
+                (ROOT / "deploy/platform/schema.sql").read_text().replace(':"platform_schema"', '"platform"')
+            )
             cursor.execute(
                 "CREATE TABLE airflow.dag_run (dag_id text,run_id text,state text,start_date timestamptz,"
                 "end_date timestamptz,PRIMARY KEY(dag_id,run_id));"
@@ -173,7 +175,10 @@ class AssessmentMaintenancePostgresTests(AssessmentCase):
         with self.assertRaises(recovery.RecoveryError):
             recovery._require_quiescent(self._probe(), "actual_pg_expired_lease")
         self.store.unknown(attempt["attempt_id"], {"phase": "reconciliation"}, owner=owner)
-        with patch.dict(os.environ, {"PLATFORM_OPERATOR_DSN": self.connect_dsn()}), contextlib.redirect_stdout(io.StringIO()):
+        with (
+            patch.dict(os.environ, {"PLATFORM_OPERATOR_DSN": self.connect_dsn()}),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
             self.assertEqual(lifecycle_state.main(["report", "--require-no-unresolved"]), 1)
         with self.connect() as connection:
             self.assertEqual(read_lifecycle_rows(connection)[0]["state"], "unknown")
@@ -300,7 +305,8 @@ class AssessmentMaintenancePostgresTests(AssessmentCase):
             )
         target = self._new_database()
         subprocess.run(
-            [str(POSTGRES_BIN_PATH / "pg_restore"), "--exit-on-error", "--dbname", self.server.get_uri(target), str(archive)],
+            [str(POSTGRES_BIN_PATH / "pg_restore"), "--exit-on-error", "--dbname",
+             self.server.get_uri(target), str(archive)],
             check=True, capture_output=True, timeout=30,
         )
         recovery.verify_checkpoint_index(index, captured)

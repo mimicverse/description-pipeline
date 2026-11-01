@@ -194,7 +194,6 @@ with tempfile.TemporaryDirectory(prefix="operator-resolved-") as temporary:
     expected = {
         key: value.replace(str(rendered_state), str(state))
         for key, value in json.loads(completed.stdout).items()
-        if value != ""
     }
 if actual != expected:
     differing = sorted(

@@ -135,13 +135,13 @@ def encode_env_value(value: str) -> str:
 
     if "\n" in value or "\r" in value:
         raise ValueError("an env value cannot carry a line break")
-    return value if ENV_SAFE.fullmatch(value) else shlex.quote(value)
+    return value if value and ENV_SAFE.fullmatch(value) else shlex.quote(value)
 
 
 def encode_env_lines(pairs) -> list[str]:
-    """Sorted ``KEY=value`` lines with the canonical encoding; empty values are omitted."""
+    """Sorted declarations preserving explicit empty values and their disabled semantics."""
 
-    return [f"{key}={encode_env_value(value)}" for key, value in sorted(pairs) if value != ""]
+    return [f"{key}={encode_env_value(value)}" for key, value in sorted(pairs)]
 
 
 def decode_env_value(raw: str) -> str:

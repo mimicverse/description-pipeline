@@ -37,7 +37,6 @@ class CompositionDatabaseTests(PostgresCase):
         with service.store.connect() as connection:
             dsn = connection.dsn
         root = tmp_path / "private-executor"
-        root.mkdir(mode=448)
         config = {
             "enabled": True,
             "root": str(root),
@@ -56,6 +55,7 @@ class CompositionDatabaseTests(PostgresCase):
             "PLATFORM_ARTIFACT_ROOT": str(service.store.artifacts.root),
         }
         executor = composition.assessment_executor_from_environment(environment)
+        self.assertEqual(root.stat().st_mode & 0o777, 0o700)
         assert executor.service.runtime.sha256 == service.runtime.sha256
         assert executor.service.store.artifacts.root == service.store.artifacts.root
         assert executor.service.capacity == 2 and executor.service.input_limit == 64 * 1024**2

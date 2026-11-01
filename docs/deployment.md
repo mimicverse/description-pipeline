@@ -1,5 +1,11 @@
 # 部署指南
 
+可选评估由 `platform.json` 的 `operator.assessment` 控制，未配置时关闭。启用须完整提供私有 `python`、`capacity`（1–8）以及 `limits`，不从模型缺失值推断执行参数。派生环境显式记录关闭状态与空值，环境文件、数据读取和 shell 读取使用同一编码，不继承宿主的旧开关或管理员列表。
+
+安装创建主原生池及已启用的评估池，健康检查只读核验相同容量，并包含 deferred 占用。启动从已核验 snapshot 选择 DAG，先暂停全部启用 DAG，完成双端身份和健康门后才开启；部分 unpause 失败会重新暂停全部 DAG，admission 保持关闭。辅助 DAG 文件及其实际 serialized identity 同样绑定当前发行，不能只凭主 DAG 通过。
+
+启用评估的 consumer 首次启动时原子创建 `state_root/assessments`，要求当前服务用户所有、0700 且无链接祖先；默认关闭不创建资源。该目录是可重建的工作区，灾备保留数据库事实与完整 CAS 引用，不复制 scratch 作为业务状态。drain/stop/backup 同时核验辅助业务和原始调度证据，UNKNOWN 或未归还资源阻塞清场；恢复到空目标后由同一 consumer 重建私有工作区。
+
 部署由一台 Linux 平台主机和一个串行 Windows 原生执行端组成。用户仅访问一个 HTTPS 操作台；Airflow、数据库、内部 API 和原生端点不直接向用户开放。
 
 Linux 承担平台编排、工程模型、URDF/MJCF 生成、独立验证、报告和发布。Windows 运行原生 CAD 读取，释放 CAD 后完成原值序列化与证据封包。Linux Capture 核验传输与绑定，Generate 一次执行语义投影、惯量规范化和 STL 生成，Verify 从 raw 独立复算；MJCF 在 Linux 生成组件碰撞代理、编码并独立验证，Publish 组合两种格式。Windows 只安装原生运行依赖和已资格化的 SolidWorks，运行在专用登录用户的交互式桌面中；不配置模型仓库、发布目标、Git 凭据、报告或 MuJoCo。

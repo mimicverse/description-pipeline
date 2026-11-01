@@ -28,9 +28,10 @@ def assessment_executor_from_environment(environment=None) -> AssessmentExecutor
     if not config["enabled"]:
         return None
     config = object_record(config, {"enabled", "root", "python", "capacity", "limits"}, "Assessment configuration")
-    require(type(config["capacity"]) is int and 1 <= config["capacity"] <= 16, "Assessment capacity is invalid")
+    require(type(config["capacity"]) is int and 1 <= config["capacity"] <= 8, "Assessment capacity is invalid")
     root = Path(text(config["root"], "Assessment work root"))
-    require(root.is_absolute() and root.is_dir() and not path_has_link_ancestor(root), "Assessment root is unsafe")
+    require(root.is_absolute() and not path_has_link_ancestor(root), "Assessment root is unsafe")
+    root.mkdir(mode=0o700, exist_ok=True)
     identity = root.stat()
     require(
         identity.st_uid == os.geteuid() and stat.S_IMODE(identity.st_mode) & 0o077 == 0,
