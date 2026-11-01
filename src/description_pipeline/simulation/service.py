@@ -47,7 +47,7 @@ from .resources import (
     validate_ready,
     validate_state,
 )
-from .evidence import RecordingDiagnostic, SessionEvidenceError, verify_manifest_counts, verify_session_finalization
+from .evidence import RecordingDiagnostic, SessionEvidenceError, verify_manifest_counts, verify_finalization_observation
 from .warnings import warning_inventory
 
 log = logging.getLogger(__name__)
@@ -1030,6 +1030,7 @@ class SimulationService:
             "manifest": None,
             "container_complete": False,
             "business_complete": False,
+            "finalization_verification": None,
             "streams": {
                 key: {"name": name, "container_complete": False}
                 for key, name in (
@@ -1078,7 +1079,9 @@ class SimulationService:
             current = self.running.get(root.name)
             if current is not None and manifest["resource_policy"] != current.expected_policy:
                 raise SessionEvidenceError("Native manifest changed the admitted resource policy")
-            await asyncio.to_thread(verify_session_finalization, root, manifest)
+            await asyncio.to_thread(
+                verify_finalization_observation, root, manifest, inspected["finalization_verification"]
+            )
             verify_manifest_counts(manifest, inspected["counts"])
             if await asyncio.to_thread(manifest_digest) != manifest_sha:
                 raise SessionEvidenceError("Native manifest changed after evidence verification")
@@ -1096,13 +1099,19 @@ class SimulationService:
             "streams": inspected["streams"],
             "session_complete": session_complete,
             "formal_one_hour_qualified": False,
+            "finalization_verification": inspected["finalization_verification"],
         }
         try:
             async with self._storage_gate:
                 if session_complete:
                     # The inspector does no writes, but remeasure at the final
                     # admission boundary before any seal or discard action.
-                    await asyncio.to_thread(verify_session_finalization, root, inspected["manifest"])
+                    await asyncio.to_thread(
+                        verify_finalization_observation,
+                        root,
+                        inspected["manifest"],
+                        inspected["finalization_verification"],
+                    )
                 storing = asyncio.create_task(
                     asyncio.to_thread(self._store_recording_result, root, outcome, runtime, save)
                 )

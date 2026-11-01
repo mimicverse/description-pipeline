@@ -176,8 +176,12 @@ def _record_stream(recording: Path, manifest: dict):
 
 
 def _verify_commands(native: Path, commands: list[dict]) -> tuple[tuple[str, ...], dict]:
-    """Match only registered operator commands while the public reader streams all input."""
-    from teleop.robots.m3_0.session_evidence import iter_raw_input_evidence, reconcile_session_evidence
+    """Close operator facts in both directions while streaming unregistered input."""
+    from teleop.robots.m3_0.session_evidence import (
+        iter_raw_input_evidence,
+        iter_session_event_evidence,
+        reconcile_session_evidence,
+    )
 
     registered, expected, seen, raw_count = {}, {}, set(), 0
     for command in commands:
@@ -198,6 +202,8 @@ def _verify_commands(native: Path, commands: list[dict]) -> tuple[tuple[str, ...
         if not isinstance(envelope, dict):
             continue
         identifier = envelope.get("id")
+        if isinstance(identifier, str) and identifier.startswith("operator-") and identifier not in registered:
+            raise ValueError("Native operator command has no registered platform fact")
         if not isinstance(identifier, str) or identifier not in registered:
             continue
         result = registered[identifier]
@@ -208,6 +214,19 @@ def _verify_commands(native: Path, commands: list[dict]) -> tuple[tuple[str, ...
         seen.add(identifier)
     if seen != expected.keys():
         raise ValueError("Native dispatch differs from its immutable registered envelope")
+    event_seen, event_count = set(), 0
+    for row in iter_session_event_evidence(native):
+        event_count += 1
+        identifier = row.get("command_id")
+        if isinstance(identifier, str) and identifier.startswith("operator-") and identifier not in registered:
+            raise ValueError("Native operator event has no registered platform fact")
+        if not isinstance(identifier, str) or identifier not in registered:
+            continue
+        if registered[identifier]["state"] == "not_sent":
+            raise ValueError("A command marked not sent has native event evidence")
+        event_seen.add(identifier)
+    if event_seen != expected.keys():
+        raise ValueError("Native events differ from the registered command set")
     identifiers = tuple(expected)
     reconciliation = reconcile_session_evidence(native, expected_command_ids=identifiers)
     if (
@@ -236,6 +255,7 @@ def _verify_commands(native: Path, commands: list[dict]) -> tuple[tuple[str, ...
         set(counts) != {"raw_input", "session_events", "commands", "unknown", "malformed"}
         or any(type(value) is not int or value < 0 for value in counts.values())
         or counts["raw_input"] != raw_count
+        or counts["session_events"] != event_count
         or counts["unknown"] != 0
         or counts["malformed"] != 0
     ):
@@ -265,6 +285,7 @@ def inspect_native(payload: dict) -> dict:
         "manifest": None,
         "container_complete": False,
         "business_complete": False,
+        "finalization_verification": None,
         "counts": None,
         "streams": {key: {"name": name, "container_complete": False} for key, name in STREAM_NAMES.items()},
         "error": None,
@@ -311,6 +332,9 @@ def inspect_native(payload: dict) -> dict:
                 raise ValueError("Native manifest changed during business-stream inspection")
         report["counts"] = {**counts, "records": records}
         report["business_complete"] = True
+        from teleop.robots.m3_0.session_evidence import verify_session_finalization
+
+        report["finalization_verification"] = verify_session_finalization(native)
     except Exception as error:
         report["error"], report["error_type"] = str(error)[:4000], type(error).__name__
     return report

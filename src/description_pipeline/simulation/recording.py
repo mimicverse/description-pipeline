@@ -15,6 +15,7 @@ from ..owned_process import process_identity, resource_state, terminate_owned
 from ..pipeline.contracts import ArtifactRef
 from .store import SimulationConflict
 from .resources import SESSION_QUOTA_BYTES
+from .evidence import validate_finalization_proof
 from .warnings import warning_inventory, verify_warning_inventory
 
 
@@ -53,6 +54,7 @@ def prepare_bound(binding: dict, artifacts, source: Path, *, commands: list, exe
         "streams",
         "session_complete",
         "formal_one_hour_qualified",
+        "finalization_verification",
     } or any(
         type(outcome[key]) is not bool
         for key in (
@@ -67,6 +69,10 @@ def prepare_bound(binding: dict, artifacts, source: Path, *, commands: list, exe
         raise ValueError("Diagnostic recording is not a complete session verification input")
     if outcome["manifest_sha256"] != inventory.get("native/session-manifest.json"):
         raise ValueError("Platform outcome differs from its committed native manifest")
+    manifest = json.loads((root / "native/session-manifest.json").read_bytes())
+    validate_finalization_proof(
+        Path(manifest["resource_policy"]["session_dir"]), manifest, outcome["finalization_verification"]
+    )
     warning_identity = verify_warning_inventory(request["source"], source)
     return {
         "binding": binding,

@@ -4,16 +4,18 @@ from copy import deepcopy
 import gzip
 import hashlib
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 
 from description_pipeline.io import canonical
 from description_pipeline.simulation.evidence import (
     SessionEvidenceError,
+    validate_finalization_proof,
     verify_manifest_counts,
-    verify_session_finalization,
+    verify_finalization_observation,
 )
-from description_pipeline.simulation.resources import PHASES, directory_bytes
+from description_pipeline.simulation.resources import PHASES, SessionResourceError, directory_bytes
 from description_pipeline.simulation.verify_recording import STREAM_NAMES, inspect_containers
 from tests.v1.test_pico_projection_contract import policy_fixture
 
@@ -87,6 +89,23 @@ class EvidenceFixture:
                 break
             self.manifest["finalization"]["observed_bytes"] = actual
 
+    def finalization_result_double(self):
+        """Model only the frozen public result shape; this is not a native proof."""
+        finalization = self.manifest["finalization"]
+        return {
+            "schema_version": "teleop-pico-session-finalization-verification/1",
+            "pass": True,
+            "session_dir": str(self.root),
+            "observed_bytes": finalization["observed_bytes"],
+            "manifest_observed_bytes": finalization["observed_bytes"],
+            "reserve_bytes": finalization["finalization_reserve_bytes"] + finalization["failure_reserve_bytes"],
+            "quota_bytes": finalization["quota_bytes"],
+            "self_bytes_match": True,
+            "quota_ok": True,
+            "finalization": deepcopy(finalization),
+            "detail": None,
+        }
+
 
 class PicoEvidenceTests(unittest.TestCase):
     def setUp(self):
@@ -138,11 +157,12 @@ class PicoEvidenceTests(unittest.TestCase):
 
     def test_finalization_counts_its_own_stable_manifest_and_rejects_a_late_outcome(self):
         self.finalization_fixture()
-        verified = verify_session_finalization(self.root, self.manifest)
+        proof = self.fixture.finalization_result_double()
+        verified = verify_finalization_observation(self.root, self.manifest, proof)
         self.assertEqual(directory_bytes(self.root), verified["observed_bytes"])
         (self.root / "recording/outcome.json").write_bytes(b"{}\n")
         with self.assertRaisesRegex(SessionEvidenceError, "complete immutable session"):
-            verify_session_finalization(self.root, self.manifest)
+            verify_finalization_observation(self.root, self.manifest, proof)
 
     def test_finalization_rejects_self_byte_and_boolean_claim_changes(self):
         self.finalization_fixture()
@@ -155,7 +175,35 @@ class PicoEvidenceTests(unittest.TestCase):
             value = deepcopy(self.manifest)
             value["finalization"].update(change)
             with self.subTest(change=change), self.assertRaises(SessionEvidenceError):
-                verify_session_finalization(self.root, value)
+                verify_finalization_observation(self.root, value, self.fixture.finalization_result_double())
+
+    def test_parent_requires_the_fixed_public_proof_and_independently_checks_its_bytes(self):
+        self.finalization_fixture()
+        proof = self.fixture.finalization_result_double()
+        for change in (
+            {"schema_version": "foreign"},
+            {"pass": False, "detail": "Native finalization failed"},
+            {"self_bytes_match": 1},
+            {"observed_bytes": proof["observed_bytes"] + 1},
+            {"manifest_observed_bytes": True},
+            {"reserve_bytes": 0},
+            {"quota_bytes": 536870913},
+            {"session_dir": str(self.root / "foreign")},
+            {"finalization": {}},
+            {"unexpected": "field"},
+        ):
+            with self.subTest(change=change), self.assertRaises(SessionEvidenceError):
+                verify_finalization_observation(self.root, self.manifest, {**proof, **change})
+        with self.assertRaises(SessionEvidenceError):
+            verify_finalization_observation(self.root, self.manifest, None)
+
+    def test_sealed_proof_validation_never_reopens_the_historical_workspace(self):
+        self.finalization_fixture()
+        proof = self.fixture.finalization_result_double()
+        shutil.rmtree(self.root)
+        self.assertEqual(proof, validate_finalization_proof(self.root, self.manifest, proof))
+        with self.assertRaises(SessionResourceError):
+            verify_finalization_observation(self.root, self.manifest, proof)
 
     def test_phase_counts_cover_all_three_streams_without_inventing_a_running_phase(self):
         self.finalization_fixture()
