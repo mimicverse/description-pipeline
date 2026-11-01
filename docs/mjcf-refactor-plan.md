@@ -50,4 +50,50 @@ FactStore 保留提交时的取消门，并以明确的类型化结果通知共�
 
 依次执行 R1 → R2 → R3 → R4 → R5。每项先保全原失败，形成实现和针对性验证，再进入依赖它的下一项。发现新的同源问题须追踪全部消费者；不为进度截止降低质量，也不重复没有变化的全套检查。证据保存在本 worktree 的 `.dev/refactor-20261101/`，前轮复审原件保留在 `.dev/review-20261101/`。
 
-当前状态：方案完成，准备创建并执行新 Goal。
+当前状态：R1–R5 开发实现、验证、隔离部署及可评审资料完成。PR保持Draft，最终CI以PR当前状态为准；正式门仍未完成。
+
+## 已完成的实现与删减
+
+| 项目 | 结果与必要性 | 实际调用/验证 |
+|---|---|---|
+| R1 | FactStore 类型化取消通知；共同 engine 使用原 claim/fence 提交 cancelled，保全候选及原失败。通知只是进程内控制流，不增加持久状态 | 15项取消回归、44项共同回归；真实MJCF活动租期反例收敛并可重复读取 |
+| R2 | 原 CLI/Airflow 按登记目标临时组合所需 handler；只有 Discover/Capture 加载CAD，只有Publish加载Git/PR | 新进程默认CLI在无CAD环境完成MJCF；25项能力回归通过 |
+| R3 | `execution_stage_ids` 唯一推导范围；共同查询核验来源并给出source/reuse，当前上游command/decision为空 | 66项共同范围、Portal、状态及真实七阶段组合通过 |
+| R4 | 原DAG七任务，MJCF使用none_failed，复用前缀由实际调度器skip；删除ReusedStage伪装success分支 | 默认工厂实际Airflow五skipped、两success；32项适配及12项实际调度相关回归通过 |
+
+新增复杂性分别用于关闭原取消竞态、解除冷启动的无关端口依赖、表达跨运行来源所有者及兑现实际调度范围；没有新增运行表、调度状态、机器人模型或配置副本。转换、独立验证、FactStore和已有端口继续各负其责。隔离Airflow驱动属于测试，不是新生产入口。
+
+删除核验的原始命令/返回见 `.dev/refactor-20261101/R5-DELETION-AUDIT.json`：
+
+```bash
+rg -n 'reused_from|_mjcf_input_projection' src/description_pipeline/orchestration/portal.py
+rg -n 'ReusedStage' src/description_pipeline/orchestration/airflow_stage_operator.py
+rg -n 'execution_stage_ids' src/description_pipeline/stages.py src/description_pipeline/pipeline/contracts.py src/description_pipeline/pipeline/application.py src/description_pipeline/platform/queries.py
+rg -n 'StageCancellationRequested|_commit_owned_cancellation' src/description_pipeline/pipeline/contracts.py src/description_pipeline/pipeline/engine.py src/description_pipeline/platform/facts.py
+```
+
+前两条exit 1且无匹配，证明旧重复逻辑已删除；后两条分别11处实际定义/调用，不以文档宣称代替检查。Portal保留的资源清单辅助函数只处理文件闭包，不判断执行范围。开发启动器也删除共享claim_policy手工替换，实际装配记录为Freeze空handler、MJCF单handler、Publish单handler；与生产默认工厂相同。
+
+## 权威文档待同步差量
+
+建议补丁为 [authority-sync.patch](../reviews/mjcf-refactor-20261101/authority-sync.patch)，包含三份权威文档及 `tests/v1/test_stages.py` 原断言的准确七阶段、MJCF输入输出/QC、受限后继、范围、默认装配、取消和资产验收差量。`git apply --check`通过，隔离副本的原文档契约检查通过。补丁尚未应用到当前文档/测试；它是交给负责人的可审阅差量，不授予批准、合并或正式发行资格。
+
+## 完整回归与结果展示修复
+
+`f129c3de` 的标准完整入口实际运行2824项：2812通过、10因平台/隔离条件跳过、1文档契约失败、1门户旧测试错误，原始日志为 `.dev/refactor-20261101/FULL-REGRESSION.log`。不改写该结果为全绿。
+
+门户旧测试仍要求从父artifact推断reuse，违反本轮共同查询的唯一职责。已将测试改为断言“无共同reuse则不推断、有共同reuse则原样展示”，保留foreign producer拒绝；真实来源完整性继续由PostgreSQL/真实门户回归覆盖，不恢复被删除的门户第二判定。
+
+最终浏览器/API审查又发现成功报告把五个复用来源算作本次完成，显示7/7，实际共同范围为MJCF/Publish。根因是 `report_view.build_report` 的显示计数遍历所有来源证据，原测试仅核通过状态及逐阶段reuse，没有核总数。原件为 `HEADLINE-BEFORE-RESULT.json` 和 `DEVELOPMENT-DOM-BEFORE-HEADLINE.txt`；同一真实门户测试新增本次2/2断言，在原代码稳定失败 `REPORT-SCOPE-REGRESSION-BEFORE.log`。修复使用已有in_scope做展示计数，成功摘要简化为 `Completed; independent verification passed`；不新增状态或范围规则。49项报告、Portal投影和真实PostgreSQL门户回归通过 `REPORT-SCOPE-REGRESSION-AFTER.log`，包含完整七阶段计数、失败及来源拒绝等相邻消费者。
+
+产品固定提交 `04931f18` 通过Ruff、diff检查和建议补丁可应用性检查。开发wheel的147个源码/JS/WASM/许可证/契约资源与当前源码逐文件一致，RECORD逐项验证，记录在 `WHEEL-IDENTITY.json`。源投影、独立检查与viewer五个核心文件及参考40输入保持原字节，见 `REFERENCE-INHERITANCE.json`，因此继承已有19项参考模型检查，不无意义重复全套几何基准。
+
+上述完整入口与49项差量验证应分别引用；最终head的CI按PR实际结果记录，不能把继承证据冒称最终全套全绿。三份权威文档及其测试保持原样，当前唯一已知未关闭的测试门是六/七阶段文档契约。
+
+## 最终开发验收
+
+最终浏览器运行 `portal-mjcf-50428384-2746-4f67-ac71-05f08e2bcd00` 在产品提交 `04931f18` 完成，实际默认装配为空/MJCF/Publish；上游五task skipped，MJCF/Publish success，数据库仅新增两阶段决定。真实API回读为本次2/2，源五阶段保持Reused。最终候选再次实测碰撞视图、0.4rad调姿、1ms步进、overlay与复位；播放/暂停已在同源码viewer的前次本轮运行实际验证，未变化证据继承。截图为 `.dev/refactor-20261101/FINAL-DEVELOPMENT-MJCF.png`，明确为两body离线开发夹具，不冒称用户CAD模型。
+
+[证据摘要](../reviews/mjcf-refactor-20261101/DEVELOPMENT-EVIDENCE.json) 绑定产品提交、真实运行、完整/差量回归范围、wheel、原始日志及页面SHA。本轮开发构建只用于核字节，正式发行仍须干净main完整构建。最后的文档和证据提交不改变上述产品源码，最终wheel会再核对同一字节。
+
+开发实例为自有8878/PID707888；隔离检查证明生产8791/PID1766、8971/PID1796、8793/PID2734不变，三份权威文档及原契约测试原字节不变。旧实例和数据库已按身份核对、无活动任务、保全CAS/metadata/SQL后停止；不删除失败证据或用户输入。不要将该隔离交付视为生产上线。

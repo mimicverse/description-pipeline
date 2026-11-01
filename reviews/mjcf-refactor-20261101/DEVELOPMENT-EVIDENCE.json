@@ -1,0 +1,146 @@
+{
+  "scope": "Isolated development evidence only; no formal release, CAD E2E or production deployment qualification",
+  "generated_at_utc": "2026-11-01T01:22:36.180937+00:00",
+  "product_commit": "04931f183c1a11458755cece84e95c36410e0cfd",
+  "full_regression": {
+    "commit": "f129c3de",
+    "total": 2824,
+    "passed": 2812,
+    "skipped": 10,
+    "failures": 1,
+    "errors": 1,
+    "remaining_failure": "Authoritative six/seven-stage documentation contract",
+    "corrected_error": "Portal test must consume common reuse projection rather than infer it from parent artifacts"
+  },
+  "final_delta_regression": {
+    "product_commit": "04931f183c1a11458755cece84e95c36410e0cfd",
+    "tests": 49,
+    "passed": 49,
+    "modules": [
+      "tests.v1.test_report_view",
+      "tests.v1.test_portal_stage_projection",
+      "tests.v1.test_mjcf_portal"
+    ]
+  },
+  "airflow_browser": {
+    "cad_environment_present": false,
+    "compositions": [
+      {
+        "handlers": [],
+        "task_id": "freeze"
+      },
+      {
+        "handlers": [
+          "mjcf"
+        ],
+        "task_id": "mjcf"
+      },
+      {
+        "handlers": [
+          "publish"
+        ],
+        "task_id": "publish"
+      }
+    ],
+    "dag_run_id": "portal-mjcf-50428384-2746-4f67-ac71-05f08e2bcd00",
+    "execution_scope": [
+      "mjcf",
+      "publish"
+    ],
+    "stage_decisions": [
+      "mjcf",
+      "publish"
+    ],
+    "state": "success",
+    "tasks": [
+      {
+        "state": "skipped",
+        "task_id": "freeze"
+      },
+      {
+        "state": "skipped",
+        "task_id": "discover"
+      },
+      {
+        "state": "skipped",
+        "task_id": "capture"
+      },
+      {
+        "state": "skipped",
+        "task_id": "generate"
+      },
+      {
+        "state": "skipped",
+        "task_id": "verify"
+      },
+      {
+        "state": "success",
+        "task_id": "mjcf"
+      },
+      {
+        "state": "success",
+        "task_id": "publish"
+      }
+    ],
+    "upstream_execute_forbidden": true
+  },
+  "result_summary": {
+    "state": "passed",
+    "state_label": "Passed",
+    "headline": "Completed; independent verification passed",
+    "stages_completed": 2,
+    "stages_total": 2,
+    "engineering_state": "external_review"
+  },
+  "wheel": {
+    "head": "04931f183c1a11458755cece84e95c36410e0cfd",
+    "wheel_sha256": "22f415ae555ef0bacca200b2ee924415a7e518bfde5c21a5a135c8a8c1d22619",
+    "file_count": 147,
+    "record_verified": true
+  },
+  "reference": {
+    "commit": "3f07af6f0a1cc2dde6c3b2857b381113538c87cd",
+    "unchanged_inputs": 40,
+    "unchanged_algorithm_files": 5,
+    "inherited_passing_checks": 19
+  },
+  "static_checks": [
+    "Ruff src/tests/tools/deploy passed",
+    "git diff --check passed",
+    "authority-sync.patch applies cleanly",
+    "Authority proposal copy passes the existing document contract test"
+  ],
+  "production_listeners_unchanged": {
+    "8791": 1766,
+    "8971": 1796,
+    "8793": 2734
+  },
+  "local_evidence_sha256": {
+    ".dev/refactor-20261101/FULL-REGRESSION.log": "092bb6d2964762a9443d3a2d6a15a1bafe371582478a5c542c7e112d4e5953f5",
+    ".dev/refactor-20261101/R1-PROBE-RESULTS.json": "765b36a4f955b610e8999a10e5118f64fd6ff48fa277ffb1c85ccc2bebbafc07",
+    ".dev/refactor-20261101/R2-PROBE-RESULTS.json": "33f6b2ad67d7a1fb1187b39023031c011d592bdcda1d596564af22c7203c4466",
+    ".dev/refactor-20261101/R3-COMMON-SCOPE-AFTER.log": "7c74474fdaeacede6746a18b58d57e644fbb8e346f4788a8c605e44ad4bf98e1",
+    ".dev/refactor-20261101/R4-AIRFLOW-RESULT.json": "3d32eed8b55c076cebb6d3510da77c57658caa9ce891ef4198c22caa95976b66",
+    ".dev/refactor-20261101/R4-ACTUAL-SCHEDULING-REGRESSION.log": "e19ecea107c6e982ee2b28554d339310512629835c240298a6be792f14421fdc",
+    ".dev/refactor-20261101/REPORT-SCOPE-REGRESSION-BEFORE.log": "0beba2de6e59ff02850f38f4133f38d84b5136f5d0c1ff91727f1d7dc36d6ccb",
+    ".dev/refactor-20261101/REPORT-SCOPE-REGRESSION-AFTER.log": "ea9ca7909c387ba2b34d44eb5dc946ef97ce42412bde3dbc36a90faf83ea8d7d",
+    ".dev/refactor-20261101/HEADLINE-BEFORE-RESULT.json": "204cf596889afd044981cf0f9bd63b036a03c7e3490d65d2d3ee272ac31bf107",
+    ".dev/refactor-20261101/HEADLINE-AFTER-RESULT.json": "5ac622d3f8f3a0ca9aa8b80556d26ae29538e9d07f26d41be26f4732275c6ccc",
+    ".dev/refactor-20261101/DEVELOPMENT-LAST.json": "55ac257ad50454b8eab20cadcda61cc3b1dcd039a720006ba3fd94462a6fa906",
+    ".dev/refactor-20261101/DEVELOPMENT-SOURCE-PROJECTION.json": "f62365a8eeb7638a563ef2963105ab1a085648325c8bc0566c07bbd9a45a0e95",
+    ".dev/refactor-20261101/DEVELOPMENT-RERUN-PROJECTION.json": "e1db4173f33b3eea217080c6fdd4a6c4dbcacf3db9c021ef9cc2b0345c1c1cf6",
+    ".dev/refactor-20261101/FINAL-DEVELOPMENT-DOM.txt": "e338239236825993886a5540859245a6bc58e3cded65c35a1320e75e361a37a9",
+    ".dev/refactor-20261101/FINAL-DEVELOPMENT-MJCF.png": "17b4a539561920499de25dc02ff9f729f1f53c93c1a42dc3cb86ae0760b52772",
+    ".dev/refactor-20261101/WHEEL-IDENTITY.json": "97488ea6a2f078bd951c37a9034a2bcb0f6404af4de976e64e3e0abcd1c2a912",
+    ".dev/refactor-20261101/R5-DELETION-AUDIT.json": "e47762329faa0aa3490327fcebb0da657f14f3219d642e36a3b434b98615f2f9",
+    ".dev/refactor-20261101/AUTHORITY-PROPOSAL-CHECK.log": "f81ef8011d12c5a04ac46a31b4edb661b8041640e76999659e6f8062256c54b9",
+    ".dev/refactor-20261101/FINAL-ISOLATION.json": "fd1b50781577c5d851897c356137ec38d37f4556da47488aaf3b0189051e75d2",
+    ".dev/refactor-20261101/REFERENCE-INHERITANCE.json": "d29a6e3963b838a89b6ec9fdd502c02f24a5996befe1860bda1040d56c810295"
+  },
+  "open_integration_gates": [
+    "Project owner must apply authoritative documentation and companion contract assertion changes",
+    "Independent fixed-head review and required CI",
+    "Unique publisher must merge main and build/deploy the official release",
+    "Same-release native CAD GUI E2E, both formats and cleanup"
+  ]
+}
