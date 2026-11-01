@@ -88,8 +88,7 @@ async def pico(config):
     return {"role": "pico", "commands": applied, "replay": replay, "archive_unchanged": True}
 
 
-def assessment():
-    import actuator_model
+def assessment(identity):
     import mujoco
     import numpy as np
     from teleop.evaluation.continuous_dynamics.actuator_model import create_actuator_model_runtime, load_public_api
@@ -101,9 +100,10 @@ def assessment():
       forcelimited="true" forcerange="-2 2"/></actuator></mujoco>""")
     data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)
-    package = actuator_model.package_info()
+    package = identity["actuator_model"]
     config = {
         "package": package,
+        "artifact": identity["actuator_model_asset"],
         "selector": {"actuator": "hd1910", "parameter_version": "pd_offset_v1", "friction_model": "m5"},
         "gains": {"kp_fw": 4, "kd_fw": 2},
         "ownership": {"armature": "actuator_model", "damping": "actuator_model", "frictionloss": "actuator_model"},
@@ -138,5 +138,6 @@ def assessment():
 
 
 if __name__ == "__main__":
-    result = asyncio.run(pico(json.load(sys.stdin))) if sys.argv[1] == "pico" else assessment()
+    config = json.load(sys.stdin)
+    result = asyncio.run(pico(config)) if sys.argv[1] == "pico" else assessment(config)
     print(json.dumps(result))
