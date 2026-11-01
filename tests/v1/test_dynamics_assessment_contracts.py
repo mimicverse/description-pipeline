@@ -29,44 +29,72 @@ def source_case(tmp_path: Path):
     artifacts = ArtifactStore(tmp_path / "artifacts")
     inputs = tmp_path / "source"
     inputs.mkdir()
-    contents = {"robot.urdf": b"<robot name='test'/>", "robot.xml": b"<mujoco/>",
-                "urdf-certificate.json": b'{"scope":"software"}',
-                "mjcf-certificate.json": b'{"scope":"structural"}'}
+    contents = {
+        "robot.urdf": b"<robot name='test'/>",
+        "robot.xml": b"<mujoco/>",
+        "urdf-certificate.json": b'{"scope":"software","warnings":[{"code":"SOURCE_LIMITATION"}]}',
+        "mjcf-certificate.json": b'{"scope":"structural"}',
+    }
     for name, content in contents.items():
         (inputs / name).write_bytes(content)
-    artifact = artifacts.seal_tree(inputs, kind="source_fixture", producer_run_id="source-run",
-                                   producer_stage=None, producer_tool_sha256=digest({"tool": "source"}))
+    artifact = artifacts.seal_tree(
+        inputs,
+        kind="source_fixture",
+        producer_run_id="source-run",
+        producer_stage=None,
+        producer_tool_sha256=digest({"tool": "source"}),
+    )
 
     def member(name):
         return MemberRef(artifact, name, len(contents[name]), hashlib.sha256(contents[name]).hexdigest()).to_record()
 
-    source = SourceBinding({"schema": SOURCE_SCHEMA, "run_id": "source-run", "dag_run_id": "source-dag-run",
-                            "subject_sha256": digest(contents["robot.xml"].decode()),
-                            "urdf": member("robot.urdf"), "mjcf": member("robot.xml"),
-                            "certificates": {"urdf": member("urdf-certificate.json"),
-                                             "mjcf": member("mjcf-certificate.json")},
-                            "warnings": [{"code": "SOURCE_LIMITATION", "message": "Software source only"}]})
+    source = SourceBinding(
+        {
+            "schema": SOURCE_SCHEMA,
+            "run_id": "source-run",
+            "dag_run_id": "source-dag-run",
+            "subject_sha256": digest(contents["robot.xml"].decode()),
+            "urdf": member("robot.urdf"),
+            "mjcf": member("robot.xml"),
+            "certificates": {"urdf": member("urdf-certificate.json"), "mjcf": member("mjcf-certificate.json")},
+        }
+    )
     return artifacts, source
 
 
 def runtime_pin():
-    return RuntimePin({"schema": RUNTIME_SCHEMA, "source_commit": "a" * 40, "wheel_sha256": "b" * 64,
-                       "files": {"teleop/__init__.py": "c" * 64},
-                       "dependency_versions": {"robot-teleop": "0.3.0", "mujoco": "3.13.0", "numpy": "2.4.1"}})
+    return RuntimePin(
+        {
+            "schema": RUNTIME_SCHEMA,
+            "source_commit": "a" * 40,
+            "wheel_sha256": "b" * 64,
+            "files": {"teleop/__init__.py": "c" * 64},
+            "dependency_versions": {"robot-teleop": "0.3.0", "mujoco": "3.13.0", "numpy": "2.4.1"},
+        }
+    )
 
 
 def request_case(tmp_path):
     artifacts, source = source_case(tmp_path)
-    request = AssessmentRequest({"schema": REQUEST_SCHEMA, "principal": "tenant:owner",
-                                 "source": source.to_record(), "bundle": None,
-                                 "runtime": runtime_pin().to_record(), "executor_sha256": "d" * 64})
+    request = AssessmentRequest(
+        {
+            "schema": REQUEST_SCHEMA,
+            "principal": "tenant:owner",
+            "source": source.to_record(),
+            "bundle": None,
+            "runtime": runtime_pin().to_record(),
+            "executor_sha256": "d" * 64,
+        }
+    )
     return artifacts, request
 
 
 def test_source_verification_reads_exact_members_and_retains_warnings(tmp_path):
     artifacts, request = request_case(tmp_path)
     request.source.verify(artifacts)
-    assert request.source.record["warnings"] == [{"code": "SOURCE_LIMITATION", "message": "Software source only"}]
+    certificate = MemberRef.from_record(request.source.record["certificates"]["urdf"])
+    assert parse_json(certificate.read(artifacts))["warnings"] == [{"code": "SOURCE_LIMITATION"}]
+    assert "warnings" not in request.source.record
     assert request.bundle is None
 
 
@@ -91,10 +119,10 @@ def test_request_values_do_not_alias_callers_or_returned_records(tmp_path):
     _artifacts, request = request_case(tmp_path)
     original = request.sha256
     record = request.to_record()
-    record["source"]["warnings"].clear()
+    record["source"]["certificates"].clear()
     request.record["runtime"]["files"].clear()
     assert request.sha256 == original
-    assert request.source.record["warnings"]
+    assert set(request.source.record["certificates"]) == {"urdf", "mjcf"}
     assert request.runtime.record["files"]
 
 
@@ -114,7 +142,7 @@ def test_wrong_bundle_role_cannot_impersonate_an_execution_bundle(tmp_path):
         AssessmentRequest(record)
 
 
-@pytest.mark.parametrize("raw", [b'{"a":1,"a":2}', b'{"a":NaN}', b'[]'])
+@pytest.mark.parametrize("raw", [b'{"a":1,"a":2}', b'{"a":NaN}', b"[]"])
 def test_ambiguous_and_nonfinite_json_is_not_accepted(raw):
     with pytest.raises(AssessmentError):
         parse_json(raw)

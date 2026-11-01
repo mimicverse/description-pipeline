@@ -18,6 +18,7 @@ SOURCE_SCHEMA = "description.assessment-source/v1"
 REQUEST_SCHEMA = "description.dynamics-assessment-request/v1"
 BUNDLE_SCHEMA = "description.dynamics-execution-bundle/v1"
 RUNTIME_SCHEMA = "description.assessment-runtime/v1"
+RESULT_SCHEMA = "description.dynamics-assessment-result/v1"
 DAG_ID = "upper_body_dynamics"
 BUNDLE_MEMBER = "assessment.json"
 TERMINAL_STATES = frozenset({"completed", "unsupported", "failed", "cancelled", "timeout"})
@@ -38,6 +39,10 @@ class AssessmentDisabled(AssessmentError):
     """The optional assessment feature is disabled."""
 
 
+class SourceNotReady(AssessmentError):
+    """An authorized source has no complete engineering artifact/certificate pair yet."""
+
+
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise AssessmentError(message)
@@ -56,9 +61,13 @@ def sha(value: Any, name: str) -> str:
 def relative(value: Any, name: str) -> str:
     value = text(value, name)
     path = PurePosixPath(value)
-    require(not path.is_absolute() and "\\" not in value and ":" not in value
-            and all(part not in {"", ".", ".."} for part in value.split("/")),
-            f"{name} must be a confined relative path")
+    require(
+        not path.is_absolute()
+        and "\\" not in value
+        and ":" not in value
+        and all(part not in {"", ".", ".."} for part in value.split("/")),
+        f"{name} must be a confined relative path",
+    )
     return value
 
 
@@ -115,8 +124,7 @@ class MemberRef:
         sha(self.sha256, "Member digest")
 
     def to_record(self) -> dict:
-        return {"artifact": self.artifact.to_record(), "path": self.path,
-                "bytes": self.bytes, "sha256": self.sha256}
+        return {"artifact": self.artifact.to_record(), "path": self.path, "bytes": self.bytes, "sha256": self.sha256}
 
     @classmethod
     def from_record(cls, value: Any) -> MemberRef:
@@ -127,9 +135,13 @@ class MemberRef:
         import hashlib
 
         data, member, _manifest = artifacts.read_metadata_member(self.artifact, self.path, max_bytes=self.bytes)
-        require(member["bytes"] == self.bytes and member["sha256"] == self.sha256
-                and len(data) == self.bytes and hashlib.sha256(data).hexdigest() == self.sha256,
-                "Source member differs from the registered source identity")
+        require(
+            member["bytes"] == self.bytes
+            and member["sha256"] == self.sha256
+            and len(data) == self.bytes
+            and hashlib.sha256(data).hexdigest() == self.sha256,
+            "Source member differs from the registered source identity",
+        )
         return data
 
 
@@ -155,8 +167,11 @@ class SourceBinding(_ImmutableRecord):
 
     def __init__(self, record: dict):
         value = copy.deepcopy(record)
-        object_record(value, {"schema", "run_id", "dag_run_id", "subject_sha256", "urdf", "mjcf",
-                              "certificates", "warnings"}, "Assessment source")
+        object_record(
+            value,
+            {"schema", "run_id", "dag_run_id", "subject_sha256", "urdf", "mjcf", "certificates"},
+            "Assessment source",
+        )
         require(value["schema"] == SOURCE_SCHEMA, "Assessment source schema is unsupported")
         text(value["run_id"], "Source run")
         text(value["dag_run_id"], "Source DagRun")
@@ -166,8 +181,6 @@ class SourceBinding(_ImmutableRecord):
         certificates = object_record(value["certificates"], {"urdf", "mjcf"}, "Source certificates")
         for item in certificates.values():
             MemberRef.from_record(item)
-        require(isinstance(value["warnings"], list) and all(isinstance(item, dict) for item in value["warnings"]),
-                "Source warnings must be preserved as structured records")
         self._freeze(value)
 
     def to_record(self) -> dict:
@@ -193,11 +206,14 @@ class RuntimePin(_ImmutableRecord):
 
     def __init__(self, record: dict):
         value = copy.deepcopy(record)
-        object_record(value, {"schema", "source_commit", "wheel_sha256", "files", "dependency_versions"},
-                      "Assessment runtime")
+        object_record(
+            value, {"schema", "source_commit", "wheel_sha256", "files", "dependency_versions"}, "Assessment runtime"
+        )
         require(value["schema"] == RUNTIME_SCHEMA, "Assessment runtime schema is unsupported")
-        require(isinstance(value["source_commit"], str) and _COMMIT.fullmatch(value["source_commit"]),
-                "Runtime source commit is invalid")
+        require(
+            isinstance(value["source_commit"], str) and _COMMIT.fullmatch(value["source_commit"]),
+            "Runtime source commit is invalid",
+        )
         sha(value["wheel_sha256"], "Runtime wheel")
         require(isinstance(value["files"], dict) and bool(value["files"]), "Runtime file closure is required")
         for name, value_digest in value["files"].items():
@@ -205,8 +221,10 @@ class RuntimePin(_ImmutableRecord):
             require(name.startswith("teleop/"), "Runtime file must belong to Teleop")
             sha(value_digest, "Runtime file digest")
         versions = value["dependency_versions"]
-        require(isinstance(versions, dict) and {"robot-teleop", "mujoco", "numpy"} <= set(versions),
-                "Runtime dependency versions are incomplete")
+        require(
+            isinstance(versions, dict) and {"robot-teleop", "mujoco", "numpy"} <= set(versions),
+            "Runtime dependency versions are incomplete",
+        )
         for name, version in versions.items():
             text(name, "Dependency name")
             text(version, "Dependency version")
@@ -225,8 +243,9 @@ class AssessmentRequest(_ImmutableRecord):
 
     def __init__(self, record: dict):
         value = copy.deepcopy(record)
-        object_record(value, {"schema", "principal", "source", "bundle", "runtime", "executor_sha256"},
-                      "Assessment request")
+        object_record(
+            value, {"schema", "principal", "source", "bundle", "runtime", "executor_sha256"}, "Assessment request"
+        )
         require(value["schema"] == REQUEST_SCHEMA, "Assessment request schema is unsupported")
         text(value["principal"], "Assessment principal")
         SourceBinding(value["source"])
@@ -234,8 +253,10 @@ class AssessmentRequest(_ImmutableRecord):
         sha(value["executor_sha256"], "Assessment executor")
         if value["bundle"] is not None:
             bundle = ArtifactRef.from_record(value["bundle"])
-            require(bundle.kind == "dynamics_execution_bundle" and bundle.producer_stage is None,
-                    "Execution bundle must be a separately sealed auxiliary artifact")
+            require(
+                bundle.kind == "dynamics_execution_bundle" and bundle.producer_stage is None,
+                "Execution bundle must be a separately sealed auxiliary artifact",
+            )
         self._freeze(value)
 
     def to_record(self) -> dict:
@@ -260,8 +281,11 @@ class AssessmentRequest(_ImmutableRecord):
 
 
 def dispatch_conf(request_id: str, attempt_id: str, request: AssessmentRequest) -> dict:
-    return {"request_id": text(request_id, "Assessment request id"),
-            "attempt_id": text(attempt_id, "Assessment attempt id"), "request_sha256": request.sha256}
+    return {
+        "request_id": text(request_id, "Assessment request id"),
+        "attempt_id": text(attempt_id, "Assessment attempt id"),
+        "request_sha256": request.sha256,
+    }
 
 
 def auxiliary_dag_run_id(attempt_id: str) -> str:
