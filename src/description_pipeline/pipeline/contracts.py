@@ -59,6 +59,15 @@ class StageCancellationRequested(ProtocolError):
         super().__init__("cancel.requested", {"cancel_command_id": cancel_command.command_id})
 
 
+class SourceInputError(PipelineError):
+    """A current typed input validator rejected a specific upstream stage."""
+
+    def __init__(self, stage: str, cause: Exception) -> None:
+        self.stage = stage
+        self.cause = cause
+        super().__init__(f"The sealed {stage} source is incompatible: {cause}; recompute {stage}")
+
+
 @dataclass(frozen=True, slots=True)
 class AdmissionControl:
     """The single administrative admission gate row."""
@@ -1500,6 +1509,11 @@ def qualify_stage(
         raise ProtocolError("qualification.invalid", {"where": "command.stage"})
     if not isinstance(admission, RunAdmission) or admission.run_id != command.run_id:
         raise ProtocolError("qualification.admission_mismatch", {"run_id": command.run_id})
+    if command.diagnostic_scope is None and command.stage not in execution_stage_ids(
+        admission.from_stage,
+        through=admission.request.get("through_stage") or "publish",
+    ):
+        raise ProtocolError("qualification.admission_mismatch", {"where": "execution_scope"})
     if command.diagnostic_scope is not None and admission.from_stage != command.stage:
         raise ProtocolError("qualification.admission_mismatch", {"where": "from_stage"})
     if (result is None) == (failure is None):
@@ -1722,14 +1736,15 @@ def project_run_status(
     pending_effect_states: tuple[str, ...] = (),
     expired_claim: bool = False,
     from_stage: StageId | None = None,
+    through_stage: StageId | None = None,
 ) -> RunStatus:
     """Derive a run status from ordered stage decisions and effect facts."""
 
     if len(stage_outcomes) != len(STAGE_IDS):
         raise ProtocolError("run_status.invalid", {"reason": "complete-stage-outcome-vector-required"})
-    if from_stage not in {None, "freeze", "mjcf"}:
+    if from_stage not in {None, *STAGE_IDS}:
         raise ProtocolError("run_status.invalid", {"where": "from_stage"})
-    selected = execution_stage_ids(from_stage)
+    selected = execution_stage_ids(from_stage, through=through_stage or "publish")
     if any(outcome is not None for stage, outcome in zip(STAGE_IDS, stage_outcomes, strict=True)
            if stage not in selected):
         raise ProtocolError("run_status.invalid", {"reason": "reused-upstream-has-new-decisions"})

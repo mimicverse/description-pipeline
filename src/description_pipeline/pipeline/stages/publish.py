@@ -58,6 +58,7 @@ from ..contracts import (
     StageEffectWait,
     StageExecution,
     StageFailure,
+    SourceInputError,
 )
 from ..effects import EffectIntent, EffectSettlement, EffectState, StageEffectPort
 from ..engine import StageWorkspace
@@ -2297,6 +2298,72 @@ class PublishPullRequestStatusProbe:
         )
 
 
+def _source_certificates(command, request, generate_root, capture_root, verify_root, mjcf_root):
+    try:
+        certificate, execution = _certificate(
+            request=request,
+            verify_root=verify_root,
+            generate_root=generate_root,
+            capture_root=capture_root,
+            command=command,
+        )
+    except (ProtocolError, SourceInputError):
+        raise
+    except PipelineError as error:
+        raise SourceInputError("verify", error) from error
+    try:
+        mjcf_record = _require_object(read_data(mjcf_root / mjcf_contract.REPORT_PATH), "MJCF certificate")
+        if not isinstance(mjcf_record.get("command"), Mapping):
+            raise PipelineError("Publish MJCF certificate has no source command")
+        mjcf_command = StageCommand.from_record(mjcf_record["command"])
+        if (
+            mjcf_command.command_id != request.mjcf_command_id
+            or mjcf_command.request_digest != request.mjcf_request_digest
+            or mjcf_command.run_id != request.mjcf_artifact.producer_run_id
+            or (command.diagnostic_scope is None and (mjcf_command.diagnostic_scope is not None))
+            or mjcf_command.expected_executor_sha256 != request.mjcf_artifact.producer_tool_sha256
+            or file_digest(mjcf_root / mjcf_contract.REPORT_PATH) != request.mjcf_certificate_sha256
+        ):
+            raise PipelineError("Publish MJCF certificate differs from its completed predecessor")
+        validate_mjcf_certificate(
+            mjcf_root,
+            mjcf_command,
+            source_roots={
+                "generate": generate_root,
+                "capture": capture_root,
+                "verify": verify_root,
+            },
+        )
+    except (ProtocolError, SourceInputError):
+        raise
+    except PipelineError as error:
+        raise SourceInputError("mjcf", error) from error
+    return certificate, execution
+
+
+def validate_source_inputs(command: StageCommand, artifacts: ArtifactStore) -> None:
+    """Validate exact delivery inputs without a candidate, Git command or PR call."""
+    request = _request_contract(command)
+    with tempfile.TemporaryDirectory(prefix="publish-source-inputs-") as temporary:
+        roots = {
+            ref.artifact_id: artifacts.materialize(ref, Path(temporary) / ref.artifact_id)
+            for ref in (
+                request.generate_artifact,
+                request.capture_artifact,
+                request.verify_artifact,
+                request.mjcf_artifact,
+            )
+        }
+        _source_certificates(
+            command,
+            request,
+            roots[request.generate_artifact.artifact_id],
+            roots[request.capture_artifact.artifact_id],
+            roots[request.verify_artifact.artifact_id],
+            roots[request.mjcf_artifact.artifact_id],
+        )
+
+
 class PublishHandler:
     """Publish one verified pair through separate Git and PR effects."""
 
@@ -2335,29 +2402,9 @@ class PublishHandler:
         capture_root = Path(workspace.inputs[request.capture_artifact.artifact_id])
         verify_root = Path(workspace.inputs[request.verify_artifact.artifact_id])
         mjcf_root = Path(workspace.inputs[request.mjcf_artifact.artifact_id])
-        certificate, execution = _certificate(
-            request=request,
-            verify_root=verify_root,
-            generate_root=generate_root,
-            capture_root=capture_root,
-            command=command,
+        certificate, execution = _source_certificates(
+            command, request, generate_root, capture_root, verify_root, mjcf_root
         )
-        mjcf_record = _require_object(read_data(mjcf_root / mjcf_contract.REPORT_PATH), "MJCF certificate")
-        if not isinstance(mjcf_record.get("command"), Mapping):
-            raise PipelineError("Publish MJCF certificate has no source command")
-        mjcf_command = StageCommand.from_record(mjcf_record["command"])
-        if (mjcf_command.command_id != request.mjcf_command_id
-                or mjcf_command.request_digest != request.mjcf_request_digest
-                or mjcf_command.run_id != request.mjcf_artifact.producer_run_id
-                or (command.diagnostic_scope is None and (
-                    mjcf_command.run_id != command.run_id or mjcf_command.diagnostic_scope is not None
-                ))
-                or mjcf_command.expected_executor_sha256 != request.mjcf_artifact.producer_tool_sha256
-                or file_digest(mjcf_root / mjcf_contract.REPORT_PATH) != request.mjcf_certificate_sha256):
-            raise PipelineError("Publish MJCF certificate differs from its completed predecessor")
-        validate_mjcf_certificate(mjcf_root, mjcf_command, source_roots={
-            "generate": generate_root, "capture": capture_root, "verify": verify_root,
-        })
         publication_root, subject, title, body = _publication_root(
             request=request,
             command=command,

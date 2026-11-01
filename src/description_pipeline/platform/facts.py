@@ -16,7 +16,7 @@ from datetime import datetime
 from typing import Protocol
 
 from ..io import PipelineError, digest
-from ..stages import STAGE_IDS
+from ..stages import STAGE_IDS, execution_stage_ids
 from ..pipeline.admission import (
     AdmissionSpec,
     VerifiedDiscoverResult,
@@ -25,7 +25,7 @@ from ..pipeline.admission import (
     VerifiedVerifyResult,
     validate_run_admission,
     validate_store_command,
-    validate_mjcf_successor,
+    validate_source_successor,
 )
 from ..pipeline.diagnostic import (
     DiagnosticAdmissionSpec,
@@ -171,6 +171,7 @@ def _run_state_from_canonical_facts(
         return project_run_status(
             stage_outcomes=outcomes,
             from_stage=request.get("from_stage"),
+            through_stage=request.get("through_stage"),
             effect_states=effect_states,
             pending_effect_states=pending_effect_states,
             expired_claim=expired_claim,
@@ -851,9 +852,32 @@ class FactStore(RunControlStore):
     def _lock_command_cursor(self, cursor, command_id: str) -> None:
         self._lock_advisory_cursor(cursor, _ADVISORY_COMMAND, command_id)
 
+    def _admission_ancestry_cursor(self, cursor, admission: RunAdmission) -> tuple[RunAdmission, ...]:
+        """Read immutable ancestry in the one root-to-leaf lock order."""
+        ancestry, seen = [], set()
+        while True:
+            if admission.run_id in seen:
+                raise FactConflict("The source admission ancestry is cyclic")
+            seen.add(admission.run_id)
+            ancestry.append(admission)
+            if admission.parent_run_id is None:
+                return tuple(reversed(ancestry))
+            admission = self._load_admission_cursor(cursor, admission.parent_run_id)
+            if admission is None:
+                raise FactConflict("The source admission is missing")
+
     def _lock_command_chain_cursor(self, cursor, command: StageCommand) -> None:
         predecessors = self._completed_predecessor_chain_cursor(cursor, command)
-        runs = dict.fromkeys([item.run_id for item in reversed(predecessors)] + [command.run_id])
+        ancestry = ()
+        if command.stage in {"discover", "capture", "publish"} or any(
+            item.run_id != command.run_id for item in predecessors
+        ):
+            admission = self._load_admission_cursor(cursor, command.run_id)
+            if admission is not None:
+                ancestry = self._admission_ancestry_cursor(cursor, admission)
+        runs = dict.fromkeys(
+            [item.run_id for item in ancestry] + [item.run_id for item in reversed(predecessors)] + [command.run_id]
+        )
         for run_id in runs:
             self._lock_run_cursor(cursor, run_id)
         for predecessor in reversed(predecessors):
@@ -1031,7 +1055,12 @@ class FactStore(RunControlStore):
         command: StageCommand,
         dispatch_command: DispatchCommand,
         dispatch_outbound_artifact: ArtifactRef,
-        *, verify_result: VerifiedVerifyResult | None = None,
+        *,
+        predecessor: VerifiedPredecessor | None = None,
+        supporting_predecessors: tuple[VerifiedPredecessor, ...] = (),
+        discover_result: VerifiedDiscoverResult | None = None,
+        verify_result: VerifiedVerifyResult | None = None,
+        publish_intent: VerifiedPublishIntent | None = None,
     ) -> tuple[StageCommand, DispatchCommand, EffectIntent]:
         """Atomically admit the run, entry command and technical dispatch."""
 
@@ -1039,14 +1068,13 @@ class FactStore(RunControlStore):
             raise FactStoreError("A canonical RunAdmission is required")
         if not isinstance(command, StageCommand) or not isinstance(dispatch_command, DispatchCommand):
             raise FactStoreError("Canonical Freeze and dispatch commands are required")
-        entry_stage = "mjcf" if admission.from_stage == "mjcf" else "freeze"
+        entry_stage = admission.from_stage or "freeze"
         if command.run_id != admission.run_id or command.stage != entry_stage or command.kind != "stage":
             raise FactStoreError("Admission must create its declared entry stage command")
-        if entry_stage == "mjcf":
-            if not isinstance(verify_result, VerifiedVerifyResult):
-                raise FactStoreError("MJCF admission requires a passing source Verify result")
-        elif command.predecessor_decision_id is not None or verify_result is not None:
-            raise FactStoreError("The initial Freeze command cannot have a predecessor decision")
+        if predecessor is None and verify_result is not None and entry_stage == "mjcf":
+            predecessor = verify_result.predecessor
+        if entry_stage == "freeze" and (predecessor is not None or supporting_predecessors):
+            raise FactStoreError("The Freeze entry cannot have predecessor decisions")
         if (
             dispatch_command.run_id != admission.run_id
             or dispatch_command.entry_command_id != command.command_id
@@ -1056,9 +1084,14 @@ class FactStore(RunControlStore):
         try:
             spec = AdmissionSpec.from_record(admission.request)
             validate_store_command(
-                spec, admission, command,
-                predecessor=verify_result.predecessor if verify_result is not None else None,
+                spec,
+                admission,
+                command,
+                predecessor=predecessor,
+                supporting_predecessors=supporting_predecessors,
+                discover_result=discover_result,
                 verify_result=verify_result,
+                publish_intent=publish_intent,
             )
         except ProtocolError as error:
             raise FactStoreError("The admission and entry command fail typed semantic validation") from error
@@ -1069,16 +1102,16 @@ class FactStore(RunControlStore):
         with self._transaction() as connection:
             cursor = connection.cursor()
             _require_open(cursor)
-            if verify_result is not None:
-                self._lock_run_cursor(cursor, admission.parent_run_id)
+            if admission.parent_run_id is not None:
                 source_admission = self._load_admission_cursor(cursor, admission.parent_run_id)
                 if source_admission is None:
-                    raise FactStoreError("The MJCF source run is not admitted")
-                validate_mjcf_successor(spec, AdmissionSpec.from_record(source_admission.request))
-                summaries = read_admitted_runs(connection, run_id=source_admission.run_id)
-                if len(summaries) != 1 or summaries[0].state not in {"succeeded", "failed", "cancelled"}:
-                    raise FactStoreError("The MJCF source run has no settled terminal outcome")
-                self._verify_registered_predecessor_cursor(cursor, source_admission, verify_result.predecessor)
+                    raise FactStoreError("The source run is not admitted")
+                for source in self._admission_ancestry_cursor(cursor, source_admission):
+                    self._lock_run_cursor(cursor, source.run_id)
+                validate_source_successor(spec, AdmissionSpec.from_record(source_admission.request))
+            for verified in ((predecessor,) if predecessor is not None else ()) + supporting_predecessors:
+                owner = self._source_owner_admission_cursor(cursor, admission, verified.stage)
+                self._verify_registered_predecessor_cursor(cursor, owner, verified)
             existing = self._load_admission_cursor(cursor, admission.run_id)
             if existing is not None:
                 if existing != admission:
@@ -1094,6 +1127,8 @@ class FactStore(RunControlStore):
                 ):
                     raise FactConflict(f"The run {admission.run_id!r} carries a different dispatch")
                 return stored_command, stored_dispatch, stored_intent
+            if admission.parent_run_id is not None:
+                self._validate_source_activity_cursor(cursor, spec)
             cursor.execute("SELECT run_id FROM run_admission WHERE request_id = %s", (admission.request_id,))
             if cursor.fetchone() is not None:
                 raise FactConflict(f"The request {admission.request_id!r} is already admitted")
@@ -1443,12 +1478,9 @@ class FactStore(RunControlStore):
             if stored_admission != admission:
                 raise FactConflict("The supplied admission differs from the registered admission")
             for verified in predecessors:
-                owner_admission = admission
-                if verified.command.run_id != admission.run_id:
-                    owner_admission = self._load_admission_cursor(cursor, verified.command.run_id)
-                    if owner_admission is None:
-                        raise FactStoreError("The reused predecessor has no source admission")
-                    validate_mjcf_successor(spec, AdmissionSpec.from_record(owner_admission.request))
+                owner_admission = self._source_owner_admission_cursor(cursor, admission, verified.stage)
+                if owner_admission.run_id != verified.command.run_id:
+                    raise FactConflict("The predecessor is not the declared source stage owner")
                 self._verify_registered_predecessor_cursor(cursor, owner_admission, verified)
             if discover_result is not None:
                 for artifact in (
@@ -1465,6 +1497,62 @@ class FactStore(RunControlStore):
                 return existing
             self._insert_command_cursor(cursor, command)
             return command
+
+    def _source_owner_admission_cursor(self, cursor, admission: RunAdmission, stage: str) -> RunAdmission:
+        """Resolve a required stage through immutable executed/reused ranges."""
+        seen = set()
+        while True:
+            if admission.run_id in seen:
+                raise FactConflict("The source admission ancestry is cyclic")
+            seen.add(admission.run_id)
+            spec = AdmissionSpec.from_record(admission.request)
+            scope = execution_stage_ids(spec.from_stage, through=spec.through_stage or "publish")
+            if stage in scope:
+                return admission
+            if STAGE_IDS.index(stage) >= STAGE_IDS.index(spec.from_stage or "freeze") or spec.parent_run_id is None:
+                raise FactConflict("The source has no result for the required stage")
+            source = self._load_admission_cursor(cursor, spec.parent_run_id)
+            if source is None:
+                raise FactConflict("The source admission is missing")
+            validate_source_successor(spec, AdmissionSpec.from_record(source.request))
+            admission = source
+
+    def validate_source_activity(self, spec: AdmissionSpec) -> None:
+        """Check only external work relevant to the selected immutable range."""
+        with self._transaction() as connection:
+            self._validate_source_activity_cursor(connection.cursor(), spec)
+
+    def _validate_source_activity_cursor(self, cursor, spec: AdmissionSpec) -> None:
+        scope = execution_stage_ids(spec.from_stage, through=spec.through_stage or "publish")
+        stages = set()
+        if any(stage in scope for stage in ("discover", "capture")):
+            stages.update(("discover", "capture"))
+        if "publish" in scope:
+            stages.add("publish")
+        if not stages or spec.parent_run_id is None:
+            return
+        source = self._load_admission_cursor(cursor, spec.parent_run_id)
+        if source is None:
+            raise FactConflict("The source admission is missing")
+        ancestry = self._admission_ancestry_cursor(cursor, source)
+        for admission in ancestry:
+            self._lock_run_cursor(cursor, admission.run_id)
+        for admission in ancestry:
+            cursor.execute(
+                "SELECT command.command_id, command.stage, decision.outcome "
+                "FROM command LEFT JOIN stage_decision AS decision "
+                "ON decision.command_id = command.command_id "
+                "WHERE command.run_id = %s AND command.kind = 'stage' AND command.stage = ANY(%s::text[])",
+                (admission.run_id, sorted(stages)),
+            )
+            for command_id, stage, outcome in cursor.fetchall():
+                states = self._effect_states_for_command_cursor(cursor, command_id, lock=True)
+                if outcome is None or any(
+                    state in {EffectState.UNKNOWN, EffectState.CONFLICT} for state in states.values()
+                ):
+                    raise FactConflict(
+                        f"The source {stage} command {command_id!r} has active or unresolved external work"
+                    )
 
     def _verify_registered_predecessor_cursor(
         self,
@@ -1610,11 +1698,11 @@ class FactStore(RunControlStore):
                 raise FactConflict("The predecessor decision has no canonical stage command")
             if predecessor.run_id != current.run_id:
                 admission = self._load_admission_cursor(cursor, current.run_id)
-                source = self._load_admission_cursor(cursor, predecessor.run_id)
-                if (admission is None or source is None or current.stage != "mjcf" or predecessor.stage != "verify"):
-                    raise FactConflict("Only the declared MJCF-to-Verify source edge may cross runs")
-                validate_mjcf_successor(AdmissionSpec.from_record(admission.request),
-                                        AdmissionSpec.from_record(source.request))
+                if admission is None:
+                    raise FactConflict("The command admission is missing")
+                owner = self._source_owner_admission_cursor(cursor, admission, predecessor.stage)
+                if owner.run_id != predecessor.run_id:
+                    raise FactConflict("The predecessor belongs to another source owner")
             if (
                 decision.outcome != "completed"
                 or STAGE_IDS.index(predecessor.stage) >= STAGE_IDS.index(current.stage)
@@ -1883,6 +1971,14 @@ class FactStore(RunControlStore):
                 self._lock_command_cursor(cursor, command_id)
             if stored_command is not None:
                 self._verify_completed_predecessor_chain_cursor(cursor, stored_command)
+                if (
+                    stored_command.stage in {"discover", "capture", "publish"}
+                    and stored_command.diagnostic_scope is None
+                ):
+                    admission = self._load_admission_cursor(cursor, stored_command.run_id)
+                    if admission is None:
+                        raise FactConflict("The external stage command has no admission")
+                    self._validate_source_activity_cursor(cursor, AdmissionSpec.from_record(admission.request))
             self._lock_effect_ledger_cursor(cursor, command_id)
             effect_settlements = self._effect_settlements_for_command_cursor(
                 cursor,

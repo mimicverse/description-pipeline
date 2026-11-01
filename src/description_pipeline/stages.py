@@ -45,7 +45,7 @@ PORTABLE_STAGES = tuple(stage for stage, hosts in HOST_BY_STAGE.items() if hosts
 
 def execution_stage_ids(from_stage: str | None = None, *, through: str = "publish") -> tuple[str, ...]:
     """Derive the execution range from the immutable admission and stage contract."""
-    if from_stage not in {None, "freeze", "mjcf"} or through not in STAGE_IDS:
+    if from_stage not in {None, *STAGE_IDS} or through not in STAGE_IDS:
         raise PipelineError("The admitted execution range is invalid")
     start = STAGE_IDS.index(from_stage or "freeze")
     end = STAGE_IDS.index(through)

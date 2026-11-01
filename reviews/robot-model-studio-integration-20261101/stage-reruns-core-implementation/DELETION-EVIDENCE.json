@@ -1,0 +1,44 @@
+[
+  {
+    "name": "removed_specialized_admission",
+    "command": [
+      "rg",
+      "-n",
+      "ProductionFreezeSuccessorRequest|ProductionMJCFSuccessorRequest|load_production_freeze_successor|load_production_mjcf_successor|admit_from_frozen_freeze|admit_mjcf_successor|validate_mjcf_successor|load_verified_freeze_origins",
+      "src/description_pipeline/pipeline",
+      "src/description_pipeline/platform",
+      "src/description_pipeline/orchestration/run_ownership.py"
+    ],
+    "exit_code": 1,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "removed_global_source_terminal_gate",
+    "command": [
+      "rg",
+      "-n",
+      "_settled_source|source.*terminal outcome|source.*state.*succeeded|parent\\[\"state\"\\].*succeeded",
+      "src/description_pipeline/pipeline",
+      "src/description_pipeline/platform",
+      "src/description_pipeline/orchestration/run_ownership.py"
+    ],
+    "exit_code": 1,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "real_generic_calls",
+    "command": [
+      "rg",
+      "-n",
+      "admit_stage_rerun|project_entry_command|validate_source_activity|source_context_from_projection|validate_generate_source|_admission_ancestry_cursor",
+      "src/description_pipeline/pipeline",
+      "src/description_pipeline/platform",
+      "src/description_pipeline/orchestration/run_ownership.py"
+    ],
+    "exit_code": 0,
+    "stdout": "src/description_pipeline/orchestration/run_ownership.py:445:            from ..pipeline.admission import source_context_from_projection, build_stage_command\nsrc/description_pipeline/orchestration/run_ownership.py:449:            predecessors, discovered, verified = source_context_from_projection(spec, source_projection, artifacts)\nsrc/description_pipeline/pipeline/verify.py:780:def validate_generate_source(command: StageCommand, output: ArtifactRef, artifacts) -> None:\nsrc/description_pipeline/platform/facts.py:855:    def _admission_ancestry_cursor(self, cursor, admission: RunAdmission) -> tuple[RunAdmission, ...]:\nsrc/description_pipeline/platform/facts.py:877:                ancestry = self._admission_ancestry_cursor(cursor, admission)\nsrc/description_pipeline/platform/facts.py:1109:                for source in self._admission_ancestry_cursor(cursor, source_admission):\nsrc/description_pipeline/platform/facts.py:1131:                self._validate_source_activity_cursor(cursor, spec)\nsrc/description_pipeline/platform/facts.py:1520:    def validate_source_activity(self, spec: AdmissionSpec) -> None:\nsrc/description_pipeline/platform/facts.py:1523:            self._validate_source_activity_cursor(connection.cursor(), spec)\nsrc/description_pipeline/platform/facts.py:1525:    def _validate_source_activity_cursor(self, cursor, spec: AdmissionSpec) -> None:\nsrc/description_pipeline/platform/facts.py:1537:        ancestry = self._admission_ancestry_cursor(cursor, source)\nsrc/description_pipeline/platform/facts.py:1981:                    self._validate_source_activity_cursor(cursor, AdmissionSpec.from_record(admission.request))\nsrc/description_pipeline/platform/queries.py:862:            from ..pipeline.admission import source_context_from_projection, build_stage_command\nsrc/description_pipeline/platform/queries.py:865:            predecessors, discovered, verified = source_context_from_projection(spec, parent, artifacts)\nsrc/description_pipeline/pipeline/admission.py:1479:def source_context_from_projection(spec: AdmissionSpec, projection: Mapping, artifacts):\nsrc/description_pipeline/pipeline/admission.py:1521:            from .verify import validate_generate_source\nsrc/description_pipeline/pipeline/admission.py:1523:            validate_generate_source(command, result.output_artifact, artifacts)\nsrc/description_pipeline/pipeline/ingestion.py:613:    def project_entry_command(self, spec: AdmissionSpec, *, validate_inputs: bool = True) -> StageCommand: ...\nsrc/description_pipeline/pipeline/ingestion.py:1318:    def admit_stage_rerun(\nsrc/description_pipeline/pipeline/ingestion.py:1335:            entry = application.project_entry_command(spec, validate_inputs=False)\nsrc/description_pipeline/pipeline/ingestion.py:1393:        application.project_entry_command(spec)\nsrc/description_pipeline/pipeline/ingestion.py:1396:        entry = application.project_entry_command(spec)\nsrc/description_pipeline/pipeline/ingestion.py:1427:    return ProductionAdmissionFactory(**factory_options).admit_stage_rerun(application, request)\nsrc/description_pipeline/pipeline/application.py:367:    def validate_source_activity(self, spec: AdmissionSpec) -> None: ...\nsrc/description_pipeline/pipeline/application.py:844:        entry_command = self.project_entry_command(spec, validate_inputs=False)\nsrc/description_pipeline/pipeline/application.py:1037:                from .verify import validate_generate_source\nsrc/description_pipeline/pipeline/application.py:1040:                    validate_generate_source(stored, predecessor.result.output_artifact, self.artifacts)\nsrc/description_pipeline/pipeline/application.py:1068:            self.facts.validate_source_activity(spec)\nsrc/description_pipeline/pipeline/application.py:1084:    def project_entry_command(self, spec: AdmissionSpec, *, validate_inputs: bool = True) -> StageCommand:\nsrc/description_pipeline/pipeline/application.py:1140:                self.project_entry_command(candidate)\n",
+    "stderr": ""
+  }
+]

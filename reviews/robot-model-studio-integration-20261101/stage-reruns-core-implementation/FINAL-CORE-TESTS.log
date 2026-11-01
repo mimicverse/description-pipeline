@@ -1,0 +1,204 @@
+................................2026-11-01T12:56:03.960716Z [info     ] no PG_VERSION file found within /tmp/production-admission-postgres-4p87g2pw/pgdata. Initializing pgdata [pgserver] loc=postgres_server.py:113
+2026-11-01T12:56:04.015072Z [info     ] Running commandline:
+['/home/andy/Work/.tmp-verify-airflow-venv/lib/python3.12/site-packages/pgserver/pginstall/bin/initdb', '-D', '/tmp/production-admission-postgres-4p87g2pw/pgdata', '--auth=trust', '--auth-local=trust', '--encoding=utf8', '-U', 'postgres']
+with kwargs: `{'user': None}` [pgserver] loc=_commands.py:36
+2026-11-01T12:56:04.331884Z [info     ] Successful postgres command ['/home/andy/Work/.tmp-verify-airflow-venv/lib/python3.12/site-packages/pgserver/pginstall/bin/initdb', '-D', '/tmp/production-admission-postgres-4p87g2pw/pgdata', '--auth=trust', '--auth-local=trust', '--encoding=utf8', '-U', 'postgres'] with kwargs: `{'user': None}`
+stdout:
+The files belonging to this database system will be owned by user "andy".
+This user must also own the server process.
+
+The database cluster will be initialized with locale "C.UTF-8".
+The default text search configuration will be set to "english".
+
+Data page checksums are disabled.
+
+fixing permissions on existing directory /tmp/production-admission-postgres-4p87g2pw/pgdata ... ok
+creating subdirectories ... ok
+selecting dynamic shared memory implementation ... posix
+selecting default max_connections ... 100
+selecting default shared_buffers ... 128MB
+selecting default time zone ... Asia/Shanghai
+creating configuration files ... ok
+running bootstrap script ... ok
+performing post-bootstrap initialization ... ok
+syncing data to disk ... ok
+
+Success. You can now start the database server using:
+
+    /home/andy/Work/.tmp-verify-airflow-venv/lib/python3.12/site-packages/pgserver/pginstall/bin/pg_ctl -D /tmp/production-admission-postgres-4p87g2pw/pgdata -l logfile start
+
+
+---
+stderr:
+
+---
+ [pgserver] loc=_commands.py:46
+2026-11-01T12:56:04.332152Z [info     ] no postmaster.pid file found in /tmp/production-admission-postgres-4p87g2pw/pgdata [pgserver] loc=postgres_server.py:146
+2026-11-01T12:56:04.332361Z [info     ] Using socket path: /tmp/production-admission-postgres-4p87g2pw/pgdata [pgserver] loc=utils.py:260
+2026-11-01T12:56:04.332445Z [info     ] running pg_ctl... pg_ctl_args=['-w', '-o', '-h ""', '-o', '-k /tmp/production-admission-postgres-4p87g2pw/pgdata', '-l', '/tmp/production-admission-postgres-4p87g2pw/pgdata/log', 'start'] [pgserver] loc=postgres_server.py:175
+2026-11-01T12:56:04.332598Z [info     ] Running commandline:
+['/home/andy/Work/.tmp-verify-airflow-venv/lib/python3.12/site-packages/pgserver/pginstall/bin/pg_ctl', '-D', '/tmp/production-admission-postgres-4p87g2pw/pgdata', '-w', '-o', '-h ""', '-o', '-k /tmp/production-admission-postgres-4p87g2pw/pgdata', '-l', '/tmp/production-admission-postgres-4p87g2pw/pgdata/log', 'start']
+with kwargs: `{'user': None, 'timeout': 10}` [pgserver] loc=_commands.py:36
+2026-11-01T12:56:04.446884Z [info     ] Successful postgres command ['/home/andy/Work/.tmp-verify-airflow-venv/lib/python3.12/site-packages/pgserver/pginstall/bin/pg_ctl', '-D', '/tmp/production-admission-postgres-4p87g2pw/pgdata', '-w', '-o', '-h ""', '-o', '-k /tmp/production-admission-postgres-4p87g2pw/pgdata', '-l', '/tmp/production-admission-postgres-4p87g2pw/pgdata/log', 'start'] with kwargs: `{'user': None, 'timeout': 10}`
+stdout:
+waiting for server to start.... done
+server started
+
+---
+stderr:
+
+---
+ [pgserver] loc=_commands.py:46
+2026-11-01T12:56:04.447195Z [info     ] waiting for postmaster info to show a running process [pgserver] loc=postgres_server.py:188
+2026-11-01T12:56:04.447781Z [info     ] running... checking if ready pinfo=PostmasterInfo(pid=1484470, pgdata=/tmp/production-admission-postgres-4p87g2pw/pgdata, start_time=2026-11-01 20:56:04, hostname=None port=5432, socket_dir=/tmp/production-admission-postgres-4p87g2pw/pgdata status=ready, process=psutil.Process(pid=1484470, name='postgres', status='sleeping')) [pgserver] loc=postgres_server.py:190
+2026-11-01T12:56:04.448029Z [info     ] Now asserting server is running self._postmaster_info=PostmasterInfo(pid=1484470, pgdata=/tmp/production-admission-postgres-4p87g2pw/pgdata, start_time=2026-11-01 20:56:04, hostname=None port=5432, socket_dir=/tmp/production-admission-postgres-4p87g2pw/pgdata status=ready, process=psutil.Process(pid=1484470, name='postgres', status='sleeping')) [pgserver] loc=postgres_server.py:198
+2026-11-01T12:56:05.089056Z [info     ] exiting 1483833 remaining pids=[1483833] [pgserver] loc=postgres_server.py:206
+2026-11-01T12:56:05.089221Z [info     ] cleaning last handle for server: /tmp/production-admission-postgres-4p87g2pw/pgdata [pgserver] loc=postgres_server.py:210
+2026-11-01T12:56:05.089490Z [info     ] Running commandline:
+['/home/andy/Work/.tmp-verify-airflow-venv/lib/python3.12/site-packages/pgserver/pginstall/bin/pg_ctl', '-D', '/tmp/production-admission-postgres-4p87g2pw/pgdata', '-w', 'stop']
+with kwargs: `{'user': None}` [pgserver] loc=_commands.py:36
+2026-11-01T12:56:05.191430Z [info     ] Successful postgres command ['/home/andy/Work/.tmp-verify-airflow-venv/lib/python3.12/site-packages/pgserver/pginstall/bin/pg_ctl', '-D', '/tmp/production-admission-postgres-4p87g2pw/pgdata', '-w', 'stop'] with kwargs: `{'user': None}`
+stdout:
+waiting for server to shut down.... done
+server stopped
+
+---
+stderr:
+
+---
+ [pgserver] loc=_commands.py:46
+...............................2026-11-01T12:56:06.543173Z [warning  ] StageTaskOperator.execute cannot be called outside of the Task Runner! [airflow.task.operators.description_pipeline.orchestration.airflow_stage_operator.StageTaskOperator] loc=operator.py:456
+2026-11-01T12:56:06.543271Z [warning  ] StageTaskOperator.execute cannot be called outside of the Task Runner! [airflow.task.operators.description_pipeline.orchestration.airflow_stage_operator.StageTaskOperator] loc=operator.py:456
+.2026-11-01T12:56:06.543905Z [warning  ] StageTaskOperator.execute cannot be called outside of the Task Runner! [airflow.task.operators.description_pipeline.orchestration.airflow_stage_operator.StageTaskOperator] loc=operator.py:456
+.2026-11-01T12:56:06.544583Z [warning  ] StageTaskOperator.execute cannot be called outside of the Task Runner! [airflow.task.operators.description_pipeline.orchestration.airflow_stage_operator.StageTaskOperator] loc=operator.py:456
+.2026-11-01T12:56:06.545176Z [warning  ] StageTaskOperator.execute cannot be called outside of the Task Runner! [airflow.task.operators.description_pipeline.orchestration.airflow_stage_operator.StageTaskOperator] loc=operator.py:456
+.........................................................................................2026-11-01T12:58:50.538432Z [info     ] no PG_VERSION file found within /tmp/verify-identity-postgres-tdu__2a8/pgdata. Initializing pgdata [pgserver] loc=postgres_server.py:113
+2026-11-01T12:58:50.570293Z [info     ] Running commandline:
+['/home/andy/Work/.tmp-verify-airflow-venv/lib/python3.12/site-packages/pgserver/pginstall/bin/initdb', '-D', '/tmp/verify-identity-postgres-tdu__2a8/pgdata', '--auth=trust', '--auth-local=trust', '--encoding=utf8', '-U', 'postgres']
+with kwargs: `{'user': None}` [pgserver] loc=_commands.py:36
+2026-11-01T12:58:50.899196Z [info     ] Successful postgres command ['/home/andy/Work/.tmp-verify-airflow-venv/lib/python3.12/site-packages/pgserver/pginstall/bin/initdb', '-D', '/tmp/verify-identity-postgres-tdu__2a8/pgdata', '--auth=trust', '--auth-local=trust', '--encoding=utf8', '-U', 'postgres'] with kwargs: `{'user': None}`
+stdout:
+The files belonging to this database system will be owned by user "andy".
+This user must also own the server process.
+
+The database cluster will be initialized with locale "C.UTF-8".
+The default text search configuration will be set to "english".
+
+Data page checksums are disabled.
+
+fixing permissions on existing directory /tmp/verify-identity-postgres-tdu__2a8/pgdata ... ok
+creating subdirectories ... ok
+selecting dynamic shared memory implementation ... posix
+selecting default max_connections ... 100
+selecting default shared_buffers ... 128MB
+selecting default time zone ... Asia/Shanghai
+creating configuration files ... ok
+running bootstrap script ... ok
+performing post-bootstrap initialization ... ok
+syncing data to disk ... ok
+
+Success. You can now start the database server using:
+
+    /home/andy/Work/.tmp-verify-airflow-venv/lib/python3.12/site-packages/pgserver/pginstall/bin/pg_ctl -D /tmp/verify-identity-postgres-tdu__2a8/pgdata -l logfile start
+
+
+---
+stderr:
+
+---
+ [pgserver] loc=_commands.py:46
+2026-11-01T12:58:50.899431Z [info     ] no postmaster.pid file found in /tmp/verify-identity-postgres-tdu__2a8/pgdata [pgserver] loc=postgres_server.py:146
+2026-11-01T12:58:50.899592Z [info     ] Using socket path: /tmp/verify-identity-postgres-tdu__2a8/pgdata [pgserver] loc=utils.py:260
+2026-11-01T12:58:50.899672Z [info     ] running pg_ctl... pg_ctl_args=['-w', '-o', '-h ""', '-o', '-k /tmp/verify-identity-postgres-tdu__2a8/pgdata', '-l', '/tmp/verify-identity-postgres-tdu__2a8/pgdata/log', 'start'] [pgserver] loc=postgres_server.py:175
+2026-11-01T12:58:50.899810Z [info     ] Running commandline:
+['/home/andy/Work/.tmp-verify-airflow-venv/lib/python3.12/site-packages/pgserver/pginstall/bin/pg_ctl', '-D', '/tmp/verify-identity-postgres-tdu__2a8/pgdata', '-w', '-o', '-h ""', '-o', '-k /tmp/verify-identity-postgres-tdu__2a8/pgdata', '-l', '/tmp/verify-identity-postgres-tdu__2a8/pgdata/log', 'start']
+with kwargs: `{'user': None, 'timeout': 10}` [pgserver] loc=_commands.py:36
+2026-11-01T12:58:51.013968Z [info     ] Successful postgres command ['/home/andy/Work/.tmp-verify-airflow-venv/lib/python3.12/site-packages/pgserver/pginstall/bin/pg_ctl', '-D', '/tmp/verify-identity-postgres-tdu__2a8/pgdata', '-w', '-o', '-h ""', '-o', '-k /tmp/verify-identity-postgres-tdu__2a8/pgdata', '-l', '/tmp/verify-identity-postgres-tdu__2a8/pgdata/log', 'start'] with kwargs: `{'user': None, 'timeout': 10}`
+stdout:
+waiting for server to start.... done
+server started
+
+---
+stderr:
+
+---
+ [pgserver] loc=_commands.py:46
+2026-11-01T12:58:51.014183Z [info     ] waiting for postmaster info to show a running process [pgserver] loc=postgres_server.py:188
+2026-11-01T12:58:51.014515Z [info     ] running... checking if ready pinfo=PostmasterInfo(pid=1510816, pgdata=/tmp/verify-identity-postgres-tdu__2a8/pgdata, start_time=2026-11-01 20:58:50, hostname=None port=5432, socket_dir=/tmp/verify-identity-postgres-tdu__2a8/pgdata status=ready, process=psutil.Process(pid=1510816, name='postgres', status='sleeping')) [pgserver] loc=postgres_server.py:190
+2026-11-01T12:58:51.014641Z [info     ] Now asserting server is running self._postmaster_info=PostmasterInfo(pid=1510816, pgdata=/tmp/verify-identity-postgres-tdu__2a8/pgdata, start_time=2026-11-01 20:58:50, hostname=None port=5432, socket_dir=/tmp/verify-identity-postgres-tdu__2a8/pgdata status=ready, process=psutil.Process(pid=1510816, name='postgres', status='sleeping')) [pgserver] loc=postgres_server.py:198
+.....2026-11-01T12:58:54.362059Z [info     ] exiting 1483833 remaining pids=[1483833] [pgserver] loc=postgres_server.py:206
+2026-11-01T12:58:54.362257Z [info     ] cleaning last handle for server: /tmp/verify-identity-postgres-tdu__2a8/pgdata [pgserver] loc=postgres_server.py:210
+2026-11-01T12:58:54.362604Z [info     ] Running commandline:
+['/home/andy/Work/.tmp-verify-airflow-venv/lib/python3.12/site-packages/pgserver/pginstall/bin/pg_ctl', '-D', '/tmp/verify-identity-postgres-tdu__2a8/pgdata', '-w', 'stop']
+with kwargs: `{'user': None}` [pgserver] loc=_commands.py:36
+2026-11-01T12:58:54.464870Z [info     ] Successful postgres command ['/home/andy/Work/.tmp-verify-airflow-venv/lib/python3.12/site-packages/pgserver/pginstall/bin/pg_ctl', '-D', '/tmp/verify-identity-postgres-tdu__2a8/pgdata', '-w', 'stop'] with kwargs: `{'user': None}`
+stdout:
+waiting for server to shut down.... done
+server stopped
+
+---
+stderr:
+
+---
+ [pgserver] loc=_commands.py:46
+2026-11-01T12:58:55.221326Z [info     ] no PG_VERSION file found within /tmp/mjcf-engine-postgres-5u1o6qtr/database. Initializing pgdata [pgserver] loc=postgres_server.py:113
+2026-11-01T12:58:55.246191Z [info     ] Running commandline:
+['/home/andy/Work/.tmp-verify-airflow-venv/lib/python3.12/site-packages/pgserver/pginstall/bin/initdb', '-D', '/tmp/mjcf-engine-postgres-5u1o6qtr/database', '--auth=trust', '--auth-local=trust', '--encoding=utf8', '-U', 'postgres']
+with kwargs: `{'user': None}` [pgserver] loc=_commands.py:36
+2026-11-01T12:58:55.532639Z [info     ] Successful postgres command ['/home/andy/Work/.tmp-verify-airflow-venv/lib/python3.12/site-packages/pgserver/pginstall/bin/initdb', '-D', '/tmp/mjcf-engine-postgres-5u1o6qtr/database', '--auth=trust', '--auth-local=trust', '--encoding=utf8', '-U', 'postgres'] with kwargs: `{'user': None}`
+stdout:
+The files belonging to this database system will be owned by user "andy".
+This user must also own the server process.
+
+The database cluster will be initialized with locale "C.UTF-8".
+The default text search configuration will be set to "english".
+
+Data page checksums are disabled.
+
+fixing permissions on existing directory /tmp/mjcf-engine-postgres-5u1o6qtr/database ... ok
+creating subdirectories ... ok
+selecting dynamic shared memory implementation ... posix
+selecting default max_connections ... 100
+selecting default shared_buffers ... 128MB
+selecting default time zone ... Asia/Shanghai
+creating configuration files ... ok
+running bootstrap script ... ok
+performing post-bootstrap initialization ... ok
+syncing data to disk ... ok
+
+Success. You can now start the database server using:
+
+    /home/andy/Work/.tmp-verify-airflow-venv/lib/python3.12/site-packages/pgserver/pginstall/bin/pg_ctl -D /tmp/mjcf-engine-postgres-5u1o6qtr/database -l logfile start
+
+
+---
+stderr:
+
+---
+ [pgserver] loc=_commands.py:46
+2026-11-01T12:58:55.532970Z [info     ] no postmaster.pid file found in /tmp/mjcf-engine-postgres-5u1o6qtr/database [pgserver] loc=postgres_server.py:146
+2026-11-01T12:58:55.533184Z [info     ] Using socket path: /tmp/mjcf-engine-postgres-5u1o6qtr/database [pgserver] loc=utils.py:260
+2026-11-01T12:58:55.533269Z [info     ] running pg_ctl... pg_ctl_args=['-w', '-o', '-h ""', '-o', '-k /tmp/mjcf-engine-postgres-5u1o6qtr/database', '-l', '/tmp/mjcf-engine-postgres-5u1o6qtr/database/log', 'start'] [pgserver] loc=postgres_server.py:175
+2026-11-01T12:58:55.533392Z [info     ] Running commandline:
+['/home/andy/Work/.tmp-verify-airflow-venv/lib/python3.12/site-packages/pgserver/pginstall/bin/pg_ctl', '-D', '/tmp/mjcf-engine-postgres-5u1o6qtr/database', '-w', '-o', '-h ""', '-o', '-k /tmp/mjcf-engine-postgres-5u1o6qtr/database', '-l', '/tmp/mjcf-engine-postgres-5u1o6qtr/database/log', 'start']
+with kwargs: `{'user': None, 'timeout': 10}` [pgserver] loc=_commands.py:36
+2026-11-01T12:58:55.648066Z [info     ] Successful postgres command ['/home/andy/Work/.tmp-verify-airflow-venv/lib/python3.12/site-packages/pgserver/pginstall/bin/pg_ctl', '-D', '/tmp/mjcf-engine-postgres-5u1o6qtr/database', '-w', '-o', '-h ""', '-o', '-k /tmp/mjcf-engine-postgres-5u1o6qtr/database', '-l', '/tmp/mjcf-engine-postgres-5u1o6qtr/database/log', 'start'] with kwargs: `{'user': None, 'timeout': 10}`
+stdout:
+waiting for server to start.... done
+server started
+
+---
+stderr:
+
+---
+ [pgserver] loc=_commands.py:46
+2026-11-01T12:58:55.648256Z [info     ] waiting for postmaster info to show a running process [pgserver] loc=postgres_server.py:188
+2026-11-01T12:58:55.648540Z [info     ] running... checking if ready pinfo=PostmasterInfo(pid=1511098, pgdata=/tmp/mjcf-engine-postgres-5u1o6qtr/database, start_time=2026-11-01 20:58:55, hostname=None port=5432, socket_dir=/tmp/mjcf-engine-postgres-5u1o6qtr/database status=ready, process=psutil.Process(pid=1511098, name='postgres', status='sleeping')) [pgserver] loc=postgres_server.py:190
+2026-11-01T12:58:55.648640Z [info     ] Now asserting server is running self._postmaster_info=PostmasterInfo(pid=1511098, pgdata=/tmp/mjcf-engine-postgres-5u1o6qtr/database, start_time=2026-11-01 20:58:55, hostname=None port=5432, socket_dir=/tmp/mjcf-engine-postgres-5u1o6qtr/database status=ready, process=psutil.Process(pid=1511098, name='postgres', status='sleeping')) [pgserver] loc=postgres_server.py:198
+2026-11-01T12:58:58.257714Z [info     ] exiting 1483833 remaining pids=[] [pgserver] loc=postgres_server.py:206
+..................
+----------------------------------------------------------------------
+Ran 178 tests in 181.095s
+
+OK
+2026-11-01T12:59:03.606527Z [info     ] exiting 1483833 remaining pids=[] [pgserver] loc=postgres_server.py:206

@@ -18,6 +18,7 @@ from ..contracts import (
     StageCommand,
     StageExecution,
     StageFailure,
+    SourceInputError,
 )
 from ..effects import StageEffectPort
 from ..engine import StageWorkspace
@@ -58,7 +59,7 @@ def source_refs(command: StageCommand) -> dict[str, ArtifactRef]:
     return refs
 
 
-def _source_certificate(command: StageCommand, refs: dict, roots: dict) -> dict:
+def _source_certificate_record(command: StageCommand, refs: dict, roots: dict) -> dict:
     if set(inventory(roots["verify"], exclude=("manifest.json",))) != {
         CERTIFICATE_FILENAME,
         EXECUTION_RECEIPT_FILENAME,
@@ -80,6 +81,23 @@ def _source_certificate(command: StageCommand, refs: dict, roots: dict) -> dict:
     ):
         raise PipelineError("MJCF source qualification differs from its admitted request")
     return certificate
+
+
+def _source_certificate(command: StageCommand, refs: dict, roots: dict) -> dict:
+    try:
+        return _source_certificate_record(command, refs, roots)
+    except (ProtocolError, SourceInputError):
+        raise
+    except PipelineError as error:
+        raise SourceInputError("verify", error) from error
+
+
+def validate_source_inputs(command: StageCommand, artifacts: ArtifactStore) -> None:
+    """Use the same certificate validator at admission without running conversion."""
+    refs = source_refs(command)
+    with tempfile.TemporaryDirectory(prefix="mjcf-source-inputs-") as temporary:
+        roots = {stage: artifacts.materialize(ref, Path(temporary) / stage) for stage, ref in refs.items()}
+        _source_certificate(command, refs, roots)
 
 
 def _view(destination: Path, generate: Path, projection: Path | None = None) -> Path:
@@ -198,9 +216,24 @@ def validate_certificate(
     certificate = read_certificate(root, command, require_pass=require_pass)
     refs = source_refs(command)
     _source_certificate(command, refs, source_roots)
+    binding = certificate["input_binding"]
+    tool, engine = binding.get("tool"), binding.get("engine")
+    if (
+        not isinstance(tool, dict)
+        or set(tool) != {"name", "version", "source_sha256"}
+        or tool["name"] != "mimicverse-description"
+        or not isinstance(tool["version"], str)
+        or not tool["version"]
+        or tool["source_sha256"] != command.expected_executor_sha256
+        or not isinstance(engine, dict)
+        or set(engine) != {"mujoco"}
+        or not isinstance(engine["mujoco"], str)
+        or not engine["mujoco"]
+    ):
+        raise PipelineError("MJCF certificate runtime identity differs from its source command")
     with tempfile.TemporaryDirectory(prefix="mjcf-certificate-") as temporary:
         view = _view(Path(temporary) / "view", source_roots["generate"], root)
-        if contract.binding_for_projection(view) != certificate["input_binding"]:
+        if contract.binding_for_projection(view, tool=tool, engine=engine) != binding:
             raise PipelineError("MJCF certificate input bytes or tool identity changed")
     return certificate
 
@@ -299,6 +332,11 @@ class MJCFHandler:
             certificate = validate_certificate(
                 root, command, source_roots=roots, require_pass=result.outcome == "completed"
             )
+            if (
+                certificate["input_binding"]["tool"] != contract.tool_identity()
+                or certificate["input_binding"]["engine"] != contract.engine_identity()
+            ):
+                raise ProtocolError("mjcf.candidate_runtime_identity")
             if certificate["report"]["passed"] != (result.outcome == "completed"):
                 raise ProtocolError("mjcf.candidate_outcome")
             if digest(certificate) != result.checks_sha256:

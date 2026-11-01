@@ -36,7 +36,7 @@ def parser() -> argparse.ArgumentParser:
 
     run = operations.add_parser("run", help="execute admitted stages through one boundary")
     run.add_argument("run_id")
-    run.add_argument("--through", choices=STAGE_IDS, default="publish")
+    run.add_argument("--through", choices=STAGE_IDS)
 
     operations.add_parser("doctor", help="show the actual portable runtime identity")
     return commands
@@ -62,7 +62,7 @@ def _default_application(
     return application_from_environment(
         command_id=arguments.command_id if arguments.operation == "stage" else None,
         run_id=arguments.run_id if arguments.operation == "run" else None,
-        through=getattr(arguments, "through", "publish"),
+        through=getattr(arguments, "through", None),
         admission_spec=admission_spec,
     )
 
