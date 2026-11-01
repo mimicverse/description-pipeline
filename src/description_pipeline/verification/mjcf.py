@@ -1763,7 +1763,13 @@ def _read_obj(content: bytes, label: str) -> tuple[np.ndarray, np.ndarray]:
             raise CheckError(f"{label}: unsupported OBJ directive")
     if not vertices or not faces or any(index < 1 or index > len(vertices) for face in faces for index in face):
         raise CheckError(f"{label}: empty or invalid OBJ topology")
-    return np.asarray(vertices, dtype=float), np.asarray(faces, dtype=np.int64) - 1
+    indices = np.asarray(faces, dtype=np.int64) - 1
+    referenced = np.zeros(len(vertices), dtype=bool)
+    referenced[indices] = True
+    if not referenced.all():
+        index = int(np.flatnonzero(~referenced)[0]) + 1
+        raise CheckError(f"{label}: unreferenced OBJ vertex {index} can affect compiled geometry and preview bounds")
+    return np.asarray(vertices, dtype=float), indices
 
 
 def _gate_geometry_instances(state: dict) -> dict:

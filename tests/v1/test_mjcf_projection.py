@@ -179,7 +179,9 @@ class ProjectionTests(unittest.TestCase):
             else:
                 changed[faces[1]] = changed[index]
             mutations[name] = '\n'.join(changed) + '\n'
-        for directive in ('mtllib ../private.mtl', 'usemtl secret', 'vt 0 0', 'v nan 0 0', 'f 1 2 -1'):
+        for directive in ('mtllib ../private.mtl', 'usemtl secret', 'vt 0 0', 'vn 0 0 1', 'vp 1 2',
+                          'p 1', 'l 1 2', 's off', 'g extra', 'o extra', 'v 0 0 0 1',
+                          'f 1/1 2/1 3/1', 'v nan 0 0', 'f 1 2 -1'):
             mutations[directive] = original + directive + '\n'
         for name, content in mutations.items():
             with self.subTest(name=name):
@@ -205,6 +207,23 @@ class ProjectionTests(unittest.TestCase):
                     tree.write(self.root / contract.ROBOT_NAME)
                     binding = self.binding()
                 self.assertFalse(evaluate_projection(self.root, binding)['passed'])
+
+    def test_unused_obj_vertices_cannot_change_engine_or_preview_bounds(self):
+        source = (self.root / contract.URDF_NAME).read_bytes()
+        mesh = (self.root / 'meshes/part.stl').read_bytes()
+        self.assertTrue(self.build({'collision': {'source': 'none'}})['passed'])
+        path = next((self.root / 'mjcf/meshes').glob('*.obj'))
+        original = path.read_text()
+        for extra in ('v 1 2 3', 'v 0 0 0'):
+            with self.subTest(extra=extra):
+                path.write_text(original + extra + '\n')
+                self.refresh_encoding_warnings()
+                report = evaluate_projection(self.root, self.binding())
+                gate = next(row for row in report['checks'] if row['id'] == 'identity.closure')
+                self.assertFalse(gate['passed'], gate)
+                self.assertIn('unreferenced OBJ vertex', gate['details']['error'])
+        self.assertEqual(source, (self.root / contract.URDF_NAME).read_bytes())
+        self.assertEqual(mesh, (self.root / 'meshes/part.stl').read_bytes())
 
     def test_compiled_triangles_preserve_direction_and_multiplicity_with_ambiguous_numeric_matches(self):
         triangle = np.array([[[0., 0., 0.], [1., 0., 0.], [0., 0., 1.]]])
@@ -511,11 +530,15 @@ class ProjectionTests(unittest.TestCase):
         self.colored_component()
         self.assertTrue(self.build()['passed'])
         proxy = next((self.root/'mjcf/collision').glob('*.obj'))
-        proxy.write_bytes(proxy.read_bytes()+b'mtllib ../../outside.mtl\n')
-        report = evaluate_projection(self.root, self.binding())
-        self.assertFalse(report['passed'])
-        engine = next(row for row in report['checks'] if row['id'] == 'engine.load')
-        self.assertIn('unsupported OBJ directive', engine['details']['error'])
+        original = proxy.read_bytes()
+        for extra, message in ((b'mtllib ../../outside.mtl\n', 'unsupported OBJ directive'),
+                               (b'v 1 2 3\n', 'unreferenced OBJ vertex')):
+            with self.subTest(extra=extra):
+                proxy.write_bytes(original + extra)
+                report = evaluate_projection(self.root, self.binding())
+                self.assertFalse(report['passed'])
+                engine = next(row for row in report['checks'] if row['id'] == 'engine.load')
+                self.assertIn(message, engine['details']['error'])
 
     def test_changed_component_group_cannot_reuse_a_proxy(self):
         metadata = self.colored_component()
