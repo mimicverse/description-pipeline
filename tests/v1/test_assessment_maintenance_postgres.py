@@ -263,7 +263,9 @@ class AssessmentMaintenancePostgresTests(AssessmentCase):
             attempt["attempt_id"], owner, state="failed",
             artifact=result(self.store, request, self.root, attempt, "failed"), detail={},
         )
+        self._scheduling(attempt, state="failed")
         self._close()
+        recovery._require_quiescent(self._probe(), "actual_pg_before_snapshot_dump")
         archive = self.root / "database.dump"
         captured = self.root / "captured-artifacts"
         with self.connect() as snapshot:
