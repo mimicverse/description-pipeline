@@ -1,0 +1,414 @@
+{
+  "schema_version": "description.pico-offline-model-evidence/1",
+  "scope": "offline software-only; not production artifacts or formal pipeline runs",
+  "runtime_commit": "8b402482559c02534668bf2cb4338c0b8d628e14",
+  "source_authority_thread": "01a17cb9-18a6-7163-90f2-bd3dacb91b29",
+  "root_cause": "MuJoCo 3.13 binary STL decoder accepts at most 200000 faces; both real revisions contain one valid 207595-face mesh. The converter forwards source STL without a native-format encoding adaptation.",
+  "why_earlier_validation_missed_it": "Synthetic model and projection fixtures used smaller meshes and did not exercise the engine decoder upper boundary. Independent engine.load correctly rejects the actual real sources.",
+  "consumers": {
+    "projection": "Produces XML; source SHA identity is intact, but projection generation alone does not qualify native loading.",
+    "independent_verify": "engine.load fails; dependent gates remain failed rather than fabricating native facts.",
+    "teleop_native_worker": "Consumes the same entry and mesh bytes; fails before ready without an encoding adaptation.",
+    "browser": "Consumes native compiled geometry and cannot receive a model until native loading succeeds.",
+    "recording_verifier": "Reloads native source; receives the same engine input restriction."
+  },
+  "policy": "Do not alter native/manual source, decimate, patch a robot name, skip independent verification, or bind the offline diagnostic to a production run. Authority converter and independent Verify must be designed together.",
+  "boundary": {
+    "path": "/home/andy/Work/reviews/pico-optimization-20261101/stl-decoder-boundary/result.json",
+    "sha256": "b27625fab732c44fd3d76301316a865dddba489733f152aee9b5438681e66a77"
+  },
+  "scripts": {
+    "derive-real-models.py": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/derive-real-models.py",
+      "sha256": "69f0c3f4db4a2e33f9ef3550420c856258b28b25f0e21351f8a002638022b0f6"
+    },
+    "diagnose-large-stl.py": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/diagnose-large-stl.py",
+      "sha256": "be632fb9be0ac23803c2dce3e6fcc54d820decab65e2bf8c4efe670debf119b3"
+    },
+    "probe-real-upper-body.py": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/probe-real-upper-body.py",
+      "sha256": "5b9561bdc3ffb926acce88331d723bb46cb30ef00773d8be16ae9af7f621447c"
+    },
+    "probe-stl-decoder-boundary.py": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/probe-stl-decoder-boundary.py",
+      "sha256": "bad26c6fd87f925b24b5250f760497b34235358da3416ea3f9190e7e8c91b8f5"
+    },
+    "diagnose-head-blockers.py": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/diagnose-head-blockers.py",
+      "sha256": "cc9aaafefafaaa75a5c93f4834f987224fdbea081f0614cb09e8ba78487c709d"
+    },
+    "probe-head-rotation-matrix.py": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/probe-head-rotation-matrix.py",
+      "sha256": "76a12de02d061ec61d77eb949a1e927a3a8f1f652f218c4a60eb51ce64cf0743"
+    },
+    "profile-real-upper-body.py": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/profile-real-upper-body.py",
+      "sha256": "8d215d30d18e88425fbcd3ff3e0ddae142db7c0e5d4fdf9b8b32e1a7e93c8256"
+    }
+  },
+  "revisions": {
+    "r03": {
+      "source_directory": "/home/andy/Work/output/M3-26dof-3615-r03-urdf",
+      "source_digest": "7dc348001357e2628881e71cb304badad11c4258420b03f36c43b2a88c698861",
+      "original_unchanged": true,
+      "source_urdf_sha256": "ab1112984493417d0424875cb15376dcc0fef43b92eef2507457ae385217bc30",
+      "files": 109,
+      "bytes": 21662374,
+      "evidence": {
+        "input-binding.json": {
+          "path": "/home/andy/Work/reviews/pico-optimization-20261101/m2-real-models-valid-policy/r03/input-binding.json",
+          "sha256": "71cf13ed81b95ddd26e24d3ea11f8fbc1b86687d368f578d3a468854554e8056"
+        },
+        "projection-binding.json": {
+          "path": "/home/andy/Work/reviews/pico-optimization-20261101/m2-real-models-valid-policy/r03/projection-binding.json",
+          "sha256": "77299abfea9aca045a706162e1ccd44c99af6fab17da3ad79f607cf2ea448b2d"
+        },
+        "projection-report.json": {
+          "path": "/home/andy/Work/reviews/pico-optimization-20261101/m2-real-models-valid-policy/r03/projection-report.json",
+          "sha256": "2a032fbb0bba392e964d3d446de467f82da4a1e8cadb010cd90abe4742eef801"
+        },
+        "outcome.json": {
+          "path": "/home/andy/Work/reviews/pico-optimization-20261101/m2-real-models-valid-policy/r03/outcome.json",
+          "sha256": "da59d0c8fc5fd29c6aead05347f08e5fb828b3dd4879ac0733c0cf97cc4e62e1"
+        },
+        "offline-obj-diagnostic.json": {
+          "path": "/home/andy/Work/reviews/pico-optimization-20261101/m2-real-models-valid-policy/r03/offline-obj-diagnostic.json",
+          "sha256": "84d53c3ea8d5c3664d091e7b732d3bede0864f4604e3d9de2f57951ca6d0a928"
+        },
+        "upper-body-config.json": {
+          "path": "/home/andy/Work/reviews/pico-optimization-20261101/m2-real-models-valid-policy/r03/upper-body-config.json",
+          "sha256": "6d1ddde9701542f57df4fb9c000965d31dd3cca91bbe52682cdfe80e61118d26"
+        },
+        "upper-body-report.json": {
+          "path": "/home/andy/Work/reviews/pico-optimization-20261101/m2-real-models-valid-policy/r03/upper-body-report.json",
+          "sha256": "b098aee06589dda5d4da3bbbcff46891243d7862c09c00d0a768874dd25a3df5"
+        },
+        "upper-body-ticks.jsonl": {
+          "path": "/home/andy/Work/reviews/pico-optimization-20261101/m2-real-models-valid-policy/r03/upper-body-ticks.jsonl",
+          "sha256": "273933151668a0966e2c408b7e931581f43703b6555f03cabf197a04fa1465a0"
+        },
+        "raw-input.jsonl": {
+          "path": "/home/andy/Work/reviews/pico-optimization-20261101/m2-real-models-valid-policy/r03/raw-input.jsonl",
+          "sha256": "ea6fb0323bbeb9c290e6504f55501c7c26f4bb41761708dc7dacd2f8ba8d4a12"
+        },
+        "offline-fk-report.json": {
+          "path": "/home/andy/Work/reviews/pico-optimization-20261101/m2-real-models-valid-policy/r03/offline-fk-report.json",
+          "sha256": "5ebf0a6083ca3fa597d6f7b2294472a0d65a3839732e8b06f4d991afb20c175b"
+        },
+        "head-blocker-diagnostic.json": {
+          "path": "/home/andy/Work/reviews/pico-optimization-20261101/m2-real-models-valid-policy/r03/head-blocker-diagnostic.json",
+          "sha256": "4e214bb126135f6770196a0ec82b51232a095358e0270ece1db4d5b13419c20c"
+        },
+        "head-rotation-matrix.json": {
+          "path": "/home/andy/Work/reviews/pico-optimization-20261101/m2-real-models-valid-policy/r03/head-rotation-matrix.json",
+          "sha256": "cba1b4f72522382106747dc293a0ffa6b0e620f25a8c904f3703ae78faf93c9a"
+        }
+      },
+      "software_ticks": 160,
+      "calibrated": true,
+      "strict_arms": {
+        "left": {
+          "RELEASED": 80,
+          "ANCHORED": 1,
+          "APPLIED_WITH_BASELINE_CONTACTS": 79
+        },
+        "right": {
+          "RELEASED": 80,
+          "ANCHORED": 1,
+          "APPLIED_WITH_BASELINE_CONTACTS": 79
+        }
+      },
+      "head_states": {
+        "HELD": 25,
+        "FOLLOW": 45,
+        "BLOCKED": 90
+      },
+      "head_nonzero_following_verified": false,
+      "tick_seconds": {
+        "p50": 0.011421602499467554,
+        "p95": 0.017823141251210473,
+        "p99": 0.01909431715022947,
+        "max": 0.019415137998294085,
+        "over_20ms": 0
+      },
+      "hardware_qualification": false,
+      "head_following_scope": "Combined-motion trial kept head fixed. Additional axis/sign matrix shows nonzero following for raw input Y in both signs; X/Z in both signs remain collision-blocked. Full head following is not verified.",
+      "head_blocker_source_trace": [
+        {
+          "mjcf_geom": "base_link__convex_10",
+          "source_visual_index": 10,
+          "source_visual": "base_link_dca87716f3c3_visual",
+          "native_mapping": {
+            "name": "base_link_dca87716f3c3_visual",
+            "link": "base_link",
+            "native_occurrence": "base_link_20261028-1/云台舵机固定架-1",
+            "uri": "../meshes/visual/mesh_b5f554e6fe89c07a8ac3343af450bf3a0ca447b1df759d106041f12f8925338f.stl",
+            "sha256": "b5f554e6fe89c07a8ac3343af450bf3a0ca447b1df759d106041f12f8925338f",
+            "triangles": 1552,
+            "relative_transform": [
+              [
+                -5.247296884607017e-15,
+                1.0,
+                -1.3660821334477408e-14,
+                -0.01635999999999882
+              ],
+              [
+                -0.9999999999999999,
+                -5.339288390233477e-15,
+                -2.6622707282151267e-13,
+                -1.5737195264750957e-16
+              ],
+              [
+                -2.6621319925289446e-13,
+                1.3726465808980764e-14,
+                1.0,
+                0.0009194819225073481
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ]
+          }
+        },
+        {
+          "mjcf_geom": "head_roll_link__convex_1",
+          "source_visual_index": 1,
+          "source_visual": "head_roll_link_82e8e5fe3251_visual",
+          "native_mapping": {
+            "name": "head_roll_link_82e8e5fe3251_visual",
+            "link": "head_roll_link",
+            "native_occurrence": "head_roll_20261028-1/脖子摆动-1",
+            "uri": "../meshes/visual/mesh_51fa1957bd8708b1f1e2cc2a161d7a524a49e06e61ff6eb19980bfc2e9a66778.stl",
+            "sha256": "51fa1957bd8708b1f1e2cc2a161d7a524a49e06e61ff6eb19980bfc2e9a66778",
+            "triangles": 3304,
+            "relative_transform": [
+              [
+                -1.0,
+                3.862131680431077e-13,
+                -7.990651028944063e-15,
+                3.8378274354669974e-14
+              ],
+              [
+                3.8621316804310857e-13,
+                1.0000000000000002,
+                -1.0527241153592928e-13,
+                -0.007000000000071616
+              ],
+              [
+                7.990651028903403e-15,
+                -1.0527253549659461e-13,
+                -0.9999999999999999,
+                0.0032999999999994145
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ]
+          }
+        }
+      ],
+      "head_blocker_result": "Existing convex-proxy contact deepens and is correctly held; actual source-surface or hardware interference is not established by this diagnostic.",
+      "disconnect_and_estop": "All six raw head axis/sign cases held all joints on disconnect and latched estop."
+    },
+    "r04": {
+      "source_directory": "/home/andy/Work/output/M3-26dof-3615-r04-urdf",
+      "source_digest": "766cb876bdfa24391c52bde1a907da37ea7765897ba7a6c3f07492f95c8de964",
+      "original_unchanged": true,
+      "source_urdf_sha256": "de85911297e34cef5f4b5544fb2bbbe30acc12f9bd223ed23eb85e8708f5c363",
+      "files": 122,
+      "bytes": 22375776,
+      "evidence": {
+        "input-binding.json": {
+          "path": "/home/andy/Work/reviews/pico-optimization-20261101/m2-real-models-valid-policy/r04/input-binding.json",
+          "sha256": "63448937afeb4bb487c4a80725cca0d024dd69eed4a36f30063765089a11f0a2"
+        },
+        "projection-binding.json": {
+          "path": "/home/andy/Work/reviews/pico-optimization-20261101/m2-real-models-valid-policy/r04/projection-binding.json",
+          "sha256": "f68070c2032f93c5700ca20b51b7b95d788d83ecf4ed3f5b767ff348fa7eb51a"
+        },
+        "projection-report.json": {
+          "path": "/home/andy/Work/reviews/pico-optimization-20261101/m2-real-models-valid-policy/r04/projection-report.json",
+          "sha256": "d9a49cc5c5a35e94e1a66618161412aab203f24ac157358606cc87580de0b866"
+        },
+        "outcome.json": {
+          "path": "/home/andy/Work/reviews/pico-optimization-20261101/m2-real-models-valid-policy/r04/outcome.json",
+          "sha256": "a1c36b4c080b8f092d95528d0411c3b97ea32809852052d0c935e08b157bd4b4"
+        },
+        "offline-obj-diagnostic.json": {
+          "path": "/home/andy/Work/reviews/pico-optimization-20261101/m2-real-models-valid-policy/r04/offline-obj-diagnostic.json",
+          "sha256": "b1bc9cb56340e7f04c9ef4b01d55f2bac32acb242683a0507abd3b8e246c77d6"
+        },
+        "upper-body-config.json": {
+          "path": "/home/andy/Work/reviews/pico-optimization-20261101/m2-real-models-valid-policy/r04/upper-body-config.json",
+          "sha256": "f39cb6fae3337feb9d0cd8ba52461672ab29ef0e5cd202414d4d82d9ba47a88b"
+        },
+        "upper-body-report.json": {
+          "path": "/home/andy/Work/reviews/pico-optimization-20261101/m2-real-models-valid-policy/r04/upper-body-report.json",
+          "sha256": "1c9a2b338617d685fb2fdb1290df3e8377aa38b6ee7533f077112bcba1057327"
+        },
+        "upper-body-ticks.jsonl": {
+          "path": "/home/andy/Work/reviews/pico-optimization-20261101/m2-real-models-valid-policy/r04/upper-body-ticks.jsonl",
+          "sha256": "32fcedc1893af12f0a95009e46ede1adbab07be436460fa8609c8bb6ce383ee1"
+        },
+        "raw-input.jsonl": {
+          "path": "/home/andy/Work/reviews/pico-optimization-20261101/m2-real-models-valid-policy/r04/raw-input.jsonl",
+          "sha256": "a840602ebd40592abfc504f5ee8ca49d4ca4ebfc6a549a736e9de2a8e9c3d5a5"
+        },
+        "offline-fk-report.json": {
+          "path": "/home/andy/Work/reviews/pico-optimization-20261101/m2-real-models-valid-policy/r04/offline-fk-report.json",
+          "sha256": "cc2c70bfa07409fcefe785b6483207929a8843b830fc418a410cb9a7dc61ed35"
+        },
+        "head-blocker-diagnostic.json": {
+          "path": "/home/andy/Work/reviews/pico-optimization-20261101/m2-real-models-valid-policy/r04/head-blocker-diagnostic.json",
+          "sha256": "faf4705e36cb994ec8f224a5ce20336445c4a8d923ac063125170d587910f1df"
+        },
+        "head-rotation-matrix.json": {
+          "path": "/home/andy/Work/reviews/pico-optimization-20261101/m2-real-models-valid-policy/r04/head-rotation-matrix.json",
+          "sha256": "cba1b4f72522382106747dc293a0ffa6b0e620f25a8c904f3703ae78faf93c9a"
+        }
+      },
+      "software_ticks": 160,
+      "calibrated": true,
+      "strict_arms": {
+        "left": {
+          "RELEASED": 80,
+          "ANCHORED": 1,
+          "APPLIED_WITH_BASELINE_CONTACTS": 79
+        },
+        "right": {
+          "RELEASED": 80,
+          "ANCHORED": 1,
+          "APPLIED_WITH_BASELINE_CONTACTS": 79
+        }
+      },
+      "head_states": {
+        "HELD": 25,
+        "FOLLOW": 45,
+        "BLOCKED": 90
+      },
+      "head_nonzero_following_verified": false,
+      "tick_seconds": {
+        "p50": 0.014444840500800638,
+        "p95": 0.025768436301950692,
+        "p99": 0.03802915773034325,
+        "max": 0.04591615399840521,
+        "over_20ms": 21
+      },
+      "hardware_qualification": false,
+      "head_following_scope": "Combined-motion trial kept head fixed. Additional axis/sign matrix shows nonzero following for raw input Y in both signs; X/Z in both signs remain collision-blocked. Full head following is not verified.",
+      "head_blocker_source_trace": [
+        {
+          "mjcf_geom": "base_link__convex_9",
+          "source_visual_index": 9,
+          "source_visual": "base_link_dca87716f3c3_visual",
+          "native_mapping": {
+            "name": "base_link_dca87716f3c3_visual",
+            "link": "base_link",
+            "native_occurrence": "base_link_20261028-1/云台舵机固定架-1",
+            "uri": "../meshes/visual/mesh_b5f554e6fe89c07a8ac3343af450bf3a0ca447b1df759d106041f12f8925338f.stl",
+            "sha256": "b5f554e6fe89c07a8ac3343af450bf3a0ca447b1df759d106041f12f8925338f",
+            "triangles": 1552,
+            "relative_transform": [
+              [
+                -5.247296884607017e-15,
+                1.0,
+                -1.3660821334477408e-14,
+                -0.01635999999999882
+              ],
+              [
+                -0.9999999999999999,
+                -5.339288390233477e-15,
+                -2.6622707282151267e-13,
+                -1.5737195264750957e-16
+              ],
+              [
+                -2.6621319925289446e-13,
+                1.3726465808980764e-14,
+                1.0,
+                0.0009194819225073481
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ]
+          }
+        },
+        {
+          "mjcf_geom": "head_roll_link__convex_1",
+          "source_visual_index": 1,
+          "source_visual": "head_roll_link_82e8e5fe3251_visual",
+          "native_mapping": {
+            "name": "head_roll_link_82e8e5fe3251_visual",
+            "link": "head_roll_link",
+            "native_occurrence": "head_roll_20261028-1/脖子摆动-1",
+            "uri": "../meshes/visual/mesh_51fa1957bd8708b1f1e2cc2a161d7a524a49e06e61ff6eb19980bfc2e9a66778.stl",
+            "sha256": "51fa1957bd8708b1f1e2cc2a161d7a524a49e06e61ff6eb19980bfc2e9a66778",
+            "triangles": 3304,
+            "relative_transform": [
+              [
+                -1.0,
+                3.862131680431077e-13,
+                -7.990651028944063e-15,
+                3.8378274354669974e-14
+              ],
+              [
+                3.8621316804310857e-13,
+                1.0000000000000002,
+                -1.0527241153592928e-13,
+                -0.007000000000071616
+              ],
+              [
+                7.990651028903403e-15,
+                -1.0527253549659461e-13,
+                -0.9999999999999999,
+                0.0032999999999994145
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ]
+          }
+        }
+      ],
+      "head_blocker_result": "Existing convex-proxy contact deepens and is correctly held; actual source-surface or hardware interference is not established by this diagnostic.",
+      "disconnect_and_estop": "All six raw head axis/sign cases held all joints on disconnect and latched estop."
+    }
+  },
+  "pending": [
+    "Authority conversion and independent Verify for large native meshes",
+    "Formal pipeline two-revision source closure",
+    "Head collision diagnosis and nonzero following",
+    "Fixed new worker protocol and complete control replay",
+    "Long-run performance and human PICO",
+    "Formal release and deployment"
+  ],
+  "performance_diagnostic": {
+    "path": "/home/andy/Work/reviews/pico-optimization-20261101/m2-real-models-valid-policy/r04/performance-diagnostic/report.json",
+    "sha256": "863025ce1b0c6b21b93a936875629bb9bc443617d4931a7103f37fef154b8dce",
+    "q_reconstruction_error_rad": 0.0,
+    "scope": "Short deterministic offline replay; excludes transport/browser, no 50Hz/long-run claim",
+    "instrumentation": "cProfile only diagnoses hot paths; separately measured uninstrumented record-off/on trials",
+    "leading_costs": [
+      "Collision sweep and repeated native mj_forward",
+      "Complete snapshot JSON encoding in every control tick"
+    ],
+    "native_json_encode_seconds_per_tick_in_instrumented_trial": 0.00248875
+  },
+  "installed_worker": {
+    "path": "/home/andy/Work/reviews/pico-optimization-20261101/m2-fixed-worker-identity.json",
+    "sha256": "4ee5e00613c7f26f6d2ffdb83226a8d13bfdb020c79cb467673863932e1a8188"
+  }
+}
