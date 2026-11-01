@@ -18,8 +18,10 @@ export function frameBounds(viewer, bounds) {
   const horizontal = 2 * Math.atan(Math.tan(vertical / 2) * viewer.camera.aspect);
   viewer.orbit.target.copy(sphere.center);
   viewer.orbit.radius = 1.15 * radius / Math.sin(Math.min(vertical, horizontal) / 2);
-  viewer.camera.near = Math.max(radius / 1000, 1e-6);
-  viewer.camera.far = Math.max(radius * 200, viewer.orbit.radius * 10);
+  viewer.orbit.minRadius = radius * 0.02;
+  viewer.orbit.maxRadius = viewer.orbit.radius * 20;
+  viewer.camera.near = radius / 1000;
+  viewer.camera.far = viewer.orbit.maxRadius + 2 * radius;
   viewer.camera.updateProjectionMatrix();
   viewer.updateCamera();
 }
@@ -331,7 +333,7 @@ async function loadMesh(url, cache, signal) {
   return pending;
 }
 
-export async function loadRobot(viewer, { urdfUrl, urdfPath, files, artifactUrl, onWarning, signal }) {
+export async function loadRobot(viewer, { urdfUrl, urdfPath, files, artifactUrl, signal }) {
   const response = await fetch(urdfUrl, { credentials: "same-origin", signal });
   if (!response.ok) throw new Error(`URDF load failed (HTTP ${response.status})`);
   const xml = await response.text();
@@ -501,7 +503,6 @@ export async function loadRobot(viewer, { urdfUrl, urdfPath, files, artifactUrl,
       frameBounds(viewer, box);
     }
     viewer.frame();
-    if (onWarning) onWarning(warnings);
     const jointRecords = joints.map((joint) => ({
       name: joint.name, type: joint.type, lower: joint.lower, upper: joint.upper,
       effort: joint.effort, velocity: joint.velocity, axis: joint.sourceAxis,
@@ -547,7 +548,7 @@ export function buildJointControls(container, joints, { onInput } = {}) {
       const value = joint.value * factor();
       range.min = String((joint.type === "continuous" ? -Math.PI : joint.lower) * factor());
       range.max = String((joint.type === "continuous" ? Math.PI : joint.upper) * factor());
-      range.value = String(value);
+      if (syncInput || document.activeElement !== range) range.value = String(value);
       if (syncInput) numeric.value = String(value);
       readout.textContent = `${value.toFixed(4)} ${unit.value}`;
       if (value < Number(range.min) || value > Number(range.max)) {
@@ -560,7 +561,8 @@ export function buildJointControls(container, joints, { onInput } = {}) {
       const raw = Number(range.value);
       const value = raw / factor();
       joint.set(value);
-      display();
+      display(false);
+      numeric.value = String(raw);
       if (onInput) onInput(joint);
     };
     range.addEventListener("input", update);
@@ -568,8 +570,10 @@ export function buildJointControls(container, joints, { onInput } = {}) {
       const raw = numeric.value.trim() === "" ? NaN : Number(numeric.value);
       if (!Number.isFinite(raw)) { if (commit) display(); return; }
       const value = raw / factor();
-      joint.set(joint.type === "continuous" ? value : Math.max(joint.lower, Math.min(joint.upper, value)));
-      display(commit);
+      const requested = joint.type === "continuous" ? value : Math.max(joint.lower, Math.min(joint.upper, value));
+      joint.set(requested);
+      display(false);
+      if (commit) numeric.value = String(requested * factor());
       if (onInput) onInput(joint);
     };
     numeric.addEventListener("input", () => updateNumeric(false));
@@ -578,10 +582,15 @@ export function buildJointControls(container, joints, { onInput } = {}) {
     display();
     row.append(label, readout, range, numeric, unit);
     container.append(row);
-    rows.push({ joint, display, row, numeric });
+    rows.push({ joint, display, row, numeric, range });
   }
   return {
-    refresh() { for (const row of rows) row.display(); },
+    refresh() {
+      for (const row of rows) {
+        const editing = document.activeElement === row.numeric || document.activeElement === row.range;
+        row.display(!editing);
+      }
+    },
     reveal(name, { focus = false } = {}) {
       const selected = rows.find((entry) => entry.joint.name === name) || (focus ? rows[0] : null);
       for (const entry of rows) entry.row.classList.toggle("selected", entry === selected);

@@ -150,7 +150,7 @@ export function applyInteraction(state, action, delta, basis) {
     next.phi = Math.min(Math.PI - 0.02, Math.max(0.02, next.phi - dy * 0.008));
   } else if (action === "zoom") {
     const dy = Number(delta) || 0;
-    next.radius = Math.min(500, Math.max(0.05, next.radius * Math.exp(dy * 0.001)));
+    next.radius = Math.min(state.maxRadius ?? next.radius * 20, Math.max(state.minRadius ?? next.radius * 0.01, next.radius * Math.exp(dy * 0.001)));
   } else if (action === "pan") {
     const dx = Number(delta?.[0]) || 0;
     const dy = Number(delta?.[1]) || 0;

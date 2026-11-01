@@ -1635,8 +1635,7 @@ function applyPreviewExpansion() {
   if (card && !card.hidden) card.classList.toggle("preview-collapsed", !expansion.expanded);
   if (expansion.expanded && state.viewer) {
     // Re-measuring after a collapse/expand avoids a zero-sized canvas on the next frame.
-    state.viewer.resize?.();
-    state.viewer.frame?.();
+    fitPreview();
   }
   const button = $("preview-collapse");
   button.hidden = !expansion.collapse_control;
@@ -2723,18 +2722,19 @@ async function loadPreview(dagRunId) {
       files: preview.files,
       artifactUrl,
       signal: request.signal,
-      onWarning: (warnings) => {
-        if (warnings.length) {
-          note.textContent = warnings.join("; ");
-          note.hidden = false;
-        }
-      },
+
     });
     }
     if (request.signal.aborted || state.dagRunId !== dagRunId) return;
     const warnings = isMJCF ? [] : loaded.warnings;
-    note.textContent = warnings.join("; ");
+    note.textContent = "";
     note.hidden = warnings.length === 0;
+    if (warnings.length) {
+      const details = expandable(note, `Viewer notices (${warnings.length})`);
+      const evidence = document.createElement("pre");
+      evidence.textContent = warnings.join("\n");
+      details.append(evidence);
+    }
     $("inspection-primary").hidden = isMJCF;
     $("inspection-controls").hidden = isMJCF;
     if (!isMJCF) {
@@ -2769,7 +2769,6 @@ async function loadPreview(dagRunId) {
     $("viewer-placeholder").hidden = true;
     updatePreviewLayout();
     applyPreviewExpansion();
-    fitPreview();
   } catch (error) {
     if (request.signal.aborted || state.dagRunId !== dagRunId) return;
     if (state.viewer) disposeRobot(state.viewer);
