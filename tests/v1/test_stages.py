@@ -189,7 +189,7 @@ class StageTests(unittest.TestCase):
     def test_stage_table_and_mechanical_responsibilities_match_the_contract(self):
         docs = Path(__file__).resolve().parents[2] / "docs"
         contracts = (docs / "contracts.md").read_text()
-        section = contracts.split("## 六阶段契约", 1)[1].split("\n## ", 1)[0]
+        section = contracts.split("## 七阶段契约", 1)[1].split("\n## ", 1)[0]
         table = "\n".join(line for line in section.splitlines() if line.startswith("|")).rstrip()
         documented_rows = [
             [cell.strip() for cell in line.strip("|").split("|")]
@@ -204,6 +204,7 @@ class StageTests(unittest.TestCase):
             "capture": "Windows 原生读取 + Linux 传输核验",
             "generate": "Linux",
             "verify": "Linux",
+            "mjcf": "Linux",
             "publish": "Linux",
         }
         expected_qc = {
@@ -220,6 +221,10 @@ class StageTests(unittest.TestCase):
             "verify": (
                 ("verification.subject",),
                 ("verification.gates", "verification.report_binding"),
+            ),
+            "mjcf": (
+                ("mjcf.inputs",),
+                ("mjcf.projection", "mjcf.binding"),
             ),
             "publish": (
                 ("publication.inputs",),

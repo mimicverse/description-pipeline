@@ -2,7 +2,7 @@
 
 部署由一台 Linux 平台主机和一个串行 Windows 原生执行端组成。用户仅访问一个 HTTPS 操作台；Airflow、数据库、内部 API 和原生端点不直接向用户开放。
 
-Linux 承担平台编排、工程模型与 URDF 生成、独立验证、报告和发布。Windows 运行原生 CAD 读取，释放 CAD 后完成原值序列化与证据封包。Linux Capture 核验传输与绑定，Generate 一次执行语义投影、惯量规范化和 STL 生成，Verify 从 raw 独立复算。Windows 只安装原生运行依赖和已资格化的 SolidWorks，运行在专用登录用户的交互式桌面中；不配置模型仓库、发布目标、Git 凭据、报告或 MuJoCo。
+Linux 承担平台编排、工程模型、URDF/MJCF 生成、独立验证、报告和发布。Windows 运行原生 CAD 读取，释放 CAD 后完成原值序列化与证据封包。Linux Capture 核验传输与绑定，Generate 一次执行语义投影、惯量规范化和 STL 生成，Verify 从 raw 独立复算；MJCF 在 Linux 生成组件碰撞代理、编码并独立验证，Publish 组合两种格式。Windows 只安装原生运行依赖和已资格化的 SolidWorks，运行在专用登录用户的交互式桌面中；不配置模型仓库、发布目标、Git 凭据、报告或 MuJoCo。
 
 ## 开发与发行链路
 
@@ -184,7 +184,7 @@ ID 不构成授权，并继续只使用一个既有部署登记来源。
 
 DAG 验收还须核对活动记录中的绝对路径与发行成员摘要、实际生效的 `core.dags_folder`、当前 `DagVersion` 和 `SerializedDag` 关联，以及序列化的文件和解析目录。唯一支持的 `dags-folder` 本地 bundle 使用空版本；不能因此省略已登记版本 UUID 与实际任务来源核对。真实监督任务日志记录加载的 DAG 路径、SHA-256 和 Python 包来源。历史目录即使存在同名字节，也不能代替当前发行绑定；身份不符时不得开放新准入。
 
-Airflow 发行固定为 3.3.2。DAG 的六个 task 均使用 `StageTaskOperator`，当前固定
+Airflow 发行固定为 3.3.2。DAG 的七个 task 均使用 `StageTaskOperator`，当前固定
 `max_active_runs=8`、`max_active_tasks=8`；这些值只限制调度并发，不能替代 physical
 CAD ownership、容量为一的 native pool 或 target/effect conflict。operator 的
 `execute()` 绑定真实 DagRun/TaskInstance 后调用 `StageApplication.run_stage()`；
@@ -219,12 +219,12 @@ fact/decision、不取消外部操作。401/403、`native_operation_identity_mis
 开放服务前，在已安装发行上验证完整流程：
 
 1. 两端安装身份及 `doctor` 通过，配置一致、TLS 可信、真实飞书登录成功；未批准租户和越权运行管理被拒绝。
-2. 上传原生文件夹，选择主装配与产品目标，执行全部六阶段；请求、证据、报告、预览和
+2. 上传原生文件夹，选择主装配与产品目标，执行全部七阶段；请求、证据、报告、预览和
    PR 绑定一致。Discover 与 Capture 分别核验本 operation archive、materialize 结果和
    生产身份与同一 SourceSet 原件血缘一致；SourceSet 与 prepared 保持不同摘要。两个
    operation 可以独立传输和物化，单 runtime/CAD owner 与 operation-local workspace
    不变；不得新增跨 operation source cache 或把内容复用当作工程资格。
-3. Linux 推导、生成、验证、报告与发布不调用 Windows；验证/发布重跑不创建 CAD 操作，Windows 安装不包含可移植运行依赖。 外观验收须用本次原生事实证明实际交付面的对象、状态、RGBA 与无损分组；覆盖完整 public-QI 分类、Part face 到 body/feature 的原生归属、合法共享 identity/fragments，以及缺失、分歧和接口不兼容的拒绝。零参 COM 方法须按方法调用，live handle 不得进入深复制或封存事实。验证原生 activity 经既有 poll 到 Portal 的真实显示，activity 与阶段资格分别核验。隔离 Capture 与 Linux transfer 通过不能代替正式 Freeze 开始的六阶段验收。
+3. Linux 推导、生成、验证、报告与发布不调用 Windows；验证/发布重跑不创建 CAD 操作，Windows 安装不包含可移植运行依赖。 外观验收须用本次原生事实证明实际交付面的对象、状态、RGBA 与无损分组；覆盖完整 public-QI 分类、Part face 到 body/feature 的原生归属、合法共享 identity/fragments，以及缺失、分歧和接口不兼容的拒绝。零参 COM 方法须按方法调用，live handle 不得进入深复制或封存事实。验证原生 activity 经既有 poll 到 Portal 的真实显示，activity 与阶段资格分别核验。隔离 Capture 与 Linux transfer 通过不能代替正式 Freeze 开始的七阶段验收。
 4. 同时提交、重复请求、断连与重启保持幂等；在全新进程中从已登记 command 和封存
    artifact 重建 workspace，不依赖前一阶段内存、缓存或临时目录。native operation
    串行，未知 CAD 会话被拒绝且不被访问或终止。
@@ -235,18 +235,19 @@ fact/decision、不取消外部操作。401/403、`native_operation_identity_mis
    直接混入 401/403、foreign operation view、`native_operation_identity_mismatch`
    和非 target conflict 必须使 trigger 明确中止；404、transport、5xx 或
    `native_target_mismatch` 保持同一 wait 继续 poll，不得切换到其他 operation。
-6. 缺失/包外来源、错误配置、坏证据及验证失败阻断下游；诊断与未验证预览的身份清晰。
+6. 必要来源缺失、未授权包外来源、错误配置、坏证据及验证失败阻断下游；获准的已知缺失引用须保留详细 warning 后继续，诊断与未验证预览的身份清晰。
    发布失败保留验证结果，未知外部结果通过对账恢复。
-7. 新的正式重跑或 Freeze successor 始终从 `freeze` 接纳；只复用父运行已验证
+7. 新 CAD 输入与 Freeze successor 从 `freeze` 接纳；Freeze successor 只复用父运行已验证
    `freeze_originals`，当前 rules/config/target/Git/native requirement 与双端工具
-   重新封存，不继承父 Discover 及后续 decision、成功或 qualification。已登记 command
+   重新封存，不继承父 Discover 及后续 decision、成功或 qualification。仅转换重跑使用
+   直接绑定原始 Verify 闭包的受限 MJCF 后继，旧下游决定不复制。已登记 command
    的安全重试保留原证据时间、producer、effect 及封存请求身份；当前执行权按
    canonical claim 规则取得新 fence，不改写外部请求中的旧 fence。删除/恢复显示
    台账不移除证据。每次 successor/claim/decision/send 都重算 immediate 与 supporting
    predecessor qualification、result/failure metadata 和 effect ledger；跨运行复用只
-   经已验证父 Freeze originals 的新请求进行。
+   经已验证父 Freeze originals 或直接绑定原始 Verify 的受限 MJCF 后继进行。
    服务重启后请求、历史、准入和发布状态从 canonical facts 经唯一共同业务 projector
-   恢复；单个诊断目标不能计入正式六阶段。
+   恢复；单个诊断目标不能计入正式七阶段。
 8. 使用实际连接写入端与正式健康/DAG消费者验证同一配置引用，并证明切换后已冻结运行的配置身份不变；演练首次安装、启停和第二主机安装失败，注入配置漂移，核对仓库规则允许追加且禁止非 fast-forward，完成凭据轮换及备份恢复；全部维护路径使用同一生命周期和资源域。
 9. 为 native 输入传输注入一种可恢复窗口：原 operation 已 accepted、input 未 admitted、
    传输响应丢失。验证只有同一 command/effect/envelope/request/payload/archive/tool 且
@@ -283,24 +284,24 @@ fact/decision、不取消外部操作。401/403、`native_operation_identity_mis
 
 保留真实原生、身份、授权、失败和恢复证据。mock、健康绿标或能打开页面不能替代完整验收。
 
-验收固定同一个已合入受保护 `main` 的提交。CI 的必需门包含锁定 Airflow 环境中的真实普通操作员提交/调度及发行完整性；模拟端点只覆盖运输与失败阻断。发布完整发行后，校验资产摘要并在两端干净安装同一版本，不对活动发行目录补拷源码或脚本。最终记录绑定源码提交、发行清单、双端安装/配置、原始工程清单、运行、六阶段收据、独立报告、实际 URDF 预览和模型 PR。当前模型仓库为 `mimicverse/description`，集成 base 为 `main`；手工与历史 PR 不参与工程生成；历史手工版仅进入独立参考单元测试和回归测试，不作为生产值来源、验证真值或正式发布必经输入。参考测试按语义区分合法表示与真实工程回归；正式验收仍依当前 CAD、独立验证和真实端到端的必需门。
+验收固定同一个已合入受保护 `main` 的提交。CI 的必需门包含锁定 Airflow 环境中的真实普通操作员提交/调度及发行完整性；模拟端点只覆盖运输与失败阻断。发布完整发行后，校验资产摘要并在两端干净安装同一版本，不对活动发行目录补拷源码或脚本。最终记录绑定源码提交、发行清单、双端安装/配置、原始工程清单、运行、七阶段收据、独立报告、实际 URDF/MJCF 预览和双格式模型 PR。当前模型仓库为 `mimicverse/description`，集成 base 为 `main`；手工与历史 PR 不参与工程生成；历史手工版仅进入独立参考单元测试和回归测试，不作为生产值来源、验证真值或正式发布必经输入。参考测试按语义区分合法表示与真实工程回归；正式验收仍依当前 CAD、独立验证和真实端到端的必需门。
 
 正式入口须验证普通操作员的必选目标及多行说明，并用浏览器实际加载绑定交付的 URDF/网格、执行关节交互。生成后自动显示预览；独立验证未通过时只提供明确标注的未验证诊断预览，不能使用通过绿标。页面阶段、检查计数和资格与同一封存结果一致。验收中的待执行项保持待执行，不因服务健康或历史运行通过而封板。
 
-操作员在同一入口明确选择工程或检查预览用途；冻结记录使用唯一 `request/v2` 并保留选择。逐组核验输入、请求、运行、报告、实际关节预览与 `main` 候选 PR 的绑定，不能跨用途代跑。两种用途均以当前 CAD 和明确的适用规则建立交付；检查预览可按[用途契约](contracts.md#purpose)的 `inspection_rotation_full_turn/v1` 使用全周窗口，必须验证适用条件并显式显示原生范围缺项与策略来源，不得抄入手工结果或冒称机械限位。已有有效 CAD 范围不得被窗口覆盖。缺失驱动按 `drive.missing_zero/v1` 填零占位，明确显示平台默认来源及驱动能力未建立；报告、URDF、预览和 PR 一致显示参数来源与资格。必需检查和原生事实要求不因用途减弱。不同用途的候选与发布恢复身份按[发布协议](contracts.md#publication)隔离。
+操作员在同一入口明确选择工程或检查预览用途；冻结记录使用唯一 `request/v2` 并保留选择。逐组核验输入、原工程请求、本次转换/发布请求、运行、两份独立证书、实际关节预览与 `main` 候选 PR 的绑定，不能跨用途代跑。MJCF 后继保留原工程请求字节，当前说明从本次 Publish intent 核对，不要求与父 `input/request.json.change_summary` 相等。两种用途均以当前 CAD 和明确的适用规则建立交付；检查预览可按[用途契约](contracts.md#purpose)的 `inspection_rotation_full_turn/v1` 使用全周窗口，必须验证适用条件并显式显示原生范围缺项与策略来源，不得抄入手工结果或冒称机械限位。已有有效 CAD 范围不得被窗口覆盖。缺失驱动按 `drive.missing_zero/v1` 填零占位，明确显示平台默认来源及驱动能力未建立；报告、URDF、预览和 PR 一致显示参数来源与资格。必需检查和原生事实要求不因用途减弱。不同用途的候选与发布恢复身份按[发布协议](contracts.md#publication)隔离。
 
-需要从已有运行改用封存 CAD 原件时，`/api/runs/<parent>/attempts` 只接受
+需要从已有运行改用封存 CAD 原件时，`/api/runs/<parent>/attempts` 的 CAD 重跑使用
 `stage=freeze`，调用 `load_production_freeze_successor(...)`。该入口通过
 `StageApplication.load_verified_freeze_origins(parent)` 重验父 Freeze
 decision/result、`inputs.json`、originals ref 和 CAS bytes，只复用
 `spec.originals`；当前 rules、config snapshot、target、RepositorySnapshot、Git
-baseline、native requirement、portable/native closure 与六阶段 executor 重新接纳，
+baseline、native requirement、portable/native closure 与七阶段 executor 重新接纳，
 随后调用同一 `StageApplication.admit`。返回的 technical dispatch command 交给同一
 `StageApplication.dispatch(command_id, adapter)` facade；facade 内的
 `TechnicalDispatchService` 先取得 claim/fence、提交 `dispatch_authorized`，再调用
 Airflow trigger。实际 Freeze task 只绑定启动后的真实 task context，不授权自己的
 创建。Portal 不接收或构造 `VerifiedArtifact`，不实例化第二 Factory，不保留 Discover
-及后续阶段起点旁路。
+及后续阶段任意起点旁路；受限 MJCF 重跑单独固定到原始 Verify 来源。
 
 方向验收绑定本次 CAD、规则版本、固定代码提交及实际交付：先核对全部关节的原值、作者声明绑定、必要坐标转换和未解决项，再通过门户预览执行有效范围内的非零运动，验证 CAD 运动语义、零位及范围的一致性。当前不发布基于右手定则或功能动作的新正向推导规则，历史试算不作为通过证据。必须注入共享 `status=local_class_aligned` 而作者正向证据仍缺失的负例，证明 Discovery、Generate、独立验证、模型来源、URDF、报告、预览和 PR 均保留同一
 `direction.semantics_unresolved` warning；同时核对 axis／xyz／rpy／limits、封存
@@ -331,8 +332,8 @@ CAD 和规则输入；固定手工参考仅由独立参考测试读取，测试�
 Airflow scheduling/DagRun 关联和 drain/stop bucket，不能聚合 stage decision 或
 effect。该 store 不能写 command、claim、candidate、decision、effect 或
 qualification，不能成为第二 stage 状态权威。显示名、隐藏与恢复只改变显示台账，
-不改变运行状态、阶段结论或证据。正式成功必须来自六个 formal stage 的 complete
-decision 与满足的 effect ledger；diagnostic 目标与正式六阶段隔离。
+不改变运行状态、阶段结论或证据。正式成功必须来自本次执行范围内的 formal stage 的 complete
+decision 与满足的 effect ledger；diagnostic 目标与正式七阶段隔离。
 关闭与重开准入只经窄 `AdmissionControlStore` 事务 API 执行，使用明确的写入授权；
 operator 不构造 `PlatformStore`、artifact reader 或第二状态机。只读凭据不能执行这些
 变更。维护查询采用[架构定义的一致快照](design.md#持久化与一致性)，缺绑定、未知状态
@@ -439,3 +440,11 @@ sealed archive/receipt 消费、独立 `admit_capture`/`verify_transfer` 和资�
 ## 端点停止与重启（settle 规程与锁拒绝）
 
 停止 Windows 端点须证明端口无监听、自有写入进程退出，超时即停止失败。原生 worker 关闭使用已有有界等待；worker 未结束时返回未决错误，不提前释放进程仍持有的所有权。随后由正常 `start` 核验任务、监听进程身份、令牌认证和双端健康后开放准入。锁不可用时核对实际属主和进程，只有原持有者已结束且锁已释放才可受控重试；等待时长不能代替释放证据，也不能杀死未知进程或删除锁强行启动。Windows 离线或隧道重试如实记为不可用；双端未完成身份与就绪核验时不能报告部署成功。
+
+## MJCF 开发、资产与正式验收差量
+
+Linux 发行必须包含锁定的 MuJoCo 运行依赖、官方 WASM/JS、许可证及完整浏览器资源，逐文件绑定实际包与服务字节。Windows 不新增 MuJoCo 或碰撞依赖。转换和独立检查各在有 CPU、内存及时限的子进程执行。默认组件凸包策略为 config schema 2、256顶点预算、相对源组件凸包 `0.00025 m` 质量门，每次独立计算；不冒称凹 CAD 表面完整等价。
+
+正式验收补充：从新 Freeze 完成七阶段并同时交付 URDF/MJCF；单独 MJCF 重跑在无 CAD endpoint/token 的新进程和实际 Airflow 中执行，上游五任务 skipped、仅 MJCF/Publish 产生新决定；核验来源与原终态不变。覆盖转换失败、执行中取消、UNKNOWN、来源冲突和误标 skipped 不放行 Publish。页面只渲染共同范围，复用标记、键盘名称、阶段证据和来源链接一致。
+
+浏览器对同一交付实际加载 URDF 与 MJCF，核验 visual/collision/overlay、非零关节调姿、播放/暂停、单步、复位、下载和摘要拒绝；碰撞显示为引擎实际接触代理，交互不回写结果。独立 worktree 的 8878 开发实例使用离线夹具、独立 PostgreSQL/Airflow/CAS/cookie 和受控 Git/PR，仅建立开发证据；不能代替固定 main 同发行的真实 CAD、正式调度器、双端身份、独立审查及发布验收。
