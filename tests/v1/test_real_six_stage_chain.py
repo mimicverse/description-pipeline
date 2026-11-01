@@ -809,7 +809,7 @@ class RealSixStageChainTests(unittest.TestCase):
                 "PATH": os.environ["PATH"],
                 "PYTHONPATH": str(Path(application_from_environment.__code__.co_filename).resolve().parents[2]),
                 "PLATFORM_SERVICE_DSN": psycopg2.extensions.make_dsn(
-                    self.server.get_uri(), options=f"-c search_path={self.schema},public",
+                    self.server.get_uri(), options=f"-c search_path={self.schema},public -c timezone=Asia/Shanghai",
                 ),
                 "PLATFORM_ARTIFACT_ROOT": str(self.store.root),
                 "PIPELINE_WORK_ROOT": str(work / "cold-runtime"),
@@ -823,9 +823,23 @@ class RealSixStageChainTests(unittest.TestCase):
             self.assertEqual(0, cold.returncode, cold.stderr)
             admitted_cold = json.loads(cold.stdout)
             self.assertEqual(cold_spec.run_id, admitted_cold["admission"]["run_id"])
+            self.assertEqual(cold_spec.created_at.astimezone(UTC).isoformat(),
+                             admitted_cold["admission"]["created_at"])
+            environment["PLATFORM_SERVICE_DSN"] = psycopg2.extensions.make_dsn(
+                self.server.get_uri(), options=f"-c search_path={self.schema},public -c timezone=America/New_York",
+            )
             repeated = cold_cli("admit", str(spec_path))
             self.assertEqual(0, repeated.returncode, repeated.stderr)
             self.assertEqual(admitted_cold, json.loads(repeated.stdout))
+            from description_pipeline.platform.queries import read_run_projection
+
+            with self._connect() as connection, connection.cursor() as cursor:
+                projections = []
+                for zone in ("UTC", "Asia/Shanghai", "America/New_York"):
+                    cursor.execute("SET TIME ZONE %s", (zone,))
+                    projections.append(read_run_projection(connection, source.run_id, artifacts=self.store))
+            self.assertEqual(projections[0], projections[1])
+            self.assertEqual(projections[0], projections[2])
             cold_stage = cold_cli("stage", admitted_cold["entry_command"]["command_id"])
             self.assertEqual(0, cold_stage.returncode, cold_stage.stderr + cold_stage.stdout)
             self.assertEqual("completed", json.loads(cold_stage.stdout)["outcome"])

@@ -474,7 +474,7 @@ class AdmissionOutcome:
     def to_record(self) -> dict[str, Any]:
         return {
             "admission": {
-                "created_at": self.admission.created_at.isoformat(),
+                "created_at": self.admission.created_at.astimezone(UTC).isoformat(),
                 "from_stage": self.admission.from_stage,
                 "parent_run_id": self.admission.parent_run_id,
                 "request": _plain(self.admission.request),

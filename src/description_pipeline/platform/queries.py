@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from ..stages import STAGE_IDS, execution_stage_ids
@@ -414,7 +414,7 @@ def read_run_projection(
                 "actual_executor_sha256": row[6],
                 "reason_code": row[7],
                 "failure_envelope": row[8],
-                "decided_at": row[9].isoformat() if isinstance(row[9], datetime) else row[9],
+                "decided_at": row[9].astimezone(UTC).isoformat() if isinstance(row[9], datetime) else row[9],
             }
             for row in cursor.fetchall()
         }
@@ -465,9 +465,9 @@ def read_run_projection(
                 "dag_run_id": row[7],
                 "task_id": row[8],
                 "map_index": row[9],
-                "issued_at": row[10].isoformat() if isinstance(row[10], datetime) else row[10],
-                "expires_at": row[11].isoformat() if isinstance(row[11], datetime) else row[11],
-                "closed_at": row[12].isoformat() if isinstance(row[12], datetime) else row[12],
+                "issued_at": row[10].astimezone(UTC).isoformat() if isinstance(row[10], datetime) else row[10],
+                "expires_at": row[11].astimezone(UTC).isoformat() if isinstance(row[11], datetime) else row[11],
+                "closed_at": row[12].astimezone(UTC).isoformat() if isinstance(row[12], datetime) else row[12],
                 "closure_code": row[13],
                 "yield_effect_id": row[14],
             }
@@ -771,7 +771,7 @@ def read_run_projection(
         "request": dict(admission[3]) if isinstance(admission[3], Mapping) else None,
         "purpose": purpose,
         "request_digest": admission[4],
-        "created_at": admission[5].isoformat() if isinstance(admission[5], datetime) else admission[5],
+        "created_at": admission[5].astimezone(UTC).isoformat() if isinstance(admission[5], datetime) else admission[5],
         "scope": run_scope,
         "formal_eligible": run_scope["formal_eligible"],
         "state": run_state,

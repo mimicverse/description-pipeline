@@ -245,7 +245,7 @@ class AssessmentMaintenancePostgresTests(AssessmentCase):
             connection.rollback()
         self.assertFalse(self._probe()["settled"])
 
-    def _bundle_request(self, *, register_bundle=True):
+    def _bundle_request(self):
         folder = self.root / "unique-bundle"
         folder.mkdir()
         (folder / "execution.bin").write_bytes(b"unique assessment execution input\x00")
@@ -253,8 +253,7 @@ class AssessmentMaintenancePostgresTests(AssessmentCase):
             folder, kind="dynamics_execution_bundle", producer_run_id="source-run", producer_stage=None,
             producer_tool_sha256=self.request.record["executor_sha256"],
         )
-        if register_bundle:
-            self.store.platform.register_artifact(bundle)
+        self.store.platform.register_artifact(bundle)
         return AssessmentRequest({**self.request.to_record(), "bundle": bundle.to_record()})
 
     def test_unique_bundle_survives_exported_snapshot_dump_and_empty_target_restore(self):
@@ -323,16 +322,27 @@ class AssessmentMaintenancePostgresTests(AssessmentCase):
         )
 
     def test_missing_nested_registry_reference_refuses_backup(self):
-        request = self._bundle_request(register_bundle=False)
+        request = self._bundle_request()
         self._attempt(request)
+        with self.connect() as connection, connection.cursor() as cursor:
+            # Inject storage corruption in this test's private database after valid admission.
+            cursor.execute("ALTER TABLE artifact DISABLE TRIGGER reject_update_delete")
+            cursor.execute("DELETE FROM artifact WHERE artifact_id=%s", (request.bundle.artifact_id,))
+            self.assertEqual(1, cursor.rowcount)
+            cursor.execute("ALTER TABLE artifact ENABLE TRIGGER reject_update_delete")
         with self.connect() as connection, self.assertRaisesRegex(ValueError, "absent from the artifact registry"):
             read_recovery_artifacts(connection, self.store.artifacts.root)
 
     def test_changed_complete_nested_reference_refuses_backup(self):
         request = self._bundle_request()
-        record = request.to_record()
-        record["bundle"]["producer_tool_sha256"] = digest({"changed": True})
-        self._attempt(AssessmentRequest(record))
+        self._attempt(request)
+        with self.connect() as connection, connection.cursor() as cursor:
+            # Inject storage corruption in this test's private database after valid admission.
+            cursor.execute("ALTER TABLE artifact DISABLE TRIGGER reject_update_delete")
+            cursor.execute("UPDATE artifact SET producer_tool_sha256=%s WHERE artifact_id=%s",
+                           (digest({"changed": True}), request.bundle.artifact_id))
+            self.assertEqual(1, cursor.rowcount)
+            cursor.execute("ALTER TABLE artifact ENABLE TRIGGER reject_update_delete")
         with self.connect() as connection, self.assertRaisesRegex(ValueError, "complete registered ArtifactRef"):
             read_recovery_artifacts(connection, self.store.artifacts.root)
 
