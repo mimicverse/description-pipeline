@@ -12,6 +12,17 @@ import sys
 import tempfile
 import venv
 
+_CONSUMER_PROBE = """
+import hashlib,json,sys
+from pathlib import Path
+source = Path(sys.argv[1]).read_bytes()
+if hashlib.sha256(source).hexdigest() != sys.argv[2]:
+    raise ValueError("Consumer checker snapshot differs from the release")
+api = {"__file__": sys.argv[1], "__name__": "_installed_consumer_checker"}
+exec(compile(source, sys.argv[1], "exec"), api)
+print(json.dumps(api["verify_runtime_contract"](json.load(sys.stdin))))
+"""
+
 
 def deployment_resource(root: Path, release: dict, relative: str) -> bytes:
     """Snapshot one member of the existing release deployment inventory."""
@@ -50,7 +61,13 @@ def installed_consumer(package: Path, identity: dict, role: str, temporary: Path
     checker_path = Path(checker.__file__).resolve()
     if not checker_path.is_relative_to(package):
         raise ValueError("Consumer checker is outside the installed release")
-    return contract, checker_path
+    checker_bytes = checker_path.read_bytes()
+    if hashlib.sha256(checker_bytes).hexdigest() != identity["package_files"].get("simulation/runtime.py"):
+        raise ValueError("Consumer checker differs from the installed release inventory")
+    checker_snapshot = temporary / "runtime.py"
+    checker_snapshot.write_bytes(checker_bytes)
+    checker_snapshot.chmod(0o400)
+    return contract, checker_snapshot
 
 
 def main():
@@ -149,12 +166,16 @@ def main():
             launcher.chmod(0o755)
             print(f"PICO link installed. Start a session with: {launcher} /path/to/pico-link-session.json")
         else:
-            bootstrap = (
-                "import json,runpy,sys;api=runpy.run_path(sys.argv[1]);"
-                "print(json.dumps(api['verify_runtime_contract'](json.load(sys.stdin))))"
-            )
             probe = subprocess.run(
-                [str(python), "-I", "-B", "-c", bootstrap, str(checker_path)],
+                [
+                    str(python),
+                    "-I",
+                    "-B",
+                    "-c",
+                    _CONSUMER_PROBE,
+                    str(checker_path),
+                    identity["package_files"]["simulation/runtime.py"],
+                ],
                 input=json.dumps(contract),
                 capture_output=True,
                 text=True,

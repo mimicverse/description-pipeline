@@ -9,8 +9,11 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
+from unittest import mock
 import zipfile
 
 from tools.release_consumers import locked_consumers, target_tags, verify_consumer_pool, wheel_record
@@ -215,6 +218,57 @@ class ConsumerPoolTests(unittest.TestCase):
             teleop.write_bytes(b"changed model wheel")
             with self.assertRaisesRegex(PipelineError, "fixed consumer asset"):
                 model_inputs(source, bound, teleop, actuator)
+
+
+class InstallerCheckerTests(unittest.TestCase):
+    def test_installer_executes_only_the_release_checker_snapshot_after_package_mutation(self):
+        from scripts import install_teleop_worker as installer
+        from description_pipeline.simulation import runtime
+
+        _members, _locks, contract, _contracts = consumer_fixture()
+        approved = b"def verify_runtime_contract(contract): return {'checker': 'approved'}\n"
+        changed = b"def verify_runtime_contract(contract): return {'checker': 'unverified'}\n"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package, temporary = root / "package", root / "temporary"
+            (package / "simulation").mkdir(parents=True)
+            temporary.mkdir()
+            contract_path = package / "simulation/teleop-runtime.json"
+            contract_path.write_text(json.dumps(contract))
+            checker = package / "simulation/runtime.py"
+            checker.write_bytes(approved)
+            identity = {
+                "package_files": {
+                    "simulation/teleop-runtime.json": hashlib.sha256(contract_path.read_bytes()).hexdigest(),
+                    "simulation/runtime.py": hashlib.sha256(approved).hexdigest(),
+                }
+            }
+            with mock.patch.object(runtime, "__file__", str(checker)):
+                selected, snapshot = installer.installed_consumer(package, identity, "pico", temporary)
+            checker.write_bytes(changed)
+            command = [
+                sys.executable,
+                "-I",
+                "-B",
+                "-c",
+                installer._CONSUMER_PROBE,
+                str(snapshot),
+                identity["package_files"]["simulation/runtime.py"],
+            ]
+            accepted = subprocess.run(command, input=json.dumps(selected), text=True, capture_output=True, timeout=10)
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertEqual(json.loads(accepted.stdout), {"checker": "approved"})
+            snapshot.chmod(0o600)
+            snapshot.write_bytes(changed)
+            rejected = subprocess.run(command, input=json.dumps(selected), text=True, capture_output=True, timeout=10)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertEqual(rejected.stdout, "")
+            self.assertIn("snapshot differs from the release", rejected.stderr)
+            with (
+                mock.patch.object(runtime, "__file__", str(checker)),
+                self.assertRaisesRegex(ValueError, "differs from the installed release"),
+            ):
+                installer.installed_consumer(package, identity, "pico", temporary)
 
 
 if __name__ == "__main__":
