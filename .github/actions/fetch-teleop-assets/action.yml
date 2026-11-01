@@ -18,7 +18,7 @@ runs:
         from pathlib import Path
         import subprocess
 
-        from description_pipeline.simulation.schemas import load_runtime_contract
+        from description_pipeline.simulation.runtime import load_runtime_contract
 
         contract = load_runtime_contract(
             Path("src/description_pipeline/simulation/teleop-runtime.json"), consumer="assessment"

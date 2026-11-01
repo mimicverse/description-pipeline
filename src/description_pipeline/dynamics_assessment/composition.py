@@ -10,7 +10,7 @@ from pathlib import Path
 from ..artifacts import ArtifactStore
 from ..artifacts.store import path_has_link_ancestor
 from ..runtime import scoped_executor_sha256, tool_record
-from ..simulation.schemas import load_runtime_contract
+from ..simulation.runtime import load_runtime_contract
 from .contracts import RUNTIME_SCHEMA, RuntimePin, object_record, parse_json, require, text
 from .executor import AssessmentExecutor
 from .runtime import ProcessLimits, TeleopProcess

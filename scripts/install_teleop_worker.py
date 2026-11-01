@@ -48,17 +48,13 @@ def installed_product(release: dict):
 
 def installed_consumer(package: Path, identity: dict, role: str, temporary: Path):
     """Project the package's canonical contract and reuse its installed native checker."""
-    from description_pipeline.simulation import runtime as checker
-    from description_pipeline.simulation.schemas import load_runtime_contract
-
     contract_path = package / "simulation/teleop-runtime.json"
     payload = contract_path.read_bytes()
     if hashlib.sha256(payload).hexdigest() != identity["package_files"].get("simulation/teleop-runtime.json"):
         raise ValueError("Installed consumer contract differs from its release inventory")
     snapshot = temporary / "teleop-runtime.json"
     snapshot.write_bytes(payload)
-    contract = load_runtime_contract(snapshot, consumer=role)
-    checker_path = Path(checker.__file__).resolve()
+    checker_path = (package / "simulation/runtime.py").resolve()
     if not checker_path.is_relative_to(package):
         raise ValueError("Consumer checker is outside the installed release")
     checker_bytes = checker_path.read_bytes()
@@ -67,6 +63,9 @@ def installed_consumer(package: Path, identity: dict, role: str, temporary: Path
     checker_snapshot = temporary / "runtime.py"
     checker_snapshot.write_bytes(checker_bytes)
     checker_snapshot.chmod(0o400)
+    api = {"__file__": str(checker_snapshot), "__name__": "_installed_consumer_contract"}
+    exec(compile(checker_bytes, str(checker_snapshot), "exec"), api)
+    contract = api["load_runtime_contract"](snapshot, consumer=role)
     return contract, checker_snapshot
 
 

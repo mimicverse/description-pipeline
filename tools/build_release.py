@@ -71,7 +71,7 @@ def bind_source_closure(source: Path) -> SimpleNamespace:
         from description_pipeline.delivery import PIPELINE_ID  # noqa: PLC0415
         from description_pipeline import interface_records as pipeline_records  # noqa: PLC0415
         from description_pipeline import runtime as pipeline_runtime  # noqa: PLC0415
-        from description_pipeline.simulation.schemas import load_runtime_contract  # noqa: PLC0415
+        from description_pipeline.simulation.runtime import load_runtime_contract  # noqa: PLC0415
 
         for module in (description_pipeline, pipeline_io, build_archive, pipeline_records, pipeline_runtime):
             module_file = getattr(module, "__file__", "") or ""

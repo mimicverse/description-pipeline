@@ -32,7 +32,7 @@ from description_pipeline.io import (
 )
 from description_pipeline.interface_records import release_domain_identity
 from description_pipeline.runtime import LINUX_PLATFORMS, TARGET_ABI, TARGET_PYTHON, WINDOWS_PLATFORMS
-from description_pipeline.simulation.schemas import load_runtime_contract
+from description_pipeline.simulation.runtime import load_runtime_contract
 
 if __package__:
     from .release_consumers import CONSUMER_LOCKS, CONSUMER_POOL_PREFIX, target_tags, verify_consumer_pool
