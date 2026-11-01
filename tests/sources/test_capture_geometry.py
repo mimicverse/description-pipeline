@@ -6,7 +6,9 @@ import copy
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from description_pipeline.geometry.native_scope import native_source_scope_is_valid
 from description_pipeline.io import PipelineError, write_json
 from description_pipeline.schemas import (
     CAPTURE_EVIDENCE_REQUESTS,
@@ -154,6 +156,110 @@ class CaptureGeometryTests(unittest.TestCase):
                 evidence_root=evidence_root,
                 destination_root=Path(self.root) / "linux",
             )
+
+    def _named_geometry_fixture(self, root, component):
+        assembly = support.make_cad_tree(root)
+        parts = [root / "base.SLDPRT", root / "arm.SLDPRT"]
+        backend = support.FixtureCadBackend(assembly, [
+            {
+                "name": "base-1", "path": str(parts[0]), "transform": support.placement(),
+                "mass": support.mass_payload(1.0, (0.01, 0.02, 0.0)),
+            },
+            {
+                "name": component, "path": str(parts[1]), "transform": support.placement((0.0, 0.0, 0.2)),
+                "mass": support.mass_payload(0.5, (0.0, 0.0, 0.05)),
+            },
+        ], dependencies=parts)
+        try:
+            backend.prepare_prepared_capture(str(root), str(assembly), "Default")
+            facts = backend.collect_prepared_scene(str(assembly), [], groups=[
+                {"name": "base_link", "components": ["base-1"]},
+                {"name": "arm_link", "components": [component]},
+            ])
+            geometry = backend.capture_prepared_geometry(facts["source_scopes"])
+            for name, raw in geometry.items():
+                scope = facts["source_scopes"][name]
+                raw["appearance_raw"] = {
+                    "component": name, "source_document_path": scope["source_document_path"],
+                    "referenced_configuration": scope["referenced_configuration"], "fixture": True,
+                }
+            return facts, geometry
+        finally:
+            backend.release()
+
+    def test_stl_staging_is_independent_of_native_occurrence_names(self) -> None:
+        reference_bytes = None
+        for index, component in enumerate(("Arm-1", "Assembly-1/Part-1", "P" * 248 + "-1")):
+            with self.subTest(component=component):
+                root = self.root / f"name-case-{index}"
+                facts, raw = self._named_geometry_fixture(root / "prepared", component)
+                scopes = facts["source_scopes"]
+                self.assertTrue(all(native_source_scope_is_valid(scope, name) for name, scope in scopes.items()))
+                original_facts, original_raw = copy.deepcopy(facts), copy.deepcopy(raw)
+                cad_inputs = {path: path.read_bytes() for path in (root / "prepared").iterdir()}
+                evidence = root / "evidence"
+                sealed = seal_native_geometry(raw, scopes, evidence)
+                sealed_bytes = {path: path.read_bytes() for path in evidence.rglob("*") if path.is_file()}
+                destination = root / "linux"
+                geometry_directory = destination / "geometry"
+                geometry_directory.mkdir(parents=True)
+                unrelated = geometry_directory / "unrelated.keep"
+                unrelated.write_bytes(b"retain unrelated output")
+                result = materialize_native_geometry(
+                    sealed, scopes, evidence_root=evidence, destination_root=destination,
+                )
+                self.assertEqual(set(result), set(scopes))
+                for name, row in result.items():
+                    self.assertEqual(row["component"], name)
+                    self.assertEqual(row["raw_sha"], sealed[name]["stream_sha256"])
+                    self.assertEqual(row["path"], f"geometry/{row['sha']}.stl")
+                    payload = (destination / row["path"]).read_bytes()
+                    if reference_bytes is None:
+                        reference_bytes = payload
+                    self.assertEqual(payload, reference_bytes)
+                self.assertEqual(set(geometry_directory.iterdir()), {
+                    unrelated, *(destination / row["path"] for row in result.values()),
+                })
+                self.assertEqual(unrelated.read_bytes(), b"retain unrelated output")
+                self.assertEqual({path: path.read_bytes() for path in cad_inputs}, cad_inputs)
+                self.assertEqual({path: path.read_bytes() for path in sealed_bytes}, sealed_bytes)
+                self.assertEqual(facts, original_facts)
+                self.assertEqual(raw, original_raw)
+
+    def test_stl_staging_cleans_owned_files_after_materialization_and_publish_failures(self) -> None:
+        evidence = self.root / "failure-evidence"
+        scopes = self.raw_facts["source_scopes"]
+        sealed = seal_native_geometry(self.raw_geometry, scopes, evidence)
+        before = {path: path.read_bytes() for path in evidence.rglob("*") if path.is_file()}
+
+        def fail_partial(_raw_path, target, _spans, *, triangle_count):
+            self.assertGreater(triangle_count, 0)
+            self.assertFalse(target.exists())
+            with target.open("xb") as stream:
+                stream.write(b"partial STL")
+            raise OSError("materialization failed after a partial write")
+
+        module = "description_pipeline.sources.solidworks.capture_geometry"
+        for failure in ("materialize", "publish"):
+            with self.subTest(failure=failure):
+                destination = self.root / f"failed-{failure}"
+                geometry_directory = destination / "geometry"
+                geometry_directory.mkdir(parents=True)
+                unrelated = geometry_directory / "unrelated.keep"
+                unrelated.write_bytes(b"retain unrelated output")
+                fault = (
+                    mock.patch(module + ".materialize_native_stl", side_effect=fail_partial)
+                    if failure == "materialize" else mock.patch(
+                        module + ".os.replace", side_effect=OSError("STL publication failed")
+                    )
+                )
+                with fault, self.assertRaises(OSError):
+                    materialize_native_geometry(
+                        sealed, scopes, evidence_root=evidence, destination_root=destination,
+                    )
+                self.assertEqual(list(geometry_directory.iterdir()), [unrelated])
+                self.assertEqual(unrelated.read_bytes(), b"retain unrelated output")
+                self.assertEqual({path: path.read_bytes() for path in before}, before)
 
     def test_raw_observation_reader_and_projection_use_one_record(self) -> None:
         evidence_root = Path(self.root) / "sealed/evidence"

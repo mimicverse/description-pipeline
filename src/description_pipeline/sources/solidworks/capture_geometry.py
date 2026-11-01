@@ -6,6 +6,7 @@ import copy
 import hashlib
 import math
 import os
+import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -460,21 +461,21 @@ def materialize_native_geometry(
             warnings.extend(component_warnings)
         stl_directory = destination_root / "geometry"
         stl_directory.mkdir(parents=True, exist_ok=True)
-        temporary = stl_directory / f".{component.casefold()}.partial.stl"
-        temporary.unlink(missing_ok=True)
-        materialize_native_stl(
-            raw_path,
-            temporary,
-            spans,
-            triangle_count=triangle_count,
-        )
-        stl_sha256 = file_digest(temporary)
-        stl_path = native_stl_relative_path(stl_sha256)
-        _publish_if_absent(
-            temporary,
-            destination_root / stl_path,
-            stl_sha256,
-        )
+        with tempfile.TemporaryDirectory(prefix=".stl-", dir=stl_directory) as temporary_root:
+            temporary = Path(temporary_root) / "mesh.stl"
+            materialize_native_stl(
+                raw_path,
+                temporary,
+                spans,
+                triangle_count=triangle_count,
+            )
+            stl_sha256 = file_digest(temporary)
+            stl_path = native_stl_relative_path(stl_sha256)
+            _publish_if_absent(
+                temporary,
+                destination_root / stl_path,
+                stl_sha256,
+            )
         records[component] = {
             "component": component,
             "raw_path": raw["stream_path"],
