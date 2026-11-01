@@ -705,6 +705,9 @@ def _read_config(path: Path) -> dict:
         raise AirflowApiError(f"portal config {path} is not valid JSON: {error}") from error
     if not isinstance(data, dict):
         raise AirflowApiError("portal config must be one JSON object")
+    unknown = set(data) - set(_CONFIG_KEYS)
+    if unknown:
+        raise AirflowApiError(f"portal config has unknown sections: {sorted(unknown)}")
     return data
 
 
@@ -827,9 +830,6 @@ def load_portal_config(path: Path) -> PortalConfig:
     rendered file (this package ships no example copy of it).
     """
     data = _read_config(path)
-    unknown = set(data) - set(_CONFIG_KEYS)
-    if unknown:
-        raise AirflowApiError(f"portal config has unknown sections: {sorted(unknown)}")
     airflow_section = _section(data, "airflow")
     portal_section = _section(data, "portal")
     endpoint_section = _section(data, "endpoint")
@@ -888,6 +888,11 @@ def _simulation_config(section: dict) -> dict | None:
         if not isinstance(value[key], str) or not Path(value[key]).is_absolute():
             raise AirflowApiError("Simulation paths must be absolute")
     return value
+
+
+def load_simulation_config(path: Path) -> dict | None:
+    """Read shared simulation settings without constructing portal services or credentials."""
+    return _simulation_config(_section(_read_config(path), "portal"))
 
 
 def _upload_root(section: dict) -> Path | None:
