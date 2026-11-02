@@ -576,12 +576,21 @@ Windows 传输消费同一固定策略。工程传输包含闭合文件清单、
 observation、selection、ruleset 与 prepared bytes；Capture result 绑定该 result、
 同版 native requirement、prepared inventory 与原生运行环境。Linux 对这些绑定逐层复核。
 
-Discover 原始记录保留组件的 `transform_raw`（SolidWorks 原生 16 值局部变换）与
-`parent_occurrence`、基准的 `array_raw` 与 owner，以及配合端点的原始名称、文档、owner
-scope 和 `EntityParams`。Windows 只验证读取形状与可读性，不组合世界坐标或局部化配合
-几何。Linux Discover 从这些原值生成临时消费视图，独立 Verify 另行复算；两者都不把
-派生结果写回封存 raw。父链、owner、引用冲突或缺失字段必须拒绝，不能当作根节点或
-空帧补齐；原生明确记录的空读数与字段缺失、null 分别处理。
+Discover 与 Capture 共用顶层保存配置下的原生实例域；每个实例保留真实引用配置、
+原生类型、suppression、parent 和来源，不用独立子文档树补成员。唯一当前 raw 契约明确
+`transform_raw` 为主装配机械 frame 中的原生 SW16 world 数组，禁止再次乘父变换或兼容
+解释为旧 local 数组。基准的 `array_raw`、配合 `EntityParams` 仍保留其文档局部 frame；
+Linux 依据实例 world 仅转换一次，独立 Verify 另行复算，不把派生值写回 raw。
+
+树读数转成 primitives 并释放借用接口后，才进行必要文档配置补读；临时 scope 内提取
+原值并在退出前释放接口，恢复后重新取得主上下文。物理 document baseline 与每实例
+引用配置分别核验，solver getter 的实际读取上下文如实保留，不混同 parent/owner。
+Capture 在任何物性读取前，直接对封存 Discover raw 核完整身份、类型、parent、状态、
+配置及来源，拒绝并报告全部漂移；不裁剪旧计划。cached/virtual 继续消费既有跨会话
+绑定，各会话临时路径/PID 原样保留，不要求其相同，不增加 registry 或缩减原件闭包。
+
+父链、frame、owner、引用冲突、无效树、未知或读取失败均不得冒充缺失或压制。已知缺失
+引用继续按保存状态规则给出来源 warning；原生明确空值、缺失字段与 null 分别保真。
 
 Mate component endpoint 的 `reference_document` 必须是可移植包内路径，或由同一 occurrence
 的 sealed embedded-virtual provenance 证明的包外 session 路径；
