@@ -928,10 +928,10 @@ def _project_link_group_mass(raw):
 
 
 def _project_scene(raw_scene):
-    if raw_scene.get("transform_frame") != NATIVE_TRANSFORM_FRAME:
-        raise CadError("cad_prepared_scene_facts_invalid", "raw scene has no main-assembly transform frame")
     if not isinstance(raw_scene, dict):
         raise CadError("cad_prepared_scene_facts_invalid", "scene_raw is not an object")
+    if raw_scene.get("transform_frame") != NATIVE_TRANSFORM_FRAME:
+        raise CadError("cad_prepared_scene_facts_invalid", "raw scene has no main-assembly transform frame")
     projected_by_name = {}
     occurrences = raw_scene.get("occurrences")
     components = raw_scene.get("components")

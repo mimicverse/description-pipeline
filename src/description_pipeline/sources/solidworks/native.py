@@ -167,6 +167,25 @@ def _assemblydoc(value):
     return _interface(value, IASSEMBLYDOC_IID)
 
 
+def _native_document_type(document, component=""):
+    """Read only documented integer native part/assembly types, without coercion."""
+    try:
+        kind = _method(document, "GetType")
+    except Exception as error:
+        raise CadError(
+            "cad_component_type",
+            "native document type could not be read",
+            {"component": component, "read_error": _native_error_record(error)},
+        ) from error
+    if type(kind) is not int or kind not in {1, 2}:
+        raise CadError(
+            "cad_component_type",
+            "native document type is not a documented part or assembly integer",
+            {"component": component, "native_type": _json_raw_value(kind), "value_type": type(kind).__name__},
+        )
+    return kind
+
+
 def _require_valid_component_tree(doc):
     try:
         valid = _method(_assemblydoc(doc), "IsComponentTreeValid")
@@ -3145,7 +3164,6 @@ class SolidWorksBackend(CadBackend):
         self._components = set()
         self._source_components = {}
         self._source_provenance = {}
-        self._source_scope_overrides = {}
         self._source_documents = {}
         self._scene_source_root = None
         self._scene_document_key = None
@@ -3779,7 +3797,7 @@ class SolidWorksBackend(CadBackend):
         return _json_raw_value(list(raw))
 
     def _mass_properties_document(self, doc, require_material=True):
-        if _method(doc, "GetType") != 1:
+        if _native_document_type(doc) != 1:
             raise CadError("cad_not_part", "mass reader requires a leaf part")
         document_path = str(_method(doc, "GetPathName"))
         _manager, _configuration, configuration_name = _configuration_context(doc)
@@ -3867,7 +3885,7 @@ class SolidWorksBackend(CadBackend):
         """
 
         doc = self._document_by_path(path)
-        if _method(doc, "GetType") != 2:
+        if _native_document_type(doc) != 2:
             raise CadError("cad_not_assembly", "assembly mass reader requires a saved SLDASM")
         document_path = str(_method(doc, "GetPathName"))
         _manager, configuration, configuration_name = _configuration_context(doc)
@@ -3950,7 +3968,7 @@ class SolidWorksBackend(CadBackend):
         """
 
         doc = self._document_by_path(path)
-        if _method(doc, "GetType") != 2:
+        if _native_document_type(doc) != 2:
             raise CadError("cad_not_assembly", "link group mass reader requires a saved SLDASM")
         document_path = str(_method(doc, "GetPathName"))
         _manager, configuration, configuration_name = _configuration_context(doc)
@@ -4080,7 +4098,7 @@ class SolidWorksBackend(CadBackend):
         """
 
         doc = self._document_by_path(path)
-        if _method(doc, "GetType") != 2:
+        if _native_document_type(doc) != 2:
             raise CadError("cad_not_assembly", "component mass context requires a saved SLDASM")
         document_path = str(_method(doc, "GetPathName"))
         _manager, configuration, configuration_name = _configuration_context(doc)
@@ -4447,7 +4465,7 @@ class SolidWorksBackend(CadBackend):
         """
 
         doc = self._document_by_path(path)
-        if _method(doc, "GetType") != 2:
+        if _native_document_type(doc) != 2:
             raise CadError("cad_not_assembly", "group mass reader requires a saved SLDASM")
         document_path = str(_method(doc, "GetPathName"))
         _manager, configuration, configuration_name = _configuration_context(doc)
@@ -4675,7 +4693,7 @@ class SolidWorksBackend(CadBackend):
             "read_errors": copy.deepcopy(reading.get("read_errors") or {}),
         }
 
-    def _read_context_occurrences(self, doc_path, source_root, *, measured=False, on_activity=None):
+    def _read_context_occurrences(self, doc_path, source_root, *, on_activity=None):
         """Extract primitives from the main assembly instance tree without selecting configurations."""
         doc = self._document_by_path(doc_path)
         _manager, configuration = _active_configuration_view(doc)
@@ -4698,7 +4716,7 @@ class SolidWorksBackend(CadBackend):
                 raw, parent, defining, owner, anchor, ancestors = stack.pop()
                 component = _component(raw)
                 borrowed.append(component)
-                state = _measured_component_state(component) if measured else _component_state(component)
+                state = _component_state(component)
                 raw_name = _property(component, "Name2")
                 if not _is_text_name(raw_name):
                     raise CadError(
@@ -4764,13 +4782,7 @@ class SolidWorksBackend(CadBackend):
                 document_type = None
                 baseline = None
                 if loaded is not None:
-                    kind = _method(loaded, "GetType")
-                    if type(kind) is not int or kind not in {1, 2}:
-                        raise CadError(
-                            "cad_component_type",
-                            "an occurrence has no native part or assembly type",
-                            {"component": name},
-                        )
+                    kind = _native_document_type(loaded, name)
                     document_type = "part" if kind == 1 else "assembly"
                     baseline = _active_configuration(loaded)
                     self._record_save_flag(loaded, path)
@@ -4820,21 +4832,12 @@ class SolidWorksBackend(CadBackend):
                 }
                 if provenance is not None:
                     row["source_provenance"] = provenance
-                counts = None
-                if measured and state != COMPONENT_SUPPRESSED and document_type == "part":
-                    counts = {"solid": None, "sheet": None, "errors": {}}
-                    for body_type, label in ((0, "solid"), (1, "sheet")):
-                        try:
-                            counts[label] = self._body_count(component, body_type, name)
-                        except CadError as error:
-                            counts["errors"][label] = _native_error_record(error)
                 rows.append(
                     {
                         "record": row,
                         "path": path,
                         "loaded": loaded is not None,
                         "baseline_configuration": baseline,
-                        "body_counts": counts,
                         "transform_error": transform_error,
                     }
                 )
@@ -4861,6 +4864,11 @@ class SolidWorksBackend(CadBackend):
                         for child in reversed(children)
                     )
             return rows, unresolved
+        except Exception as error:
+            error.partial_occurrence_context = {
+                "occurrences": copy.deepcopy(rows), "unresolved_components": copy.deepcopy(unresolved)
+            }
+            raise
         finally:
             borrowed.clear()
             stack.clear()
@@ -4878,6 +4886,8 @@ class SolidWorksBackend(CadBackend):
         expected_occurrences=None,
     ):
         facts = {}
+        context_rows = None
+        unresolved_components = []
         try:
             activity = _ActivityEmitter(on_activity)
             if self._prepared_capture_root is None:
@@ -4918,7 +4928,7 @@ class SolidWorksBackend(CadBackend):
 
             note("prepare_capture", current_object=_activity_object(doc_path), force=True)
             doc = self._document_by_path(doc_path)
-            if _method(doc, "GetType") != 2:
+            if _native_document_type(doc) != 2:
                 raise CadError("cad_not_assembly", "export requires a saved SLDASM")
             document, configuration = _capture_document_identity(
                 doc,
@@ -4954,7 +4964,6 @@ class SolidWorksBackend(CadBackend):
             self._components = set()
             self._source_components = {}
             self._source_provenance = {}
-            self._source_scope_overrides = {}
             self._source_documents = {}
             self._scene_source_root = source_root
             self._session_document_paths = {}
@@ -5047,11 +5056,9 @@ class SolidWorksBackend(CadBackend):
                     coordinate_system_rows[key] = record
                     found_datums.add(datum)
 
-            record_datums(self._document_by_path(doc_path), "", None)
-            context_rows, _unresolved = self._read_context_occurrences(
+            context_rows, unresolved_components = self._read_context_occurrences(
                 doc_path,
                 source_root,
-                measured=True,
                 on_activity=lambda name: note("walk", current_object=_activity_object(name)),
             )
             if expected_occurrences is not None:
@@ -5107,8 +5114,6 @@ class SolidWorksBackend(CadBackend):
                     path, entry["baseline_configuration"], session_document=session_document
                 )
                 self._source_components[name] = (key, referenced, row)
-                if entry["body_counts"] is not None:
-                    self.notes["bodies:" + name] = entry["body_counts"]
                 if entry["transform_error"] is not None:
                     self.notes["transform_error:" + name] = entry["transform_error"]
                 occurrences.append(
@@ -5132,7 +5137,21 @@ class SolidWorksBackend(CadBackend):
                     "a sealed cached occurrence is absent or did not rematerialize in the current session",
                     {"components": unexpected_sources},
                 )
-            context_rows = None
+            with self._current_components("body_counts") as current:
+                for occurrence in occurrences:
+                    name = occurrence["name"]
+                    _measured_component_state(current[name])
+                    if occurrence["document_type"] != "part":
+                        continue
+                    counts = {"solid": None, "sheet": None, "errors": {}}
+                    for body_type, label in ((0, "solid"), (1, "sheet")):
+                        try:
+                            counts[label] = self._body_count(current[name], body_type, name)
+                        except CadError as error:
+                            counts["errors"][label] = _native_error_record(error)
+                    self.notes["bodies:" + name] = counts
+            current = None
+            record_datums(self._document_by_path(doc_path), "", None)
             note("walk", completed=len(occurrences), total=len(occurrences), force=True)
             for index, occurrence in enumerate(occurrences, start=1):
                 name, path = occurrence["name"], occurrence["path"]
@@ -5268,6 +5287,13 @@ class SolidWorksBackend(CadBackend):
         except Exception as error:
             if facts:
                 snapshot = copy.deepcopy(facts)
+                observed_context = (
+                    {"occurrences": context_rows, "unresolved_components": unresolved_components}
+                    if context_rows is not None
+                    else getattr(error, "partial_occurrence_context", None)
+                )
+                if observed_context is not None:
+                    snapshot["notes"]["native_occurrence_context"] = copy.deepcopy(observed_context)
                 snapshot["notes"]["save_flags"] = copy.deepcopy(self.save_flags)
                 snapshot["notes"]["save_flag_errors"] = copy.deepcopy(self.save_flag_errors)
                 error.partial_native_facts = snapshot
@@ -6324,7 +6350,7 @@ class SolidWorksBackend(CadBackend):
                 component,
                 "appearance",
             )
-            document_type = _method(document, "GetType")
+            document_type = _native_document_type(document, component)
             document_path = _method(document, "GetPathName")
             if (
                 document_type != 1
@@ -6937,9 +6963,6 @@ class SolidWorksBackend(CadBackend):
     def _component_source_scope(self, component):
         """Bind the occurrence's exact source identity and virtual owner path."""
 
-        override = self._source_scope_overrides.get(component)
-        if override is not None:
-            return dict(override)
         configured = self._source_components.get(component)
         if configured is None:
             return None
@@ -7161,7 +7184,7 @@ class SolidWorksBackend(CadBackend):
                 document_key, referenced, captured = self._source_components[name]
                 expected_path = self._source_documents[document_key][0]
                 native_document = _component_document(comp)
-                native_type = _method(native_document, "GetType")
+                native_type = _native_document_type(native_document, name)
                 if not document_paths_match(_method(native_document, "GetPathName"), expected_path):
                     raise CadError("cad_source_changed", "native occurrence document changed", {"component": name})
                 if (

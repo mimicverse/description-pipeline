@@ -915,6 +915,8 @@ def _project_native_record(record: dict) -> dict:
     mate references and EntityParams as the sole raw authority.
     """
 
+    if not isinstance(record, dict):
+        raise CadError("cad_native_record_invalid", "native discovery raw record is not an object")
     if record.get("transform_frame") != NATIVE_TRANSFORM_FRAME:
         raise CadError("cad_native_record_invalid", "native discovery has no explicit main-assembly transform frame")
     projected = copy.deepcopy(record)

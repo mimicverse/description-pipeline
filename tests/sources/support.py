@@ -1285,16 +1285,8 @@ class FixtureCadBackend(CadBackend):
                 "selection_rule": "top_most_providers+uncovered_leaves",
                 "links": {},
             }
-        scope_reader = getattr(self, "source_scopes", None)
         component_names = [component.name for component in scene.components]
-        source_scopes = (
-            scope_reader(component_names)
-            if callable(scope_reader)
-            else {
-                name: copy.deepcopy(self._source_scope_overrides[name])
-                for name in component_names
-            }
-        )
+        source_scopes = self.source_scopes(component_names)
         return {
             "scene_raw": raw_scene,
             "part_mass_raw": part_mass,

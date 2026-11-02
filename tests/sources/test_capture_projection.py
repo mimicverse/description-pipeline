@@ -12,6 +12,7 @@ import unittest
 from pathlib import Path
 
 from description_pipeline.sources.solidworks import capture_projection
+from description_pipeline.sources.solidworks.errors import CadError
 from description_pipeline.sources.solidworks.protocol import RawScene
 from tests.sources import support
 
@@ -53,6 +54,25 @@ class CaptureProjectionTests(unittest.TestCase):
             self.document,
             "Default",
         )
+
+    def test_public_projections_reject_non_object_scene_with_typed_error(self) -> None:
+        facts = self.backend.collect_prepared_scene(
+            self.document, [], groups=[{"name": "body", "components": ["base-1", "arm-1"]}]
+        )
+        observation = capture_projection.build_native_capture_observation(
+            facts=facts, geometry_raw={}, axis_references_raw=[], document_state={}, input_stability={}
+        )
+        for invalid in (None, [], "scene", True, 1, {}, {"transform_frame": "parent"}):
+            for public in ("facts", "observation"):
+                with self.subTest(scene=invalid, public=public):
+                    record = copy.deepcopy(facts if public == "facts" else observation)
+                    record["scene_raw"] = invalid
+                    with self.assertRaises(CadError) as caught:
+                        if public == "facts":
+                            capture_projection.project_capture_facts(record)
+                        else:
+                            capture_projection.project_native_capture_observation(record, {})
+                    self.assertEqual(caught.exception.code, "cad_prepared_scene_facts_invalid")
 
     def test_portable_projection_reconstructs_raw_scene_and_masses(self) -> None:
         raw_facts = self.backend.collect_prepared_scene(

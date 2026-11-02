@@ -1,4 +1,4 @@
-"""Linux discovery projection from preserved local native facts."""
+"""Linux discovery projection from preserved main-frame native facts."""
 
 from __future__ import annotations
 
@@ -484,6 +484,13 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
         self.assertEqual(raw, original)
 
     def test_missing_or_foreign_world_frame_is_rejected_by_both_projections(self):
+        for raw in (None, [], "record", True, 1):
+            with self.subTest(raw=raw), self.assertRaises(CadError) as producer:
+                _project_native_record(raw)
+            self.assertEqual(producer.exception.code, "cad_native_record_invalid")
+            with self.subTest(raw=raw), self.assertRaises(_Failure) as verifier:
+                project_native_verification_record(raw)
+            self.assertEqual(verifier.exception.code, "discovery.raw")
         for frame in (None, "child_document"):
             raw = _sealed_record()
             if frame is None:

@@ -2075,7 +2075,7 @@ class CaptureSceneTests(unittest.TestCase):
             self.assertEqual({c.name for c in scene.components}, {"arm1", "arm2"})
             paths = [i for i, event in enumerate(events) if event[0] == "path"]
             mutations = [i for i, event in enumerate(events) if event[0] == "read_only"]
-            self.assertEqual(len(paths), 2)
+            self.assertEqual({events[index][1] for index in paths}, {"arm1", "arm2"})
             self.assertEqual(len(mutations), 2)
             self.assertLess(max(paths), min(mutations))
             self.assertTrue(all(doc.read_only for path, doc in documents.items() if path != assembly))
@@ -3198,7 +3198,7 @@ class AppearanceRawTests(_FixtureAppearanceInterfaceMixin, unittest.TestCase):
             self.assertEqual(face_raw[0]["appearance"]["read_errors"], {})
 
     def test_instance_document_type_or_path_drift_blocks_geometry(self) -> None:
-        for failure in ("type", "path"):
+        for failure in ("type", "path", "bool", "float", "null", "text", "unreadable"):
             with self.subTest(failure=failure), TemporaryDirectory() as tmp, _com_stubs():
                 root = Path(tmp)
                 part = _write(root, "arm.SLDPRT")
@@ -3244,11 +3244,22 @@ class AppearanceRawTests(_FixtureAppearanceInterfaceMixin, unittest.TestCase):
                 backend.capture_scene_for_test(str(assembly), [])
                 if failure == "type":
                     part_document._doc_type = 2
-                else:
+                elif failure == "path":
                     part_document._path = str(other)
+                elif failure == "unreadable":
+                    part_document.GetType = _raiser(RuntimeError("type unavailable"))
+                else:
+                    part_document._doc_type = {"bool": True, "float": 1.0, "null": None, "text": "1"}[failure]
+                backend._capture_component_geometry = Mock(
+                    side_effect=AssertionError("invalid source reached geometry")
+                )
                 with self.assertRaises(CadError) as caught:
                     backend.capture_geometry_for_test()
-                self.assertEqual(caught.exception.code, "cad_source_changed")
+                self.assertEqual(
+                    caught.exception.code,
+                    "cad_source_changed" if failure in {"type", "path"} else "cad_source_state_unreadable",
+                )
+                backend._capture_component_geometry.assert_not_called()
 
     def test_null_material_values_follow_same_owner_presence(self) -> None:
         with TemporaryDirectory() as tmp, _com_stubs():
@@ -8116,6 +8127,180 @@ class LinkGroupMassPropertiesTests(unittest.TestCase):
 
 class NativeOccurrenceContextTests(unittest.TestCase):
     """The real readers consume one instance domain before any document selection."""
+
+    def test_all_native_type_consumers_reject_non_integer_and_unreadable_types(self):
+        consumers = (
+            "part_mass", "assembly_mass", "link_mass", "component_mass", "group_mass",
+            "context", "collect", "current", "appearance",
+        )
+        for consumer in consumers:
+            for kind in (True, False, 1.0, 2.0, None, "1", 0, 3, RuntimeError("type unavailable")):
+                with self.subTest(consumer=consumer, kind=repr(kind)):
+                    self._check_invalid_native_type(consumer, kind)
+
+    def _check_invalid_native_type(self, consumer, kind):
+        with TemporaryDirectory() as tmp, _com_stubs():
+            root = Path(tmp)
+            main_path, part_path = _write(root, "robot.SLDASM"), _write(root, "part.SLDPRT")
+            component = _Component("part-1", part_path)
+            main = _Doc(main_path, children=[component])
+            app = _App({main_path: main})
+            backend = _CaptureBackend(session_factory=lambda: _Session(app))
+            backend.prepare_prepared_capture(str(root), str(main_path), "Default")
+            facts = backend.collect_prepared_scene(
+                str(main_path), [], groups=[{"name": "body", "components": ["part-1"]}]
+            )
+            document = (
+                component._doc if consumer in {"part_mass", "context", "current", "appearance"} else main
+            )
+            if isinstance(kind, Exception):
+                document.GetType = Mock(side_effect=kind)
+            else:
+                document._doc_type = kind
+            backend._body_count = Mock(side_effect=AssertionError("body getter reached with invalid type"))
+            main.Extension.CreateMassProperty2 = Mock(
+                side_effect=AssertionError("mass getter reached with invalid type")
+            )
+            component._doc.Extension.CreateMassProperty2 = Mock(
+                side_effect=AssertionError("mass getter reached with invalid type")
+            )
+
+            def current():
+                with backend._current_components("test_invalid_type"):
+                    self.fail("invalid native type escaped the current source guard")
+
+            calls = {
+                "part_mass": lambda: SolidWorksBackend._mass_properties_document(backend, component._doc),
+                "assembly_mass": lambda: SolidWorksBackend.assembly_mass_properties(backend, str(main_path)),
+                "link_mass": lambda: SolidWorksBackend.link_group_mass_properties(
+                    backend, str(main_path), {"body": ["part-1"]}
+                ),
+                "component_mass": lambda: SolidWorksBackend.assembly_component_mass_properties(backend, str(main_path)),
+                "group_mass": lambda: SolidWorksBackend.assembly_group_mass_properties(
+                    backend, str(main_path), ["part-1"]
+                ),
+                "context": lambda: backend._read_context_occurrences(str(main_path), root),
+                "collect": lambda: backend.collect_prepared_scene(
+                    str(main_path), [], groups=[{"name": "body", "components": ["part-1"]}]
+                ),
+                "current": current,
+            }
+            with patch.object(native_module, "_part_bodies") as part_bodies:
+                if consumer == "appearance":
+                    with patch.object(backend, "_component_bodies", return_value=([], [])):
+                        geometry = backend._capture_component_geometry(
+                            "part-1", component, facts["source_scopes"]["part-1"],
+                            current={"part-1": component}, render_material_cache={}, resolution_cache={},
+                        )
+                    document_raw = geometry["appearance_raw"]["document"]
+                    self.assertIn("cad_component_type", {
+                        row.get("code") for row in document_raw["read_errors"].values() if isinstance(row, dict)
+                    })
+                    self.assertIsNone(geometry["appearance_raw"]["native_active_configuration"])
+                else:
+                    with self.assertRaises(CadError) as caught:
+                        calls[consumer]()
+                    self.assertEqual(
+                        caught.exception.code,
+                        "cad_source_state_unreadable" if consumer == "current" else "cad_component_type",
+                    )
+                part_bodies.assert_not_called()
+            backend._body_count.assert_not_called()
+            main.Extension.CreateMassProperty2.assert_not_called()
+            component._doc.Extension.CreateMassProperty2.assert_not_called()
+
+    def test_context_rejection_precedes_engineering_reads_and_survives_freeze_failure(self):
+        with TemporaryDirectory() as tmp:
+            self._check_context_failure(Path(tmp))
+
+    def _check_context_failure(self, root):
+        from description_pipeline.sources.solidworks.freeze import _capture_prepared_local
+
+        with _com_stubs():
+            package = root / "package"
+            package.mkdir(parents=True)
+            main_path = _write(package, "robot.SLDASM")
+            part_path, parked_path = _write(package, "part.SLDPRT"), _write(package, "parked.SLDPRT")
+            destination = root / "capture"
+            copied = root / "capture.partial" / "source"
+
+            def scene(folder):
+                active = _Component(
+                    "part-1", folder / part_path.name,
+                    transform=(*SW_IDENTITY[:9], 0.2, 0.3, 0.4, *SW_IDENTITY[12:]),
+                )
+                parked = _Component("parked-1", folder / parked_path.name, suppressed=True)
+                missing = _Component("missing-1", "", suppressed=True)
+                missing._doc = None
+                missing.GetImportedPath = lambda: None
+                return _Doc(folder / main_path.name, children=[active, parked, missing])
+
+            expected = _read(package, _App({main_path: scene(package)}))["components"]
+            expected[0]["configuration"] = "Changed"
+            main = scene(copied)
+            app = _App({copied / main_path.name: main})
+            backend = _CaptureBackend(session_factory=lambda: _Session(app))
+            observed = {}
+            reader = backend._read_context_occurrences
+
+            def read_context(*args, **kwargs):
+                rows, unresolved = reader(*args, **kwargs)
+                observed.update(occurrences=copy.deepcopy(rows), unresolved_components=copy.deepcopy(unresolved))
+                return rows, unresolved
+
+            backend._read_context_occurrences = read_context
+            counters = {
+                name: Mock(side_effect=AssertionError(f"{name} preceded occurrence validation"))
+                for name in (
+                    "_body_count", "_mass_properties_document", "assembly_mass_properties",
+                    "assembly_component_mass_properties", "link_group_mass_properties", "capture_prepared_geometry",
+                )
+            }
+            for name, counter in counters.items():
+                setattr(backend, name, counter)
+            expected_before = copy.deepcopy(expected)
+            native_files = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                            for path in (main_path, part_path, parked_path)}
+            config = {
+                "provider": "solidworks", "assembly": str(main_path), "configuration": "Default",
+                "geometry": {"enabled": True, "format": "stl_binary"}, "coordinate_systems": ["TCP"],
+                "groups": [{"name": "body", "components": ["part-1"]}], "axis_requests": [],
+            }
+            with patch.object(native_module, "_coordinate_system_features") as datums:
+                with self.assertRaises(CadError) as caught:
+                    _capture_prepared_local(
+                        config, destination, package=package, prepared_root=package, native_files=native_files,
+                        backend=backend, worker_version="portable-regression", expected_occurrences=expected,
+                    )
+                datums.assert_not_called()
+            error = caught.exception
+            self.assertEqual(error.code, "cad_occurrence_context_changed")
+            self.assertEqual(expected, expected_before)
+            self.assertEqual(error.detail, {
+                "missing": [], "extra": [],
+                "changed": {"part-1": {"configuration": {"expected": "Changed", "observed": "Default"}}},
+            })
+            for counter in counters.values():
+                counter.assert_not_called()
+            retained = error.partial_native_facts["notes"]["native_occurrence_context"]
+            self.assertEqual(retained, observed)
+            self.assertEqual({row["record"]["name2"] for row in retained["occurrences"]}, {"part-1", "parked-1"})
+            self.assertEqual(retained["unresolved_components"][0]["instance"], "missing-1")
+            self.assertTrue(next(row["record"] for row in retained["occurrences"]
+                                 if row["record"]["name2"] == "parked-1")["suppressed"])
+            failed = root / "capture.failed-001"
+            failure = read_json(failed / "failure.json")
+            raw = read_json(failed / "native_observations.json")
+            self.assertEqual(raw["scene"], error.partial_native_facts)
+            self.assertEqual(failure["code"], error.code)
+            self.assertEqual(failure["detail"], error.detail)
+            self.assertEqual(failure["stage"], "readings")
+            self.assertFalse(destination.exists())
+            self.assertEqual(native_files, {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                                            for path in (main_path, part_path, parked_path)})
+            return {"failure": failure, "observations": raw, "failed_directory": str(failed),
+                    "engineering_read_counts": {name: counter.call_count for name, counter in counters.items()},
+                    "datum_read_count": datums.call_count, "sealed_input_unchanged": expected == expected_before}
 
     def test_document_children_cannot_expand_the_main_instance_domain(self):
         with TemporaryDirectory() as tmp, _com_stubs():
