@@ -127,6 +127,8 @@ Portal 从 canonical 阶段事实与既有检查摘要生成只读展示：有�
 
 Windows 文件系统读写、遍历、摘要、三角流封存和传输打包统一复用 `io` 的物理路径边界，支持长路径；扩展路径前缀仅用于本地 Python I/O，不写入 manifest，不传入 CAD/COM。临时三角文件使用 occurrence 标识的摘要命名，原始 occurrence 名称与几何流字节保持不变。
 
+Capture 总事务使用标准库在同一父目录创建短且唯一的临时根，不将输出目录名称复制进工作路径；最终目录、内部相对布局和原子失败保留边界不变。Discover 与 Capture 在共同 native source 封存边界逐一验证实际交付文件可通过普通路径打开读取，失败保留原文件定位与操作系统错误，在原生会话前拒绝。此门只作用于封存的实际文件，不套用到 embedded-virtual/session 文档绑定；本地 extended-path 复制成功不代表 CAD 可见路径可读。
+
 ## 持久化与一致性
 
 数据库保存 `RunAdmission`、`StageCommand`、`ExecutionClaim`、candidate、唯一 `StageDecision` 及 append-only effect facts。`ArtifactStore` 先从私有 staging 校验并原子发布不可变文件集合，数据库随后登记引用；两者之间的崩溃窗口通过原 command/effect/candidate 对账。数据库不可用时停止业务写入，不回退到文件状态。
