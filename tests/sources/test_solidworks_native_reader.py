@@ -8125,6 +8125,56 @@ class LinkGroupMassPropertiesTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, "cad_not_assembly")
 
 
+class NativeSourcePathTests(unittest.TestCase):
+    def test_seal_reads_all_real_files_without_extended_path_fallback(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            documents = [_write(root, name) for name in ("robot.SLDASM", "part.SLDPRT")]
+            backend = SolidWorksBackend()
+            backend.configure_staged_search(root)
+            with patch.object(native_module, "open", wraps=open, create=True) as reader, patch.object(
+                native_module, "_filesystem_path", side_effect=AssertionError("Extended path fallback used"),
+            ):
+                sealed = backend.seal_documents(documents)
+            self.assertEqual([call.args for call in reader.call_args_list], [(str(path), "rb") for path in documents])
+            self.assertEqual(sealed, sorted(native_module.normalize_document_path(str(path)) for path in documents))
+
+    def test_both_source_entries_refuse_an_actual_read_failure_before_native_open(self):
+        for stage in ("discover", "capture"):
+            with self.subTest(stage=stage), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                main, part = _write(root, "robot.SLDASM"), _write(root, "part.SLDPRT")
+                factory = Mock(side_effect=AssertionError("Native session started before source validation"))
+                backend = SolidWorksBackend(session_factory=factory)
+                builtin_open = open
+
+                def read(path, *args, _part=part, _open=builtin_open, **kwargs):
+                    if Path(path) == _part:
+                        _part.unlink()
+                    return _open(path, *args, **kwargs)
+
+                with (
+                    patch.object(native_module, "open", side_effect=read, create=True),
+                    self.assertRaises(CadError) as caught,
+                ):
+                    if stage == "discover":
+                        with backend._discover_session(root, {main.name: "a" * 64, part.name: "b" * 64}):
+                            self.fail("Unreadable source entered the native session")
+                    else:
+                        backend.prepare_prepared_capture(root, main, "Default")
+                error = caught.exception
+                self.assertEqual(error.code, "cad_source_path_unreadable")
+                self.assertIsInstance(error.__cause__, FileNotFoundError)
+                self.assertEqual(error.detail["document"], str(part))
+                self.assertEqual(error.detail["relative_document"], part.name)
+                self.assertEqual(error.detail["path_characters"], len(str(part)))
+                self.assertEqual(error.detail["error"]["message"], str(error.__cause__))
+                self.assertEqual(error.detail["error"]["errno"], error.__cause__.errno)
+                self.assertEqual(error.detail["error"]["winerror"], getattr(error.__cause__, "winerror", None))
+                self.assertIsNone(backend.sealed_documents())
+                factory.assert_not_called()
+
+
 class NativeOccurrenceContextTests(unittest.TestCase):
     """The real readers consume one instance domain before any document selection."""
 
@@ -8292,6 +8342,10 @@ class NativeOccurrenceContextTests(unittest.TestCase):
             failure = read_json(failed / "failure.json")
             raw = read_json(failed / "native_observations.json")
             self.assertEqual(raw["scene"], error.partial_native_facts)
+            self.assertEqual(raw["runtime"]["prepared_capture"]["policy"]["requested_configuration"], "Default")
+            self.assertEqual(raw["runtime"]["prepared_capture"]["opened"]["path"], str(copied / main_path.name))
+            self.assertEqual(set(raw["runtime"]["document_state"]), {"before"})
+            self.assertIn("solidworks", raw["runtime"])
             self.assertEqual(failure["code"], error.code)
             self.assertEqual(failure["detail"], error.detail)
             self.assertEqual(failure["stage"], "readings")

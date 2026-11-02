@@ -1135,7 +1135,7 @@ def _capture_native_transaction(
     with _capture_output_lock(output) as output:
         if not writable_output(output):
             raise PipelineError(f"Output must be absent or empty: {output}")
-        staging = Path(tempfile.mkdtemp(prefix=f".{output.name}-capture-", dir=output.parent))
+        staging = Path(tempfile.mkdtemp(dir=output.parent))
         receipt = _capture_receipt(
             run_id,
             handoff_sha256=handoff_sha256,

@@ -3231,7 +3231,7 @@ class CaptureTransactionPreservationTests(unittest.TestCase):
                     request_evidence=request_evidence,
                 )
 
-            retained = list(root.glob(".output-capture-*"))
+            retained = [path for path in root.iterdir() if path.is_dir() and path != package]
             self.assertEqual(len(retained), 1)
             self.assertEqual(
                 (retained[0] / "raw-native.bin").read_bytes(),

@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 from collections.abc import Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 
 from ...geometry.native_scope import NATIVE_SOURCE_SCOPE_RULE
@@ -3273,7 +3273,9 @@ class SolidWorksBackend(CadBackend):
         SolidWorks itself reads the reference files it resolves, and the owned
         session provides no OS-level file-access isolation.  Pass absolute
         document paths and receive the sorted normalized sealed set as
-        evidence.
+        evidence. Every delivered file must also be readable through its
+        ordinary path before native reference resolution starts; extended
+        filesystem I/O alone does not establish that boundary.
         """
 
         sealed = set()
@@ -3285,6 +3287,29 @@ class SolidWorksBackend(CadBackend):
                 )
             if not os.path.isabs(text):
                 raise CadError("document_seal_invalid", "Sealed documents must be absolute paths", {"document": text})
+            try:
+                with open(text, "rb") as stream:
+                    stream.read(1)
+            except OSError as error:
+                relative = None
+                if self._staged_search_root is not None:
+                    with suppress(ValueError):
+                        relative = Path(text).relative_to(self._staged_search_root).as_posix()
+                raise CadError(
+                    "cad_source_path_unreadable",
+                    "a sealed document is unreadable through the ordinary native source path",
+                    {
+                        "document": text,
+                        "relative_document": relative,
+                        "path_characters": len(text),
+                        "error": {
+                            "type": type(error).__name__,
+                            "errno": error.errno,
+                            "winerror": getattr(error, "winerror", None),
+                            "message": str(error),
+                        },
+                    },
+                ) from error
             sealed.add(normalize_document_path(os.path.abspath(text)))
         self._sealed_documents = sealed
         return sorted(sealed)

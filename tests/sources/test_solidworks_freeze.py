@@ -5,12 +5,14 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 
 from description_pipeline.io import read_data
 from description_pipeline.schemas import (
     NATIVE_CAPTURE_OBSERVATION_KEYS,
     NATIVE_CAPTURE_OBSERVATION_SCHEMA,
 )
+from description_pipeline.sources.solidworks.errors import CadError
 
 from . import support
 
@@ -169,6 +171,73 @@ class RawCaptureFreezeTests(unittest.TestCase):
             self.capture()
         self.assertIn("geometry", str(caught.exception).lower())
         self.assertIn("release", self.backend.order)
+        failed = self.destination.with_name(self.destination.name + ".failed-001")
+        runtime = read_data(failed / "native_observations.json")["runtime"]
+        self.assertEqual(set(runtime["document_state"]), {"before", "after"})
+        self.assertEqual(runtime["document_state"]["after"]["active_configuration"], "Default")
+
+    def test_failure_runtime_retains_only_completed_observation_prefixes(self) -> None:
+        for failing in (
+            "prepare_prepared_capture", "open_document", "document_state",
+            "environment", "collect_prepared_scene", "cancelled",
+        ):
+            with self.subTest(failing=failing):
+                self.setUp()
+                error = (
+                    KeyboardInterrupt("Native capture cancelled")
+                    if failing == "cancelled"
+                    else CadError("native_read_failed", "Native reading failed", {"step": failing})
+                )
+                observed = {}
+                for method in ("prepare_prepared_capture", "open_document", "document_state", "environment"):
+                    original = getattr(self.backend, method)
+
+                    def read(
+                        *args, _method=method, _original=original,
+                        _failing=failing, _error=error, _observed=observed, **kwargs,
+                    ):
+                        if _method == _failing:
+                            raise _error
+                        value = _original(*args, **kwargs)
+                        _observed[_method] = value
+                        return value
+
+                    setattr(self.backend, method, Mock(side_effect=read))
+                self.backend.collect_prepared_scene = Mock(side_effect=error)
+                with self.assertRaises(type(error)) as caught:
+                    self.capture()
+                self.assertIs(caught.exception, error)
+                failed = self.destination.with_name(self.destination.name + ".failed-001")
+                raw = read_data(failed / "native_observations.json")
+                runtime = raw["runtime"]
+                if failing == "prepare_prepared_capture":
+                    self.assertEqual(runtime, {})
+                    self.backend.open_document.assert_not_called()
+                    self.backend.document_state.assert_not_called()
+                    self.backend.environment.assert_not_called()
+                    continue
+                self.assertEqual(runtime["prepared_capture"]["policy"], observed["prepare_prepared_capture"])
+                if failing == "open_document":
+                    self.assertEqual(set(runtime), {"prepared_capture"})
+                    self.assertEqual(set(runtime["prepared_capture"]), {"policy"})
+                else:
+                    self.assertEqual(runtime["prepared_capture"]["opened"], observed["open_document"])
+                if failing in {"environment", "collect_prepared_scene", "cancelled"}:
+                    self.assertEqual(runtime["document_state"], {"before": observed["document_state"]})
+                else:
+                    self.assertNotIn("document_state", runtime)
+                if failing in {"collect_prepared_scene", "cancelled"}:
+                    self.assertEqual(runtime["solidworks"], observed["environment"])
+                else:
+                    self.assertNotIn("solidworks", runtime)
+                self.backend.open_document.assert_called_once()
+                self.assertEqual(self.backend.document_state.call_count, int(failing != "open_document"))
+                self.assertEqual(
+                    self.backend.environment.call_count,
+                    int(failing in {"environment", "collect_prepared_scene", "cancelled"}),
+                )
+                self.assertFalse((failed / "partial/native-runtime.json").exists())
+                self.assertFalse(self.destination.exists())
 
 
 if __name__ == "__main__":

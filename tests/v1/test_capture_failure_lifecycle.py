@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import threading
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from description_pipeline.io import file_digest
 from description_pipeline.orchestration.native_operation_runtime import NativeFailureView, NativeOperationError
 from description_pipeline.pipeline import capture
 from description_pipeline.sources.solidworks.errors import CadError, EnvironmentError_
@@ -66,9 +68,9 @@ class CaptureFailureReceiptTests(unittest.TestCase):
         self.inputs = capture.CaptureInputs.resolve(self.case.command, self.workspace, self.request)
         self.backend = capture_tests.fixture_backend(self.inputs.package, capture_tests.MAIN)
 
-    def transaction(self, *, expected_inputs=None):
+    def transaction(self, *, expected_inputs=None, output_name="failure-output"):
         return capture._capture_native_transaction(
-            self.inputs.package, self.case.root / "failure-output", backend=self.backend,
+            self.inputs.package, self.case.root / output_name, backend=self.backend,
             run_id=self.case.command.run_id, expected_inputs=(
                 self.inputs.prepared_files if expected_inputs is None else expected_inputs
             ), handoff_sha256=self.request.handoff_sha256, upload_sha256=self.request.upload_sha256,
@@ -88,6 +90,31 @@ class CaptureFailureReceiptTests(unittest.TestCase):
         self.assertTrue(receipt["resource_settlement"]["settled"])
         self.assertTrue(Path(receipt["diagnostic_path"]).is_dir())
         self.assertEqual(self.backend.open_documents, [])
+
+    def test_output_name_does_not_lengthen_native_staging_or_lose_failed_sources(self):
+        self.backend.collect_prepared_scene = Mock(side_effect=CadError(
+            "link_group_member_unknown", "Unknown native occurrence", DETAIL,
+        ))
+        staging_lengths = []
+        for output_name in ("short", "capture-" + "n" * 150):
+            with self.subTest(output_name=output_name), patch.object(
+                capture, "capture_native_package", wraps=capture.capture_native_package,
+            ) as producer:
+                receipt = self.transaction(output_name=output_name)
+            staging = Path(producer.call_args.args[1])
+            staging_lengths.append(len(staging.name))
+            self.assertEqual(staging.parent, self.case.root)
+            self.assertNotIn(output_name, staging.name)
+            self.assertFalse(staging.exists())
+            failed = Path(receipt["diagnostic_path"])
+            self.assertEqual(failed, self.case.root / (output_name + ".failed"))
+            source = failed / "evidence.failed-001/partial/source"
+            archived = failed / "input/cad"
+            for path in archived.rglob("*"):
+                if path.is_file():
+                    self.assertEqual(file_digest(source / path.relative_to(archived)), file_digest(path))
+            self.assertFalse((self.case.root / output_name).exists())
+        self.assertEqual(*staging_lengths)
 
     def test_actual_capture_cleanup_failure_remains_unsettled_and_keeps_primary_detail(self):
         self.backend.collect_prepared_scene = Mock(side_effect=CadError(
@@ -138,3 +165,34 @@ class CaptureFailureReceiptTests(unittest.TestCase):
         )
         self.assertEqual(result.failure.detail, {"native_detail": DETAIL})
         self.assertEqual(str(result.failure), "Unknown native occurrence")
+
+
+class CaptureAtomicInstallTests(unittest.TestCase):
+    def test_install_and_failed_install_restore_real_files_and_remove_backups(self):
+        for fail_install in (False, True):
+            with self.subTest(fail_install=fail_install), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                staging, target = root / "staging", root / "target"
+                staging.mkdir()
+                target.mkdir()
+                (staging / "native.bin").write_bytes(b"sealed native bytes")
+                replace = capture.os.replace
+
+                def install(source, destination, _fail=fail_install, _staging=staging, _replace=replace):
+                    if _fail and Path(source) == _staging:
+                        raise OSError("Atomic install failed")
+                    return _replace(source, destination)
+
+                with patch.object(capture.os, "replace", side_effect=install):
+                    if fail_install:
+                        with self.assertRaisesRegex(OSError, "Atomic install failed"):
+                            capture._install_capture_tree(staging, target)
+                    else:
+                        capture._install_capture_tree(staging, target)
+                if fail_install:
+                    self.assertEqual(list(target.iterdir()), [])
+                    self.assertEqual((staging / "native.bin").read_bytes(), b"sealed native bytes")
+                    self.assertEqual(set(root.iterdir()), {staging, target})
+                else:
+                    self.assertEqual((target / "native.bin").read_bytes(), b"sealed native bytes")
+                    self.assertEqual(list(root.iterdir()), [target])
