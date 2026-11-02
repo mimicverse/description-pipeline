@@ -7666,6 +7666,7 @@ class SolidWorksBackend(CadBackend):
                 on_activity=lambda name: activity.emit("read_components", current_object=_activity_object(name)),
             )
             components = [entry["record"] for entry in context_rows]
+            activity.emit("read_components", completed=len(components), total=len(components), force=True)
             by_component = {entry["record"]["name2"]: (entry["path"], entry["loaded"]) for entry in context_rows}
             for entry in context_rows:
                 if entry["transform_error"] is not None:
@@ -7680,7 +7681,6 @@ class SolidWorksBackend(CadBackend):
             ]
             context_rows = None
             mates = []
-            components_done = components_total = len(components)
             mates_done = mates_total = 0
             for assembly_path, prefix, referenced_configuration in scopes:
                 activity.emit("open_document", current_object=_activity_object(assembly_path, source_root))
@@ -7976,7 +7976,6 @@ class SolidWorksBackend(CadBackend):
                         mate_list = None
                         entity = reference = target = feature = specific = bound = definition = None
                         root = active_config = _manager = assembly = None
-            activity.emit("read_components", completed=components_done, total=components_total, force=True)
             activity.emit("read_mates", completed=mates_done, total=mates_total, force=True)
             datums = []
             activity.emit("read_datums", current_object=_activity_object(main_path, source_root), force=True)

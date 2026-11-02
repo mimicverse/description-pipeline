@@ -18,6 +18,7 @@ from unittest.mock import patch
 
 from description_pipeline.sources.solidworks import native as native_module
 from description_pipeline.sources.solidworks.native import SolidWorksBackend
+from description_pipeline.sources.solidworks.errors import CadError
 
 from tests.sources.test_solidworks_native_reader import (
     _App,
@@ -174,11 +175,16 @@ class ActivityEmissionTests(unittest.TestCase):
             finally:
                 native_module._ACTIVITY_MIN_INTERVAL_SECONDS = original
             reads = [item for item in records if item["action"] == "read_components"]
-            self.assertEqual([item["completed"] for item in reads], [0, 1, 2, 3])
-            self.assertEqual({item["total"] for item in reads}, {3})
+            self.assertEqual(len(reads), 4)
+            self.assertTrue(all("completed" not in item and "total" not in item for item in reads[:-1]))
+            self.assertEqual(reads[-1], {"phase": "discover", "action": "read_components", "completed": 3, "total": 3})
             self.assertEqual(len(record["components"]), 3)
             objects = [item["current_object"] for item in reads if "current_object" in item]
-            self.assertEqual(sorted(set(objects)), ["base-1", "base-2", "base-3"])
+            self.assertEqual(objects, ["base-1", "base-2", "base-3"])
+            self.assertLess(
+                records.index(reads[-1]),
+                next(index for index, item in enumerate(records) if item["action"] == "read_mates"),
+            )
 
     def test_large_interval_emits_each_object_transition_and_final_count(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -196,8 +202,57 @@ class ActivityEmissionTests(unittest.TestCase):
                 [item.get("current_object") for item in reads[:3]],
                 ["base-1", "base-2", "base-3"],
             )
-            self.assertEqual(reads[0]["completed"], 0)
-            self.assertEqual(reads[-1]["completed"], 3)
+            self.assertTrue(all("completed" not in item and "total" not in item for item in reads[:-1]))
+            self.assertEqual(reads[-1], {"phase": "discover", "action": "read_components", "completed": 3, "total": 3})
+            self.assertLess(
+                records.index(reads[-1]),
+                next(index for index, item in enumerate(records) if item["action"] == "read_mates"),
+            )
+
+    def test_nested_suppressed_and_unresolved_progress_counts_only_returned_primitives(self) -> None:
+        for shape in ("nested", "suppressed_and_unresolved"):
+            with self.subTest(shape=shape), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                leaf = _Component("sub-1/part-1" if shape == "nested" else "part-1", _write(root, "part.SLDPRT"))
+                if shape == "nested":
+                    sub_path = _write(root, "sub.SLDASM")
+                    children = [_Component("sub-1", sub_path, children=[leaf], doc=_Doc(sub_path, children=[leaf]))]
+                    transitions = ["sub-1", "sub-1/part-1"]
+                else:
+                    parked = _Component("parked-1", _write(root, "parked.SLDPRT"), suppressed=True)
+                    missing = _Component("missing-1", "", suppressed=True)
+                    missing._doc = None
+                    missing.GetImportedPath = lambda: None
+                    children = [leaf, parked, missing]
+                    transitions = ["part-1", "parked-1", "missing-1"]
+                assembly = _write(root, "robot.SLDASM")
+                records = []
+                raw = _discover(root, _App({assembly: _Doc(assembly, children=children)}), records.append)
+                reads = [item for item in records if item["action"] == "read_components"]
+                self.assertEqual([item.get("current_object") for item in reads[:-1]], transitions)
+                self.assertTrue(all("completed" not in item and "total" not in item for item in reads[:-1]))
+                self.assertEqual(reads[-1], {
+                    "phase": "discover", "action": "read_components", "completed": 2, "total": 2,
+                })
+                self.assertEqual(len(raw["components"]), 2)
+                self.assertEqual(len(raw["unresolved_components"]), 0 if shape == "nested" else 1)
+                self.assertLess(
+                    records.index(reads[-1]),
+                    next(index for index, item in enumerate(records) if item["action"] == "read_mates"),
+                )
+
+    def test_failed_instance_walk_emits_no_completion(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            part = _write(root, "part.SLDPRT")
+            assembly = _write(root, "robot.SLDASM")
+            children = [_Component("good-1", part), _Component("bad-1", part, suppression=7)]
+            records = []
+            with self.assertRaises(CadError) as caught:
+                _discover(root, _App({assembly: _Doc(assembly, children=children)}), records.append)
+            self.assertEqual(caught.exception.code, "cad_component_state_unsupported")
+            reads = [item for item in records if item["action"] == "read_components"]
+            self.assertEqual(reads, [{"phase": "discover", "action": "read_components", "current_object": "good-1"}])
 
     def test_object_transition_is_emitted_before_repeat_interval(self) -> None:
         records = []

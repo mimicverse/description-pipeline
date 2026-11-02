@@ -292,6 +292,7 @@ class ConfigurationPrimitiveTests(unittest.TestCase):
         manager = types.SimpleNamespace(ActiveConfiguration=configuration)
         inner = types.SimpleNamespace(
             GetType=Mock(spec=lambda: None, return_value=2),
+            IsComponentTreeValid=Mock(spec=lambda: None, return_value=True),
             ConfigurationManager=manager,
             GetPathName=Mock(spec=lambda: None, return_value="C:/captures/robot.SLDASM"),
             GetTitle=Mock(spec=lambda: None, return_value="robot"),
@@ -517,6 +518,7 @@ class ConfigurationPrimitiveTests(unittest.TestCase):
         mass_property = _MassProperty(configuration)
         inner = types.SimpleNamespace(
             GetType=Mock(spec=lambda: None, return_value=2),
+            IsComponentTreeValid=Mock(spec=lambda: None, return_value=True),
             ConfigurationManager=types.SimpleNamespace(ActiveConfiguration=configuration),
             Extension=_Extension(mass_property),
             GetPathName=Mock(spec=lambda: None, return_value="C:/captures/robot.SLDASM"),
