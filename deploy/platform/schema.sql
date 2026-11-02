@@ -370,3 +370,69 @@ DROP TRIGGER IF EXISTS reject_truncate
 CREATE TRIGGER reject_truncate
     BEFORE TRUNCATE ON :"platform_schema".effect_fact
     FOR EACH STATEMENT EXECUTE FUNCTION :"platform_schema".reject_immutable_fact_mutation();
+
+-- Interactive consumers do not create stage decisions or scheduler state.
+CREATE TABLE IF NOT EXISTS :"platform_schema".simulation_session (
+    session_id text PRIMARY KEY,
+    actor text NOT NULL,
+    request_key text NOT NULL,
+    source_run_id text NOT NULL REFERENCES :"platform_schema".run_admission(run_id),
+    request_digest text NOT NULL CHECK (request_digest ~ '^[0-9a-f]{64}$'),
+    request jsonb NOT NULL,
+    owner_nonce text NOT NULL,
+    state text NOT NULL CHECK (state IN ('starting','ready','stopping','stopped','failed','unresolved')),
+    revision bigint NOT NULL DEFAULT 1 CHECK (revision > 0),
+    error text,
+    process_identity jsonb,
+    recording_artifact jsonb,
+    ready_at timestamptz,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (actor, request_key)
+);
+CREATE TABLE IF NOT EXISTS :"platform_schema".simulation_command (
+    session_id text NOT NULL REFERENCES :"platform_schema".simulation_session(session_id),
+    command_id text NOT NULL,
+    request_digest text NOT NULL CHECK (request_digest ~ '^[0-9a-f]{64}$'),
+    request jsonb NOT NULL,
+    result jsonb,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (session_id, command_id)
+);
+
+-- Optional dynamics requests and owned attempts are independent of engineering decisions.
+CREATE TABLE IF NOT EXISTS :"platform_schema".assessment_request (
+    request_id text PRIMARY KEY CHECK (request_id ~ '^[0-9a-f]{64}$'),
+    principal text NOT NULL CHECK (principal <> ''),
+    idempotency_key text NOT NULL CHECK (length(idempotency_key) BETWEEN 1 AND 128),
+    source_run_id text NOT NULL REFERENCES :"platform_schema".run_admission(run_id),
+    request_sha256 char(64) NOT NULL CHECK (request_sha256 ~ '^[0-9a-f]{64}$'),
+    request_artifact_id text NOT NULL REFERENCES :"platform_schema".artifact(artifact_id),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE(principal,idempotency_key)
+);
+CREATE TABLE IF NOT EXISTS :"platform_schema".assessment_attempt (
+    attempt_id text PRIMARY KEY CHECK (attempt_id ~ '^[0-9a-f]{64}$'),
+    request_id text NOT NULL REFERENCES :"platform_schema".assessment_request(request_id),
+    attempt_number integer NOT NULL CHECK (attempt_number > 0),
+    dag_run_id text NOT NULL UNIQUE,
+    state text NOT NULL CHECK (state IN (
+        'registered','dispatching','queued','running','verifying','sealing','unknown',
+        'completed','unsupported','failed','cancelled','timeout'
+    )),
+    owner_token char(64) CHECK (owner_token ~ '^[0-9a-f]{64}$'),
+    owner_process jsonb,
+    lease_until timestamptz,
+    process jsonb,
+    cancel_requested boolean NOT NULL DEFAULT false,
+    resources_settled boolean NOT NULL DEFAULT false,
+    result_artifact_id text REFERENCES :"platform_schema".artifact(artifact_id),
+    detail jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE(request_id,attempt_number),
+    CHECK ((owner_token IS NULL) = (owner_process IS NULL)),
+    CHECK (state NOT IN ('running','verifying','sealing')
+           OR (owner_token IS NOT NULL AND lease_until IS NOT NULL)),
+    CHECK (resources_settled = (state IN ('completed','unsupported','failed','cancelled','timeout')))
+);

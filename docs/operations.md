@@ -1,6 +1,6 @@
 # 操作指南
 
-工程师通过同一操作台完成 **原生工程上传 → 六阶段执行 → 验证结果 → URDF 预览与 PR**。仓库、凭据、规格库和传输由平台维护，操作时无需输入服务器路径或流水线配置。
+工程师通过同一操作台完成 **原生工程上传 → 七阶段执行 → 验证结果 → URDF / MJCF 预览与 PR**。仓库、凭据、规格库和传输由平台维护，操作时无需输入服务器路径或流水线配置。
 
 ## 准备与提交
 
@@ -14,7 +14,7 @@
 
 ## 查看运行
 
-页面按[六阶段契约](contracts.md#stages)展示输入、输入检查、输出与输出检查。失败首先显示对象、原因、证据与处理方向；测量结果同时给出单位和阈值，原始文件与摘要按需展开。
+页面按[七阶段契约](contracts.md#stages)展示输入、输入检查、输出与输出检查。失败首先显示对象、原因、证据与处理方向；测量结果同时给出单位和阈值，原始文件与摘要按需展开。
 
 必需前提失败时，下游阻断，未执行检查不算通过。复用结果标明原生产运行和检查时间。警告保留对象和资格影响，可以与通过并存；零参数、未分配实例或材料缺失不能获得其对应工程资格。
 
@@ -39,38 +39,19 @@
 | 独立验证失败 | 追溯原始证据与生成规则，保留失败产物与检查结果 |
 | 通信中断 | 恢复连接并查询同一原生操作，不重复发起 CAD 工作 |
 | 发布失败或结果未知 | 保留已验证交付与外部操作记录，恢复权限/服务后由发布阶段对账 |
-| 发布基线变化 | 检查目标候选与 base；如仍要正式执行，使用 `Create new request from Freeze` 在新 Freeze 下重做全部下游 |
+| 发布基线变化 | 先对账原外部结果，再通过 Publish 阶段重跑建立新的不可变发布意图与实际基线；只有源工程变化才从 Freeze 重新建立结果 |
 
 观察数量不是缺陷零件数量。一处未解析约束可能影响多个实例，应先判定问题来源。机械事实的变化在 CAD/规格中修正，形成新提交；不编辑模型、URDF、网格或质量报告。
 
 ## 恢复、重试与新建请求
 
-恢复区提供 `Retry` / `Continue original job` 与 `Create new request from Freeze` 两种
-操作；首页首次上传是独立的正式入口。
+阶段详情提供统一的 `Rerun <stage>`。七阶段均从已封存输入独立执行，默认只运行所选阶段；高级选项可明确延续到一个下游终点。新执行使用新的不可变请求和 command，保留原失败、产物与 producer。新结果需要继续验证或发布时，可从它再选择下一阶段，不借用失效的旧下游成功。
 
-- `Retry` / `Continue original job` 只针对同一已登记且不可变的 command。它可继续原
-  operation、处理传输恢复或执行受控 terminal resume；输入、expected target、tool、
-  effect identity 与既有资格不能通过 retry 改写。结果 UNKNOWN 时先对账原 operation，
-  不得新建 operation、重新上传不同 archive、重做 CAD 或创建新阶段 command。
-- `Create new request from Freeze` 只用于已有 run。它只从父运行已通过独立复核的
-  sealed Freeze originals 创建当前规则、配置、tool、policy 与发布基线下的新 Freeze
-  request；随后按顺序重新执行 Freeze、Discover、Capture、Generate、Verify 和 Publish。
-  原运行、原始证据和原 command 保持不变。重复提交返回同一幂等的新 request；其他来源
-  或任一前置缺失时拒绝。
+`Continue original job` 仅恢复同一已登记 command 的原执行，输入、tool、target 和 effect 身份不变。已有决定只核验返回原结果；不会换新工具改写终态。UNKNOWN 先对账原 operation，不能直接重发。已提交的阶段重跑若响应未知，界面锁定原正文和幂等键；刷新后仍对账同一请求。
 
-首页首次上传提交本次完整受控原件并直接形成新的 Freeze request；它不调用
-`Create new request from Freeze`，也不复用任何旧运行的 sealed originals。所有正式新
-运行均从 Freeze 接纳，包括首次上传与已有 run 的封存复用；不能为正式运行选择任意起始
-阶段，也不存在“只重跑 Verify／Publish”的新运行入口。
+首页首次上传提交新的受控原件，按 Freeze→Publish 完整运行。阶段重跑复用其真实依赖的封存前缀；Freeze 只复用 originals，Discover/Capture 才执行必要 CAD 工作，Generate/Verify/MJCF/Publish 不重复采集。工程原件或主装配变化从 Freeze 重新建立必要结果；规则、配置、用途和目标变化按实际影响重新核验，不把旧证书套到新事实。
 
-同一原始 CAD 字节下，规则、config、tool 版本、发布 base 或封存内主装配选择变化时，
-可从已有 run 使用 `Create new request from Freeze`。原始 CAD 字节变化必须重新上传新的
-受控输入，再从该输入形成 Freeze request；不得复用旧 bytes 冒充变化，也不得把已有
-上游结果拼入新规则组合。
-
-独立阶段诊断只能执行已登记且隔离授权的 exact command；它不是页面上的正式阶段起跑
-资格，不能创建新的正式 run 或绕过 Freeze。复用、UNKNOWN 对账与终态恢复的具体边界
-遵循[系统契约](contracts.md#recovery)。
+单阶段范围成功只表示该范围完成。页面分别显示 Reused、实际执行及 Out of scope；正式交付仍要求完整有效来源、独立验证和本次 Publish 的真实 PR。所有权、原件、资格或外部结果不清楚时，界面显示具体原因并拒绝执行。
 
 发起人和管理员可以请求取消尚未完成的运行。平台先停止自有操作并核对外部结果，确认后才显示取消；未决结果先对账，已完成发布不能被取消。取消保留请求、原始证据与诊断。
 
@@ -96,5 +77,5 @@ description stage <verify-command-id>
 并提交正式 decision、certificate 与 receipt；结果按既有契约参与后续发布。已有决定时，
 命令只核验并返回原封存结果，不重新计算。Verify 对输入证据的读取不改写原件，但阶段
 执行会写入业务事实。真正隔离复算须绑定既有 `DiagnosticReplayScope` 并走受控诊断
-入口，不登记正式资格；不能把正式命令当作只读诊断。发布恢复使用操作台的发布重跑，
+入口，不登记正式资格；不能把正式命令当作只读诊断。发布恢复使用操作台的 Publish 阶段重跑，
 以保持同一授权、目标和审计流程。命令与完整交付边界见[交付契约](contracts.md#delivery)。

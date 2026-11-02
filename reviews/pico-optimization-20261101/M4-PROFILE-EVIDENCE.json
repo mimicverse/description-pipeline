@@ -1,0 +1,166 @@
+{
+  "schema_version": "description.pico-profile-evidence/1",
+  "parent_commit": "810f0c28f15e3c0b0c34e2c4752234cd1036df39",
+  "source_files": {
+    "deploy/operator/health.sh": "da1a28e05e26c0aa381a445922d293ae30530e8991de5e1a6456f073781ae3c9",
+    "docs/pico-upper-body.md": "266d7e8794b144d13f7b25184aa2ac1866bf85f7002c643ff1664fbe2193f4b0",
+    "src/description_pipeline/orchestration/pico_portal.py": "e67efea8d217bfd5427e403a1a0aa3cd3e269c65eca770d7ed5beb217ebfd313",
+    "src/description_pipeline/orchestration/static/pico.css": "289e4fc8b0a611bde56e2452e179ff88bcad97d1a2ba3ed3fca48001312f074c",
+    "src/description_pipeline/orchestration/static/pico.html": "417296506a3578e26a44c6e5517535f2d67391de5dd080ab58df2501f131e69e",
+    "src/description_pipeline/orchestration/static/pico.js": "3e01dff63e8e55b579c003819d43da35fb2849a3bcf884a4ebea995014af3f32",
+    "src/description_pipeline/orchestration/static/pico_profile.js": "b33c5ada9cf273c4b83a719c73c8c73b8c54299f2275cffb9d022f6d5b5144eb",
+    "tests/v1/test_operator_assets.py": "6c66a0704b2170d9a00d90ab2e3a35f22710bc6fe56aacc52e46fe7ce317e485",
+    "tests/v1/test_pico_sessions.py": "9050ae768f445b945f3ca2f6c01e795af9afb4750ef6674c9df1b1ac16e74fab"
+  },
+  "teleop_commit": "8b402482559c02534668bf2cb4338c0b8d628e14",
+  "scope": "Software-only development integration. Real native worker, PostgreSQL, ArtifactStore, HTTP/WS/ZMQ and browser. External identity/source stage boundaries remain explicit software fixtures.",
+  "validation": {
+    "native_integration": {
+      "passed": 6,
+      "failed": 0,
+      "seconds": 75.593
+    },
+    "final_http_metadata_and_native_flow": {
+      "passed": 1,
+      "failed": 0,
+      "seconds": 14.152,
+      "scope": "After adding warning propagation; all other final edits are browser/asset changes."
+    },
+    "installed_asset_probe": {
+      "passed": 7,
+      "failed": 0,
+      "seconds": 3.438,
+      "actual_branches": [
+        "complete installed JS bundle",
+        "missing existing module",
+        "missing new profile module",
+        "empty installed inventory",
+        "HTML response",
+        "changed served bytes",
+        "canonical effect ordering"
+      ]
+    },
+    "static_checks": [
+      "Ruff passed",
+      "JavaScript syntax passed",
+      "shell syntax passed",
+      "git diff --check passed"
+    ],
+    "development_wheel": "All four PICO asset files match the actual candidate wheel; not a formal release."
+  },
+  "browser_cases": [
+    "First profile configured without JSON and accepted by the native worker",
+    "Wrong-branch TCP rejected with the source joint/frame names",
+    "Home outside source range rejected",
+    "Reflection rotation rejected",
+    "Different model identity rejected on JSON import",
+    "Same model with different subject digest rejected on JSON import",
+    "Same-subject export/import accepted",
+    "Refresh restored the saved source-bound profile",
+    "One-click launch with launch=1 reused the exact original profile/settings; distinct sessions had equal request digests",
+    "Controlled subset with an intermediate joint fixed at home accepted natively and restored after refresh",
+    "Committed launch response deliberately replaced with HTTP503; original request and recording choice locked",
+    "Reload preserved the pending original request",
+    "Retry returned the actual original session with no extra worker directory",
+    "Normal stop sealed complete recordings",
+    "Retry label reset to Start Session after success and stop"
+  ],
+  "adjacent_defect": {
+    "cause": "The launch label was changed only on failure and not reset after clearing the pending request.",
+    "why_missed": "Earlier browser checks covered successful startup but did not complete response-loss recovery through stop and the next-start view.",
+    "scope": "Initial launch, retry success, recoverable failure, explicit rejection, refresh and stopped-session setup.",
+    "fix": "Reset the normal launch label in the same pending-control update that unlocks the form.",
+    "actual_regression": "Repeated the real response-loss/retry/stop branch with the new source; two session directories (one seeded, one launched), complete recordings and Start Session after stop."
+  },
+  "artifacts": {
+    "m4-native-tests.log": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/m4-native-tests.log",
+      "sha256": "7ac916b4130cb25c5f9ee21bd91a1dac2f75e634b1f6212c4347b3888b581974"
+    },
+    "m4-final-http-tests.log": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/m4-final-http-tests.log",
+      "sha256": "9f1d51ca0d6ec75eb31b748d296c58d86ae370e398690f0b382d6f7aaf434634"
+    },
+    "m4-final-asset-tests.log": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/m4-final-asset-tests.log",
+      "sha256": "e78ad23d15b85a33f1a2422dc46f1f5eff4c2f53a7119213b1319ec0add91b6c"
+    },
+    "m4-browser-fixture.py": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/m4-browser-fixture.py",
+      "sha256": "eaf7c1d22a36dfa660391007108c5e43651fd9e79a95159bd3551af73dd865b0"
+    },
+    "m4-final-browser-fixture.py": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/m4-final-browser-fixture.py",
+      "sha256": "3c7d9601ea6ce5861a3b53d8be08591138d3ac45c972ce62af8a44ef00657faa"
+    },
+    "m4-response-loss-fixture.py": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/m4-response-loss-fixture.py",
+      "sha256": "f2da0d1b2f6aff2bd9db9e31f5c76aafff35379aca1d1b835e45988dd008c64e"
+    },
+    "m4-exported-draft.json": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/m4-exported-draft.json",
+      "sha256": "774d2d33faf7e808d3dde457e0d148b38942aa774ad26b3fd515a5be1143058a"
+    },
+    "m4-browser-sessions.json": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/m4-browser-sessions.json",
+      "sha256": "3a7f2eab04bdd5384fe7963c11e8522d1b39b926c94df8a13e1e74dfb5d0c02e"
+    },
+    "m4-partial-browser-sessions.json": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/m4-partial-browser-sessions.json",
+      "sha256": "44ebb28b9684307a6b2a3f7ca411280aa4e741a02a67b7942da62223197712be"
+    },
+    "m4-response-loss-before-retry.json": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/m4-response-loss-before-retry.json",
+      "sha256": "c47d984c3b2ffa78e3a6bbcbd9cd3df3019d0378f8dce3d5c74d004f664c6375"
+    },
+    "m4-response-loss-after-retry.json": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/m4-response-loss-after-retry.json",
+      "sha256": "41bfe61db320d67c6dc9143b89a9120352e17f02d7c98405aa50abd6ccf2469f"
+    },
+    "m4-label-fixed-reconciliation.json": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/m4-label-fixed-reconciliation.json",
+      "sha256": "cdd3568b689d331a0ca1cadba4585497b713527427f2b0b5f701a2b81d518146"
+    },
+    "m4-label-fixed-wheel-closure.json": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/m4-label-fixed-wheel-closure.json",
+      "sha256": "1633cb3d8a31f63e675e018e596d55afc351433c4fac893217d025d834b4809d"
+    },
+    "m4-first-launch.png": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/m4-first-launch.png",
+      "sha256": "20b1de97c79bf38244a088138db62a686cfbabe254d538456ae1da1a9fc3c206"
+    },
+    "m4-source-import-rejected.png": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/m4-source-import-rejected.png",
+      "sha256": "7e2c8ca45dae6dc5406851c916e908a6bb9b3c770011d73d524f59c6ae1f7530"
+    },
+    "m4-structured-profile-final.png": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/m4-structured-profile-final.png",
+      "sha256": "91389519c238b8d98c4cbd11a19d33904260dde847cfdef4bcc26afb8cf9fbe2"
+    },
+    "m4-launch-reconciliation.png": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/m4-launch-reconciliation.png",
+      "sha256": "4388070816c19e469f7597109e126c2a58123a86d8d24f2b619eda78198469d3"
+    },
+    "m4-reconciled-launch.png": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/m4-reconciled-launch.png",
+      "sha256": "d71ca469e5e25606115ea341b73b79aa09fe4a9ffbaafd8fba4ea72f49886a72"
+    },
+    "m4-stale-launch-label-before-fix.png": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/m4-stale-launch-label-before-fix.png",
+      "sha256": "1af2ee1cf046bba7990dee64ad3ea15a0ed71b6cfb8437689106c46980f4106f"
+    },
+    "m4-launch-label-fixed.png": {
+      "path": "/home/andy/Work/reviews/pico-optimization-20261101/m4-launch-label-fixed.png",
+      "sha256": "2ab4470340565b6397206edafaba10495c3cb1e673ff778ed3f9aea48f14bc02"
+    }
+  },
+  "not_verified": [
+    "New Teleop worker protocol, effective command confirmation and complete event replay",
+    "Full three-axis head following on the real models",
+    "Long-run resource and transport/backpressure qualification",
+    "Physical PICO or narrow-screen device operation",
+    "Daily link startup packaging",
+    "Same-release offline assets, independent review, merge and formal deployment/E2E"
+  ],
+  "previous_evidence": "M1 and M2 records remain unchanged and apply to their recorded commits/scopes."
+}

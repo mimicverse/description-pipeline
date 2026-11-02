@@ -62,11 +62,10 @@ from description_pipeline.pipeline.freeze import (
 from description_pipeline.pipeline.ingestion import (
     ProductionAdmissionRequest,
     ProductionAdmissionFactory,
-    ProductionMJCFSuccessorRequest,
-    ProductionFreezeSuccessorRequest,
+    ProductionStageRerunRequest,
     ReceivedUploadReceipt,
     load_production_admission,
-    load_production_freeze_successor,
+    load_production_stage_rerun,
 )
 from description_pipeline.pipeline.services import (
     CanonicalStageServices,
@@ -243,21 +242,20 @@ class RealSixStageChainTests(unittest.TestCase):
             install_id="win-" + "4" * 32,
             pipeline_id="solidworks-to-urdf",
         )
+        from description_pipeline.stages import CONTRACT_FILE_SHA256
+
+        package_files = {"runtime.py": "c" * 64, "stage-contract.json": CONTRACT_FILE_SHA256}
         release = {
             "schema_version": "solidworks-to-urdf.release/v1",
             "pipeline_id": "solidworks-to-urdf",
             "version": __version__,
             "source_commit": "a" * 40,
             "source_tree": "b" * 40,
-            "source_sha256": digest(
-                {"description_pipeline/runtime.py": "c" * 64}
-            ),
-            "package_files": {
-                "description_pipeline/runtime.py": "c" * 64,
-            },
+            "source_sha256": digest(package_files),
+            "package_files": package_files,
             "contract": {
                 "schema_version": "fixture-contract/v1",
-                "digest": CONTRACT_SHA256,
+                "stage": CONTRACT_SHA256,
             },
             "support": {
                 "python": "3.12",
@@ -514,9 +512,10 @@ class RealSixStageChainTests(unittest.TestCase):
         native = copy.deepcopy(self.native)
         for role, tool in (("portable", portable), ("native", native)):
             package_files = {
-                f"description_pipeline/{role}_{seed}.py": digest(
+                f"{role}_{seed}.py": digest(
                     {"release-file": role, "seed": seed}
-                )
+                ),
+                "stage-contract.json": tool["release"]["package_files"]["stage-contract.json"],
             }
             source_sha256 = digest(package_files)
             tool["source_sha256"] = source_sha256
@@ -603,6 +602,61 @@ class RealSixStageChainTests(unittest.TestCase):
                 else None
             ),
         )
+
+    def _assert_portal_source_reads(self, run_id):
+        from description_pipeline.orchestration.portal import PortalApp, PortalConfig
+        from description_pipeline.platform.queries import read_run_projection
+        from description_pipeline.io import PipelineError, canonical
+        from description_pipeline.pipeline.contracts import StageCommand
+        from description_pipeline import mjcf_contract
+
+        def read_projection(identifier):
+            with self._connect() as connection:
+                return read_run_projection(connection, identifier, artifacts=self.store)
+
+        portal = PortalApp(PortalConfig(
+            airflow=None, run_projection_factory=read_projection, artifact_store=self.store,
+        ))
+        projection = portal._read_projection(run_id)
+        with (
+            patch.object(mjcf_contract, "tool_identity", side_effect=AssertionError("Current tool is not proof")),
+            patch.object(mjcf_contract, "engine_identity", side_effect=AssertionError("Current engine is not proof")),
+        ):
+            preview = portal._preview_from_projection(run_id, projection)
+        self.assertEqual(preview["verified"], projection["state"] != "unresolved")
+        self.assertEqual(preview["mjcf"]["verified"], projection["state"] != "unresolved")
+        self.assertEqual(run_id, preview["run_id"])
+        self.assertIsNotNone(portal._registered_stage_report(projection, stage="capture"))
+        for stage in ("capture", "generate", "verify"):
+            with self.subTest(source_command=stage):
+                changed = copy.deepcopy(projection)
+                row = changed["stages"][stage]
+                record = dict(row["command"])
+                record["contract_sha256"] = digest({"wrong_contract": stage})
+                record["request_digest"] = digest({k: v for k, v in record.items() if k != "request_digest"})
+                row["command"] = StageCommand.from_record(record).to_record()
+                with self.assertRaises(PipelineError):
+                    if stage == "capture":
+                        portal._registered_stage_report(changed, stage=stage)
+                    else:
+                        portal._urdf_preview_from_projection(run_id, changed)
+        original_read = portal._registered_member_bytes
+
+        def wrong_nested_tool(path, member):
+            content = original_read(path, member)
+            if path == mjcf_contract.REPORT_PATH:
+                record = json.loads(content)
+                record["input_binding"]["tool"]["source_sha256"] = digest({"wrong_nested_tool": True})
+                record["report"]["input_binding_sha256"] = digest(record["input_binding"])
+                record["certificate_key"] = digest({k: v for k, v in record.items() if k != "certificate_key"})
+                content = canonical(record)
+            return content
+
+        with (
+            patch.object(portal, "_registered_member_bytes", side_effect=wrong_nested_tool),
+            self.assertRaisesRegex(PipelineError, "runtime identity differs"),
+        ):
+            portal._mjcf_preview_from_projection(projection)
 
     def test_production_intake_completes_the_real_six_stage_chain(self) -> None:
         application = self._application()
@@ -691,6 +745,7 @@ class RealSixStageChainTests(unittest.TestCase):
                 ("publish", "completed"),
             ],
         )
+        self._assert_portal_source_reads(RUN_ID)
 
     def test_mjcf_only_successor_uses_real_qualified_inputs_without_upstream_execution(self) -> None:
         from description_pipeline.runtime import tool_record
@@ -725,9 +780,15 @@ class RealSixStageChainTests(unittest.TestCase):
             def forbidden_native():
                 raise AssertionError("MJCF rerun contacted the native endpoint")
             factory.native_tool_provider = forbidden_native
-            cold_request = ProductionMJCFSuccessorRequest(
-                run_id="cold-mjcf-run", request_id="cold-mjcf-request", parent_run_id=source.run_id,
-                principal=source.principal, change_summary="Admit and execute MJCF without native capabilities",
+            cold_request = ProductionStageRerunRequest(
+                from_stage="mjcf",
+                through_stage="publish",
+                run_id="cold-mjcf-run",
+                request_id="cold-mjcf-request",
+                parent_run_id=source.run_id,
+                principal=source.principal,
+                change_summary="Admit and execute MJCF without native capabilities",
+                simulation="{}\n",
             )
             captured = []
 
@@ -739,7 +800,7 @@ class RealSixStageChainTests(unittest.TestCase):
                 raise CapturedAdmission()
 
             with patch.object(application, "admit", side_effect=capture_spec), self.assertRaises(CapturedAdmission):
-                factory.admit_mjcf(application, cold_request)
+                factory.admit_stage_rerun(application, cold_request)
             cold_spec = replace(captured[0], executors=replace(captured[0].executors, mjcf=actual_executor))
             spec_path = work / "cold-admission.json"
             write_json(spec_path, cold_spec.to_record())
@@ -748,7 +809,7 @@ class RealSixStageChainTests(unittest.TestCase):
                 "PATH": os.environ["PATH"],
                 "PYTHONPATH": str(Path(application_from_environment.__code__.co_filename).resolve().parents[2]),
                 "PLATFORM_SERVICE_DSN": psycopg2.extensions.make_dsn(
-                    self.server.get_uri(), options=f"-c search_path={self.schema},public",
+                    self.server.get_uri(), options=f"-c search_path={self.schema},public -c timezone=Asia/Shanghai",
                 ),
                 "PLATFORM_ARTIFACT_ROOT": str(self.store.root),
                 "PIPELINE_WORK_ROOT": str(work / "cold-runtime"),
@@ -762,11 +823,25 @@ class RealSixStageChainTests(unittest.TestCase):
             self.assertEqual(0, cold.returncode, cold.stderr)
             admitted_cold = json.loads(cold.stdout)
             self.assertEqual(cold_spec.run_id, admitted_cold["admission"]["run_id"])
+            self.assertEqual(cold_spec.created_at.astimezone(UTC).isoformat(),
+                             admitted_cold["admission"]["created_at"])
+            environment["PLATFORM_SERVICE_DSN"] = psycopg2.extensions.make_dsn(
+                self.server.get_uri(), options=f"-c search_path={self.schema},public -c timezone=America/New_York",
+            )
             repeated = cold_cli("admit", str(spec_path))
             self.assertEqual(0, repeated.returncode, repeated.stderr)
             self.assertEqual(admitted_cold, json.loads(repeated.stdout))
+            from description_pipeline.platform.queries import read_run_projection
+
+            with self._connect() as connection, connection.cursor() as cursor:
+                projections = []
+                for zone in ("UTC", "Asia/Shanghai", "America/New_York"):
+                    cursor.execute("SET TIME ZONE %s", (zone,))
+                    projections.append(read_run_projection(connection, source.run_id, artifacts=self.store))
+            self.assertEqual(projections[0], projections[1])
+            self.assertEqual(projections[0], projections[2])
             cold_stage = cold_cli("stage", admitted_cold["entry_command"]["command_id"])
-            self.assertEqual(0, cold_stage.returncode, cold_stage.stderr)
+            self.assertEqual(0, cold_stage.returncode, cold_stage.stderr + cold_stage.stdout)
             self.assertEqual("completed", json.loads(cold_stage.stdout)["outcome"])
             invalid = replace(cold_spec, run_id="invalid-cold-run", request_id="invalid-cold-request",
                               parent_run_id="missing-source")
@@ -775,18 +850,23 @@ class RealSixStageChainTests(unittest.TestCase):
             self.assertNotEqual(0, rejected.returncode)
             self.assertNotIn("native_target_missing", rejected.stderr)
             self.assertIsNone(application.facts.load_admission(invalid.run_id))
-            rerun = ProductionMJCFSuccessorRequest(
-                run_id="mjcf-only-run", request_id="mjcf-only-request", parent_run_id=source.run_id,
-                principal=source.principal, change_summary="Use a qualified collision budget",
+            rerun = ProductionStageRerunRequest(
+                from_stage="mjcf",
+                through_stage="publish",
+                run_id="mjcf-only-run",
+                request_id="mjcf-only-request",
+                parent_run_id=source.run_id,
+                principal=source.principal,
+                change_summary="Use a qualified collision budget",
                 simulation='{"collision":{"max_vertices":128}}',
             )
             with ExitStack() as stack:
                 for stage in ("freeze", "discover", "capture", "generate", "verify"):
                     stack.enter_context(patch.object(application.handlers[stage], "execute",
                                                      side_effect=AssertionError("Upstream execution was repeated")))
-                admitted = factory.admit_mjcf(application, rerun)
+                admitted = factory.admit_stage_rerun(application, rerun)
                 self.assertEqual("mjcf", admitted.entry_command.stage)
-                self.assertEqual(admitted, factory.admit_mjcf(application, rerun))
+                self.assertEqual(admitted, factory.admit_stage_rerun(application, rerun))
                 for stage in ("freeze", "discover", "capture", "generate", "verify"):
                     reuse = application.run_stage(rerun.run_id, stage).to_record()
                     self.assertEqual(("reused", source.run_id), (reuse["outcome"], reuse["source_run_id"]))
@@ -799,6 +879,747 @@ class RealSixStageChainTests(unittest.TestCase):
                 cursor.execute("SELECT stage, result_digest FROM stage_decision WHERE run_id = %s ORDER BY stage",
                                (source.run_id,))
                 self.assertEqual(before, cursor.fetchall())
+
+    def test_independent_ranges_and_chained_sources_execute_in_separate_processes(self) -> None:
+        from description_pipeline.stages import STAGE_IDS
+        from description_pipeline.io import PipelineError
+        from description_pipeline.pipeline.application import ApplicationError
+        from tests.v1.stage_rerun_child import FixtureDispatch
+        from tests.v1.publish_recovery_child import _FilePullRequests
+
+        work = self.root / "independent-reruns"
+        work.mkdir()
+        application = self._application(pull_requests=_FilePullRequests(work / "pull-requests.json"))
+        single_ids = {stage: str(uuid.uuid4()) for stage in STAGE_IDS}
+        snapshot = self._platform_snapshot()
+        factory = ProductionAdmissionFactory(
+            artifacts=self.store,
+            platform_snapshot=snapshot,
+            native_tool_provider=lambda: copy.deepcopy(self.native),
+            portable_tool_provider=lambda: copy.deepcopy(self.portable),
+            work_root=work,
+            clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
+        )
+        environment = {
+            **os.environ,
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src")
+            + os.pathsep
+            + str(Path(__file__).resolve().parents[2]),
+        }
+        context = work / "process-context.json"
+        write_json(
+            context,
+            {
+                "database": self.server.get_uri(),
+                "schema": self.schema,
+                "artifacts": str(self.store.root),
+                "portable": self.portable,
+                "native": self.native,
+                "work": str(work),
+                "pull_requests": str(work / "pull-requests.json"),
+                "now": datetime(2026, 10, 25, tzinfo=UTC).isoformat(),
+            },
+        )
+
+        def child(admitted, stage, fault=None):
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    "-m",
+                    "tests.v1.stage_rerun_child",
+                    str(context),
+                    admitted.admission.run_id,
+                    stage,
+                    *([fault] if fault else []),
+                ],
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            self.assertEqual(0, completed.returncode, completed.stderr + completed.stdout[-4096:])
+            return json.loads(completed.stdout)
+
+        with ExitStack() as stack:
+            for target, tool in (
+                ("description_pipeline.runtime.tool_record", self.native),
+                ("description_pipeline.pipeline.stages.generate.tool_record", self.portable),
+                ("description_pipeline.pipeline.stages.publish.tool_record", self.portable),
+            ):
+                stack.enter_context(patch(target, return_value=copy.deepcopy(tool)))
+            source = factory.prepare(self._production_request()).spec
+            admitted_source = application.admit(source)
+            application.dispatch(admitted_source.dispatch_command.command_id, FixtureDispatch())
+            completed = application.execute_run(source.run_id)
+            self.assertEqual("completed", completed.outcome, completed)
+            options = application.stage_rerun_options(source.run_id, source.principal)
+            self.assertEqual(list(STAGE_IDS), [row["stage"] for row in options])
+            self.assertTrue(all(row["eligible"] and not row["execution_authorized"] for row in options), options)
+            with self._connect() as connection, connection.cursor() as cursor:
+                cursor.execute("SELECT count(*) FROM command")
+                before = cursor.fetchone()[0]
+            application.stage_rerun_options(source.run_id, "app:tenant:different")
+            with self._connect() as connection, connection.cursor() as cursor:
+                cursor.execute("SELECT count(*) FROM command")
+                self.assertEqual(before, cursor.fetchone()[0])
+            native_reads = []
+            def native_provider():
+                native_reads.append(True)
+                return copy.deepcopy(self.native)
+            factory.native_tool_provider = native_provider
+            for stage in STAGE_IDS:
+                previous_reads = len(native_reads)
+                request = ProductionStageRerunRequest(
+                    run_id=single_ids[stage],
+                    request_id="request-single-" + stage,
+                    parent_run_id=source.run_id,
+                    principal=source.principal,
+                    change_summary="Independently recompute " + stage,
+                    from_stage=stage,
+                )
+                admitted = factory.admit_stage_rerun(application, request)
+                self.assertEqual(admitted, factory.admit_stage_rerun(application, request))
+                self.assertEqual(int(stage in {"discover", "capture"}), len(native_reads) - previous_reads)
+                result = child(admitted, stage)
+                self.assertNotEqual(os.getpid(), result["process"])
+                self.assertEqual("completed", result["result"]["outcome"], result["failures"])
+                projection = result["projection"]
+                self.assertEqual([stage], projection["execution_scope"])
+                self.assertEqual(stage == "publish", projection["delivery_complete"])
+                self.assertEqual("succeeded", projection["state"])
+                actual = [row["stage"] for row in projection["stages"] if row["decision"] is not None]
+                self.assertEqual([stage], actual)
+                if stage == "generate":
+                    chain_source = admitted.admission.run_id
+            old_executor = source.executors.publish
+            self._install_current_tools(source_commit="d" * 40, source_tree="e" * 40, seed="independent-stage")
+            self.native_target = NativeTargetIdentity.create(
+                install_id="win-" + "9" * 32, pipeline_id="solidworks-to-urdf"
+            )
+            factory.platform_snapshot = self._platform_snapshot()
+            application = self._application(pull_requests=_FilePullRequests(work / "pull-requests.json"))
+            document = read_data(context)
+            document.update(portable=self.portable, native=self.native)
+            write_json(context, document)
+            for target, tool in (
+                ("description_pipeline.runtime.tool_record", self.native),
+                ("description_pipeline.pipeline.stages.generate.tool_record", self.portable),
+                ("description_pipeline.pipeline.stages.publish.tool_record", self.portable),
+            ):
+                stack.enter_context(patch(target, return_value=copy.deepcopy(tool)))
+            for stage in ("capture", "publish"):
+                adopted = factory.admit_stage_rerun(
+                    application,
+                    ProductionStageRerunRequest(
+                        run_id=str(uuid.uuid4()),
+                        request_id="request-new-tool-" + stage,
+                        parent_run_id=source.run_id,
+                        principal=source.principal,
+                        change_summary="Use the actual current tool for " + stage,
+                        from_stage=stage,
+                    ),
+                )
+                spec = AdmissionSpec.from_record(adopted.admission.request)
+                self.assertNotEqual(old_executor, spec.executors.for_stage(stage))
+                for prefix in STAGE_IDS[: STAGE_IDS.index(stage)]:
+                    self.assertEqual(source.executors.for_stage(prefix), spec.executors.for_stage(prefix))
+                if stage == "capture":
+                    self.assertEqual(self.native_target, spec.native_target_identity)
+                else:
+                    self.assertEqual(source.native_target_identity, spec.native_target_identity)
+                    self.assertEqual(source.native_tool_requirement, spec.native_tool_requirement)
+                executed = child(adopted, stage)
+                self.assertEqual(
+                    "completed", executed["result"]["outcome"],
+                    {"stage": stage, "result": executed["result"], "failures": executed["failures"]},
+                )
+                self.assertEqual(self.portable["source_sha256"], executed["result"]["actual_executor_sha256"])
+                if stage == "publish":
+                    self._assert_portal_source_reads(adopted.admission.run_id)
+            for stage in ("verify", "mjcf", "publish"):
+                admitted = factory.admit_stage_rerun(
+                    application,
+                    ProductionStageRerunRequest(
+                        run_id=str(uuid.uuid4()),
+                        request_id="request-chain-" + stage,
+                        parent_run_id=chain_source,
+                        principal=source.principal,
+                        change_summary="Chained result for " + stage,
+                        from_stage=stage,
+                    ),
+                )
+                result = child(admitted, stage)
+                self.assertEqual("completed", result["result"]["outcome"], result["failures"])
+                self.assertEqual(single_ids["generate"], result["projection"]["stages"][3]["reuse"]["source_run"])
+                if stage == "verify":
+                    chain_verify = admitted
+                chain_source = admitted.admission.run_id
+            # A rerun result never revives a discarded downstream result.
+            freeze_only = factory.admit_stage_rerun(
+                application,
+                ProductionStageRerunRequest(
+                    run_id=str(uuid.uuid4()),
+                    request_id="request-chain-freeze",
+                    parent_run_id=source.run_id,
+                    principal=source.principal,
+                    change_summary="Freeze only",
+                    from_stage="freeze",
+                ),
+            )
+            child(freeze_only, "freeze")
+            with self.assertRaises((ApplicationError, PipelineError)):
+                factory.admit_stage_rerun(
+                    application,
+                    ProductionStageRerunRequest(
+                        run_id=str(uuid.uuid4()),
+                        request_id="request-invalid-publish",
+                        parent_run_id=freeze_only.admission.run_id,
+                        principal=source.principal,
+                        change_summary="Cannot reuse discarded downstream",
+                        from_stage="publish",
+                    ),
+                )
+
+            from description_pipeline.pipeline.admission import build_verify_command
+            from description_pipeline.platform.facts import FactConflict
+            from description_pipeline.pipeline.contracts import ProtocolError
+
+            original_prefix = application._read_source_prefix(source, 4, frozenset())[0]
+            chain_spec = AdmissionSpec.from_record(chain_verify.admission.request)
+            wrong_command = build_verify_command(chain_spec, original_prefix["generate"], original_prefix["capture"])
+            with self.assertRaises(FactConflict):
+                self.facts.create_command(
+                    wrong_command,
+                    admission=chain_verify.admission,
+                    predecessor=original_prefix["generate"],
+                    supporting_predecessors=(original_prefix["capture"],),
+                )
+            with self.assertRaises(ProtocolError):
+                factory.admit_stage_rerun(
+                    application,
+                    replace(
+                        ProductionStageRerunRequest(
+                            run_id=chain_verify.admission.run_id,
+                            request_id=chain_verify.admission.request_id,
+                            parent_run_id=chain_spec.parent_run_id,
+                            principal=source.principal,
+                            change_summary=chain_spec.change_summary,
+                            from_stage="verify",
+                        ),
+                        through_stage="publish",
+                    ),
+                )
+            cancelled = factory.admit_stage_rerun(
+                application,
+                ProductionStageRerunRequest(
+                    run_id=str(uuid.uuid4()),
+                    request_id="request-cancel-verify",
+                    parent_run_id=source.run_id,
+                    principal=source.principal,
+                    change_summary="Cancel the independent verification",
+                    from_stage="verify",
+                ),
+            )
+            self.facts.request_cancel(
+                target_command_id=cancelled.entry_command.command_id,
+                cancel_executor_sha256=self.portable["source_sha256"],
+                reason_code="operator_cancelled",
+                reason="Cancel the selected stage before execution",
+                requested_by=source.principal,
+                requested_at=datetime(2026, 10, 25, tzinfo=UTC),
+            )
+            cancellation = child(cancelled, "verify")
+            self.assertEqual("cancelled", cancellation["result"]["outcome"])
+            retried = factory.admit_stage_rerun(
+                application,
+                ProductionStageRerunRequest(
+                    run_id=str(uuid.uuid4()),
+                    request_id="request-after-cancel",
+                    parent_run_id=cancelled.admission.run_id,
+                    principal=source.principal,
+                    change_summary="New command after cancellation",
+                    from_stage="verify",
+                ),
+            )
+            self.assertEqual("completed", child(retried, "verify")["result"]["outcome"])
+            failed = factory.admit_stage_rerun(
+                application,
+                ProductionStageRerunRequest(
+                    run_id=str(uuid.uuid4()),
+                    request_id="request-local-publish-failure",
+                    parent_run_id=chain_source,
+                    principal=source.principal,
+                    change_summary="Preserve a local publication failure",
+                    from_stage="publish",
+                ),
+            )
+            failure = child(failed, "publish", "local_publish_failure")
+            self.assertEqual("failed", failure["result"]["outcome"])
+            self.assertEqual("publish.local_process_failed", failure["result"]["reason_code"])
+            fresh = factory.admit_stage_rerun(
+                application,
+                ProductionStageRerunRequest(
+                    run_id=str(uuid.uuid4()),
+                    request_id="request-after-local-failure",
+                    parent_run_id=failed.admission.run_id,
+                    principal=source.principal,
+                    change_summary="New publication without altering the failed command",
+                    from_stage="publish",
+                ),
+            )
+            self.assertEqual("completed", child(fresh, "publish")["result"]["outcome"])
+            unknown = factory.admit_stage_rerun(
+                application,
+                ProductionStageRerunRequest(
+                    run_id=str(uuid.uuid4()),
+                    request_id="request-unknown-publish",
+                    parent_run_id=chain_source,
+                    principal=source.principal,
+                    change_summary="Retain an unknown publication outcome",
+                    from_stage="publish",
+                ),
+            )
+            unresolved = child(unknown, "publish", "unknown_publish")
+            self.assertEqual("pending", unresolved["result"]["outcome"])
+            self.assertTrue(
+                any(item["state"] == "unknown" for item in unresolved["projection"]["technical"]["effects"])
+            )
+            unresolved_options = application.stage_rerun_options(unknown.admission.run_id, source.principal)
+            self.assertFalse(unresolved_options[-1]["eligible"], unresolved_options)
+            self.assertTrue(unresolved_options[3]["eligible"], unresolved_options)
+            with self.assertRaises((ApplicationError, PipelineError)):
+                factory.admit_stage_rerun(
+                    application,
+                    ProductionStageRerunRequest(
+                        run_id=str(uuid.uuid4()),
+                        request_id="request-must-reconcile-first",
+                        parent_run_id=unknown.admission.run_id,
+                        principal=source.principal,
+                        change_summary="Unknown cannot become a new publication",
+                        from_stage="publish",
+                    ),
+                )
+
+    def _execute_rerun_child(self, work: Path, admitted, stage: str, *, policy=None) -> dict:
+        context = work / "policy-process-context.json"
+        document = {
+            "database": self.server.get_uri(),
+            "schema": self.schema,
+            "artifacts": str(self.store.root),
+            "portable": self.portable,
+            "native": self.native,
+            "work": str(work),
+            "pull_requests": str(work / "pull-requests.json"),
+            "now": datetime(2026, 10, 25, tzinfo=UTC).isoformat(),
+        }
+        if policy is not None:
+            document["check_policy"] = policy
+        write_json(context, document)
+        completed = subprocess.run(
+            [sys.executable, "-B", "-m", "tests.v1.stage_rerun_child", str(context), admitted.admission.run_id, stage],
+            env={
+                **os.environ,
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src")
+                + os.pathsep + str(Path(__file__).resolve().parents[2]),
+            },
+            capture_output=True, text=True, timeout=120,
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr + completed.stdout[-4096:])
+        return json.loads(completed.stdout)
+
+    def test_current_policy_reuses_sealed_prefix_while_unrelated_suffix_is_pending(self) -> None:
+        from description_pipeline.interface_records import CHECK_POLICY_V1, check_policy_digest
+        from description_pipeline.pipeline.application import ApplicationError
+        from description_pipeline.pipeline.contracts import ProtocolError
+        from description_pipeline.platform.facts import FactConflict
+        from description_pipeline.verification.solidworks_urdf import required_checks
+        from tests.v1.stage_rerun_child import FixtureDispatch
+        from tests.v1.publish_recovery_child import _FilePullRequests
+
+        work = self.root / "policy-reruns"
+        work.mkdir()
+        (self.source_root / "cad/alternate.SLDASM").write_bytes(b"sealed alternate assembly\n")
+        application = self._application(pull_requests=_FilePullRequests(work / "pull-requests.json"))
+        snapshot = self._platform_snapshot()
+        factory = ProductionAdmissionFactory(
+            artifacts=self.store, platform_snapshot=snapshot,
+            native_tool_provider=lambda: copy.deepcopy(self.native),
+            portable_tool_provider=lambda: copy.deepcopy(self.portable), work_root=work,
+            clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
+        )
+
+        def request(stage, parent, **changes):
+            return ProductionStageRerunRequest(
+                run_id=str(uuid.uuid4()), request_id="policy-" + uuid.uuid4().hex,
+                parent_run_id=parent, principal="cli:tenant:ou_chain",
+                change_summary="Recompute " + stage, from_stage=stage, **changes,
+            )
+
+        with ExitStack() as stack:
+            for target, tool in (
+                ("description_pipeline.runtime.tool_record", self.native),
+                ("description_pipeline.pipeline.stages.generate.tool_record", self.portable),
+                ("description_pipeline.pipeline.stages.publish.tool_record", self.portable),
+            ):
+                stack.enter_context(patch(target, return_value=copy.deepcopy(tool)))
+            source = factory.prepare(self._production_request()).spec
+            source_outcome = application.admit(source)
+            application.dispatch(source_outcome.dispatch_command.command_id, FixtureDispatch())
+            self.assertEqual("completed", application.execute_run(source.run_id, through="mjcf").outcome)
+            self.assertEqual("incomplete", self.facts.get_admitted_run(source.run_id).state)
+            with self._connect() as connection, connection.cursor() as cursor:
+                cursor.execute("SELECT stage, result_digest FROM stage_decision WHERE run_id = %s ORDER BY stage",
+                               (source.run_id,))
+                source_decisions = cursor.fetchall()
+            old_prefix = application._read_source_prefix(source, 6, frozenset())[0]
+
+            self._advance_production_repository("policy-rerun")
+            current = read_data(snapshot)
+            current["generated_at"] = "2026-10-26T00:00:00Z"
+            current["resolved"]["operator"]["origin"] = "https://new-operator.example.test"
+            current["resolved"]["windows"]["ssh_host"] = "new-windows-route"
+            current["resolved"]["targets"]["nd_other"] = dict(current["resolved"]["targets"]["nd_fixture"])
+            write_json(snapshot, current)
+            self._write_install_record(snapshot, current)
+            git(self.production_repository, "config", "user.name", "Current Publisher")
+            git(self.production_repository, "config", "user.email", "current@example.test")
+
+            def forbidden_native():
+                raise AssertionError("An offline rerun contacted the native endpoint")
+
+            factory.native_tool_provider = forbidden_native
+            freeze_request = replace(
+                request("freeze", source.run_id, main_assembly="cad/alternate.SLDASM", target_hardware="nd_other"),
+                change_summary="First line\r\nSecond line\rThird line",
+            )
+            frozen = factory.admit_stage_rerun(application, freeze_request)
+            frozen_spec = AdmissionSpec.from_record(frozen.admission.request)
+            self.assertEqual(("nd_other", "cad/alternate.SLDASM"),
+                             (frozen_spec.target_hardware, frozen_spec.main_assembly))
+            self.assertEqual("First line\nSecond line\nThird line", frozen_spec.change_summary)
+            self.assertEqual(frozen, factory.admit_stage_rerun(application, freeze_request))
+            self.assertEqual("completed", self._execute_rerun_child(work, frozen, "freeze")["result"]["outcome"])
+            for changes in ({"target_hardware": "nd_other"}, {"main_assembly": "cad/alternate.SLDASM"}):
+                with self.subTest(changes=changes), self.assertRaises(ProtocolError):
+                    factory.admit_stage_rerun(application, request("verify", source.run_id, **changes))
+
+            original_policy = copy.deepcopy(CHECK_POLICY_V1)
+            new_policy = copy.deepcopy(original_policy)
+            next(rule for rule in new_policy["dynamic_expansions"] if rule["family"] == "shafts.{joint}").pop("when")
+            definition = {"source": {"joints": [{"name": "fixed-boundary", "type": "fixed"}]}}
+            self.assertNotIn("shafts.fixed-boundary", required_checks(definition))
+            with patch.dict(CHECK_POLICY_V1, new_policy, clear=True):
+                self.assertIn("shafts.fixed-boundary", required_checks(definition))
+                self.assertNotEqual(source.policy_sha256, check_policy_digest())
+                for stage in ("mjcf", "publish"):
+                    with self.subTest(stage=stage), self.assertRaises(ApplicationError) as rejected:
+                        factory.admit_stage_rerun(application, request(stage, source.run_id))
+                    self.assertEqual("verify", rejected.exception.detail["earliest_stage"])
+                chain = source.run_id
+                for stage in ("verify", "mjcf", "publish"):
+                    admitted = factory.admit_stage_rerun(application, request(stage, chain))
+                    spec = AdmissionSpec.from_record(admitted.admission.request)
+                    self.assertEqual(source.configuration, spec.configuration)
+                    self.assertEqual(source.platform_config_sha256, spec.platform_config_sha256)
+                    self.assertEqual(check_policy_digest(), spec.policy_sha256)
+                    executed = self._execute_rerun_child(work, admitted, stage, policy=new_policy)
+                    self.assertEqual("completed", executed["result"]["outcome"], executed)
+                    for prefix in ("freeze", "discover", "capture", "generate"):
+                        self.assertEqual(source.run_id, executed["projection"]["stages"][
+                            ("freeze", "discover", "capture", "generate").index(prefix)
+                        ]["reuse"]["source_run"])
+                    if stage == "publish":
+                        self.assertNotEqual(source.publish_intent.repository.expected_base_oid,
+                                            spec.publish_intent.repository.expected_base_oid)
+                        self.assertEqual("Current Publisher", spec.publish_intent.commit.author_name)
+                        self.assertTrue(executed["projection"]["delivery_complete"])
+                    chain = admitted.admission.run_id
+            with self._connect() as connection, connection.cursor() as cursor:
+                cursor.execute("SELECT stage, result_digest FROM stage_decision WHERE run_id = %s ORDER BY stage",
+                               (source.run_id,))
+                self.assertEqual(source_decisions, cursor.fetchall())
+            current_prefix = application._read_source_prefix(source, 4, frozenset())[0]
+            for stage in current_prefix:
+                self.assertEqual(old_prefix[stage].result.output_artifact, current_prefix[stage].result.output_artifact)
+
+            factory.native_tool_provider = lambda: copy.deepcopy(self.native)
+            pending = factory.admit_stage_rerun(application, request("discover", source.run_id))
+            with self.assertRaises(FactConflict):
+                factory.admit_stage_rerun(application, request("discover", pending.admission.run_id))
+            available = factory.admit_stage_rerun(application, request("freeze", pending.admission.run_id))
+            self.assertEqual("completed", self._execute_rerun_child(work, available, "freeze")["result"]["outcome"])
+            finished = factory.admit_stage_rerun(application, request("publish", source.run_id))
+            finished_result = self._execute_rerun_child(work, finished, "publish")
+            self.assertEqual("completed", finished_result["result"]["outcome"], finished_result)
+            publication_request = request("publish", source.run_id)
+            publication = factory.admit_stage_rerun(application, publication_request)
+            from description_pipeline.pipeline.admission import build_publish_command
+
+            verified = application._verified_verify_result(old_prefix["verify"])
+            parent_publish = build_publish_command(source, verified, source.publish_intent, old_prefix["mjcf"])
+            self.facts.create_command(
+                parent_publish, admission=source_outcome.admission, predecessor=old_prefix["mjcf"],
+                supporting_predecessors=(old_prefix["verify"],), verify_result=verified,
+                publish_intent=source.publish_intent,
+            )
+            # Immutable admission reads remain available; execution rechecks live source effects.
+            self.assertEqual(publication, factory.admit_stage_rerun(application, publication_request))
+            self.assertEqual(publication, application.admit(AdmissionSpec.from_record(publication.admission.request)))
+            self.assertEqual("completed", application.run_stage(finished.admission.run_id, "publish").outcome)
+            with self.assertRaises(FactConflict):
+                application.run_stage(publication.admission.run_id, "publish")
+            with self.assertRaises(FactConflict):
+                application.execute_registered_command(publication.entry_command.command_id)
+
+    def test_unsupported_generate_source_and_wrong_capture_pair_identify_recompute_stage(self) -> None:
+        from description_pipeline.pipeline.application import ApplicationError
+        from description_pipeline.pipeline.contracts import StageCommand
+        from description_pipeline.pipeline.generate_contract import GENERATE_OUTPUT_CONTRACT
+        from description_pipeline.pipeline.verify_contract import OUTPUT_CONTRACT, REQUEST_SCHEMA
+        from description_pipeline.io import inventory
+        from description_pipeline.schemas import GENERATE_REQUEST_SCHEMA, NATIVE_CAPTURE_FACTS
+        from tests.v1.stage_rerun_child import FixtureDispatch
+
+        work = self.root / "unsupported-reruns"
+        work.mkdir()
+        application = self._application()
+        factory = ProductionAdmissionFactory(
+            artifacts=self.store, platform_snapshot=self._platform_snapshot(),
+            native_tool_provider=lambda: copy.deepcopy(self.native),
+            portable_tool_provider=lambda: copy.deepcopy(self.portable), work_root=work,
+            clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
+        )
+        with ExitStack() as stack:
+            for target, tool in (
+                ("description_pipeline.runtime.tool_record", self.native),
+                ("description_pipeline.pipeline.stages.generate.tool_record", self.portable),
+            ):
+                stack.enter_context(patch(target, return_value=copy.deepcopy(tool)))
+            source = factory.prepare(self._production_request()).spec
+            admitted = application.admit(source)
+            application.dispatch(admitted.dispatch_command.command_id, FixtureDispatch())
+            # The original producer supports this receipt; the current consumer does not.
+            with patch("description_pipeline.pipeline.stages.generate.GENERATE_RESULT_SCHEMA", "fixture-generated/v0"):
+                self.assertEqual("completed", application.execute_run(source.run_id, through="generate").outcome)
+            original_command = self.facts.load_stage_command(source.run_id, "generate")
+            original_decision = self.facts.decision_for(original_command)
+
+            def forbidden_native():
+                raise AssertionError("Offline input qualification contacted the native endpoint")
+
+            factory.native_tool_provider = forbidden_native
+            verification = ProductionStageRerunRequest(
+                run_id=str(uuid.uuid4()), request_id="unsupported-verify", parent_run_id=source.run_id,
+                principal=source.principal, change_summary="Reject an unsupported sealed receipt", from_stage="verify",
+            )
+            with self.assertRaises(ApplicationError) as rejected:
+                factory.admit_stage_rerun(application, verification)
+            self.assertEqual("generate", rejected.exception.detail["earliest_stage"])
+            self.assertIsNone(self.facts.load_admission(verification.run_id))
+            repaired = factory.admit_stage_rerun(
+                application, replace(verification, run_id=str(uuid.uuid4()), request_id="supported-generate",
+                                     from_stage="generate", through_stage="generate"),
+            )
+            executed = self._execute_rerun_child(work, repaired, "generate")
+            self.assertEqual("completed", executed["result"]["outcome"], executed)
+            self.assertEqual(original_decision, self.facts.decision_for(original_command))
+            spec = AdmissionSpec.from_record(repaired.admission.request)
+            prefix = application._read_source_prefix(spec, 4, frozenset())[0]
+            capture_ref = prefix["capture"].result.output_artifact
+            with tempfile.TemporaryDirectory(prefix="different-capture-") as temporary:
+                root = self.store.materialize(capture_ref, Path(temporary) / "capture")
+                (root / "manifest.json").unlink()
+                different = self.store.seal_tree(
+                    root, kind=capture_ref.kind, producer_run_id=str(uuid.uuid4()), producer_stage="capture",
+                    producer_tool_sha256=capture_ref.producer_tool_sha256,
+                )
+            generate_ref = prefix["generate"].result.output_artifact
+            wrong_pair = StageCommand.create(
+                command_id="wrong-subject-verify", run_id="wrong-subject-run", stage="verify",
+                idempotency_key="wrong-subject-verify",
+                request={
+                    "schema_version": REQUEST_SCHEMA,
+                    "output_contract": OUTPUT_CONTRACT,
+                    "capture_artifact_id": different.artifact_id,
+                    "generate_artifact_id": generate_ref.artifact_id,
+                    "purpose": source.purpose,
+                },
+                input_artifacts=(generate_ref, different), config_snapshot_sha256=source.platform_config_sha256,
+                contract_sha256=source.contract_sha256, policy_sha256=source.policy_sha256,
+                expected_executor_sha256=self.portable["source_sha256"], predecessor_decision_id=None,
+            )
+            with self.assertRaises(ApplicationError) as wrong:
+                application._validate_entry_inputs(wrong_pair)
+            self.assertEqual("generate", wrong.exception.detail["earliest_stage"])
+            with tempfile.TemporaryDirectory(prefix="unsupported-capture-") as temporary:
+                root = self.store.materialize(capture_ref, Path(temporary) / "capture")
+                (root / "manifest.json").unlink()
+                evidence = root / "evidence"
+                raw = read_data(evidence / NATIVE_CAPTURE_FACTS)
+                raw["schema_version"] = "fixture-native-observation/v0"
+                write_json(evidence / NATIVE_CAPTURE_FACTS, raw)
+                manifest = read_data(evidence / "manifest.json")
+                manifest["files"] = inventory(evidence, exclude=("manifest.json",))
+                write_json(evidence / "manifest.json", manifest)
+                unsupported = self.store.seal_tree(
+                    root, kind=capture_ref.kind, producer_run_id=str(uuid.uuid4()), producer_stage="capture",
+                    producer_tool_sha256=capture_ref.producer_tool_sha256,
+                )
+            wrong_capture = StageCommand.create(
+                command_id="unsupported-capture-generate", run_id="unsupported-capture-run", stage="generate",
+                idempotency_key="unsupported-capture-generate",
+                request={"schema_version": GENERATE_REQUEST_SCHEMA, "output_contract": GENERATE_OUTPUT_CONTRACT,
+                         "capture_artifact_id": unsupported.artifact_id},
+                input_artifacts=(unsupported,), config_snapshot_sha256=source.platform_config_sha256,
+                contract_sha256=source.contract_sha256, policy_sha256=source.policy_sha256,
+                expected_executor_sha256=self.portable["source_sha256"], predecessor_decision_id=None,
+            )
+            with self.assertRaises(ApplicationError) as incompatible:
+                application._validate_entry_inputs(wrong_capture)
+            self.assertEqual("capture", incompatible.exception.detail["earliest_stage"])
+
+    def test_chained_native_and_publication_claims_use_one_ancestor_lock_order(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+        from description_pipeline.pipeline.admission import build_publish_command
+        from tests.v1.stage_rerun_child import FixtureDispatch
+
+        work = self.root / "concurrent-reruns"
+        work.mkdir()
+        application = self._application()
+        factory = ProductionAdmissionFactory(
+            artifacts=self.store, platform_snapshot=self._platform_snapshot(),
+            native_tool_provider=lambda: copy.deepcopy(self.native),
+            portable_tool_provider=lambda: copy.deepcopy(self.portable), work_root=work,
+            clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
+        )
+        with ExitStack() as stack:
+            for target, tool in (
+                ("description_pipeline.runtime.tool_record", self.native),
+                ("description_pipeline.pipeline.stages.generate.tool_record", self.portable),
+                ("description_pipeline.pipeline.stages.publish.tool_record", self.portable),
+            ):
+                stack.enter_context(patch(target, return_value=copy.deepcopy(tool)))
+            source = factory.prepare(self._production_request()).spec
+            original = application.admit(source)
+            application.dispatch(original.dispatch_command.command_id, FixtureDispatch())
+            self.assertEqual("completed", application.execute_run(source.run_id).outcome)
+            middle = factory.admit_stage_rerun(
+                application, ProductionStageRerunRequest(
+                    run_id=str(uuid.uuid4()), request_id="concurrent-middle", parent_run_id=source.run_id,
+                    principal=source.principal, change_summary="Recompute offline stages",
+                    from_stage="generate", through_stage="publish",
+                ),
+            )
+            application.dispatch(middle.dispatch_command.command_id, FixtureDispatch())
+            self.assertEqual("completed", application.execute_run(middle.admission.run_id, through="mjcf").outcome)
+            spec = AdmissionSpec.from_record(middle.admission.request)
+            prefix, _discovered, verified = application._read_source_prefix(spec, 6, frozenset())
+            publisher = build_publish_command(spec, verified, spec.publish_intent, prefix["mjcf"])
+            self.facts.create_command(
+                publisher, admission=middle.admission, predecessor=prefix["mjcf"],
+                supporting_predecessors=(prefix["verify"],), verify_result=verified, publish_intent=spec.publish_intent,
+            )
+            child = factory.admit_stage_rerun(
+                application, ProductionStageRerunRequest(
+                    run_id=str(uuid.uuid4()), request_id="concurrent-discover", parent_run_id=spec.run_id,
+                    principal=source.principal, change_summary="Recompute native discovery", from_stage="discover",
+                ),
+            )
+            application.dispatch(child.dispatch_command.command_id, FixtureDispatch())
+            commands = {"publish": publisher, "discover": child.entry_command}
+            stores = {name: FactStore(self._connect, self.store) for name in commands}
+            orders = {name: [] for name in commands}
+            start = threading.Barrier(2)
+            for name, store in stores.items():
+                original_lock = store._lock_run_cursor
+
+                def record_lock(cursor, run_id, *, name=name, original_lock=original_lock):
+                    original_lock(cursor, run_id)
+                    orders[name].append(run_id)
+
+                stack.enter_context(patch.object(store, "_lock_run_cursor", side_effect=record_lock))
+
+            def acquire(name):
+                command = commands[name]
+                start.wait(timeout=10)
+                return stores[name].acquire_claim(
+                    command.command_id, claim_id="concurrent-" + name,
+                    owner_sha256=digest({"owner": name}), executor_sha256=command.expected_executor_sha256,
+                    now=datetime(2026, 10, 25, tzinfo=UTC),
+                    expires_at=datetime(2026, 10, 25, tzinfo=UTC) + timedelta(minutes=5),
+                )
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = {name: pool.submit(acquire, name) for name in commands}
+                claims = {name: future.result(timeout=15) for name, future in futures.items()}
+            for name, claim in claims.items():
+                self.assertEqual(commands[name].command_id, claim.command_id)
+                expected = [source.run_id, spec.run_id]
+                if name == "discover":
+                    expected.append(child.admission.run_id)
+                self.assertEqual(expected, list(dict.fromkeys(orders[name])), orders)
+
+    def test_recovery_qualifies_only_the_required_source_prefix(self) -> None:
+        from description_pipeline.orchestration.airflow_client import native_run_id
+        from description_pipeline.orchestration.run_ownership import recorded_canonical_projection
+        from tests.v1.stage_rerun_child import FixtureDispatch
+
+        work = self.root / "recovery-prefix"
+        work.mkdir()
+        application = self._application()
+        factory = ProductionAdmissionFactory(
+            artifacts=self.store, platform_snapshot=self._platform_snapshot(),
+            native_tool_provider=lambda: copy.deepcopy(self.native),
+            portable_tool_provider=lambda: copy.deepcopy(self.portable), work_root=work,
+            clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
+        )
+        with ExitStack() as stack:
+            for target, tool in (
+                ("description_pipeline.runtime.tool_record", self.native),
+                ("description_pipeline.pipeline.stages.generate.tool_record", self.portable),
+                ("description_pipeline.pipeline.stages.publish.tool_record", self.portable),
+            ):
+                stack.enter_context(patch(target, return_value=copy.deepcopy(tool)))
+            source = factory.prepare(self._production_request()).spec
+            original = application.admit(source)
+            application.dispatch(original.dispatch_command.command_id, FixtureDispatch())
+            self.assertEqual("completed", application.execute_run(source.run_id).outcome)
+            dag_run_id = "recover-generate-" + uuid.uuid4().hex
+            child = factory.admit_stage_rerun(
+                application, ProductionStageRerunRequest(
+                    run_id=native_run_id(dag_run_id), request_id=dag_run_id, parent_run_id=source.run_id,
+                    principal=source.principal, change_summary="Recover only the required prefix",
+                    from_stage="generate",
+                ),
+            )
+            stack.enter_context(patch.dict(os.environ, {
+                "PLATFORM_OPERATOR_DSN": self.server.get_uri(), "PLATFORM_ARTIFACT_ROOT": str(self.store.root),
+            }))
+            real_connect = psycopg2.connect
+
+            def isolated_connect(dsn, **options):
+                options["options"] = options.get("options", "") + f" -c search_path={self.schema},public"
+                return real_connect(dsn, **options)
+
+            stack.enter_context(patch("psycopg2.connect", side_effect=isolated_connect))
+            self.assertIsNotNone(recorded_canonical_projection("solidworks_to_urdf", dag_run_id))
+            for stage, allowed in (("publish", True), ("capture", False)):
+                command = self.facts.load_stage_command(source.run_id, stage)
+                result = self.facts.load_result(self.facts.decision_for(command))
+                artifact = self.store.objects / result.output_artifact.artifact_id
+                saved = work / ("preserved-" + stage)
+                artifact.rename(saved)
+                try:
+                    recovered = recorded_canonical_projection("solidworks_to_urdf", dag_run_id)
+                    self.assertEqual(allowed, recovered is not None, stage)
+                    if allowed:
+                        self.assertEqual(child, application.load_admission_outcome(child.admission.run_id))
+                finally:
+                    saved.rename(artifact)
+            self.assertIsNotNone(recorded_canonical_projection("solidworks_to_urdf", dag_run_id))
 
     def _assert_published_change_summary(self, spec: AdmissionSpec, summary: str) -> None:
         branch = spec.publish_intent.repository.branch_ref
@@ -997,8 +1818,7 @@ class RealSixStageChainTests(unittest.TestCase):
             operation_ids = [
                 str(row[0])
                 for row in connection.execute(
-                    "SELECT operation_id FROM native_operation "
-                    "ORDER BY created_at, operation_id"
+                    "SELECT operation_id FROM native_operation ORDER BY created_at, operation_id"
                 ).fetchall()
             ]
         operations = [client.get_operation(operation_id) for operation_id in operation_ids]
@@ -1035,9 +1855,7 @@ class RealSixStageChainTests(unittest.TestCase):
                 return_value=copy.deepcopy(self.portable),
             ),
         ):
-            parent = load_production_admission(
-                parent_application,
-                parent_request,
+            parent_factory = ProductionAdmissionFactory(
                 artifacts=self.store,
                 platform_snapshot=parent_snapshot,
                 native_tool_provider=lambda: copy.deepcopy(self.native),
@@ -1045,10 +1863,13 @@ class RealSixStageChainTests(unittest.TestCase):
                 clock=lambda: datetime(2026, 10, 25, tzinfo=UTC),
                 portable_tool_provider=lambda: copy.deepcopy(self.portable),
             )
-            freeze = parent_application.execute_registered_command(
-                parent.entry_command.command_id
-            )
+            parent = parent_application.admit(parent_factory.prepare(parent_request).spec)
+            from tests.v1.stage_rerun_child import FixtureDispatch
+
+            parent_application.dispatch(parent.dispatch_command.command_id, FixtureDispatch())
+            freeze = parent_application.execute_registered_command(parent.entry_command.command_id)
         self.assertEqual(freeze.outcome, "completed")
+        self.assertEqual("incomplete", self.facts.get_admitted_run(parent.admission.run_id).state)
         parent_spec = AdmissionSpec.from_record(parent.admission.request)
         parent_executor = parent_spec.executors.freeze
 
@@ -1081,15 +1902,14 @@ class RealSixStageChainTests(unittest.TestCase):
             parent_executor,
         )
 
-        successor = ProductionFreezeSuccessorRequest(
+        successor = ProductionStageRerunRequest(
+            from_stage="freeze", through_stage="publish",
             run_id=SUCCESSOR_RUN_ID,
             request_id="real-six-stage-successor-request",
             parent_run_id=RUN_ID,
             main_assembly=MAIN_ASSEMBLY,
-            target_hardware="nd_fixture",
-            purpose="engineering",
             change_summary="Reuse sealed CAD bytes under current production inputs\nReview this successor separately",
-            principal="cli:tenant:ou_successor",
+            principal=parent_spec.principal,
         )
         successor_work = self.root / "successor-factory-work"
         successor_work.mkdir()
@@ -1108,7 +1928,7 @@ class RealSixStageChainTests(unittest.TestCase):
                 return_value=copy.deepcopy(self.portable),
             ),
         ):
-            child = load_production_freeze_successor(
+            child = load_production_stage_rerun(
                 application,
                 successor,
                 artifacts=self.store,

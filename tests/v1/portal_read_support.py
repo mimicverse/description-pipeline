@@ -19,7 +19,7 @@ from description_pipeline.interface_records import (
     CHECK_POLICY_SCHEMA,
     check_policy_digest,
 )
-from description_pipeline.pipeline.contracts import ArtifactRef
+from description_pipeline.pipeline.contracts import ArtifactRef, StageCommand
 from description_pipeline.pipeline.verify import (
     VerifyDomainRequest,
     _ArtifactInput,
@@ -35,7 +35,7 @@ from description_pipeline.runtime import tool_record
 from description_pipeline.schemas import (
     TOOL_SCHEMA,
 )
-from description_pipeline.stages import CONTRACT, CONTRACT_SHA256, STAGE_IDS, stage_view
+from description_pipeline.stages import CONTRACT, CONTRACT_SHA256, CONTRACT_FILE_SHA256, STAGE_IDS, stage_view
 
 from .protocol_support import native_discovery_record, protocol_events
 from .source_record_support import source_record
@@ -44,11 +44,84 @@ from .source_record_support import source_record
 def registered_check_fixture(run_id: str, stage: str) -> tuple[dict, dict]:
     """Declare a read-port fixture's check record, without claiming a domain execution."""
 
-    command = {"command_id": f"fixture:{run_id}:{stage}",
-               "request_digest": digest({"fixture_run": run_id, "stage": stage}), "input_artifacts": []}
+    command = registered_command_fixture(run_id, stage)
     checks = {"command_id": command["command_id"], "request_digest": command["request_digest"],
               "checks": [{"id": "fixture.recorded_boundary", "state": "passed", "details": {}}]}
     return command, checks
+
+
+def registered_command_fixture(run_id, stage, *, request=None, inputs=(), contract="f" * 64, policy="1" * 64):
+    """A complete immutable command for the synthetic registered read port."""
+    return StageCommand.create(
+        command_id=f"fixture:{run_id}:{stage}", run_id=run_id, stage=stage,
+        idempotency_key=f"fixture:{run_id}:{stage}",
+        request={"fixture_run": run_id, "stage": stage} if request is None else request,
+        input_artifacts=tuple(ArtifactRef.from_record(ref) for ref in inputs),
+        config_snapshot_sha256="e" * 64, contract_sha256=contract, policy_sha256=policy,
+        expected_executor_sha256=digest({"tool": stage}), predecessor_decision_id=None,
+    ).to_record()
+
+
+def native_tool_fixture():
+    """Synthetic released native metadata; no installed or historical tool is executed."""
+    files = {"stage-contract.json": CONTRACT_FILE_SHA256, "runtime.py": digest({"fixture": "native"})}
+    source = digest(files)
+    return {
+        "schema_version": TOOL_SCHEMA, "pipeline_id": PIPELINE_ID, "version": "fixture-native",
+        "source_sha256": source, "runtime": {"role": "native"},
+        "release": {"source_sha256": source, "package_files": files, "contract": {"stage": CONTRACT_SHA256}},
+    }
+
+
+def bind_source_commands_fixture(projection, objects):
+    """Supply source commands absent from the former minimal read fixtures."""
+    rows = projection["stages"]
+    rows = list(rows.values()) if isinstance(rows, dict) else rows
+    by_stage = projection["by_stage"]
+    purpose = projection.get("purpose") or "engineering"
+    for row in rows:
+        stage = row["stage"]
+        members = by_stage.get(stage) or {}
+        if not members or stage not in {"capture", "generate", "verify"}:
+            continue
+        artifact = next(iter(members.values()))["artifact"]
+        run_id = artifact["producer_run_id"]
+        inputs = []
+        request = {}
+        contract = "f" * 64
+        if stage == "capture":
+            content = objects[artifact["artifact_id"]]["reports/native-tool.json"]
+            native = json.loads(content)
+            requirement = ArtifactRef(
+                artifact_id="fixture-native-requirement:" + digest(native), kind="native_tool_requirement",
+                locator="cas://artifact/fixture-native-requirement:" + digest(native),
+                manifest_sha256=digest({"native_manifest": native}), set_sha256=digest({"native_set": native}),
+                producer_run_id=None, producer_stage=None, producer_tool_sha256=native["source_sha256"],
+            ).to_record()
+            inputs = [requirement]
+            request = {
+                "native_tool_record_sha256": digest(native), "native_tool_source_sha256": native["source_sha256"],
+                "native_tool_requirement_artifact_id": requirement["artifact_id"],
+            }
+            contract = native["release"]["contract"]["stage"]
+        elif stage == "generate":
+            capture = next(iter(by_stage["capture"].values()))["artifact"]
+            inputs = [capture]
+            request = {"capture_artifact_id": capture["artifact_id"]}
+        else:
+            inputs = [next(iter(by_stage[name].values()))["artifact"] for name in ("generate", "capture")]
+            request = {
+                "generate_artifact_id": inputs[0]["artifact_id"], "capture_artifact_id": inputs[1]["artifact_id"],
+                "purpose": purpose,
+            }
+        row["command"] = registered_command_fixture(run_id, stage, request=request, inputs=inputs, contract=contract)
+        if run_id != projection["run_id"] and not row.get("reuse"):
+            source = dict(row)
+            row.update(
+                state="reused", source=source, formal_eligible=False,
+                reuse={"reused": True, "source_run": run_id, "source_command_id": source["command"]["command_id"]},
+            )
+    return projection
 
 
 def registered_certificate_fixture(
@@ -59,6 +132,8 @@ def registered_certificate_fixture(
     capture_files: dict[str, bytes],
     report: dict,
     purpose: str = "engineering",
+    contract_sha256: str = "f" * 64,
+    policy_sha256: str = "1" * 64,
 ) -> dict:
     """Use the production certificate writer over one synthetic registered pair.
 
@@ -88,8 +163,8 @@ def registered_certificate_fixture(
         capture_artifact=ArtifactRef.from_record(capture),
         expected_verifier_sha256=verifier["source_sha256"],
         config_snapshot_sha256="e" * 64,
-        contract_sha256="f" * 64,
-        policy_sha256="1" * 64,
+        contract_sha256=contract_sha256,
+        policy_sha256=policy_sha256,
         purpose=purpose,
     )
     with tempfile.TemporaryDirectory(prefix="registered-certificate-fixture-") as directory:
@@ -225,13 +300,7 @@ def build_sealed_delivery(
     )
     write_json(
         root / "reports" / "native-tool.json",
-        {
-            "schema_version": TOOL_SCHEMA,
-            "pipeline_id": PIPELINE_ID,
-            "version": "1.4.0",
-            "source_sha256": "a" * 64,
-            "runtime": {"role": "native"},
-        },
+        native_tool_fixture(),
     )
     native_events = protocol_events(stages=("freeze", "discover", "capture"))
     native_stages = stage_view(
@@ -569,6 +638,8 @@ class RegisteredPlatform:
         *,
         hardware_id: str = "robot",
         revision: str = "r1",
+        handoff_warnings: list[dict] | None = None,
+        discovery_findings: list[dict] | None = None,
     ) -> Path:
         capture = self.tree(run_id, "capture")
         registered = self.facts.stage_records(run_id).get("capture") or {}
@@ -585,6 +656,13 @@ class RegisteredPlatform:
                 run_id=run_id,
             )
         )
+        for relative, field, values in (
+            ("input/handoff.json", "warnings", handoff_warnings),
+            ("input/discovery/native-discovery.json", "findings", discovery_findings),
+        ):
+            if values is not None:
+                record = read_data(capture / relative)
+                write_json(capture / relative, {**record, field: values})
         artifacts = []
         for path in capture.rglob("*"):
             if not path.is_file():
@@ -676,12 +754,15 @@ class RegisteredPlatform:
                 selected["prepared/discovery/native-discovery.json"] = json.dumps(
                     native_discovery_record(source_run),
                 ).encode()
+            if stage == "generate" and selected:
+                selected = self._bind_projection_generate(selected, by_stage.get("capture"))
             if stage == "verify" and selected:
                 selected = self._bind_projection_verify(
                     run_id,
                     selected,
                     receipt,
                     by_stage.get("capture"),
+                    by_stage.get("generate"),
                 )
                 receipt = {**receipt, "checks_sha256": digest(json.loads(selected["verification-certificate.json"]))}
                 if not by_stage.get("generate") and any(
@@ -789,7 +870,7 @@ class RegisteredPlatform:
         for event in self.world.events.get(run_id, ()):
             if isinstance(event, dict):
                 events.append(dict(event))
-        return {
+        return bind_source_commands_fixture({
             "run_id": run_id,
             "request_id": record.get("request_id"),
             "parent_run_id": record.get("parent_run_id"),
@@ -816,7 +897,7 @@ class RegisteredPlatform:
                 "claims": [],
                 "effects": [],
             },
-        }
+        }, self.projection_artifacts.objects)
 
     def _stage_tree(
         self,
@@ -833,12 +914,37 @@ class RegisteredPlatform:
             f"store://sealed/{source_run}/{source_stage}"
         )
 
+    def _projection_source(self, members: dict | None, stage: str) -> tuple[dict | None, dict[str, bytes]]:
+        source = None
+        for member in (members or {}).values():
+            candidate = ArtifactRef.from_record(member["artifact"]).to_record()
+            if source is not None and candidate != source:
+                raise AssertionError(f"{stage} fixture spans multiple artifacts")
+            source = candidate
+        return source, self.projection_artifacts.objects[source["artifact_id"]] if source else {}
+
+    def _bind_projection_generate(self, files: dict[str, bytes], capture_members: dict | None) -> dict[str, bytes]:
+        capture, _capture_files = self._projection_source(capture_members, "capture")
+        if capture is None:
+            raise AssertionError("Generate fixture has no registered Capture source")
+        files.setdefault("tool.json", b'{"fixture":"generate-tool"}\n')
+        generate_executor_sha256 = digest({"tool": "generate"})
+        files.setdefault("reports/generate.json", json.dumps({
+            "capture_artifact": capture,
+            "config_snapshot_sha256": "e" * 64,
+            "contract_sha256": "f" * 64,
+            "actual_executor_sha256": generate_executor_sha256,
+            "required_executor_sha256": generate_executor_sha256,
+        }, sort_keys=True).encode("utf-8") + b"\n")
+        return files
+
     def _bind_projection_verify(
         self,
         run_id: str,
         files: dict[str, bytes],
         receipt: dict,
         capture_members: dict | None,
+        generate_members: dict | None,
     ) -> dict[str, bytes]:
         generate_files = {
             path: data
@@ -852,32 +958,9 @@ class RegisteredPlatform:
             for path, data in files.items()
             if path.startswith(("input/", "evidence/"))
         }
-        capture = None
-        capture_object_id = None
-        for member in (capture_members or {}).values():
-            if not isinstance(member, dict) or not isinstance(
-                member.get("artifact"),
-                dict,
-            ):
-                continue
-            candidate = ArtifactRef.from_record(
-                member["artifact"]
-            ).to_record()
-            if capture is not None and candidate != capture:
-                raise AssertionError(
-                    "capture fixture spans multiple artifacts"
-                )
-            capture = candidate
-            capture_object_id = capture["artifact_id"]
-        if capture_object_id is not None:
-            registered_capture = self.projection_artifacts.objects[
-                capture_object_id
-            ]
-            capture_files = {
-                path: data
-                for path, data in registered_capture.items()
-                if path.startswith(("input/", "evidence/"))
-            }
+        capture, registered_capture = self._projection_source(capture_members, "capture")
+        if capture is not None:
+            capture_files = registered_capture
         if not capture_files:
             capture_files["input/handoff.json"] = b"{}\n"
         if capture is None:
@@ -886,30 +969,19 @@ class RegisteredPlatform:
                 stage="capture",
                 files=capture_files,
             )
-        generate_files.setdefault("tool.json", b'{"fixture":"generate-tool"}\n')
-        config_snapshot_sha256 = "e" * 64
-        contract_sha256 = "f" * 64
-        generate_executor_sha256 = digest({"tool": "generate"})
-        generate_receipt = {
-            "capture_artifact": capture,
-            "config_snapshot_sha256": config_snapshot_sha256,
-            "contract_sha256": contract_sha256,
-            "actual_executor_sha256": generate_executor_sha256,
-            "required_executor_sha256": generate_executor_sha256,
-        }
-        generate_receipt_bytes = (
-            json.dumps(generate_receipt, sort_keys=True).encode("utf-8")
-            + b"\n"
-        )
-        generate_files["reports/generate.json"] = (
-            generate_receipt_bytes
-        )
-        files.update(generate_files)
-        generate = self.projection_artifacts.register(
-            run_id=run_id,
-            stage="generate",
-            files=generate_files,
-        )
+        generate, registered_generate = self._projection_source(generate_members, "generate")
+        if generate is not None:
+            generate_files = registered_generate
+        else:
+            generate_files = self._bind_projection_generate(
+                generate_files, {"source": {"artifact": capture}},
+            )
+            files.update(generate_files)
+            generate = self.projection_artifacts.register(
+                run_id=run_id,
+                stage="generate",
+                files=generate_files,
+            )
         quality = {}
         try:
             parsed = json.loads(files.get("verification-certificate.json", b"{}"))

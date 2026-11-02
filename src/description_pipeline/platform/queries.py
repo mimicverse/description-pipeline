@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from ..stages import STAGE_IDS, execution_stage_ids
@@ -55,6 +55,7 @@ def _run_state(
     diagnostic_target: str | None = None,
     expired_claim: bool = False,
     from_stage: str | None = None,
+    through_stage: str | None = None,
     technical_effect_states: tuple[str, ...] = (),
     technical_pending_states: tuple[str, ...] = (),
 ) -> str:
@@ -110,6 +111,7 @@ def _run_state(
     projected = project_run_status(
         stage_outcomes=outcomes,
         from_stage=from_stage,
+        through_stage=through_stage,
         effect_states=effect_states,
         pending_effect_states=pending_effect_states,
         expired_claim=expired_claim,
@@ -288,11 +290,15 @@ def read_run_projection(
     run_id: str,
     *,
     artifacts: ArtifactStore | None = None,
+    _source_seen: frozenset[str] = frozenset(),
+    _qualified_stages: tuple[str, ...] = STAGE_IDS,
 ) -> dict[str, Any]:
     """Read one run from immutable admission, command and decision facts."""
 
     if not isinstance(run_id, str) or not run_id:
         raise PipelineError("A run id is required")
+    if run_id in _source_seen:
+        raise PipelineError("The source admission ancestry is cyclic")
     cursor = connection.cursor()
     try:
         cursor.execute(
@@ -408,7 +414,7 @@ def read_run_projection(
                 "actual_executor_sha256": row[6],
                 "reason_code": row[7],
                 "failure_envelope": row[8],
-                "decided_at": row[9].isoformat() if isinstance(row[9], datetime) else row[9],
+                "decided_at": row[9].astimezone(UTC).isoformat() if isinstance(row[9], datetime) else row[9],
             }
             for row in cursor.fetchall()
         }
@@ -459,9 +465,9 @@ def read_run_projection(
                 "dag_run_id": row[7],
                 "task_id": row[8],
                 "map_index": row[9],
-                "issued_at": row[10].isoformat() if isinstance(row[10], datetime) else row[10],
-                "expires_at": row[11].isoformat() if isinstance(row[11], datetime) else row[11],
-                "closed_at": row[12].isoformat() if isinstance(row[12], datetime) else row[12],
+                "issued_at": row[10].astimezone(UTC).isoformat() if isinstance(row[10], datetime) else row[10],
+                "expires_at": row[11].astimezone(UTC).isoformat() if isinstance(row[11], datetime) else row[11],
+                "closed_at": row[12].astimezone(UTC).isoformat() if isinstance(row[12], datetime) else row[12],
                 "closure_code": row[13],
                 "yield_effect_id": row[14],
             }
@@ -567,8 +573,13 @@ def read_run_projection(
         ):
             raise PipelineError("The diagnostic run does not carry one scoped target command")
 
-    execution_scope = ((diagnostic_target,) if diagnostic_target is not None
-                       else execution_stage_ids(admission_record.from_stage))
+    execution_scope = (
+        (diagnostic_target,)
+        if diagnostic_target is not None
+        else execution_stage_ids(
+            admission_record.from_stage, through=admission_record.request.get("through_stage") or "publish"
+        )
+    )
     stage_rows: list[dict[str, Any]] = []
     by_stage: dict[str, dict[str, dict[str, Any]]] = {}
     members: dict[str, dict[str, Any]] = {}
@@ -608,7 +619,7 @@ def read_run_projection(
         result = None
         output_record = None
         qualification = None
-        if decision is not None and artifacts is not None:
+        if decision is not None and artifacts is not None and stage in _qualified_stages:
             if command_model is None:
                 raise PipelineError("A stage decision has no canonical stage command")
             result_artifact = artifact_rows.get(decision.get("result_record_artifact_id"))
@@ -664,12 +675,9 @@ def read_run_projection(
         stage_index = STAGE_IDS.index(stage)
         predecessor_completed = (
             stage_index == 0
-            or (admission_record.from_stage == "mjcf" and stage == "mjcf")
+            or (stage == (admission_record.from_stage or "freeze"))
             or diagnostic_target == stage
-            or (
-                stage_index > 0
-                and stage_rows[-1].get("state") == StageStatus.COMPLETED.value
-            )
+            or (stage_index > 0 and stage_rows[-1].get("state") == StageStatus.COMPLETED.value)
         )
         status = project_stage_status(
             decision_outcome=(
@@ -728,15 +736,16 @@ def read_run_projection(
         stage_rows,
         technical_effect_states=tuple(item["state"] for item in technical_effects),
         technical_pending_states=tuple(
-            "unknown" for item in technical_effects
+            "unknown"
+            for item in technical_effects
             if item["state"] == "unknown"
             and item["effect_id"] == (yielded_effect_by_command.get(item["command_id"]) or (None, None))[1]
         ),
         from_stage=admission_record.from_stage if diagnostic_target is None else None,
+        through_stage=admission_record.request.get("through_stage") if diagnostic_target is None else None,
         diagnostic_target=diagnostic_target,
         expired_claim=any(
-            (row.get("command") or {}).get("command_id") in expired_claim_commands
-            and row.get("decision") is None
+            (row.get("command") or {}).get("command_id") in expired_claim_commands and row.get("decision") is None
             for row in stage_rows
         ),
     )
@@ -758,10 +767,11 @@ def read_run_projection(
         "request_id": admission[0],
         "parent_run_id": admission[1],
         "from_stage": admission[2],
+        "through_stage": admission_record.request.get("through_stage") or "publish",
         "request": dict(admission[3]) if isinstance(admission[3], Mapping) else None,
         "purpose": purpose,
         "request_digest": admission[4],
-        "created_at": admission[5].isoformat() if isinstance(admission[5], datetime) else admission[5],
+        "created_at": admission[5].astimezone(UTC).isoformat() if isinstance(admission[5], datetime) else admission[5],
         "scope": run_scope,
         "formal_eligible": run_scope["formal_eligible"],
         "state": run_state,
@@ -776,54 +786,93 @@ def read_run_projection(
             "effects": effect_state_rows,
         },
     }
-    return _reused_mjcf_prefix(connection, projection, artifacts=artifacts)
-
-
-def _reused_mjcf_prefix(connection, projection, *, artifacts):
-    """Attach original evidence without creating current-run commands or decisions."""
-    if projection["from_stage"] != "mjcf":
-        return projection
-    from ..pipeline.admission import AdmissionSpec, validate_mjcf_successor
-    from ..pipeline.stages.mjcf import source_refs
-    from ..pipeline.verify_contract import CERTIFICATE_FILENAME
-
-    parent_id = projection["parent_run_id"]
-    with connection.cursor() as cursor:
-        cursor.execute("SELECT from_stage FROM run_admission WHERE run_id = %s", (parent_id,))
-        parent_entry = cursor.fetchone()
-    if parent_entry is None or parent_entry[0] not in {None, "freeze"}:
-        raise PipelineError("MJCF reuse requires one original source run")
-    parent = read_run_projection(connection, parent_id, artifacts=artifacts)
-    validate_mjcf_successor(
-        AdmissionSpec.from_record(projection["request"]), AdmissionSpec.from_record(parent["request"]),
+    return _reused_source_prefix(
+        connection, projection, artifacts=artifacts, seen=_source_seen | {run_id}, qualified_stages=_qualified_stages
     )
-    if parent["state"] not in {"succeeded", "failed", "cancelled"}:
-        raise PipelineError("The original MJCF source run has no settled terminal outcome")
+
+
+def _reused_source_prefix(connection, projection, *, artifacts, seen, qualified_stages):
+    """Project real source facts without inventing current-run decisions."""
+    from ..pipeline.admission import AdmissionSpec, validate_source_successor
+
     rows = {row["stage"]: row for row in projection["stages"]}
-    original = {row["stage"]: row for row in parent["stages"]}
-    command = StageCommand.from_record(rows["mjcf"]["command"])
-    refs = source_refs(command)
-    if command.predecessor_decision_id != original["verify"]["decision"]["decision_id"]:
-        raise PipelineError("MJCF successor names another original Verify decision")
-    if artifacts is not None:
-        for stage, ref in refs.items():
-            members = parent["by_stage"][stage]
-            if not members or any(ArtifactRef.from_record(item["artifact"]) != ref for item in members.values()):
-                raise PipelineError("MJCF successor names another original source artifact")
-        if command.request["verify_certificate_sha256"] != parent["by_stage"]["verify"][CERTIFICATE_FILENAME]["sha256"]:
-            raise PipelineError("MJCF command names another URDF verification certificate")
-    for stage in (row["stage"] for row in projection["stages"] if not row["in_scope"]):
-        row, source = rows[stage], original[stage]
-        if source["state"] != "completed" or row.get("command") is not None or row.get("decision") is not None:
-            raise PipelineError("MJCF successor carries new or incomplete upstream work")
-        row.update(
-            state="reused", source=source,
-            reuse={"reused": True, "source_run": parent_id,
-                   "source_command_id": source["command"]["command_id"],
-                   "source_result_digest": source["decision"]["result_digest"]},
+    start = STAGE_IDS.index(projection["from_stage"] or "freeze")
+    end = STAGE_IDS.index(projection["through_stage"])
+    for stage in STAGE_IDS[end + 1 :]:
+        if rows[stage].get("command") is not None or rows[stage].get("decision") is not None:
+            raise PipelineError("An out-of-scope downstream stage has current-run facts")
+        rows[stage].update(state="out_of_scope", formal_eligible=False)
+    if projection["scope"]["kind"] == "diagnostic":
+        return projection
+    if start:
+        parent_id = projection["parent_run_id"]
+        if parent_id is None:
+            raise PipelineError("The source run is missing")
+        parent = read_run_projection(
+            connection,
+            parent_id,
+            artifacts=artifacts,
+            _source_seen=seen,
+            _qualified_stages=tuple(stage for stage in STAGE_IDS[:start] if stage in qualified_stages),
         )
-        projection["by_stage"][stage] = parent["by_stage"][stage]
-        projection["members"].update(parent["by_stage"][stage])
+        validate_source_successor(
+            AdmissionSpec.from_record(projection["request"]), AdmissionSpec.from_record(parent["request"])
+        )
+        if parent["scope"]["kind"] != "formal":
+            raise PipelineError("The source run is diagnostic")
+        source_rows = {row["stage"]: row for row in parent["stages"]}
+        entry = rows[STAGE_IDS[start]].get("command")
+        for stage in STAGE_IDS[:start]:
+            row, inherited = rows[stage], source_rows[stage]
+            source = inherited.get("source") if inherited["state"] == "reused" else inherited
+            if (
+                source is None
+                or source["state"] != "completed"
+                or (artifacts is not None and stage in qualified_stages and source.get("formal_eligible") is not True)
+                or row.get("command") is not None
+                or row.get("decision") is not None
+            ):
+                raise PipelineError("The required source stage is not a qualified completed fact")
+            if entry is not None:
+                command = StageCommand.from_record(entry)
+                if (
+                    stage == STAGE_IDS[start - 1]
+                    and command.predecessor_decision_id != source["decision"]["decision_id"]
+                ):
+                    raise PipelineError("The entry command names another source decision")
+                if artifacts is not None and stage in qualified_stages:
+                    ref = ArtifactRef.from_record(source["receipt"]["result"]["output_artifact"])
+                    for actual in command.input_artifacts:
+                        if actual.producer_stage == stage and actual != ref:
+                            raise PipelineError("The entry command names another source artifact")
+            row.update(
+                state="reused",
+                source=source,
+                reuse={
+                    "reused": True,
+                    "source_run": source["command"]["run_id"],
+                    "source_command_id": source["command"]["command_id"],
+                    "source_result_digest": source["decision"]["result_digest"],
+                },
+                formal_eligible=False,
+            )
+            projection["by_stage"][stage] = parent["by_stage"][stage]
+            projection["members"].update(parent["by_stage"][stage])
+        if artifacts is not None and entry is not None and STAGE_IDS[start] in qualified_stages:
+            from ..pipeline.admission import source_context_from_projection, build_stage_command
+
+            spec = AdmissionSpec.from_record(projection["request"])
+            predecessors, discovered, verified = source_context_from_projection(spec, parent, artifacts)
+            if StageCommand.from_record(entry) != build_stage_command(
+                spec, STAGE_IDS[start], predecessors, discovered, verified
+            ):
+                raise PipelineError("The entry command differs from its exact source closure")
+    projection["delivery_complete"] = bool(
+        "publish" in projection["execution_scope"]
+        and rows["publish"]["state"] == "completed"
+        and rows["publish"].get("formal_eligible") is True
+        and projection["state"] == "succeeded"
+    )
     return projection
 
 

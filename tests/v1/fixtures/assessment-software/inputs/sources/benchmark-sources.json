@@ -1,0 +1,57 @@
+{
+  "schema": "teleop-software-benchmark-sources/1",
+  "qualification_scope": "software_regression_only",
+  "production_engineering_qualification": false,
+  "parameter_claims_are_synthetic": true,
+  "parameters": {
+    "mass_inertia": {
+      "provenance": "nominal_uncalibrated",
+      "source_kind": "synthetic_urdf_fixture",
+      "source_path": "urdf/upper_body.urdf",
+      "locator": "every /robot/link/inertial element",
+      "applies_to": [
+        "base_link",
+        "waist_link",
+        "head_link",
+        "left_upper_link",
+        "left_forearm_link",
+        "right_upper_link",
+        "right_forearm_link",
+        "benchmark_payload_link"
+      ]
+    },
+    "actuator": {
+      "provenance": "nominal_uncalibrated",
+      "source_kind": "synthetic_fixture",
+      "source_path": "sources/benchmark-sources.json",
+      "locator": "/parameters/actuator/records",
+      "records": {
+        "waist_yaw": {"gear": 1.0, "ctrlrange": [-20.0, 20.0], "forcerange": [-20.0, 20.0]},
+        "head_yaw": {"gear": 1.0, "ctrlrange": [-10.0, 10.0], "forcerange": [-10.0, 10.0]},
+        "left_shoulder_pitch": {"gear": 1.0, "ctrlrange": [-20.0, 20.0], "forcerange": [-20.0, 20.0]},
+        "left_elbow_pitch": {"gear": 1.0, "ctrlrange": [-20.0, 20.0], "forcerange": [-20.0, 20.0]},
+        "right_shoulder_pitch": {"gear": 1.0, "ctrlrange": [-20.0, 20.0], "forcerange": [-20.0, 20.0]},
+        "right_elbow_pitch": {"gear": 1.0, "ctrlrange": [-20.0, 20.0], "forcerange": [-20.0, 20.0]}
+      }
+    },
+    "joint_dynamics": {
+      "provenance": "nominal_uncalibrated",
+      "source_kind": "synthetic_fixture",
+      "source_path": "sources/benchmark-sources.json",
+      "locator": "/parameters/joint_dynamics/records",
+      "records": {
+        "waist_yaw": {"damping": 0.05, "armature": 0.002, "frictionloss": 0.01},
+        "head_yaw": {"damping": 0.02, "armature": 0.001, "frictionloss": 0.005},
+        "left_shoulder_pitch": {"damping": 0.04, "armature": 0.002, "frictionloss": 0.008},
+        "left_elbow_pitch": {"damping": 0.02, "armature": 0.001, "frictionloss": 0.004},
+        "right_shoulder_pitch": {"damping": 0.04, "armature": 0.002, "frictionloss": 0.008},
+        "right_elbow_pitch": {"damping": 0.02, "armature": 0.001, "frictionloss": 0.004}
+      }
+    }
+  },
+  "not_applicable": {
+    "contact_model": "All benchmark collision geoms are disabled; no contact or safety claim is requested.",
+    "mesh_geometry": "The benchmark uses analytic primitives; no collision/contact geometry claim is requested.",
+    "latency": "No sim-to-real or latency claim is requested."
+  }
+}

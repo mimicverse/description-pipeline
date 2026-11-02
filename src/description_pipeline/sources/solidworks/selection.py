@@ -1,9 +1,8 @@
-"""Assembly-rooted file selection, independent of transport and the CAD runtime.
+"""Bind complete admitted bytes to native object observations.
 
-The upload index is metadata, not permission to read every indexed file. Only
-the main assembly and references observed from already selected documents may
-be requested. Native adapters supply those observations; this module neither
-searches the filesystem nor guesses a stored reference's relocated path.
+The input inventory authorizes read-only access to every admitted file. The
+component graph constrains observed objects, never input retention. Stored
+reference metadata never guesses or authorizes a relocated source.
 """
 
 from __future__ import annotations
@@ -102,9 +101,9 @@ def validate_file_index(files: Mapping[str, str]) -> dict[str, str]:
 
 
 def verify_selection(
-    manifest: dict, upload_files: Mapping[str, str], selected_files: Mapping[str, str], *, reader_sha256: str
+    manifest: dict, upload_files: Mapping[str, str], staged_files: Mapping[str, str], *, reader_sha256: str
 ) -> dict:
-    """Recompute graph membership and require exact transferred file identities."""
+    """Recompute native bindings and require the complete transferred input."""
 
     if not isinstance(manifest, dict):
         raise SelectionError("selection_manifest_invalid", "Selection manifest must be an object")
@@ -116,8 +115,8 @@ def verify_selection(
         manifest.get("closure") or {},
         reader_sha256=reader_sha256,
     )
-    if validate_file_index(selected_files) != expected["files"]:
-        raise SelectionError("selection_inventory_changed", "Transferred files differ from the assembly selection")
+    if validate_file_index(staged_files) != expected["files"]:
+        raise SelectionError("selection_inventory_changed", "Transferred files differ from the complete admitted input")
     if manifest != expected:
         raise SelectionError("selection_manifest_changed", "Selection manifest differs from its recorded graph")
     return expected
@@ -126,10 +125,8 @@ def verify_selection(
 def selection_bindings(selection: object) -> dict:
     """Validate one sealed selection manifest and return its bound identities.
 
-    The full intake index is reconstructed from the selected and excluded file
-    inventories, and ``verify_selection`` re-seals the complete manifest from
-    that index.  This is the one consumer-side proof for both transfer and
-    capture; no caller accepts a partial closure carrier.
+    The manifest carries the complete admitted file inventory. Graph
+    membership is validated separately and cannot narrow native input.
     """
 
     if not isinstance(selection, Mapping):
@@ -138,30 +135,23 @@ def selection_bindings(selection: object) -> dict:
     if manifest.get("schema_version") != SELECTION_SCHEMA:
         raise PipelineError("selection manifest uses an unknown schema")
     files = manifest.get("files")
-    excluded = manifest.get("excluded_files")
     if not isinstance(files, Mapping) or not files:
-        raise PipelineError("selection manifest must carry its selected files")
-    if not isinstance(excluded, Mapping):
-        raise PipelineError("selection manifest must carry its excluded files")
-    if set(files) & set(excluded):
-        raise PipelineError("selection manifest selected and excluded files overlap")
-    upload = {**dict(excluded), **dict(files)}
-    verify_selection(manifest, upload, files, reader_sha256=manifest.get("reader_sha256"))
-    for key in ("selection_sha256", "upload_sha256", "handoff_sha256"):
+        raise PipelineError("selection manifest must carry the complete admitted input")
+    verify_selection(manifest, files, files, reader_sha256=manifest.get("reader_sha256"))
+    for key in ("selection_sha256", "upload_sha256"):
         if not isinstance(manifest.get(key), str) or _SHA.fullmatch(manifest[key]) is None:
             raise PipelineError(f"selection manifest lacks a usable {key}")
-    selected = validate_file_index(files)
+    files = validate_file_index(files)
     main = manifest.get("main_assembly")
-    if not isinstance(main, str) or not main or not main.lower().endswith(".sldasm") or main not in selected:
+    if not isinstance(main, str) or not main or not main.lower().endswith(".sldasm") or main not in files:
         raise PipelineError("selection manifest lacks its selected main assembly")
     return {
         "selection": manifest,
-        "files": selected,
+        "files": files,
         "main_assembly": main,
-        "main_assembly_sha256": selected[main],
+        "main_assembly_sha256": files[main],
         "selection_sha256": manifest["selection_sha256"],
         "upload_sha256": manifest["upload_sha256"],
-        "handoff_sha256": manifest["handoff_sha256"],
     }
 
 
@@ -193,10 +183,9 @@ def seal_closure_selection(
 ) -> dict:
     """Seal one native closure evidence block into the shared selection manifest.
 
-    The graph is the reachability proof: keys and references are canonical upload-index
-    names whose hashes equal the index, the selected set is everything reachable from the
-    main over resolved edges, and every other index entry is reported as excluded.  Stored
-    author references and further native evidence stay verbatim under ``closure``.
+    Graph keys and edges bind actual native object observations to admitted
+    bytes. Every admitted file remains available independently of reachability.
+    Retention does not prove that CAD opened or mechanically observed a file.
     """
 
     if not isinstance(reader_sha256, str) or _SHA.fullmatch(reader_sha256) is None:
@@ -789,8 +778,13 @@ def seal_closure_selection(
             "An embedded virtual component owner is not reachable from the selected main",
             paths=unreachable_virtual_owners,
         )
-    selected = {name: files[name] for name in sorted(reachable)}
-    excluded = {name: value for name, value in files.items() if name not in selected}
+    disconnected = sorted(set(checked) - reachable)
+    if disconnected:
+        raise SelectionError(
+            "selection_closure_incomplete",
+            "An observed document is not connected to the selected main",
+            paths=disconnected,
+        )
     if any(item.get("suppression_state") != 0 for item in unresolved):
         raise SelectionError(
             "selection_closure_invalid",
@@ -807,10 +801,8 @@ def seal_closure_selection(
         "reader_sha256": reader_sha256,
         "upload_sha256": digest(files),
         "main_assembly": main,
-        "files": selected,
-        "handoff_sha256": digest(selected),
+        "files": files,
         "closure": {**evidence, "main_assembly": main, "graph": checked},
-        "excluded_files": excluded,
     }
     if saved_state_incomplete:
         from .saved_state import warning_from_selection

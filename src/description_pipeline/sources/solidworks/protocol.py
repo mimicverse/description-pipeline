@@ -125,6 +125,7 @@ class CadBackend:
         require_material: bool = True,
         expected_session_sources: Mapping[str, str] | None = None,
         native_files: Mapping[str, str] | None = None,
+        expected_occurrences=None,
     ) -> dict[str, Any]:
         """Read raw scene, mass, pose, configuration and source facts in COM."""
 
@@ -143,7 +144,7 @@ class CadBackend:
     def discover_native(self, frozen_source: Path, settings: dict, *, on_activity=None) -> dict:
         """Read the raw native primitives used for CAD-only semantic discovery.
 
-        Returns the ``solidworks-to-urdf.native-discovery/v1`` raw record:
+        Returns the ``solidworks-to-urdf.native-discovery/v2`` raw record:
         identity records, the component graph, mate features with their
         entities, named datums, user-defined properties, cylinder axes and the
         per-component mass/material readings, each with the file hashes it was

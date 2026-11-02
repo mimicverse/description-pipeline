@@ -1,0 +1,50 @@
+name: Fetch fixed Teleop assets
+description: Download the model wheels bound by the current consumer contract.
+inputs:
+  token:
+    description: Read-only GitHub credential for private Teleop release assets.
+    required: true
+  destination:
+    description: Fresh directory for the two fixed model wheels.
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        MODEL_ASSET_DESTINATION: ${{ inputs.destination }}
+        GH_TOKEN: ${{ inputs.token }}
+      run: |
+        python - <<'PY'
+        import hashlib
+        import os
+        from pathlib import Path
+        import subprocess
+
+        from description_pipeline.simulation.runtime import load_runtime_contract
+
+        if not os.environ.get("GH_TOKEN", "").strip():
+            raise SystemExit("TELEOP_ASSETS_TOKEN is required to read private mimicverse/teleop release assets")
+
+        contract = load_runtime_contract(
+            Path("src/description_pipeline/simulation/teleop-runtime.json"), consumer="assessment"
+        )
+        destination = Path(os.environ["MODEL_ASSET_DESTINATION"]).resolve()
+        destination.mkdir(parents=True, exist_ok=False)
+        assets = (contract, contract["actuator_model"])
+        version = contract["dependency_versions"]["robot-teleop"]
+        command = ["gh", "release", "download", f"v{version}", "--repo", "mimicverse/teleop",
+                   "--dir", str(destination)]
+        for asset in assets:
+            command += ["--pattern", asset["wheel_filename"]]
+        subprocess.run(command, check=True)
+        if {path.name for path in destination.iterdir()} != {asset["wheel_filename"] for asset in assets}:
+            raise SystemExit("Downloaded model asset set differs from the fixed consumer contract")
+        for asset in assets:
+            wheel = destination / asset["wheel_filename"]
+            if hashlib.sha256(wheel.read_bytes()).hexdigest() != asset["wheel_sha256"]:
+                raise SystemExit(f"Downloaded model wheel differs from the fixed consumer asset: {wheel.name}")
+        with Path(os.environ["GITHUB_ENV"]).open("a") as environment:
+            environment.write(f"TELEOP_WHEEL={destination / contract['wheel_filename']}\n")
+            environment.write(f"ACTUATOR_WHEEL={destination / contract['actuator_model']['wheel_filename']}\n")
+        PY

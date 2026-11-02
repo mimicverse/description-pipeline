@@ -91,7 +91,7 @@ def _login_page(message: str, status_code: int) -> HTMLResponse:
     body = (
         '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
-        '<title>Feishu sign-in</title><link rel="stylesheet" href="/static/style.css"></head><body>'
+        '<title>Robot Model Studio</title><link rel="stylesheet" href="/static/style.css"></head><body>'
         '<main class="auth-message"><section class="card narrow">'
         '<h1>Feishu sign-in did not complete</h1>'
         f'<p class="error" role="alert">{message}</p>'

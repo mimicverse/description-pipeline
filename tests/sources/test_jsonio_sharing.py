@@ -20,6 +20,21 @@ from description_pipeline.sources.solidworks import jsonio
 
 
 class AtomicJsonSharingTests(unittest.TestCase):
+    def test_plain_json_roundtrip_with_a_valid_long_basename(self):
+        payload = {"component": "part-1", "values": [0, -0.0, 1.25], "enabled": True}
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / ("j" * 245 + ".json")
+            physical = Path(io_module._filesystem_path(path))
+            self.assertEqual(len(path.name.encode("ascii")), 250)
+            physical.write_bytes(b"ordinary destination control")
+            self.assertEqual(physical.read_bytes(), b"ordinary destination control")
+
+            io_module.write_json(path, payload)
+
+            self.assertEqual(physical.read_bytes(), io_module.canonical(payload))
+            self.assertEqual(io_module.read_data(path), payload)
+            self.assertEqual([entry.name for entry in physical.parent.iterdir()], [path.name])
+
     def test_write_retries_a_transient_sharing_violation(self):
         with TemporaryDirectory() as temporary:
             path = Path(temporary) / "job.json"
@@ -85,6 +100,25 @@ class AtomicJsonSharingTests(unittest.TestCase):
 
 
 class CompressedJsonTests(unittest.TestCase):
+    def test_gzip_json_roundtrip_with_a_valid_long_basename(self):
+        payload = {"component": "part-1", "values": [0, -0.0, 1.25], "enabled": True}
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / ("j" * 242 + ".json.gz")
+            physical = Path(io_module._filesystem_path(path))
+            ordinary = Path(temporary) / "ordinary.json.gz"
+            self.assertEqual(len(path.name.encode("ascii")), 250)
+            physical.write_bytes(b"ordinary destination control")
+            self.assertEqual(physical.read_bytes(), b"ordinary destination control")
+
+            io_module.write_json(path, payload)
+            io_module.write_json(ordinary, payload)
+
+            self.assertEqual(physical.read_bytes(), ordinary.read_bytes())
+            self.assertEqual(gzip.decompress(physical.read_bytes()), io_module.canonical(payload))
+            self.assertEqual(io_module.read_data(path), payload)
+            self.assertEqual(sorted(entry.name for entry in physical.parent.iterdir()),
+                             sorted([path.name, ordinary.name]))
+
     def test_canonical_gzip_roundtrip_is_independent_of_filename_and_time(self):
         payload = {
             "component": "\u90e8\u4ef6-1",

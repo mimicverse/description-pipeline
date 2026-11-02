@@ -2501,12 +2501,9 @@ class CaptureHandlerTests(unittest.TestCase):
             )
         )
 
-    def test_formal_capture_does_not_relax_distinct_current_requirement(self) -> None:
+    def test_formal_capture_uses_current_requirement_and_preserves_historical_producer(self) -> None:
         current_tool = self._native_tool_variant("current")
-        requirement = self._seal_native_requirement(
-            current_tool,
-            "formal-native-tool-requirement",
-        )
+        requirement = self._seal_native_requirement(current_tool, "formal-native-tool-requirement")
         request = {
             **self.command.to_record()["request"],
             "native_tool_source_sha256": current_tool["source_sha256"],
@@ -2514,28 +2511,65 @@ class CaptureHandlerTests(unittest.TestCase):
             "native_tool_requirement_artifact_id": requirement.artifact_id,
         }
         command = self._command(requirement=requirement, request=request)
-        claim = self._claim(command, "claim-formal-distinct-requirement", fence=1)
-        operation = Mock()
-        effects = self.effects(command, claim)
-
-        with self.assertRaisesRegex(Exception, "native_requirement_binding"):
-            self.handler(tool=current_tool, native_operation=operation).execute(
-                command,
-                claim,
+        claim = self._claim(command, "claim-formal-current-requirement", fence=1)
+        historical_result = self.store.objects / self.discover_ref.artifact_id / "result.json"
+        historical_sha256 = file_digest(historical_result)
+        with patch("description_pipeline.runtime.tool_record", return_value=current_tool):
+            execution = self.handler(tool=current_tool).execute(
+                command, claim,
                 self._materialized_workspace(
-                    self.root / "workspace-formal-distinct-requirement",
+                    self.root / "workspace-formal-current-requirement",
                     (self.freeze_ref, self.discover_ref, requirement),
                 ),
-                effects=effects,
+                effects=self.effects(command, claim),
             )
+        self.assertEqual(execution.outcome, "completed")
+        manifest = read_data(Path(execution.candidate_root) / "transfer-manifest.json")
+        self.assertEqual(manifest["native_tool"], current_tool)
+        self.assertEqual(manifest["execution"]["executor_sha256"], self.stage_executor)
+        self.assertIn(self.discover_ref.to_record(), manifest["upstream_artifacts"])
+        self.assertEqual(file_digest(historical_result), historical_sha256)
+        self.assertNotEqual(read_data(historical_result)["native_tool"], current_tool)
 
-        operation.assert_not_called()
-        self.assertFalse(
-            any(
-                intent.command_id == command.command_id
-                for intent in self.effect_ledger.intents.values()
-            )
-        )
+    def test_formal_capture_rejects_current_authority_mismatch_before_native_effect(self) -> None:
+        current_tool = self._native_tool_variant("current")
+        requirement = self._seal_native_requirement(current_tool, "formal-current-requirement")
+        for fault, code in (
+            ("tool", "native_tool_mismatch"),
+            ("requirement", "native_requirement_artifact"),
+            ("executor", "claim_mismatch"),
+            ("target", "native_target_invalid"),
+        ):
+            with self.subTest(fault=fault):
+                reference = self.native_tool_requirement_ref if fault == "requirement" else requirement
+                request = {
+                    **self.command.to_record()["request"],
+                    "native_tool_source_sha256": current_tool["source_sha256"],
+                    "native_tool_record_sha256": digest(current_tool),
+                    "native_tool_requirement_artifact_id": reference.artifact_id,
+                }
+                if fault == "target":
+                    request["native_target_identity"]["target_id"] = "f" * 64
+                command = self._command(requirement=reference, request=request)
+                claim = self._claim(command, "claim-formal-" + fault, fence=1)
+                if fault == "executor":
+                    claim = replace(claim, executor_sha256=digest({"executor": "foreign"}))
+                operation = Mock(side_effect=AssertionError("Native effect must not be invoked"))
+                effects = self.effects(command, claim)
+                tool = self.capture_tool if fault == "tool" else current_tool
+                with self.assertRaisesRegex(capture_module.ProtocolError, code):
+                    self.handler(tool=tool, native_operation=operation).execute(
+                        command, claim,
+                        self._materialized_workspace(
+                            self.root / ("workspace-formal-" + fault),
+                            (self.freeze_ref, self.discover_ref, reference),
+                        ),
+                        effects=effects,
+                    )
+                operation.assert_not_called()
+                self.assertFalse(any(
+                    intent.command_id == command.command_id for intent in self.effect_ledger.intents.values()
+                ))
 
     def test_capture_rejects_an_incomplete_requirement_input_closure(self) -> None:
         current_tool = self._native_tool_variant("current")
@@ -3197,7 +3231,7 @@ class CaptureTransactionPreservationTests(unittest.TestCase):
                     request_evidence=request_evidence,
                 )
 
-            retained = list(root.glob(".output-capture-*"))
+            retained = [path for path in root.iterdir() if path.is_dir() and path != package]
             self.assertEqual(len(retained), 1)
             self.assertEqual(
                 (retained[0] / "raw-native.bin").read_bytes(),

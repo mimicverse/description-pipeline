@@ -45,6 +45,7 @@ def build_package(root: Path) -> Path:
             "cad/arm.SLDPRT": "c" * 64,
         },
         "raw": {
+            "transform_frame": "main_assembly",
             "saved_configuration": "Default",
             "components": [
                 {
@@ -52,12 +53,20 @@ def build_package(root: Path) -> Path:
                     "name2": "base-1",
                     "document": "cad/base.SLDPRT",
                     "suppression_state": 2,
+                    "suppressed": False,
+                    "parent_occurrence": "",
+                    "configuration": "Default",
+                    "document_type": "part",
                 },
                 {
                     "instance_id": "arm-1",
                     "name2": "arm-1",
                     "document": "cad/arm.SLDPRT",
                     "suppression_state": 2,
+                    "suppressed": False,
+                    "parent_occurrence": "",
+                    "configuration": "Default",
+                    "document_type": "part",
                 },
             ],
         },
@@ -456,9 +465,7 @@ class CapturePlanTests(unittest.TestCase):
             "upload_sha256",
             "main_assembly",
             "files",
-            "handoff_sha256",
             "closure",
-            "excluded_files",
             "selection_sha256",
         ):
             with self.subTest(field=field):
@@ -507,7 +514,9 @@ class CapturePlanTests(unittest.TestCase):
             "document": None,
         }
         write_json(self.root / "discovery" / "native-discovery.json", discovery)
-        discovery_sha = hashlib.sha256((self.root / "discovery" / "native-discovery.json").read_bytes()).hexdigest()
+        discovery_sha = hashlib.sha256(
+            (self.root / "discovery" / "native-discovery.json").read_bytes()
+        ).hexdigest()
         self._rewrite_plan(
             lambda plan: (
                 plan.update(discovery_sha256=discovery_sha),

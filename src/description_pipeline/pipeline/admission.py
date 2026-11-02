@@ -12,7 +12,7 @@ from typing import Any
 
 from ..interface_records import REQUEST_PURPOSES
 from .. import mjcf_contract
-from ..stages import STAGE_IDS
+from ..stages import STAGE_IDS, execution_stage_ids
 from ..io import PipelineError, artifact_path_parts, digest, parse_data
 from ..repository.publish import CommitSpec
 from ..schemas import (
@@ -395,6 +395,7 @@ class AdmissionSpec:
     created_at: datetime
     simulation: str = mjcf_contract.EMPTY_CONFIG.decode("utf-8")
     native_target_identity: NativeTargetIdentity | None = None
+    through_stage: StageId | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != ADMISSION_SPEC_SCHEMA:
@@ -413,8 +414,11 @@ class AdmissionSpec:
             mjcf_contract.load_simulation(self.simulation.encode("utf-8"))
         except PipelineError as error:
             raise ProtocolError("admission.invalid", {"where": "simulation", "reason": str(error)}) from error
-        if self.from_stage == "mjcf" and self.parent_run_id is None:
-            raise ProtocolError("admission.invalid", {"where": "parent_run_id", "reason": "mjcf-source-required"})
+        if self.through_stage is not None and self.through_stage not in STAGE_IDS:
+            raise ProtocolError("admission.invalid", {"where": "through_stage"})
+        execution_stage_ids(self.from_stage, through=self.through_stage or "publish")
+        if self.from_stage not in {None, "freeze"} and self.parent_run_id is None:
+            raise ProtocolError("admission.invalid", {"where": "parent_run_id", "reason": "stage-source-required"})
         if self.purpose not in REQUEST_PURPOSES:
             raise ProtocolError("admission.invalid", {"where": "purpose"})
         _require_safe_multiline(self.change_summary, "admission.invalid", "change_summary")
@@ -488,6 +492,7 @@ class AdmissionSpec:
 
     def identity_record(self) -> dict[str, Any]:
         return {
+            **({"through_stage": self.through_stage} if self.through_stage is not None else {}),
             "change_summary": self.change_summary,
             "configuration": self.configuration.to_record(),
             "contract_sha256": self.contract_sha256,
@@ -501,9 +506,7 @@ class AdmissionSpec:
             "native_tool_record_sha256": self.native_tool_record_sha256,
             "native_tool_requirement": self.native_tool_requirement.to_record(),
             "native_target_identity": (
-                None
-                if self.native_target_identity is None
-                else self.native_target_identity.to_record()
+                None if self.native_target_identity is None else self.native_target_identity.to_record()
             ),
             "originals": self.originals.to_record(),
             "parent_run_id": self.parent_run_id,
@@ -535,7 +538,9 @@ class AdmissionSpec:
 
     @classmethod
     def from_record(cls, record: Mapping[str, Any]) -> AdmissionSpec:
-        if not isinstance(record, Mapping) or set(record) != _ADMISSION_FIELDS | {"admission_sha256"}:
+        if not isinstance(record, Mapping) or set(record) - {"through_stage"} != _ADMISSION_FIELDS | {
+            "admission_sha256"
+        }:
             raise ProtocolError("admission.invalid", {"where": "record"})
         originals = _verified_from_record(record["originals"])
         ruleset = VerifiedRuleset.from_record(record["ruleset"])
@@ -546,6 +551,7 @@ class AdmissionSpec:
             request_id=record["request_id"],
             parent_run_id=record["parent_run_id"],
             from_stage=record["from_stage"],
+            through_stage=record.get("through_stage"),
             simulation=record["simulation"],
             principal=record["principal"],
             target_hardware=record["target_hardware"],
@@ -559,9 +565,7 @@ class AdmissionSpec:
             dispatch_executor_sha256=record["dispatch_executor_sha256"],
             native_tool_source_sha256=record["native_tool_source_sha256"],
             native_tool_record_sha256=record["native_tool_record_sha256"],
-            native_tool_requirement=_verified_from_record(
-                record["native_tool_requirement"]
-            ),
+            native_tool_requirement=_verified_from_record(record["native_tool_requirement"]),
             native_target_identity=(
                 NativeTargetIdentity.from_record(record["native_target_identity"])
                 if record["native_target_identity"] is not None
@@ -675,7 +679,6 @@ class VerifiedDiscoverResult:
 
     predecessor: VerifiedPredecessor
     prepared_sha256: str
-    selected_files_sha256: str
     upload_inventory_sha256: str
     main_assembly: str
     native_observation_sha256: str
@@ -690,7 +693,6 @@ class VerifiedDiscoverResult:
             raise ProtocolError("admission.discover_result_invalid", {"where": "predecessor"})
         for field in (
             "prepared_sha256",
-            "selected_files_sha256",
             "upload_inventory_sha256",
             "native_observation_sha256",
             "native_tool_source_sha256",
@@ -746,9 +748,8 @@ class VerifiedDiscoverResult:
         main = selection.get("main_assembly")
         if not isinstance(files, Mapping) or not files:
             raise ProtocolError("admission.discover_result_invalid", {"where": "selection.files"})
-        selected_files_sha256 = digest({str(path): str(checksum) for path, checksum in files.items()})
-        if selection.get("handoff_sha256") != selected_files_sha256:
-            raise ProtocolError("admission.discover_result_invalid", {"where": "selection.handoff_sha256"})
+        if digest({str(path): str(checksum) for path, checksum in files.items()}) != upload:
+            raise ProtocolError("admission.discover_result_invalid", {"where": "selection.upload_sha256"})
         _require_digest(upload, "admission.discover_result_invalid", "selection.upload_sha256")
         _require_text(main, "admission.discover_result_invalid", "selection.main_assembly")
         native_tool = record["native_tool"]
@@ -763,7 +764,6 @@ class VerifiedDiscoverResult:
         return cls(
             predecessor=predecessor,
             prepared_sha256=record["prepared_sha256"],
-            selected_files_sha256=selected_files_sha256,
             upload_inventory_sha256=upload,
             main_assembly=main,
             native_observation_sha256=record["native_observation_sha256"],
@@ -822,8 +822,8 @@ class VerifiedVerifyResult:
             request.get("generate_artifact_id") != self.generate_artifact.artifact_id
             or request.get("capture_artifact_id") != self.capture_artifact.artifact_id
             or self.verified_subject_sha256 != self.generate_artifact.set_sha256
-            or self.predecessor.result.run_id != self.generate_artifact.producer_run_id
-            or self.predecessor.result.run_id != self.capture_artifact.producer_run_id
+            or self.generate_artifact not in self.predecessor.command.input_artifacts
+            or self.capture_artifact not in self.predecessor.command.input_artifacts
         ):
             raise ProtocolError("admission.verify_result_invalid", {"where": "lineage"})
 
@@ -1183,8 +1183,7 @@ def build_discover_command(spec: AdmissionSpec, predecessor: VerifiedPredecessor
         raise ProtocolError("admission.stage_mismatch", {"stage": "discover", "from_stage": spec.from_stage})
     if not isinstance(predecessor, VerifiedPredecessor) or predecessor.stage != "freeze":
         raise ProtocolError("admission.predecessor_invalid", {"stage": "discover"})
-    if predecessor.command.run_id != spec.run_id or predecessor.decision.run_id != spec.run_id:
-        raise ProtocolError("admission.predecessor_invalid", {"reason": "run-mismatch"})
+    _source_predecessor(spec, predecessor, "freeze")
     native_target = spec.require_native_target_identity()
     request = {
         "schema_version": DISCOVER_REQUEST_SCHEMA,
@@ -1236,6 +1235,15 @@ def _require_predecessor(
     return predecessor
 
 
+def _source_predecessor(spec: AdmissionSpec, predecessor: VerifiedPredecessor, stage: StageId) -> VerifiedPredecessor:
+    """Validate the stage/run boundary; the store verifies the exact source owner."""
+    if not isinstance(predecessor, VerifiedPredecessor):
+        raise ProtocolError("admission.predecessor_invalid", {"stage": stage})
+    reusable = spec.parent_run_id is not None and STAGE_IDS.index(stage) < STAGE_IDS.index(spec.from_stage or "freeze")
+    owner = predecessor.command.run_id if reusable else spec.run_id
+    return _require_predecessor(predecessor, stage=stage, run_id=owner)
+
+
 def build_capture_command(
     spec: AdmissionSpec,
     freeze: VerifiedPredecessor,
@@ -1244,8 +1252,8 @@ def build_capture_command(
 ) -> StageCommand:
     """Project Capture from the verified Freeze/Discover lineage and result."""
 
-    freeze = _require_predecessor(freeze, stage="freeze", run_id=spec.run_id)
-    discover = _require_predecessor(discover, stage="discover", run_id=spec.run_id)
+    freeze = _source_predecessor(spec, freeze, "freeze")
+    discover = _source_predecessor(spec, discover, "discover")
     native_target = spec.require_native_target_identity()
     if (
         discover_result.predecessor != discover
@@ -1255,9 +1263,9 @@ def build_capture_command(
         or discover_result.source_set_artifact != spec.originals.ref
         or discover_result.ruleset_artifact != spec.ruleset.artifact.ref
         or discover_result.configuration_artifact != spec.configuration.ref
-        or discover_result.native_tool_source_sha256 != spec.native_tool_source_sha256
+        or discover_result.native_tool_source_sha256 != discover.command.request.get("expected_native_tool_sha256")
         or discover_result.native_tool_record_sha256
-        != spec.native_tool_record_sha256
+        != discover.command.request.get("expected_native_tool_record_sha256")
     ):
         raise ProtocolError("admission.lineage_mismatch", {"stage": "capture"})
     effect_key = "native-capture:" + digest(
@@ -1269,12 +1277,12 @@ def build_capture_command(
     )
     request = {
         "effect_key": effect_key,
-        "handoff_sha256": discover_result.selected_files_sha256,
+        "handoff_sha256": discover_result.upload_inventory_sha256,
         "upload_sha256": discover_result.upload_inventory_sha256,
         "prepared_sha256": discover_result.prepared_sha256,
         "main_assembly": discover_result.main_assembly,
-        "native_tool_source_sha256": discover_result.native_tool_source_sha256,
-        "native_tool_record_sha256": discover_result.native_tool_record_sha256,
+        "native_tool_source_sha256": spec.native_tool_source_sha256,
+        "native_tool_record_sha256": spec.native_tool_record_sha256,
         "native_tool_requirement_artifact_id": spec.native_tool_requirement.ref.artifact_id,
         "native_target_identity": native_target.to_record(),
     }
@@ -1294,7 +1302,7 @@ def build_capture_command(
 def build_generate_command(spec: AdmissionSpec, capture: VerifiedPredecessor) -> StageCommand:
     """Project Generate from the exact committed Capture output."""
 
-    capture = _require_predecessor(capture, stage="capture", run_id=spec.run_id)
+    capture = _source_predecessor(spec, capture, "capture")
     request = {
         "schema_version": GENERATE_REQUEST_SCHEMA,
         "capture_artifact_id": capture.result.output_artifact.artifact_id,
@@ -1316,8 +1324,8 @@ def build_verify_command(
 ) -> StageCommand:
     """Project Verify from the exact Generate/Capture artifact pair."""
 
-    generate = _require_predecessor(generate, stage="generate", run_id=spec.run_id)
-    capture = _require_predecessor(capture, stage="capture", run_id=spec.run_id)
+    generate = _source_predecessor(spec, generate, "generate")
+    capture = _source_predecessor(spec, capture, "capture")
     if generate.command.request.get("capture_artifact_id") != capture.result.output_artifact.artifact_id:
         raise ProtocolError("admission.lineage_mismatch", {"stage": "verify"})
     request = {
@@ -1340,8 +1348,7 @@ def build_mjcf_command(spec: AdmissionSpec, verify_result: VerifiedVerifyResult)
     """Bind conversion to one passing URDF result and immutable simulation bytes."""
     if not isinstance(verify_result, VerifiedVerifyResult):
         raise ProtocolError("admission.verify_result_invalid", {"stage": "mjcf"})
-    source_run_id = spec.parent_run_id if spec.from_stage == "mjcf" else spec.run_id
-    verify = _require_predecessor(verify_result.predecessor, stage="verify", run_id=source_run_id)
+    verify = _source_predecessor(spec, verify_result.predecessor, "verify")
     request = {
         "schema_version": mjcf_contract.STAGE_REQUEST_SCHEMA,
         "output_contract": mjcf_contract.OUTPUT_CONTRACT,
@@ -1359,22 +1366,34 @@ def build_mjcf_command(spec: AdmissionSpec, verify_result: VerifiedVerifyResult)
     )
 
 
-def validate_mjcf_successor(spec: AdmissionSpec, source: AdmissionSpec) -> None:
-    """Permit one direct MJCF successor while preserving every upstream fact."""
-    if (spec.from_stage != "mjcf" or spec.parent_run_id != source.run_id
-            or source.from_stage not in {None, "freeze"}):
-        raise ProtocolError("admission.mjcf_source_invalid")
-    fields = (
-        "principal", "target_hardware", "purpose", "main_assembly", "originals", "ruleset", "configuration",
-        "native_tool_source_sha256", "native_tool_record_sha256", "native_tool_requirement", "native_target_identity",
-        "contract_sha256", "policy_sha256", "platform_config_sha256",
-    )
+def validate_source_successor(spec: AdmissionSpec, source: AdmissionSpec) -> None:
+    """Bind one immutable rerun to its direct source and unchanged engineering inputs."""
+    if spec.parent_run_id != source.run_id or spec.run_id == source.run_id:
+        raise ProtocolError("admission.source_invalid")
+    fields = ("principal", "purpose", "originals")
+    if spec.from_stage not in {None, "freeze"}:
+        fields += (
+            "target_hardware",
+            "main_assembly",
+            "ruleset",
+            "configuration",
+            "platform_config_sha256",
+        )
+        if spec.from_stage != "mjcf":
+            fields += ("simulation",)
+        if spec.from_stage not in {"discover", "capture"}:
+            fields += (
+                "native_tool_source_sha256",
+                "native_tool_record_sha256",
+                "native_tool_requirement",
+                "native_target_identity",
+            )
+        for stage in STAGE_IDS[: STAGE_IDS.index(spec.from_stage)]:
+            if spec.executors.for_stage(stage) != source.executors.for_stage(stage):
+                raise ProtocolError("admission.source_mismatch", {"field": f"executors.{stage}"})
     for field in fields:
         if getattr(spec, field) != getattr(source, field):
-            raise ProtocolError("admission.mjcf_source_mismatch", {"field": field})
-    for stage in ("freeze", "discover", "capture", "generate", "verify"):
-        if spec.executors.for_stage(stage) != source.executors.for_stage(stage):
-            raise ProtocolError("admission.mjcf_source_mismatch", {"field": f"executors.{stage}"})
+            raise ProtocolError("admission.source_mismatch", {"field": field})
 
 
 def build_publish_command(
@@ -1391,10 +1410,9 @@ def build_publish_command(
         raise ProtocolError("admission.publish_intent_invalid", {"stage": "publish"})
     if publish_intent != spec.publish_intent:
         raise ProtocolError("admission.publish_intent_invalid", {"where": "admission-binding"})
-    source_run_id = spec.parent_run_id if spec.from_stage == "mjcf" else spec.run_id
-    _require_predecessor(verify_result.predecessor, stage="verify", run_id=source_run_id)
-    mjcf = _require_predecessor(mjcf, stage="mjcf", run_id=spec.run_id)
-    if mjcf.command != build_mjcf_command(spec, verify_result):
+    _source_predecessor(spec, verify_result.predecessor, "verify")
+    mjcf = _source_predecessor(spec, mjcf, "mjcf")
+    if mjcf.command.run_id == spec.run_id and mjcf.command != build_mjcf_command(spec, verify_result):
         raise ProtocolError("admission.mjcf_result_invalid", {"where": "source-command"})
     repository = publish_intent.repository
     verified = verify_result.predecessor.result.output_artifact
@@ -1434,6 +1452,86 @@ def build_publish_command(
         input_artifacts=input_artifacts,
         predecessor_decision_id=mjcf.decision.decision_id,
     )
+
+
+def build_stage_command(
+    spec: AdmissionSpec, stage: str, predecessors: Mapping[str, VerifiedPredecessor], discovered=None, verified=None
+) -> StageCommand:
+    """Project one stage from the same typed predecessor facts at every boundary."""
+    builders = {
+        "freeze": lambda: build_freeze_command(spec),
+        "discover": lambda: build_discover_command(spec, predecessors["freeze"]),
+        "capture": lambda: build_capture_command(spec, predecessors["freeze"], predecessors["discover"], discovered),
+        "generate": lambda: build_generate_command(spec, predecessors["capture"]),
+        "verify": lambda: build_verify_command(spec, predecessors["generate"], predecessors["capture"]),
+        "mjcf": lambda: build_mjcf_command(spec, verified),
+        "publish": lambda: build_publish_command(spec, verified, spec.publish_intent, predecessors["mjcf"]),
+    }
+    if stage not in builders:
+        raise ProtocolError("admission.stage_invalid", {"stage": stage})
+    return builders[stage]()
+
+
+def source_context_from_projection(spec: AdmissionSpec, projection: Mapping, artifacts):
+    """Read the exact sealed records from an already canonical source projection."""
+    import tempfile
+
+    if (
+        artifacts is None
+        or projection.get("scope", {}).get("kind") != "formal"
+    ):
+        raise ProtocolError("admission.source_unsettled")
+    validate_source_successor(spec, AdmissionSpec.from_record(projection["request"]))
+    rows = {row["stage"]: row for row in projection["stages"]}
+    predecessors = {}
+    discovered = verified = None
+    for stage in STAGE_IDS[: STAGE_IDS.index(spec.from_stage or "freeze")]:
+        row = rows[stage]
+        row = row.get("source") if row.get("state") == "reused" else row
+        if row is None or row.get("state") != "completed" or row.get("formal_eligible") is not True:
+            raise ProtocolError("admission.source_unverified", {"stage": stage})
+        command = StageCommand.from_record(row["command"])
+        record = row["decision"]
+        result_ref = ArtifactRef.from_record(row["receipt"]["result_record_artifact"])
+        result = artifacts.read_result(result_ref)
+        if result.to_record() != row["receipt"]["result"]:
+            raise ProtocolError("admission.source_result_mismatch")
+        decision = StageDecision(
+            decision_id=record["decision_id"],
+            run_id=command.run_id,
+            stage=stage,
+            command_id=record["command_id"],
+            outcome=record["outcome"],
+            result_record_artifact=result_ref,
+            result_digest=record["result_digest"],
+            actual_executor_sha256=record["actual_executor_sha256"],
+            original_producer_decision_id=record.get("original_producer_decision_id"),
+            reason_code=record["reason_code"],
+            failure_envelope=None,
+            decided_at=datetime.fromisoformat(record["decided_at"]),
+        )
+        predecessor = VerifiedPredecessor(stage, command, result, decision)
+        predecessors[stage] = predecessor
+        artifacts.verify(result.output_artifact)
+        if stage == "generate":
+            from .verify import validate_generate_source
+
+            validate_generate_source(command, result.output_artifact, artifacts)
+        if stage == "discover":
+            with tempfile.TemporaryDirectory(prefix="description-source-discover-") as directory:
+                root = artifacts.materialize(result.output_artifact, Path(directory) / "artifact")
+                discovered = VerifiedDiscoverResult.from_record(
+                    predecessor, parse_data((root / "result.json").read_bytes(), root / "result.json")
+                )
+        elif stage == "verify":
+            artifact = VerifiedArtifact.from_store_record(
+                result.output_artifact, artifacts.verify(result.output_artifact)
+            )
+            certificate, _member, _manifest = artifacts.read_metadata_member(
+                result.output_artifact, CERTIFICATE_FILENAME, max_bytes=16 * 1024 * 1024
+            )
+            verified = VerifiedVerifyResult.from_artifact_bytes(predecessor, artifact, certificate)
+    return predecessors, discovered, verified
 
 
 def _command_differences(expected: StageCommand, actual: StageCommand) -> list[str]:
@@ -1543,6 +1641,8 @@ def validate_stage_command(
 ) -> StageCommand:
     """The pure Store transaction hook; unsupported stages are explicit."""
 
+    if command.stage not in execution_stage_ids(spec.from_stage, through=spec.through_stage or "publish"):
+        raise ProtocolError("admission.stage_out_of_scope", {"stage": command.stage})
     if command.stage == "freeze":
         if (
             predecessor is not None

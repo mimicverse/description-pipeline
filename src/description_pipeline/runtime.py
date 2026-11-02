@@ -18,9 +18,23 @@ from .schemas import TOOL_SCHEMA
 #: staged capture/conversion pipeline: it imports packaging (stage transfer and tool records)
 #: and the pywin32 COM bindings.  numpy, PyYAML, jsonschema and python-multipart belong to
 #: the portable (Linux) surfaces (model derivation, pages, uploads, authored YAML inputs).
+#: Starlette, AnyIO, Uvicorn, a2wsgi and websockets serve the same authenticated portal
+#: and its PICO WebSocket consumer; they never enter the native endpoint closure.
 RUNTIME_PACKAGES = {
     "native": ("packaging", "pywin32"),
-    "portable": ("numpy", "PyYAML", "jsonschema", "packaging", "python-multipart", "mujoco"),
+    "portable": (
+        "numpy",
+        "PyYAML",
+        "jsonschema",
+        "packaging",
+        "python-multipart",
+        "mujoco",
+        "starlette",
+        "anyio",
+        "uvicorn",
+        "a2wsgi",
+        "websockets",
+    ),
 }
 RUNTIME_VERSIONS = {
     "numpy": "2.5.3",
@@ -30,6 +44,11 @@ RUNTIME_VERSIONS = {
     "python-multipart": "0.0.32",
     "pywin32": "311",
     "mujoco": "3.13.0",
+    "starlette": "1.6.0",
+    "anyio": "4.15.1",
+    "uvicorn": "0.52.4",
+    "a2wsgi": "1.10.10",
+    "websockets": "16.1.1",
 }
 #: The one supported interpreter range; pyproject's requires-python and the
 #: release build mirror this line (IF-15 support single source).
@@ -40,9 +59,7 @@ SUPPORTED_PYTHON = ">=3.12,<3.13"
 #: offline archives are built for (older-glibc spellings stay installable, a
 #: newer baseline never enters an archive).
 TARGET_PYTHON = "3.12"
-_PYTHON_RUNTIME_VERSION = re.compile(
-    rf"\A{re.escape(TARGET_PYTHON)}(?:\.[0-9]+)?\Z"
-)
+_PYTHON_RUNTIME_VERSION = re.compile(rf"\A{re.escape(TARGET_PYTHON)}(?:\.[0-9]+)?\Z")
 TARGET_ABI = "cp312"
 WINDOWS_PLATFORMS = ("win_amd64",)
 LINUX_GLIBC_BASELINE = 28
@@ -138,13 +155,9 @@ def scoped_executor_sha256(record: dict, scope: str) -> str:
     """Bind one runtime record to a non-stage executor responsibility."""
 
     if not isinstance(record, dict) or not record:
-        raise PipelineError(
-            "An executor tool record must be a nonempty object"
-        )
+        raise PipelineError("An executor tool record must be a nonempty object")
     if not isinstance(scope, str) or not scope or "\x00" in scope:
-        raise PipelineError(
-            "An executor scope must be a nonempty string"
-        )
+        raise PipelineError("An executor scope must be a nonempty string")
     return digest({"scope": scope, "tool": record})
 
 

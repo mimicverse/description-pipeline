@@ -37,6 +37,7 @@ from description_pipeline.runtime import RUNTIME_VERSIONS, required_packages
 from description_pipeline.schemas import (
     CAPTURE_EVIDENCE_REQUESTS,
     NATIVE_CAPTURE_OBSERVATION_SCHEMA,
+    NATIVE_TRANSFORM_FRAME,
     SOURCE_RECORD_SCHEMA,
 )
 from description_pipeline import native_transfer
@@ -300,7 +301,7 @@ def capture_root(
     )
     package_files["source.json"] = file_digest(root / "input/source.json")
     discovery = {
-        "schema_version": "solidworks-to-urdf.native-discovery/v1",
+        "schema_version": "solidworks-to-urdf.native-discovery/v2",
         "run_id": run_id,
         "derivation": {
             "main_assembly": main,
@@ -492,6 +493,7 @@ def capture_root(
         "scene_raw": {
             "document": str(root / "input/cad" / main),
             "configuration": "Default",
+            "transform_frame": NATIVE_TRANSFORM_FRAME,
             "occurrences": [
                 {
                     "name": main,
@@ -1070,27 +1072,14 @@ class StageTransferTests(unittest.TestCase):
             sealed = archive.read(transfer.CAPTURE_MANIFEST)
         self.assertEqual((destination / transfer.CAPTURE_MANIFEST).read_bytes(), sealed)
 
-    def test_full_upload_and_selected_native_handoff_are_bound_separately(self) -> None:
-        upload_files = {**NATIVE_FILES, "excluded.SLDPRT": "e" * 64}
+    def test_pruned_input_cannot_be_sealed_as_the_complete_upload(self) -> None:
+        upload_files = {**NATIVE_FILES, "support.SLDPRT": "e" * 64}
         upload_sha256 = digest(upload_files)
         root = capture_root(
-            self.base / "separate-upload",
-            upload=upload_sha256,
-            upload_files=upload_files,
+            self.base / "pruned-input", upload=upload_sha256, upload_files=upload_files,
         )
-        archive = self.base / "separate-upload.zip"
-        manifest = seal(root, archive, upload_sha256=upload_sha256)
-        self.assertEqual(manifest["upload_sha256"], upload_sha256)
-        self.assertEqual(manifest["handoff_sha256"], HANDOFF)
-
-        destination = self.base / "separate-upload-admitted"
-        admit(archive, destination, expected_upload_sha256=upload_sha256)
-        summary = _verify_transfer(
-            destination,
-            expected_upload_sha256=upload_sha256,
-        )
-        self.assertEqual(summary["upload_sha256"], upload_sha256)
-        self.assertEqual(summary["handoff_sha256"], HANDOFF)
+        with self.assertRaisesRegex(PipelineError, "complete frozen upload"):
+            seal(root, self.base / "pruned-input.zip", upload_sha256=upload_sha256)
 
     def test_structural_team_reports_are_not_capture_payload(self) -> None:
         (self.root / "reports/structural-team.md").write_text(
@@ -1259,7 +1248,9 @@ class StageTransferTests(unittest.TestCase):
         write_json(mutated_facts, facts)
         payload = mutated_facts.read_bytes()
         with zipfile.ZipFile(self.archive) as source:
-            evidence_manifest = json.loads(source.read("evidence/manifest.json"))
+            evidence_manifest = json.loads(
+                source.read("evidence/manifest.json")
+            )
         evidence_manifest["files"]["raw/native_capture_facts.json.gz"] = hashlib.sha256(
             payload
         ).hexdigest()
@@ -1992,10 +1983,7 @@ class StageTransferTests(unittest.TestCase):
         manifest["total_bytes"] += 1
         receipts["transfer_manifest_bytes"] = canonical(manifest)
         with self.assertRaisesRegex(PipelineError, "size differs"):
-            _verify_transfer(
-                destination,
-                native_receipts=receipts,
-            )
+            _verify_transfer(destination, native_receipts=receipts)
 
     def test_source_record_is_required_and_cross_bound(self) -> None:
         missing = capture_root(self.base / "missing-source")
@@ -2307,9 +2295,7 @@ class StageTransferTests(unittest.TestCase):
                 report["input_receipt"]["inventory"]["extra.SLDPRT"] = file_digest(extra)
                 report["package_files"]["cad/extra.SLDPRT"] = file_digest(extra)
                 write_json(report_path, report)
-                discovery_path = (
-                    root / "input/discovery/native-discovery.json"
-                )
+                discovery_path = root / "input/discovery/native-discovery.json"
                 discovery = read_data(discovery_path)
                 if added:
                     discovery["native_files"]["extra.SLDPRT"] = "0" * 64

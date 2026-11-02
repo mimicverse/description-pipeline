@@ -1109,8 +1109,7 @@ class ReportViewTests(unittest.TestCase):
             "missing_references": {"state": "unavailable", "items": []},
             "actual_scope": {
                 "main_assembly": "cad/robot.SLDASM",
-                "selected_files": ["cad/robot.SLDASM"],
-                "excluded_files": [],
+                "input_files": ["cad/robot.SLDASM"],
                 "graph_nodes": 1,
                 "occurrence_count": 0,
                 "unresolved_occurrences": [],

@@ -64,11 +64,13 @@ class AirflowApplicationAdapterTests(unittest.TestCase):
     def test_real_dag_and_pool_preserve_deferred_native_capacity(self):
         script = textwrap.dedent("""
             import importlib.util
+            import os
             from contextlib import contextmanager
             from pathlib import Path
             from sqlalchemy import create_engine
             from sqlalchemy.orm import Session
             from airflow.models.pool import Pool
+            from unittest.mock import patch
             from description_pipeline.stages import STAGE_IDS, WINDOWS_STAGES
 
             def load(name, path):
@@ -104,6 +106,31 @@ class AirflowApplicationAdapterTests(unittest.TestCase):
                 with Session(engine) as session:
                     pool = session.query(Pool).filter(Pool.pool == "windows_native").one()
                     assert pool.slots == 1 and pool.include_deferred is True
+            from description_pipeline.dynamics_assessment.contracts import POOL_ID
+            optional = load("assessment_pool_dag", Path("deploy/airflow/dags/upper_body_dynamics.py"))
+            assert optional.upper_body_dynamics_dag.get_task("assess").pool == POOL_ID
+            assert len(module.configured_pools({})) == 1
+            pools = module.configured_pools({"ASSESSMENT_CONFIG_JSON": '{"enabled":true,"capacity":3}'})
+            assert [name for name, _, _ in pools] == ["windows_native", POOL_ID]
+            for name, slots, description in pools:
+                module.ensure_pool(name, slots, description, session_factory=session_factory, pool_class=Pool)
+            with Session(engine) as session:
+                module.require_pool(session, Pool, POOL_ID, 3)
+                try:
+                    module.require_pool(session, Pool, POOL_ID, 2)
+                except SystemExit:
+                    pass
+                else:
+                    raise AssertionError("A health check accepted another resource capacity")
+                assert session.query(Pool).filter(Pool.pool == POOL_ID).one().slots == 3
+            with (
+                patch.dict(os.environ, {"ASSESSMENT_CONFIG_JSON": '{"enabled":true,"capacity":2}'}),
+                patch("airflow.utils.session.create_session", session_factory),
+            ):
+                assert module.main([]) == 0
+                assert module.main(["--check"]) == 0
+                with Session(engine) as session:
+                    assert session.query(Pool).filter(Pool.pool == POOL_ID).one().slots == 2
         """)
         with tempfile.TemporaryDirectory() as home:
             env = {key: value for key, value in os.environ.items() if not key.startswith("AIRFLOW")}

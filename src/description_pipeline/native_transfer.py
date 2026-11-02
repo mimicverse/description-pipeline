@@ -1159,6 +1159,10 @@ def _validate_capture(
         actual_inputs=actual_inputs,
     )
     _require(
+        handoff_sha256 == upload_sha256 == digest(actual_inputs),
+        "Capture does not preserve the complete frozen upload",
+    )
+    _require(
         native_sha256 == main_assembly_sha256,
         "The archived main assembly differs between the input report and the native inventory",
     )

@@ -100,6 +100,13 @@ class MJCFHandlerTests(unittest.TestCase):
         self.assertTrue(all(path.startswith("mjcf/") or path == contract.REPORT_PATH for path in inventory(output)))
         certificate = validate_certificate(output, command, source_roots=self.roots)
         self.assertEqual(execution.checks_sha256, digest(certificate))
+        encoded = {path: row for path, row in certificate['input_binding']['files'].items()
+                   if path.startswith(contract.MESH_ENCODING_PREFIX)}
+        self.assertTrue(encoded)
+        for path, row in encoded.items():
+            self.assertEqual(row['sha256'], file_digest(output / path))
+        self.assertTrue(any(warning.startswith(contract.MESH_WARNING_PREFIX)
+                            for warning in contract.projection_warnings(certificate)))
         ref = self.store.seal_tree(
             output,
             kind=contract.ARTIFACT_KIND,

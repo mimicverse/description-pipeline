@@ -41,7 +41,7 @@ from description_pipeline.pipeline.admission import (
     validate_stage_command,
     validate_verify_command,
     validate_store_command,
-    validate_mjcf_successor,
+    validate_source_successor,
 )
 from description_pipeline.pipeline.admission import ADMISSION_SPEC_SCHEMA
 from description_pipeline.pipeline.contracts import (
@@ -374,21 +374,21 @@ class AdmissionHarness:
 
 
 class AdmissionProjectionTests(unittest.TestCase):
-    def test_mjcf_successor_preserves_sources_and_rejects_chains(self):
+    def test_successor_preserves_sources_and_allows_valid_chains(self):
         source = self.harness.spec
         successor = replace(
             source, run_id="mjcf-rerun", request_id="mjcf-rerun-request", parent_run_id=source.run_id,
             from_stage="mjcf", simulation='{"collision":{"max_vertices":128}}',
         )
-        validate_mjcf_successor(successor, source)
+        validate_source_successor(successor, source)
         for field, value in (("purpose", "inspection_preview" if source.purpose != "inspection_preview" else "release"),
                              ("platform_config_sha256", "1" * 64), ("principal", "another-owner")):
             with self.subTest(field=field), self.assertRaises(ProtocolError):
-                validate_mjcf_successor(replace(successor, **{field: value}), source)
-        with self.assertRaises(ProtocolError):
-            validate_mjcf_successor(
-                replace(successor, run_id="another-rerun", parent_run_id=successor.run_id), successor,
-            )
+                validate_source_successor(replace(successor, **{field: value}), source)
+        validate_source_successor(
+            replace(successor, run_id="another-rerun", parent_run_id=successor.run_id),
+            successor,
+        )
 
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="admission-projection-")
@@ -603,8 +603,7 @@ class AdmissionProjectionTests(unittest.TestCase):
             "run_id": self.harness.spec.run_id,
             "request_digest": discover_command.request_digest,
             "selection": {
-                "files": {"cad/robot.SLDASM": self.harness.originals.inventory["cad/robot.SLDASM"]},
-                "handoff_sha256": digest({"selected": 1}),
+                "files": dict(self.harness.originals.inventory),
                 "upload_sha256": self.harness.originals.inventory_sha256,
                 "main_assembly": self.harness.spec.main_assembly,
             },
@@ -620,7 +619,6 @@ class AdmissionProjectionTests(unittest.TestCase):
             "discovery_file": "input/discovery/native-discovery.json",
             "findings_file": "input/discovery/findings.json",
         }
-        discover_payload["selection"]["handoff_sha256"] = digest(discover_payload["selection"]["files"])
         discover = self.harness.predecessor("discover", discover_command, discover_payload)
         discover_result = VerifiedDiscoverResult.from_record(discover, discover_payload)
         with self.assertRaises(ProtocolError):
@@ -877,7 +875,7 @@ class AdmissionProjectionTests(unittest.TestCase):
             "run_id": self.harness.spec.run_id,
             "request_digest": discover_command.request_digest,
             "selection": {
-                "files": {"cad/robot.SLDASM": self.harness.originals.inventory["cad/robot.SLDASM"]},
+                "files": dict(self.harness.originals.inventory),
                 "upload_sha256": self.harness.originals.inventory_sha256,
                 "main_assembly": self.harness.spec.main_assembly,
             },
@@ -893,7 +891,6 @@ class AdmissionProjectionTests(unittest.TestCase):
             "discovery_file": "input/discovery/native-discovery.json",
             "findings_file": "input/discovery/findings.json",
         }
-        discover_payload["selection"]["handoff_sha256"] = digest(discover_payload["selection"]["files"])
         discover = self.harness.predecessor("discover", discover_command, discover_payload)
         discover_result = VerifiedDiscoverResult.from_record(discover, discover_payload)
         capture = build_capture_command(self.harness.spec, freeze, discover, discover_result)
@@ -951,7 +948,7 @@ class AdmissionProjectionTests(unittest.TestCase):
             "run_id": self.harness.spec.run_id,
             "request_digest": discover_command.request_digest,
             "selection": {
-                "files": {"cad/robot.SLDASM": self.harness.originals.inventory["cad/robot.SLDASM"]},
+                "files": dict(self.harness.originals.inventory),
                 "upload_sha256": self.harness.originals.inventory_sha256,
                 "main_assembly": self.harness.spec.main_assembly,
             },
@@ -967,7 +964,6 @@ class AdmissionProjectionTests(unittest.TestCase):
             "discovery_file": "input/discovery/native-discovery.json",
             "findings_file": "input/discovery/findings.json",
         }
-        discover_payload["selection"]["handoff_sha256"] = digest(discover_payload["selection"]["files"])
         discover = self.harness.predecessor("discover", discover_command, discover_payload)
         discover_result = VerifiedDiscoverResult.from_record(discover, discover_payload)
         capture_command = build_capture_command(self.harness.spec, freeze, discover, discover_result)

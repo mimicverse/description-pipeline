@@ -19,14 +19,14 @@ import sys
 import threading
 import time
 from collections.abc import Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 
 from ...geometry.native_scope import NATIVE_SOURCE_SCOPE_RULE
 from ...geometry.native_tessellation import native_zero_triangle_evidence_is_valid
 from ...geometry.native_transform import transform_from_solidworks as _shared_transform
 from ...io import _filesystem_path, _physical_path, file_digest
-from ...schemas import NATIVE_DISCOVERY_SCHEMA
+from ...schemas import NATIVE_DISCOVERY_CONTRACT, NATIVE_DISCOVERY_SCHEMA, NATIVE_TRANSFORM_FRAME
 from .errors import CadError, EnvironmentError_
 from .group_selection import compose_link_group_selections
 from .protocol import CadBackend
@@ -48,6 +48,7 @@ from .session_artifacts import (
 # Published dual-interface IIDs in the SolidWorks type library.
 ICOMPONENT2_IID = "{655D6F2A-5441-45D1-8CBA-D35FB26988E4}"
 IMODELDOC2_IID = "{B90793FB-EF3D-4B80-A5C4-99959CDB6CEB}"
+IASSEMBLYDOC_IID = "{83A33D35-27C5-11CE-BFD4-00400513BB57}"
 IPARTDOC_IID = "{83A33D32-27C5-11CE-BFD4-00400513BB57}"
 ICONFIGURATIONMANAGER_IID = "{8DB64337-F36E-47CC-BBBC-B4B979D31505}"
 ICONFIGURATION_IID = "{83A33D98-27C5-11CE-BFD4-00400513BB57}"
@@ -159,6 +160,41 @@ def _component(value):
 def _modeldoc2(value):
     """Bind a native document dispatch to the common IModelDoc2 interface."""
     return _interface(value, IMODELDOC2_IID)
+
+
+def _assemblydoc(value):
+    """IAssemblyDoc owner verified in the offline published typelib dump."""
+    return _interface(value, IASSEMBLYDOC_IID)
+
+
+def _native_document_type(document, component=""):
+    """Read only documented integer native part/assembly types, without coercion."""
+    try:
+        kind = _method(document, "GetType")
+    except Exception as error:
+        raise CadError(
+            "cad_component_type",
+            "native document type could not be read",
+            {"component": component, "read_error": _native_error_record(error)},
+        ) from error
+    if type(kind) is not int or kind not in {1, 2}:
+        raise CadError(
+            "cad_component_type",
+            "native document type is not a documented part or assembly integer",
+            {"component": component, "native_type": _json_raw_value(kind), "value_type": type(kind).__name__},
+        )
+    return kind
+
+
+def _require_valid_component_tree(doc):
+    try:
+        valid = _method(_assemblydoc(doc), "IsComponentTreeValid")
+    except Exception as error:
+        raise CadError("cad_component_tree_unreadable", "the native component tree validity is unreadable") from error
+    if type(valid) is not bool or not valid:
+        raise CadError(
+            "cad_component_tree_invalid", "the native component tree is not valid", {"value": _raw_scalar(valid)}
+        )
 
 
 def _partdoc(value):
@@ -569,10 +605,6 @@ def _temporary_configuration(get_document, configuration, occurrence):
                     raise
                 raise restoration from error
             pending.add_note(f"Configuration restoration also failed: {restoration} ({restoration.detail!r})")
-
-
-
-
 
 
 def resolve_dependency_path(value, document_path):
@@ -1744,8 +1776,6 @@ def _raw_component_mass_fact(reading):
     return _json_raw_value(result)
 
 
-
-
 def _hash(path):
     return file_digest(Path(path))
 
@@ -2863,17 +2893,12 @@ def _component_source_document(component, source_root, *, native_path=None):
     return result
 
 
-def _solver_observation(component, defining_document, source_root, *, configuration, scope):
-    """Context-bound solver readings for one occurrence (diagnostics only).
+def _solver_observation(component, context_document, source_root, *, configuration, scope):
+    """Preserve solver getters in their actual acquisition document and configuration.
 
-    The documented ``IComponent2.Solving`` property and
-    ``IComponent2.GetConstrainedStatus()`` method are recorded with their enum
-    families and the context the occurrence was read in: the *defining*
-    document, its configuration and the occurrence scope.  That context is kept
-    distinct from the occurrence's referenced child configuration and from
-    ``IsFixed``.  An unavailable or non-integer reading is preserved explicitly
-    as ``value: None`` plus an error string — never coerced to ``False`` or
-    ``0``, never defaulted, and never a capture failure.
+    Parentage and source ownership are separate native facts. These values do
+    not imply that a top-context getter was called in a standalone child file.
+    Unknown diagnostic values remain explicit and cannot establish rigidity.
     """
 
     def relative_document(value) -> str:
@@ -2903,7 +2928,7 @@ def _solver_observation(component, defining_document, source_root, *, configurat
 
     return {
         "context": {
-            "document": relative_document(defining_document),
+            "document": relative_document(context_document),
             "configuration": str(configuration or ""),
             "scope": str(scope or ""),
         },
@@ -3139,7 +3164,6 @@ class SolidWorksBackend(CadBackend):
         self._components = set()
         self._source_components = {}
         self._source_provenance = {}
-        self._source_scope_overrides = {}
         self._source_documents = {}
         self._scene_source_root = None
         self._scene_document_key = None
@@ -3249,7 +3273,9 @@ class SolidWorksBackend(CadBackend):
         SolidWorks itself reads the reference files it resolves, and the owned
         session provides no OS-level file-access isolation.  Pass absolute
         document paths and receive the sorted normalized sealed set as
-        evidence.
+        evidence. Every delivered file must also be readable through its
+        ordinary path before native reference resolution starts; extended
+        filesystem I/O alone does not establish that boundary.
         """
 
         sealed = set()
@@ -3261,6 +3287,29 @@ class SolidWorksBackend(CadBackend):
                 )
             if not os.path.isabs(text):
                 raise CadError("document_seal_invalid", "Sealed documents must be absolute paths", {"document": text})
+            try:
+                with open(text, "rb") as stream:
+                    stream.read(1)
+            except OSError as error:
+                relative = None
+                if self._staged_search_root is not None:
+                    with suppress(ValueError):
+                        relative = Path(text).relative_to(self._staged_search_root).as_posix()
+                raise CadError(
+                    "cad_source_path_unreadable",
+                    "a sealed document is unreadable through the ordinary native source path",
+                    {
+                        "document": text,
+                        "relative_document": relative,
+                        "path_characters": len(text),
+                        "error": {
+                            "type": type(error).__name__,
+                            "errno": error.errno,
+                            "winerror": getattr(error, "winerror", None),
+                            "message": str(error),
+                        },
+                    },
+                ) from error
             sealed.add(normalize_document_path(os.path.abspath(text)))
         self._sealed_documents = sealed
         return sorted(sealed)
@@ -3537,7 +3586,6 @@ class SolidWorksBackend(CadBackend):
                 errors.append({**session.identity(), "error": str(error)})
         return {"terminated": terminated, "errors": errors}
 
-
     def release(self):
         if self._owner_thread is not None and self._owner_thread is not threading.current_thread():
             raise EnvironmentError_("cad_thread_mismatch", "Release CAD references on their owning STA thread")
@@ -3774,7 +3822,7 @@ class SolidWorksBackend(CadBackend):
         return _json_raw_value(list(raw))
 
     def _mass_properties_document(self, doc, require_material=True):
-        if _method(doc, "GetType") != 1:
+        if _native_document_type(doc) != 1:
             raise CadError("cad_not_part", "mass reader requires a leaf part")
         document_path = str(_method(doc, "GetPathName"))
         _manager, _configuration, configuration_name = _configuration_context(doc)
@@ -3862,11 +3910,12 @@ class SolidWorksBackend(CadBackend):
         """
 
         doc = self._document_by_path(path)
-        if _method(doc, "GetType") != 2:
+        if _native_document_type(doc) != 2:
             raise CadError("cad_not_assembly", "assembly mass reader requires a saved SLDASM")
         document_path = str(_method(doc, "GetPathName"))
         _manager, configuration, configuration_name = _configuration_context(doc)
         root = _component(_method(configuration, "GetRootComponent3", True))
+        _require_valid_component_tree(doc)
         mp = _method(_property(doc, "Extension"), "CreateMassProperty2")
         if mp is None:
             raise CadError(
@@ -3944,11 +3993,12 @@ class SolidWorksBackend(CadBackend):
         """
 
         doc = self._document_by_path(path)
-        if _method(doc, "GetType") != 2:
+        if _native_document_type(doc) != 2:
             raise CadError("cad_not_assembly", "link group mass reader requires a saved SLDASM")
         document_path = str(_method(doc, "GetPathName"))
         _manager, configuration, configuration_name = _configuration_context(doc)
         root = _component(_method(configuration, "GetRootComponent3", True))
+        _require_valid_component_tree(doc)
         if root is None:
             raise CadError("cad_empty_mass_property", "assembly has no root component")
         if not isinstance(selections, dict) or not selections:
@@ -4073,11 +4123,12 @@ class SolidWorksBackend(CadBackend):
         """
 
         doc = self._document_by_path(path)
-        if _method(doc, "GetType") != 2:
+        if _native_document_type(doc) != 2:
             raise CadError("cad_not_assembly", "component mass context requires a saved SLDASM")
         document_path = str(_method(doc, "GetPathName"))
         _manager, configuration, configuration_name = _configuration_context(doc)
         root = _component(_method(configuration, "GetRootComponent3", True))
+        _require_valid_component_tree(doc)
         if root is None:
             raise CadError("cad_empty_mass_property", "assembly mass context has no root component")
         import pythoncom
@@ -4266,14 +4317,20 @@ class SolidWorksBackend(CadBackend):
                     if not isinstance(component, str) or component not in self._components:
                         raise CadError("cad_missing_component", str(component))
                     with self._current_components("axis_reference"):
-                        key, _configuration_name = self._source_components[component]
-                        doc = self._captured_document(key, component, "axis_reference")
+                        key, referenced = self._source_components[component][:2]
+                    self._captured_document(key, component, "axis_reference")
+                    with _temporary_configuration(
+                        lambda: self._document_by_path(self._source_documents[key][0]),
+                        referenced,
+                        component,
+                    ) as (doc, _previous):
+                        reading = _capture_reference_axis_raw(doc, name, component, reference)
+                        doc = None
+                    self._captured_document(key, component, "axis_reference")
                 else:
                     doc = self._captured_document(self._scene_document_key, phase="axis_reference")
-                return {
-                    **raw,
-                    **_capture_reference_axis_raw(doc, name, str(component or ""), reference),
-                }
+                    reading = _capture_reference_axis_raw(doc, name, "", reference)
+                return {**raw, **reading}
             except Exception as error:  # noqa: BLE001 - raw failure is projected offline
                 raw["read_errors"]["document"] = _native_error_record(error)
                 return raw
@@ -4433,11 +4490,12 @@ class SolidWorksBackend(CadBackend):
         """
 
         doc = self._document_by_path(path)
-        if _method(doc, "GetType") != 2:
+        if _native_document_type(doc) != 2:
             raise CadError("cad_not_assembly", "group mass reader requires a saved SLDASM")
         document_path = str(_method(doc, "GetPathName"))
         _manager, configuration, configuration_name = _configuration_context(doc)
         root = _component(_method(configuration, "GetRootComponent3", True))
+        _require_valid_component_tree(doc)
         if root is None:
             raise CadError("cad_empty_mass_property", "assembly has no root component")
         wanted = {str(name) for name in names}
@@ -4596,7 +4654,6 @@ class SolidWorksBackend(CadBackend):
             reading["part_measurement_raw"] = _raw_mass_fact(part_reading)
         return reading
 
-
     def _sheet_only_instance_fallback(self, occurrence, assembly_path, name, referenced, error, counts):
         """Effective CAD-authored instance measurement for a proven sheet-only occurrence.
 
@@ -4661,6 +4718,186 @@ class SolidWorksBackend(CadBackend):
             "read_errors": copy.deepcopy(reading.get("read_errors") or {}),
         }
 
+    def _read_context_occurrences(self, doc_path, source_root, *, on_activity=None):
+        """Extract primitives from the main assembly instance tree without selecting configurations."""
+        doc = self._document_by_path(doc_path)
+        _manager, configuration = _active_configuration_view(doc)
+        main_configuration = _property(configuration, "Name")
+        if not _is_text_name(main_configuration):
+            raise CadError("cad_configuration_missing", "the main assembly configuration is unreadable")
+        root = _component(_method(configuration, "GetRootComponent3", True))
+        _require_valid_component_tree(doc)
+        if root is None:
+            raise CadError("cad_component_tree_invalid", "the native assembly root is unavailable")
+        pid = int(_method(self._app_obj(), "GetProcessID"))
+        rows, unresolved, borrowed = [], [], []
+        stack = [
+            (child, "", str(doc_path), str(doc_path), None, (normalize_document_path(str(doc_path)),))
+            for child in reversed(list(_method(root, "GetChildren") or ()))
+        ]
+        names = set()
+        try:
+            while stack:
+                raw, parent, defining, owner, anchor, ancestors = stack.pop()
+                component = _component(raw)
+                borrowed.append(component)
+                state = _component_state(component)
+                raw_name = _property(component, "Name2")
+                if not _is_text_name(raw_name):
+                    raise CadError(
+                        "cad_component_identity_unreadable",
+                        "a component has no readable Name2",
+                        {"raw_name": _raw_scalar(raw_name)},
+                    )
+                name = raw_name if not parent or raw_name.startswith(parent + "/") else f"{parent}/{raw_name}"
+                if name in names:
+                    raise CadError(
+                        "cad_component_identity_ambiguous", "native occurrences repeat an identity", {"component": name}
+                    )
+                names.add(name)
+                if on_activity is not None:
+                    on_activity(name)
+                path = _method(component, "GetPathName")
+                loaded = _component_document(component)
+                if state != COMPONENT_SUPPRESSED and loaded is None:
+                    raise CadError(
+                        "cad_component_unresolved", "an active occurrence has no loaded document", {"component": name}
+                    )
+                if state == COMPONENT_SUPPRESSED and not path:
+                    reference = _require_missing_component(component, name, path)
+                    unresolved.append(
+                        {
+                            "instance": name,
+                            "native_reference": {
+                                **reference,
+                                "defining": _relative_document(defining, source_root) or str(defining),
+                                "defining_anchor": anchor,
+                                "native_owner": _relative_document(owner, source_root) or str(owner),
+                            },
+                            "document": "",
+                            "configuration": str(_property(component, "ReferencedConfiguration") or ""),
+                            "suppression_state": state,
+                            "reason": "solidworks_returned_no_loaded_document"
+                            if loaded is None
+                            else "solidworks_returned_no_readable_file",
+                        }
+                    )
+                    continue
+                source = _component_source_document(component, source_root, native_path=path)
+                provenance = source.get("source_provenance")
+                if provenance is not None:
+                    provenance.update(
+                        owner=_relative_document(owner, source_root) or normalize_document_path(str(owner)),
+                        owner_sha256=_hash(str(owner)) if os.path.isfile(_filesystem_path(Path(owner))) else None,
+                        occurrence=name,
+                        native_api_pid=pid,
+                        defining_anchor=anchor,
+                        defining_document=_relative_document(defining, source_root)
+                        or normalize_document_path(str(defining)),
+                    )
+                referenced = _property(component, "ReferencedConfiguration")
+                if state != COMPONENT_SUPPRESSED and not _is_text_name(referenced):
+                    raise CadError(
+                        "cad_component_configuration_unreadable",
+                        "an occurrence has no referenced configuration",
+                        {"component": name},
+                    )
+                if provenance is not None:
+                    provenance["configuration"] = referenced
+                document_type = None
+                baseline = None
+                if loaded is not None:
+                    kind = _native_document_type(loaded, name)
+                    document_type = "part" if kind == 1 else "assembly"
+                    baseline = _active_configuration(loaded)
+                    self._record_save_flag(loaded, path)
+                transform, transform_error = [], None
+                if state != COMPONENT_SUPPRESSED:
+                    try:
+                        transform = self._placement(component)
+                        _shared_transform(transform)
+                    except Exception as error:
+                        transform_error = _native_error_record(error)
+                fixed, fixed_error = None, None
+                try:
+                    fixed = _method(component, "IsFixed")
+                    if type(fixed) is not bool:
+                        raise CadError(
+                            "cad_component_fixed_invalid",
+                            "IComponent2.IsFixed did not return bool",
+                            {"value_type": type(fixed).__name__},
+                        )
+                except Exception as error:
+                    fixed = None
+                    fixed_error = _native_error_record(error)
+                row = {
+                    "name2": name,
+                    "instance_id": name,
+                    "native_reference": {
+                        **source["native_reference"],
+                        "name2": raw_name,
+                        "defining": _relative_document(defining, source_root) or str(defining),
+                        "defining_anchor": anchor,
+                        "native_owner": _relative_document(owner, source_root) or str(owner),
+                    },
+                    "document": source["document"] or normalize_document_path(str(path)),
+                    "configuration": referenced,
+                    "fixed": fixed,
+                    "fixed_error": fixed_error,
+                    "suppressed": state == COMPONENT_SUPPRESSED,
+                    "suppression_state": state,
+                    "lightweight": state in (1, 4),
+                    "transform_raw": transform,
+                    "parent_occurrence": parent,
+                    "document_type": document_type,
+                    "defining_anchor": anchor,
+                    "solver_observation": _solver_observation(
+                        component, str(doc_path), source_root, configuration=main_configuration, scope=""
+                    ),
+                }
+                if provenance is not None:
+                    row["source_provenance"] = provenance
+                rows.append(
+                    {
+                        "record": row,
+                        "path": path,
+                        "loaded": loaded is not None,
+                        "baseline_configuration": baseline,
+                        "transform_error": transform_error,
+                    }
+                )
+                if state != COMPONENT_SUPPRESSED:
+                    children = list(_method(component, "GetChildren") or ())
+                    if document_type == "part" and children:
+                        raise CadError("cad_component_type", "a native part contains occurrences", {"component": name})
+                    key = normalize_document_path(str(path))
+                    if document_type == "assembly" and key in ancestors:
+                        raise CadError(
+                            "cad_reference_cycle", "an assembly repeats an ancestor document", {"component": name}
+                        )
+                    session_document = (
+                        isinstance(provenance, dict)
+                        and provenance.get("state")
+                        in {"cached_materialization", "embedded_virtual_component"}
+                    )
+                    child_owner = (
+                        owner if session_document else (path if _relative_document(path, source_root) else owner)
+                    )
+                    child_anchor = name if session_document else anchor
+                    stack.extend(
+                        (child, name, path, child_owner, child_anchor, (*ancestors, key))
+                        for child in reversed(children)
+                    )
+            return rows, unresolved
+        except Exception as error:
+            error.partial_occurrence_context = {
+                "occurrences": copy.deepcopy(rows), "unresolved_components": copy.deepcopy(unresolved)
+            }
+            raise
+        finally:
+            borrowed.clear()
+            stack.clear()
+            raw = component = loaded = children = root = configuration = _manager = doc = None
 
     def collect_prepared_scene(
         self,
@@ -4671,8 +4908,11 @@ class SolidWorksBackend(CadBackend):
         require_material=True,
         expected_session_sources: Mapping[str, str] | None = None,
         native_files: Mapping[str, str] | None = None,
+        expected_occurrences=None,
     ):
         facts = {}
+        context_rows = None
+        unresolved_components = []
         try:
             activity = _ActivityEmitter(on_activity)
             if self._prepared_capture_root is None:
@@ -4713,7 +4953,7 @@ class SolidWorksBackend(CadBackend):
 
             note("prepare_capture", current_object=_activity_object(doc_path), force=True)
             doc = self._document_by_path(doc_path)
-            if _method(doc, "GetType") != 2:
+            if _native_document_type(doc) != 2:
                 raise CadError("cad_not_assembly", "export requires a saved SLDASM")
             document, configuration = _capture_document_identity(
                 doc,
@@ -4749,7 +4989,6 @@ class SolidWorksBackend(CadBackend):
             self._components = set()
             self._source_components = {}
             self._source_provenance = {}
-            self._source_scope_overrides = {}
             self._source_documents = {}
             self._scene_source_root = source_root
             self._session_document_paths = {}
@@ -4758,6 +4997,7 @@ class SolidWorksBackend(CadBackend):
             self.notes = {}
             facts = {
                 "scene_raw": {
+                    "transform_frame": NATIVE_TRANSFORM_FRAME,
                     "document": str(document),
                     "configuration": configuration,
                     "occurrences": None,
@@ -4773,12 +5013,7 @@ class SolidWorksBackend(CadBackend):
             }
             _manager, config = _active_configuration_view(doc)
             self._scene_document_key = self._record_source_document(doc_path, str(_property(config, "Name")))
-            root = _component(_method(config, "GetRootComponent3", True))
-            stack = [
-                (component, doc_path, doc_path, None)
-                for component in list(_method(root, "GetChildren") or ())
-            ]
-            borrowed_components = []
+            _manager = config = doc = None
             occurrences = []
             leaf_components = []
             properties = {}
@@ -4846,58 +5081,23 @@ class SolidWorksBackend(CadBackend):
                     coordinate_system_rows[key] = record
                     found_datums.add(datum)
 
-            record_datums(doc, "", None)
-            while stack:
-                raw_component, defining_path, owner_path, anchor = stack.pop()
-                comp = _component(raw_component)
-                suppression_state = _measured_component_state(comp)
-                if suppression_state == COMPONENT_SUPPRESSED:
+            context_rows, unresolved_components = self._read_context_occurrences(
+                doc_path,
+                source_root,
+                on_activity=lambda name: note("walk", current_object=_activity_object(name)),
+            )
+            if expected_occurrences is not None:
+                from .occurrence_context import compare_occurrence_context
+
+                compare_occurrence_context(
+                    expected_occurrences, [entry["record"] for entry in context_rows], native_files=frozen_native_files
+                )
+            for entry in context_rows:
+                row = entry["record"]
+                if row["suppressed"]:
                     continue
-                borrowed_components.append(comp)
-                raw_name = _property(comp, "Name2")
-                if not isinstance(raw_name, str) or not raw_name.strip():
-                    raise CadError(
-                        "cad_component_identity_unreadable",
-                        "a component has no readable Name2",
-                        {"raw_name": repr(raw_name)},
-                    )
-                name = raw_name
-                note("walk", current_object=_activity_object(name))
-                path = _method(comp, "GetPathName")
-                part = _component_document(comp)
-                if part is None:
-                    raise CadError("cad_component_unresolved", name)
-                # SetReadOnlyState can change native state. Defer it until the
-                # occurrence tree has been captured as primitives and released;
-                # phase-two document acquisition enforces read-only before reads.
-                if not path or not os.path.isfile(_filesystem_path(Path(path))):
-                    # Without a file on disk there is no revision to hash or copy, so the
-                    # snapshot could not name what it read.
-                    raise CadError("cad_component_not_on_disk", name, {"component": name, "path": path})
-                source_document = _component_source_document(comp, source_root, native_path=path)
-                provenance = source_document.get("source_provenance")
-                if provenance is not None:
-                    owner_relative = _relative_document(
-                        owner_path,
-                        source_root,
-                    )
-                    provenance["owner"] = (
-                        owner_relative
-                        or normalize_document_path(str(owner_path))
-                    )
-                    provenance["owner_sha256"] = (
-                        _hash(str(owner_path))
-                        if os.path.isfile(_filesystem_path(Path(owner_path)))
-                        else None
-                    )
-                    provenance["occurrence"] = name
-                    provenance["native_api_pid"] = native_api_pid
-                    provenance["defining_anchor"] = anchor
-                    provenance["defining_document"] = (
-                        _relative_document(defining_path, source_root)
-                        or normalize_document_path(str(defining_path))
-                    )
-                    self._source_provenance[name] = provenance
+                name, path, referenced = row["name2"], entry["path"], row["configuration"]
+                provenance = row.get("source_provenance")
                 session_document = (
                     isinstance(provenance, dict)
                     and provenance.get("state")
@@ -4906,24 +5106,17 @@ class SolidWorksBackend(CadBackend):
                 if provenance is not None and not session_document:
                     raise CadError(
                         "cad_component_source_unread",
-                        "a component did not resolve to a delivered file or an admitted session document",
-                        {"component": name, "path": path, "source_provenance": provenance},
+                        "the native occurrence source is unbound",
+                        {"component": name, "source_provenance": provenance},
                     )
-                self._record_save_flag(part, path)
-                referenced = _property(comp, "ReferencedConfiguration")
-                if not isinstance(referenced, str) or not referenced.strip():
-                    raise CadError(
-                        "cad_component_configuration_unreadable",
-                        "a component has no readable ReferencedConfiguration",
-                        {"component": name, "raw_value": repr(referenced)},
-                    )
-                if isinstance(provenance, dict):
-                    provenance["configuration"] = str(referenced)
+                if not path or not os.path.isfile(_filesystem_path(Path(path))):
+                    # Without a file on disk there is no revision to hash or copy, so the
+                    # snapshot could not name what it read.
+                    raise CadError("cad_component_not_on_disk", name, {"component": name, "path": path})
+                if provenance is not None:
+                    self._source_provenance[name] = provenance
                 expected_source = expected_sources.get(name)
-                if (
-                    isinstance(provenance, dict)
-                    and provenance.get("state") == "cached_materialization"
-                ):
+                if isinstance(provenance, dict) and provenance.get("state") == "cached_materialization":
                     if not expected_source or not current_session_source_matches(
                         provenance,
                         expected_source,
@@ -4932,99 +5125,33 @@ class SolidWorksBackend(CadBackend):
                     ):
                         raise CadError(
                             "cad_cached_materialization_identity_mismatch",
-                            "a cached materialization does not match the sealed stable identity in the current session",
-                            {
-                                "component": name,
-                                "expected_sha256": expected_source,
-                                "source_provenance": provenance,
-                                "native_api_pid": native_api_pid,
-                            },
+                            "a cached materialization differs from its sealed identity",
+                            {"component": name},
                         )
                     matched_expected_sources.add(name)
                 elif expected_source is not None:
                     raise CadError(
                         "cad_cached_materialization_identity_mismatch",
                         "a sealed cached occurrence did not remain a cached materialization",
-                        {"component": name, "expected_sha256": expected_source, "source_provenance": provenance},
+                        {"component": name},
                     )
-                # Configuration changes can invalidate borrowed occurrence interfaces.
-                # Finish the assembly traversal using primitives before any selection.
-                children = list(_method(comp, "GetChildren") or ())
-                try:
-                    placement = self._placement(comp)
-                except CadError as error:
-                    placement = None
-                    self.notes["transform_error:" + name] = {
-                        "code": error.code,
-                        "message": error.message,
-                        "detail": error.detail,
-                    }
-                if children:
-                    if _method(part, "GetType") != 2:
-                        raise CadError("cad_component_type", name)
-                    document_type = "assembly"
-                    if (
-                        session_document
-                        and provenance is not None
-                        and provenance.get("state") == "cached_materialization"
-                    ):
-                        child_owner_path = owner_path
-                        child_anchor = name
-                    else:
-                        child_owner_path = (
-                            path
-                            if _relative_document(path, source_root)
-                            else owner_path
-                        )
-                        child_anchor = anchor
-                    stack.extend(
-                        (child, path, child_owner_path, child_anchor)
-                        for child in children
-                    )
-                else:
-                    if _method(part, "GetType") != 1:
-                        raise CadError("cad_empty_subassembly", name)
-                    document_type = "part"
-                    body_counts = {"solid": None, "sheet": None}
-                    body_count_errors = {}
-                    for body_type, kind in ((0, "solid"), (1, "sheet")):
-                        try:
-                            body_counts[kind] = self._body_count(comp, body_type, name)
-                        except CadError as error:
-                            body_count_errors[kind] = _native_error_record(error)
-                    self.notes["bodies:" + name] = {
-                        **body_counts,
-                        "errors": body_count_errors,
-                    }
-                fixed = None
-                fixed_error = None
-                try:
-                    fixed = _method(comp, "IsFixed")
-                except Exception as error:  # noqa: BLE001 - preserve the getter failure
-                    fixed_error = _native_error_record(error)
-                else:
-                    if type(fixed) is not bool:
-                        fixed_error = {
-                            "code": "cad_component_fixed_invalid",
-                            "message": "IComponent2.IsFixed did not return bool",
-                            "detail": {"value_type": type(fixed).__name__},
-                        }
-                document_key = self._record_source_document(
-                    path,
-                    _active_configuration(part),
-                    session_document=session_document,
+                key = self._record_source_document(
+                    path, entry["baseline_configuration"], session_document=session_document
                 )
-                self._source_components[name] = (document_key, str(referenced))
+                self._source_components[name] = (key, referenced, row)
+                if entry["transform_error"] is not None:
+                    self.notes["transform_error:" + name] = entry["transform_error"]
                 occurrences.append(
                     {
                         "name": name,
                         "path": path,
-                        "transform_raw": copy.deepcopy(placement),
-                        "referenced_configuration": str(referenced),
-                        "suppression_state": suppression_state,
-                        "is_fixed": fixed,
-                        "is_fixed_error": fixed_error,
-                        "document_type": document_type,
+                        "transform_raw": row["transform_raw"],
+                        "referenced_configuration": referenced,
+                        "suppression_state": row["suppression_state"],
+                        "is_fixed": row["fixed"],
+                        "is_fixed_error": row["fixed_error"],
+                        "document_type": row["document_type"],
+                        "parent_occurrence": row["parent_occurrence"],
                     }
                 )
 
@@ -5035,8 +5162,21 @@ class SolidWorksBackend(CadBackend):
                     "a sealed cached occurrence is absent or did not rematerialize in the current session",
                     {"components": unexpected_sources},
                 )
-            borrowed_components.clear()
-            raw_component = defining_path = owner_path = anchor = comp = children = part = root = stack = None
+            with self._current_components("body_counts") as current:
+                for occurrence in occurrences:
+                    name = occurrence["name"]
+                    _measured_component_state(current[name])
+                    if occurrence["document_type"] != "part":
+                        continue
+                    counts = {"solid": None, "sheet": None, "errors": {}}
+                    for body_type, label in ((0, "solid"), (1, "sheet")):
+                        try:
+                            counts[label] = self._body_count(current[name], body_type, name)
+                        except CadError as error:
+                            counts["errors"][label] = _native_error_record(error)
+                    self.notes["bodies:" + name] = counts
+            current = None
+            record_datums(self._document_by_path(doc_path), "", None)
             note("walk", completed=len(occurrences), total=len(occurrences), force=True)
             for index, occurrence in enumerate(occurrences, start=1):
                 name, path = occurrence["name"], occurrence["path"]
@@ -5172,6 +5312,13 @@ class SolidWorksBackend(CadBackend):
         except Exception as error:
             if facts:
                 snapshot = copy.deepcopy(facts)
+                observed_context = (
+                    {"occurrences": context_rows, "unresolved_components": unresolved_components}
+                    if context_rows is not None
+                    else getattr(error, "partial_occurrence_context", None)
+                )
+                if observed_context is not None:
+                    snapshot["notes"]["native_occurrence_context"] = copy.deepcopy(observed_context)
                 snapshot["notes"]["save_flags"] = copy.deepcopy(self.save_flags)
                 snapshot["notes"]["save_flag_errors"] = copy.deepcopy(self.save_flag_errors)
                 error.partial_native_facts = snapshot
@@ -6228,7 +6375,7 @@ class SolidWorksBackend(CadBackend):
                 component,
                 "appearance",
             )
-            document_type = _method(document, "GetType")
+            document_type = _native_document_type(document, component)
             document_path = _method(document, "GetPathName")
             if (
                 document_type != 1
@@ -6841,9 +6988,6 @@ class SolidWorksBackend(CadBackend):
     def _component_source_scope(self, component):
         """Bind the occurrence's exact source identity and virtual owner path."""
 
-        override = self._source_scope_overrides.get(component)
-        if override is not None:
-            return dict(override)
         configured = self._source_components.get(component)
         if configured is None:
             return None
@@ -6975,7 +7119,6 @@ class SolidWorksBackend(CadBackend):
             scopes[component] = scope
         return scopes
 
-
     def _record_source_document(self, path, configuration, *, session_document=False):
         role = self._role_for_path(path)
         key = (role, normalize_document_path(os.path.abspath(path)))
@@ -7046,6 +7189,7 @@ class SolidWorksBackend(CadBackend):
         try:
             _manager, config = _active_configuration_view(doc)
             root = _component(_method(config, "GetRootComponent3", True))
+            _require_valid_component_tree(doc)
             if root is None:
                 raise ValueError("the assembly has no readable root component")
             stack = list(_method(root, "GetChildren") or ())
@@ -7062,8 +7206,17 @@ class SolidWorksBackend(CadBackend):
                     raise CadError(
                         "cad_source_changed", "the active occurrence identities changed", {"component": name}
                     )
-                document_key, referenced = self._source_components[name]
+                document_key, referenced, captured = self._source_components[name]
                 expected_path = self._source_documents[document_key][0]
+                native_document = _component_document(comp)
+                native_type = _native_document_type(native_document, name)
+                if not document_paths_match(_method(native_document, "GetPathName"), expected_path):
+                    raise CadError("cad_source_changed", "native occurrence document changed", {"component": name})
+                if (
+                    state != captured["suppression_state"]
+                    or native_type != ({"part": 1, "assembly": 2}[captured["document_type"]])
+                ):
+                    raise CadError("cad_source_changed", "native occurrence state or type changed", {"component": name})
                 occurrence = {
                     "path": _method(comp, "GetPathName"),
                     "referenced_configuration": _property(comp, "ReferencedConfiguration"),
@@ -7100,7 +7253,6 @@ class SolidWorksBackend(CadBackend):
         if missing:
             raise CadError("cad_source_changed", "active occurrences disappeared", {"missing": missing, "path": path})
         yield current
-
 
     # -- freeze support ---------------------------------------------------
 
@@ -7142,7 +7294,6 @@ class SolidWorksBackend(CadBackend):
                 )
         return facts
 
-
     def _ensure_document(self, path):
         """Return an open document, opening it read-only when needed."""
 
@@ -7155,7 +7306,6 @@ class SolidWorksBackend(CadBackend):
                 raise
         self.open_document(path)
         return self._document_by_path(path)
-
 
     def _record_save_flag(self, doc, path):
         """Record what SolidWorks says about saving; never decide a capture by it.
@@ -7189,7 +7339,6 @@ class SolidWorksBackend(CadBackend):
                     "message": "GetSaveFlag did not return bool",
                     "detail": {"value_type": type(value).__name__, "value": repr(value)},
                 }
-
 
     def document_state(self, path):
         """Saved state plus configuration facts; never saves anything itself.
@@ -7257,9 +7406,6 @@ class SolidWorksBackend(CadBackend):
         state["lightweight"] = None
         state["unsupported"] = ["lightweight"]
         return state
-
-
-
 
     @contextmanager
     def _discover_session(self, source_root, source_files):
@@ -7363,7 +7509,7 @@ class SolidWorksBackend(CadBackend):
 
         Opens the immutable engineering directory read-only inside this
         process's owned session and records the primitives discovery needs:
-        identity properties, the component graph with local ``transform_raw``
+        identity properties, the component graph with top-assembly ``transform_raw``
         and parent occurrences, mate reference identity with raw
         ``EntityParams``, local coordinate-system arrays, materials and per-document
         hashes.  Every read fails closed; nothing is defaulted.  The delivered
@@ -7407,8 +7553,8 @@ class SolidWorksBackend(CadBackend):
         the configuration-bound ``IComponent2.Solving`` (family
         ``swComponentSolvingOption_e``) and ``IComponent2.GetConstrainedStatus``
         (family ``swConstrainedStatus_e``) readings, each with its method
-        provenance, plus the defining document, its configuration and the
-        occurrence scope the reading was taken in — distinct from the
+        provenance, plus the main acquisition document, its configuration and the
+        acquisition scope the reading was taken in — distinct from the
         occurrence's referenced child configuration and from ``IsFixed``.
         These readings are diagnostics for unproven bodies: they change no
         grouping, mass, axis, limit or gate derivation, and an unavailable or
@@ -7488,7 +7634,6 @@ class SolidWorksBackend(CadBackend):
         source_files = package_inventory(source_root)
         activity.emit("session_start", force=True)
         with self._discover_session(source_root, source_files) as observation:
-            native_api_pid = int(_method(self._app_obj(), "GetProcessID"))
             # Exactly the selected frozen entry is opened; zero or several
             # assemblies already failed before this session started.
             activity.emit("open_document", current_object=_activity_object(selected_path, source_root), force=True)
@@ -7540,570 +7685,358 @@ class SolidWorksBackend(CadBackend):
             activity.emit("read_properties", current_object=_activity_object(main_path, source_root), force=True)
             identity_properties = _custom_properties(doc, configuration)
             doc = active = None
-            components = []
-            unresolved_components = []
-            by_component = {}
-            owner_hashes: dict[str, str] = {}
-            mates: list[dict] = []
-            components_total = 0
-            components_done = 0
-            mates_total = 0
-            mates_done = 0
-            stack = [
-                (
-                    str(main_path),
-                    "",
-                    configuration,
-                    (normalize_document_path(str(main_path)),),
-                    None,
-                    str(main_path),
-                )
+            context_rows, unresolved_components = self._read_context_occurrences(
+                str(main_path),
+                source_root,
+                on_activity=lambda name: activity.emit("read_components", current_object=_activity_object(name)),
+            )
+            components = [entry["record"] for entry in context_rows]
+            activity.emit("read_components", completed=len(components), total=len(components), force=True)
+            by_component = {entry["record"]["name2"]: (entry["path"], entry["loaded"]) for entry in context_rows}
+            for entry in context_rows:
+                if entry["transform_error"] is not None:
+                    notes.append(f"transform:{entry['record']['name2']}:{entry['transform_error']}")
+                provenance = entry["record"].get("source_provenance")
+                if provenance is not None:
+                    self._source_provenance[entry["record"]["name2"]] = provenance
+            scopes = [(str(main_path), "", configuration)] + [
+                (entry["path"], entry["record"]["name2"], entry["record"]["configuration"])
+                for entry in context_rows
+                if not entry["record"]["suppressed"] and entry["record"]["document_type"] == "assembly"
             ]
-            while stack:
-                (
-                    assembly_path,
-                    prefix,
-                    referenced_configuration,
-                    ancestor_paths,
-                    anchor,
-                    owner_path,
-                ) = stack.pop()
+            context_rows = None
+            mates = []
+            mates_done = mates_total = 0
+            for assembly_path, prefix, referenced_configuration in scopes:
                 activity.emit("open_document", current_object=_activity_object(assembly_path, source_root))
-                assembly = self._document_by_path(assembly_path)
-                activity.emit(
-                    "select_configuration",
-                    current_object=_activity_object(assembly_path, source_root),
-                    params={"configuration": str(referenced_configuration or "")},
-                )
-                _select_configuration(assembly, referenced_configuration, prefix or "assembly")
-                _manager, active_config = _active_configuration_view(assembly)
-                root = _component(_method(active_config, "GetRootComponent3", True))
-                root_children = list(_method(root, "GetChildren") or [])
-                components_total += len(root_children)
-                for raw in root_children:
-                    component = _component(raw)
-                    raw_name = _property(component, "Name2")
-                    if not _is_text_name(raw_name):
-                        raise CadError(
-                            "cad_component_identity_unreadable",
-                            "a component has no readable Name2",
-                            {"raw_name": _raw_scalar(raw_name)},
-                        )
-                    name = str(raw_name)
-                    # The scoped instance identity must be byte-identical to the
-                    # selection walk's stitching rule so the
-                    # closure carrier's occurrence strings compare exactly.
-                    path_name = name if not prefix or name.startswith(prefix + "/") else f"{prefix}/{name}"
-                    if path_name in by_component:
-                        raise CadError(
-                            "cad_component_identity_ambiguous",
-                            "two native occurrences have the same scoped identity",
-                            {"component": path_name, "configuration": referenced_configuration},
-                        )
-                    activity.emit(
-                        "read_components",
-                        current_object=_activity_object(path_name),
-                        completed=components_done,
-                        total=components_total,
-                    )
-                    # Read the documented suppression state before any path, model or
-                    # mass traversal: a mismatched internal-ID binding must refuse the
-                    # capture, not be silently traversed as a resolved occurrence.
-                    state = _component_state(component)
-                    document_path = _method(component, "GetPathName")
-                    reference_context = {
-                        "defining": _relative_document(assembly_path, source_root) or str(assembly_path),
-                        "defining_anchor": anchor,
-                        "native_owner": _relative_document(owner_path, source_root) or str(owner_path),
-                    }
-                    loaded_document = _method(component, "GetModelDoc2")
-                    if state != COMPONENT_SUPPRESSED and loaded_document is None:
-                        raise CadError(
-                            "cad_component_unresolved",
-                            "an active occurrence has no loaded document for required engineering facts",
-                            {"component": path_name, "path": document_path, "suppression_state": state},
-                        )
-                    if (
-                        open_status["errors"] == 2 and state == COMPONENT_SUPPRESSED
-                        and document_path in (None, "")
-                    ):
-                        reference = _require_missing_component(component, path_name, document_path)
-                        unresolved_components.append(
-                            {
-                                "instance": path_name,
-                                "native_reference": {**reference, **reference_context},
-                                "document": (
-                                    normalize_document_path(str(document_path))
-                                    if _is_text_name(document_path)
-                                    else ""
-                                ),
-                                "configuration": str(
-                                    _property(component, "ReferencedConfiguration") or ""
-                                ),
-                                "suppression_state": state,
-                                "reason": (
-                                    "solidworks_returned_no_loaded_document"
-                                    if loaded_document is None
-                                    else "solidworks_returned_no_readable_file"
-                                ),
-                            }
-                        )
-                        components_done += 1
-                        continue
-                    source_document = _component_source_document(component, source_root, native_path=document_path)
-                    # The native materialization identity is recorded inside
-                    # source_provenance. Reading it from the outer record would
-                    # make cached descendants lose their defining anchor.
-                    source_provenance = source_document.get("source_provenance") or {}
-                    materialization_path = source_provenance.get("materialization_path")
-                    materialized = bool(materialization_path) and (
-                        session_materialization_path(materialization_path)
-                        or (
-                            source_provenance.get("state") == "embedded_virtual_component"
-                            and embedded_virtual_component_path(materialization_path)
-                        )
-                    )
-                    anchor_for_children = path_name if materialized else anchor
-                    # Ultimate native owner: the nearest ancestor delivered
-                    # document that owns this occurrence's subtree; nested
-                    # materialization descendants inherit it unchanged.
-                    child_owner_path = owner_path
-                    if not materialized:
-                        child_relative = _relative_document(document_path, source_root)
-                        if child_relative:
-                            child_owner_path = str(Path(source_root) / child_relative)
-                    provenance = source_document.get("source_provenance")
-                    if provenance is not None:
-                        provenance["native_api_pid"] = native_api_pid
-                        owner_relative = _relative_document(owner_path, source_root)
-                        if not owner_relative:
-                            owner_relative = normalize_document_path(str(owner_path))
-                        try:
-                            if owner_path not in owner_hashes:
-                                owner_hashes[owner_path] = _hash(str(owner_path))
-                            provenance["owner_sha256"] = owner_hashes[owner_path]
-                        except Exception as error:  # noqa: BLE001 - an unreadable owner hash stays explicit
-                            provenance["owner_sha256"] = None
-                            provenance["owner_sha256_error"] = f"{type(error).__name__}: {error}"[:200]
-                        provenance["occurrence"] = path_name
-                        provenance["owner"] = owner_relative
-                        provenance["defining_anchor"] = anchor
-                        self._source_provenance[path_name] = provenance
-                    local_transform_raw = []
-                    # Mechanical placement is the fixed False form only; the True
-                    # form includes the presentation transform and must never
-                    # become an alternate mechanical reading.
-                    transform_error = "GetTotalTransform(False) returned no transform data"
+                with _temporary_configuration(
+                    lambda path=assembly_path: self._document_by_path(path),
+                    referenced_configuration,
+                    prefix or "assembly",
+                ) as (assembly, _previous):
                     try:
-                        holder = _method(component, "GetTotalTransform", False)
-                        raw_values = _property(holder, "ArrayData")
-                        # Lossless shape validation remains inside the owned
-                        # session because its result decides whether children
-                        # can be read. The normalized world view is derived on
-                        # Linux from this preserved local array.
-                        transform_from_solidworks(raw_values)
-                        local_transform_raw = [float(value) for value in raw_values]
-                    except Exception as error:  # noqa: BLE001 - an unreadable transform must block, not guess
-                        transform_error = f"GetTotalTransform(False): {error}"
-                    else:
-                        if local_transform_raw:
-                            transform_error = ""
-                    if not local_transform_raw:
-                        notes.append(f"transform:{path_name}:{transform_error}")
-                    fixed = None
-                    fixed_error = None
-                    try:
-                        fixed = _method(component, "IsFixed")
-                    except Exception as error:  # noqa: BLE001 - preserve the getter failure
-                        fixed_error = _native_error_record(error)
-                    else:
-                        if type(fixed) is not bool:
-                            fixed_error = {
-                                "code": "cad_component_fixed_invalid",
-                                "message": "IComponent2.IsFixed did not return bool",
-                                "detail": {
-                                    "value_type": type(fixed).__name__,
-                                    "value": repr(fixed),
-                                },
-                            }
-                            fixed = None
-                    entry = {
-                        "name2": path_name,
-                        "instance_id": path_name,
-                        "native_reference": {**source_document["native_reference"], **reference_context},
-                        "document": source_document["document"]
-                        or (normalize_document_path(str(document_path)) if _is_text_name(document_path) else ""),
-                        "configuration": str(_property(component, "ReferencedConfiguration") or ""),
-                        "fixed": fixed,
-                        "fixed_error": fixed_error,
-                        "suppressed": state == COMPONENT_SUPPRESSED,
-                        "suppression_state": state,
-                        "lightweight": state in (1, 4),
-                        "transform_raw": local_transform_raw,
-                        "parent_occurrence": prefix,
-                    }
-                    if (
-                        isinstance(provenance, dict)
-                        and provenance.get("state") == "cached_materialization"
-                    ):
-                        provenance["configuration"] = entry["configuration"]
-                    if "source_provenance" in source_document:
-                        entry["source_provenance"] = source_document["source_provenance"]
-                    entry["defining_anchor"] = anchor
-                    entry["solver_observation"] = _solver_observation(
-                        component,
-                        assembly_path,
-                        source_root,
-                        configuration=referenced_configuration,
-                        scope=prefix,
-                    )
-                    components.append(entry)
-                    # Keep primitives beyond this traversal scope. Later
-                    # configuration changes must not reuse borrowed occurrences.
-                    by_component[path_name] = (str(document_path), loaded_document is not None)
-                    children = list(_method(component, "GetChildren") or [])
-                    if children:
-                        if not local_transform_raw:
-                            # An unreadable occurrence transform leaves no frame
-                            # for its descendants: composing with an empty parent
-                            # would fabricate placement.  The subtree is skipped,
-                            # the skip is recorded, and the occurrence's own
-                            # empty transform stays a blocking native finding
-                            # downstream.
-                            notes.append(f"transform:{path_name}:subtree_skipped_unreadable_parent")
-                        part = loaded_document if local_transform_raw else None
-                        if part is not None:
-                            referenced = entry["configuration"]
-                            # A containment chain that repeats a document (an assembly
-                            # holding itself, directly or through its ancestors) is a
-                            # reference cycle: recursing would never converge and the
-                            # occurrence has no resolvable identity.
-                            document_key = normalize_document_path(str(document_path))
-                            if document_key and document_key in ancestor_paths:
-                                raise CadError(
-                                    "cad_reference_cycle",
-                                    "an assembly occurrence repeats a document in its own ancestor chain",
-                                    {"component": path_name, "document": entry["document"]},
-                                )
-                            stack.append(
-                                (
-                                    str(document_path),
-                                    path_name,
-                                    referenced,
-                                    (*ancestor_paths, document_key),
-                                    anchor_for_children,
-                                    child_owner_path,
-                                )
+                        _manager, active_config = _active_configuration_view(assembly)
+                        root = _component(_method(active_config, "GetRootComponent3", True))
+                        _require_valid_component_tree(assembly)
+                        mate_list = list(_mate_features(assembly))
+                        mates_total += len(mate_list)
+                        for feature, specific, entity_count, feature_type in mate_list:
+                            name = str(_property(feature, "Name") or "")
+                            activity.emit(
+                                "read_mates",
+                                current_object=_activity_object(name),
+                                completed=mates_done,
+                                total=mates_total,
                             )
-                    components_done += 1
-                mate_list = list(_mate_features(assembly))
-                mates_total += len(mate_list)
-                for feature, specific, entity_count, feature_type in mate_list:
-                    name = str(_property(feature, "Name") or "")
-                    activity.emit(
-                        "read_mates",
-                        current_object=_activity_object(name),
-                        completed=mates_done,
-                        total=mates_total,
-                    )
-                    if feature_type == "MateInPlace":
-                        mates.append(
-                            _inplace_mate_record(
-                                feature,
-                                specific,
-                                entity_count,
-                                scope=prefix or "",
-                                configuration=referenced_configuration,
-                            )
-                        )
-                        mates_done += 1
-                        continue
-                    try:
-                        type_index = _property(specific, "Type")
-                        if type(type_index) is not int:
-                            raise ValueError("mate type is not a native integer")
-                    except Exception as error:  # noqa: BLE001
-                        raise CadError(
-                            "cad_mate_unreadable", "mate type could not be read", {"mate": name, "error": str(error)}
-                        ) from error
-                    mate_type = _SW_MATE_TYPES.get(type_index, f"unknown-{type_index}")
-                    try:
-                        suppressed = _method(feature, "IsSuppressed")
-                        if type(suppressed) is not bool:
-                            raise ValueError("mate suppression state is not a native boolean")
-                    except Exception as error:  # noqa: BLE001
-                        raise CadError(
-                            "cad_mate_unreadable",
-                            "mate suppression state could not be read",
-                            {"mate": name, "error": str(error)},
-                        ) from error
-                    try:
-                        error_code = _method(feature, "GetErrorCode")
-                        if type(error_code) is not int:
-                            raise ValueError("mate solve state is not a native integer")
-                    except Exception as error:  # noqa: BLE001
-                        raise CadError(
-                            "cad_mate_unreadable",
-                            "mate solve state could not be read; the constraint cannot be trusted",
-                            {"mate": name, "error": str(error)},
-                        ) from error
-                    entities = []
-                    for entity_index in range(entity_count):
-                        if suppressed:
-                            continue
-                        try:
-                            entity = _interface(_method(specific, "MateEntity", entity_index), IMATEENTITY2_IID)
-                            reference = _component(_property(entity, "ReferenceComponent"))
-                            reference_full = str(_method(reference, "GetPathName") or "")
-                            reference_name = str(_property(reference, "Name2") or "")
-                            reference_configuration = _json_raw_value(
-                                _property(
-                                    reference,
-                                    "ReferencedConfiguration",
-                                )
-                            )
-                            reference_path = _relative_document(
-                                reference_full,
-                                source_root,
-                            )
-                            if (
-                                reference_path is None
-                                and _is_text_name(reference_full)
-                            ):
-                                reference_path = (
-                                    str(reference_full)
-                                    .replace("/", "\\")
-                                    .strip()
-                                )
-                            # An entity may lie on the owning assembly's own reference
-                            # geometry (assembly planes/axes): it has no component
-                            # occurrence identity and belongs to that assembly's frame.
-                            # The root object from this assembly's current configuration
-                            # is the authority; a document match alone is not proof, and
-                            # the identity must be exact (full path, Name2, IsRoot true).
-                            assembly_frame = _matches_assembly_root(
-                                reference, root, reference_full, reference_name, assembly_path
-                            )
-                            # EXEMPT (untyped multi-type return): IMateEntity2.Reference
-                            # is a VT_DISPATCH spanning multiple native geometry kinds
-                            # with no single declared view, so the generic dispatch
-                            # stays and the unambiguous GetFeature/GetSurface/GetCurve
-                            # returns are bound to their own published interfaces.
-                            target = _property(entity, "Reference")
-                        except Exception as error:  # noqa: BLE001
-                            raise CadError(
-                                "cad_mate_unreadable",
-                                "a mate entity could not be read",
-                                {"mate": name, "error": str(error)},
-                            ) from error
-                        entities.append(
-                            {
-                                "entity_index": entity_index,
-                                "reference_name": reference_name,
-                                "reference_document": reference_path,
-                                "reference_configuration": reference_configuration,
-                                "assembly_frame": bool(assembly_frame),
-                                "feature": _feature_name(target),
-                                "face_index": None,
-                                "mate_entity_reference": _mate_entity_reference(entity),
-                                **_plane_or_cylinder(target),
-                            }
-                        )
-                    limits = None
-                    is_advanced_mate = None
-                    is_advanced_mate_error = None
-                    is_advanced_mate_api = None
-                    variation_lower = None
-                    variation_upper = None
-                    if suppressed is False and error_code == 0:
-                        try:
-                            variation_lower = float(_property(specific, "MinimumVariation"))
-                            variation_upper = float(_property(specific, "MaximumVariation"))
-                        except Exception as error:  # noqa: BLE001
-                            if type_index in {5, 6}:
-                                raise CadError(
-                                    "cad_mate_limits_unreadable",
-                                    "mate travel variation could not be read",
-                                    {"mate": name, "type": mate_type, "error": str(error)},
-                                ) from error
-                    if variation_lower is not None and variation_upper is not None and (
-                        not math.isfinite(variation_lower)
-                        or not math.isfinite(variation_upper)
-                        or variation_upper < variation_lower
-                    ):
-                        raise CadError(
-                            "cad_mate_limits_invalid",
-                            "mate travel variation is not finite and ordered",
-                            {"mate": name, "lower": variation_lower, "upper": variation_upper},
-                        )
-                    if type_index not in {5, 6} and (
-                        variation_lower not in {None, 0.0} or variation_upper not in {None, 0.0}
-                    ):
-                        raise CadError(
-                            "cad_mate_limits_invalid",
-                            "a bounded range on an unsupported mate type cannot be observed",
-                            {"mate": name, "type": mate_type},
-                        )
-                    native_limit = None
-                    if suppressed is False and type_index in {5, 6} and error_code == 0:
-                        interface_prefix = "IAngle" if type_index == 6 else "IDistance"
-                        unit = "rad" if type_index == 6 else "m"
-                        names = (
-                            ("Angle", "MinimumAngle", "MaximumAngle")
-                            if type_index == 6
-                            else ("Distance", "MinimumDistance", "MaximumDistance")
-                        )
-                        try:
-                            definition = _method(feature, "GetDefinition")
-                            if definition is None:
-                                is_advanced_mate_error = "mate definition is null"
-                            else:
-                                iid = IANGLEMATEFEATUREDATA_IID if type_index == 6 else IDISTANCEMATEFEATUREDATA_IID
-                                bound = _interface(definition, iid)
-                                value = _property(bound, "IsAdvancedMate")
-                                if type(value) is bool:
-                                    is_advanced_mate = value
-                                    is_advanced_mate_api = f"{interface_prefix}MateFeatureData.IsAdvancedMate"
-                                else:
-                                    is_advanced_mate_error = f"unexpected value: {value!r}"
-                                if is_advanced_mate is True:
-                                    values = {}
-                                    for key in names:
-                                        raw_value = _property(bound, key)
-                                        parsed = float(raw_value)
-                                        if not math.isfinite(parsed):
-                                            raise ValueError(f"{key} is not finite")
-                                        values[key] = parsed
-                                    values["MinimumVariation"] = variation_lower
-                                    values["MaximumVariation"] = variation_upper
-                                    nominal, minimum, maximum = (values[key] for key in names)
-                                    lower = nominal + values["MinimumVariation"]
-                                    upper = nominal + values["MaximumVariation"]
-                                    if (
-                                        abs(lower - minimum) > 1e-12
-                                        or abs(upper - maximum) > 1e-12
-                                        or upper < lower
-                                    ):
-                                        raise ValueError("native variation and absolute limits disagree")
-                                    limits = {"lower": minimum, "upper": maximum, "unit": unit}
-                                    mate_type = "limitdistance" if type_index == 5 else "limitangle"
-                                    native_limit = {
-                                        "type_index": type_index,
-                                        "definition_interface": f"{interface_prefix}MateFeatureData",
-                                        "definition_interface_iid": iid,
-                                        "nominal_dimension": {
-                                            "value": nominal,
-                                            "api": f"{interface_prefix}MateFeatureData.{names[0]}",
-                                            "unit": unit,
-                                        },
-                                        "minimum_variation": {
-                                            "value": values["MinimumVariation"],
-                                            "api": "IMate2.MinimumVariation",
-                                            "unit": unit,
-                                        },
-                                        "maximum_variation": {
-                                            "value": values["MaximumVariation"],
-                                            "api": "IMate2.MaximumVariation",
-                                            "unit": unit,
-                                        },
-                                        "minimum_limit": {
-                                            "value": minimum,
-                                            "api": f"{interface_prefix}MateFeatureData.{names[1]}",
-                                            "unit": unit,
-                                        },
-                                        "maximum_limit": {
-                                            "value": maximum,
-                                            "api": f"{interface_prefix}MateFeatureData.{names[2]}",
-                                            "unit": unit,
-                                        },
-                                    }
-                        except Exception as error:  # noqa: BLE001
-                            is_advanced_mate_error = f"{type(error).__name__}: {error}"[:240]
-                    mate_record = {
-                        "name": name,
-                        "type": mate_type,
-                        "suppressed": suppressed,
-                        "limits": limits,
-                        "is_advanced_mate": is_advanced_mate,
-                        "is_advanced_mate_error": is_advanced_mate_error,
-                        "is_advanced_mate_api": is_advanced_mate_api,
-                        "native_limit": native_limit,
-                        "entity_count": entity_count,
-                        "entities": entities,
-                        "error_code": error_code,
-                        "scope": prefix or "",
-                        "configuration": referenced_configuration,
-                    }
-                    if mate_type == "concentric":
-                        # Documented native rotation lock (IConcentricMateFeatureData
-                        # .LockRotation, SW2019+; typelib IID {D9E1EBDD-...}): the
-                        # flag removes ONE rotational degree of freedom; a locked
-                        # concentric is not by itself rigid because axial
-                        # translation remains until another mate constrains it.
-                        # The value is read from CAD through the same GetDefinition
-                        # path the earlier manual native scripts used; it is never
-                        # inferred from any reference output.
-                        lock_rotation = None
-                        lock_rotation_api = None
-                        try:
-                            definition = _method(feature, "GetDefinition")
-                            if definition is not None:
-                                bound = _interface(definition, ICONCENTRICMATEFEATUREDATA_IID)
-                                raw_lock = _property(bound, "LockRotation")
-                                if isinstance(raw_lock, bool):
-                                    lock_rotation = raw_lock
-                                    lock_rotation_api = "IConcentricMateFeatureData.LockRotation"
-                                    notes.append(
-                                        f"mate_lock_rotation:{name}:read:IConcentricMateFeatureData.LockRotation"
+                            if feature_type == "MateInPlace":
+                                mates.append(
+                                    _inplace_mate_record(
+                                        feature,
+                                        specific,
+                                        entity_count,
+                                        scope=prefix or "",
+                                        configuration=referenced_configuration,
                                     )
-                                else:
-                                    notes.append(f"mate_lock_rotation:{name}:unreadable:{repr(raw_lock)[:60]}")
-                            else:
-                                notes.append(f"mate_lock_rotation:{name}:no_definition")
-                        except Exception as error:  # noqa: BLE001 - recorded, never guessed
-                            notes.append(f"mate_lock_rotation:{name}:{type(error).__name__}: {str(error)[:160]}")
-                        mate_record["lock_rotation"] = lock_rotation
-                        if lock_rotation_api is not None:
-                            mate_record["lock_rotation_api"] = lock_rotation_api
-                    mates.append(mate_record)
-                    mates_done += 1
-                # The next assembly selection may invalidate this entire borrowed
-                # tree. Pending assemblies and occurrence records contain paths
-                # and primitives only; release all native traversal handles now.
-                component = raw = root = active_config = part = children = holder = None
-                root_children = mate_list = None
-                entity = reference = target = feature = specific = assembly = None
-            activity.emit("read_components", completed=components_done, total=components_total, force=True)
+                                )
+                                mates_done += 1
+                                continue
+                            try:
+                                type_index = _property(specific, "Type")
+                                if type(type_index) is not int:
+                                    raise ValueError("mate type is not a native integer")
+                            except Exception as error:  # noqa: BLE001
+                                raise CadError(
+                                    "cad_mate_unreadable",
+                                    "mate type could not be read",
+                                    {"mate": name, "error": str(error)}
+                                ) from error
+                            mate_type = _SW_MATE_TYPES.get(type_index, f"unknown-{type_index}")
+                            try:
+                                suppressed = _method(feature, "IsSuppressed")
+                                if type(suppressed) is not bool:
+                                    raise ValueError("mate suppression state is not a native boolean")
+                            except Exception as error:  # noqa: BLE001
+                                raise CadError(
+                                    "cad_mate_unreadable",
+                                    "mate suppression state could not be read",
+                                    {"mate": name, "error": str(error)},
+                                ) from error
+                            try:
+                                error_code = _method(feature, "GetErrorCode")
+                                if type(error_code) is not int:
+                                    raise ValueError("mate solve state is not a native integer")
+                            except Exception as error:  # noqa: BLE001
+                                raise CadError(
+                                    "cad_mate_unreadable",
+                                    "mate solve state could not be read; the constraint cannot be trusted",
+                                    {"mate": name, "error": str(error)},
+                                ) from error
+                            entities = []
+                            for entity_index in range(entity_count):
+                                if suppressed:
+                                    continue
+                                try:
+                                    entity = _interface(_method(specific, "MateEntity", entity_index), IMATEENTITY2_IID)
+                                    reference = _component(_property(entity, "ReferenceComponent"))
+                                    reference_full = str(_method(reference, "GetPathName") or "")
+                                    reference_name = str(_property(reference, "Name2") or "")
+                                    reference_configuration = _json_raw_value(
+                                        _property(
+                                            reference,
+                                            "ReferencedConfiguration",
+                                        )
+                                    )
+                                    reference_path = _relative_document(
+                                        reference_full,
+                                        source_root,
+                                    )
+                                    if (
+                                        reference_path is None
+                                        and _is_text_name(reference_full)
+                                    ):
+                                        reference_path = (
+                                            str(reference_full)
+                                            .replace("/", "\\")
+                                            .strip()
+                                        )
+                                    # An entity may lie on the owning assembly's own reference
+                                    # geometry (assembly planes/axes): it has no component
+                                    # occurrence identity and belongs to that assembly's frame.
+                                    # The root object from this assembly's current configuration
+                                    # is the authority; a document match alone is not proof, and
+                                    # the identity must be exact (full path, Name2, IsRoot true).
+                                    assembly_frame = _matches_assembly_root(
+                                        reference, root, reference_full, reference_name, assembly_path
+                                    )
+                                    # EXEMPT (untyped multi-type return): IMateEntity2.Reference
+                                    # is a VT_DISPATCH spanning multiple native geometry kinds
+                                    # with no single declared view, so the generic dispatch
+                                    # stays and the unambiguous GetFeature/GetSurface/GetCurve
+                                    # returns are bound to their own published interfaces.
+                                    target = _property(entity, "Reference")
+                                except Exception as error:  # noqa: BLE001
+                                    raise CadError(
+                                        "cad_mate_unreadable",
+                                        "a mate entity could not be read",
+                                        {"mate": name, "error": str(error)},
+                                    ) from error
+                                entities.append(
+                                    {
+                                        "entity_index": entity_index,
+                                        "reference_name": reference_name,
+                                        "reference_document": reference_path,
+                                        "reference_configuration": reference_configuration,
+                                        "assembly_frame": bool(assembly_frame),
+                                        "feature": _feature_name(target),
+                                        "face_index": None,
+                                        "mate_entity_reference": _mate_entity_reference(entity),
+                                        **_plane_or_cylinder(target),
+                                    }
+                                )
+                            limits = None
+                            is_advanced_mate = None
+                            is_advanced_mate_error = None
+                            is_advanced_mate_api = None
+                            variation_lower = None
+                            variation_upper = None
+                            if suppressed is False and error_code == 0:
+                                try:
+                                    variation_lower = float(_property(specific, "MinimumVariation"))
+                                    variation_upper = float(_property(specific, "MaximumVariation"))
+                                except Exception as error:  # noqa: BLE001
+                                    if type_index in {5, 6}:
+                                        raise CadError(
+                                            "cad_mate_limits_unreadable",
+                                            "mate travel variation could not be read",
+                                            {"mate": name, "type": mate_type, "error": str(error)},
+                                        ) from error
+                            if variation_lower is not None and variation_upper is not None and (
+                                not math.isfinite(variation_lower)
+                                or not math.isfinite(variation_upper)
+                                or variation_upper < variation_lower
+                            ):
+                                raise CadError(
+                                    "cad_mate_limits_invalid",
+                                    "mate travel variation is not finite and ordered",
+                                    {"mate": name, "lower": variation_lower, "upper": variation_upper},
+                                )
+                            if type_index not in {5, 6} and (
+                                variation_lower not in {None, 0.0} or variation_upper not in {None, 0.0}
+                            ):
+                                raise CadError(
+                                    "cad_mate_limits_invalid",
+                                    "a bounded range on an unsupported mate type cannot be observed",
+                                    {"mate": name, "type": mate_type},
+                                )
+                            native_limit = None
+                            if suppressed is False and type_index in {5, 6} and error_code == 0:
+                                interface_prefix = "IAngle" if type_index == 6 else "IDistance"
+                                unit = "rad" if type_index == 6 else "m"
+                                names = (
+                                    ("Angle", "MinimumAngle", "MaximumAngle")
+                                    if type_index == 6
+                                    else ("Distance", "MinimumDistance", "MaximumDistance")
+                                )
+                                try:
+                                    definition = _method(feature, "GetDefinition")
+                                    if definition is None:
+                                        is_advanced_mate_error = "mate definition is null"
+                                    else:
+                                        iid = (
+                                            IANGLEMATEFEATUREDATA_IID
+                                            if type_index == 6
+                                            else IDISTANCEMATEFEATUREDATA_IID
+                                        )
+                                        bound = _interface(definition, iid)
+                                        value = _property(bound, "IsAdvancedMate")
+                                        if type(value) is bool:
+                                            is_advanced_mate = value
+                                            is_advanced_mate_api = f"{interface_prefix}MateFeatureData.IsAdvancedMate"
+                                        else:
+                                            is_advanced_mate_error = f"unexpected value: {value!r}"
+                                        if is_advanced_mate is True:
+                                            values = {}
+                                            for key in names:
+                                                raw_value = _property(bound, key)
+                                                parsed = float(raw_value)
+                                                if not math.isfinite(parsed):
+                                                    raise ValueError(f"{key} is not finite")
+                                                values[key] = parsed
+                                            values["MinimumVariation"] = variation_lower
+                                            values["MaximumVariation"] = variation_upper
+                                            nominal, minimum, maximum = (values[key] for key in names)
+                                            lower = nominal + values["MinimumVariation"]
+                                            upper = nominal + values["MaximumVariation"]
+                                            if (
+                                                abs(lower - minimum) > 1e-12
+                                                or abs(upper - maximum) > 1e-12
+                                                or upper < lower
+                                            ):
+                                                raise ValueError("native variation and absolute limits disagree")
+                                            limits = {"lower": minimum, "upper": maximum, "unit": unit}
+                                            mate_type = "limitdistance" if type_index == 5 else "limitangle"
+                                            native_limit = {
+                                                "type_index": type_index,
+                                                "definition_interface": f"{interface_prefix}MateFeatureData",
+                                                "definition_interface_iid": iid,
+                                                "nominal_dimension": {
+                                                    "value": nominal,
+                                                    "api": f"{interface_prefix}MateFeatureData.{names[0]}",
+                                                    "unit": unit,
+                                                },
+                                                "minimum_variation": {
+                                                    "value": values["MinimumVariation"],
+                                                    "api": "IMate2.MinimumVariation",
+                                                    "unit": unit,
+                                                },
+                                                "maximum_variation": {
+                                                    "value": values["MaximumVariation"],
+                                                    "api": "IMate2.MaximumVariation",
+                                                    "unit": unit,
+                                                },
+                                                "minimum_limit": {
+                                                    "value": minimum,
+                                                    "api": f"{interface_prefix}MateFeatureData.{names[1]}",
+                                                    "unit": unit,
+                                                },
+                                                "maximum_limit": {
+                                                    "value": maximum,
+                                                    "api": f"{interface_prefix}MateFeatureData.{names[2]}",
+                                                    "unit": unit,
+                                                },
+                                            }
+                                except Exception as error:  # noqa: BLE001
+                                    is_advanced_mate_error = f"{type(error).__name__}: {error}"[:240]
+                            mate_record = {
+                                "name": name,
+                                "type": mate_type,
+                                "suppressed": suppressed,
+                                "limits": limits,
+                                "is_advanced_mate": is_advanced_mate,
+                                "is_advanced_mate_error": is_advanced_mate_error,
+                                "is_advanced_mate_api": is_advanced_mate_api,
+                                "native_limit": native_limit,
+                                "entity_count": entity_count,
+                                "entities": entities,
+                                "error_code": error_code,
+                                "scope": prefix or "",
+                                "configuration": referenced_configuration,
+                            }
+                            if mate_type == "concentric":
+                                # Documented native rotation lock (IConcentricMateFeatureData
+                                # .LockRotation, SW2019+; typelib IID {D9E1EBDD-...}): the
+                                # flag removes ONE rotational degree of freedom; a locked
+                                # concentric is not by itself rigid because axial
+                                # translation remains until another mate constrains it.
+                                # The value is read from CAD through the same GetDefinition
+                                # path the earlier manual native scripts used; it is never
+                                # inferred from any reference output.
+                                lock_rotation = None
+                                lock_rotation_api = None
+                                try:
+                                    definition = _method(feature, "GetDefinition")
+                                    if definition is not None:
+                                        bound = _interface(definition, ICONCENTRICMATEFEATUREDATA_IID)
+                                        raw_lock = _property(bound, "LockRotation")
+                                        if isinstance(raw_lock, bool):
+                                            lock_rotation = raw_lock
+                                            lock_rotation_api = "IConcentricMateFeatureData.LockRotation"
+                                            notes.append(
+                                                f"mate_lock_rotation:{name}:read:IConcentricMateFeatureData.LockRotation"
+                                            )
+                                        else:
+                                            notes.append(f"mate_lock_rotation:{name}:unreadable:{repr(raw_lock)[:60]}")
+                                    else:
+                                        notes.append(f"mate_lock_rotation:{name}:no_definition")
+                                except Exception as error:  # noqa: BLE001 - recorded, never guessed
+                                    notes.append(
+                                        f"mate_lock_rotation:{name}:{type(error).__name__}: {str(error)[:160]}"
+                                    )
+                                mate_record["lock_rotation"] = lock_rotation
+                                if lock_rotation_api is not None:
+                                    mate_record["lock_rotation_api"] = lock_rotation_api
+                            mates.append(mate_record)
+                            mates_done += 1
+                    finally:
+                        mate_list = None
+                        entity = reference = target = feature = specific = bound = definition = None
+                        root = active_config = _manager = assembly = None
             activity.emit("read_mates", completed=mates_done, total=mates_total, force=True)
             datums = []
             activity.emit("read_datums", current_object=_activity_object(main_path, source_root), force=True)
-            doc = self._document_by_path(str(main_path))
-            _select_configuration(doc, configuration, "assembly")
-            for name in _coordinate_system_features(doc):
-                matrix = [float(value) for value in self._coordinate_system_transform_raw(doc, name)]
-                datums.append(
-                    {
-                        "name": name,
-                        "owner": "",
-                        "array_raw": matrix,
-                        "configuration": configuration,
-                        "references": _coordinate_system_references(
-                            doc,
-                            name,
-                            source_root=source_root,
-                            document=_relative_document(main_path, source_root),
-                            configuration=configuration,
-                            scope="",
-                        ),
-                    }
-                )
-            reference_axes = []
-            for feature in _features_of_type(doc, {"RefAxis"}):
-                suppressed = _method(feature, "IsSuppressed")
-                if type(suppressed) is not bool:
-                    raise CadError("cad_axis_reference_unreadable", "reference axis suppression state is unreadable")
-                if not suppressed:
-                    reference_axes.append(_reference_axis_record(doc, str(_property(feature, "Name"))))
+            with _temporary_configuration(
+                lambda: self._document_by_path(str(main_path)),
+                configuration,
+                "assembly",
+            ) as (doc, _previous):
+                for name in _coordinate_system_features(doc):
+                    matrix = [float(value) for value in self._coordinate_system_transform_raw(doc, name)]
+                    datums.append(
+                        {
+                            "name": name,
+                            "owner": "",
+                            "array_raw": matrix,
+                            "configuration": configuration,
+                            "references": _coordinate_system_references(
+                                doc,
+                                name,
+                                source_root=source_root,
+                                document=_relative_document(main_path, source_root),
+                                configuration=configuration,
+                                scope="",
+                            ),
+                        }
+                    )
+                reference_axes = []
+                for feature in _features_of_type(doc, {"RefAxis"}):
+                    suppressed = _method(feature, "IsSuppressed")
+                    if type(suppressed) is not bool:
+                        raise CadError(
+                            "cad_axis_reference_unreadable", "reference axis suppression state is unreadable"
+                        )
+                    if not suppressed:
+                        reference_axes.append(_reference_axis_record(doc, str(_property(feature, "Name"))))
+                feature = doc = None
             for entry in components:
                 source = by_component.get(entry["name2"])
                 if source is None or not source[1] or entry["suppressed"]:
@@ -8111,89 +8044,59 @@ class SolidWorksBackend(CadBackend):
                 if not entry["transform_raw"]:
                     continue
                 activity.emit("read_datums", current_object=_activity_object(entry["name2"]))
-                document = self._document_by_path(source[0])
-                _select_configuration(document, entry["configuration"], entry["name2"])
-                for name in _coordinate_system_features(document):
-                    values = [
-                        float(value)
-                        for value in self._coordinate_system_transform_raw(document, name)
-                    ]
-                    datums.append(
-                        {
-                            "name": name,
-                            "owner": entry["name2"],
-                            "array_raw": values,
-                            "configuration": entry["configuration"],
-                            "references": _coordinate_system_references(
-                                document,
-                                name,
-                                source_root=source_root,
-                                document=_relative_document(source[0], source_root),
-                                configuration=entry["configuration"],
-                                scope=str(entry["name2"]),
-                            ),
-                        }
-                    )
+                with _temporary_configuration(
+                    lambda path=source[0]: self._document_by_path(path),
+                    entry["configuration"],
+                    entry["name2"],
+                ) as (document, _previous):
+                    for name in _coordinate_system_features(document):
+                        values = [
+                            float(value)
+                            for value in self._coordinate_system_transform_raw(document, name)
+                        ]
+                        datums.append(
+                            {
+                                "name": name,
+                                "owner": entry["name2"],
+                                "array_raw": values,
+                                "configuration": entry["configuration"],
+                                "references": _coordinate_system_references(
+                                    document,
+                                    name,
+                                    source_root=source_root,
+                                    document=_relative_document(source[0], source_root),
+                                    configuration=entry["configuration"],
+                                    scope=str(entry["name2"]),
+                                ),
+                            }
+                        )
+                    document = None
             property_buckets = {"document": identity_properties, "components": {}, "mates": {}}
             for entry in components:
                 source = by_component.get(entry["name2"])
                 if source is None or not source[1] or entry["suppressed"]:
                     continue
                 activity.emit("read_properties", current_object=_activity_object(entry["name2"]))
-                document = self._document_by_path(source[0])
-                _select_configuration(document, entry["configuration"], entry["name2"])
-                values = _custom_properties(document, entry["configuration"] or None)
-                if values:
-                    property_buckets["components"][entry["name2"]] = values
-            files = {}
-            hash_plan = []
-            planned = set()
-            observed_paths = [
-                Path(by_component[entry["name2"]][0]) for entry in components if not entry["suppressed"]
-            ]
-            for path in (main_path, *observed_paths):
-                relative = _relative_document(path, source_root)
-                if relative and relative not in planned:
-                    planned.add(relative)
-                    hash_plan.append((path, relative))
-            for entry in components:
-                if entry["suppressed"]:
-                    continue
-                provenance = entry.get("source_provenance", {})
-                relative = provenance.get("document") if provenance.get("state") == "resolved" else None
-                if relative and relative not in planned:
-                    planned.add(relative)
-                    hash_plan.append((source_root / relative, relative))
-                elif provenance.get("state") == "cached_materialization" and provenance.get(
-                    "author_imported_in_source_root"
-                ):
-                    # A validated in-stage author source of a cached
-                    # materialization is an acquired CAD document: hash the
-                    # staged bytes that the sealed selection retains as
-                    # bound_source, so the native file inventory carries the
-                    # same file.  Strictly confined to the source root;
-                    # external author metadata never enters the file map.
-                    bound_relative = provenance.get("author_imported_relative")
-                    if isinstance(bound_relative, str) and bound_relative:
-                        staged = source_root / bound_relative
-                        if _relative_document(staged, source_root) != bound_relative:
-                            raise CadError(
-                                "cad_import_source_unavailable",
-                                "the validated in-stage import source is missing from the acquired folder",
-                                {"path": bound_relative},
-                            )
-                        if bound_relative not in planned:
-                            planned.add(bound_relative)
-                            hash_plan.append((staged, bound_relative))
-            for index, (path, relative) in enumerate(hash_plan):
-                activity.emit(
-                    "hash_sources",
-                    current_object=_activity_object(path, source_root) or relative,
-                    completed=index,
-                    total=len(hash_plan),
+                with _temporary_configuration(
+                    lambda path=source[0]: self._document_by_path(path),
+                    entry["configuration"],
+                    entry["name2"],
+                ) as (document, _previous):
+                    values = _custom_properties(document, entry["configuration"] or None)
+                    if values:
+                        property_buckets["components"][entry["name2"]] = values
+                    document = None
+            # Available byte identity is distinct from native object evidence:
+            # unopened supporting documents acquire no mechanical observation.
+            activity.emit("hash_sources", completed=0, total=len(source_files), force=True)
+            files = package_inventory(source_root)
+            if files != source_files:
+                raise CadError(
+                    "native_discovery_source_changed",
+                    "admitted input bytes changed during native discovery",
+                    {"expected": source_files, "observed": files},
                 )
-                files[relative] = _hash(str(Path(source_root) / relative))
-            activity.emit("hash_sources", completed=len(hash_plan), total=len(hash_plan), force=True)
+            activity.emit("hash_sources", completed=len(files), total=len(files), force=True)
             activity.emit(
                 "build_record",
                 force=True,
@@ -8201,7 +8104,8 @@ class SolidWorksBackend(CadBackend):
             )
             record = {
                 "schema_version": NATIVE_DISCOVERY_SCHEMA,
-                "contract": "native-discovery/v1",
+                "contract": NATIVE_DISCOVERY_CONTRACT,
+                "transform_frame": NATIVE_TRANSFORM_FRAME,
                 "namespace": "dp",
                 "generator": "solidworks-native-reader",
                 "solidworks": dict(self.environment()),
@@ -8245,6 +8149,8 @@ class SolidWorksBackend(CadBackend):
             }
         record.update(observation)
         return record
+
+
 def _native_error_record(error):
     detail = getattr(error, "detail", None)
     return {

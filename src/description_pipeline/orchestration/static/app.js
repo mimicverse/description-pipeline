@@ -2,6 +2,7 @@
 // module only talks to the portal's own JSON API and the digest-verified artifact routes.
 import { buildJointControls, createViewer, disposeRobot, loadRobot } from "/static/viewer.js";
 import { createInspection } from "/static/inspection.js";
+import { mountDynamicsAssessment } from "/static/dynamics_assessment.js";
 import {
   menuAction,
   overlayRun,
@@ -60,8 +61,9 @@ const state = {
   rerunningRunId: null,
   rerunNotice: null,
   rerunError: null,
-  rerunMainByRun: {},
-  rerunKeyByRun: {},
+  rerunRequests: {},
+  assessmentView: null,
+  assessmentBinding: null,
   runsList: [],
   listRequest: null,
   runView: "active",
@@ -151,6 +153,11 @@ const RETRY_REASONS = {
   portable_retry: "Continue side-effect-free stages without repeating CAD capture.",
   endpoint_evidence_unavailable: "The original job state cannot be confirmed; retry later.",
   deleted: "This delivery is hidden; restore it before retrying or rerunning.",
+  registered_failed: "This run has a recorded failure. Select a stage to rerun from its sealed inputs.",
+  registered_cancelled: "This run was cancelled. Select a stage to create a new execution over its sealed inputs.",
+  registered_succeeded: "This execution scope completed. Select a stage to run it again with a new identity.",
+  registered_unresolved: "External results remain unresolved. Reconcile the original operations before rerunning.",
+  registration_missing: "Canonical registration is unavailable; stage recovery cannot be authorized.",
 };
 
 const $ = (id) => document.getElementById(id);
@@ -639,6 +646,7 @@ function clearPreview() {
 }
 
 function stopRunRead() {
+  stopAssessmentView();
   if (state.timer) window.clearTimeout(state.timer);
   state.timer = null;
   if (state.pollRequest) state.pollRequest.abort();
@@ -1939,259 +1947,172 @@ function renderStepper() {
   });
 }
 
+function rerunStorageKey(runId, stageId) {
+  return `portal.rerun.${runId}.${stageId}`;
+}
+
+function stageRerunDraft(run, row) {
+  const slot = rerunStorageKey(run.dag_run_id, row.stage);
+  if (!state.rerunRequests[slot]) {
+    let saved = null;
+    try {
+      const value = sessionStorage.getItem(slot);
+      if (value) {
+        saved = JSON.parse(value);
+        if (!saved || typeof saved.key !== "string" || !saved.key ||
+            saved.body?.from_stage !== row.stage || typeof saved.body.through_stage !== "string") {
+          throw new Error("Invalid saved request");
+        }
+      }
+    } catch {
+      saved = { error: "The saved stage request could not be read. Inspect the run list before starting another request." };
+    }
+    state.rerunRequests[slot] = saved || { key: null, body: {
+      from_stage: row.stage, through_stage: row.stage,
+      ...(row.stage === "freeze" ? { main_assembly: row.main_assembly || run.main_assembly || "" } : {}),
+    } };
+  }
+  return state.rerunRequests[slot];
+}
+
 function renderRerunPanel(run) {
   const host = $("stage-rerun");
   if (!host) return;
-  const policyOpen = host.querySelector("details")?.open === true;
-  const rows = Array.isArray(run.stage_reruns) ? run.stage_reruns : null;
+  const open = host.querySelector("details")?.open === true;
   const stage = state.stages[state.selectedStage];
-  // The select owns its in-progress input; changes to eligibility still replace the panel.
-  if (!beginRender(host, [run.dag_run_id, rows, stage?.id, run.main_assembly, run.can_manage,
-    run.deleted, state.rerunningRunId, state.rerunKeyByRun[run.dag_run_id], state.rerunKeyByRun[`${run.dag_run_id}:mjcf`], state.rerunNotice,
-    state.rerunError])) return;
-  if (!stage) {
-    host.hidden = true;
-    return;
-  }
-  if (!["freeze", "mjcf"].includes(stage.id)) {
-    host.hidden = true;
-    return;
-  }
+  const rows = Array.isArray(run.stage_reruns) ? run.stage_reruns : [];
+  const row = rows.find((item) => item?.stage === stage?.id);
+  if (!stage || !row) { host.hidden = true; return; }
+  const draft = stageRerunDraft(run, row);
+  if (!beginRender(host, [run.dag_run_id, row, stage.id, run.can_manage, run.deleted,
+    state.rerunningRunId, draft.key, draft.error, state.rerunError])) return;
   host.hidden = false;
-  const row = rows && rows.find((item) => item && item.stage === stage.id) || null;
-  const runId = String(run.dag_run_id || "");
-  const canManage = run.can_manage === true;
-  const eligible = Boolean(row && row.eligible === true);
-  const busy = state.rerunningRunId === runId;
-  const deleted = run.deleted === true;
-  const options = row && Array.isArray(row.main_assembly_options)
-    ? row.main_assembly_options.filter((value) => typeof value === "string" && value)
-    : [];
+  const busy = state.rerunningRunId !== null;
+  const allowed = run.can_manage === true && row.eligible === true && !run.deleted && !draft.error;
+  const locked = busy || !allowed || Boolean(draft.key);
+  const button = document.createElement("button"); button.type = "button";
+  button.textContent = busy ? "Submitting..." : draft.key ? "Reconcile same stage request" : `Rerun ${stage.name}`;
+  button.disabled = busy || !allowed;
+  button.addEventListener("click", () => { void rerunFromStage(stage.id); });
+  const note = document.createElement("p"); note.className = "muted small";
+  note.textContent = draft.error || (run.deleted ? "Restore the delivery before rerunning." :
+    run.can_manage !== true ? "Only the initiator or a platform administrator can rerun." :
+    draft.key ? "The submitted inputs are locked. Retry reconciles the same request and preserves its identity." :
+    row.message || "Rerun only this stage from its sealed inputs; keep the original results and failure history.");
+  host.append(button, note);
+
+  function selectField(labelText, values, selected, name) {
+    const label = document.createElement("label"); label.textContent = labelText;
+    const select = document.createElement("select"); select.disabled = locked;
+    select.setAttribute("aria-label", labelText);
+    for (const item of values) {
+      const option = document.createElement("option"); option.value = item.id; option.textContent = item.name;
+      option.selected = item.id === selected; select.append(option);
+    }
+    select.value = selected;
+    select.addEventListener("change", () => { draft.body[name] = select.value; });
+    label.append(select); return label;
+  }
+  if (stage.id === "freeze") {
+    const options = (row.main_assembly_options || []).map((name) => ({ id: name, name }));
+    host.append(selectField("Main assembly in sealed originals", options, draft.body.main_assembly, "main_assembly"));
+  }
+  const advanced = document.createElement("details"); advanced.open = open;
+  const summary = document.createElement("summary"); summary.textContent = "Execution options";
+  const index = rows.findIndex((item) => item.stage === stage.id);
+  advanced.append(summary, selectField("Run through", rows.slice(index).map((item) => ({ id: item.stage, name: item.name })),
+    draft.body.through_stage, "through_stage"));
+  const explanation = document.createElement("p"); explanation.className = "muted small";
+  explanation.textContent = "Only the selected stage runs by default. Continuing through a later stage reruns the required downstream stages; old downstream results are not reused.";
+  advanced.append(explanation);
   if (stage.id === "mjcf") {
-    const button = document.createElement("button"); button.type = "button";
-    button.textContent = busy ? "Creating MJCF request..." : state.rerunKeyByRun[`${runId}:mjcf`] ? "Retry same MJCF request" : "Rerun MJCF";
-    button.disabled = busy || !canManage || !eligible || deleted;
-    button.onclick = () => { void rerunFromStage("mjcf"); };
-    const note = document.createElement("p"); note.className = "muted small";
-    note.textContent = deleted ? "This delivery is hidden; restore it before rerunning." : !canManage
-      ? "Only the initiator or a platform administrator can rerun." : row?.message || "Source verification is unavailable.";
     const label = document.createElement("label"); label.textContent = "Simulation policy (JSON)";
-    const policy = document.createElement("textarea"); policy.id = "mjcf-policy";
-    policy.value = state.rerunMainByRun[`${runId}:mjcf`] || row?.simulation || "{}";
-    policy.disabled = busy || !canManage || deleted;
-    policy.oninput = () => {
-      state.rerunMainByRun[`${runId}:mjcf`] = policy.value;
-      delete state.rerunKeyByRun[`${runId}:mjcf`];
-    };
-    label.append(policy);
-    const advanced = document.createElement("details"); advanced.open = policyOpen;
-    const advancedTitle = document.createElement("summary"); advancedTitle.textContent = "Advanced simulation settings";
-    advanced.append(advancedTitle, label); host.append(button, note, advanced);
-    if (row?.source_dag_run_id) {
-      const source = ghostButton(`Verified input source: ${shortRunId(row.source_dag_run_id)}`);
-      source.title = String(row.source_dag_run_id);
-      source.addEventListener("click", () => { void selectRun(row.source_dag_run_id); });
-      host.append(source);
-    }
-    if (state.rerunError) { const error = document.createElement("p"); error.className = "error"; error.textContent = state.rerunError; host.append(error); }
-    return;
+    const input = document.createElement("textarea"); input.value = draft.body.simulation ?? row.simulation ?? "{}";
+    input.disabled = locked;
+    input.addEventListener("input", () => { draft.body.simulation = input.value; });
+    label.append(input); advanced.append(label);
   }
-  const savedMain = typeof state.rerunMainByRun[runId] === "string" ? state.rerunMainByRun[runId] : "";
-  const originalMain = typeof run.main_assembly === "string" ? run.main_assembly : "";
-  const selectedMain = options.includes(savedMain)
-    ? savedMain
-    : (options.includes(originalMain) ? originalMain : "");
-
-  const line = document.createElement("div");
-  line.className = "rerun-row";
-  const button = document.createElement("button");
-  button.type = "button";
-  button.textContent = busy ? "Creating request..." : state.rerunKeyByRun[runId] ? "Retry same Freeze request" : "Create new request from Freeze";
-  button.disabled = busy || !canManage || !eligible || deleted || !selectedMain;
-  button.addEventListener("click", () => {
-    void rerunFromStage(stage.id);
-  });
-
-  const assemblyLine = document.createElement("div");
-  assemblyLine.className = "rerun-row rerun-assembly";
-  const label = document.createElement("label");
-  label.textContent = "New request from Freeze — main assembly in the sealed upload:";
-  const select = document.createElement("select");
-  select.setAttribute("aria-label", "Main assembly for the new request");
-  if (!options.length) {
-    const unavailable = document.createElement("option");
-    unavailable.value = "";
-    unavailable.textContent = "Verified main assembly list unavailable";
-    unavailable.selected = true;
-    select.append(unavailable);
-    select.disabled = true;
-  } else {
-    for (const name of options) {
-      const option = document.createElement("option");
-      option.value = name;
-      option.textContent = name;
-      select.append(option);
-    }
-    select.value = selectedMain;
-    select.disabled = busy || !canManage || deleted;
-    select.addEventListener("change", () => {
-      const value = String(select.value || "");
-      if (value !== selectedMain) delete state.rerunKeyByRun[runId];
-      if (value) state.rerunMainByRun[runId] = value;
-      else delete state.rerunMainByRun[runId];
-      button.disabled = busy || !canManage || !eligible || deleted || !value;
-    });
+  const description = document.createElement("label"); description.textContent = "Change description";
+  const input = document.createElement("textarea"); input.value = draft.body.change_summary ?? row.change_summary ?? "";
+  input.disabled = locked;
+  input.addEventListener("input", () => { draft.body.change_summary = input.value; });
+  description.append(input); advanced.append(description); host.append(advanced);
+  if (row.source_dag_run_id) {
+    const source = document.createElement("p"); source.className = "muted small";
+    source.textContent = `Sealed input source: ${shortRunId(row.source_dag_run_id)}`; host.append(source);
   }
-  assemblyLine.append(label, select);
-  host.append(assemblyLine);
-
-  line.append(button);
-
-  const note = document.createElement("span");
-  note.className = "muted small";
-  if (state.rerunNotice) {
-    note.textContent = state.rerunNotice;
-  } else if (deleted) {
-    note.textContent = "This delivery is hidden; restore it before rerunning.";
-  } else if (!canManage) {
-    note.textContent = "Only the initiator or a platform administrator can rerun.";
-  } else if (row && row.message) {
-    // Canonical backend reason shown verbatim whenever the stage is not eligible.
-    note.textContent = row.message;
-  } else if (eligible) {
-    note.textContent = "Freeze creates a new request from the sealed originals; freeze and all later stages rerun under the current rules and configuration. The original run and evidence remain.";
-  } else {
-    note.textContent = "Rerun conditions for this stage cannot be confirmed; refresh later.";
-  }
-  line.append(note);
-  host.append(line);
-
-  if (row) {
-    const meta = document.createElement("p");
-    meta.className = "muted small rerun-meta";
-    const pieces = [];
-    const prereq = row.prerequisites && typeof row.prerequisites === "object" ? row.prerequisites : null;
-    if (prereq) {
-      const parts = [];
-      for (const [key, label] of [["inputs", "inputs"], ["tool", "tool"], ["receipt", "receipt"]]) {
-        const value = prereq[key];
-        if (typeof value === "string" && value) parts.push(`${label}: ${PREREQ_STATE[value] || value}`);
-      }
-      if (parts.length) pieces.push(`Prerequisites: ${parts.join(" · ")}`);
-    }
-    const recomputes = Array.isArray(row.recomputes) ? row.recomputes : [];
-    if (recomputes.length) {
-      pieces.push(`Recomputes: ${recomputes.map((id) => rerunStageName(rows, id)).join(" -> ")}`);
-    }
-    if (prereq && prereq.earliest_required && prereq.earliest_required !== stage.id) {
-      pieces.push(`Earliest restart: ${rerunStageName(rows, prereq.earliest_required)}`);
-    }
-    if (pieces.length) {
-      meta.textContent = pieces.join("; ");
-      host.append(meta);
-    }
-    const retains = Array.isArray(row.retains) ? row.retains : [];
-    if (retains.length) {
-      const details = document.createElement("details");
-      const summary = document.createElement("summary");
-      summary.textContent = `Reused inputs/results (${retains.length})`;
-      details.append(summary);
-      const list = document.createElement("div");
-      list.className = "rerun-retains";
-      for (const item of retains) {
-        if (!item || typeof item !== "object") continue;
-        const entry = document.createElement("p");
-        entry.textContent = [item.label || item.path || "", item.availability || ""].filter(Boolean).join(" · ");
-        list.append(entry);
-      }
-      details.append(list);
-      host.append(details);
-    }
-  }
-
   if (state.rerunError) {
-    const error = document.createElement("p");
-    error.className = "error";
-    error.textContent = state.rerunError;
-    host.append(error);
+    const error = document.createElement("p"); error.className = "error"; error.textContent = state.rerunError; host.append(error);
   }
 }
 
+function stopAssessmentView() {
+  state.assessmentView?.destroy();
+  state.assessmentView = null;
+  state.assessmentBinding = null;
+}
+
+function renderAssessment(run) {
+  const host = $("dynamics-assessment");
+  if (!host) return;
+  host.hidden = run.assessment_enabled !== true;
+  if (host.hidden) { stopAssessmentView(); return; }
+  const binding = JSON.stringify([run.dag_run_id, run.can_manage === true, run.deleted === true]);
+  if (state.assessmentBinding === binding) return;
+  stopAssessmentView();
+  host.replaceChildren();
+  state.assessmentBinding = binding;
+  state.assessmentView = mountDynamicsAssessment({
+    container: host, runId: run.dag_run_id, requestJson: api,
+    canManage: run.can_manage === true && run.deleted !== true,
+  });
+}
+
 async function rerunFromStage(stageId) {
-  const run = state.lastRun;
-  const runId = state.dagRunId;
-  if (!["freeze", "mjcf"].includes(stageId)) return;
-  if (!run || !runId || state.rerunningRunId !== null || run.can_manage !== true || !stageId) return;
-  const body = { stage: stageId };
-  if (stageId === "freeze") {
-  let selectedMain = "";
-  const row = (Array.isArray(run.stage_reruns) ? run.stage_reruns : [])
-    .find((item) => item && item.stage === "freeze");
-  const options = row && Array.isArray(row.main_assembly_options)
-    ? row.main_assembly_options.filter((value) => typeof value === "string" && value)
-    : [];
-  selectedMain = typeof state.rerunMainByRun[runId] === "string"
-    ? state.rerunMainByRun[runId]
-    : String(run.main_assembly || "");
-  if (!options.includes(selectedMain)) {
-    state.rerunError = (row && row.message)
-      || "Select a verified main assembly from the sealed originals before creating a new request.";
-    renderRerunPanel(run);
-    return;
+  const run = state.lastRun, runId = state.dagRunId;
+  const row = run?.stage_reruns?.find((item) => item.stage === stageId);
+  if (!run || !runId || !row || row.eligible !== true || run.can_manage !== true || run.deleted || state.rerunningRunId !== null) return;
+  const draft = stageRerunDraft(run, row);
+  if (draft.error) return;
+  const newlyPrepared = !draft.key;
+  if (!draft.key) {
+    if (draft.body.simulation !== undefined) {
+      try { JSON.parse(draft.body.simulation); } catch {
+        state.rerunError = "Simulation policy must be valid JSON."; renderRerunPanel(run); return;
+      }
+    }
+    draft.key = requestKey();
   }
-  body.main_assembly = selectedMain;
-  } else {
-    body.simulation = document.getElementById("mjcf-policy").value;
-    try { JSON.parse(body.simulation); } catch { state.rerunError = "Simulation policy must be valid JSON."; renderRerunPanel(run); return; }
+  try {
+    sessionStorage.setItem(rerunStorageKey(runId, stageId), JSON.stringify(draft));
+  } catch {
+    if (newlyPrepared) draft.key = null;
+    state.rerunError = "The browser could not preserve this request. No stage request was sent.";
+    renderRerunPanel(run); return;
   }
-  const requestSlot = stageId === "freeze" ? runId : `${runId}:mjcf`;
-  state.rerunKeyByRun[requestSlot] ||= requestKey();
-  const idempotencyKey = state.rerunKeyByRun[requestSlot];
-  state.rerunningRunId = runId;
-  state.rerunNotice = "";
-  state.rerunError = "";
+  const idempotencyKey = draft.key;
+  state.rerunningRunId = runId; state.rerunError = "";
   renderRerunPanel(run);
   try {
     const payload = await api(`/api/runs/${encodeURIComponent(runId)}/attempts`, {
-      method: "POST",
-      body,
-      idempotencyKey,
+      method: "POST", body: draft.body, idempotencyKey,
     });
     const nextRunId = responseRunId(payload, `portal-${stageId}-${idempotencyKey}`);
-    if (state.rerunKeyByRun[requestSlot] === idempotencyKey) delete state.rerunKeyByRun[requestSlot];
-    const stageToShow = String(payload.resume_from || stageId);
+    const slot = rerunStorageKey(runId, stageId);
+    sessionStorage.removeItem(slot); delete state.rerunRequests[slot];
     await refreshRuns();
-    if (state.dagRunId !== runId) return; // the operator moved on; the list is refreshed
-    try {
-      localStorage.setItem(stageSelectionKey(nextRunId), stageToShow);
-    } catch {
-      // remembering the requested stage is best-effort
-    }
+    if (state.dagRunId !== runId) return;
+    try { localStorage.setItem(stageSelectionKey(nextRunId), String(payload.resume_from || stageId)); } catch { /* Display preference only. */ }
     await selectRun(nextRunId);
   } catch (error) {
     if (error.status === 401) return;
     if (state.dagRunId === runId) {
-      const detail = error.payload && typeof error.payload === "object" ? error.payload : {};
-      state.rerunError = detail.message || error.message || "Rerun was not accepted.";
-      if (detail.earliest_required) {
-        const target = String(detail.earliest_required);
-        const index = state.stages.findIndex((item) => item.id === target);
-        if (index !== -1) {
-          state.selectedStage = index;
-          try {
-            // Persist the jump so the poll's stage chooser cannot overwrite it.
-            localStorage.setItem(stageSelectionKey(runId), target);
-          } catch {
-            // best-effort persistence
-          }
-        }
-      }
-      await poll();
-      await refreshRuns();
+      state.rerunError = error.message || "The stage request is unconfirmed. Reconcile the same request.";
+      await poll(); await refreshRuns();
     }
   } finally {
     state.rerunningRunId = null;
-    if (state.lastRun && state.lastRun.dag_run_id === state.dagRunId) renderRun(state.lastRun);
+    if (state.lastRun?.dag_run_id === state.dagRunId) renderRun(state.lastRun);
   }
 }
 
@@ -2548,6 +2469,7 @@ function renderRun(run) {
     pr.hidden = true;
   }
   renderRerunPanel(run);
+  renderAssessment(run);
   updatePreviewLayout();
 }
 
@@ -2701,9 +2623,20 @@ async function loadPreview(dagRunId) {
       };
       linkSelect.onchange = showCollision; showCollision();
       $("mjcf-warnings").replaceChildren();
-      for (const warning of preview.mjcf.warnings || []) { const item = document.createElement("li"); item.textContent = warning; $("mjcf-warnings").append(item); }
+      const inventory = preview.mjcf.warning_inventory;
+      for (const warning of inventory?.items || []) {
+        const item = document.createElement("li"); item.textContent = warning.text; $("mjcf-warnings").append(item);
+      }
+      if (inventory?.omitted > 0) {
+        const more = document.createElement("li");
+        more.textContent = `${inventory.omitted} more source warnings are available in the original certificate.`;
+        $("mjcf-warnings").append(more);
+      }
       loaded.setMode($("mjcf-mode").value); loaded.setMarkers($("mjcf-markers").checked);
       $("preview-meta").textContent = `MJCF ${preview.mjcf.entry} · subject ${preview.mjcf.subject_sha256.slice(0, 12)}...`;
+      const teleop = document.createElement("a"); teleop.href = `/static/pico.html?run=${encodeURIComponent(dagRunId)}&launch=1`;
+      teleop.textContent = "Open PICO Teleop"; teleop.target = "_blank"; teleop.rel = "noopener";
+      $("preview-meta").append(" · ", teleop);
       const evidence = document.createElement("a"); evidence.href = artifactUrl(preview.mjcf.certificate.path);
       evidence.textContent = "Collision approximation and source warnings"; evidence.target = "_blank"; evidence.rel = "noopener";
       $("preview-meta").append(" · ", evidence);

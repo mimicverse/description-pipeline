@@ -68,6 +68,9 @@ sys.path[:] = [
     *(entry for entry in sys.path if entry != release_source),
 ]
 
+from description_pipeline.dynamics_assessment.queries import (  # noqa: E402
+    read_lifecycle_rows as read_assessment_lifecycle_rows,
+)
 from description_pipeline.pipeline.contracts import RunStatus  # noqa: E402
 from description_pipeline.platform.facts import read_admitted_runs  # noqa: E402
 
@@ -78,6 +81,8 @@ try:
     systemd_units = render_operator.systemd_units
     from windows_transport import TransportDecodeError
     from windows_transport import decode_output as _decode_windows_output
+    from windows_transport import error_streams as _windows_error_streams
+    from windows_transport import request_metadata as _windows_request_metadata
     from windows_transport import run_powershell as _transport_powershell
 except ImportError as error:  # pragma: no cover - exercised by deployment layout
     raise SystemExit(
@@ -1636,6 +1641,35 @@ def _roles_settings_snapshot(connection) -> dict:
 
 
 def _maintenance_probe(connection) -> dict:
+    """Read admission, business and scheduler facts in one consistent snapshot."""
+    if connection.get_transaction_status() == _psycopg2().extensions.TRANSACTION_STATUS_IDLE:
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY" if connection.autocommit
+                    else "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+                )
+            return _maintenance_probe_snapshot(connection)
+        finally:
+            if connection.autocommit:
+                with connection.cursor() as cursor:
+                    cursor.execute("ROLLBACK")
+            else:
+                connection.rollback()
+    require(
+        _connection_scalar(connection, "SHOW transaction_isolation") in {"repeatable read", "serializable"},
+        "recovery_database_readback_failed",
+        "maintenance probe requires a consistent caller snapshot",
+    )
+    require(
+        _connection_scalar(connection, "SHOW transaction_read_only") == "on",
+        "recovery_database_readback_failed",
+        "maintenance probe requires a read-only caller snapshot",
+    )
+    return _maintenance_probe_snapshot(connection)
+
+
+def _maintenance_probe_snapshot(connection) -> dict:
     status = _connection_json(connection, MAINTENANCE_QUERY)
     run_rows = read_admitted_runs(connection)
     scheduling_rows = _connection_json(
@@ -1681,6 +1715,7 @@ def _maintenance_probe(connection) -> dict:
         for row in scheduling_rows
         if isinstance(row, dict) and row.get("bucket") != "terminal"
     )
+    unsettled.extend(row for row in read_assessment_lifecycle_rows(connection) if row["bucket"] != "terminal")
     return {
         "admission": status["admission"],
         "settled": not unsettled,
@@ -2006,6 +2041,11 @@ RECOVERY_ROOT_QUERY = (
     "UNION SELECT result_record_artifact_id FROM platform.stage_candidate "
     "UNION SELECT result_record_artifact_id FROM platform.stage_decision "
     "WHERE result_record_artifact_id IS NOT NULL "
+    "UNION SELECT recording_artifact->>'artifact_id' FROM platform.simulation_session "
+    "WHERE recording_artifact IS NOT NULL "
+    "UNION SELECT request_artifact_id FROM platform.assessment_request "
+    "UNION SELECT result_artifact_id FROM platform.assessment_attempt "
+    "WHERE result_artifact_id IS NOT NULL "
     "UNION SELECT outbound_artifact_id FROM platform.effect_intent "
     "UNION SELECT payload_artifact_id FROM platform.effect_fact "
     "WHERE payload_artifact_id IS NOT NULL "
@@ -2139,7 +2179,9 @@ def validate_recovery_root(root: object) -> dict:
     return root
 
 
-def _recovery_root(connection) -> dict:
+def _recovery_root(connection, artifact_root: Path) -> dict:
+    from description_pipeline.dynamics_assessment.queries import read_recovery_artifacts
+
     root = validate_recovery_root(_connection_json(connection, RECOVERY_ROOT_QUERY))
     decisions = _checkpoint_references(connection)
     require(
@@ -2147,6 +2189,23 @@ def _recovery_root(connection) -> dict:
         "recovery_database_readback_failed",
         "canonical recovery root decisions differ from the decision read model",
     )
+    try:
+        assessment_artifacts = read_recovery_artifacts(connection, artifact_root)
+    except Exception as error:
+        raise RecoveryError(
+            "recovery_reference_invalid",
+            "assessment recovery references failed verification",
+            {"error": str(error)},
+        ) from error
+    artifacts = {record["artifact_id"]: record for record in root["artifacts"]}
+    for artifact in assessment_artifacts:
+        record = artifact.to_record()
+        require(
+            artifacts.setdefault(artifact.artifact_id, record) == record,
+            "recovery_reference_invalid",
+            "assessment recovery reference differs from the canonical fact root",
+        )
+    root["artifacts"] = [artifacts[key] for key in sorted(artifacts)]
     return root
 
 
@@ -2200,7 +2259,7 @@ def _live_database_data(connection) -> dict:
     }
 
 
-def _database_baseline_snapshot(connection) -> tuple[dict, dict, dict]:
+def _database_baseline_snapshot(connection, artifact_root: Path) -> tuple[dict, dict, dict]:
     legacy_catalog = _connection_json(connection, CATALOG_QUERY)
     full_catalog = _connection_json(connection, FULL_CATALOG_QUERY)
     require(
@@ -2225,7 +2284,7 @@ def _database_baseline_snapshot(connection) -> tuple[dict, dict, dict]:
         "catalog": full_catalog,
     }
     data = _live_database_data(connection)
-    return catalog, data, _recovery_root(connection)
+    return catalog, data, _recovery_root(connection, artifact_root)
 
 
 def pg_control(path: Path, context: CommandContext) -> dict:
@@ -4745,6 +4804,7 @@ def _snapshot_worker(request_path: Path) -> int:
             "schema_version",
             "control_dir",
             "staging",
+            "artifact_root",
             "database",
             "postgres",
             "timeout_seconds",
@@ -4755,11 +4815,13 @@ def _snapshot_worker(request_path: Path) -> int:
     )
     control = Path(request["control_dir"])
     staging = Path(request["staging"])
+    artifact_root = Path(request["artifact_root"])
     database = request["database"]
     postgres = request["postgres"]
     timeout = request["timeout_seconds"]
     require(
-        control.is_absolute() and staging.is_absolute() and type(timeout) is int and timeout > 0,
+        control.is_absolute() and staging.is_absolute() and artifact_root.is_absolute()
+        and type(timeout) is int and timeout > 0,
         "recovery_snapshot_worker_failed",
         "snapshot worker paths/timeout are malformed",
     )
@@ -4821,7 +4883,7 @@ def _snapshot_worker(request_path: Path) -> int:
         snapshot = _db_connect(database)
         snapshot_id = _begin_exported_snapshot(snapshot)
         roles_snapshot_before = _roles_settings_snapshot(snapshot)
-        catalog, data, recovery_root = _database_baseline_snapshot(snapshot)
+        catalog, data, recovery_root = _database_baseline_snapshot(snapshot, artifact_root)
         checkpoint_rows = recovery_root["decisions"]
         sequence_before = data["sequences"]
         atomic_write(
@@ -5292,6 +5354,30 @@ def _windows_lifecycle_paths(state_root: str) -> tuple[str, str]:
     return root + "/instance-lifecycle.ps1", root + "/windows-binding.json"
 
 
+def _windows_transport_evidence(
+    program: str,
+    result: subprocess.CompletedProcess[bytes] | BaseException,
+    transport: dict | None,
+) -> dict:
+    if isinstance(result, subprocess.CompletedProcess):
+        stdout, stderr = result.stdout, result.stderr
+    else:
+        stdout, stderr = _windows_error_streams(result)
+    evidence = {
+        "program": program,
+        "returncode": getattr(result, "returncode", None),
+        "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
+        "stdout_base64": base64.b64encode(stdout).decode("ascii"),
+        "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
+        "stderr_base64": base64.b64encode(stderr).decode("ascii"),
+        "transport": transport,
+    }
+    if isinstance(result, BaseException):
+        evidence["error_type"] = type(result).__name__
+        evidence["timeout_seconds"] = getattr(result, "timeout", None)
+    return evidence
+
+
 def _run_windows_powershell(
     *,
     ssh_host: str,
@@ -5299,17 +5385,26 @@ def _run_windows_powershell(
     timeout: int,
     commands: list[dict] | None = None,
 ) -> tuple[dict, subprocess.CompletedProcess[bytes]]:
+    transport = None
     try:
+        transport = _windows_request_metadata(script)
         completed = _transport_powershell(
             ssh_host=ssh_host,
             script=script,
             timeout=timeout,
         )
     except (OSError, subprocess.SubprocessError, ValueError) as error:
+        evidence = _windows_transport_evidence("windows-lifecycle", error, transport)
+        if commands is not None:
+            commands.append(evidence)
         raise RecoveryError(
             "windows_recovery_transport_unknown",
             f"Windows transport failed: {error}",
+            evidence,
         ) from error
+    evidence = _windows_transport_evidence("windows-lifecycle", completed, transport)
+    if commands is not None:
+        commands.append(evidence)
     try:
         stdout = _decode_windows_output(completed.stdout, stream="stdout")
         _decode_windows_output(completed.stderr, stream="stderr")
@@ -5317,7 +5412,7 @@ def _run_windows_powershell(
         raise RecoveryError(
             "windows_recovery_transport_unknown",
             "Windows transport output is not valid text",
-            {"stream": error.stream, "sha256": error.payload_sha256},
+            {**evidence, "stream": error.stream, "sha256": error.payload_sha256},
         ) from error
     document = None
     for line in reversed(stdout.splitlines()):
@@ -5331,16 +5426,7 @@ def _run_windows_powershell(
         raise RecoveryError(
             "windows_recovery_transport_unknown",
             "Windows lifecycle returned no result object",
-            {"returncode": completed.returncode},
-        )
-    if commands is not None:
-        commands.append(
-            {
-                "program": "windows-lifecycle",
-                "returncode": completed.returncode,
-                "stdout_sha256": hashlib.sha256(completed.stdout).hexdigest(),
-                "stderr_sha256": hashlib.sha256(completed.stderr).hexdigest(),
-            }
+            evidence,
         )
     return document, completed
 
@@ -5409,26 +5495,34 @@ def _windows_scp(
     if recursive:
         argv.append("-r")
     argv.extend([str(source), str(destination)])
+    transport = {
+        "argv": argv,
+        "argv_sha256": hashlib.sha256(json.dumps(argv, separators=(",", ":")).encode("ascii")).hexdigest(),
+    }
     try:
         completed = subprocess.run(
             argv,
             capture_output=True,
-            text=True,
             timeout=timeout,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError) as error:
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        evidence = _windows_transport_evidence("scp", error, transport)
+        if commands is not None:
+            commands.append(evidence)
         raise RecoveryError(
             "windows_recovery_transport_unknown",
             f"Windows file transfer failed: {error}",
+            evidence,
         ) from error
+    evidence = _windows_transport_evidence("scp", completed, transport)
     if commands is not None:
-        commands.append({"program": "scp", "returncode": completed.returncode})
+        commands.append(evidence)
     require(
         completed.returncode == 0,
         "windows_recovery_transport_unknown",
         "Windows file transfer failed",
-        {"stderr": completed.stderr.strip()[-2000:]},
+        evidence,
     )
 
 
@@ -6752,6 +6846,7 @@ def _backup_command_claimed(
             "schema_version": SNAPSHOT_WORKER_SCHEMA,
             "control_dir": str(control),
             "staging": str(staging),
+            "artifact_root": context.resolved["storage"]["artifact_root"],
             "database": {
                 "socket_dir": str(socket_dir),
                 "port": port,
@@ -9510,12 +9605,8 @@ def copy_extracted_directory(
             f"target root became nonempty: {target}",
         )
         target.rmdir()
-    partial = target.with_name(f".{target.name}.{os.getpid()}.partial")
-    require(
-        not path_exists(partial),
-        "recovery_target_not_empty",
-        f"partial target path already exists: {partial}",
-    )
+    staging = Path(tempfile.mkdtemp(prefix=".part-", dir=target.parent))
+    partial = staging / "tree"
     try:
         copy_tree_strict(source, partial)
         modes = {
@@ -9538,9 +9629,9 @@ def copy_extracted_directory(
         )
         os.replace(partial, target)
     finally:
-        if path_exists(partial):
+        if path_exists(staging):
             with contextlib.suppress(OSError, SystemExit):
-                _remove_staging_tree(partial)
+                _remove_staging_tree(staging)
 
 
 def restore_directories(
@@ -9587,13 +9678,10 @@ def restore_exact_files(
             f"exact file target already exists: {target}",
         )
         target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        partial = target.with_name(f".{target.name}.{os.getpid()}.partial")
-        require(
-            not path_exists(partial),
-            "recovery_target_not_empty",
-            f"secret partial path already exists: {partial}",
-        )
+        descriptor, temporary_name = tempfile.mkstemp(prefix=".part-", dir=target.parent)
+        partial = Path(temporary_name)
         try:
+            os.close(descriptor)
             shutil.copy2(source, partial)
             os.chmod(partial, entry["mode"])
             os.replace(partial, target)
@@ -10502,19 +10590,13 @@ def restore_workspaces(manifest: dict, extracted: Path, *, verify_only: bool) ->
         )
         require_no_links(target.parent, "workspace target parent")
         target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        partial = target.parent / f".{target.name}.{os.getpid()}.partial"
-        require(
-            not path_exists(partial),
-            "recovery_target_not_empty",
-            f"workspace partial target already exists: {partial}",
-        )
         try:
-            _materialize_workspace(bundle, partial, row)
-            os.replace(partial, target)
-            _workspace_verify(target, row)
+            with tempfile.TemporaryDirectory(prefix=".part-", dir=target.parent) as staging:
+                partial = Path(staging) / "tree"
+                _materialize_workspace(bundle, partial, row)
+                os.replace(partial, target)
+                _workspace_verify(target, row)
         except (OSError, subprocess.SubprocessError, RecoveryError) as error:
-            if path_exists(partial):
-                _remove_staging_tree(partial)
             raise RecoveryError(
                 "recovery_workspace_failed",
                 f"workspace reconstruction failed: {row['repository_slug']}",
@@ -11883,13 +11965,26 @@ def record_backup_failure(
         receipt_written = False
     staging_removed = False
     try:
-        partial_download = (
-            isinstance(payload["detail"], dict) and payload["detail"].get("download", {}).get("present") is True
-        )
+        # The owned workspace is the download evidence authority; exception
+        # metadata cannot grant permission to discard bytes already received.
+        windows_staging = out / "backup" / "windows"
+        try:
+            mode = windows_staging.lstat().st_mode
+        except FileNotFoundError:
+            partial_download = False
+        except OSError:
+            partial_download = True
+            payload["staging_retained_reason"] = "windows_download_observation_unknown"
+        else:
+            try:
+                partial_download = not stat.S_ISDIR(mode) or any(windows_staging.iterdir())
+            except OSError:
+                partial_download = True
+                payload["staging_retained_reason"] = "windows_download_observation_unknown"
         if _claim_is_current(claim) and not partial_download:
             staging_removed = remove_private_staging(out)
         if partial_download:
-            payload["staging_retained_reason"] = "partial_windows_download"
+            payload.setdefault("staging_retained_reason", "partial_windows_download")
     except (SystemExit, OSError, RecoveryError):
         staging_removed = False
     if receipt_written:

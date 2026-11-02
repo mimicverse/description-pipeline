@@ -1,0 +1,58 @@
+{
+  "schema": "teleop.actuator-model-offline-wheel-fixture/1",
+  "fixture_id": "actuator-model-offline-wheel-native-null-v1",
+  "qualification_scope": "software_regression_only",
+  "production_input": false,
+  "source": {
+    "kind": "synthetic_input_copy",
+    "logical_id": "p1-w2-runtime-20261101/fresh-input-original-vcs/inputs",
+    "note": "The committed fixture closure is complete; CI reads only relative files under this directory."
+  },
+  "plan_template": {
+    "path": "plan.template.json",
+    "bytes": 11673,
+    "sha256": "b82d8612bf2489cee3b325f177a77bc7782e2f05db8279151be6be70c2e7a9d8"
+  },
+  "inputs": [
+    {
+      "path": "urdf/upper_body.urdf",
+      "bytes": 5635,
+      "sha256": "ba53508cc23c7c3aff8115bef7f7e68f6c6b710a328b6ad4eef38ad12d9eb4d7"
+    },
+    {
+      "path": "mjcf/upper_body.xml",
+      "bytes": 4794,
+      "sha256": "4e6d1fcad71976fe65a359524c8ec5c67d04fd17fd44f5692e8b78cc7d54c5ed"
+    },
+    {
+      "path": "sources/benchmark-sources.json",
+      "bytes": 2607,
+      "sha256": "9c7ab9a99a93d528fcad8a0a5a042e3bdbffd60fc40d9e33c828fd911cf78da5"
+    },
+    {
+      "path": "tasks/hold.json",
+      "bytes": 1375,
+      "sha256": "228b866ae203ac5e8b1ef4a0bb1ee91bae95e23dfeb6beccf0b5856a21c5e2fb"
+    },
+    {
+      "path": "tasks/step.json",
+      "bytes": 1228,
+      "sha256": "ee7b99023eebb3fd11df0a5287df394ed71b88dadbd8a34232bdcab825aed20b"
+    },
+    {
+      "path": "tasks/round_trip.json",
+      "bytes": 1262,
+      "sha256": "797c79413fbf673e2621b686352fe445387697a88b54e4cdfa4dca1c00ddd80d"
+    },
+    {
+      "path": "tasks/multi_group.json",
+      "bytes": 1204,
+      "sha256": "621712d743121d1d4d42c5c2f4346b85b09ad02088975cb981c469df71ba47fd"
+    },
+    {
+      "path": "tasks/load_condition.json",
+      "bytes": 1553,
+      "sha256": "d8cb48dd258b5967114ad21ded94be9fb85606750ff59720ab235fb1246eae55"
+    }
+  ]
+}

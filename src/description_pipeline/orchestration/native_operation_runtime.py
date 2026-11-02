@@ -9,6 +9,7 @@ import queue
 import re
 import shutil
 import sqlite3
+import tempfile
 import threading
 import uuid
 from collections.abc import Callable, Mapping
@@ -617,6 +618,8 @@ class CaptureOperationRequest:
         _sha256(self.request_digest, "request_digest")
         _sha256(self.handoff_sha256, "handoff_sha256")
         _sha256(self.upload_sha256, "upload_sha256")
+        if self.handoff_sha256 != self.upload_sha256:
+            raise NativeOperationError("Native Capture must preserve the complete frozen upload")
         _sha256(self.prepared_sha256, "prepared_sha256")
         _sha256(
             self.native_tool_source_sha256,
@@ -1640,13 +1643,14 @@ class NativeOperationRuntime:
                 and destination.stat().st_size == intent.input_archive_bytes
                 and file_digest(destination) == intent.input_archive_sha256
             ):
-                temporary = destination.with_name(
-                    "." + destination.name + "." + uuid.uuid4().hex
+                descriptor, temporary_name = tempfile.mkstemp(
+                    prefix=".part-", dir=destination.parent
                 )
+                temporary = Path(temporary_name)
                 try:
-                    with source.open("rb") as input_stream, temporary.open(
-                        "xb"
-                    ) as output_stream:
+                    with os.fdopen(descriptor, "wb") as output_stream, source.open(
+                        "rb"
+                    ) as input_stream:
                         shutil.copyfileobj(
                             input_stream,
                             output_stream,
@@ -1853,11 +1857,14 @@ class NativeOperationRuntime:
         directory.mkdir(parents=True, exist_ok=True)
         target = directory / f"{named_id}.zip"
         if not target.exists():
-            temporary = directory / f".{named_id}.{uuid.uuid4().hex}"
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=".part-", dir=directory
+            )
+            temporary = Path(temporary_name)
             try:
-                with result.artifact_path.open("rb") as source, temporary.open(
-                    "xb"
-                ) as destination:
+                with os.fdopen(descriptor, "wb") as destination, result.artifact_path.open(
+                    "rb"
+                ) as source:
                     shutil.copyfileobj(source, destination, length=1024 * 1024)
                     destination.flush()
                     os.fsync(destination.fileno())

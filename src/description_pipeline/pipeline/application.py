@@ -17,8 +17,9 @@ from typing import Any, Protocol, get_args
 
 from ..artifacts import ArtifactStore
 from ..interface_records import validate_config_snapshot
+from ..interface_records import check_policy_digest
 from ..io import PipelineError, digest, read_data
-from ..platform.facts import FactStore
+from ..platform.facts import FactConflict, FactStore
 from ..orchestration.native_operation_client import (
     NativeOperationClient,
     NativeOperationDiscoverPort,
@@ -30,7 +31,7 @@ from ..orchestration.native_operation_client import (
 )
 from ..repository.publish import REPOSITORY_SNAPSHOT_METADATA
 from ..runtime import tool_record
-from ..stages import STAGE_IDS, execution_stage_ids
+from ..stages import CONTRACT, CONTRACT_SHA256, STAGE_IDS, execution_stage_ids
 from ..schemas import AIRFLOW_DISPATCH_CONF_SCHEMA
 from .admission import (
     AdmissionSpec,
@@ -41,15 +42,9 @@ from .admission import (
     VerifiedRepositorySnapshot,
     VerifiedRuleset,
     VerifiedVerifyResult,
-    build_capture_command,
-    build_discover_command,
-    build_freeze_command,
-    build_generate_command,
-    build_mjcf_command,
-    validate_mjcf_successor,
-    build_publish_command,
+    build_stage_command,
+    validate_source_successor,
     build_run_admission,
-    build_verify_command,
     validate_run_admission,
     validate_stage_command,
 )
@@ -69,6 +64,8 @@ from .contracts import (
     StageId,
     StagePending,
     StageResult,
+    SourceInputError,
+    ProtocolError,
 )
 from .discover import DiscoverDomainAdapter, DiscoverHandler
 from .dispatch import DispatchAdapter, DispatchResult, TechnicalDispatchService
@@ -367,6 +364,8 @@ class AdmissionFactPort(Protocol):
 
     def get_admitted_run(self, run_id: str): ...
 
+    def validate_source_activity(self, spec: AdmissionSpec) -> None: ...
+
     def create_command(
         self,
         command: StageCommand,
@@ -419,57 +418,13 @@ CommandBuilder = Callable[[CommandBuildContext], StageCommand]
 
 def _default_builders() -> dict[StageId, CommandBuilder]:
     return {
-        "freeze": lambda context: build_freeze_command(context.admission),
-        "discover": lambda context: build_discover_command(
-            context.admission,
-            context.predecessor("freeze"),
-        ),
-        "capture": lambda context: build_capture_command(
-            context.admission,
-            context.predecessor("freeze"),
-            context.predecessor("discover"),
-            context.discover_result
-            if context.discover_result is not None
-            else _missing_discover_result(context.stage),
-        ),
-        "generate": lambda context: build_generate_command(
-            context.admission,
-            context.predecessor("capture"),
-        ),
-        "verify": lambda context: build_verify_command(
-            context.admission,
-            context.predecessor("generate"),
-            context.predecessor("capture"),
-        ),
-        "mjcf": lambda context: build_mjcf_command(
-            context.admission,
-            context.verify_result if context.verify_result is not None else _missing_verify_result(context.stage),
-        ),
-        "publish": lambda context: build_publish_command(
-            context.admission,
-            context.verify_result
-            if context.verify_result is not None
-            else _missing_verify_result(context.stage),
-            context.admission.publish_intent,
-            context.predecessor("mjcf"),
-        ),
+        stage: (
+            lambda context: build_stage_command(
+                context.admission, context.stage, context.predecessors, context.discover_result, context.verify_result
+            )
+        )
+        for stage in STAGE_IDS
     }
-
-
-def _missing_discover_result(stage: StageId) -> VerifiedDiscoverResult:
-    raise ApplicationError(
-        "application.discover_result_missing",
-        "Capture requires the verified Discover result",
-        detail={"stage": stage},
-    )
-
-
-def _missing_verify_result(stage: StageId) -> VerifiedVerifyResult:
-    raise ApplicationError(
-        "application.verify_result_missing",
-        "Publish requires a verified certificate",
-        detail={"stage": stage},
-    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -519,7 +474,7 @@ class AdmissionOutcome:
     def to_record(self) -> dict[str, Any]:
         return {
             "admission": {
-                "created_at": self.admission.created_at.isoformat(),
+                "created_at": self.admission.created_at.astimezone(UTC).isoformat(),
                 "from_stage": self.admission.from_stage,
                 "parent_run_id": self.admission.parent_run_id,
                 "request": _plain(self.admission.request),
@@ -733,6 +688,8 @@ class StageApplication:
             actual_ruleset = VerifiedRuleset.from_catalog_bytes(ruleset_artifact, catalog.read_bytes())
         if actual_ruleset != spec.ruleset:
             raise ApplicationError("application.ruleset_invalid", "Ruleset version differs from its catalog")
+        if "publish" not in execution_stage_ids(spec.from_stage, through=spec.through_stage or "publish"):
+            return
         repository_snapshot = spec.publish_intent.repository
         snapshot_artifact = VerifiedArtifact.from_store_record(
             repository_snapshot.artifact.ref,
@@ -781,16 +738,17 @@ class StageApplication:
                         "admission": admitted_target.to_record(),
                     },
                 )
-        if spec.from_stage not in {None, "freeze", "mjcf"}:
-            raise ApplicationError(
-                "application.linked_admission_builder_missing",
-                "The linked-run admission builder is not installed",
-                detail={"from_stage": spec.from_stage},
-            )
         self._verify_admission_artifacts(spec)
+        existing = self.load_admission_outcome(spec.run_id)
+        if existing is not None:
+            if existing.admission != build_run_admission(spec):
+                raise FactConflict("The run is already admitted with different facts")
+            return existing
         admission = build_run_admission(spec)
-        verify_result = self._mjcf_source_context(spec)[2] if spec.from_stage == "mjcf" else None
-        command = build_mjcf_command(spec, verify_result) if verify_result is not None else build_freeze_command(spec)
+        predecessors, discovered, verified = self.source_context(spec)
+        entry_stage = spec.from_stage or "freeze"
+        command = self._build_command(spec, entry_stage, predecessors, discovered, verified)
+        self._validate_entry_inputs(command)
         conf = DispatchConf(
             schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
             run_id=spec.run_id,
@@ -807,7 +765,18 @@ class StageApplication:
             command,
             conf_artifact,
         )
-        admission_keywords = {"verify_result": verify_result} if verify_result is not None else {}
+        previous, supporting, discover_result = self._command_predecessors(entry_stage, predecessors, discovered)
+        admission_keywords = (
+            {}
+            if entry_stage == "freeze"
+            else {
+                "predecessor": previous,
+                "supporting_predecessors": supporting,
+                "discover_result": discover_result,
+                "verify_result": verified if entry_stage in {"mjcf", "publish"} else None,
+                "publish_intent": spec.publish_intent if entry_stage == "publish" else None,
+            }
+        )
         stored_command, stored_dispatch, _intent = self.facts.admit_run(
             admission,
             command,
@@ -872,8 +841,7 @@ class StageApplication:
         spec = AdmissionSpec.from_record(request_record)
         validate_run_admission(spec, admission)
         self._verify_admission_artifacts(spec)
-        entry_command = (build_mjcf_command(spec, self._mjcf_source_context(spec)[2])
-                         if spec.from_stage == "mjcf" else build_freeze_command(spec))
+        entry_command = self.project_entry_command(spec, validate_inputs=False)
         stored_freeze = self.facts.load_command(entry_command.command_id)
         if stored_freeze != entry_command:
             raise ApplicationError(
@@ -907,65 +875,6 @@ class StageApplication:
             entry_command=stored_freeze,
             dispatch_command=stored_dispatch,
         )
-
-    def load_verified_freeze_origins(self, run_id: str) -> VerifiedArtifact:
-        """Read parent CAD originals only through one committed Freeze closure."""
-
-        spec, admission = self._load_spec(run_id)
-        entry_command = build_freeze_command(spec)
-        stored_command = self.facts.load_command(entry_command.command_id)
-        if stored_command != entry_command:
-            raise ApplicationError(
-                "application.freeze_origin_mismatch",
-                "Stored Freeze command differs from its admission projection",
-            )
-        predecessor = self._completed_predecessor(stored_command)
-        if predecessor is None:
-            raise ApplicationError(
-                "application.freeze_origin_uncommitted",
-                "The parent run has no completed Freeze decision",
-            )
-        result = predecessor.result
-        if (
-            result.stage != "freeze"
-            or result.run_id != admission.run_id
-            or result.command_id != stored_command.command_id
-        ):
-            raise ApplicationError(
-                "application.freeze_origin_invalid",
-                "The parent Freeze result has another identity",
-            )
-        self.artifacts.verify(result.output_artifact)
-        with tempfile.TemporaryDirectory(prefix="description-freeze-origin-") as directory:
-            root = self.artifacts.materialize(
-                result.output_artifact,
-                Path(directory) / "artifact",
-            )
-            inputs = read_data(root / "inputs.json")
-        if (
-            not isinstance(inputs, Mapping)
-            or set(inputs) != {"artifacts", "upload_inventory"}
-            or not isinstance(inputs.get("artifacts"), Mapping)
-            or set(inputs["artifacts"])
-            != {"configuration", "originals", "ruleset"}
-            or inputs["artifacts"].get("originals")
-            != spec.originals.ref.to_record()
-            or inputs.get("upload_inventory") != spec.originals.inventory
-        ):
-            raise ApplicationError(
-                "application.freeze_origin_invalid",
-                "The parent Freeze closure differs from its admitted originals",
-            )
-        actual = VerifiedArtifact.from_store_record(
-            spec.originals.ref,
-            self.artifacts.verify(spec.originals.ref),
-        )
-        if actual != spec.originals:
-            raise ApplicationError(
-                "application.freeze_origin_invalid",
-                "The parent originals differ from the artifact store",
-            )
-        return spec.originals
 
     def dispatch(
         self,
@@ -1081,40 +990,185 @@ class StageApplication:
         )
         return command
 
-    def _mjcf_source_context(self, spec: AdmissionSpec):
-        """Load completed source facts only; this path never executes upstream work."""
-        if spec.parent_run_id is None:
-            raise ApplicationError("application.mjcf_source_required", "MJCF rerun requires an original source run")
-        source, _admission = self._load_spec(spec.parent_run_id)
-        validate_mjcf_successor(spec, source)
-        summary = self.facts.get_admitted_run(source.run_id)
-        if summary is None or summary.state not in {"succeeded", "failed", "cancelled"}:
-            raise ApplicationError(
-                "application.mjcf_source_unsettled", "Source run must have a settled terminal outcome",
-            )
+    def _source_spec(self, run_id: str) -> AdmissionSpec:
+        source, _admission = self._load_spec(run_id)
+        return source
+
+    def _read_source_prefix(
+        self, source: AdmissionSpec, count: int, seen: frozenset[str], *, validate_inputs: bool = True
+    ):
+        """Resolve only the required stages through actual immutable producers."""
+        if source.run_id in seen:
+            raise ApplicationError("application.source_cycle", "The source admission ancestry is cyclic")
+        start = STAGE_IDS.index(source.from_stage or "freeze")
         predecessors = {}
         discovered = verified = None
-        for stage in STAGE_IDS[:STAGE_IDS.index("verify") + 1]:
+        if start and count:
+            if source.parent_run_id is None:
+                raise ApplicationError("application.source_required", "A rerun requires a sealed source")
+            parent = self._source_spec(source.parent_run_id)
+            validate_source_successor(source, parent)
+            predecessors, discovered, verified = self._read_source_prefix(
+                parent, min(count, start), seen | {source.run_id}, validate_inputs=validate_inputs
+            )
+        scope = execution_stage_ids(source.from_stage, through=source.through_stage or "publish")
+        for stage in STAGE_IDS[start:count]:
+            if stage not in scope:
+                raise ApplicationError(
+                    "application.source_out_of_scope",
+                    "The selected source has no result for the required stage",
+                    detail={"stage": stage},
+                )
             expected = self._build_command(source, stage, predecessors, discovered, verified)
             stored = self.facts.load_command(expected.command_id)
             if stored != expected:
-                raise ApplicationError("application.mjcf_source_mismatch", "Source command differs from admission")
+                raise ApplicationError(
+                    "application.source_mismatch",
+                    f"The sealed {stage} command is unsupported; recompute {stage}",
+                    detail={"earliest_stage": stage},
+                )
             predecessor = self._completed_predecessor(stored)
             if predecessor is None:
-                raise ApplicationError("application.mjcf_source_unverified", "Source upstream stage is not completed")
+                raise ApplicationError(
+                    "application.source_unverified", "A required source stage is not completed", detail={"stage": stage}
+                )
             self.artifacts.verify(predecessor.result.output_artifact)
+            if stage == "generate" and validate_inputs:
+                from .verify import validate_generate_source
+
+                try:
+                    validate_generate_source(stored, predecessor.result.output_artifact, self.artifacts)
+                except ProtocolError:
+                    raise
+                except PipelineError as error:
+                    raise ApplicationError(
+                        "application.source_input_incompatible", str(error), detail={"earliest_stage": stage}
+                    ) from error
             predecessors[stage] = predecessor
-            if stage == "discover":
-                discovered = self._verified_discover_result(predecessor)
-            elif stage == "verify":
-                verified = self._verified_verify_result(predecessor)
-        if verified is None:
-            raise ApplicationError("application.mjcf_source_unverified", "Source has no passing URDF certificate")
+            try:
+                if stage == "discover":
+                    discovered = self._verified_discover_result(predecessor)
+                elif stage == "verify":
+                    verified = self._verified_verify_result(predecessor)
+            except ProtocolError as error:
+                error.detail.setdefault("earliest_stage", stage)
+                raise
         return predecessors, discovered, verified
 
-    def mjcf_source_result(self, spec: AdmissionSpec) -> VerifiedVerifyResult:
-        """Expose the checked source certificate to the admission boundary."""
-        return self._mjcf_source_context(spec)[2]
+    def source_context(self, spec: AdmissionSpec, *, validate_inputs: bool = True):
+        """Read and requalify the needed source prefix; never execute source work."""
+        entry = STAGE_IDS.index(spec.from_stage or "freeze")
+        if spec.parent_run_id is None:
+            if entry:
+                raise ApplicationError("application.source_required", "A rerun requires a sealed source")
+            return {}, None, None
+        source = self._source_spec(spec.parent_run_id)
+        validate_source_successor(spec, source)
+        if validate_inputs:
+            self.facts.validate_source_activity(spec)
+        if not entry:
+            actual = VerifiedArtifact.from_store_record(
+                source.originals.ref, self.artifacts.verify(source.originals.ref)
+            )
+            if actual != source.originals:
+                raise ApplicationError(
+                    "application.source_mismatch", "Sealed originals differ from the source admission"
+                )
+            return {}, None, None
+        return self._read_source_prefix(source, entry, frozenset({spec.run_id}), validate_inputs=validate_inputs)
+
+    def source_admission(self, run_id: str) -> AdmissionSpec:
+        """Read the immutable source identity without loading unrelated downstream artifacts."""
+        return self._source_spec(run_id)
+
+    def project_entry_command(self, spec: AdmissionSpec, *, validate_inputs: bool = True) -> StageCommand:
+        predecessors, discovered, verified = self.source_context(spec, validate_inputs=validate_inputs)
+        command = self._build_command(spec, spec.from_stage or "freeze", predecessors, discovered, verified)
+        if validate_inputs:
+            self._validate_entry_inputs(command)
+        return command
+
+    def _validate_entry_inputs(self, command: StageCommand) -> None:
+        try:
+            if command.stage == "capture":
+                from .capture import validate_source_inputs
+
+                validate_source_inputs(command, self.artifacts)
+            elif command.stage == "generate":
+                from .stages.generate import validate_source_inputs
+
+                validate_source_inputs(command, self.artifacts)
+            elif command.stage == "verify":
+                from .verify import validate_source_inputs
+
+                validate_source_inputs(command, self.artifacts)
+            elif command.stage == "mjcf":
+                from .stages.mjcf import validate_source_inputs
+
+                validate_source_inputs(command, self.artifacts)
+            elif command.stage == "publish":
+                from .stages.publish import validate_source_inputs
+
+                validate_source_inputs(command, self.artifacts)
+        except SourceInputError as error:
+            raise ApplicationError(
+                "application.source_input_incompatible", str(error), detail={"earliest_stage": error.stage}
+            ) from error
+
+    def stage_rerun_options(self, source_run_id: str, principal: str) -> list[dict]:
+        """Read source eligibility only; current installed tools/targets are checked at admission."""
+        from dataclasses import replace
+
+        source, _ = self._load_spec(source_run_id)
+        rows = []
+        for stage in STAGE_IDS:
+            candidate = replace(
+                source,
+                run_id="rerun-options:" + digest(source.run_id),
+                request_id="rerun-options:" + digest(source.request_id),
+                parent_run_id=source.run_id,
+                from_stage=stage,
+                through_stage=stage,
+                contract_sha256=CONTRACT_SHA256,
+                policy_sha256=check_policy_digest(),
+            )
+            try:
+                if principal != source.principal:
+                    raise ApplicationError(
+                        "application.source_owner_mismatch", "Only the source owner can rerun this stage"
+                    )
+                self.project_entry_command(candidate)
+                reason, message, eligible = (
+                    "source_ready",
+                    "Sealed source is available; admission rechecks tools, configuration and target before execution.",
+                    True,
+                )
+            except (ApplicationError, PipelineError) as error:
+                reason, message, eligible = getattr(error, "code", "source_invalid"), str(error), False
+            rows.append(
+                {
+                    "stage": stage,
+                    "name": next(item["name"] for item in CONTRACT["stages"] if item["id"] == stage),
+                    "eligible": eligible,
+                    "reason": reason,
+                    "message": message,
+                    "source": {"run_id": source.run_id},
+                    "source_run_id": source.run_id,
+                    "source_dag_run_id": source.request_id,
+                    "main_assembly_options": sorted(
+                        name for name in source.originals.inventory if name.lower().endswith(".sldasm")
+                    ),
+                    "main_assembly": source.main_assembly,
+                    "target_hardware": source.target_hardware,
+                    "purpose": source.purpose,
+                    "change_summary": source.change_summary,
+                    "simulation": source.simulation,
+                    "recomputes": [stage],
+                    "retains": [{"label": "Sealed source inputs", "availability": "sealed"}] if eligible else [],
+                    "execution_authorized": False,
+                }
+            )
+        return rows
 
     @staticmethod
     def _command_predecessors(
@@ -1231,23 +1285,15 @@ class StageApplication:
             raise ApplicationError("application.stage_invalid", f"Unknown stage {stage!r}")
         self._validate_airflow_task_binding(run_id, stage)
         spec, admission = self._load_spec(run_id)
-        if spec.from_stage not in {None, "freeze", "mjcf"}:
-            raise ApplicationError(
-                "application.linked_run_not_supported",
-                "This application composition has no linked-run predecessor builder",
-                detail={"from_stage": spec.from_stage},
-            )
-        predecessors: dict[StageId, VerifiedPredecessor] = {}
-        discover_result: VerifiedDiscoverResult | None = None
-        verify_result: VerifiedVerifyResult | None = None
-        planned = execution_stage_ids(spec.from_stage)
-        if spec.from_stage == "mjcf":
-            predecessors, discover_result, verify_result = self._mjcf_source_context(spec)
-            if stage not in planned:
+        predecessors, discover_result, verify_result = self.source_context(spec, validate_inputs=False)
+        planned = execution_stage_ids(spec.from_stage, through=spec.through_stage or "publish")
+        if stage not in planned:
+            if stage in predecessors:
                 source = predecessors[stage]
                 return ReusedStage(
-                    run_id, stage, source.command.run_id, source.command.command_id, source.result.digest,
+                    run_id, stage, source.command.run_id, source.command.command_id, source.result.digest
                 )
+            raise ApplicationError("application.stage_out_of_scope", "The stage is outside the sealed execution range")
         self._require_handler(stage)
         for current_stage in planned[:planned.index(stage) + 1]:
             command = self._build_command(
@@ -1416,17 +1462,18 @@ class StageApplication:
         if task_id is not None:
             self._validate_airflow_task_binding(run_id, task_id)
         spec, _admission = self._load_spec(run_id)
-        return execution_stage_ids(spec.from_stage)
+        return execution_stage_ids(spec.from_stage, through=spec.through_stage or "publish")
 
-    def execute_run(self, run_id: str, *, through: StageId = "publish") -> ApplicationOutcome:
+    def execute_run(self, run_id: str, *, through: StageId | None = None) -> ApplicationOutcome:
         """Run stages one at a time from one admission; no downstream work is hidden in a handler."""
 
-        if through not in STAGE_IDS:
+        if through is not None and through not in STAGE_IDS:
             raise ApplicationError("application.stage_invalid", f"Unknown stage {through!r}")
         last: StageAttemptResult | None = None
         completed_stage: StageId | None = None
         spec, _admission = self._load_spec(run_id)
-        if through not in execution_stage_ids(spec.from_stage):
+        through = through or spec.through_stage or "publish"
+        if through not in execution_stage_ids(spec.from_stage, through=spec.through_stage or "publish"):
             raise ApplicationError("application.reused_stage", "Target stage belongs to the original source run")
         for stage in execution_stage_ids(spec.from_stage, through=through):
             last = self.run_stage(run_id, stage)
@@ -1477,7 +1524,10 @@ def _runtime_stage_ids(facts, *, command_id, run_id, through, binding, admission
             raise ApplicationError("application.run_not_admitted", "The runtime run is not admitted")
         spec = AdmissionSpec.from_record(admission.request)
         validate_run_admission(spec, admission)
-        selected = execution_stage_ids(spec.from_stage, through=through)
+        end = spec.through_stage or "publish"
+        if through is not None and STAGE_IDS.index(through) < STAGE_IDS.index(end):
+            end = through
+        selected = execution_stage_ids(spec.from_stage, through=end)
     if binding is not None:
         if not isinstance(binding, AirflowTaskBinding) or binding.task_id not in STAGE_IDS:
             raise ApplicationError(
@@ -1523,8 +1573,21 @@ def application_from_environment(
         native_target_identity
         if native_target_identity is not None
         else _registered_native_target_from_environment(source)
-        if (any(stage in selected for stage in ("freeze", "discover", "capture"))
-            or (admission_spec is not None and admission_spec.from_stage != "mjcf")) else None
+        if (
+            any(stage in selected for stage in ("freeze", "discover", "capture"))
+            or (
+                admission_spec is not None
+                and any(
+                    stage
+                    in execution_stage_ids(
+                        admission_spec.from_stage,
+                        through=admission_spec.through_stage or "publish",
+                    )
+                    for stage in ("discover", "capture")
+                )
+            )
+        )
+        else None
     )
     if registered_target is not None and not isinstance(registered_target, NativeTargetIdentity):
         raise ApplicationError(

@@ -17,7 +17,9 @@ from fnmatch import fnmatch
 from pathlib import Path
 
 from description_pipeline.interface_records import release_domain_identity
-from description_pipeline.io import PipelineError, inventory, write_json
+from description_pipeline.io import PipelineError, digest, inventory, write_json
+from tests.v1.test_release_consumers import consumer_fixture, synthetic_wheel
+from tools.release_consumers import CONSUMER_LOCKS, CONSUMER_POOL_PREFIX
 from tools.verify_distribution import _locked_pins, safe_members, validate_deployment_boundary, verify_release
 
 VERSION = "1.4.0"
@@ -37,24 +39,29 @@ def complete_release(root: Path, *, identity: dict | None = None) -> dict:
     identity.setdefault("schema_version", "solidworks-to-urdf.release/v1")
     identity.setdefault("pipeline_id", "solidworks-to-urdf")
     identity.setdefault("source_tree", "c" * 40)
-    identity.setdefault("package_files", {})
-    identity.setdefault("source_sha256", hashlib.sha256(b"wheel bytes").hexdigest())
+    consumer_wheels, consumer_locks, contract, _contracts = consumer_fixture()
+    package_members = {"simulation/teleop-runtime.json": json.dumps(contract).encode()}
+    identity["package_files"] = {name: hashlib.sha256(payload).hexdigest() for name, payload in package_members.items()}
+    identity["source_sha256"] = digest(identity["package_files"])
     test_members = {"tests/v1/test_demo.py": b"def test_demo():\n    assert True\n"}
-    identity["test_files"] = {
-        name: hashlib.sha256(payload).hexdigest() for name, payload in test_members.items()
-    }
+    identity["test_files"] = {name: hashlib.sha256(payload).hexdigest() for name, payload in test_members.items()}
     wheel = root / f"mimicverse_description-{VERSION}-py3-none-any.whl"
-    wheel.write_bytes(b"wheel bytes")
     demo_wheel = b"demo wheel bytes"
     deployment_members = {
         "deploy/airflow/requirements.lock": b"demo==1.0\n",
         "requirements/linux-py312.lock": b"demo==1.0\n",
         "requirements/windows-py312.lock": b"demo==1.0\n",
         "deploy/operator/operatorctl.sh": b"operator tool",
-        "deploy/operator/install_record.py": (
-            ROOT / "deploy/operator/install_record.py"
-        ).read_bytes(),
+        "deploy/operator/install_record.py": (ROOT / "deploy/operator/install_record.py").read_bytes(),
         "deploy/operator/example.py": b"value = 1\n",
+        **{path: consumer_locks[role] for role, path in CONSUMER_LOCKS.items()},
+        **{
+            path: (ROOT / path).read_bytes()
+            for path in (
+                "scripts/install_teleop_worker.py",
+                "scripts/pico_pipeline_link.py",
+            )
+        },
     }
     identity["deployment_files"] = {
         name: hashlib.sha256(payload).hexdigest() for name, payload in deployment_members.items()
@@ -63,7 +70,19 @@ def complete_release(root: Path, *, identity: dict | None = None) -> dict:
         "linux": identity["deployment_files"]["requirements/linux-py312.lock"],
         "windows": identity["deployment_files"]["requirements/windows-py312.lock"],
     }
+    embedded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    wheel.write_bytes(
+        synthetic_wheel(
+            "mimicverse-description",
+            VERSION,
+            files={
+                **{"description_pipeline/" + name: payload for name, payload in package_members.items()},
+                "description_pipeline/tool-release.json": embedded,
+            },
+        )[1]
+    )
     with tarfile.open(root / f"mimicverse_description-{VERSION}.tar.gz", "w:gz") as archive:
+
         def add(member_name: str, payload: bytes) -> None:
             member = tarfile.TarInfo(member_name)
             member.size = len(payload)
@@ -71,8 +90,10 @@ def complete_release(root: Path, *, identity: dict | None = None) -> dict:
 
         add(
             f"mimicverse_description-{VERSION}/src/description_pipeline/tool-release.json",
-            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode(),
+            embedded,
         )
+        for member_name, payload in package_members.items():
+            add(f"mimicverse_description-{VERSION}/src/description_pipeline/{member_name}", payload)
         for member_name, payload in deployment_members.items():
             add(f"mimicverse_description-{VERSION}/{member_name}", payload)
         for member_name, payload in test_members.items():
@@ -88,6 +109,8 @@ def complete_release(root: Path, *, identity: dict | None = None) -> dict:
             "wheels/demo-1.0-py3-none-any.whl": demo_wheel,
             "requirements.lock": f"{product_line}\n{demo_line}\n".encode(),
         }
+        if platform == "linux":
+            members.update({CONSUMER_POOL_PREFIX + name: payload for name, payload in consumer_wheels.items()})
         members["files.json"] = json.dumps(
             {name: hashlib.sha256(payload).hexdigest() for name, payload in members.items()}, sort_keys=True
         ).encode()
@@ -99,6 +122,40 @@ def complete_release(root: Path, *, identity: dict | None = None) -> dict:
 
 
 class DistributionTests(unittest.TestCase):
+    def test_linux_consumer_pool_cannot_reseal_changed_or_missing_wheels(self):
+        for fault in ("missing", "bytes", "windows"):
+            with tempfile.TemporaryDirectory() as directory, self.subTest(fault=fault):
+                root = Path(directory)
+                identity = complete_release(root)
+                platform = "windows" if fault == "windows" else "linux"
+                path = root / f"description-{VERSION}-{platform}-cp312-x86_64.zip"
+                with zipfile.ZipFile(path) as archive:
+                    members = {name: archive.read(name) for name in archive.namelist()}
+                key = CONSUMER_POOL_PREFIX + "numpy-1.0-py3-none-any.whl"
+                if fault == "missing":
+                    members.pop(key)
+                else:
+                    members[key] = b"changed consumer wheel"
+                members["files.json"] = json.dumps(
+                    {
+                        name: hashlib.sha256(payload).hexdigest()
+                        for name, payload in members.items()
+                        if name != "files.json"
+                    }
+                ).encode()
+                with zipfile.ZipFile(path, "w") as archive:
+                    for name, payload in members.items():
+                        archive.writestr(name, payload)
+                write_json(
+                    root / "release.json",
+                    {
+                        **identity,
+                        "artifacts": inventory(root, exclude=("release.json",)),
+                    },
+                )
+                with self.assertRaisesRegex(PipelineError, "Consumer|unexpected members"):
+                    verify_release(root, identity)
+
     def test_manifest_covers_every_tracked_deploy_file(self):
         deploy_line = next(
             line.strip()
@@ -157,9 +214,7 @@ class DistributionTests(unittest.TestCase):
     def test_ci_checkouts_bind_the_reviewed_pull_request_head(self):
         workflow = (ROOT / ".github/workflows/verify.yml").read_text(encoding="utf-8")
         self.assertEqual(
-            workflow.count(
-                "ref: ${{ github.event.pull_request.head.sha || github.sha }}"
-            ),
+            workflow.count("ref: ${{ github.event.pull_request.head.sha || github.sha }}"),
             workflow.count("uses: actions/checkout@v4"),
         )
 
@@ -220,9 +275,7 @@ class DistributionTests(unittest.TestCase):
                 root = Path(directory)
                 identity = complete_release(root)
                 (root / missing).unlink()
-                write_json(
-                    root / "release.json", {**identity, "artifacts": inventory(root, exclude=("release.json",))}
-                )
+                write_json(root / "release.json", {**identity, "artifacts": inventory(root, exclude=("release.json",))})
                 with self.assertRaises(PipelineError) as raised:
                     verify_release(root, identity)
                 self.assertIn("incomplete", str(raised.exception))
@@ -285,9 +338,7 @@ class DistributionTests(unittest.TestCase):
                 with zipfile.ZipFile(archive_path, "w") as archive:
                     for name, payload in members.items():
                         archive.writestr(name, payload)
-                write_json(
-                    root / "release.json", {**identity, "artifacts": inventory(root, exclude=("release.json",))}
-                )
+                write_json(root / "release.json", {**identity, "artifacts": inventory(root, exclude=("release.json",))})
                 with self.assertRaises(PipelineError) as raised:
                     verify_release(root, identity)
                 self.assertIn("another wheel", str(raised.exception))
@@ -308,9 +359,7 @@ class DistributionTests(unittest.TestCase):
                 with zipfile.ZipFile(archive_path, "w") as archive:
                     for name, payload in members.items():
                         archive.writestr(name, payload)
-                write_json(
-                    root / "release.json", {**identity, "artifacts": inventory(root, exclude=("release.json",))}
-                )
+                write_json(root / "release.json", {**identity, "artifacts": inventory(root, exclude=("release.json",))})
                 with self.assertRaises(PipelineError) as raised:
                     verify_release(root, identity)
                 self.assertIn("lock does not pin exactly", str(raised.exception))
@@ -329,9 +378,7 @@ class DistributionTests(unittest.TestCase):
                 with zipfile.ZipFile(archive_path, "w") as archive:
                     for name, payload in members.items():
                         archive.writestr(name, payload)
-                write_json(
-                    root / "release.json", {**identity, "artifacts": inventory(root, exclude=("release.json",))}
-                )
+                write_json(root / "release.json", {**identity, "artifacts": inventory(root, exclude=("release.json",))})
                 with self.assertRaises(PipelineError) as raised:
                     verify_release(root, identity)
                 self.assertIn("repeats demo", str(raised.exception))
@@ -343,11 +390,7 @@ class DistributionTests(unittest.TestCase):
                 identity = complete_release(root)
                 archive_path = root / f"description-{VERSION}-{platform}-cp312-x86_64.zip"
                 with zipfile.ZipFile(archive_path) as source:
-                    members = {
-                        name: source.read(name)
-                        for name in source.namelist()
-                        if name != "files.json"
-                    }
+                    members = {name: source.read(name) for name in source.namelist() if name != "files.json"}
                 with zipfile.ZipFile(archive_path, "w") as archive:
                     for name, payload in members.items():
                         archive.writestr(name, payload)
@@ -360,8 +403,10 @@ class DistributionTests(unittest.TestCase):
 
     def test_role_archives_reject_additional_bound_members(self):
         for platform, nested in (
-            ("linux", False), ("windows", False),
-            ("linux", True), ("windows", True),
+            ("linux", False),
+            ("windows", False),
+            ("linux", True),
+            ("windows", True),
         ):
             with tempfile.TemporaryDirectory() as directory, self.subTest(platform=platform, nested=nested):
                 root = Path(directory)
@@ -418,9 +463,7 @@ class DistributionTests(unittest.TestCase):
                 with zipfile.ZipFile(archive_path, "w") as archive:
                     for name, payload in members.items():
                         archive.writestr(name, payload)
-                write_json(
-                    root / "release.json", {**identity, "artifacts": inventory(root, exclude=("release.json",))}
-                )
+                write_json(root / "release.json", {**identity, "artifacts": inventory(root, exclude=("release.json",))})
                 with self.assertRaises(PipelineError) as raised:
                     verify_release(root, identity)
                 self.assertIn("another target", str(raised.exception))
@@ -460,9 +503,10 @@ class DistributionTests(unittest.TestCase):
             with zipfile.ZipFile(archive_path, "w") as archive:
                 for name, payload in members.items():
                     archive.writestr(name, payload)
-            identity = {**identity, "deployment_files": {
-                name: hashlib.sha256(payload).hexdigest() for name, payload in members.items()
-            }}
+            identity = {
+                **identity,
+                "deployment_files": {name: hashlib.sha256(payload).hexdigest() for name, payload in members.items()},
+            }
             # The private copy reseals the embedded identities too; the deployment
             # copies inside the source archive stay untouched.
             sdist = root / f"mimicverse_description-{VERSION}.tar.gz"

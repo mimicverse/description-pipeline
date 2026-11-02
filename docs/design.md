@@ -2,6 +2,8 @@
 
 系统只有一条生产工作流：原生 SolidWorks 文件夹 → Airflow 七阶段 → 独立验证 → URDF/MJCF 预览与评审 PR。架构以正确性、能力完整、职责清楚、可恢复、可测试和实际执行效率为验收依据。最终系统精简的是重复权威、失效入口和无用兼容，不以改动量、抽象数量或删除行数限制必要重构。
 
+可选上半身动力学评估由独立 `upper_body_dynamics` DAG 执行，默认关闭，不增加主链或 Publish 的等待条件。pipeline 负责来源、鉴权、准入、调度、资源所有权和结果关联；动态执行与独立复验由固定 Teleop 包负责。评估复用平台 admission、ArtifactStore 与维护快照，request/attempt 是该辅助业务的唯一事实，不用文件或 Airflow 状态重建第二套业务状态。取消和 UNKNOWN 结算独立于新增工作准入。
+
 本文说明模块职责与设计理由。[系统契约](contracts.md)定义数据和状态边界，[机械规范](mechanical-handoff-spec.md)定义工程语义，[质量规范](quality.md)定义判据与容差，[操作指南](operations.md)和[部署指南](deployment.md)分别面向工程使用与平台维护。协议字段和阈值只在各自规范中维护。
 
 会话和项目文档使用中文；代码、注释、错误、日志和界面使用英文。原生名称及文件内容作为输入原样保留。
@@ -39,7 +41,7 @@ flowchart LR
 | PostgreSQL `FactStore` | 接纳、命令、执行权、effect 与阶段决定 | artifact 文件内容和 Airflow 调度状态 |
 | `ArtifactStore` | 不可变文件集合、manifest、摘要及物化 | 运行成功、阶段决定和业务显示状态 |
 
-Linux 完成上传与 Freeze 后，Windows 为 Discover 和 Capture 分别物化受控输入、建立并释放自己的原生会话。Discover 在同一个自有会话中打开指定主装配，从同次观察形成来源闭包和机械事实；搜索环境恢复与会话释放完成后才封存和裁剪目录。Capture 仍需依据 prepared 计划读取分组物性与轴等原生事实，不把两阶段合成跨 operation 的长驻会话。Linux 接纳 Capture 时只核必要字节、schema、身份、scope 和计划绑定；Generate 执行一次语义投影。SourceSet archive 与 prepared archive 分别绑定摘要并证明同一原件血缘，等待 Linux 时不占用 CAD。
+Linux 完成上传与 Freeze 后，Windows 为 Discover 和 Capture 分别完整物化已接纳 SourceSet、建立并释放自己的原生会话。Discover 在同一个自有会话中打开指定主装配，从同次观察形成对象绑定和机械事实，搜索环境恢复与会话释放后封存。SourceSet 是文件字节唯一权威；组件图只约束实际对象、owner、配置、拓扑和导出范围，不能决定文件保留范围。`raw.files` 记录全部可用输入的字节身份，不声称未打开文件已获得机械观察。Capture 仍需依据 prepared 计划读取分组物性与轴等原生事实，不把两阶段合成跨 operation 的长驻会话。Linux 接纳 Capture 时核必要字节、schema、身份、scope 和计划绑定；Generate 执行一次语义投影。完整 SourceSet 与含生成 metadata 的 prepared archive 分别绑定必要摘要并证明同一原件血缘，等待 Linux 时不占用 CAD。
 
 Windows 工作目录直接使用已登记的唯一 claim，不在路径中重复嵌套 operation 标识，输入相对路径与字节保持原样。Capture 发生异常时，原生会话边界按实际释放结果记录资源结算；成功释放后的领域失败与清理未证明的 UNKNOWN 分开处理。原始结构化错误通过既有失败链保留至 GUI，不用笼统超时替代已收到的失败响应。
 
@@ -75,7 +77,7 @@ CAD 有值时先读取、保留和检查，再按有据规则修正。规则不�
 
 完整上传、选定原生依赖闭包、prepared package、artifact 集合、tool source、完整 tool record 和交付 subject 的摘要属于不同语义域。逐域核验，不能因两个摘要不同就认定内容冲突，也不能以其中一个代替另一个。
 
-新的 CAD 输入从 Freeze 接纳；仅转换重跑可使用受限 `from_stage=mjcf` 后继。首次上传封存新 originals；Freeze successor 仅复用父运行已验证的 originals，当前请求、规则、配置、目标、Git 基线和工具要求重新封存，重新执行七阶段。Freeze successor 不得继承父运行下游 decision 或成功资格。同一已登记命令的受控重试与新建运行是两种操作，详见[状态与恢复](contracts.md#recovery)。
+新的 CAD 输入按 Freeze→Publish 完整接纳；七阶段均可用同一后继机制独立重跑。不可变请求以 `from_stage/through_stage` 封存实际执行范围，单阶段默认两者相同。范围前的必要来源逐项核验并保留真实 producer，不复制为本次决定；范围后的旧成功不继承。独立新结果可继续建立新的验证/发布后继，仍通过同一 application/FactStore/engine。范围成功与交付完成分别表达。同 command 只恢复原执行，不改旧终态或工具。详见[状态与恢复](contracts.md#recovery)。
 
 门户每次有意新建请求使用新的 `Idempotency-Key`；结果未确认时保留同一键重试，不能由相同表单值推断这是旧请求。运行列表来自已接纳事实，尚未创建 Airflow DagRun 的请求同样可见；详情及重试读取原不可变请求。浏览器只维护当前请求的读取生命周期，列表、分页和详情的过期响应不得覆盖新读取；读取失败撤下旧成功与预览，不据缓存重判业务状态。
 
@@ -125,6 +127,8 @@ Portal 从 canonical 阶段事实与既有检查摘要生成只读展示：有�
 
 Windows 文件系统读写、遍历、摘要、三角流封存和传输打包统一复用 `io` 的物理路径边界，支持长路径；扩展路径前缀仅用于本地 Python I/O，不写入 manifest，不传入 CAD/COM。临时三角文件使用 occurrence 标识的摘要命名，原始 occurrence 名称与几何流字节保持不变。
 
+Capture 总事务使用标准库在同一父目录创建短且唯一的临时根，不将输出目录名称复制进工作路径；最终目录、内部相对布局和原子失败保留边界不变。Discover 与 Capture 在共同 native source 封存边界逐一验证实际交付文件可通过普通路径打开读取，失败保留原文件定位与操作系统错误，在原生会话前拒绝。此门只作用于封存的实际文件，不套用到 embedded-virtual/session 文档绑定；本地 extended-path 复制成功不代表 CAD 可见路径可读。
+
 ## 持久化与一致性
 
 数据库保存 `RunAdmission`、`StageCommand`、`ExecutionClaim`、candidate、唯一 `StageDecision` 及 append-only effect facts。`ArtifactStore` 先从私有 staging 校验并原子发布不可变文件集合，数据库随后登记引用；两者之间的崩溃窗口通过原 command/effect/candidate 对账。数据库不可用时停止业务写入，不回退到文件状态。
@@ -173,8 +177,8 @@ CAD 排他来自实际资源所有权，不来自 Airflow 并发数字。只能�
 
 ## MJCF 派生与共同执行范围
 
-MJCF 后继固定直接引用原始完整运行的 Generate/Capture/Verify 闭包，保留来源字节、用途、所有者、规则与平台身份；不追踪多跳后继链。接纳、claim、candidate 提交和 Publish 各自重验来源及 effect 结算。碰撞代理和仿真参数是带来源 warning 的派生策略，不回写 URDF，不建立第二规范化机器人模型。
+阶段后继沿统一来源解析核验真实 Generate/Capture/Verify 闭包，支持从先前独立重跑结果继续必要后继，保留每个实际 producer、来源字节、用途、所有者、规则与平台身份。接纳、claim、candidate 提交和 Publish 各自重验来源及 effect 结算。碰撞代理和仿真参数是带来源 warning 的派生策略，不回写 URDF，不建立第二规范化机器人模型。
 
-`execution_stage_ids` 从不可变 `from_stage` 推导范围；共同查询给出 `execution_scope`，复用上游的 command/decision 为 null，真实来源位于 source/reuse。Portal 仅渲染。Airflow 保持七任务，MJCF 使用 `none_failed`，MJCF 后继的上游五任务 skipped；调度跳过不能代替 FactStore 前驱资格。
+`execution_stage_ids` 从不可变 `from_stage/through_stage` 推导范围；共同查询给出 `execution_scope` 与 `delivery_complete`。复用上游的真实来源位于 source/reuse，本次 command/decision 不伪造；未执行后缀标为 out_of_scope。Portal 只渲染共同事实。Airflow 保持同一七任务图并从该范围决定跳过和执行；调度 skipped 不能代替 FactStore 前驱资格。
 
-执行中取消复用共同引擎及原 claim/fence，保全候选与原失败；已完成决定不改写，UNKNOWN/CONFLICT 先对账。具体锁序、通知及请求身份见[系统契约](contracts.md#受限-mjcf-后继与执行范围)，本层不维护另一套终态或执行范围。
+执行中取消复用共同引擎及原 claim/fence，保全候选与原失败；已完成决定不改写，UNKNOWN/CONFLICT 先对账。具体锁序、通知及请求身份见[系统契约](contracts.md#七阶段独立重跑与执行范围)，本层不维护另一套终态或执行范围。

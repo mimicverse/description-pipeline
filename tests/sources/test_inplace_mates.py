@@ -15,6 +15,7 @@ from description_pipeline.verification import native_discovery
 from description_pipeline.verification.native_declarations import verify_declarations
 
 from . import support
+from .selection_support import seal_fixture_object_observation
 from .test_solidworks_discovery import FakeMateFeature
 from .test_verify_declarations import fixture, rewrite, NS_TAG, Z_TAG
 
@@ -61,9 +62,13 @@ def native_record(mate):
                 )
 
     rewrite(raw, namespace_types)
-    raw = support.local_native_record_payload(raw, default_mate_scope=True)
+    raw = support.world_native_record_payload(raw, default_mate_scope=True)
     raw["mates"].append(copy.deepcopy(mate))
     return raw
+
+
+def sealed_native_record(mate):
+    return seal_fixture_object_observation(native_record(mate), main_assembly="robot.SLDASM")
 
 
 class InPlaceNativeTests(unittest.TestCase):
@@ -131,7 +136,7 @@ class InPlaceConsumerTests(unittest.TestCase):
         return verify_declarations(native_discovery.project_native_verification_record(raw))
 
     def test_partial_internal_mate_preserves_warning_without_constraint_rows(self):
-        raw = native_record(observed_mate())
+        raw = sealed_native_record(observed_mate())
         original = copy.deepcopy(raw)
         projected, findings = self.source(raw)
         finding = next(item for item in findings if item["code"] == "discovery.inplace_constraint_unmeasured")
@@ -154,7 +159,7 @@ class InPlaceConsumerTests(unittest.TestCase):
         from description_pipeline.verification.solidworks_urdf import _value_warning_gate
         from .test_solidworks_value_warnings import ValueWarningTests
 
-        raw = native_record(observed_mate())
+        raw = sealed_native_record(observed_mate())
         warning = inplace_observation_warnings(raw)
         self.assertEqual(warning[0]["objects"][0]["actual"], raw["mates"][-1]["inplace"])
         self.assertFalse(warning[0]["objects"][0]["constraint_rows_used"])
@@ -178,7 +183,7 @@ class InPlaceConsumerTests(unittest.TestCase):
             _value_warning_gate(scenario.root, scenario.source, forged, observation_warnings=warning)
 
     def test_unmeasured_cross_link_scope_blocks_both_consumers(self):
-        raw = native_record(observed_mate(scope=""))
+        raw = sealed_native_record(observed_mate(scope=""))
         _projected, findings = self.source(raw)
         self.assertTrue(any(
             row["blocking"] for row in findings if row["code"] == "discovery.inplace_constraint_unmeasured"
@@ -200,7 +205,7 @@ class InPlaceConsumerTests(unittest.TestCase):
                 "path": {"value": None, "error": None},
                 "configuration": {"value": configuration, "error": None},
             }
-            raw = native_record(mate)
+            raw = sealed_native_record(mate)
             with self.subTest(name=name, configuration=configuration):
                 if allowed:
                     self.source(raw)
@@ -214,7 +219,7 @@ class InPlaceConsumerTests(unittest.TestCase):
                     self.assertIn("v14.inplace_binding", {row["code"] for row in report["errors"]})
 
     def test_unassigned_material_cannot_be_completed_by_inplace(self):
-        raw = native_record(observed_mate())
+        raw = sealed_native_record(observed_mate())
 
         def remove_container_selection(root):
             root.set("xmlns", NS_TAG[1:-1])
@@ -239,7 +244,7 @@ class InPlaceConsumerTests(unittest.TestCase):
         from description_pipeline.sources.solidworks.session_artifacts import SESSION_DOCUMENT_API
 
         for path, allowed in (("c:/input/module-1_tool_part.SLDPRT", True), ("C:/other/part.SLDPRT", False)):
-            raw = native_record(observed_mate())
+            raw = sealed_native_record(observed_mate())
             component = next(row for row in raw["components"] if row["name2"] == "module-1/tool_part")
             provenance = {
                 "state": "resolved", "kind": "native_imported_document", "used_api": SESSION_DOCUMENT_API,
@@ -268,7 +273,7 @@ class InPlaceConsumerTests(unittest.TestCase):
                     self.assertIn("v14.inplace_binding", {row["code"] for row in report["errors"]})
 
     def test_solver_mode_rejects_unmeasured_inplace_instead_of_ignoring_it(self):
-        raw = discovery._project_native_record(native_record(observed_mate()))
+        raw = discovery._project_native_record(sealed_native_record(observed_mate()))
         raw.pop("exporter")
         findings = []
         discovery._clusters(raw, findings)
@@ -277,7 +282,7 @@ class InPlaceConsumerTests(unittest.TestCase):
     def test_suppressed_relationship_is_retained_without_active_scope_claim(self):
         mate = observed_mate(scope="")
         mate["suppressed"] = True
-        raw = native_record(mate)
+        raw = sealed_native_record(mate)
         _projected, findings = self.source(raw)
         self.assertFalse(any(row["code"] == "discovery.inplace_constraint_unmeasured" for row in findings))
         self.assertTrue(self.verify(raw)["passed"])
@@ -294,7 +299,7 @@ class InPlaceConsumerTests(unittest.TestCase):
         for index, mutate in enumerate(mutations):
             mate = observed_mate()
             mutate(mate)
-            raw = native_record(mate)
+            raw = sealed_native_record(mate)
             for projector in (discovery._project_native_record, native_discovery.project_native_verification_record):
                 with self.subTest(index=index, projector=projector.__name__), self.assertRaises(
                     (native.CadError, native_discovery._Failure)
@@ -314,7 +319,7 @@ class InPlaceConsumerTests(unittest.TestCase):
                 if value != "missing":
                     geometry[field] = {"value": value, "error": None}
                 endpoint["entity"] = {"value": geometry, "error": None}
-                raw = native_record(mate)
+                raw = sealed_native_record(mate)
                 for projector in (
                     discovery._project_native_record, native_discovery.project_native_verification_record
                 ):

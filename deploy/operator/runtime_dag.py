@@ -15,7 +15,9 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from install_record import DAG_ID, read_installed_generation  # noqa: E402
+from install_record import (  # noqa: E402
+    DAG_ID, DAG_MEMBER, read_installed_generation, release_identity, release_deployment_files,
+)
 
 MANAGED_MARKER = "# managed-by: description-airflow"
 DAG_BUNDLE_NAME = "dags-folder"
@@ -47,6 +49,41 @@ def active_dag(record: dict[str, Any]) -> tuple[Path, str]:
     digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
     require(digest == binding.get("digest"), "active DAG digest differs from the install record")
     return resolved, digest
+
+
+def enabled_dag_ids(snapshot: dict) -> list[str]:
+    """Select auxiliary scheduling from the same validated installation snapshot."""
+    result = [DAG_ID]
+    assessment = snapshot.get("resolved", {}).get("operator", {}).get("assessment", {})
+    if assessment.get("enabled") is True:
+        from description_pipeline.dynamics_assessment.contracts import DAG_ID as ASSESSMENT_DAG_ID
+
+        result.append(ASSESSMENT_DAG_ID)
+    return result
+
+
+def active_dags(record: dict, snapshot: dict) -> dict[str, tuple[Path, str]]:
+    """Bind enabled auxiliary files to the existing release deployment inventory."""
+    main_path, main_digest = active_dag(record)
+    result = {DAG_ID: (main_path, main_digest)}
+    auxiliary = enabled_dag_ids(snapshot)[1:]
+    if not auxiliary:
+        return result
+    deployment_root = main_path
+    for _part in Path(DAG_MEMBER).parts:
+        deployment_root = deployment_root.parent
+    require(deployment_root / DAG_MEMBER == main_path, "active DAG is outside its deployment member path")
+    manifest = regular_file(deployment_root / "release.json", "release manifest")
+    document = json.loads(manifest.read_bytes())
+    require(release_identity(document) == record["release"], "auxiliary DAG release differs from the install record")
+    files = release_deployment_files(document)
+    for dag_id in auxiliary:
+        path = regular_file(main_path.with_name(dag_id + ".py"), "auxiliary DAG")
+        checksum = hashlib.sha256(path.read_bytes()).hexdigest()
+        require(files.get(path.relative_to(deployment_root).as_posix()) == checksum,
+                "auxiliary DAG digest differs from the release deployment inventory")
+        result[dag_id] = (path, checksum)
+    return result
 
 
 def configured_dags_folder(airflow_home: Path) -> tuple[Path, str]:
@@ -155,8 +192,9 @@ def serialized_dag(dag_id: str, *, dag_path: Path, dags_folder: Path) -> dict[st
 
 
 def check(state_root: Path, airflow_home: Path, *, files_only: bool = False) -> dict[str, Any]:
-    record, _snapshot = read_installed_generation(Path(state_root))
-    dag_path, dag_digest = active_dag(record)
+    record, snapshot = read_installed_generation(Path(state_root))
+    bindings = active_dags(record, snapshot)
+    dag_path, dag_digest = bindings[DAG_ID]
     dags_folder, cfg_digest = configured_dags_folder(Path(airflow_home))
     require(dags_folder == dag_path.parent, "airflow.cfg does not point at the active install-record DAG")
     require(
@@ -174,16 +212,30 @@ def check(state_root: Path, airflow_home: Path, *, files_only: bool = False) -> 
     }
     if not files_only:
         result["serialized"] = serialized_dag(DAG_ID, dag_path=dag_path, dags_folder=dags_folder)
+    result["auxiliary"] = []
+    for dag_id, (path, checksum) in bindings.items():
+        if dag_id == DAG_ID:
+            continue
+        bound = {"dag_id": dag_id, "dag_path": str(path), "dag_sha256": checksum}
+        if not files_only:
+            bound["serialized"] = serialized_dag(dag_id, dag_path=path, dags_folder=dags_folder)
+        result["auxiliary"].append(bound)
     return result
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state-root", type=Path, required=True)
-    parser.add_argument("--airflow-home", type=Path, required=True)
+    parser.add_argument("--airflow-home", type=Path)
     parser.add_argument("--files-only", action="store_true")
+    parser.add_argument("--dag-ids", action="store_true", help="Print enabled DAG ids from the verified snapshot")
     args = parser.parse_args()
     try:
+        if args.dag_ids:
+            _record, snapshot = read_installed_generation(args.state_root)
+            print("\n".join(enabled_dag_ids(snapshot)))
+            return 0
+        require(args.airflow_home is not None, "--airflow-home is required for runtime identity checks")
         result = check(args.state_root, args.airflow_home, files_only=args.files_only)
     except Exception as error:
         print(f"runtime_dag: {error}", file=sys.stderr)

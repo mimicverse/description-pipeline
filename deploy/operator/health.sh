@@ -44,7 +44,7 @@ if ! load_current_environment "$OPERATOR_STATE" \
   OPERATOR_STATE OPERATOR_TLS_KEY OPERATOR_TLS_CERT OPERATOR_NGINX_CONF \
   OPERATOR_HTTPS_PORT OPERATOR_URL PORTAL_CONFIG PORTAL_PORT NGINX_BIN \
   AIRFLOW_VENV AIRFLOW_HOME AIRFLOW_API_PORT TUNNEL_LOOPBACK_PORT \
-  ENDPOINT_TOKEN_FILE FEISHU_ENV_FILE FEISHU_APP_SECRET_FILE; then
+  ENDPOINT_TOKEN_FILE FEISHU_ENV_FILE FEISHU_APP_SECRET_FILE ASSESSMENT_CONFIG_JSON; then
   report FAIL "the active generation environment could not be verified"
   exit 1
 fi
@@ -197,26 +197,17 @@ else
   report FAIL "run-ownership request-context plugin cannot be verified: AIRFLOW_VENV is not executable"
 fi
 
-# The native-stage pool is part of the seven-stage contract: a missing pool or a
-# capacity other than 1 is a deployment failure (contracts stage contract / IF-02).
+# Installation and health derive the same active pools from the verified generation.
 if [ -x "${AIRFLOW_VENV:-}/bin/python" ]; then
-  if AIRFLOW_HOME="${AIRFLOW_HOME:-}" "$AIRFLOW_VENV/bin/python" - <<'PY'
-import sys
-
-from airflow.models.pool import Pool
-from airflow.settings import Session
-
-with Session() as session:
-    pool = session.query(Pool).filter(Pool.pool == "windows_native").one_or_none()
-    sys.exit(0 if pool is not None and int(pool.slots) == 1 and pool.include_deferred else 1)
-PY
+  if AIRFLOW_HOME="${AIRFLOW_HOME:-}" "$AIRFLOW_VENV/bin/python" \
+      "$AIRFLOW_HERE/scripts/ensure_pool.py" --check
   then
-    report PASS "native pool windows_native capacity=1 including deferred tasks"
+    report PASS "configured pools retain deferred tasks within their resource capacity"
   else
-    report FAIL "native pool windows_native must have capacity 1 including deferred tasks"
+    report FAIL "a configured Airflow pool is missing or has another capacity"
   fi
 else
-  report FAIL "native pool cannot be verified: AIRFLOW_VENV is not executable"
+  report FAIL "configured pools cannot be verified: AIRFLOW_VENV is not executable"
 fi
 
 # Deferred effects require the pinned triggerer to be both installed and alive. A merely
@@ -283,8 +274,8 @@ else
   report FAIL "operator URL failed verified TLS or origin-host identity: ${TLS_DIAG:-no response}"
 fi
 
-# Check the complete current browser module bundle against installed bytes. A
-# working login page alone does not establish that the URDF viewer can start.
+# Check installed JavaScript module bytes, including optional browser features.
+# A working login page alone does not establish that their modules are served.
 if [ -x "${AIRFLOW_VENV:-}/bin/python" ]; then
   if ASSET_DIAG="$("$AIRFLOW_VENV/bin/python" - "$PORTAL_PORT" <<'ASSETS'
 import hashlib
@@ -296,8 +287,12 @@ import description_pipeline
 
 root = Path(description_pipeline.__file__).resolve().parent / "orchestration" / "static"
 try:
-    for name in ("app.js", "run_history.js", "viewer.js", "vendor/three.module.min.js", "vendor/three.core.min.js"):
-        expected = (root / name).read_bytes()
+    modules = sorted(root.rglob("*.js"))
+    if not modules:
+        raise ValueError("Installed browser modules are missing")
+    for path in modules:
+        name = path.relative_to(root).as_posix()
+        expected = path.read_bytes()
         with urlopen(f"http://127.0.0.1:{sys.argv[1]}/static/{name}", timeout=10) as response:
             if response.status != 200 or response.headers.get_content_type() not in {
                 "application/javascript", "text/javascript"

@@ -1,0 +1,488 @@
+"""PostgreSQL authority for interactive session lifecycle and commands."""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+import json
+import secrets
+
+from ..io import digest
+from ..pipeline.contracts import ArtifactRef
+
+
+class SimulationConflict(ValueError):
+    """An immutable session or command identity was reused inconsistently."""
+
+
+class SimulationStore:
+    def __init__(self, connect):
+        self.connect = connect
+
+    def acquire_supervisor(self):
+        connection = self.connect()
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_try_advisory_lock(738204163)")
+                if not cursor.fetchone()[0]:
+                    raise SimulationConflict("Another simulation supervisor owns this database")
+            connection.commit()
+            return connection
+        except BaseException:
+            connection.close()
+            raise
+
+    @contextmanager
+    def transaction(self, *, connection=None):
+        owned = connection is None
+        if owned:
+            connection = self.connect()
+        try:
+            with connection, connection.cursor() as cursor:
+                yield cursor
+        finally:
+            if owned:
+                connection.close()
+
+    def create(self, actor: str, key: str, source_run: str, request: dict, owner: str, *, capacity: int = 2) -> dict:
+        request_digest = digest(request)
+        with self.transaction() as cursor:
+            # One bounded capacity domain; no process is spawned inside this transaction.
+            cursor.execute("SELECT pg_advisory_xact_lock(738204162)")
+            cursor.execute(
+                "SELECT session_id, request_digest FROM simulation_session WHERE actor=%s AND request_key=%s",
+                (actor, key),
+            )
+            existing = cursor.fetchone()
+            if existing:
+                if existing[1] != request_digest:
+                    raise SimulationConflict("Session idempotency key names another request")
+                session_id = existing[0]
+            else:
+                cursor.execute("SELECT state FROM admission WHERE id=1 FOR SHARE")
+                if cursor.fetchone() != ("open",):
+                    raise SimulationConflict("Platform admission is closed")
+                cursor.execute("SELECT count(*) FROM simulation_session WHERE state NOT IN ('stopped','failed')")
+                if cursor.fetchone()[0] >= capacity:
+                    raise SimulationConflict("Simulation capacity is exhausted")
+                session_id = secrets.token_hex(16)
+                cursor.execute(
+                    "INSERT INTO simulation_session(session_id,actor,request_key,source_run_id,request_digest,request,"
+                    "owner_nonce,state) VALUES(%s,%s,%s,%s,%s,%s::jsonb,%s,'starting')",
+                    (session_id, actor, key, source_run, request_digest, json.dumps(request), owner),
+                )
+        return self.get(session_id)
+
+    def admission_open(self):
+        with self.transaction() as cursor:
+            cursor.execute("SELECT state FROM admission WHERE id=1")
+            return cursor.fetchone() == ("open",)
+
+    def active_session_ids(self):
+        """Read the existing session authority for host-space admission."""
+        with self.transaction() as cursor:
+            cursor.execute("SELECT session_id FROM simulation_session WHERE state NOT IN ('stopped','failed')")
+            return [row[0] for row in cursor.fetchall()]
+
+    def get(self, session_id: str) -> dict:
+        with self.transaction() as cursor:
+            cursor.execute(
+                "SELECT session_id,actor,source_run_id,request_digest,request,owner_nonce,state,revision,"
+                "error,process_identity,recording_artifact FROM simulation_session WHERE session_id=%s",
+                (session_id,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise KeyError(session_id)
+            result = dict(
+                zip(
+                    (
+                        "session_id",
+                        "actor",
+                        "source_run_id",
+                        "request_digest",
+                        "request",
+                        "owner_nonce",
+                        "state",
+                        "revision",
+                        "error",
+                        "process_identity",
+                        "recording_artifact",
+                    ),
+                    row,
+                    strict=True,
+                )
+            )
+            if digest(result["request"]) != result["request_digest"]:
+                raise SimulationConflict("Stored simulation request digest is inconsistent")
+            if result["recording_artifact"] is not None:
+                ref = ArtifactRef.from_record(result["recording_artifact"])
+                cursor.execute(
+                    "SELECT kind,locator,manifest_sha256,set_sha256,producer_run_id,producer_stage,"
+                    "producer_tool_sha256 "
+                    "FROM artifact WHERE artifact_id=%s",
+                    (ref.artifact_id,),
+                )
+                registered = cursor.fetchone()
+                if registered != (
+                    ref.kind,
+                    ref.locator,
+                    ref.manifest_sha256,
+                    ref.set_sha256,
+                    ref.producer_run_id,
+                    ref.producer_stage,
+                    ref.producer_tool_sha256,
+                ):
+                    raise SimulationConflict("Session recording differs from its artifact registration")
+            return result
+
+    def transition(self, session_id: str, owner: str, state: str, *, error=None, process=None, recording=None) -> dict:
+        allowed = {
+            "starting": {"starting"},
+            "ready": {"starting"},
+            "stopping": {"starting", "ready", "stopping"},
+            "stopped": {"stopping"},
+            "failed": {"starting", "ready", "stopping", "unresolved"},
+            "unresolved": {"starting", "ready", "stopping", "unresolved"},
+        }
+        if state not in allowed:
+            raise ValueError("Invalid simulation transition")
+        with self.transaction() as cursor:
+            cursor.execute(
+                "SELECT state FROM simulation_session WHERE session_id=%s AND owner_nonce=%s FOR UPDATE",
+                (session_id, owner),
+            )
+            row = cursor.fetchone()
+            if row is None or row[0] not in allowed[state]:
+                raise SimulationConflict("Session ownership or lifecycle changed")
+            if state in {"stopped", "failed", "unresolved"}:
+                self._settle_worker_commands(cursor, session_id)
+            if recording is not None:
+                ref = ArtifactRef.from_record(recording)
+                cursor.execute(
+                    "INSERT INTO artifact(artifact_id,kind,locator,manifest_sha256,set_sha256,producer_run_id,"
+                    "producer_stage,producer_tool_sha256) VALUES(%s,%s,%s,%s,%s,%s,%s,%s) "
+                    "ON CONFLICT (artifact_id) DO NOTHING",
+                    (
+                        ref.artifact_id,
+                        ref.kind,
+                        ref.locator,
+                        ref.manifest_sha256,
+                        ref.set_sha256,
+                        ref.producer_run_id,
+                        ref.producer_stage,
+                        ref.producer_tool_sha256,
+                    ),
+                )
+            cursor.execute(
+                "UPDATE simulation_session SET state=%s,error=%s,process_identity=COALESCE(%s::jsonb,process_identity),"
+                "recording_artifact=COALESCE(%s::jsonb,recording_artifact),revision=revision+1,updated_at=now(),"
+                "ready_at=CASE WHEN %s='ready' THEN COALESCE(ready_at,now()) ELSE ready_at END "
+                "WHERE session_id=%s AND owner_nonce=%s AND state NOT IN ('stopped','failed')",
+                (
+                    state,
+                    error,
+                    json.dumps(process) if process else None,
+                    json.dumps(recording) if recording else None,
+                    state,
+                    session_id,
+                    owner,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise SimulationConflict("Session ownership or terminal state changed")
+        return self.get(session_id)
+
+    def previous_profile(self, actor: str, subject: str) -> dict | None:
+        with self.transaction() as cursor:
+            cursor.execute(
+                "SELECT request_digest,request FROM simulation_session WHERE actor=%s AND ready_at IS NOT NULL "
+                "AND request->'source'->>'subject_sha256'=%s ORDER BY created_at DESC LIMIT 1",
+                (actor, subject),
+            )
+            row = cursor.fetchone()
+            if row is not None and digest(row[1]) != row[0]:
+                raise SimulationConflict("Stored simulation request digest is inconsistent")
+            return {key: row[1][key] for key in ("profile", "settings", "record")} if row else None
+
+    def authorize_command(self, session_id: str, command_id: str, actor: str, request: dict) -> dict | None:
+        with self.transaction() as cursor:
+            cursor.execute("SELECT actor,state FROM simulation_session WHERE session_id=%s FOR UPDATE", (session_id,))
+            row = cursor.fetchone()
+            if row is None or row[0] != actor:
+                raise SimulationConflict("Session is not controlled by this actor")
+            cursor.execute(
+                "SELECT request_digest,result FROM simulation_command WHERE session_id=%s AND command_id=%s",
+                (session_id, command_id),
+            )
+            existing = cursor.fetchone()
+            if existing:
+                if existing[0] != digest(request):
+                    raise SimulationConflict("Command identity names another request")
+                return existing[1] or {"state": "pending"}
+            if row[1] not in {"starting", "ready"}:
+                raise SimulationConflict("Session is not accepting new commands")
+            cursor.execute(
+                "INSERT INTO simulation_command(session_id,command_id,request_digest,request) "
+                "VALUES(%s,%s,%s,%s::jsonb)",
+                (session_id, command_id, digest(request), json.dumps(request)),
+            )
+        return None
+
+    def complete_command(self, session_id: str, command_id: str, result: dict) -> None:
+        with self.transaction() as cursor:
+            cursor.execute(
+                "UPDATE simulation_command SET result=%s::jsonb WHERE session_id=%s AND command_id=%s "
+                "AND result IS NULL",
+                (json.dumps(result), session_id, command_id),
+            )
+
+    def bind_worker_command(self, session_id, command_id, owner, envelope):
+        with self.transaction() as cursor:
+            cursor.execute(
+                "SELECT owner_nonce,state FROM simulation_session WHERE session_id=%s FOR UPDATE",
+                (session_id,),
+            )
+            row = cursor.fetchone()
+            if row is None or row[0] != owner or row[1] not in {"starting", "ready", "stopping"}:
+                raise SimulationConflict("Worker command ownership is unavailable")
+            cursor.execute(
+                "SELECT request_digest,request,result FROM simulation_command "
+                "WHERE session_id=%s AND command_id=%s FOR UPDATE",
+                (session_id, command_id),
+            )
+            command = cursor.fetchone()
+            if (
+                command is None
+                or digest(command[1]) != command[0]
+                or command[1].get("type") not in {"estop", "stop"}
+                or envelope["type"] != command[1]["type"]
+            ):
+                raise SimulationConflict("Worker command differs from its authorized request")
+            if command[2] is not None:
+                if "envelope" not in command[2]:
+                    raise SimulationConflict("Worker command has another result kind")
+                return command[2]
+            result = {"state": "pending", "envelope": envelope, "response": None, "error": None}
+            cursor.execute(
+                "UPDATE simulation_command SET result=%s::jsonb WHERE session_id=%s AND command_id=%s",
+                (json.dumps(result), session_id, command_id),
+            )
+        return result
+
+    def worker_result(self, session_id, command_id, state, *, response=None, error=None):
+        if state not in {"accepted", "applied", "rejected", "unknown"}:
+            raise ValueError("Invalid worker command result")
+        with self.transaction() as cursor:
+            cursor.execute(
+                "SELECT result FROM simulation_command WHERE session_id=%s AND command_id=%s FOR UPDATE",
+                (session_id, command_id),
+            )
+            row = cursor.fetchone()
+            if row is None or not isinstance(row[0], dict) or "envelope" not in row[0]:
+                raise SimulationConflict("Worker command has no registered envelope")
+            previous = row[0]
+            if previous["state"] == "not_sent":
+                raise SimulationConflict("Command never had worker dispatch authorization")
+            if previous["state"] in {"applied", "rejected"}:
+                if state in {"applied", "rejected"} and response != previous["response"]:
+                    raise SimulationConflict("Worker returned conflicting terminal command evidence")
+                return previous
+            if response is not None and (
+                response.get("command_id") != previous["envelope"]["id"]
+                or response.get("kind", previous["envelope"]["type"]) != previous["envelope"]["type"]
+            ):
+                raise SimulationConflict("Worker response differs from its registered envelope")
+            result = {
+                **previous,
+                "state": state,
+                "response": response if response is not None else previous["response"],
+                "error": error,
+            }
+            cursor.execute(
+                "UPDATE simulation_command SET result=%s::jsonb WHERE session_id=%s AND command_id=%s",
+                (json.dumps(result), session_id, command_id),
+            )
+        return result
+
+    def worker_commands(self, session_id):
+        with self.transaction() as cursor:
+            cursor.execute(
+                "SELECT command_id,request_digest,request,result FROM simulation_command WHERE session_id=%s "
+                "AND request->>'type' IN ('estop','stop') ORDER BY created_at,command_id",
+                (session_id,),
+            )
+            rows = cursor.fetchall()
+        results = []
+        for command, sha, request, result in rows:
+            if digest(request) != sha:
+                raise SimulationConflict("Stored worker command request is inconsistent")
+            results.append({"command_id": command, "result": result})
+        return results
+
+    @staticmethod
+    def _settle_worker_commands(cursor, session_id):
+        cursor.execute(
+            "UPDATE simulation_command SET result=CASE WHEN result IS NULL THEN %s::jsonb "
+            "ELSE result || %s::jsonb END WHERE session_id=%s AND request->>'type' IN ('estop','stop') "
+            "AND (result IS NULL OR result->>'state' IN ('pending','accepted'))",
+            (
+                json.dumps(
+                    {
+                        "state": "not_sent",
+                        "envelope": None,
+                        "response": None,
+                        "error": "Worker dispatch was never registered before session closure",
+                    }
+                ),
+                json.dumps({"state": "unknown", "error": "Session closed before a terminal command receipt"}),
+                session_id,
+            ),
+        )
+
+    def settle_worker_commands(self, session_id, owner):
+        with self.transaction() as cursor:
+            cursor.execute(
+                "SELECT owner_nonce,state FROM simulation_session WHERE session_id=%s FOR UPDATE",
+                (session_id,),
+            )
+            row = cursor.fetchone()
+            if row is None or row[0] != owner or row[1] not in {"stopping", "unresolved"}:
+                raise SimulationConflict("Worker command admission is not closed")
+            self._settle_worker_commands(cursor, session_id)
+
+    def orphaned(self, owner: str) -> list[dict]:
+        with self.transaction() as cursor:
+            cursor.execute(
+                "SELECT session_id FROM simulation_session WHERE owner_nonce<>%s AND state NOT IN ('stopped','failed')",
+                (owner,),
+            )
+            ids = [row[0] for row in cursor.fetchall()]
+        return [self.get(session_id) for session_id in ids]
+
+    def reconcile_orphan(self, session_id: str, previous_owner: str) -> None:
+        # No guessed PID termination: an old worker must stop on its private pipe/watchdog.
+        with self.transaction() as cursor:
+            cursor.execute(
+                "UPDATE simulation_session SET state='unresolved',error='Supervisor ownership changed',"
+                "revision=revision+1,updated_at=now() WHERE session_id=%s AND owner_nonce=%s "
+                "AND state NOT IN ('stopped','failed')",
+                (session_id, previous_owner),
+            )
+            if cursor.rowcount:
+                self._settle_worker_commands(cursor, session_id)
+
+    def acquire_verification_slot(self):
+        """Hold the existing verification advisory key for one actual managed owner."""
+        connection = self.connect()
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_try_advisory_lock(738204164)")
+                acquired = cursor.fetchone()[0]
+            connection.commit()
+            if not acquired:
+                connection.close()
+                return None
+            return connection
+        except BaseException:
+            connection.close()
+            raise
+
+    def begin_verification(self, session_id, command_id, request, owner, *, slot=None):
+        """The existing command row owns one global managed verification slot."""
+        with self.transaction(connection=slot) as cursor:
+            cursor.execute("SELECT pg_advisory_xact_lock(738204164)")
+            cursor.execute(
+                "SELECT 1 FROM simulation_command WHERE request->>'type'='verify_recording' "
+                "AND COALESCE(result->>'state','unknown') NOT IN ('completed','failed','cancelled') LIMIT 1"
+            )
+            if cursor.fetchone():
+                raise SimulationConflict("Recording verification capacity is occupied or unresolved")
+            cursor.execute(
+                "SELECT request_digest,recording_artifact,state FROM simulation_session WHERE session_id=%s FOR UPDATE",
+                (session_id,),
+            )
+            row = cursor.fetchone()
+            binding = request["binding"]
+            if (
+                row is None
+                or row[:2] != (binding["request_digest"], binding["recording_artifact"])
+                or row[2]
+                not in {
+                    "stopped",
+                    "failed",
+                }
+            ):
+                raise SimulationConflict("Recording verification binding changed")
+            cursor.execute(
+                "INSERT INTO simulation_command(session_id,command_id,request_digest,request,result) "
+                "VALUES(%s,%s,%s,%s::jsonb,%s::jsonb)",
+                (
+                    session_id,
+                    command_id,
+                    digest(request),
+                    json.dumps(request),
+                    json.dumps(
+                        {
+                            "state": "starting",
+                            "owner_nonce": owner,
+                            "process_identity": None,
+                            "error": None,
+                            "value": None,
+                        }
+                    ),
+                ),
+            )
+
+    def verification_attempts(self, session_id=None):
+        with self.transaction() as cursor:
+            cursor.execute(
+                "SELECT session_id,command_id,request_digest,request,result FROM simulation_command "
+                "WHERE request->>'type'='verify_recording' "
+                "AND (%s::text IS NULL OR session_id=%s) ORDER BY created_at,command_id",
+                (session_id, session_id),
+            )
+            rows = cursor.fetchall()
+        attempts = []
+        for session, command, sha, request, result in rows:
+            if (
+                digest(request) != sha
+                or not isinstance(result, dict)
+                or set(result) != {"state", "owner_nonce", "process_identity", "error", "value"}
+                or result["state"] not in {"starting", "running", "unknown", "completed", "failed", "cancelled"}
+                or not isinstance(result["owner_nonce"], str)
+                or not result["owner_nonce"]
+                or (result["process_identity"] is not None and not isinstance(result["process_identity"], dict))
+            ):
+                raise SimulationConflict("Recording verification command integrity is inconsistent")
+            attempts.append({"session_id": session, "command_id": command, "request": request, "result": result})
+        return attempts
+
+    def transition_verification(self, session_id, command_id, owner, state, *, process=None, error=None, value=None):
+        allowed = {
+            "running": {"starting", "running"},
+            "unknown": {"starting", "running", "unknown"},
+            "completed": {"running"},
+            "failed": {"starting", "running", "unknown"},
+            "cancelled": {"starting", "running"},
+        }
+        if state not in allowed:
+            raise ValueError("Invalid recording verification transition")
+        with self.transaction() as cursor:
+            cursor.execute(
+                "SELECT request_digest,request,result FROM simulation_command "
+                "WHERE session_id=%s AND command_id=%s FOR UPDATE",
+                (session_id, command_id),
+            )
+            row = cursor.fetchone()
+            if row is None or digest(row[1]) != row[0] or row[1].get("type") != "verify_recording":
+                raise SimulationConflict("Recording verification command identity changed")
+            previous = row[2]
+            if previous["owner_nonce"] != owner or previous["state"] not in allowed[state]:
+                raise SimulationConflict("Recording verification ownership or lifecycle changed")
+            result = {**previous, "state": state, "error": error, "value": value}
+            if process is not None:
+                result["process_identity"] = process
+            cursor.execute(
+                "UPDATE simulation_command SET result=%s::jsonb WHERE session_id=%s AND command_id=%s",
+                (json.dumps(result), session_id, command_id),
+            )

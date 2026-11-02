@@ -37,7 +37,7 @@ def seal_fixture_open_observation(record: dict, *, configuration: str = "Default
     record["open_status"] = copy.deepcopy(closure["open_status"])
     record.setdefault("unresolved_components", [])
     record["source_selection"] = seal_closure_selection(
-        {**selection["files"], **selection["excluded_files"]},
+        dict(selection["files"]),
         selection["main_assembly"], closure, reader_sha256=selection["reader_sha256"],
     )
 
@@ -126,12 +126,63 @@ def sealed_selection(
     return seal_closure_selection(upload_files, main_assembly, evidence, reader_sha256=reader_sha256)
 
 
-def observation_from_closure_fixture(record: dict, closure: dict) -> dict:
+def seal_fixture_object_observation(record: dict, *, main_assembly: str) -> dict:
+    """Arrange a sealed synthetic observation before consumer-specific mutations.
+
+    Only explicitly observed component documents enter the graph. Available
+    supporting files do not become objects. This helper never reads CAD and
+    must not be called by a projection adapter to repair an invalid input.
+    """
+    import copy
+
+    raw = copy.deepcopy(record)
+    files = raw["files"]
+    assert main_assembly in files
+    rows = raw["components"]
+    by_name = {row["name2"]: row for row in rows}
+    assert len(by_name) == len(rows)
+    graph = {main_assembly: set()}
+    observed = []
+    for row in rows:
+        assert type(row["suppressed"]) is bool
+        if row["suppressed"]:
+            continue
+        name, document = row["name2"], row["document"]
+        parent = row["parent_occurrence"]
+        owner = by_name[parent]["document"] if parent else main_assembly
+        assert owner in files and document in files
+        assert isinstance(row["configuration"], str) and row["configuration"]
+        assert type(row["suppression_state"]) is int
+        assert row["suppression_state"] in {1, 2, 3, 4}
+        graph.setdefault(owner, set()).add(document)
+        graph.setdefault(document, set())
+        observed.append((owner, document, name, row))
+    closure = closure_evidence(
+        files, main_assembly, edges={name: sorted(targets) for name, targets in graph.items()},
+    )
+    for document in closure["documents"].values():
+        document["resolved_edges"] = []
+    for owner, document, name, row in observed:
+        closure["documents"][owner]["resolved_edges"].append({
+            "name": name, "instance": name, "kind": "native_document", "resolved": document,
+            "resolved_path": STAGE_ROOT + "\\" + document.replace("/", "\\"),
+            "configuration": row["configuration"], "suppression_state": row["suppression_state"],
+            "lightweight": row["suppression_state"] in {1, 4},
+        })
+    raw["source_selection"] = seal_closure_selection(
+        files, main_assembly, closure, reader_sha256=READER_SHA256,
+    )
+    seal_fixture_open_observation(raw, configuration=raw["saved_configuration"])
+    return raw
+
+
+def observation_from_closure_fixture(record: dict, closure: dict, *, files: Mapping[str, str]) -> dict:
     """Give one test backend the same primitive carrier as native Discover."""
 
     import copy
 
     record = copy.deepcopy(record)
+    record["files"] = dict(files)
     rows = []
     edges = [
         (owner, edge)

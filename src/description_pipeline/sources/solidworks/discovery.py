@@ -13,7 +13,7 @@ native record, a versioned controlled record, or a scalar CAD annotation become
 object-specific findings and block the prepared package; no geometry default,
 name prefix or parameter default is ever substituted.
 
-Raw record shape (``solidworks-to-urdf.native-discovery/v1``), as returned by
+Raw record shape (``solidworks-to-urdf.native-discovery/v2``), as returned by
 the backend and re-read by the independent verifier:
 
 ``identity``
@@ -24,7 +24,7 @@ the backend and re-read by the independent verifier:
 ``components``
     ``{name2, document, configuration, fixed, suppressed, lightweight,
     suppression_state, transform_raw, parent_occurrence}`` for every component
-    occurrence; ``transform_raw`` is the preserved local SW16 array and
+    occurrence; ``transform_raw`` is the preserved top-assembly SW16 array and
     ``parent_occurrence`` is the native scoped owner (``""`` is the frozen
     root). ``suppression_state``
     is the raw documented ``GetSuppression2`` integer (0 suppressed, 1
@@ -118,6 +118,8 @@ from ...schemas import (
     NATIVE_DISCOVERY_OPTIONAL_ENVELOPE_KEYS,
     NATIVE_DISCOVERY_RECORD_KEYS,
     NATIVE_DISCOVERY_SCHEMA,
+    NATIVE_DISCOVERY_CONTRACT,
+    NATIVE_TRANSFORM_FRAME,
     NATIVE_IDENTITY_RESOLUTION_SCHEMA,
     SOURCE_RECORD_SCHEMA,
     exporter_declaration_present,
@@ -137,7 +139,7 @@ IDENTITY_SCHEMA = NATIVE_IDENTITY_RESOLUTION_SCHEMA
 RECORD_DIR = "records"
 #: The one native contract: a fixed property namespace and one record version.
 NAMESPACE = "dp"
-CONTRACT = "native-discovery/v1"
+CONTRACT = NATIVE_DISCOVERY_CONTRACT
 GENERATOR = "native-discovery"
 GENERATOR_VERSION = "1"
 NATIVE_READER_GENERATOR = "solidworks-native-reader"
@@ -675,12 +677,16 @@ def _projected_component_document_is_bound(
                 native_files,
             )
         )
+    carrier = record.get("source_selection")
+    closure = carrier.get("closure") if isinstance(carrier, dict) else None
+    graph = closure.get("graph") if isinstance(closure, dict) else None
+    normalized = document.replace("\\", "/")
+    node = graph.get(normalized) if isinstance(graph, dict) else None
     return (
         isinstance(native_files, dict)
-        and isinstance(
-            native_files.get(document.replace("\\", "/")),
-            str,
-        )
+        and isinstance(native_files.get(normalized), str)
+        and isinstance(node, dict)
+        and node.get("sha256") == native_files[normalized]
     )
 
 
@@ -902,13 +908,17 @@ def _validate_inplace_record(mate: dict) -> None:
 
 
 def _project_native_record(record: dict) -> dict:
-    """Project calculated native semantics from one preserved local raw record.
+    """Project calculated native semantics from one preserved world raw record.
 
     The returned copy is an in-memory consumer view only. The caller persists
-    ``record`` itself, keeping the original local transforms, parent links,
+    ``record`` itself, keeping the original world transforms, parent links,
     mate references and EntityParams as the sole raw authority.
     """
 
+    if not isinstance(record, dict):
+        raise CadError("cad_native_record_invalid", "native discovery raw record is not an object")
+    if record.get("transform_frame") != NATIVE_TRANSFORM_FRAME:
+        raise CadError("cad_native_record_invalid", "native discovery has no explicit main-assembly transform frame")
     projected = copy.deepcopy(record)
     components = projected.get("components")
     if not isinstance(components, list):
@@ -938,7 +948,7 @@ def _project_native_record(record: dict) -> dict:
         if "transform" in component:
             raise CadError(
                 "cad_native_record_invalid",
-                "native components must carry local transform_raw, not a composed transform",
+                "native components must carry world transform_raw, not a composed transform",
                 {"component": name},
             )
         parent = component.get("parent_occurrence")
@@ -993,24 +1003,24 @@ def _project_native_record(record: dict) -> dict:
             visiting.remove(name)
             frames[name] = None
             return None
-        raw_local = component.get("transform_raw")
-        if raw_local is None:
+        raw_world = component.get("transform_raw")
+        if raw_world is None:
             visiting.remove(name)
             raise CadError(
                 "cad_transform_invalid",
                 "a native occurrence transform_raw is null rather than a raw value or explicit read failure",
                 {"component": name},
             )
-        if raw_local == []:
+        if raw_world == []:
             visiting.remove(name)
             frames[name] = None
             component["transform"] = []
             return None
-        if not isinstance(raw_local, list) or len(raw_local) != 16:
+        if not isinstance(raw_world, list) or len(raw_world) != 16:
             visiting.remove(name)
             raise CadError(
                 "cad_transform_invalid",
-                "a native occurrence has no raw 16-value local transform",
+                "a native occurrence has no raw 16-value world transform",
                 {"component": name},
             )
         parent = component["parent_occurrence"]
@@ -1021,8 +1031,7 @@ def _project_native_record(record: dict) -> dict:
             component["transform"] = []
             return None
         try:
-            local = _projected_frame(raw_local)
-            world = _projected_multiply(parent_frame, local)
+            world = _projected_frame(raw_world)
         finally:
             visiting.remove(name)
         frames[name] = world
@@ -1725,8 +1734,7 @@ def _entity_geometry_view(entity: dict, findings: list[dict], obj: str) -> dict 
                 return None
             return view
         if usable_flat:
-            # A localized point cannot coexist with recorded face evidence of another kind:
-            # the shapes contradict each other, and merging them would invent a reference.
+            # A different comparable geometry than the recorded face evidence is a contradiction.
             findings.append(
                 _finding(
                     "discovery.mate_entities_unsupported",
@@ -3512,9 +3520,7 @@ def _exporter_memberships(record: dict, declaration: dict, findings: list[dict])
         owners = selections[selected]
         return next(iter(owners)) if len(owners) == 1 else None
 
-    material = {
-        name for name, item in active.items() if not str(item.get("document") or "").lower().endswith(".sldasm")
-    }
+    material = {name for name, item in active.items() if item.get("document_type") == "part"}
     assigned = {name: owner_of(name) for name in active}
     pairs = _exporter_native_pairs(record, findings)
     rigid = [
@@ -4828,11 +4834,7 @@ def _body_records(
     bodies: list[dict] = []
     for root, members in sorted(clusters.members.items()):
         proven = attached is not None and frozenset(members) == attached
-        material = [
-            member
-            for member in members
-            if not str(components[member].get("document") or "").lower().endswith(".sldasm")
-        ]
+        material = [member for member in members if components[member].get("document_type") == "part"]
         if not material:
             continue
         anchor = material[0]
@@ -5300,11 +5302,7 @@ def _frame_attachment_findings(record: dict, clusters: _Clusters, bodies: list[d
     if frame is None:
         return
     components = {str(item.get("name2")): item for item in record.get("components") or [] if isinstance(item, dict)}
-    material = [
-        name
-        for name in sorted(frame.members)
-        if not str((components.get(name) or {}).get("document") or "").lower().endswith(".sldasm")
-    ]
+    material = [name for name in sorted(frame.members) if (components.get(name) or {}).get("document_type") == "part"]
     if not material:
         findings.append(
             _finding(
@@ -6703,7 +6701,7 @@ def _saved_native_carriers(
             if any(key.startswith("dp.joint.") for key in component_properties):
                 findings.append(_finding("discovery.joint_property_unbound", f"component:{member}",
                                          "Component-level joint properties lack an exact interface binding"))
-        material = [name for name in members if not proof["components"][name]["document"].lower().endswith(".sldasm")]
+        material = [name for name in members if proof["components"][name].get("document_type") == "part"]
         if not material:
             findings.append(_finding("discovery.saved_native_reference_empty", f"body:{occurrence}",
                                      "A declared native carrier has no material members"))

@@ -45,8 +45,6 @@ from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 from ..pipeline.verify_contract import validate_certificate_diagnostics
 from ..stages import (
     CONTRACT,
-    CONTRACT_FILE_SHA256,
-    CONTRACT_SHA256,
     VIEW_SCHEMA,
     activity_view,
     stage_display_state,
@@ -74,6 +72,7 @@ from ..interface_records import REQUEST_PURPOSES
 from ..delivery import PIPELINE_ID, SUBJECT_DIRECTORIES, PROJECTION_DIRECTORIES, SUBJECT_FILES
 from ..platform.queries import read_run_projection
 from ..schemas import PUBLICATION_RECEIPT_SCHEMA, RUN_ACTIVITY_SCHEMA
+from ..schemas import NATIVE_TOOL_REQUIREMENT_KIND
 from ..pipeline.contracts import ArtifactRef, StageStatus, StageCommand
 from ..pipeline.dispatch import DispatchObservation
 from ..pipeline.effects import EffectState
@@ -104,6 +103,7 @@ from .run_ownership import (
 from .report_view import (
     _display_check_details, _display_value, display_stage_view,
     warning_summaries,
+    text_warning_inventory,
     build_report,
     merge_warnings,
     registered_discovery_record,
@@ -647,6 +647,8 @@ class PortalConfig:
     max_body_bytes: int = 64 * 1024
     upload_root: Path | None = None
     upload_concurrency: int = 2
+    simulation: dict | None = None
+    assessment_executor: Any | None = None
     #: Split-pipeline routing: the model-repository checkouts.
     pipeline_repositories: dict[str, Path] | None = None
     #: Configured publication targets used by the upload selector and conf validation.
@@ -663,8 +665,7 @@ class PortalConfig:
     #: One production ingestion closure over the shared StageApplication, artifact
     #: store, native operation client and immutable config snapshot.
     production_admission_loader: Callable[[Any], Any] | None = None
-    production_freeze_successor_loader: Callable[[Any], Any] | None = None
-    production_mjcf_successor_loader: Callable[[Any], Any] | None = None
+    production_stage_rerun_loader: Callable[[Any], Any] | None = None
     production_application: Any | None = None
     production_native_client: Any | None = None
     production_config_snapshot: Path | None = None
@@ -687,7 +688,7 @@ class PortalConfig:
 _CONFIG_KEYS = {
     "airflow": {"url"},
     "endpoint": {"url", "token_file"},
-    "portal": {"host", "port", "upload_root", "upload_concurrency"},
+    "portal": {"host", "port", "upload_root", "upload_concurrency", "simulation"},
     "pipeline": {"repositories", "targets", "discovery"},
 }
 
@@ -704,6 +705,9 @@ def _read_config(path: Path) -> dict:
         raise AirflowApiError(f"portal config {path} is not valid JSON: {error}") from error
     if not isinstance(data, dict):
         raise AirflowApiError("portal config must be one JSON object")
+    unknown = set(data) - set(_CONFIG_KEYS)
+    if unknown:
+        raise AirflowApiError(f"portal config has unknown sections: {sorted(unknown)}")
     return data
 
 
@@ -721,7 +725,6 @@ def _production_admission_runtime(
     endpoint_section: dict,
     environ: Mapping[str, str],
 ) -> tuple[
-    Callable[[Any], Any] | None,
     Callable[[Any], Any] | None,
     Callable[[Any], Any] | None,
     Any | None,
@@ -773,7 +776,7 @@ def _production_admission_runtime(
             NativeOperationToolProvider,
         )
         from ..pipeline.ingestion import load_production_admission
-        from ..pipeline.ingestion import load_production_freeze_successor
+        from ..pipeline.ingestion import load_production_stage_rerun
         from ..pipeline.native_target import (
             load_registered_native_target,
         )
@@ -810,25 +813,13 @@ def _production_admission_runtime(
             work_root=work_root,
         )
 
-    def load_successor(request):
-        return load_production_freeze_successor(
-            application,
-            request,
-            artifacts=artifacts,
-            platform_snapshot=snapshot,
-            native_tool_provider=tool_provider,
-            work_root=work_root,
-        )
-
-    def load_mjcf_successor(request):
-        from ..pipeline.ingestion import load_production_mjcf_successor
-
-        return load_production_mjcf_successor(
+    def load_stage_rerun(request):
+        return load_production_stage_rerun(
             application, request, artifacts=artifacts, platform_snapshot=snapshot,
             native_tool_provider=tool_provider, work_root=work_root,
         )
 
-    return load, load_successor, load_mjcf_successor, application, client, snapshot
+    return load, load_stage_rerun, application, client, snapshot
 
 
 def load_portal_config(path: Path) -> PortalConfig:
@@ -839,9 +830,6 @@ def load_portal_config(path: Path) -> PortalConfig:
     rendered file (this package ships no example copy of it).
     """
     data = _read_config(path)
-    unknown = set(data) - set(_CONFIG_KEYS)
-    if unknown:
-        raise AirflowApiError(f"portal config has unknown sections: {sorted(unknown)}")
     airflow_section = _section(data, "airflow")
     portal_section = _section(data, "portal")
     endpoint_section = _section(data, "endpoint")
@@ -862,27 +850,49 @@ def load_portal_config(path: Path) -> PortalConfig:
             )
     (
         production_loader,
-        production_freeze_successor_loader,
-        production_mjcf_successor_loader,
+        production_stage_rerun_loader,
         production_application,
         production_native_client,
         production_snapshot,
     ) = _production_admission_runtime(endpoint_section, os.environ)
+    from ..dynamics_assessment.composition import assessment_executor_from_environment
+
+    assessment_executor = assessment_executor_from_environment(os.environ)
     return PortalConfig(
         airflow=AirflowApi(url.strip()),
         host=str(portal_section.get("host") or "127.0.0.1"),
         port=int(portal_section.get("port", PORTAL_HTTP_PORT)),
         upload_root=_upload_root(portal_section),
         upload_concurrency=_upload_concurrency(portal_section),
+        simulation=_simulation_config(portal_section),
+        assessment_executor=assessment_executor,
         pipeline_repositories=pipeline_repositories,
         pipeline_targets=pipeline_targets,
         production_admission_loader=production_loader,
-        production_freeze_successor_loader=production_freeze_successor_loader,
-        production_mjcf_successor_loader=production_mjcf_successor_loader,
+        production_stage_rerun_loader=production_stage_rerun_loader,
         production_application=production_application,
         production_native_client=production_native_client,
         production_config_snapshot=production_snapshot,
     )
+
+
+def _simulation_config(section: dict) -> dict | None:
+    value = section.get("simulation")
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {"root", "python", "capacity"}:
+        raise AirflowApiError("portal.simulation requires root, python and capacity")
+    if type(value["capacity"]) is not int or not 1 <= value["capacity"] <= 8:
+        raise AirflowApiError("Simulation capacity must be between 1 and 8")
+    for key in ("root", "python"):
+        if not isinstance(value[key], str) or not Path(value[key]).is_absolute():
+            raise AirflowApiError("Simulation paths must be absolute")
+    return value
+
+
+def load_simulation_config(path: Path) -> dict | None:
+    """Read shared simulation settings without constructing portal services or credentials."""
+    return _simulation_config(_section(_read_config(path), "portal"))
 
 
 def _upload_root(section: dict) -> Path | None:
@@ -1409,6 +1419,14 @@ class PortalApp:
         self._run_control_store = config.run_control_store
         self._platform_lock = threading.Lock()
         self._artifacts_cache = config.artifact_store
+        self._assessment_api = None
+        if config.assessment_executor is not None:
+            from ..dynamics_assessment.api import AssessmentApi
+
+            self._assessment_api = AssessmentApi(
+                config.assessment_executor.service, self._assessment_context,
+                runtime_reconciler=config.assessment_executor.reconcile,
+            )
 
     def _run_control(self):
         """The canonical admission-control and display-metadata surface."""
@@ -1488,6 +1506,79 @@ class PortalApp:
                 "Run facts are temporarily unavailable; retry later",
             ) from error
 
+    def _assessment_context(self, environ: dict, mutating: bool):
+        from ..dynamics_assessment.service import AssessmentAccess
+
+        session = self._session(environ, csrf=mutating)
+        principal, is_admin = self._viewer_identity(session)
+        portal = self
+
+        class DispatchTransport:
+            def trigger(self, dag_id, dag_run_id, conf):
+                return portal.config.airflow.trigger_dag_run(session.token, dag_id, dag_run_id, conf)
+
+            def observe(self, dag_id, dag_run_id):
+                try:
+                    return portal.config.airflow.dag_run(session.token, dag_id, dag_run_id)
+                except AirflowApiError as error:
+                    if isinstance(error.__cause__, urlerror.HTTPError) and error.__cause__.code == 404:
+                        return None
+                    raise
+
+        return AssessmentAccess(
+            principal, is_admin, lambda dag, control: self._assessment_source(session, dag, control),
+        ), DispatchTransport()
+
+    def _assessment_source(self, session: PortalSession, dag_run_id: str, control: bool):
+        from ..dynamics_assessment.contracts import MemberRef, SOURCE_SCHEMA, SourceBinding, SourceNotReady
+
+        source_id = self._authorize_run(session, dag_run_id)
+        if control:
+            run = self.config.airflow.dag_run(session.token, self.config.dag_id, dag_run_id)
+            if not self._can_manage(session, run):
+                raise PortalError(HTTPStatus.FORBIDDEN, "Only the source operator or an administrator can assess it")
+            if self._metadata_overlay(dag_run_id)["deleted"]:
+                raise PortalError(HTTPStatus.CONFLICT, "Restore the delivery before requesting assessment")
+        projection = self._read_projection(source_id)
+        if projection is None:
+            raise SourceNotReady("Registered engineering source is unavailable")
+        urdf = self._urdf_preview_from_projection(source_id, projection)
+        mjcf = self._mjcf_preview_from_projection(projection)
+        if not urdf or not mjcf or urdf.get("verified") is not True or mjcf.get("verified") is not True:
+            raise SourceNotReady("Qualified URDF and MJCF certificates are required for optional assessment")
+        by_stage = projection["by_stage"]
+
+        def member(stage, path):
+            declared = (by_stage.get(stage) or {}).get(path)
+            if declared is None:
+                raise SourceNotReady("A required registered engineering source member is unavailable")
+            checksum, size, artifact = self._registered_member_fields(declared)
+            return MemberRef(artifact, path, size, checksum).to_record()
+
+        return SourceBinding({
+            "schema": SOURCE_SCHEMA, "run_id": source_id, "dag_run_id": dag_run_id,
+            "subject_sha256": urdf["subject_sha256"],
+            "urdf": member("generate", "urdf/robot.urdf"),
+            "mjcf": member("mjcf", mjcf_contract.ROBOT_NAME),
+            "certificates": {
+                "urdf": member("verify", CERTIFICATE_FILENAME),
+                "mjcf": member("mjcf", mjcf_contract.REPORT_PATH),
+            },
+        })
+
+    def _assessment_response(self, environ, start_response, action, identity):
+        if self._assessment_api is None:
+            self._session(environ, csrf=environ.get("REQUEST_METHOD") != "GET")
+            if action == "list":
+                return _json_response(start_response, 200, {
+                    "enabled": False, "assessments": [], "publish_dependency": False,
+                }, self.config)
+            raise PortalError(HTTPStatus.CONFLICT, "Optional dynamics assessment is disabled")
+        result = self._assessment_api.handle(environ, action=action, identity=identity)
+        headers = [*result.headers, ("Content-Length", str(len(result.body)))]
+        start_response(f"{result.status} {HTTPStatus(result.status).phrase}", _common_headers(headers, self.config))
+        return [result.body]
+
     # ------------------------------------------------------------------ WSGI
     def __call__(self, environ: dict, start_response: Callable) -> Iterable[bytes]:
         try:
@@ -1505,6 +1596,9 @@ class PortalApp:
             return self._static(start_response, "index.html")
         if path.startswith("/static/") and method == "GET":
             return self._static(start_response, path[len("/static/") :])
+        if path == "/api/simulation-capability" and method == "GET":
+            self._session(environ)
+            return _json_response(start_response, 200, {"available": self.config.simulation is not None}, self.config)
         if path == "/api/targets" and method == "GET":
             return self._targets(environ, start_response)
         if path == "/api/session":
@@ -1519,6 +1613,17 @@ class PortalApp:
                 return self._list_runs(environ, start_response)
             if method == "POST":
                 return self._start_run(environ, start_response)
+        match = re.fullmatch(r"/api/runs/([^/]+)/assessments/dynamics(?:/(source|bundles))?", path)
+        if match:
+            action = ({"source": "source", "bundles": "bundle"}.get(match.group(2))
+                      or ("list" if method == "GET" else "create"))
+            return self._assessment_response(environ, start_response, action, match.group(1))
+        match = re.fullmatch(r"/api/dynamics-assessments/attempts/([^/]+)/(cancel|reconcile|dispatch|result)", path)
+        if match:
+            return self._assessment_response(environ, start_response, match.group(2), match.group(1))
+        match = re.fullmatch(r"/api/dynamics-assessments/([^/]+)(?:/(retry))?", path)
+        if match:
+            return self._assessment_response(environ, start_response, match.group(2) or "get", match.group(1))
         match = re.fullmatch(r"/api/runs/([^/]+)", path)
         if match:
             if method == "GET":
@@ -2325,6 +2430,7 @@ class PortalApp:
             "operator": operator,
             "principal": principal,
             "can_manage": can_manage,
+            "assessment_enabled": self._assessment_api is not None,
             # Linked rerun lineage from canonical admission, same fields as the list rows.
             "parent_dag_run_id": parent_dag_run_id,
             "resume_from": _optional_str(
@@ -2383,9 +2489,9 @@ class PortalApp:
             **self._metadata_overlay(dag_run_id),
         }
         if isinstance(projection, dict):
-            payload["stage_reruns"] = [
-                self._freeze_successor_row(projection), self._mjcf_successor_row(projection, principal=principal),
-            ]
+            payload["stage_reruns"] = self._stage_rerun_rows(projection["run_id"], principal)
+            payload["execution_scope"] = projection.get("execution_scope")
+            payload["delivery_complete"] = projection.get("delivery_complete") is True
         return _json_response(start_response, 200, payload, self.config)
 
     def _retry_run(self, environ: dict, start_response: Callable, dag_run_id: str) -> Iterable[bytes]:
@@ -2538,384 +2644,23 @@ class PortalApp:
         )
 
     # ------------------------------------------------------------- rerun
-    @staticmethod
-    def _freeze_successor_row(projection: dict) -> dict:
-        request = projection.get("request")
-        request = request if isinstance(request, Mapping) else {}
-        stages = projection.get("stages")
-        stages = stages if isinstance(stages, Mapping) else {}
-        freeze = stages.get("freeze")
-        freeze = freeze if isinstance(freeze, Mapping) else {}
-        originals = request.get("originals")
-        originals = originals if isinstance(originals, Mapping) else {}
-        members = originals.get("members")
-        options = sorted(
-            {
-                item.get("path")
-                for item in members or ()
-                if isinstance(item, Mapping)
-                and isinstance(item.get("path"), str)
-                and item["path"].casefold().endswith(".sldasm")
-            }
-        )
-        eligible = bool(
-            freeze.get("state") == StageStatus.COMPLETED.value
-            and options
-            and request.get("from_stage") != "mjcf"
-            and request.get("purpose") in REQUEST_PURPOSES
-            and isinstance(request.get("target_hardware"), str)
-            and isinstance(request.get("change_summary"), str)
-        )
-        return {
-            "stage": "freeze",
-            "name": _STAGE_NAMES["freeze"],
-            "eligible": eligible,
-            "reason": "ready" if eligible else "sealed_freeze_unavailable",
-            "message": (
-                "Create a new request from the sealed CAD originals under the "
-                "current rules, configuration, target and native release."
-                if eligible
-                else "Open the original source run to create a new Freeze request."
-                if request.get("from_stage") == "mjcf"
-                else "A completed sealed Freeze closure is required to create a new request."
-            ),
-            "main_assembly_options": options,
-            "recomputes": list(_STAGE_IDS),
-            "retains": [
-                {
-                    "availability": "sealed",
-                    "label": "Parent Freeze CAD originals",
-                }
+    def _stage_rerun_rows(self, source_run_id: str, principal: str) -> list[dict]:
+        application = self.config.production_application
+        if application is None:
+            return [
+                {"stage": stage, "name": _STAGE_NAMES[stage], "eligible": False,
+                 "reason": "stage_rerun_unavailable", "message": "Stage rerun service is unavailable."}
+                for stage in _STAGE_IDS
             ]
-            if eligible
-            else [],
-            "prerequisites": {
-                "inputs": "ok" if eligible else "missing",
-                "tool": "current" if eligible else "missing",
-                "dependency": "sealed" if eligible else "missing",
-                "target": "current" if eligible else "missing",
-                "receipt": "ok" if eligible else "missing",
-                "earliest_required": "freeze",
-            },
-        }
+        return application.stage_rerun_options(source_run_id, principal)
 
-    def _mjcf_successor_row(self, projection: dict, *, principal: str | None = None) -> dict:
-        """Describe the restricted entry; the application rechecks every source fact."""
-        request = projection.get("request") or {}
-        source_id = request.get("parent_run_id") if request.get("from_stage") == "mjcf" else projection["run_id"]
-        source = self._read_projection(source_id) if source_id != projection["run_id"] else projection
-        verify = ((source or {}).get("stages") or {}).get("verify") or {}
-        eligible = bool(
-            source and source.get("state") in {"succeeded", "failed", "cancelled"}
-            and (source.get("scope") or {}).get("kind") == "formal"
-            and verify.get("state") == "completed" and verify.get("formal_eligible") is True
-        )
-        owner_matches = principal is None or principal == ((source or {}).get("request") or {}).get("principal")
-        eligible = eligible and owner_matches
-        return {
-            "stage": "mjcf", "name": _STAGE_NAMES["mjcf"], "eligible": eligible,
-            "reason": ("ready" if eligible else "source_owner_mismatch"
-                       if not owner_matches else "verified_source_unavailable"),
-            "message": "Reuse the verified URDF and meshes; rerun MJCF and publication in a new request."
-                       if eligible else "Only the original initiator can rerun MJCF over this source."
-                       if not owner_matches
-                       else "A settled formal run with a qualified URDF verification is required.",
-            "source_run_id": source_id, "source_dag_run_id": (source or {}).get("request_id"),
-            "simulation": request.get("simulation", "{}\n"),
-            "recomputes": ["mjcf", "publish"],
-            "retains": [{"label": "Verified URDF and meshes", "availability": "sealed"}] if eligible else [],
-        }
-
-    def _mjcf_successor_attempt(
-        self, start_response, session, principal, dag_run_id, body, submission_key,
-    ):
-        """Admit and dispatch a new immutable MJCF request over its original URDF source."""
-        with self._rerun_lock:
-            if self._metadata_overlay(dag_run_id)["deleted"]:
-                return self._rerun_refusal(start_response, "deleted", "Restore the run before rerunning", None)
-            projection = self._read_projection(native_run_id(dag_run_id))
-            if projection is None:
-                return self._rerun_refusal(
-                    start_response, "registration_missing", "Canonical run facts are unavailable", None,
-                )
-            row = self._mjcf_successor_row(projection, principal=principal)
-            if row["eligible"] is not True:
-                return self._rerun_refusal(start_response, row["reason"], row["message"], "freeze")
-            loader = self.config.production_mjcf_successor_loader
-            application = self.config.production_application
-            if not callable(loader) or application is None:
-                raise PortalError(HTTPStatus.SERVICE_UNAVAILABLE, "MJCF successor composition is unavailable")
-            new_dag_run_id = "portal-mjcf-" + submission_key
-            new_run_id = native_run_id(new_dag_run_id)
-            request = projection["request"]
-            try:
-                from ..pipeline.ingestion import ProductionMJCFSuccessorRequest
-
-                existing = application.load_admission_outcome(new_run_id)
-                outcome = loader(ProductionMJCFSuccessorRequest(
-                    run_id=new_run_id, request_id=new_dag_run_id, parent_run_id=row["source_run_id"],
-                    principal=principal, change_summary=body.get("change_summary", request["change_summary"]),
-                    simulation=body.get("simulation", row["simulation"]),
-                ))
-            except Exception as error:
-                return self._rerun_refusal(
-                    start_response, str(getattr(error, "code", "admission_refused")), str(error)[:512], None,
-                )
-            command = getattr(outcome, "dispatch_command", None)
-            if command is None or command.run_id != new_run_id or command.dag_run_id != new_dag_run_id:
-                return self._rerun_refusal(
-                    start_response, "admission_identity_mismatch", "MJCF dispatch identity differs", None,
-                )
-            try:
-                dispatched = self._dispatch_technical(session, command.command_id, retry_absent=existing is not None)
-            except AirflowAuthError as error:
-                raise PortalError(HTTPStatus.UNAUTHORIZED, "Feishu session expired; sign in again") from error
-            except (AirflowApiError, PipelineError, ValueError) as error:
-                return self._rerun_refusal(start_response, "dispatch_start_unconfirmed", str(error)[:512], None)
-            if dispatched.state is not EffectState.SATISFIED:
-                return _json_response(start_response, HTTPStatus.BAD_GATEWAY, {
-                    "error": "Start state is unconfirmed; reconcile the registered dispatch effect.",
-                    "dag_run_id": new_dag_run_id, "trigger": dispatched.state.value,
-                }, self.config)
-        return self._accepted_attempt(start_response, new_dag_run_id, row["source_dag_run_id"], "mjcf", "queued")
-
-    @staticmethod
-    def _attempt_payload(new_run_id: str, parent_dag_run_id: str, stage: str, state: str) -> dict:
-        return {
-            "dag_run_id": new_run_id,
-            "parent_dag_run_id": parent_dag_run_id,
-            "resume_from": stage,
-            "resume_from_name": _STAGE_NAMES.get(stage, stage),
-            "state": state,
-        }
-
-    def _accepted_attempt(
-        self, start_response: Callable, attempt_id: str, parent_dag_run_id: str, stage: str, state: object
-    ) -> Iterable[bytes]:
-        return _json_response(
-            start_response,
-            HTTPStatus.ACCEPTED,
-            self._attempt_payload(attempt_id, parent_dag_run_id, stage, _optional_str(state) or "queued"),
-            self.config,
-        )
-
-    def _rerun_refusal(
-        self,
-        start_response: Callable,
-        reason: str,
-        message: str,
-        earliest_required: str | None,
-        *,
-        active_dag_run_id: str | None = None,
-    ) -> Iterable[bytes]:
-        payload = {
-            "error": message,
-            "reason": reason,
-            "message": message,
-            "earliest_required": earliest_required,
-        }
-        if active_dag_run_id is not None:
-            payload["active_dag_run_id"] = active_dag_run_id
-        return _json_response(start_response, HTTPStatus.CONFLICT, payload, self.config)
-
-    def _freeze_successor_attempt(
-        self,
-        start_response: Callable,
-        session: PortalSession,
-        principal: str,
-        dag_run_id: str,
-        body: dict,
-        submission_key: str,
-    ) -> Iterable[bytes]:
-        """Create one current-generation request from a completed parent Freeze."""
-
-        with self._rerun_lock:
-            if self._metadata_overlay(dag_run_id)["deleted"]:
-                return self._rerun_refusal(
-                    start_response,
-                    "deleted",
-                    "Deleted runs cannot be reused; restore first",
-                    None,
-                )
-            parent_run_id = native_run_id(dag_run_id)
-            projection = self._read_projection(parent_run_id)
-            if projection is None:
-                return self._rerun_refusal(
-                    start_response,
-                    "registration_missing",
-                    "The parent run has no canonical admission facts",
-                    None,
-                )
-            row = self._freeze_successor_row(projection)
-            if row.get("eligible") is not True:
-                return self._rerun_refusal(
-                    start_response,
-                    str(row.get("reason") or "sealed_freeze_unavailable"),
-                    str(row.get("message") or "The parent Freeze closure is unavailable"),
-                    "freeze",
-                )
-            parent_request = projection.get("request")
-            parent_request = (
-                parent_request if isinstance(parent_request, Mapping) else {}
-            )
-            scope = projection.get("scope")
-            if not isinstance(scope, Mapping) or scope.get("kind") != "formal":
-                return self._rerun_refusal(
-                    start_response,
-                    "diagnostic_parent",
-                    "A diagnostic run cannot create a formal successor",
-                    None,
-                )
-
-            target_hardware = (
-                body.get("target_hardware")
-                if "target_hardware" in body
-                else parent_request.get("target_hardware")
-            )
-            if (
-                not isinstance(target_hardware, str)
-                or target_hardware not in (self.config.pipeline_targets or {})
-            ):
-                raise PortalError(
-                    HTTPStatus.BAD_REQUEST,
-                    "Publication target is required and must be configured",
-                )
-            change_summary = (
-                body.get("change_summary")
-                if "change_summary" in body
-                else parent_request.get("change_summary")
-            )
-            change_summary = (
-                normalize_change_summary(change_summary).strip()
-                if isinstance(change_summary, str)
-                else ""
-            )
-            if not change_summary:
-                raise PortalError(
-                    HTTPStatus.BAD_REQUEST,
-                    "Change summary is required when creating a new request",
-                )
-            purpose = parent_request.get("purpose")
-            if purpose not in REQUEST_PURPOSES:
-                return self._rerun_refusal(
-                    start_response,
-                    "incomplete",
-                    "The parent run has no valid frozen purpose",
-                    None,
-                )
-            options = row["main_assembly_options"]
-            main_assembly = (
-                body.get("main_assembly")
-                if "main_assembly" in body
-                else parent_request.get("main_assembly")
-            )
-            if not isinstance(main_assembly, str) or main_assembly not in options:
-                raise PortalError(
-                    HTTPStatus.BAD_REQUEST,
-                    "Select a main assembly from the parent's sealed Freeze originals",
-                )
-
-            new_dag_run_id = "portal-freeze-" + submission_key
-            new_run_id = native_run_id(new_dag_run_id)
-            loader = self.config.production_freeze_successor_loader
-            if not callable(loader) or self.config.production_application is None:
-                raise PortalError(
-                    HTTPStatus.SERVICE_UNAVAILABLE,
-                    "The production Freeze successor composition is unavailable",
-                )
-            try:
-                from ..pipeline.ingestion import (
-                    ProductionFreezeSuccessorRequest,
-                )
-
-                existing_outcome = self.config.production_application.load_admission_outcome(new_run_id)
-                outcome = loader(
-                    ProductionFreezeSuccessorRequest(
-                        run_id=new_run_id,
-                        request_id=new_dag_run_id,
-                        parent_run_id=parent_run_id,
-                        main_assembly=main_assembly,
-                        target_hardware=target_hardware,
-                        purpose=purpose,
-                        change_summary=change_summary,
-                        principal=principal,
-                    )
-                )
-            except Exception as error:
-                code = str(getattr(error, "code", ""))
-                if code == "admission_ingestion.intent_conflict":
-                    return self._rerun_refusal(
-                        start_response,
-                        "attempt_mismatch",
-                        "A new request with this identity already exists with different parameters",
-                        None,
-                    )
-                return self._rerun_refusal(
-                    start_response,
-                    code or "admission_refused",
-                    str(error)[:512],
-                    None,
-                )
-            dispatch_command = getattr(outcome, "dispatch_command", None)
-            if (
-                dispatch_command is None
-                or getattr(dispatch_command, "run_id", None) != new_run_id
-                or getattr(dispatch_command, "dag_run_id", None) != new_dag_run_id
-            ):
-                return self._rerun_refusal(
-                    start_response,
-                    "admission_identity_mismatch",
-                    "The new request returned another dispatch identity",
-                    None,
-                )
-            try:
-                dispatch_result = self._dispatch_technical(
-                    session,
-                    dispatch_command.command_id,
-                    retry_absent=existing_outcome is not None,
-                )
-            except AirflowAuthError as error:
-                raise PortalError(
-                    HTTPStatus.UNAUTHORIZED,
-                    "Feishu session expired; sign in again",
-                ) from error
-            except (AirflowApiError, PipelineError, ValueError) as error:
-                return self._rerun_refusal(
-                    start_response,
-                    "dispatch_start_unconfirmed",
-                    str(error)[:512],
-                    None,
-                )
-            if dispatch_result.state is not EffectState.SATISFIED:
-                return _json_response(
-                    start_response,
-                    HTTPStatus.BAD_GATEWAY,
-                    {
-                        "error": (
-                            "Start state is unconfirmed; do not submit again. "
-                            "Reconcile the registered dispatch effect."
-                        ),
-                        "dag_run_id": new_dag_run_id,
-                        "trigger": dispatch_result.state.value,
-                    },
-                    self.config,
-                )
-        log.info(
-            "portal freeze successor parent=%s child=%s principal=%s",
-            dag_run_id,
-            new_dag_run_id,
-            principal,
-        )
-        return self._accepted_attempt(
-            start_response,
-            new_dag_run_id,
-            dag_run_id,
-            "freeze",
-            "queued",
-        )
+    def _rerun_refusal(self, start_response, reason: str, message: str) -> Iterable[bytes]:
+        return _json_response(start_response, HTTPStatus.CONFLICT, {
+            "error": message, "reason": reason, "message": message,
+        }, self.config)
 
     def _rerun_attempt(self, environ: dict, start_response: Callable, dag_run_id: str) -> Iterable[bytes]:
-        """Create a new formal request only from a verified parent Freeze closure."""
+        """Admit a new immutable execution range over verified sealed inputs."""
         session = self._session(environ, csrf=True)
         principal = session.principal or ""
         if not principal:
@@ -2925,63 +2670,83 @@ class PortalApp:
         submission_key = str(environ.get("HTTP_IDEMPOTENCY_KEY") or "").strip()
         if not submission_key or _RUN_ID.fullmatch(submission_key) is None or len(submission_key) > 110:
             raise PortalError(
-                HTTPStatus.BAD_REQUEST,
-                "Idempotency-Key must be a non-empty safe identifier of at most 110 characters",
+                HTTPStatus.BAD_REQUEST, "Idempotency-Key must be a safe identifier of at most 110 characters"
             )
         body = self._body(environ)
-        stage = body.get("stage")
-        keys = ({"stage", "change_summary", "simulation"} if stage == "mjcf" else
-                {"stage", "target_hardware", "change_summary", "main_assembly"})
-        if set(body) - keys or stage not in {"freeze", "mjcf"}:
-            raise PortalError(
-                HTTPStatus.BAD_REQUEST,
-                "New requests must start from Freeze or the restricted MJCF entry",
-            )
-        for key in ("target_hardware", "change_summary", "main_assembly", "simulation"):
-            if key in body and not isinstance(body[key], str):
-                raise PortalError(
-                    HTTPStatus.BAD_REQUEST,
-                    "Only text request parameters are accepted",
-                )
+        allowed = {"from_stage", "through_stage", "change_summary", "main_assembly", "simulation", "target_hardware"}
+        if set(body) - allowed:
+            raise PortalError(HTTPStatus.BAD_REQUEST, "Stage rerun parameters are invalid")
+        stage = body.get("from_stage")
+        through = body.get("through_stage", stage)
+        if stage not in _STAGE_IDS or through not in _STAGE_IDS or _STAGE_IDS.index(through) < _STAGE_IDS.index(stage):
+            raise PortalError(HTTPStatus.BAD_REQUEST, "Stage rerun execution range is invalid")
+        for name in ("change_summary", "main_assembly", "simulation", "target_hardware"):
+            if name in body and not isinstance(body[name], str):
+                raise PortalError(HTTPStatus.BAD_REQUEST, "Stage rerun parameters must be text")
         try:
-            airflow_run = self.config.airflow.dag_run(
-                session.token,
-                self.config.dag_id,
-                dag_run_id,
-            )
-            if not self._can_manage(session, airflow_run):
-                raise PortalError(
-                    HTTPStatus.FORBIDDEN,
-                    "Only the initiator or a platform administrator can create a new request",
-                )
+            airflow_run = self.config.airflow.dag_run(session.token, self.config.dag_id, dag_run_id)
         except AirflowAuthError as error:
-            forbidden = (
-                isinstance(error.__cause__, urlerror.HTTPError)
-                and error.__cause__.code == 403
-            )
-            raise PortalError(
-                HTTPStatus.FORBIDDEN if forbidden else HTTPStatus.UNAUTHORIZED,
-                str(error),
-            ) from error
+            raise PortalError(HTTPStatus.UNAUTHORIZED, "Feishu session expired; sign in again") from error
         except AirflowApiError as error:
-            code = (
-                error.__cause__.code
-                if isinstance(error.__cause__, urlerror.HTTPError)
-                else None
-            )
-            raise PortalError(
-                code if code in {404, 409} else HTTPStatus.BAD_GATEWAY,
-                str(error),
-            ) from error
-        attempt = self._mjcf_successor_attempt if stage == "mjcf" else self._freeze_successor_attempt
-        return attempt(
-            start_response,
-            session,
-            principal,
-            dag_run_id,
-            body,
-            submission_key,
-        )
+            raise PortalError(HTTPStatus.BAD_GATEWAY, str(error)) from error
+        if not self._can_manage(session, airflow_run):
+            raise PortalError(HTTPStatus.FORBIDDEN, "Only the initiator or a platform administrator can rerun a stage")
+        loader = self.config.production_stage_rerun_loader
+        application = self.config.production_application
+        if loader is None or application is None:
+            raise PortalError(HTTPStatus.SERVICE_UNAVAILABLE, "Stage rerun composition is unavailable")
+        with self._rerun_lock:
+            if self._metadata_overlay(dag_run_id)["deleted"]:
+                return self._rerun_refusal(start_response, "deleted", "Restore the delivery before rerunning a stage")
+            source_id = native_run_id(dag_run_id)
+            projection = self._read_projection(source_id)
+            if projection is None:
+                return self._rerun_refusal(
+                    start_response, "registration_missing", "Canonical source facts are unavailable"
+                )
+            new_dag_run_id = "portal-" + stage + "-" + submission_key
+            new_run_id = native_run_id(new_dag_run_id)
+            from ..pipeline.ingestion import ProductionStageRerunRequest
+
+            try:
+                existing = application.load_admission_outcome(new_run_id)
+                outcome = loader(ProductionStageRerunRequest(
+                    run_id=new_run_id, request_id=new_dag_run_id, parent_run_id=source_id,
+                    principal=principal, from_stage=stage, through_stage=through,
+                    change_summary=normalize_change_summary(
+                        body.get("change_summary", projection["request"]["change_summary"])
+                    ),
+                    main_assembly=body.get("main_assembly"), simulation=body.get("simulation"),
+                    target_hardware=body.get("target_hardware"),
+                ))
+            except (PipelineError, ValueError) as error:
+                return self._rerun_refusal(
+                    start_response, str(getattr(error, "code", "admission_refused")), str(error)[:512]
+                )
+            command = outcome.dispatch_command
+            if command.run_id != new_run_id or command.dag_run_id != new_dag_run_id:
+                return self._rerun_refusal(
+                    start_response, "admission_identity_mismatch", "Stage dispatch identity differs"
+                )
+            try:
+                dispatched = self._dispatch_technical(session, command.command_id, retry_absent=existing is not None)
+            except AirflowAuthError as error:
+                raise PortalError(HTTPStatus.UNAUTHORIZED, "Feishu session expired; sign in again") from error
+            except (AirflowApiError, PipelineError, ValueError) as error:
+                return _json_response(start_response, HTTPStatus.BAD_GATEWAY, {
+                    "error": str(error)[:512], "dag_run_id": new_dag_run_id,
+                    "reason": "dispatch_start_unconfirmed",
+                }, self.config)
+            settled = dispatched.state is EffectState.SATISFIED
+        return _json_response(start_response, HTTPStatus.ACCEPTED if settled else HTTPStatus.BAD_GATEWAY, {
+            "dag_run_id": new_dag_run_id, "parent_dag_run_id": dag_run_id,
+            "resume_from": stage, "resume_from_name": _STAGE_NAMES[stage],
+            "through_stage": through, "state": "queued" if settled else "unresolved",
+            "trigger": dispatched.state.value,
+            **({} if settled else {
+                "error": "Start state is unconfirmed; retry this same immutable request to reconcile it."
+            }),
+        }, self.config)
 
     # --------------------------------------------------------------- preview
     def _authorize_run(self, session: PortalSession, dag_run_id: str) -> str:
@@ -3029,6 +2794,35 @@ class PortalApp:
         }
         return self._mjcf_input_members(result)
 
+    @staticmethod
+    def _registered_producer_run(projection: dict, row: dict) -> str:
+        reuse = row.get("reuse")
+        if not reuse:
+            return projection["run_id"]
+        command = row.get("command") or {}
+        producer = reuse.get("source_run")
+        if (
+            reuse.get("reused") is not True or not isinstance(producer, str) or not producer
+            or command.get("run_id") != producer
+            or command.get("command_id") != reuse.get("source_command_id")
+        ):
+            raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered reused stage producer is inconsistent")
+        return producer
+
+    @staticmethod
+    def _registered_stage_command(projection: dict, row: dict, artifact: ArtifactRef) -> StageCommand:
+        """Read the original producer command, including a reused stage's identity."""
+        command = StageCommand.from_record(row.get("command"))
+        if (
+            command.run_id != PortalApp._registered_producer_run(projection, row)
+            or artifact.producer_run_id != command.run_id
+            or artifact.producer_stage != command.stage
+            or artifact.kind != f"stage_output:{command.stage}"
+            or artifact.producer_tool_sha256 != command.expected_executor_sha256
+        ):
+            raise PipelineError("Registered stage artifact differs from its original producer command")
+        return command
+
     def _mjcf_input_members(self, projection: dict) -> dict:
         """Expose only the registered MJCF command's exact source closure."""
         stages = projection["stages"]
@@ -3041,8 +2835,9 @@ class PortalApp:
             return projection
         try:
             command = StageCommand.from_record(command_record)
-            if command.run_id != projection["run_id"]:
-                raise PipelineError("MJCF entry command belongs to another run")
+            producer_run = self._registered_producer_run(projection, row)
+            if command.run_id != producer_run:
+                raise PipelineError("MJCF command differs from its registered source producer")
             refs = mjcf_source_refs(command)
             by_stage = dict(projection.get("by_stage") or {})
             members = dict(projection.get("members") or {})
@@ -3316,12 +3111,38 @@ class PortalApp:
         else:
             return None
         report = _parse_registered_json(data)
+        command = self._registered_stage_command(projection, row, artifact)
+        native_member = members.get("reports/native-tool.json")
+        if stage != "capture" or not isinstance(native_member, dict):
+            raise PipelineError("Registered native Capture tool evidence is missing")
+        native_tool = _parse_registered_json(self._registered_member_bytes("reports/native-tool.json", native_member))
+        request = command.request
+        requirements = [ref for ref in command.input_artifacts if ref.kind == NATIVE_TOOL_REQUIREMENT_KIND]
+        release = native_tool.get("release")
+        if not isinstance(release, dict) or not isinstance(release.get("contract"), dict):
+            raise PipelineError("Registered native tool has no original release inventory")
+        package_files = release.get("package_files")
+        if (
+            digest(native_tool) != request.get("native_tool_record_sha256")
+            or native_tool.get("source_sha256") != request.get("native_tool_source_sha256")
+            or len(requirements) != 1
+            or requirements[0].artifact_id != request.get("native_tool_requirement_artifact_id")
+            or requirements[0].producer_run_id is not None
+            or requirements[0].producer_stage is not None
+            or not isinstance(package_files, dict) or not package_files
+            or digest(package_files) != native_tool.get("source_sha256")
+            or release.get("source_sha256") != native_tool.get("source_sha256")
+            or release["contract"].get("stage") != command.contract_sha256
+            or not isinstance(package_files.get("stage-contract.json"), str)
+            or _SHA256_TEXT.fullmatch(package_files["stage-contract.json"]) is None
+        ):
+            raise PipelineError("Registered native tool differs from the original Capture requirement")
         if (
             report.get("schema_version") != VIEW_SCHEMA
             or report.get("pipeline_id") != PIPELINE_ID
             or report.get("run_id") != source_run
-            or report.get("contract_sha256") != CONTRACT_SHA256
-            or report.get("contract_file_sha256") != CONTRACT_FILE_SHA256
+            or report.get("contract_sha256") != command.contract_sha256
+            or report.get("contract_file_sha256") != package_files["stage-contract.json"]
         ):
             raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered stage report conflicts with its run or contract")
         return report
@@ -3421,10 +3242,10 @@ class PortalApp:
             members = by_stage.get(stage_id) or {}
             if members:
                 artifact = self._registered_stage_artifact(members, stage=stage_id)
-                if artifact.producer_run_id != run_id:
-                    parent = projection.get("parent_run_id")
-                    if not parent or artifact.producer_run_id != parent:
-                        raise PortalError(HTTPStatus.BAD_GATEWAY, "Registered stage artifact has no proven parent run")
+                if artifact.producer_run_id != self._registered_producer_run(projection, row):
+                    raise PortalError(
+                        HTTPStatus.BAD_GATEWAY, "Registered stage artifact differs from its proven producer"
+                    )
                 stage["outputs"] = [{
                     "path": ".", "label": "Sealed stage output", "availability": "recorded",
                     "files": {name: member["sha256"] for name, member in members.items()},
@@ -3654,7 +3475,22 @@ class PortalApp:
             raise PipelineError("The verification certificate differs from its stage result")
         by_stage = projection.get("by_stage")
         by_stage = by_stage if isinstance(by_stage, dict) else {}
+        verify_artifact = self._stage_artifact_ref(by_stage.get("verify") or {}, stage="verify")
+        verify_command = self._registered_stage_command(projection, verify_row, verify_artifact)
+        if verify_command.stage != "verify" or (
+            certificate.get("contract_sha256") != verify_command.contract_sha256
+            or certificate.get("policy_sha256") != verify_command.policy_sha256
+            or certificate.get("config_snapshot_sha256") != verify_command.config_snapshot_sha256
+            or certificate.get("actual_verifier_sha256") != verify_command.expected_executor_sha256
+            or certificate.get("purpose") != verify_command.request.get("purpose")
+        ):
+            raise PipelineError("The verification certificate differs from its original Verify command")
         generate, capture = self._verification_input_pair(verify_row, by_stage)
+        generate_row = (projection.get("stages") or {}).get("generate") or {}
+        generate_command = self._registered_stage_command(projection, generate_row, generate)
+        generate_captures = [ref for ref in generate_command.input_artifacts if ref.kind == "stage_output:capture"]
+        if generate_captures != [capture] or generate_command.request.get("capture_artifact_id") != capture.artifact_id:
+            raise PipelineError("The original Generate command names another Capture artifact")
         certificate_generate = ArtifactRef.from_record(certificate.get("generate_artifact"))
         certificate_capture = ArtifactRef.from_record(certificate.get("capture_artifact"))
         if certificate_generate != generate or certificate_capture != capture:
@@ -3672,21 +3508,8 @@ class PortalApp:
         generate_members = generate_members if isinstance(generate_members, dict) else {}
         capture_members = by_stage.get("capture")
         capture_members = capture_members if isinstance(capture_members, dict) else {}
-        verify_members = by_stage.get("verify")
-        verify_members = verify_members if isinstance(verify_members, dict) else {}
-        if not generate_members:
-            generate_members = {
-                path: member
-                for path, member in verify_members.items()
-                if path == "tool.json"
-                or path.startswith(("model/", "urdf/", "meshes/"))
-            }
-        if not capture_members:
-            capture_members = {
-                path: member
-                for path, member in verify_members.items()
-                if path.startswith(("input/", "evidence/"))
-            }
+        if not generate_members or not capture_members:
+            raise PipelineError("The registered Generate/Capture source inventory is missing")
         evaluation_subject = self._pair_subject_from_members(generate_members, capture_members)
         if (
             evaluation_subject is not None
@@ -3694,24 +3517,22 @@ class PortalApp:
         ):
             raise PipelineError("The verification certificate evaluation subject differs")
 
-        receipt_member = generate_members.get(
-            "reports/generate.json",
-            verify_members.get("reports/generate.json"),
-        )
-        if isinstance(receipt_member, dict):
-            receipt_bytes = self._registered_member_bytes("reports/generate.json", receipt_member)
-            if certificate.get("generate_receipt_sha256") != hashlib.sha256(receipt_bytes).hexdigest():
-                raise PipelineError("The verification certificate names another Generate receipt")
-            receipt = _parse_registered_json(receipt_bytes)
-            if (
-                not isinstance(receipt, dict)
-                or receipt.get("capture_artifact") != capture.to_record()
-                or receipt.get("config_snapshot_sha256") != certificate.get("config_snapshot_sha256")
-                or receipt.get("contract_sha256") != certificate.get("contract_sha256")
-                or receipt.get("actual_executor_sha256") != generate.producer_tool_sha256
-                or receipt.get("required_executor_sha256") != generate.producer_tool_sha256
-            ):
-                raise PipelineError("The Generate receipt differs from the verification pair")
+        receipt_member = generate_members.get("reports/generate.json")
+        if not isinstance(receipt_member, dict):
+            raise PipelineError("The original Generate receipt is missing")
+        receipt_bytes = self._registered_member_bytes("reports/generate.json", receipt_member)
+        if certificate.get("generate_receipt_sha256") != hashlib.sha256(receipt_bytes).hexdigest():
+            raise PipelineError("The verification certificate names another Generate receipt")
+        receipt = _parse_registered_json(receipt_bytes)
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("capture_artifact") != capture.to_record()
+            or receipt.get("config_snapshot_sha256") != generate_command.config_snapshot_sha256
+            or receipt.get("contract_sha256") != generate_command.contract_sha256
+            or receipt.get("actual_executor_sha256") != generate.producer_tool_sha256
+            or receipt.get("required_executor_sha256") != generate.producer_tool_sha256
+        ):
+            raise PipelineError("The Generate receipt differs from the verification pair")
         return generate, capture, evaluation_subject
 
     def _mjcf_preview_from_projection(self, projection: dict) -> dict | None:
@@ -3724,16 +3545,13 @@ class PortalApp:
         member = output.get(mjcf_contract.REPORT_PATH)
         if not isinstance(member, dict):
             raise PipelineError("Completed MJCF stage has no registered certificate")
-        command = StageCommand.from_record(row.get("command"))
+        output_ref = self._stage_artifact_ref(output, stage="mjcf")
+        command = self._registered_stage_command(projection, row, output_ref)
         certificate = mjcf_certificate_from_bytes(
             self._registered_member_bytes(mjcf_contract.REPORT_PATH, member), command,
         )
         if digest(certificate) != (row.get("receipt") or {}).get("checks_sha256"):
             raise PipelineError("MJCF certificate differs from its registered stage result")
-        output_ref = self._stage_artifact_ref(output, stage="mjcf")
-        if (output_ref.producer_run_id != command.run_id
-                or output_ref.producer_tool_sha256 != command.expected_executor_sha256):
-            raise PipelineError("MJCF artifact belongs to another producer")
         for stage, ref in mjcf_source_refs(command).items():
             if ref != self._stage_artifact_ref(by_stage.get(stage) or {}, stage=stage):
                 raise PipelineError("MJCF preview names another source artifact")
@@ -3751,7 +3569,10 @@ class PortalApp:
             sha, size, _ref = self._registered_member_fields(source)
             files[name] = {"sha256": sha, "bytes": size}
         components = mjcf_contract.COMPONENT_SOURCE if mjcf_contract.COMPONENT_SOURCE in files else None
-        actual_binding = mjcf_contract.binding_for_files(files, components=components)
+        binding = certificate["input_binding"]
+        actual_binding = mjcf_contract.binding_for_files(
+            files, components=components, tool=binding["tool"], engine=binding["engine"],
+        )
         if actual_binding != certificate["input_binding"]:
             raise PipelineError("MJCF preview file inventory or engine differs from its certificate")
         projected = {name: record for name, record in files.items() if name.startswith("mjcf/")}
@@ -3769,6 +3590,11 @@ class PortalApp:
         if not formal and not diagnostic:
             raise PipelineError("Completed MJCF output has no matching stage qualification")
         verified = formal and projection.get("state") != "unresolved"
+        report_sha, report_bytes, report_ref = self._registered_member_fields(member)
+        warning_inventory = text_warning_inventory(mjcf_contract.projection_warnings(certificate), {
+            "artifact": report_ref, "path": mjcf_contract.REPORT_PATH,
+            "bytes": report_bytes, "sha256": report_sha,
+        })
         return {
             "entry": mjcf_contract.SCENE_NAME if mjcf_contract.SCENE_NAME in files else mjcf_contract.ROBOT_NAME,
             "files": {name: record["sha256"] for name, record in files.items()},
@@ -3778,7 +3604,7 @@ class PortalApp:
             "verified": verified, "formal_eligible": verified, "mechanical_passed": True,
             "state": "verified" if verified else "unverified",
             "verification_scope": qualification["scope_kind"],
-            "warnings": mjcf_contract.projection_warnings(certificate),
+            "warning_inventory": warning_inventory,
             "collision": next((item["details"] for item in certificate["report"]["checks"]
                                if item["id"] == "collision.hulls"), {}),
             "facts": certificate["report"]["facts"], "scope": certificate["report"]["scope"],
@@ -4193,6 +4019,20 @@ class _QuietHandler(WSGIRequestHandler):
 def serve(config: PortalConfig) -> None:
     """Serve the portal until interrupted (deployment owns the reverse proxy and TLS)."""
     app = PortalApp(config)
+    if config.simulation is not None:
+        import uvicorn
+        from .pico_portal import create_app
+        from ..simulation.service import SimulationService
+        from ..simulation.store import SimulationStore
+        from ..platform.facts import AdmissionControlStore
+
+        connection_factory = AdmissionControlStore.from_environment(os.environ)._connect
+        settings = config.simulation
+        service = SimulationService(SimulationStore(connection_factory), app._artifact_store(),
+                                    Path(settings["root"]), Path(settings["python"]), capacity=settings["capacity"])
+        uvicorn.run(create_app(app, service), host=config.host, port=config.port, workers=1,
+                    ws_max_size=128 * 1024, log_level="info")
+        return
     with make_server(
         config.host, config.port, app, server_class=_ThreadingWSGIServer, handler_class=_QuietHandler
     ) as server:

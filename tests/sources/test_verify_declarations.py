@@ -21,7 +21,7 @@ from xml.sax.saxutils import escape
 
 from description_pipeline.verification import v14_declarations as v14
 from description_pipeline.interface_records import PURPOSE_ENGINEERING, PURPOSE_INSPECTION_PREVIEW
-from description_pipeline.io import PipelineError, digest
+from description_pipeline.io import PipelineError, artifact_path_parts, digest
 from description_pipeline.verification import solidworks_urdf
 from description_pipeline.verification import native_declarations as native_declarations_module
 from description_pipeline.verification.native_declarations import (
@@ -48,16 +48,25 @@ def verify_declarations(raw, source=None, *, purpose=None):
         )
         if isinstance(main_assembly, str) and main_assembly:
             documents.add(main_assembly)
+        # Invalid component claims stay in the scenario, never in its admitted bytes.
+        for document in tuple(documents):
+            try:
+                artifact_path_parts(document)
+            except PipelineError:
+                documents.remove(document)
         raw["files"] = dict.fromkeys(sorted(documents), "f" * 64)
     if all(
         "transform_raw" not in item
         for item in raw.get("components") or []
         if isinstance(item, dict)
     ):
-        raw = support.local_native_record_payload(
+        raw = support.world_native_record_payload(
             raw,
             default_mate_scope=True,
         )
+    if "source_selection" not in raw:
+        main = raw["selection"]["main_assembly"]
+        raw["source_selection"] = sealed_selection(raw["files"], main)
     return _verify_declarations(raw, source, purpose=purpose)
 
 
@@ -592,9 +601,8 @@ class DeclarationConsumerTests(unittest.TestCase):
         raw["source_selection"] = sealed_selection(
             native_files,
             "robot.SLDASM",
-            edges={document: [] for document in documents},
         )
-        raw = support.local_native_record_payload(
+        raw = support.world_native_record_payload(
             raw,
             default_mate_scope=True,
         )
@@ -602,10 +610,10 @@ class DeclarationConsumerTests(unittest.TestCase):
         robot["source"]["robot_name"] = "fixture"
         payload = support.frozen_discovery_payload(
             {
-                "schema_version": "solidworks-to-urdf.native-discovery/v1",
+                "schema_version": "solidworks-to-urdf.native-discovery/v2",
                 "run_id": "declaration-consumer",
-                "contract": "native-discovery/v1",
-                    "handoff_sha256": raw["source_selection"]["handoff_sha256"],
+                "contract": "native-discovery/v2",
+                    "handoff_sha256": raw["source_selection"]["upload_sha256"],
                 "raw": raw,
                 "identity": copy.deepcopy(raw["identity"]),
             },
@@ -807,7 +815,7 @@ class DeclarationConsumerTests(unittest.TestCase):
     def test_interface_expansion_refuses_a_missing_referenced_configuration(self) -> None:
         raw = {"components": [{"name2": "a-1"}], "datums": [self._interface("TCP_x", "a-1")]}
         bodies = [{"id": "a", "name": "a", "components": ["a-1"], "frame": {"coordinate_system": "CS_a"}}]
-        raw = support.local_native_record_payload(
+        raw = support.world_native_record_payload(
             raw,
             default_mate_scope=True,
         )
@@ -1340,18 +1348,14 @@ class NativeDeclarationsTests(unittest.TestCase):
                 kind = item.find(NS_TAG + "AttributeType")
                 if (
                     (item.get(Z_TAG + "Id") or "").startswith("joint_limit_")
-                    and kind is not None
-                    and kind.text in {"lower", "upper"}
+                    and kind is not None and kind.text in {"lower", "upper"}
                 ):
                     item.find(NS_TAG + "Value").text = "0"
 
         rewrite(raw, zero_position)
         report = verify_declarations(raw, purpose=PURPOSE_ENGINEERING)
         self.assertFalse(report["passed"])
-        self.assertIn(
-            "v14.native_limits_conflict",
-            {item["code"] for item in report["errors"]},
-        )
+        self.assertIn("v14.native_limits_conflict", {item["code"] for item in report["errors"]})
 
     def test_engineering_unreadable_native_limit_blocks_without_a_default(self) -> None:
         raw = zero_limit_values(fixture())
@@ -1571,6 +1575,7 @@ class NativeDeclarationsTests(unittest.TestCase):
                 and component.get("document") != "source.step"
             },
             "source.step": "a" * 64,
+            "robot.SLDASM": "f" * 64,
         }
         self.assertTrue(verify_declarations(raw)["passed"])
         for patch in [
@@ -1668,7 +1673,6 @@ class NativeDeclarationsTests(unittest.TestCase):
         raw["source_selection"] = sealed_selection(
             raw["files"],
             owner,
-            edges={document: [] for document in raw["files"]},
             imports=[],
             virtual_components=[slot],
         )
@@ -1754,7 +1758,7 @@ class NativeDeclarationsTests(unittest.TestCase):
         )
 
     def test_serialized_origin_is_claim_only_when_customized(self):
-        raw = fixture()  # stored origin differs from native datums, but isCustomized=false
+        raw = fixture()
         self.assertTrue(verify_declarations(raw)["passed"])
         rewrite(raw, lambda root: [setattr(item, "text", "true") for item in root.iter(NS_TAG + "isCustomized")])
         self.assertIn("v14.evidence_invalid", self.errors(raw))
@@ -1861,22 +1865,18 @@ class NativeDeclarationsTests(unittest.TestCase):
             from .selection_support import seal_fixture_open_observation
 
             seal_fixture_open_observation(raw)
-            raw = support.local_native_record_payload(
+            raw = support.world_native_record_payload(
                 raw,
                 default_mate_scope=True,
             )
-            robot = {
-                "hardware_id": "fixture",
-                "source": source_claims(),
-                "checks": {},
-            }
+            robot = {"hardware_id": "fixture", "source": source_claims(), "checks": {}}
             robot["source"]["robot_name"] = "fixture"
             payload = support.frozen_discovery_payload(
                 {
-                    "schema_version": "solidworks-to-urdf.native-discovery/v1",
+                    "schema_version": "solidworks-to-urdf.native-discovery/v2",
                     "run_id": "test",
-                    "contract": "native-discovery/v1",
-                    "handoff_sha256": raw["source_selection"]["handoff_sha256"],
+                    "contract": "native-discovery/v2",
+                    "handoff_sha256": raw["source_selection"]["upload_sha256"],
                     "raw": raw,
                     "identity": copy.deepcopy(raw["identity"]),
                 },
@@ -1990,7 +1990,10 @@ class NativeDeclarationsTests(unittest.TestCase):
             ):
                 mutate()
                 reseal()
-                self.assertIn("discovery.identity", {item["code"] for item in verify_discovery(package)["errors"]})
+                self.assertIn(
+                    "discovery.identity",
+                    {item["code"] for item in verify_discovery(package)["errors"]},
+                )
                 raw["identity"] = dict.fromkeys(authored)
                 payload["identity"] = dict.fromkeys(identity_keys)
                 robot["hardware_id"] = None

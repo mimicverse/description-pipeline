@@ -3,12 +3,12 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Robot delivery</title>
+  <title>Robot Model Studio</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
   <header class="topbar">
-    <div class="brand"><svg class="brand-mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="m12 2 9 5v10l-9 5-9-5V7Z M3 7l9 5 9-5 M12 12v10"/></svg><h1>Robot delivery</h1></div>
+    <div class="brand"><svg class="brand-mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="m12 2 9 5v10l-9 5-9-5V7Z M3 7l9 5 9-5 M12 12v10"/></svg><h1>Robot Model Studio</h1></div>
     <div id="account" class="account" hidden><span id="account-user"></span><button id="logout" type="button" class="ghost">Sign out</button></div>
   </header>
   <main>
@@ -108,6 +108,7 @@
               <aside class="pane pane-inspect" aria-label="Delivery details">
                 <section class="findings-section"><h3>Warnings and findings</h3><ul id="findings" class="findings"></ul></section>
                 <details id="stage-panel" class="detail-section"><summary>Stage details <span id="stage-selection-label" class="muted"></span></summary><div id="stage-detail"></div><div id="stage-rerun" class="stage-rerun" hidden></div></details>
+                <section id="dynamics-assessment" class="detail-section" hidden></section>
                 <details class="detail-section"><summary>Engineering review scope</summary><div id="confirmations" class="confirmations"></div></details>
                 <details class="detail-section"><summary>Delivery records</summary><dl class="meta" id="run-meta"></dl><p id="run-ident" class="muted small"></p><div id="task-progress" class="progress"></div></details>
               </aside>

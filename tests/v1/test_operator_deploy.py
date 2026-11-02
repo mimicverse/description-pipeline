@@ -125,6 +125,9 @@ def write_contract_wheel(path: Path) -> None:
 
 def create_package_source(root: Path) -> Path:
     package = root / "fixture-package" / "description_pipeline"
+    (package / "dynamics_assessment").mkdir(parents=True)
+    (package / "dynamics_assessment/__init__.py").write_text("")
+    (package / "dynamics_assessment/contracts.py").write_text('DAG_ID = "upper_body_dynamics"\n')
     (package / "orchestration").mkdir(parents=True)
     (package / "platform").mkdir(parents=True)
     (package / "pipeline").mkdir()
@@ -480,8 +483,19 @@ exit "${HEALTH_GATE_RC:-0}"
         operator / "runtime_dag.py",
         """\
 #!/usr/bin/env python3
-print("runtime-dag-ok")
-""",
+import sys
+import json
+import runpy
+from pathlib import Path
+if "--dag-ids" in sys.argv:
+    state = Path(sys.argv[sys.argv.index("--state-root") + 1])
+    record = json.loads((state / "install-record.json").read_bytes())
+    snapshot = json.loads(Path(record["snapshot"]["path"]).read_bytes())
+    reader = runpy.run_path(__RUNTIME_DAG_SOURCE__)
+    print("\\n".join(reader["enabled_dag_ids"](snapshot)))
+else:
+    print("runtime-dag-ok")
+""".replace("__RUNTIME_DAG_SOURCE__", repr(str(ROOT / "deploy/operator/runtime_dag.py"))),
     )
     (operator / "reconcile-effect.py").write_text(
         """\
@@ -915,6 +929,54 @@ class FirstInstallTests(unittest.TestCase):
             ),
             self.environment,
         )
+
+    def _enable_assessment(self):
+        config = json.loads(self.config.read_bytes())
+        config["operator"]["assessment"] = {
+            "enabled": True, "python": "/opt/assessment/bin/python", "capacity": 3,
+            "limits": {"wall_seconds": 60, "cpu_seconds": 60,
+                       "memory_bytes": 2147483648, "output_bytes": 16777216},
+        }
+        self.config.write_text(json.dumps(config))
+
+    def test_enabled_assessment_uses_the_same_start_keep_closed_and_drain_boundary(self):
+        self._enable_assessment()
+        installed = self._install()
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        for keep_closed in (True, False):
+            self.paths["order"].write_text("")
+            options = ("--keep-admission-closed",) if keep_closed else ()
+            started = run(self._command("start", *options), self.environment)
+            self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+            order = self.paths["order"].read_text()
+            for dag_id in ("solidworks_to_urdf", "upper_body_dynamics"):
+                self.assertIn("airflow dags pause " + dag_id, order)
+                self.assertEqual("airflow dags unpause " + dag_id in order, not keep_closed)
+        self.paths["order"].write_text("")
+        drained = run(self._command("drain"), self.environment)
+        self.assertEqual(drained.returncode, 0, drained.stdout + drained.stderr)
+        for dag_id in ("solidworks_to_urdf", "upper_body_dynamics"):
+            self.assertIn("airflow dags pause " + dag_id, self.paths["order"].read_text())
+
+    def test_auxiliary_unpause_failure_repauses_both_dags_and_keeps_admission_closed(self):
+        self._enable_assessment()
+        installed = self._install()
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        python = self.paths["state"] / "derived/gen-1/operator.env"
+        from tests.v1.test_platform_env import render_operator
+
+        airflow = Path(render_operator.read_env(python)["AIRFLOW_VENV"]) / "bin/airflow"
+        write_stub(airflow, '#!/bin/bash\necho "airflow $*" >> "$ORDER_LOG"\n'
+                   'if [ "$*" = "dags unpause upper_body_dynamics" ]; then exit 8; fi\n')
+        self.paths["order"].write_text("")
+        started = run(self._command("start"), self.environment)
+        self.assertNotEqual(started.returncode, 0, started.stdout + started.stderr)
+        order = self.paths["order"].read_text()
+        self.assertIn("airflow dags unpause solidworks_to_urdf", order)
+        failure = order.index("airflow dags unpause upper_body_dynamics")
+        self.assertIn("airflow dags pause solidworks_to_urdf", order[failure:])
+        self.assertIn("airflow dags pause upper_body_dynamics", order[failure:])
+        self.assertEqual(self.paths["admission"].read_text(), "true")
 
     def test_clean_install_binds_one_current_record_and_windows_identity(self) -> None:
         installed = self._install()

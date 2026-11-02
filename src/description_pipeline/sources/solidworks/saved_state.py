@@ -161,9 +161,8 @@ def _scope(selection: Mapping[str, Any]) -> dict[str, Any]:
 
     closure = selection.get("closure")
     occurrences = closure.get("observed_occurrences") if isinstance(closure, Mapping) else None
-    selected = selection.get("files")
-    excluded = selection.get("excluded_files")
-    if not isinstance(selected, Mapping) or not isinstance(excluded, Mapping):
+    files = selection.get("files")
+    if not isinstance(files, Mapping):
         raise PipelineError("saved-state selection inventory is missing")
     if (
         not isinstance(occurrences, list)
@@ -185,8 +184,7 @@ def _scope(selection: Mapping[str, Any]) -> dict[str, Any]:
         raise PipelineError("an unresolved occurrence lacks native suppression evidence")
     return {
         "main_assembly": selection["main_assembly"],
-        "selected_files": sorted(selected),
-        "excluded_files": sorted(excluded),
+        "input_files": sorted(files),
         "graph_nodes": len(closure["graph"]),
         "occurrence_count": len(occurrences),
         "occurrences": occurrences,

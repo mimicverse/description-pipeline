@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -61,6 +62,50 @@ class RuntimeDagTests(unittest.TestCase):
         self.assertEqual(path, self.dag.resolve())
         self.assertEqual(digest, self.digest)
         self.assertEqual(folder, self.dag.parent.resolve())
+
+    def auxiliary_release(self):
+        root = self.root / "release"
+        self.dag = root / runtime_dag.DAG_MEMBER
+        self.dag.parent.mkdir(parents=True)
+        self.dag.write_text("# main dag\n")
+        self.digest = hashlib.sha256(self.dag.read_bytes()).hexdigest()
+        auxiliary = self.dag.with_name("upper_body_dynamics.py")
+        auxiliary.write_text("# auxiliary dag\n")
+        self.write_config(self.dag.parent)
+        document = {
+            "schema_version": "solidworks-to-urdf.release/v1", "pipeline_id": "solidworks-to-urdf",
+            "version": "1.5.1", "source_commit": "c" * 40, "source_tree": "d" * 40,
+            "source_sha256": "e" * 64, "artifacts": {"runtime.whl": "a" * 64},
+            "deployment_files": {
+                runtime_dag.DAG_MEMBER: self.digest,
+                auxiliary.relative_to(root).as_posix(): hashlib.sha256(auxiliary.read_bytes()).hexdigest(),
+            },
+        }
+        (root / "release.json").write_text(json.dumps(document))
+        record = self.record()
+        record["release"] = runtime_dag.release_identity(document)
+        snapshot = {"resolved": {"operator": {"assessment": {"enabled": True}}}}
+        return record, snapshot, auxiliary
+
+    def test_enabled_auxiliary_dag_uses_release_inventory_and_actual_serialized_file(self):
+        record, snapshot, auxiliary = self.auxiliary_release()
+        with (
+            mock.patch.object(runtime_dag, "read_installed_generation", return_value=(record, snapshot)),
+            mock.patch.object(runtime_dag, "effective_dags_folder", return_value=self.dag.parent),
+            mock.patch.object(runtime_dag, "serialized_dag", return_value={"observed": True}) as serialized,
+        ):
+            result = runtime_dag.check(self.root / "state", self.airflow_home)
+        self.assertEqual(runtime_dag.enabled_dag_ids(snapshot), [runtime_dag.DAG_ID, "upper_body_dynamics"])
+        self.assertEqual(result["auxiliary"][0]["dag_path"], str(auxiliary))
+        self.assertEqual(serialized.call_args_list, [
+            mock.call(runtime_dag.DAG_ID, dag_path=self.dag, dags_folder=self.dag.parent),
+            mock.call("upper_body_dynamics", dag_path=auxiliary, dags_folder=self.dag.parent),
+        ])
+        auxiliary.write_text("# changed auxiliary bytes\n")
+        with self.assertRaisesRegex(RuntimeError, "auxiliary DAG digest differs"):
+            runtime_dag.active_dags(record, snapshot)
+        snapshot["resolved"]["operator"]["assessment"]["enabled"] = False
+        self.assertEqual(list(runtime_dag.active_dags(record, snapshot)), [runtime_dag.DAG_ID])
 
     def test_dag_digest_and_config_folder_mismatches_fail(self) -> None:
         record = self.record()

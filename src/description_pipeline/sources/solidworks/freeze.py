@@ -789,7 +789,7 @@ def _capture_axis_references(backend: Any, cfg: dict[str, Any]) -> list[dict[str
             )
         try:
             captured.append({"joint": joint_name, **reader(reference)})
-        except Exception as error:
+        except BaseException as error:
             error.partial_axis_facts = captured
             raise
     return captured
@@ -827,6 +827,7 @@ def _capture_prepared_local(
     backend: Any,
     worker_version: str,
     expected_session_sources: Mapping[str, str] | None = None,
+    expected_occurrences=None,
     on_activity=None,
 ) -> dict[str, Any]:
     """Capture one already sealed prepared assembly in a single owned session."""
@@ -868,6 +869,7 @@ def _capture_prepared_local(
     raw_facts = None
     raw_geometry: dict[str, Any] = {}
     axis_references: list[dict[str, Any]] = []
+    runtime: dict[str, Any] = {}
     try:
         main_relative, sealed_files = _sealed_capture_files(
             package,
@@ -909,6 +911,7 @@ def _capture_prepared_local(
             document,
             cfg["configuration"],
         )
+        runtime["prepared_capture"] = {"policy": prepared_policy}
         if not isinstance(prepared_policy, dict):
             raise BridgeError(
                 "cad_prepared_capture_policy",
@@ -917,6 +920,7 @@ def _capture_prepared_local(
                 exit_code=3,
             )
         opened = opener(document)
+        runtime["prepared_capture"]["opened"] = opened
         if (
             not isinstance(opened, dict)
             or not _same_document(str(opened.get("path") or ""), document)
@@ -933,13 +937,12 @@ def _capture_prepared_local(
             document,
             str(cfg["configuration"]),
         )
+        runtime["document_state"] = {"before": state_before}
 
         stage = "environment"
         environment = capture_environment(backend, worker_version)
-        environment["prepared_capture"] = {
-            "policy": prepared_policy,
-            "opened": opened,
-        }
+        environment["prepared_capture"] = runtime["prepared_capture"]
+        runtime.update(environment)
 
         stage = "readings"
         _capture_note(activity, "readings")
@@ -948,6 +951,7 @@ def _capture_prepared_local(
             cfg["coordinate_systems"],
             groups=cfg["groups"],
             expected_session_sources=expected_session_sources or {},
+            expected_occurrences=expected_occurrences,
             native_files=native_files,
             on_activity=activity.publish,
             require_material=True,
@@ -974,6 +978,7 @@ def _capture_prepared_local(
             document,
             str(cfg["configuration"]),
         )
+        runtime["document_state"]["after"] = state_after
 
         stage = "release"
         _capture_note(activity, "release")
@@ -1066,23 +1071,30 @@ def _capture_prepared_local(
         os.replace(staging, destination)
         return manifest
     except BaseException as error:
-        if not released:
-            release = getattr(backend, "release", None)
-            if callable(release):
-                try:
-                    release()
-                except Exception as cleanup_error:
-                    error.add_note(f"CAD cleanup also failed: {cleanup_error}")
         observations = {
             "scene": raw_facts if raw_facts is not None else getattr(error, "partial_native_facts", None),
             "geometry": raw_geometry,
             "axis_references": axis_references or getattr(error, "partial_axis_facts", []),
+            "runtime": runtime,
         }
-        with contextlib.suppress(Exception):
-            _retain_failure(staging, destination, error, stage, request, observations)
+        try:
+            if not released:
+                release = getattr(backend, "release", None)
+                if callable(release):
+                    try:
+                        release()
+                    except BaseException as cleanup_error:
+                        error.add_note(f"CAD cleanup also failed: {type(cleanup_error).__name__}: {cleanup_error}")
+                        observations["cleanup_exceptions"] = _exception_trace(cleanup_error)
+                        if not isinstance(cleanup_error, Exception):
+                            raise
+        finally:
+            with contextlib.suppress(Exception):
+                _retain_failure(staging, destination, error, stage, request, observations)
         raise
     finally:
         activity.stop_keepalive()
+
 
 def capture_prepared(
     config: dict[str, Any],
@@ -1094,6 +1106,7 @@ def capture_prepared(
     backend: Any,
     worker_version: str,
     expected_session_sources: Mapping[str, str] | None = None,
+    expected_occurrences=None,
     on_activity=None,
     resource_settlement: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -1109,5 +1122,6 @@ def capture_prepared(
             backend=backend,
             worker_version=worker_version,
             expected_session_sources=expected_session_sources,
+            expected_occurrences=expected_occurrences,
             on_activity=on_activity,
         )

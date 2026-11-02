@@ -315,7 +315,7 @@ def write_file_source_scope_authority(
     write_json(
         root / "input/discovery/native-discovery.json",
         {
-            "schema_version": "solidworks-to-urdf.native-discovery/v1",
+            "schema_version": "solidworks-to-urdf.native-discovery/v2",
             "run_id": "fixture-run",
             "derivation": {
                 "main_assembly": "",
@@ -553,15 +553,16 @@ def _reference_type_from_geometry(reference: dict) -> int | None:
     }.get(geometry.get("kind"))
 
 
-def local_native_record_payload(
+def world_native_record_payload(
     payload: dict,
     *,
     default_mate_scope: bool = False,
     fill_missing_parents: bool = False,
 ) -> dict:
-    """Encode fixture scenario values as the local facts the Windows reader emits."""
+    """Encode fixture scenario values as the world facts the Windows reader emits."""
 
     result = copy.deepcopy(payload)
+    result["transform_frame"] = "main_assembly"
     result.setdefault("mates", [])
     result.setdefault("datums", [])
     components = [
@@ -616,27 +617,12 @@ def local_native_record_payload(
                 for value in values
             )
         )
-        parent_values = (
-            world.get(parent, _identity())
-            if parent
-            else _identity()
+        transform_raw = solidworks_transform(values) if valid else copy.deepcopy(values)
+        component.setdefault(
+            "document_type",
+            "assembly" if str(component.get("document") or "").lower().endswith(".sldasm") else "part",
         )
-        valid_parent = (
-            isinstance(parent_values, list)
-            and len(parent_values) == 16
-            and all(
-                type(value) in (int, float)
-                for value in parent_values
-            )
-        )
-        if valid and values and valid_parent:
-            local = _matrix_product(
-                _matrix_inverse(parent_values),
-                values,
-            )
-            transform_raw = solidworks_transform(local)
-        else:
-            transform_raw = copy.deepcopy(values)
+        component.setdefault("instance_id", name)
         component["parent_occurrence"] = parent
         component["transform_raw"] = transform_raw
         component.pop("transform", None)
@@ -1189,6 +1175,7 @@ class FixtureCadBackend(CadBackend):
         require_material: bool = True,
         expected_session_sources: Mapping[str, str] | None = None,
         native_files: Mapping[str, str] | None = None,
+        expected_occurrences=None,
     ) -> dict[str, Any]:
         """Return the seven raw fact families consumed after CAD release."""
 
@@ -1234,6 +1221,7 @@ class FixtureCadBackend(CadBackend):
                 }
             )
         raw_scene = {
+            "transform_frame": "main_assembly",
             "document": scene.document,
             "configuration": self.configurations[0],
             "occurrences": occurrences,
@@ -1297,16 +1285,8 @@ class FixtureCadBackend(CadBackend):
                 "selection_rule": "top_most_providers+uncovered_leaves",
                 "links": {},
             }
-        scope_reader = getattr(self, "source_scopes", None)
         component_names = [component.name for component in scene.components]
-        source_scopes = (
-            scope_reader(component_names)
-            if callable(scope_reader)
-            else {
-                name: copy.deepcopy(self._source_scope_overrides[name])
-                for name in component_names
-            }
-        )
+        source_scopes = self.source_scopes(component_names)
         return {
             "scene_raw": raw_scene,
             "part_mass_raw": part_mass,
@@ -1856,8 +1836,8 @@ def frozen_discovery_payload(
     raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
     raw_identity = raw.get("identity") if isinstance(raw.get("identity"), dict) else {}
     envelope_defaults = {
-        "schema_version": "solidworks-to-urdf.native-discovery/v1",
-        "contract": "native-discovery/v1",
+        "schema_version": "solidworks-to-urdf.native-discovery/v2",
+        "contract": "native-discovery/v2",
         "namespace": "dp",
         "run_id": "fixture-run",
         "generator": "native-discovery",
@@ -2506,7 +2486,7 @@ def native_record(
             "robot.SLDASM",
             edges={"robot.SLDASM": parts, **{name: [] for name in parts}},
         )
-    return local_native_record_payload(payload)
+    return world_native_record_payload(payload)
 
 
 def seal_scene_inputs(
@@ -2635,7 +2615,7 @@ def stage_discovery_inputs(
     write_json(
         root / "evidence" / "discovery.json",
         {
-            "schema_version": "solidworks-to-urdf.native-discovery/v1",
+            "schema_version": "solidworks-to-urdf.native-discovery/v2",
             "run_id": "fixture-run",
             "derivation": {
                 "main_assembly": "robot.SLDASM",

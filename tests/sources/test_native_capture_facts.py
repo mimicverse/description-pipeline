@@ -117,6 +117,7 @@ class NativeCaptureFactsTests(unittest.TestCase):
         raw_facts = {
             "schema_version": NATIVE_CAPTURE_OBSERVATION_SCHEMA,
             "scene_raw": {
+                "transform_frame": "main_assembly",
                 "document": "/source/root.SLDASM",
                 "configuration": "Default",
                 "occurrences": [

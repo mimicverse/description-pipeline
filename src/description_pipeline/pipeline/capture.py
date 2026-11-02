@@ -500,6 +500,8 @@ class CaptureRequest:
             value = values[key]
             if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
                 raise ProtocolError("capture.request_invalid", {"where": key})
+        if values["handoff_sha256"] != values["upload_sha256"]:
+            raise ProtocolError("capture.request_invalid", {"where": "complete-input-identity"})
         return cls(native_target_identity=target.to_record(), **values)
 
 
@@ -719,17 +721,6 @@ class CaptureInputs:
                 "capture.native_history_binding",
                 {"where": "native.observation"},
             )
-        if command.diagnostic_scope is None and (
-            historical_source_sha256 != request.native_tool_source_sha256
-            or digest(native_tool) != request.native_tool_record_sha256
-        ):
-            raise ProtocolError(
-                "capture.native_requirement_binding",
-                {
-                    "source": request.native_tool_source_sha256,
-                    "record": request.native_tool_record_sha256,
-                },
-            )
         if (
             discover_request.get("freeze_artifact_id") != freeze.artifact_id
             or discover_request.get("main_assembly") != request.main_assembly
@@ -793,16 +784,14 @@ class CaptureInputs:
             selection_binding = selection_bindings(selection)
         except PipelineError as error:
             raise ProtocolError("capture.discover_selection", {"where": "selection"}) from error
-        selected_files = {str(name): str(value) for name, value in selection_binding["files"].items()}
+        source_files = {str(name): str(value) for name, value in selection_binding["files"].items()}
         if (
-            digest(selected_files) != request.handoff_sha256
+            digest(source_files) != request.handoff_sha256
             or selection_binding["upload_sha256"] != request.upload_sha256
         ):
             raise ProtocolError("capture.handoff_mismatch", {"handoff_sha256": request.handoff_sha256})
         upload_inventory = freeze_inputs.get("upload_inventory")
-        if not isinstance(upload_inventory, dict) or any(
-            upload_inventory.get(name) != checksum for name, checksum in selected_files.items()
-        ):
+        if not isinstance(upload_inventory, dict) or source_files != upload_inventory:
             raise ProtocolError("capture.selection_source_mismatch", {"where": "freeze upload inventory"})
 
         if discover_result.get("prepared_sha256") != request.prepared_sha256 or not isinstance(
@@ -1146,7 +1135,7 @@ def _capture_native_transaction(
     with _capture_output_lock(output) as output:
         if not writable_output(output):
             raise PipelineError(f"Output must be absent or empty: {output}")
-        staging = Path(tempfile.mkdtemp(prefix=f".{output.name}-capture-", dir=output.parent))
+        staging = Path(tempfile.mkdtemp(dir=output.parent))
         receipt = _capture_receipt(
             run_id,
             handoff_sha256=handoff_sha256,
@@ -1256,6 +1245,25 @@ def _invoke_native_operation(
             reason,
         )
     return NativeCaptureResult("unknown", None, None, result, False, "capture.native_unknown")
+
+
+def validate_source_inputs(command: StageCommand, artifacts: ArtifactStore) -> None:
+    """Use the existing adjacent-input parser without a native operation."""
+    with tempfile.TemporaryDirectory(prefix="capture-source-inputs-") as temporary:
+        workspace = StageWorkspace(
+            root=Path(temporary),
+            inputs={
+                ref.artifact_id: artifacts.materialize(ref, Path(temporary) / ref.artifact_id)
+                for ref in command.input_artifacts
+            },
+        )
+        try:
+            CaptureInputs.resolve(command, workspace, CaptureRequest.from_command(command))
+        except ProtocolError as error:
+            for stage in ("freeze", "discover"):
+                if error.code.startswith(f"capture.{stage}"):
+                    error.detail.setdefault("earliest_stage", stage)
+            raise
 
 
 class CaptureHandler:

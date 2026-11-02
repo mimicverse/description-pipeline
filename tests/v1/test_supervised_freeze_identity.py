@@ -37,6 +37,7 @@ import unittest
 import uuid
 import zipfile
 from base64 import urlsafe_b64encode
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
@@ -171,7 +172,7 @@ class SupervisedFreezeIdentityTests(unittest.TestCase):
         from description_pipeline.pipeline.ingestion import (
             ProductionAdmissionFactory,
             ProductionAdmissionRequest,
-            ProductionFreezeSuccessorRequest,
+            ProductionStageRerunRequest,
             ReceivedUploadReceipt,
         )
         from description_pipeline.pipeline.services import CanonicalStageServices, ClaimPolicy
@@ -184,7 +185,7 @@ class SupervisedFreezeIdentityTests(unittest.TestCase):
         cls.ProtocolError = ProtocolError
         cls.ProductionAdmissionFactory = ProductionAdmissionFactory
         cls.ProductionAdmissionRequest = ProductionAdmissionRequest
-        cls.ProductionFreezeSuccessorRequest = ProductionFreezeSuccessorRequest
+        cls.ProductionStageRerunRequest = ProductionStageRerunRequest
         cls.ReceivedUploadReceipt = ReceivedUploadReceipt
 
         cls.wheel_root = cls.root / "wheel"
@@ -304,6 +305,7 @@ class SupervisedFreezeIdentityTests(unittest.TestCase):
             clock=lambda: datetime(2026, 10, 25, 10, tzinfo=UTC),
         )
         cls.runs: dict[str, dict[str, object]] = {}
+        cls.dispatches: dict[str, dict[str, object]] = {}
         cls.actual_identities: dict[str, dict] = {}
         cls._admit_run("fresh")
         cls._admit_run("parent")
@@ -360,6 +362,14 @@ class SupervisedFreezeIdentityTests(unittest.TestCase):
             raise AssertionError("the supervised DAG copy is not byte-identical")
 
         cls._write_connection(database_connection)
+        from airflow.models.pool import Pool
+        from airflow.utils.session import create_session
+
+        with create_session() as session:
+            Pool.create_or_update_pool(
+                name="windows_native", slots=1, description="Isolated supervised scope fixture",
+                include_deferred=True, session=session,
+            )
         cls._start_services("initial", cls.dag_file.parent)
         cls._wait_for_dag()
         cls.serialized = cls._serialized_identity(cls.dag_file)
@@ -421,7 +431,8 @@ class SupervisedFreezeIdentityTests(unittest.TestCase):
     def _admit_run(cls, label: str) -> None:
         request, dag_run_id = cls._request(label)
         work = cls.root / "admission-work" / f"{label}-{uuid.uuid4().hex}"
-        outcome = cls._factory(work_root=work).admit(cls.application, request)
+        prepared = cls._factory(work_root=work).prepare(request)
+        outcome = cls.application.admit(replace(prepared.spec, through_stage="freeze"))
         if outcome.entry_command.request["native_target_identity"] != (
             cls.install_record["ends"]["windows"]["target_identity"]
         ):
@@ -438,6 +449,9 @@ class SupervisedFreezeIdentityTests(unittest.TestCase):
             "dag_run_id": dag_run_id,
             "run_id": request.run_id,
             "entry_command_id": outcome.entry_command.command_id,
+            "dispatch_command_id": outcome.dispatch_command.command_id,
+            "dispatch_conf": conf.to_record(),
+            "execution_scope": list(cls.application.execution_scope(request.run_id)),
             "dispatch_dag_id": outcome.dispatch_command.dag_id,
             "dispatch_dag_run_id": outcome.dispatch_command.dag_run_id,
             "dispatch_conf_run_id": conf.run_id,
@@ -450,18 +464,18 @@ class SupervisedFreezeIdentityTests(unittest.TestCase):
     def _admit_successor(cls, label: str) -> None:
         parent = str(cls.runs["parent"]["run_id"])
         dag_run_id = f"portal-supervised-{label}-{uuid.uuid4().hex[:10]}"
-        request = cls.ProductionFreezeSuccessorRequest(
+        request = cls.ProductionStageRerunRequest(
             run_id=str(uuid.uuid4()),
             request_id=dag_run_id,
             parent_run_id=parent,
+            from_stage="freeze",
             main_assembly="M3.0.3.SLDASM",
             target_hardware="m3.0",
-            purpose="engineering",
             change_summary="Supervised linked proof from committed Freeze bytes",
             principal=cls.actor,
         )
         work = cls.root / "admission-work" / f"{label}-{uuid.uuid4().hex}"
-        outcome = cls._factory(work_root=work).admit_from_frozen_freeze(
+        outcome = cls._factory(work_root=work).admit_stage_rerun(
             cls.application,
             request,
         )
@@ -477,6 +491,9 @@ class SupervisedFreezeIdentityTests(unittest.TestCase):
             "dag_run_id": dag_run_id,
             "run_id": request.run_id,
             "entry_command_id": outcome.entry_command.command_id,
+            "dispatch_command_id": outcome.dispatch_command.command_id,
+            "dispatch_conf": conf.to_record(),
+            "execution_scope": list(cls.application.execution_scope(request.run_id)),
             "dispatch_dag_id": outcome.dispatch_command.dag_id,
             "dispatch_dag_run_id": outcome.dispatch_command.dag_run_id,
             "dispatch_conf_run_id": conf.run_id,
@@ -884,12 +901,79 @@ class SupervisedFreezeIdentityTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-    def _trigger(self, label: str, conf: dict) -> dict:
-        return self._trigger_run(
-            label,
-            str(self.runs[label]["dag_run_id"]),
-            conf,
-        )
+    def _trigger(self, label: str, *, lose_response: bool = False) -> dict:
+        from description_pipeline.pipeline.contracts import DispatchConf
+        from description_pipeline.pipeline.dispatch import DispatchObservation
+        from description_pipeline.pipeline.effects import EffectState
+
+        outer = self
+        expected = self.runs[label]
+        command = self.facts.load_dispatch_command(str(expected["dispatch_command_id"]))
+        admitted_conf = DispatchConf.from_record(expected["dispatch_conf"])
+        paused = self._run("dags", "pause", DAG_ID)
+        self.assertEqual(paused.returncode, 0, paused.stderr)
+
+        class RealCLIDispatch:
+            def __init__(self):
+                self.trigger_calls = 0
+                self.observation_calls = 0
+
+            def trigger(self, command, conf):
+                self.trigger_calls += 1
+                outer.assertEqual(admitted_conf, conf)
+                triggered = outer._run(
+                    "dags", "trigger", command.dag_id, "-r", command.dag_run_id,
+                    "-c", json.dumps(conf.to_record()), "-o", "plain",
+                )
+                outer.assertEqual(triggered.returncode, 0, triggered.stdout + triggered.stderr)
+                if lose_response:
+                    raise RuntimeError("The real CLI trigger response was lost")
+                return {"dag_id": command.dag_id, "dag_run_id": command.dag_run_id}
+
+            def observe(self, command, conf):
+                self.observation_calls += 1
+                if lose_response and self.observation_calls == 1:
+                    return DispatchObservation("unobservable", {"error": "The initial observation is unavailable"})
+                from airflow.models.dagrun import DagRun
+                from airflow.settings import Session
+
+                with Session() as session:
+                    run = session.query(DagRun).filter(
+                        DagRun.dag_id == command.dag_id, DagRun.run_id == command.dag_run_id,
+                    ).one_or_none()
+                    if run is None:
+                        return DispatchObservation("absent", {"dag_id": command.dag_id,
+                                                              "dag_run_id": command.dag_run_id})
+                    outer.assertEqual(conf.to_record(), run.conf)
+                    return DispatchObservation("known", {"dag_id": run.dag_id, "dag_run_id": run.run_id,
+                                                         "conf": dict(run.conf)})
+
+        adapter = RealCLIDispatch()
+        dispatched = self.application.dispatch(command.command_id, adapter)
+        first_state = dispatched.state
+        if lose_response:
+            self.assertEqual(EffectState.UNKNOWN, dispatched.state)
+            self.assertEqual(1, adapter.trigger_calls)
+            with self.connect() as connection, connection.cursor() as cursor:
+                cursor.execute("SELECT count(*) FROM execution_claim WHERE command_id = %s",
+                               (expected["entry_command_id"],))
+                self.assertEqual(0, cursor.fetchone()[0])
+            reconciled = self.application.dispatch(command.command_id, adapter, retry_absent=True)
+            self.assertEqual(dispatched.effect_id, reconciled.effect_id)
+            dispatched = reconciled
+        self.assertEqual(EffectState.SATISFIED, dispatched.state)
+        self.assertEqual(1, adapter.trigger_calls)
+        self.assertEqual(command, self.facts.load_dispatch_command(command.command_id))
+        self.assertEqual(admitted_conf, self.artifacts.read_dispatch_conf(command.conf_artifact))
+        self.dispatches[label] = {
+            "command_id": command.command_id, "effect_id": dispatched.effect_id,
+            "first_state": first_state.value, "settled_state": dispatched.state.value,
+            "trigger_calls": adapter.trigger_calls, "observation_calls": adapter.observation_calls,
+            "conf": admitted_conf.to_record(),
+        }
+        unpaused = self._run("dags", "unpause", DAG_ID)
+        self.assertEqual(unpaused.returncode, 0, unpaused.stderr)
+        return self._wait_for_terminal(label, command.dag_run_id)
 
     def _trigger_run(self, label: str, dag_run_id: str, conf: dict) -> dict:
         paused = self._run("dags", "pause", DAG_ID)
@@ -908,10 +992,16 @@ class SupervisedFreezeIdentityTests(unittest.TestCase):
         self.assertEqual(triggered.returncode, 0, triggered.stdout + triggered.stderr)
         unpaused = self._run("dags", "unpause", DAG_ID)
         self.assertEqual(unpaused.returncode, 0, unpaused.stderr)
+        return self._wait_for_terminal(label, dag_run_id)
+
+    def _wait_for_terminal(self, label: str, dag_run_id: str) -> dict:
         deadline = time.monotonic() + 180
         while time.monotonic() < deadline:
             identity = self._task_identity(dag_run_id)
-            if identity.get("state") in {"success", "failed", "upstream_failed"}:
+            if (
+                identity.get("state") in {"success", "failed", "upstream_failed"}
+                and identity.get("dag_run_state") in {"success", "failed"}
+            ):
                 with contextlib.suppress(AssertionError):
                     self._record_actual_identity(label, identity)
                 self._run("dags", "pause", DAG_ID)
@@ -945,6 +1035,7 @@ class SupervisedFreezeIdentityTests(unittest.TestCase):
             )
             return {
                 "state": task.state.value if hasattr(task.state, "value") else str(task.state or ""),
+                "dag_run_state": run.state.value if hasattr(run.state, "value") else str(run.state or ""),
                 "task_dag_version_id": str(task.dag_version_id) if task.dag_version_id else "",
                 "dag_run_dag_version_id": (
                     str(run.created_dag_version_id)
@@ -1033,8 +1124,22 @@ class SupervisedFreezeIdentityTests(unittest.TestCase):
         return result
 
     def _assert_claim_binding(self, label: str) -> None:
+        from airflow.models.taskinstance import TaskInstance
+        from airflow.settings import Session
+        from description_pipeline.stages import STAGE_IDS
+
         expected = self.runs[label]
+        self.assertEqual(["freeze"], expected["execution_scope"])
+        with Session() as session:
+            tasks = session.query(TaskInstance).filter(
+                TaskInstance.dag_id == DAG_ID, TaskInstance.run_id == expected["dag_run_id"],
+            ).all()
+            self.assertEqual(set(STAGE_IDS), {task.task_id for task in tasks})
+            self.assertTrue(all(task.state == "skipped" for task in tasks if task.task_id != "freeze"))
         with self.connect() as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT stage FROM command WHERE run_id = %s AND kind = 'stage' ORDER BY stage",
+                           (expected["run_id"],))
+            self.assertEqual([("freeze",)], cursor.fetchall())
             cursor.execute(
                 """
                 SELECT dag_id, dag_run_id, task_id, map_index, fence
@@ -1165,7 +1270,7 @@ class SupervisedFreezeIdentityTests(unittest.TestCase):
 
     def test_fresh_parent_linked_and_early_failure(self) -> None:
         fresh_run = str(self.runs["fresh"]["run_id"])
-        fresh = self._trigger("fresh", {"run_id": fresh_run})
+        fresh = self._trigger("fresh")
         self.assertEqual(fresh["state"], "success")
         fresh_result = self._freeze_result(fresh_run)
         self.assertEqual(fresh_result.run_id, fresh_run)
@@ -1180,7 +1285,7 @@ class SupervisedFreezeIdentityTests(unittest.TestCase):
         )
 
         parent_run = str(self.runs["parent"]["run_id"])
-        parent = self._trigger("parent", {"run_id": parent_run})
+        parent = self._trigger("parent")
         self.assertEqual(parent["state"], "success")
         parent_result = self._freeze_result(parent_run)
         self.assertEqual(parent_result.run_id, parent_run)
@@ -1188,13 +1293,15 @@ class SupervisedFreezeIdentityTests(unittest.TestCase):
 
         self._admit_successor("linked")
         linked_run = str(self.runs["linked"]["run_id"])
-        linked = self._trigger("linked", {"run_id": linked_run})
+        linked = self._trigger("linked", lose_response=True)
         self.assertEqual(linked["state"], "success")
         linked_result = self._freeze_result(linked_run)
         admission = self.facts.load_admission(linked_run)
         self.assertIsNotNone(admission)
         self.assertEqual(admission.parent_run_id, parent_run)
         self.assertEqual(admission.from_stage, "freeze")
+        self.assertEqual(admission.request["through_stage"], "freeze")
+        self.assertEqual(admission.request["purpose"], "engineering")
         self.assertEqual(linked_result.run_id, linked_run)
         self._assert_claim_binding("linked")
 
@@ -1214,6 +1321,7 @@ class SupervisedFreezeIdentityTests(unittest.TestCase):
             "serialized_dag": self.serialized,
             "actual_task_versions": self.actual_identities,
             "runs": self.runs,
+            "dispatches": self.dispatches,
             "states": {
                 "fresh": fresh["state"],
                 "parent": parent["state"],

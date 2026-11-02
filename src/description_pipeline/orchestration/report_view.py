@@ -11,12 +11,13 @@ recorded contract hashes.
 
 from __future__ import annotations
 
+import copy
 from pathlib import PureWindowsPath
 
 from ..geometry.native_scope import (
     NATIVE_SCOPE_IDENTITY_WARNING_CODES,
 )
-from ..io import PipelineError, canonical_json_value
+from ..io import PipelineError, canonical, canonical_json_value, digest
 from ..pipeline.verify_contract import validate_certificate_diagnostics
 from ..schemas import (
     NATIVE_DISCOVERY_BUDGET_KEYS,
@@ -988,6 +989,41 @@ def _failed_summary(label: str, summary: dict | None, details: dict) -> dict:
     return row
 
 
+def text_warning_inventory(
+    records: list[str], certificate_member: dict, *, max_bytes: int = 32768, max_item_bytes: int = 2048,
+) -> dict:
+    """Bound a display excerpt while the sealed certificate owns every complete record."""
+
+    if not isinstance(records, list) or any(not isinstance(item, str) for item in records):
+        raise PipelineError("Text warnings must be complete strings")
+    if not isinstance(certificate_member, dict) or set(certificate_member) != {"artifact", "path", "bytes", "sha256"}:
+        raise PipelineError("Warning inventory requires its exact certificate member")
+    if type(max_bytes) is not int or max_bytes <= 0 or type(max_item_bytes) is not int or max_item_bytes <= 0:
+        raise PipelineError("Warning display budgets must be positive integers")
+    result = {
+        "certificate": copy.deepcopy(certificate_member), "count": len(records), "sha256": digest(records),
+        "shown": 0, "omitted": len(records), "items": [],
+    }
+    if len(canonical(result)) > max_bytes:
+        raise PipelineError("Warning certificate identity exceeds the display budget")
+    for record in records:
+        raw = record.encode("utf-8")
+        excerpt = len(raw) > max_item_bytes
+        text = raw[:max_item_bytes].decode("utf-8", errors="ignore") if excerpt else record
+        if excerpt:
+            text += " [excerpt; see certificate]"
+        item = {"text": text, "excerpt": excerpt}
+        result["items"].append(item)
+        result["shown"] += 1
+        result["omitted"] -= 1
+        if len(canonical(result)) > max_bytes:
+            result["items"].pop()
+            result["shown"] -= 1
+            result["omitted"] += 1
+            break
+    return result
+
+
 def merge_warnings(*groups: list[dict]) -> list[dict]:
     """Deduplicate complete warning content, preserving recorded source identities."""
 
@@ -1407,7 +1443,7 @@ def build_report(job: dict | None = None, *, view: dict | None = None) -> dict:
             f"{first['name']} stage is unresolved; reconcile its external effects",
         )
     elif "failed" in states:
-        overall_state, headline = "failed", f"{first_failed['name']} stage failed; downstream stages did not run"
+        overall_state, headline = "failed", f"{first_failed['name']} stage failed"
     elif "cancelled" in states:
         first = next(stage for stage in stages_out if stage["state"] == "cancelled")
         overall_state, headline = "cancelled", f"{first['name']} stage was cancelled"

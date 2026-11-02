@@ -9,18 +9,26 @@
 在[开发环境](CONTRIBUTING.md)中构建到两个新的外部目录：
 
 ```sh
-python tools/build_release.py --output /path/to/release-a
-python tools/build_release.py --output /path/to/release-b
+python tools/build_release.py --output /path/to/release-a \
+  --teleop-wheel /path/to/fixed-models/robot_teleop-0.3.0-cp312-cp312-linux_x86_64.whl \
+  --actuator-wheel /path/to/fixed-models/actuator_model-1.3.0-py3-none-any.whl
+python tools/build_release.py --output /path/to/release-b \
+  --teleop-wheel /path/to/fixed-models/robot_teleop-0.3.0-cp312-cp312-linux_x86_64.whl \
+  --actuator-wheel /path/to/fixed-models/actuator_model-1.3.0-py3-none-any.whl
 diff -r /path/to/release-a /path/to/release-b
 ```
 
 归档成员按相对 UTF-8 路径排序，固定权限、UID/GID 和空用户名，移除绝对路径及本机元数据；ZIP 使用固定 1980 epoch，tar/gzip 使用 epoch 0，压缩算法和版本锁定。模型与发行 JSON 使用[统一规范序列化](docs/contracts.md#delivery)。不同路径、时间和 ambient 安装下的独立构建必须得到相同字节，核对清单及每项资产摘要。
+
+示例模型文件名须与本次 `simulation/teleop-runtime.json` 相符。两份模型 wheel 必须取自已批准的固定发行，先核其 SHA；构建器再次对源 manifest、原 wheel 和角色 lock 验证。禁止在 CI 或部署现场重编后替代固定 wheel。离线构建可提供 `--consumer-wheelhouse /path/to/fixed-wheels`。
 
 `release.json` 是唯一且必需的发行清单，包含源码 commit、源码/包文件摘要、版本、实际 schema 定义/阶段/策略摘要、完整支持矩阵及各资产摘要。schema 摘要覆盖结构与字段规则。支持矩阵明确两端操作系统、架构、CPython、角色依赖及原生 API 前提。
 
 每次构建交付同一完整集合：wheel、源码、部署档案、Linux 离线运行档案与最小 Windows 离线运行档案。校验入口要求清单和全部资产存在，核对部署成员、角色工具与依赖锁来自同一源码发行；缺项或重新封存后来源不一致均拒绝。
 
 运行档案只包含对应角色的全部精确依赖及 hash-locked 安装文件。Linux 支持生成、独立验证和平台；Windows 支持原生读取、原值序列化与封包，以及必要传输/资源管理；语义投影、惯量规范化和 STL 生成由 Linux Generate 执行。两端安装同一源码发行身份，原生资格记录精确 Windows、SolidWorks 版本/build 与 API 环境。原生对象归属与 Part namespace 解析以[原生外观契约](docs/contracts.md#原生外观读数与交付)为准，不另建发行侧解释。
+
+Linux 的主 `wheels/` 保持平台闭包，`consumers/wheels/` 是 PICO、assessment 与轻量 link 的单一共享离线池。角色 lock 来自同一部署档案，common runtime contract 来自同一产品包；池允许两个已声明的 MuJoCo 版本，各环境仍独立安装。它们继续由原 `files.json` 与 `release.json` 绑定，不增加发行资产或第二份 registry。
 
 ## 必需验收
 
@@ -35,7 +43,8 @@ diff -r /path/to/release-a /path/to/release-b
 | 资源安全 | 所有启动/取消/退出/恢复路径拒绝未知 CAD，只操作自有会话；同句柄身份复核和并发账本成立 |
 | 交换与恢复 | 缺失、多余、篡改及跨运行文件拒绝；重复提交、断连、崩溃、重启与终态封存正确 |
 | 消费者与发布 | 实际 URDF/MuJoCo 验证，失败不发布；Git blobs 与报告一致，远端基线冲突和部分外部结果可安全恢复 |
-| 部署 | 真实 HTTPS/飞书、原生文件夹、六阶段、检查、预览和 PR；双端实际身份绑定同一发行，业务受控重试、UNKNOWN 对账和同版恢复符合部署契约 |
+| 部署 | 真实 HTTPS/飞书、原生文件夹、七阶段及各阶段独立重跑、检查、双格式预览和准确 PR；双端实际身份绑定同一发行，业务受控重试、UNKNOWN 对账和同版恢复符合部署契约 |
+| 可选消费者 | P1 默认关闭与真实动态执行/独立复验；PICO 命令生效、完整录制/回放、两真实修订、真人和完整一小时持续验证；来源和资格分别保真 |
 
 验收矩阵逐项绑定中性夹具、断言、模式、原生记录和独立结果：声明模式覆盖有效、损坏/不可读、几何/限位冲突与未知存在性；配合模式覆盖确证无声明、六自由度刚性约束、单自由度及不支持拓扑；资格路径覆盖未分配、材料缺失、有效覆盖/实例差异、零范围/驱动、曲面无 facets，以及可选预算存在/缺失。原生资源覆盖活属主、未知会话、PID 重用、阻塞取消和封存边界崩溃；发布覆盖基线竞态、Git 字节变化和部分外部结果。
 

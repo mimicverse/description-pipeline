@@ -306,10 +306,7 @@ def _limits(mates, properties, components, direction, payload, package, *, joint
         value, drive_evidence = _controlled(properties["drive_record"], payload, package)
         readings = {key: _number(value[key]) for key in ("effort", "velocity") if key in value}
         _require(bool(readings), "controlled drive record has no readable effort or velocity")
-        _require(
-            all(number >= 0 for number in readings.values()),
-            "controlled drive values must be nonnegative",
-        )
+        _require(all(number >= 0 for number in readings.values()), "controlled drive values must be nonnegative")
         _require(
             all(key not in limits or limits[key] == number for key, number in readings.items()),
             "controlled drive and range records disagree",
@@ -373,17 +370,16 @@ def rebuild_saved_native_references(raw, *, purpose, payload=None, package=None)
             active[name] = item
     for name, item in active.items():
         parent = item["parent_occurrence"]
-        expected_document = document if not parent else active[parent]["document"]
-        expected_configuration = configuration if not parent else active[parent]["configuration"]
+        _require(not parent or parent in active, "component has no active parent", component=name)
         _require(
-            _context(item, expected_document, expected_configuration, parent),
-            "component solver observation has the wrong immediate parent context",
+            _context(item, document, configuration, ""),
+            "component solver observation has the wrong main-assembly context",
             component=name,
         )
     for name, item in active.items():
-        extension = str(item.get("document") or "").lower()
+        native_type = item.get("document_type")
         children = [child for child in active.values() if child["parent_occurrence"] == name]
-        if extension.endswith(".sldasm"):
+        if native_type == "assembly":
             _require(bool(children), "folded assembly needs a direct active child", component=name)
             solving = item["solver_observation"].get("solving")
             _require(
@@ -398,7 +394,7 @@ def rebuild_saved_native_references(raw, *, purpose, payload=None, package=None)
             )
         else:
             _require(
-                extension.endswith(".sldprt") and not any(key.startswith(name + "/") for key in components),
+                native_type == "part" and not any(key.startswith(name + "/") for key in components),
                 "a material part must have no assembly subtree",
                 component=name,
             )
@@ -407,7 +403,7 @@ def rebuild_saved_native_references(raw, *, purpose, payload=None, package=None)
     materials = {}
     for name in tops:
         members = [key for key in active if key == name or key.startswith(name + "/")]
-        leaves = sorted(key for key in members if str(active[key].get("document") or "").lower().endswith(".sldprt"))
+        leaves = sorted(key for key in members if active[key].get("document_type") == "part")
         _require(bool(leaves), "top-level occurrence has no material part", component=name)
         materials[name] = leaves
     fixed = [name for name, item in tops.items() if item.get("fixed") is True and item.get("fixed_error") is None]

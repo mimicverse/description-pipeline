@@ -1,0 +1,134 @@
+{
+  "schema_version": "description.pico-development-evidence/v1",
+  "base_commit": "49d775046bda3b23dac363b36a413188bcc79869",
+  "teleop_commit": "8b402482559c02534668bf2cb4338c0b8d628e14",
+  "source_files": {
+    "deploy/operator/nginx.conf.template": "0ecd6871628c9e223050b05ec7515f86ed5c12a67ce52cde669efda9adaeb02f",
+    "deploy/operator/platform_config.py": "e147ab859ac21685bdbf077a3af6935f3b1712aad4cba6568429a46efac47e99",
+    "deploy/operator/platform_env.py": "54e45606f9c0ead9bac90530730484078ee8bf66206d46cbb7585ed0fcab2c9e",
+    "deploy/operator/recovery.py": "9b11b0df6004cd3c01a9071ae71af24f40b2f9590995dc486d8210fa3a4a11b8",
+    "deploy/operator/render_operator.py": "104322f5c97e9e75d0d9c81d3b4531534c6b5aacc7ac26a87994967c1a0563af",
+    "deploy/platform/roles.sql": "a4b34195e30e872b89f57cf88c0e6fb2f3e0db951f218227a7b9446eb00b2aca",
+    "deploy/platform/schema.sql": "8dbd826667029c2d7d8ec0ee2d29817987531a2300fa4ce732f22b466c6cd58b",
+    "docs/pico-upper-body.md": "5d519c19466332a2553c4c0b09d01e42647e1c8a29c333b669afed3ebd88267c",
+    "pyproject.toml": "34609ec067d41fd97b72435e21bfa8919912a6ae3e6ef734272107575bd46b1f",
+    "requirements/linux-py312.lock": "071c3e703789a41d4e8d4af6aa2822a4d0e8cd51d26bbb8759bbfa8a9b201f8a",
+    "requirements/pico-link-py312.lock": "21919f264b16c07820618577ab8a900ecc3ede0bfb2dfd33aea6527e0134cd3e",
+    "requirements/teleop-worker-py312.lock": "f6c2d987df75d1b1c99e271b7bd31e9bbb0c09aaeb8317f636fb6ba6d1dd908e",
+    "scripts/install_teleop_worker.py": "8c8bbfb14f2099b4db7524a155e5af2bd358f277551cf8ae8ab27bc13fd3a372",
+    "scripts/pico_pipeline_link.py": "9acc4db8fd5bc841312a3597b1e2b3944a95f7f1e0df53fc5be0f97e8992c6d4",
+    "src/description_pipeline/interface_records.py": "0b1daf76bd69172237a81bab1cf2b5d27b81bb354f2c7604baa55c3e4fd31f2a",
+    "src/description_pipeline/orchestration/lifecycle_state.py": "7c88d826e63eece4a7b1cdc6ab98d6edf76428a74ecaaab2fefc2718ccabe176",
+    "src/description_pipeline/orchestration/pico_portal.py": "be08a1cb408eabdf437134a974fbceb0845c8a15439faac8140f24d621fbf581",
+    "src/description_pipeline/orchestration/portal.py": "98b404c1bcaab234403d0e4b97a92c8b4b470f3bedc741c034131da7bafc4652",
+    "src/description_pipeline/orchestration/static/app.js": "f961fbc0ac61b546e331581bf2d4f0c7e33691e7a819a4570004676c49385aef",
+    "src/description_pipeline/orchestration/static/mjcf_viewer.js": "5eb0f6693e2953b3d06f190a9741d2988d6d1e322fa846d9685982ab05f3a0c6",
+    "src/description_pipeline/orchestration/static/pico.css": "4ee414d888e3cee157d2aab45d8588948ee9a279a54cb055e1176b81f1e67e99",
+    "src/description_pipeline/orchestration/static/pico.html": "cbb3199a49dcdad42fffda56f2648b6fe28cc025076d238bd2a422ee2bf71ebf",
+    "src/description_pipeline/orchestration/static/pico.js": "7020194d36cb99015f8433814773c9a2264072c93f572d59b659783e934ad1a7",
+    "src/description_pipeline/runtime.py": "7b573e39f65ab2f2e88445e8fa857794bcd744d96ae3216976c37fa71b398537",
+    "src/description_pipeline/simulation/__init__.py": "743ce12c616924eca5a410d3ec0039bd7bbe7583a606c358c26ae7e8c573ea03",
+    "src/description_pipeline/simulation/service.py": "8143390a345cfc6231a522a613b1d29d78dd8b1a0a1a7c66bfeceb1ff79a181b",
+    "src/description_pipeline/simulation/store.py": "113b43e72754e20e1775d9159db37d1f10b6cd0809ce3f861073fcc9033ceb4d",
+    "src/description_pipeline/simulation/teleop-runtime.json": "713547476f6cee014e65904b987ca571aef283f980ccec478224af32cbda95fc",
+    "src/description_pipeline/simulation/verify_recording.py": "5145a69d11a0e90755399f121c4f61421d8111f9264a3c37963c2dba200acaa0",
+    "tests/v1/pico_link_probe.py": "1fd3d76b59342e4fa0b67e0e2559a6c70ad665a5a4b20f9a68f7d022c1049070",
+    "tests/v1/test_pico_sessions.py": "291e0a2c2861d8aa80584c56ec67b39653f10db1fc4d67db199af1705e42c60c",
+    "tests/v1/test_platform_config.py": "a7049681452b0429f91317e0344e6b0ebd195334ee3c3aefd77257eac94e2a0b",
+    "tests/v1/test_platform_env.py": "2993a030f3550ef444f9bf9db701120f331cc1fb1a637695b04a9205061abda1"
+  },
+  "validation": {
+    "related_regression": {
+      "initial": {
+        "run": 195,
+        "passed": 193,
+        "errors": 2,
+        "reason": "Airflow is absent from the private minimal environment"
+      },
+      "airflow_environment_rerun": {
+        "passed": 2,
+        "failed": 0
+      }
+    },
+    "config_parity_final": {
+      "passed": 9,
+      "failed": 0
+    },
+    "environment_derivation": {
+      "passed": 17,
+      "failed": 0
+    },
+    "native_database_http_ws_zmq_fk": {
+      "passed": 4,
+      "failed": 0,
+      "calibrated_motion": [
+        "Left arm position IK",
+        "Right arm position IK",
+        "Headset rotation to nonzero head joints",
+        "Released independent arm clutch",
+        "Independent verification of the complete moving recording"
+      ]
+    },
+    "ruff": "passed",
+    "javascript_syntax": "passed",
+    "wheel_build": "passed with requirements/build-py312.lock",
+    "wheel_member_bytes": "verified",
+    "fixed_worker_install": "passed with hash-locked dependencies",
+    "browser": "Actual native geometry, saved-profile launch, refresh, head state, latched e-stop, stop and recording entry verified with isolated fixtures",
+    "saved_profile_request_digest": "Verified before reuse; inconsistent saved requests are rejected",
+    "browser_recordings": "Two native fixture recordings sealed with complete=true and error=null; owned server stopped",
+    "native_test_discovery": "Four opt-in Linux cases skip cleanly without optional native/portal dependencies when no worker is configured",
+    "optimization_plan": {
+      "date": "2026-11-01",
+      "status": "Planned; not implemented",
+      "implementation_evidence_inherited_from": "428c64706940f5366a5859017602b2f82f3056c6",
+      "product_bytes_changed": false
+    }
+  },
+  "logs": {
+    "pipeline-broad.log": {
+      "sha256": "07956619e21a321e17a3fceaa04df54485dc1835d10474aeb4fbaabccfcaa038",
+      "path": "/home/andy/Work/reviews/urdf-pico-upper-body-design-20261101/pipeline-broad.log"
+    },
+    "pipeline-airflow-rerun.log": {
+      "sha256": "9abcc927cdcbec9311fb0cef4a36085753760687a10295a88257408d391f4859",
+      "path": "/home/andy/Work/reviews/urdf-pico-upper-body-design-20261101/pipeline-airflow-rerun.log"
+    },
+    "pipeline-config-final.log": {
+      "sha256": "99ba0a1f4d68a24f2399172efb20aad66afd59af840a36ad726d0547e53fb4a0",
+      "path": "/home/andy/Work/reviews/urdf-pico-upper-body-design-20261101/pipeline-config-final.log"
+    },
+    "pipeline-env-final.log": {
+      "sha256": "12c294afb87c14d4c9eb9466a09777a80f1c162d9ea1ea02d57a10c14609b117",
+      "path": "/home/andy/Work/reviews/urdf-pico-upper-body-design-20261101/pipeline-env-final.log"
+    },
+    "pipeline-native-final.log": {
+      "sha256": "4ca8d3877af891b02cc09693d8f71ad738a9a3df98167870d0ae01c6cbdb2bcd",
+      "path": "/home/andy/Work/reviews/urdf-pico-upper-body-design-20261101/pipeline-native-final.log"
+    },
+    "pipeline-assets-final.log": {
+      "sha256": "f3f173254c74e96f677b81280c000daf1dcca0fd1509b9f80ea06e6535ffbcda",
+      "path": "/home/andy/Work/reviews/urdf-pico-upper-body-design-20261101/pipeline-assets-final.log"
+    },
+    "pipeline-wheel-build.log": {
+      "sha256": "0c77391941eeb2dd6dfa1a444fc5ba1d237590a243831857ff6ea9293fb938ec",
+      "path": "/home/andy/Work/reviews/urdf-pico-upper-body-design-20261101/pipeline-wheel-build.log"
+    },
+    "worker-install.log": {
+      "sha256": "17ae8d23a761e0e50613c010efa2af3160a399c24a4fec6ade57979d0b72e8ee",
+      "path": "/home/andy/Work/reviews/urdf-pico-upper-body-design-20261101/worker-install.log"
+    }
+  },
+  "limitations": [
+    "External Airflow/Feishu identity and source-projection boundaries are stubbed in the native fixture test; the existing MJCF Portal regression covers the registered-source read chain.",
+    "No physical PICO, CAD session, hardware, actuator dynamics or production deployment was used.",
+    "Two real model revisions, physical PICO acceptance and the same-release offline packaging remain required.",
+    "Teleop PR 12 remains draft with six MuJoCo 3.10-specific collision test premises pending owner review.",
+    "The frozen worker requires stop plus parent stdin closure; isolated open-pipe failure evidence is retained."
+  ],
+  "development_wheel": {
+    "file": "mimicverse_description-1.5.1-py3-none-any.whl",
+    "sha256": "92e2d195aa98b2fa3910565eeec740d2a4259af3136c03e198c5f974a282ba95",
+    "formal_release": false
+  }
+}

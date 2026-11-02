@@ -2,11 +2,11 @@
 import * as THREE from "/static/vendor/three.module.min.js";
 import { disposeRobot, frameBounds } from "/static/viewer.js";
 const hex = (buffer) => [...new Uint8Array(buffer)].map((n) => n.toString(16).padStart(2, "0")).join("");
-function geometry(record) {
+export function compiledGeometry(record) {
   const s = record.size;
   if (record.type === "mjGEOM_MESH") {
     const result = new THREE.BufferGeometry();
-    result.setAttribute("position", new THREE.BufferAttribute(record.positions, 3));
+    result.setAttribute("position", new THREE.Float32BufferAttribute(record.positions, 3));
     result.setIndex(Array.from(record.indices)); result.computeVertexNormals(); return result;
   }
   if (record.type === "mjGEOM_BOX") return new THREE.BoxGeometry(...s.map((n) => 2 * n));
@@ -15,6 +15,12 @@ function geometry(record) {
   if (record.type === "mjGEOM_CYLINDER") return new THREE.CylinderGeometry(s[0], s[0], 2 * s[1], 24).rotateX(Math.PI / 2);
   if (record.type === "mjGEOM_PLANE") return new THREE.PlaneGeometry(2 * s[0], 2 * s[1]);
   throw new Error(`Unsupported compiled geometry: ${record.type}`);
+}
+export function frameCompiledGeometry(viewer, objects) {
+  viewer.robotRoot.updateMatrixWorld(true); viewer.resize();
+  const bounds = new THREE.Box3();
+  for (const { object, record } of objects) if (record.type !== "mjGEOM_PLANE") bounds.union(new THREE.Box3().setFromObject(object));
+  frameBounds(viewer, bounds);
 }
 export async function loadMJCF(viewer, { descriptor, artifactUrl, signal, onStatus }) {
   if (!descriptor.files[descriptor.entry]) throw new Error("MJCF entry is absent from the verified inventory");
@@ -71,7 +77,7 @@ export async function loadMJCF(viewer, { descriptor, artifactUrl, signal, onStat
     for (const record of initial.geoms) {
       const environment = record.type === "mjGEOM_PLANE";
       const color = record.collision && !environment ? new THREE.Color(1, 0.42, 0.08) : new THREE.Color(...record.rgba.slice(0, 3));
-      const object = new THREE.Mesh(geometry(record), new THREE.MeshStandardMaterial({ color, side: THREE.DoubleSide, roughness: 0.75 }));
+      const object = new THREE.Mesh(compiledGeometry(record), new THREE.MeshStandardMaterial({ color, side: THREE.DoubleSide, roughness: 0.75 }));
       viewer.robotRoot.add(object); objects.push({ object, record, environment });
     }
     for (let body = 1; body <= initial.bodies; body++) {
@@ -129,11 +135,7 @@ export async function loadMJCF(viewer, { descriptor, artifactUrl, signal, onStat
     };
     worker.onerror = (event) => { pendingJoints.clear(); onStatus?.({ error: event.message || "MuJoCo worker failed" }); };
     sync(); viewer.robotRoot.updateMatrixWorld(true); viewer.resize();
-    const fit = () => {
-      const bounds = new THREE.Box3();
-      for (const { object, environment } of objects) if (!environment) bounds.union(new THREE.Box3().setFromObject(object));
-      frameBounds(viewer, bounds);
-    };
+    const fit = () => frameCompiledGeometry(viewer, objects);
     fit();
     return {
       fit, engineMemoryBytes: initial.memory_bytes,

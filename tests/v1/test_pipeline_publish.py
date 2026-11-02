@@ -1003,7 +1003,7 @@ elif args[:2] == ["pr", "create"]:
     base = args[args.index("--base") + 1]
     head = args[args.index("--head") + 1]
     title = args[args.index("--title") + 1]
-    body = args[args.index("--body") + 1]
+    body = Path(args[args.index("--body-file") + 1]).read_text(encoding="utf-8")
     listing = subprocess.check_output(
         ["git", "ls-remote", "origin", f"refs/heads/{head}"],
         text=True,
@@ -1170,7 +1170,7 @@ elif args[:2] == ["pr", "create"]:
     base = args[args.index("--base") + 1]
     head = args[args.index("--head") + 1]
     title = args[args.index("--title") + 1]
-    body = args[args.index("--body") + 1]
+    body = Path(args[args.index("--body-file") + 1]).read_text(encoding="utf-8")
     listing = subprocess.check_output(
         ["git", "ls-remote", "origin", f"refs/heads/{head}"],
         text=True,
@@ -2329,8 +2329,7 @@ class PublicationWarningProjectionTests(unittest.TestCase):
             "actual_scope": {
                 "graph_nodes": 3,
                 "occurrence_count": 7,
-                "selected_files": ["a", "b", "c"],
-                "excluded_files": ["d"],
+                "input_files": ["a", "b", "c"],
                 "unresolved_occurrences": [{"instance": "missing-1"}],
             },
             "source_integrity_proven": False,

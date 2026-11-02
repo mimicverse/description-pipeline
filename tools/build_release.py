@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.metadata
 import json
 import os
@@ -12,12 +13,32 @@ import sys
 import tarfile
 import tempfile
 import tomllib
+import zipfile
 from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 
 from packaging.utils import parse_wheel_filename
 from packaging.requirements import Requirement
+
+if __package__:
+    from .release_consumers import (
+        CONSUMER_LOCKS,
+        CONSUMER_POOL_PREFIX,
+        locked_consumers,
+        target_tags,
+        verify_consumer_pool,
+        wheel_record,
+    )
+else:
+    from release_consumers import (
+        CONSUMER_LOCKS,
+        CONSUMER_POOL_PREFIX,
+        locked_consumers,
+        target_tags,
+        verify_consumer_pool,
+        wheel_record,
+    )
 
 BUILD_PACKAGES = {"setuptools", "wheel", "build"}
 
@@ -36,9 +57,7 @@ def bind_source_closure(source: Path) -> SimpleNamespace:
 
     def pipeline_modules() -> list[str]:
         return [
-            name
-            for name in sys.modules
-            if name == "description_pipeline" or name.startswith("description_pipeline.")
+            name for name in sys.modules if name == "description_pipeline" or name.startswith("description_pipeline.")
         ]
 
     saved = {name: sys.modules[name] for name in pipeline_modules()}
@@ -52,6 +71,7 @@ def bind_source_closure(source: Path) -> SimpleNamespace:
         from description_pipeline.delivery import PIPELINE_ID  # noqa: PLC0415
         from description_pipeline import interface_records as pipeline_records  # noqa: PLC0415
         from description_pipeline import runtime as pipeline_runtime  # noqa: PLC0415
+        from description_pipeline.simulation.runtime import load_runtime_contract  # noqa: PLC0415
 
         for module in (description_pipeline, pipeline_io, build_archive, pipeline_records, pipeline_runtime):
             module_file = getattr(module, "__file__", "") or ""
@@ -76,6 +96,7 @@ def bind_source_closure(source: Path) -> SimpleNamespace:
             TARGET_ABI=pipeline_runtime.TARGET_ABI,
             WINDOWS_PLATFORMS=pipeline_runtime.WINDOWS_PLATFORMS,
             LINUX_PLATFORMS=pipeline_runtime.LINUX_PLATFORMS,
+            load_runtime_contract=load_runtime_contract,
         )
     finally:
         sys.path.remove(str(source))
@@ -134,9 +155,7 @@ def source_inventory(directory: Path, bound: SimpleNamespace) -> dict[str, str]:
     """
 
     return {
-        name: digest
-        for name, digest in bound.inventory(directory).items()
-        if "__pycache__" not in Path(name).parts
+        name: digest for name, digest in bound.inventory(directory).items() if "__pycache__" not in Path(name).parts
     }
 
 
@@ -184,7 +203,92 @@ def tracked_test_inventory(root: Path, bound: SimpleNamespace) -> dict[str, str]
     return files
 
 
-def offline_bundle(source, output, wheel, platform, bound):
+def consumer_contracts(source, bound):
+    path = source / "src/description_pipeline/simulation/teleop-runtime.json"
+    return {role: bound.load_runtime_contract(path, consumer=role) for role in ("pico", "assessment")}
+
+
+def model_inputs(source, bound, teleop_wheel, actuator_wheel):
+    """Snapshot the two explicit model wheels after checking the existing common contract."""
+    contracts = consumer_contracts(source, bound)
+    locked_consumers({role: (source / name).read_bytes() for role, name in CONSUMER_LOCKS.items()}, contracts)
+    models = {}
+    for path, expected in (
+        (teleop_wheel, contracts["pico"]),
+        (actuator_wheel, contracts["assessment"]["actuator_model"]),
+    ):
+        if path is None:
+            raise bound.PipelineError("Release builds require explicit Teleop and actuator-model wheels")
+        path = Path(path)
+        payload = path.read_bytes()
+        if path.name != expected["wheel_filename"] or hashlib.sha256(payload).hexdigest() != expected["wheel_sha256"]:
+            raise bound.PipelineError("A model wheel differs from the fixed consumer asset")
+        try:
+            record = wheel_record(
+                path.name, payload, target_tags(bound.LINUX_PLATFORMS, bound.TARGET_PYTHON, bound.TARGET_ABI)
+            )
+        except (ValueError, zipfile.BadZipFile, KeyError, TypeError) as error:
+            raise bound.PipelineError("A model wheel archive is invalid") from error
+        if record["name"] == "robot-teleop" and record["teleop_files"] != contracts["pico"]["files"]:
+            raise bound.PipelineError("Teleop wheel differs from the common runtime inventory")
+        models[path.name] = payload
+    return models
+
+
+def consumer_pool(source, models, bound, *, wheelhouse=None, main_wheels=None):
+    """Resolve each isolated role, then keep one checked pool without mixing main wheels."""
+    contracts = consumer_contracts(source, bound)
+    lock_data = {role: (source / name).read_bytes() for role, name in CONSUMER_LOCKS.items()}
+    locked_consumers(lock_data, contracts)
+    with tempfile.TemporaryDirectory(prefix="description-consumers-") as temporary:
+        root = Path(temporary)
+        supplied = root / "models"
+        supplied.mkdir()
+        for name, payload in models.items():
+            (supplied / name).write_bytes(payload)
+        pool = root / "wheels"
+        for role, lock in CONSUMER_LOCKS.items():
+            arguments = [
+                sys.executable,
+                "-m",
+                "pip",
+                "download",
+                "--only-binary=:all:",
+                "--require-hashes",
+                "--dest",
+                str(pool),
+                *target_arguments("linux", bound),
+                "-r",
+                str(source / lock),
+            ]
+            if wheelhouse is not None:
+                arguments += ["--no-index", "--find-links", str(Path(wheelhouse).resolve())]
+            if main_wheels is not None:
+                arguments += ["--find-links", str(main_wheels)]
+            if role != "pico-link":
+                contract = contracts[role]
+                assets = [("robot-teleop[evaluation]" if role == "assessment" else "robot-teleop", contract)]
+                if contract["actuator_model"] is not None:
+                    assets.append(("actuator-model[mujoco]", contract["actuator_model"]))
+                explicit = root / (role + ".lock")
+                explicit.write_text(
+                    "\n".join(
+                        f"{name} @ {(supplied / asset['wheel_filename']).as_uri()} "
+                        f"--hash=sha256:{asset['wheel_sha256']}"
+                        for name, asset in assets
+                    )
+                    + "\n"
+                )
+                arguments += ["-r", str(explicit)]
+            subprocess.run(arguments, check=True)
+        members = {path.name: path.read_bytes() for path in pool.iterdir()}
+        verify_consumer_pool(
+            members, lock_data, contracts, target_tags(bound.LINUX_PLATFORMS, bound.TARGET_PYTHON, bound.TARGET_ABI)
+        )
+        return members
+
+
+def offline_bundle(source, output, wheel, platform, bound, *, models=None, consumer_wheelhouse=None):
     """Include exactly the resolved target wheels and a SHA-256 installation lock."""
     with tempfile.TemporaryDirectory(prefix="description-offline-") as temporary:
         staging = Path(temporary)
@@ -193,11 +297,7 @@ def offline_bundle(source, output, wheel, platform, bound):
         arguments += target_arguments(platform, bound)
         lock_files = [
             source
-            / (
-                "deploy/airflow/requirements.lock"
-                if platform == "linux"
-                else f"requirements/{platform}-py312.lock"
-            )
+            / ("deploy/airflow/requirements.lock" if platform == "linux" else f"requirements/{platform}-py312.lock")
         ]
         for lock_file in lock_files:
             arguments += ["-r", str(lock_file)]
@@ -208,11 +308,17 @@ def offline_bundle(source, output, wheel, platform, bound):
             name, version, _, _ = parse_wheel_filename(path.name)
             locked.append(f"{name}=={version} --hash=sha256:{bound.file_digest(path)}")
         (staging / "requirements.lock").write_text("\n".join(locked) + "\n", encoding="utf-8")
+        if platform == "linux":
+            members = consumer_pool(source, models, bound, wheelhouse=consumer_wheelhouse, main_wheels=wheels)
+            for name, payload in members.items():
+                path = staging / CONSUMER_POOL_PREFIX / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(payload)
         doctor_command = (
             "description doctor"
             if platform == "linux"
             else (
-                "python -I -B -c \"import json; "
+                'python -I -B -c "import json; '
                 "from description_pipeline.runtime import tool_record; "
                 "from description_pipeline.solidworks import doctor; "
                 "print(json.dumps({'tool': tool_record(role='native'), 'doctor': doctor()}))\""
@@ -231,15 +337,13 @@ def offline_bundle(source, output, wheel, platform, bound):
         return target
 
 
-def build(root, output):
+def build(root, output, *, teleop_wheel=None, actuator_wheel=None, consumer_wheelhouse=None):
     root, output = root.resolve(), output.resolve()
     bound = bind_source_closure(root / "src")
     target_python = tuple(int(part) for part in bound.TARGET_PYTHON.split("."))
     if sys.version_info[:2] != target_python:
         raise bound.PipelineError(f"Release builds require CPython {bound.TARGET_PYTHON}")
-    requires_python = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["project"][
-        "requires-python"
-    ]
+    requires_python = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["project"]["requires-python"]
     if requires_python != bound.SUPPORTED_PYTHON:
         raise bound.PipelineError("pyproject requires-python differs from the supported interpreter range")
     if git(root, "status", "--porcelain", "--untracked-files=normal"):
@@ -250,6 +354,7 @@ def build(root, output):
     for name, expected in builders.items():
         if importlib.metadata.version(name) != expected:
             raise bound.PipelineError(f"Install requirements/build-py312.lock: {name} must be {expected}")
+    models = model_inputs(root, bound, teleop_wheel, actuator_wheel)
     test_files = tracked_test_inventory(root, bound)
     output.mkdir(parents=True, exist_ok=True)
     commit = git(root, "rev-parse", "HEAD")
@@ -272,16 +377,14 @@ def build(root, output):
         files = bound.inventory(package)
         resources = [
             path
-            for directory in ("deploy", "docs", "requirements")
+            for directory in ("deploy", "docs", "requirements", "scripts")
             for path in (source / directory).rglob("*")
             if path.is_file()
         ]
         resources += [
             source / name for name in ("README.md", "LICENSE", "CODE_OF_CONDUCT.md", "CONTRIBUTING.md", "RELEASING.md")
         ]
-        deployment_files = {
-            path.relative_to(source).as_posix(): bound.file_digest(path) for path in resources
-        }
+        deployment_files = {path.relative_to(source).as_posix(): bound.file_digest(path) for path in resources}
         runtime_locks = {
             platform: bound.file_digest(source / f"requirements/{platform}-py312.lock")
             for platform in ("linux", "windows")
@@ -314,7 +417,9 @@ def build(root, output):
         deployment = output / f"description-{bound.version}-deployment.zip"
         bound.write_zip(deployment, ((path.relative_to(source).as_posix(), path.read_bytes()) for path in resources))
         for platform in ("linux", "windows"):
-            offline_bundle(source, output, wheel, platform, bound)
+            offline_bundle(
+                source, output, wheel, platform, bound, models=models, consumer_wheelhouse=consumer_wheelhouse
+            )
         artifacts = bound.inventory(output)
         bound.write_json(output / "release.json", {**identity, "artifacts": artifacts})
     return {
@@ -328,8 +433,17 @@ def build(root, output):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--teleop-wheel", type=Path, required=True)
+    parser.add_argument("--actuator-wheel", type=Path, required=True)
+    parser.add_argument("--consumer-wheelhouse", type=Path, help="Resolve consumers only from local wheels")
     args = parser.parse_args()
-    result = build(Path(__file__).resolve().parent.parent, args.output)
+    result = build(
+        Path(__file__).resolve().parent.parent,
+        args.output,
+        teleop_wheel=args.teleop_wheel,
+        actuator_wheel=args.actuator_wheel,
+        consumer_wheelhouse=args.consumer_wheelhouse,
+    )
     print(json.dumps(result, indent=2))
 
 

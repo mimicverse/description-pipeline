@@ -1,0 +1,50 @@
+{
+  "schema": "continuous-dynamics-task/1",
+  "task_id": "benchmark_step",
+  "comparison_task_id": "software.full_upper_body.step",
+  "family": "step",
+  "controlled_groups": ["left_arm", "right_arm"],
+  "target_mode": "scheduled_joint_configuration_fk",
+  "target_points": ["left_tcp", "right_tcp"],
+  "joint_order": [
+    "waist_yaw",
+    "head_yaw",
+    "left_shoulder_pitch",
+    "left_elbow_pitch",
+    "right_shoulder_pitch",
+    "right_elbow_pitch"
+  ],
+  "initial_positions": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+  "schedule": [
+    {
+      "time_s": 0.0,
+      "positions": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    },
+    {
+      "time_s": 0.20,
+      "positions": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    },
+    {
+      "time_s": 0.50,
+      "positions": [0.0, 0.0, 0.55, -0.70, -0.45, -0.55]
+    },
+    {
+      "time_s": 1.00,
+      "positions": [0.0, 0.0, 0.55, -0.70, -0.45, -0.55]
+    },
+    {
+      "time_s": 1.50,
+      "positions": [0.0, 0.0, 0.55, -0.70, -0.45, -0.55]
+    }
+  ],
+  "duration_s": 1.50,
+  "control_period_s": 0.002,
+  "hold_window_s": 0.30,
+  "tolerances": {
+    "joint_position_rad": 0.05,
+    "joint_velocity_rad_s": 0.15,
+    "tcp_position_m": 0.03,
+    "tcp_orientation_rad": 0.08
+  },
+  "timeout_s": 10.0
+}

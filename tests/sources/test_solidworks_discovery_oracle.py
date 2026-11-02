@@ -311,7 +311,7 @@ class _ReplayBackend:
         self.payload = payload
 
     def discover_native(self, frozen_source: Path, settings: dict, *, on_activity=None) -> dict:
-        return support.local_native_record_payload(
+        return support.world_native_record_payload(
             copy.deepcopy(self.payload)
         )
 
@@ -360,7 +360,7 @@ class OracleSemanticsTests(unittest.TestCase):
         payload = json.loads(record_path.read_text(encoding="utf-8"))
         canonical_raw = support.native_consumer_view(payload["raw"])
         mutate(canonical_raw, payload)
-        payload["raw"] = support.local_native_record_payload(canonical_raw)
+        payload["raw"] = support.world_native_record_payload(canonical_raw)
         # Allow non-finite literals when callers inject them so the shared strict
         # reader, rather than manifest resealing, is the rejection boundary.
         record_path.write_text(

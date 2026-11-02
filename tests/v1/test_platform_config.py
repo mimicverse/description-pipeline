@@ -108,6 +108,48 @@ class ValidationTests(unittest.TestCase):
             platform_config.validate_platform(candidate)
         self.assertIn(needle, str(raised.exception))
 
+    def test_teleop_configuration_rejects_unknown_or_incomplete_values(self):
+        for value in (
+            None,
+            {},
+            {"python": "relative/python", "capacity": 2},
+            {"python": "/opt/worker/python", "capacity": True},
+            {"python": "/opt/worker/python", "capacity": 9},
+        ):
+            with self.subTest(value=value):
+                self.assert_rejected(lambda doc, selected=value: doc["operator"].update(teleop=selected), "teleop")
+
+    def test_assessment_admission_and_snapshot_validators_agree(self):
+        enabled = {"enabled": True, "python": "/opt/teleop/bin/python", "capacity": 2,
+                   "limits": {"wall_seconds": 60, "memory_bytes": 2147483648,
+                              "cpu_seconds": 120, "output_bytes": 16777216}}
+        for value in (None, {"enabled": False}, enabled):
+            with self.subTest(value=value):
+                document = platform_document(VALID_ROOT)
+                if value is not None:
+                    document["operator"]["assessment"] = value
+                resolved = platform_config.validate_platform(document)
+                snapshot = platform_config.build_snapshot(
+                    resolved, platform_json_sha256="a" * 64,
+                    install_id="assessment-test", generated_at="2026-11-01T00:00:00Z",
+                )
+                ir.validate_config_snapshot(snapshot)
+                self.assertEqual(resolved["operator"].get("assessment"), value)
+        for value in ({"enabled": "false"}, {"enabled": True},
+                      {**enabled, "capacity": True}, {**enabled, "python": "relative/python"},
+                      {**enabled, "limits": {**enabled["limits"], "wall_seconds": float("nan")}},
+                      {"enabled": False, "python": "/opt/unused/python"}):
+            with self.subTest(rejected=value):
+                self.assert_rejected(lambda doc, value=value: doc["operator"].update(assessment=value), "assessment")
+                resolved = platform_config.validate_platform(platform_document(VALID_ROOT))
+                resolved["operator"]["assessment"] = value
+                snapshot = platform_config.build_snapshot(
+                    resolved, platform_json_sha256="a" * 64,
+                    install_id="assessment-test", generated_at="2026-11-01T00:00:00Z",
+                )
+                with self.assertRaises(ir.InterfaceRecordError):
+                    ir.validate_config_snapshot(snapshot)
+
     def test_positive_resolves_with_defaults_and_derived_values(self):
         resolved = platform_config.validate_platform(platform_document(VALID_ROOT))
         self.assertEqual(resolved["schema_version"], platform_config.PLATFORM_SCHEMA)
@@ -329,7 +371,9 @@ class RenderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="platform-config-") as temporary:
             root = Path(temporary)
             config_path = root / "platform.json"
-            config_path.write_text(json.dumps(platform_document(root)), encoding="utf-8")
+            document = platform_document(root)
+            document["operator"]["teleop"] = {"python": "/opt/teleop-worker/bin/python", "capacity": 2}
+            config_path.write_text(json.dumps(document), encoding="utf-8")
             wheel = root / WHEEL_NAME
             write_contract_wheel(wheel)
 
@@ -354,6 +398,7 @@ class RenderTests(unittest.TestCase):
 
             snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
             ir.validate_config_snapshot(snapshot)
+            self.assertEqual(document["operator"]["teleop"], snapshot["resolved"]["operator"]["teleop"])
             # R17: the deployment keeps no canonical mirror - the written bytes and the printed
             # digest come from the single owner (io/interface_records) carried by the release
             # wheel's contract closure.

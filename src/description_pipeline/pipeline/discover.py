@@ -249,13 +249,7 @@ def _bound_artifacts(command: StageCommand, request: Mapping[str, Any]) -> dict[
             )
         bound[role] = artifact
     freeze = bound["freeze"]
-    if (
-        freeze.producer_stage != "freeze"
-        or (
-            command.diagnostic_scope is None
-            and freeze.producer_run_id != command.run_id
-        )
-    ):
+    if freeze.producer_stage != "freeze":
         raise NativeDiscoverRefusal("discover.freeze_binding_mismatch", "Freeze artifact belongs to another run")
     if bound["ruleset"].set_sha256 != request["ruleset_catalog_sha256"]:
         raise NativeDiscoverRefusal("discover.ruleset_binding_mismatch", "Ruleset artifact differs from the request")
@@ -362,7 +356,7 @@ def _submission_identity(value: Mapping[str, Any]) -> SubmissionIdentity:
     return SubmissionIdentity(**dict(value))
 
 
-def _copy_selected(source: Path, destination: Path, files: Mapping[str, str]) -> None:
+def _copy_source_files(source: Path, destination: Path, files: Mapping[str, str]) -> None:
     destination.mkdir(parents=True, exist_ok=False)
     for name, checksum in files.items():
         target = confined(destination, name, exists=False)
@@ -371,7 +365,7 @@ def _copy_selected(source: Path, destination: Path, files: Mapping[str, str]) ->
         if file_digest(target) != checksum:
             raise NativeDiscoverRefusal(
                 "discover.source_set_changed",
-                "Selected source changed while preparing pure derivation",
+                "SourceSet changed while preparing pure derivation",
                 {"path": name},
             )
 
@@ -685,8 +679,14 @@ class DiscoverHandler:
                     "Native observation carries no selection",
                     evidence_artifacts=(effect_artifact,),
                 )
-            selected_root = workspace.root / f"selected-{claim.fence}"
-            _copy_selected(roots["source_set"], selected_root, bindings_files)
+            if dict(bindings_files) != source_files:
+                raise StageFailure(
+                    "discover.selection_invalid",
+                    "Native observation does not retain the complete SourceSet",
+                    evidence_artifacts=(effect_artifact,),
+                )
+            native_source = workspace.root / f"native-source-{claim.fence}"
+            _copy_source_files(roots["source_set"], native_source, source_files)
             output = workspace.root / f"discover-result-{claim.fence}"
             output.mkdir(parents=True, exist_ok=False)
             settings = DiscoverySettings(
@@ -699,7 +699,7 @@ class DiscoverHandler:
             )
             try:
                 prepared = derive_native_package(
-                    selected_root,
+                    native_source,
                     output / "prepared",
                     command.run_id,
                     dict(observation.record),
@@ -739,7 +739,6 @@ class DiscoverHandler:
                         "state": "passed",
                         "details": {
                             "selection_sha256": observation.manifest["selection_sha256"],
-                            "selected_files_sha256": observation.manifest["selected_files_sha256"],
                         },
                     },
                     {

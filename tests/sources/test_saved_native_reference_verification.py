@@ -7,6 +7,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from .selection_support import seal_fixture_object_observation
+
+from description_pipeline.schemas import NATIVE_DISCOVERY_CONTRACT, NATIVE_DISCOVERY_SCHEMA, NATIVE_TRANSFORM_FRAME
 from description_pipeline.verification.saved_native_references import rebuild_saved_native_references as rebuild
 from description_pipeline.verification.native_discovery import _Failure as Failure
 
@@ -19,14 +22,18 @@ def context(document="machine.SLDASM", scope=""):
     return {"document": document, "configuration": "Default", "scope": scope}
 
 
-def component(name, document=None, parent="", fixed=False):
+def component(name, document=None, parent="", fixed=False, document_type="part"):
     return {
         "name2": name,
+        "instance_id": name,
         "parent_occurrence": parent,
         "document": document or name + ".SLDPRT",
+        "document_type": document_type,
         "configuration": "Default",
         "transform_raw": transform(),
         "suppressed": False,
+        "suppression_state": 2,
+        "lightweight": False,
         "fixed": fixed,
         "fixed_error": None,
         "solver_observation": {
@@ -82,10 +89,15 @@ def mate(name, left, right, x, kind="concentric"):
 
 def fixture():
     raw = {
+        "schema_version": NATIVE_DISCOVERY_SCHEMA,
+        "contract": NATIVE_DISCOVERY_CONTRACT,
+        "transform_frame": NATIVE_TRANSFORM_FRAME,
         "identity": {"main_assembly": "machine.SLDASM"},
         "saved_configuration": "Default",
         "namespace": "dp",
-        "files": {name + ".SLDPRT": "0" * 64 for name in ("base", "boom", "tool")},
+        "files": {"machine.SLDASM": "f" * 64, **{
+            name + ".SLDPRT": "0" * 64 for name in ("base", "boom", "tool")
+        }},
         "exporter": {
             "state": "absent",
             "document": "machine.SLDASM",
@@ -131,7 +143,7 @@ def fixture():
                 "used_api": "IFeature.GetSpecificFeature2/IRefAxis.GetRefAxisParams",
             }
         )
-    return raw
+    return seal_fixture_object_observation(raw, main_assembly="machine.SLDASM")
 
 
 class SavedNativeTests(unittest.TestCase):
@@ -179,7 +191,7 @@ class SavedNativeTests(unittest.TestCase):
             lambda r: r["mates"][0].update(lock_rotation=None),
             lambda r: r["mates"][0].update(error_code=True),
             lambda r: r["mates"][0].update(is_advanced_mate_error="unread"),
-            lambda r: r["components"][1].update(document="boom.SLDASM"),
+            lambda r: r["components"][1].update(document="boom.SLDASM", document_type="assembly"),
             lambda r: r["properties"]["document"].update({"dp.joint.unknown.axis_sign": 1}),
             lambda r: r["properties"]["components"].update({"boom": {"dp.joint.axis_sign": 1}}),
             lambda r: r["properties"]["mates"].update({"hinge_one": {"dp.joint.type": "prismatic"}}),
@@ -197,12 +209,15 @@ class SavedNativeTests(unittest.TestCase):
     def test_requires_child_solver_context_for_subassembly(self):
         raw = fixture()
         raw["components"][1]["document"] = "boom.SLDASM"
+        raw["components"][1]["document_type"] = "assembly"
         raw["files"]["boom.SLDASM"] = "1" * 64
         raw["mates"][0]["entities"][1]["reference_document"] = "boom.SLDASM"
         raw["mates"][1]["entities"][0]["reference_document"] = "boom.SLDASM"
         child = component("boom/plate", "plate.SLDPRT", parent="boom")
-        child["solver_observation"]["context"] = context("boom.SLDASM", "boom")
+        child["solver_observation"]["context"] = context()
         raw["components"].append(child)
+        raw["files"]["plate.SLDPRT"] = "2" * 64
+        raw = seal_fixture_object_observation(raw, main_assembly="machine.SLDASM")
         result = self.run_fixture(raw)
         self.assertIn(["boom/plate"], [body["components"] for body in result["bodies"]])
         raw["components"][1]["solver_observation"]["solving"]["value"] = False
@@ -252,6 +267,7 @@ class SavedNativeTests(unittest.TestCase):
             raw["datums"].append(datum)
             raw["reference_axes"].append(axis)
             raw["mates"] = [mate(f"edge_{index}", left, right, 1) for index, (left, right) in enumerate(edges)]
+            raw = seal_fixture_object_observation(raw, main_assembly="machine.SLDASM")
             with self.subTest(edges=edges), self.assertRaisesRegex(Failure, "cycle|disconnected"):
                 self.run_fixture(raw)
 
@@ -576,13 +592,16 @@ class SavedNativeTests(unittest.TestCase):
         raw["datums"][2].update(name="c_auto_link_007", array_raw=transform(1))
         raw["reference_axes"][2]["selector"]["feature_name"] = "a_auto_link_007"
         raw["reference_axes"][2].update(axis_point_m=[1, 0, 0], raw_endpoints_m=[1, 0, 0, 1, 0, 0.01])
-        raw["components"][1].update(name2="boom_extension", document="boom_extension.SLDPRT")
+        raw["components"][1].update(
+            name2="boom_extension", instance_id="boom_extension", document="boom_extension.SLDPRT"
+        )
         raw["files"]["boom_extension.SLDPRT"] = "3" * 64
         for native_mate in raw["mates"]:
             for endpoint in native_mate["entities"]:
                 endpoint["mate_entity_reference"]["params"][0] = 1
                 if endpoint["reference_name"] == "boom":
                     endpoint.update(reference_name="boom_extension", reference_document="boom_extension.SLDPRT")
+        raw = seal_fixture_object_observation(raw, main_assembly="machine.SLDASM")
         with self.assertRaisesRegex(Failure, "complete geometric binding"):
             self.run_fixture(raw)
         raw["components"][1]["document"] = "boom_20401231.SLDPRT"
@@ -591,19 +610,24 @@ class SavedNativeTests(unittest.TestCase):
             for endpoint in native_mate["entities"]:
                 if endpoint["reference_name"] == "boom_extension":
                     endpoint["reference_document"] = "boom_20401231.SLDPRT"
+        raw = seal_fixture_object_observation(raw, main_assembly="machine.SLDASM")
         self.assertEqual(len(self.run_fixture(raw)["bodies"]), 3)
 
-    def test_nested_solver_context_binds_each_immediate_parent(self):
+    def test_nested_main_getter_context_preserves_native_parent_roles(self):
         raw = fixture()
         raw["components"][1]["document"] = "boom.SLDASM"
+        raw["components"][1]["document_type"] = "assembly"
         raw["files"]["boom.SLDASM"] = "1" * 64
         raw["mates"][0]["entities"][1]["reference_document"] = "boom.SLDASM"
         raw["mates"][1]["entities"][0]["reference_document"] = "boom.SLDASM"
-        inner = component("boom/inner", "inner.SLDASM", "boom")
-        inner["solver_observation"]["context"] = context("boom.SLDASM", "boom")
+        inner = component("boom/inner", "inner.SLDASM", "boom", document_type="assembly")
+        inner["solver_observation"]["context"] = context()
         leaf = component("boom/inner/plate", "plate.SLDPRT", "boom/inner")
-        leaf["solver_observation"]["context"] = context("inner.SLDASM", "boom/inner")
+        leaf["solver_observation"]["context"] = context()
         raw["components"].extend((inner, leaf))
+        raw["files"].update({"inner.SLDASM": "2" * 64, "plate.SLDPRT": "3" * 64})
+        raw = seal_fixture_object_observation(raw, main_assembly="machine.SLDASM")
+        inner, leaf = raw["components"][-2:]
         self.assertEqual(len(self.run_fixture(raw)["bodies"]), 3)
         solving = inner["solver_observation"]["solving"]
         for field, value in (
@@ -623,12 +647,13 @@ class SavedNativeTests(unittest.TestCase):
             self.run_fixture(raw)
         raw["components"].append(leaf)
         inner["document"] = "inner.SLDPRT"
-        leaf["solver_observation"]["context"] = context("inner.SLDPRT", "boom/inner")
+        inner["document_type"] = "part"
         with self.assertRaisesRegex(Failure, "part must have no assembly subtree"):
             self.run_fixture(raw)
         inner["document"] = "inner.SLDASM"
+        inner["document_type"] = "assembly"
         leaf["solver_observation"]["context"] = context("boom.SLDASM", "boom")
-        with self.assertRaisesRegex(Failure, "immediate parent context"):
+        with self.assertRaisesRegex(Failure, "wrong main-assembly context"):
             self.run_fixture(raw)
 
 

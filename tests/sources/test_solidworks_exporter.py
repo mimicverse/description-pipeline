@@ -149,7 +149,10 @@ def raw_record() -> dict:
         "components": [
             {
                 "name2": name,
+                "instance_id": name,
                 "document": document,
+                "document_type": "part",
+                "parent_occurrence": "",
                 "configuration": "Default",
                 "transform": IDENTITY.copy(),
                 "suppressed": False,
@@ -623,7 +626,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
 
     def test_uncovered_material_warning_preserves_exact_occurrence_without_assignment(self):
         raw = raw_record()
-        raw["components"].append({**raw["components"][0], "name2": "unselected-1"})
+        raw["components"].append({**raw["components"][0], "name2": "unselected-1", "instance_id": "unselected-1"})
         bodies, _, findings = self.derive(raw)
         coverage = next(item for item in findings if item["code"] == "discovery.exporter_membership_uncovered")
         self.assertFalse(coverage["blocking"])
@@ -639,9 +642,16 @@ class ExporterDiscoveryTests(unittest.TestCase):
 
     def test_moving_selected_subtree_is_not_absorbed_by_parent_selection(self):
         raw = raw_record()
-        raw["components"][0].update(name2="assembly-1", document="assembly.SLDASM")
-        raw["components"][1]["name2"] = "assembly-1/arm-1"
-        raw["components"].append({**raw["components"][1], "name2": "assembly-1/base-1", "document": "base.SLDPRT"})
+        raw["components"][0].update(
+            name2="assembly-1", instance_id="assembly-1", document="assembly.SLDASM", document_type="assembly"
+        )
+        raw["components"][1].update(
+            name2="assembly-1/arm-1", instance_id="assembly-1/arm-1", parent_occurrence="assembly-1"
+        )
+        raw["components"].append({
+            **raw["components"][1], "name2": "assembly-1/base-1", "instance_id": "assembly-1/base-1",
+            "document": "base.SLDPRT",
+        })
         for binding, component in zip(raw["exporter"]["pid_bindings"], raw["components"][:2], strict=True):
             binding.update({key: component[key] for key in ("name2", "document")})
         bodies, _, _ = self.derive(raw)
@@ -656,7 +666,9 @@ class ExporterDiscoveryTests(unittest.TestCase):
                 "discovery.exporter_membership_overlap",
             ),
             (
-                lambda raw: raw["components"].append({**raw["components"][0], "name2": "unselected-1"}),
+                lambda raw: raw["components"].append({
+                    **raw["components"][0], "name2": "unselected-1", "instance_id": "unselected-1",
+                }),
                 "discovery.exporter_membership_uncovered",
             ),
             (
@@ -670,7 +682,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
 
     def test_only_complete_rigidity_proves_an_unselected_attachment(self):
         raw = raw_record()
-        raw["components"].append({**raw["components"][0], "name2": "cover-1"})
+        raw["components"].append({**raw["components"][0], "name2": "cover-1", "instance_id": "cover-1"})
         raw["mates"] = [
             {
                 "name": "cover_lock",
@@ -691,7 +703,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
 
     def test_rank_five_and_ambiguous_attachments_never_choose_an_owner(self):
         raw = raw_record()
-        raw["components"].append({**raw["components"][0], "name2": "washer-1"})
+        raw["components"].append({**raw["components"][0], "name2": "washer-1", "instance_id": "washer-1"})
         cylinder = {"point": [0, 0, 0], "direction": [0, 0, 1], "radius": 0.01}
         plane = {"point": [0, 0, 0], "normal": [0, 0, 1]}
         raw["mates"] = [
@@ -838,7 +850,7 @@ class ExporterDiscoveryTests(unittest.TestCase):
         ):
             with self.subTest(expected=expected):
                 raw = raw_record()
-                raw["components"].append({**raw["components"][0], "name2": "cover-1"})
+                raw["components"].append({**raw["components"][0], "name2": "cover-1", "instance_id": "cover-1"})
                 raw["mates"] = [
                     {
                         "name": "recorded_lock",

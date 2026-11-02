@@ -148,7 +148,7 @@ def _build_prepared_package(
     import hashlib
 
     from description_pipeline.io import digest, write_json
-    from description_pipeline.schemas import NATIVE_DISCOVERY_SCHEMA
+    from description_pipeline.schemas import NATIVE_DISCOVERY_SCHEMA, NATIVE_TRANSFORM_FRAME
     from tests.sources import support
     from description_pipeline.schemas import CAPTURE_EVIDENCE_REQUESTS
     from tests.sources.selection_support import sealed_selection
@@ -180,16 +180,21 @@ def _build_prepared_package(
         {
             "configuration": "Default",
             "document": document,
+            "document_type": "part",
             "instance_id": name,
+            "parent_occurrence": "",
+            "transform_raw": support.solidworks_transform(support.placement((0.0, 0.0, z))),
+            "fixed": False,
+            "fixed_error": None,
             "lightweight": False,
             "name2": name,
             "source_provenance": None,
             "suppressed": False,
             "suppression_state": 2,
         }
-        for name, document in (
-            ("base-1", "cad/base.SLDPRT"),
-            ("arm-1", "cad/arm.SLDPRT"),
+        for name, document, z in (
+            ("base-1", "cad/base.SLDPRT", 0.0),
+            ("arm-1", "cad/arm.SLDPRT", 0.2),
         )
     ]
     discovery = {
@@ -217,6 +222,7 @@ def _build_prepared_package(
         "native_files": native_files,
         "records": [],
         "raw": {
+            "transform_frame": NATIVE_TRANSFORM_FRAME,
             "components": components,
             "files": dict(native_files),
             "saved_configuration": "Default",

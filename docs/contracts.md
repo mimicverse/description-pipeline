@@ -12,12 +12,12 @@ CAD 提供工程事实，版本化规则负责规范化、派生与有依据的�
 | 对象 | 定义与不变量 |
 |---|---|
 | `handoff_digest` | 封存上传文件清单的摘要；主装配相对路径另行固定 |
-| 原生传输 `handoff_sha256` | 已封存选择的原生依赖闭包摘要；有未选文件时不等于完整上传摘要，不等于含生成身份与规格文件的制备包摘要 |
-| 阶段收据 `handoff_sha256` | `freeze` 绑定完整上传索引；原生阶段及其生成、验证、发布后继绑定原生传输选择身份。复用保留原生产者的同一绑定 |
+| 原生传输 `handoff_sha256` | 完整已接纳上传清单的摘要，与 `upload_sha256` 及原请求 `handoff_digest` 一致；不等于含生成身份与规格文件的制备包摘要 |
+| 阶段收据 `handoff_sha256` | 各阶段均绑定同一完整上传身份；复用保留原生产者的同一绑定 |
 | `source_revision_id` | 工程内容身份：完整上传清单摘要、主装配、交付配置、选定硬件标识及实际引用的受控记录摘要的规范对象之 SHA-256；使用完整 64 位十六进制值 |
 | 工程修订 | CAD/PDM 编写的版本标签及受控原件引用；保持原值与缺项，不用内容摘要冒充工程修订 |
 | `request_id` | 一次认证提交的稳定标识；请求封存后不可变，绑定用途、目标配置、七阶段 executor、native tool source/record、契约/检查/资源策略摘要与发布前置基线 |
-| `run_id` | 一次工程执行的 UUID；新 CAD 输入从 `freeze` 接纳；受限 MJCF 后继以 `from_stage=mjcf` 直接引用原始已验证来源，关联运行各有新的准入及下游身份 |
+| `run_id` | 一次工程执行的 UUID；新 CAD 输入从 `freeze` 接纳；七阶段后继以 `from_stage/through_stage` 固定执行范围，直接核验实际来源；每次执行都有新的准入与 command 身份 |
 | `NativeTargetIdentity` | 既有部署登记证明的 Windows runtime 目标；精确字段为 `schema_version/install_id/pipeline_id/target_id`，不由 URL、health readiness、tool、release 或 worker owner 合成 |
 | `target_binding_digest` | 单个 native effect target 对 operation identity、main assembly、tool source digest、完整 target identity 与 target ID 的规范摘要；不替代 command、request、archive、tool record 或 payload 摘要 |
 | `command_id` | 一个不可变 stage、dispatch 或 cancel command；reconciliation 是 claim-free 操作，不创建 reconcile command |
@@ -58,11 +58,11 @@ effect 的 operation/tool/target 绑定；command 的 `request_digest`、effect 
 
 评审 PR 是待批准候选。缺少工程行政标签不等于机械证据缺失；前者如实展示，后者仍按质量规范阻断。原件、完整上传清单和内容身份必须可追溯。字段存在但无效、读取失败或来源冲突时保留原值和诊断，不静默当作缺失回退。产品名称匹配只提供目标选择建议。更改主装配、目标或原件须形成新请求。
 
-提交的变更说明为必填，可多行；接纳时去除首尾空白，行尾统一为 LF，正文内容不改写、不截断。初始运行及 Freeze 后继将该说明封存在 `input/request.json.change_summary`；受限 MJCF 后继将新说明封存在本次不可变 admission 及 Publish commit intent，保留原 Capture 的 `input/request.json` 字节。最终 description 评审 PR 正文开头与 Git 提交正文始终使用本次接纳的完整说明；验证警告、证书摘要和仓库身份只追加在其后。CAD 已录说明属于 `input/source.json` 的工程元数据，即使与本次提交说明不同，也不得替换提交说明或 PR 正文。工程元数据按上表保留 `cad` / `submission` 来源；两者均缺失时 `discover` 记为 `discovery.summary_missing`，发布就绪不成立。
+提交的变更说明为必填，可多行；接纳时去除首尾空白，行尾统一为 LF，正文内容不改写、不截断。初始运行及 Freeze 后继将该说明封存在 `input/request.json.change_summary`；下游阶段后继将新说明封存在本次不可变 admission，Publish 使用本次 commit intent，保留原 Capture 的 `input/request.json` 字节。最终 description 评审 PR 正文开头与 Git 提交正文始终使用本次接纳的完整说明；验证警告、证书摘要和仓库身份只追加在其后。CAD 已录说明属于 `input/source.json` 的工程元数据，即使与本次提交说明不同，也不得替换提交说明或 PR 正文。工程元数据按上表保留 `cad` / `submission` 来源；两者均缺失时 `discover` 记为 `discovery.summary_missing`，发布就绪不成立。
 
 同一不可变请求的重试、UNKNOWN 对账和进程恢复沿用已封存的 PR 文本及其摘要，不重新读取页面或 CAD 来改写说明。复用父 Freeze 原件的新运行使用该次接纳请求已确定的说明：显式提交新说明时采用新说明，否则沿用父请求已封存的说明；均封存进新请求，Publish 不再补读或改写。更改已接纳说明必须形成新请求。PR 成功回读须核对完整正文摘要，不能只确认 PR 已创建。
 
-请求固定发布目标、其配置摘要和基线读取结果。读取失败明确标记为未解析，不能当作首次交付；发布前须在新请求中固定已解析基线。新 CAD 输入及 Freeze 后继从 Freeze 接纳，只复用原件；只重做 MJCF 使用下述受限后继，重新固定本次转换和发布意图。主装配、工程输入、用途或目标变化必须从 Freeze 新建运行。显示名修改不改变请求。
+请求固定发布目标、其配置摘要和基线读取结果。读取失败明确标记为未解析，不能当作首次交付；发布前须在新请求中固定已解析基线。新 CAD 输入从 Freeze 接纳；阶段后继仅复用真实必要前缀，重新封存所选执行范围与本次意图。主装配、工程输入、用途或目标变化必须从 Freeze 新建运行。显示名修改不改变请求。
 
 初始运行及 Freeze 后继的 `freeze` 在调用推导或生成器之前，将已接纳工程请求封存为 `input/request.json`，schema 为 `solidworks-to-urdf.request/v2`。记录包含 `schema_version`、`purpose`、`request_id`、`target_hardware`、`change_summary`、`main_assembly`、`handoff_digest` 和 `platform_config_digest`；分别固定记录版本、用途、本次请求、经配置校验的所选硬件、规范 LF 的原始提交说明、明确的主装配、完整上传索引与实际平台配置快照身份。记录不包含秘密或凭据，冻结收据绑定其文件摘要，后续阶段原字节沿用，完整交付必须携带该件。
 
@@ -80,27 +80,14 @@ wire/view/expectation 和入站 upload admission。不得在 `run_stage`、trigg
 还须在 admit 前拒绝 application/client target 与 spec target 不一致；现有 request
 重试先复用已封存 spec，再考虑当前登记。
 
-新的 CAD 输入从 `freeze` 起点开始；受限 MJCF 后继见本节后述约束。需要复用父运行 CAD 原件时，接纳对象携带
-`parent_run_id`，由 `ProductionFreezeSuccessorRequest` 表达新运行、请求、主装配、
-目标、用途、说明和提交主体，并调用
-`load_production_freeze_successor(...)`。该入口必须通过
-`StageApplication.load_verified_freeze_origins(parent_run_id)` 读取父 Freeze
-decision/result、`inputs.json`、`freeze_originals` 引用及 ArtifactStore 实际字节，
-并只原样复用 `spec.originals`。当前 rules、configuration snapshot、target、
-RepositorySnapshot、Git actor/base、native requirement、portable/native release
-与七阶段 executor 必须重新接纳并封存；历史 producer 与本次消费者身份分别保留。
+新的 CAD 输入从 `freeze` 起点开始。阶段重跑由统一的 `ProductionStageRerunRequest` 与 `load_production_stage_rerun(...)` 接纳，固定 `parent_run_id/from_stage/through_stage`。默认终点为所选起点；正常首次上传的终点为 Publish。Freeze 后继仅复用经统一 `source_admission/source_context` 核验的 originals；其他阶段从真实父来源解析必要前缀，支持由先前独立重跑结果继续下一阶段。原件、command、decision、certificate 和 artifact 的真实 producer 保留，不回填旧运行或复制旧下游成功。
 
-Freeze 后继不得引用父 Discover、Capture、Generate、Verify、MJCF 或 Publish decision，
-不得复制任何下游成功、qualification 或 effect 状态。父上传目录和 work root 可以
-删除，父来源收据或字节缺失、漂移、错绑时拒绝。相同 `run_id` 的同类请求只在完整
-行政意图与 originals artifact ref 完全一致时返回原接纳；改变父运行、主装配、目标、
-用途、说明、主体或原件身份均拒绝。普通上传接纳不接受 `parent_run_id`，除受限 `from_stage=mjcf` 后继外，任意下游起点的旧 resume 不进入生产；已登记不可变 command 的安全重试
-仍走共同 engine，UNKNOWN effect 必须先只读 reconciliation。
+同一幂等身份只有完整请求及来源一致时才返回原接纳，改变已提交正文拒绝。普通上传不接受 parent；stage 后继必须经过同一事实和来源资格核验，不能把任意目录或诊断输出当作正式前缀。已有 command 的恢复仍走共同 engine；UNKNOWN effect 先按原身份对账。
 
 隔离诊断仍可使用显式 `DiagnosticReplayScope` 执行一个目标阶段，但它只引用完整
 输入 closure，不伪造上游 decision，不登记正式 checkpoint，也不产生可被普通后继
 消费的 formal qualification。诊断输出必须保留 scope 与原 producer 身份，不能晋升为正式下游输入。
-后续正式运行通过初始/Freeze 后继建立新工程事实，或通过受限 MJCF 后继引用原始正式 Verify 前缀；不得引用诊断结果代替该前缀。
+后续正式运行通过初始接纳或有界阶段后继建立新结果；不得引用诊断结果代替正式来源。
 
 `platform_config` artifact 恰含 `config-snapshot.json`。Freeze 与 Discover 从
 artifact 校验快照结构并复算 canonical snapshot digest，再与 request 和 command 的
@@ -114,7 +101,7 @@ executor。各 role 只与自己的冻结 requirement 比较，禁止假设跨 r
 
 独立验证从原生读数与该请求证据重算硬件和说明来源，并核对主装配及上传摘要；不能以 `input/source.json` 与发现结果两份生成声明相等替代来源证明。CAD 属性确证缺失才允许对应回退，读取失败、无效值或冲突保持拒绝。即使生成声明被同时修改并重新封装，原请求不变时仍须检出差异。
 
-同一已登记 command 的恢复保留原请求与证据。初始运行及 Freeze successor 生成本次工程请求记录；Freeze successor 保留父 originals 的 producer 身份，不复用父下游结果。受限 MJCF 后继保留原工程 `input/request.json` 及 URDF Verify subject，新的 run/request、simulation、说明和发布基线仅属于本次转换接纳与 Publish intent；不能把原工程 request_id 冒充本次提交，也不能把原 URDF 证书扩成双格式证书。工程输入、用途、配置、规则或目标改变须从 Freeze 建立完整下游，不能改已有字节后沿用旧证书。
+同一已登记 command 的恢复保留原请求与证据。阶段后继保留所复用工程输入、原 request 与证书字节；新的 run/request、说明、simulation 与发布意图分别归属本次接纳，不能伪装原 producer。上游行政说明不限制本次合法提交说明；原工程 subject 不因新说明被改写。工程输入、用途、规则、配置或目标变化须重新建立受影响结果与资格，不能改已有字节后沿用旧证书。
 
 <a id="naming"></a>
 ## 工程交付标识与模型命名
@@ -246,11 +233,7 @@ decision、sealed StageResult、输出 artifact 与 supporting predecessors，�
 request digest、command/request digest、result/failure digest、executor、artifact
 ref、diagnostic scope 和 effect ledger 必须与当前事实一致。缓存、页面摘要、
 `formal_eligible` 布尔或证书自报值不能替代本次重算。
-完整初始运行沿同一 run 的 bounded command/predecessor decision 链验证 immediate 与
-supporting predecessors；受限 MJCF 后继额外核验原始 Verify 来源；`command_input_artifact.position` 保留输入顺序。跨运行复用
-只允许通过父 Freeze originals 或直接绑定原始 Verify 的受限 MJCF 后继建立新运行，不定义通用的多跳 checkpoint 或
-producer lineage 兼容链。不得仅凭相同 artifact 摘要省略 command、decision、
-metadata 或 producer 身份。
+完整初始运行及有界后继共用同一 command/predecessor 和 supporting predecessor 核验。跨运行前缀沿真实不可变来源解析，`command_input_artifact.position` 保留输入顺序；不建立第二 checkpoint、journal 或 lineage 兼容台账。不得仅凭相同 artifact 摘要省略 command、decision、metadata 或 producer 身份。
 该复核在 successor command 创建、claim 获取、已决结果读取/提交和 effect
 authorization 边界分别执行，防止另一个进程已使祖先冲突后仍由缓存继续外发。
 
@@ -368,7 +351,7 @@ metadata closure。同一 command/effect 恢复复用原 intent 与 outbound；�
 
 `project_stage_status` 与 `project_run_status` 是唯一业务状态投影。它们只消费
 canonical facts 的真实阶段 decision/effect 以及实际 Airflow task/DagRun 关联；
-SQL view、Portal、operator 和 display metadata 均不得另写状态 reducer。完整初始运行要求七个 formal stage decision 按序全部 `completed`；受限 MJCF 后继要求本次 MJCF/Publish 完成及来源前缀重验通过。全部相关 effect 必须为 `satisfied`；
+SQL view、Portal、operator 和 display metadata 均不得另写状态 reducer。完整初始运行要求七个 formal stage decision 按序全部 `completed`；有界后继的 scope 成功要求本次范围完成且来源前缀重验通过。只有 Publish 实际完成并具备完整有效来源时 `delivery_complete` 才成立，单阶段成功不冒称交付成功。全部相关 effect 必须为 `satisfied`；
 任一当前未收口的 UNKNOWN/CONFLICT 为 `unresolved`；合法 reconciliation 可以按原
 effect identity 追加 settlement，历史 fact 不得使已收口结果永久冲突。缺少任一
 本次范围内 formal stage 为 `incomplete`；复用上游为 `reused`，不是本次完成决定。
@@ -448,15 +431,12 @@ operation，不重复打开 CAD。原生执行器重启后，未封存的在途�
 原始响应、outbound 和诊断；未知 COM 状态不能续算或获得清理授权。
 
 同一 command 已有成功决定时，只有原 `StageDecision`、sealed StageResult、output
-artifact、完整祖先及 effect 仍通过核验，才可返回原结果。新的 CAD 输入及 Freeze
-successor 均从 Freeze 开始，只复用父 originals，不引用父下游 decision；受限 MJCF
-后继只引用原始通过 Verify 的前缀，不继承父 MJCF/Publish 决定。父失败、
+artifact、完整祖先及 effect 仍通过核验，才可返回原结果。新的 CAD 输入从 Freeze 开始；阶段后继仅复用已复核的必要前缀，不继承所选范围及其下游的旧决定。父失败、
 取消、未决证据和原 producer 不得覆盖；工具、CAD 输入、规则、配置、目标或 native
 requirement 变化必须形成新请求及其下游执行。
 
 传输断连后恢复同一 effect。同一不可变 command 可在当前输入、工具、祖先资格和
-owner/fence 约束下安全重试或恢复；已有终态决定时只复核并复用，不新建决定。新的
-CAD/URDF 重做必须从 Freeze 新建运行；只重做 MJCF 时使用受限的新 MJCF 后继。
+owner/fence 约束下安全重试或恢复；已有终态决定时只复核并复用，不新建决定。新的工程原件从 Freeze 接纳；同一来源的阶段重算使用统一的有界后继。
 显式指定 target 的诊断只产生非 formal
 结果，不能续成一个正式旧阶段。对已发送的 native 或 Git/PR effect，UNKNOWN 状态下
 原 handler 不得取得普通 execution claim 或自行重发；先通过
@@ -596,12 +576,21 @@ Windows 传输消费同一固定策略。工程传输包含闭合文件清单、
 observation、selection、ruleset 与 prepared bytes；Capture result 绑定该 result、
 同版 native requirement、prepared inventory 与原生运行环境。Linux 对这些绑定逐层复核。
 
-Discover 原始记录保留组件的 `transform_raw`（SolidWorks 原生 16 值局部变换）与
-`parent_occurrence`、基准的 `array_raw` 与 owner，以及配合端点的原始名称、文档、owner
-scope 和 `EntityParams`。Windows 只验证读取形状与可读性，不组合世界坐标或局部化配合
-几何。Linux Discover 从这些原值生成临时消费视图，独立 Verify 另行复算；两者都不把
-派生结果写回封存 raw。父链、owner、引用冲突或缺失字段必须拒绝，不能当作根节点或
-空帧补齐；原生明确记录的空读数与字段缺失、null 分别处理。
+Discover 与 Capture 共用顶层保存配置下的原生实例域；每个实例保留真实引用配置、
+原生类型、suppression、parent 和来源，不用独立子文档树补成员。唯一当前 raw 契约明确
+`transform_raw` 为主装配机械 frame 中的原生 SW16 world 数组，禁止再次乘父变换或兼容
+解释为旧 local 数组。基准的 `array_raw`、配合 `EntityParams` 仍保留其文档局部 frame；
+Linux 依据实例 world 仅转换一次，独立 Verify 另行复算，不把派生值写回 raw。
+
+树读数转成 primitives 并释放借用接口后，才进行必要文档配置补读；临时 scope 内提取
+原值并在退出前释放接口，恢复后重新取得主上下文。物理 document baseline 与每实例
+引用配置分别核验，solver getter 的实际读取上下文如实保留，不混同 parent/owner。
+Capture 在任何物性读取前，直接对封存 Discover raw 核完整身份、类型、parent、状态、
+配置及来源，拒绝并报告全部漂移；不裁剪旧计划。cached/virtual 继续消费既有跨会话
+绑定，各会话临时路径/PID 原样保留，不要求其相同，不增加 registry 或缩减原件闭包。
+
+父链、frame、owner、引用冲突、无效树、未知或读取失败均不得冒充缺失或压制。已知缺失
+引用继续按保存状态规则给出来源 warning；原生明确空值、缺失字段与 null 分别保真。
 
 Mate component endpoint 的 `reference_document` 必须是可移植包内路径，或由同一 occurrence
 的 sealed embedded-virtual provenance 证明的包外 session 路径；
@@ -808,6 +797,8 @@ CAD 唯一工程来源的边界保持：本次冻结 CAD 缺少实际驱动／�
 
 原生采集封存原始事实与失败原件，并按既有排他和所有权协议完成资源结算、释放 CAD；未知外部结果继续通过原 operation 对账，不能登记虚假成功。后续坐标转换、模型生成、报告和独立工程验证从固定事实离线执行，保留原值、规则、来源 warning 与字节绑定；纯计算或验证修复复用同一份原始事实，不因此再次启动 CAD。独立验证对照原始发现、选择闭包、源摘要及实际字节复算，仍核验必需且适用的工程约束，不另建工程模型或状态权威。
 
+早期失败和取消在既有 `native_observations.json` 的 `runtime` 中保留已完成的 policy、opened、document state 与 environment 观察前缀。只有实际取得 after state 才记录该字段；未知或尚未执行的观察不补默认值，也不在失败后追加 CAD getter。成功的 `native-runtime.json` 结构和读取顺序不变，失败诊断不建立第二份运行状态或工程来源。
+
 原生 API 错误保留调用名、返回值和完整整数位码、可解析的枚举名、SolidWorks/API 版本、文档/配置、失败操作及已取得的引用信息。位码不是错误数量。缺少具体引用绑定时明确记为未定位，不能据此宣称缺失文件数、原件损坏或工程师交错材料。路径诊断记录主装配、工作目录、搜索路径以及原生返回的存储/解析路径，秘密与无关工程信息不得外泄。阶段按实际执行归属记录；原生打开位于 `discover`，不能记成纯文件冻结失败。
 
 完成状态只能在结果封存并可读取后公布。所有结果文件只能通过已登记清单访问。缺失、多余、损坏、跨运行或不完整文件组均拒绝；临时文件和部分采集不能伪装成成功证据。活动含操作、对象、可用计数、序号和时间，只表达已观测事实。
@@ -846,7 +837,9 @@ reports/verification-execution.json
 reports/mjcf-certificate.json
 ```
 
-每个原生文件、观察、实例、物理读数和网格都必须能够追溯到主装配、配置和对应来源。完整上传清单留存所有上传字节的身份；模型交付只携带经原生绑定核验的依赖闭包。完整上传原件另外保存在平台冻结存储中。
+所有已接纳原件始终完整保留，Discover/Capture 和模型交付不能按组件图删减支持文件。`selection.files` 与 `raw.files` 绑定完整可用输入，`upload_sha256` 是该清单的内容摘要；实际归档清单还须与原请求 `handoff_digest` 复算一致，不维护 selected/excluded 子集或另一份子集摘要。
+
+可用文件不等于已观察对象。组件图、原生实例、配置、会话与 owner 约束实际对象读取、绑定、拓扑及导出范围；物理读数与网格须追溯到相应原生证据。warning 的 `actual_scope.input_files` 仅表示可用输入，graph 与 occurrences 才记录对象观察，不能宣称未打开文件已获得机械资格。
 
 `input/` 与 `evidence/` 由 Capture admitted tree 原字节提供；Generate 只增加 `model/`、
 `urdf/`、`meshes/` 和 `tool.json`，Verify 只增加两个 verification 文件；MJCF 增加实际转换资源和独立证书。Publish
@@ -859,7 +852,7 @@ reports/mjcf-certificate.json
 schema、receipt 与 artifact identity 验证，不能把自身纳入摘要形成循环。URDF certificate 的 `subject_sha256` 是 Generate artifact 的 set digest，`evaluation_subject_sha256` 绑定独立评估的 Generate/Capture pair。MJCF certificate 通过 `source_artifacts` 和 `input_binding` 绑定转换输入及策略，`projection_sha256` 只绑定实际 `mjcf/` 输出成员（含 simulation 配置）。组合 `publication_subject_sha256` 才覆盖两种格式的交付主体。各摘要域分别核验，不要求相等，也不修改旧证书扩展覆盖范围。Verify
 certificate 另绑定 verifier、contract 与 policy；
 execution receipt 绑定该 certificate，仅以 `execution_details` 保全 `check.details` 直接层的原始进程输出与退出信息，不重复保存检查和 warning 全表。该分离不递归改写 warning、diagnostic 或资格中的来源扩展；完整记录按规范字节去重，证书拒绝重复的顶层 diagnostics。URDF 检查、warning 与资格的唯一交付依据为其 certificate；MJCF 的派生策略、检查及 warning 由独立 MJCF certificate 承载，PR 和预览分别读取两者，不合成第三份质量真值；URDF、PR 和浏览器引用实际登记的证书路径，展示保留对象、字段、来源、规则及未建立资格的原值。PR 摘要达到长度上限时明确给出未展开数量与完整证书位置，不生成另一份 quality 或 structural-team 报告。Publish receipt 再绑定 publication subject、
-publication plan、候选 commit/tree 与 Git/PR effect。
+publication plan、候选 commit/tree 与 Git/PR effect。PR 正文对 URDF 与 MJCF 警告共用 GitHub 正文容量，先完整保留本次变更说明及证书身份，再分配类别计数和有来源的有限实例；未展开记录与类别明确计数，两份证书保留完整明细。必要说明本身无法容纳时，在外部 effect 前明确拒绝，不截断用户说明。Git 提交正文通过标准输入，PR 创建正文通过私有临时文件交给 GitHub CLI，避免操作系统单参数/总参数上限；PR 更新沿 JSON 标准输入，封存计划、重算和远端回读绑定同一最终正文。
 
 证书的顶层 `diagnostics` 是唯一完整诊断库存：Verify 从独立报告及检查明细汇总原记录，按规范字节去重；封装后每项检查仅以 `details.warning_indices`、`details.diagnostic_indices` 的严格整数索引保留分类和归属，不再次序列化完整记录。共享读取边界拒绝布尔、负数、越界、重复索引及旧嵌套记录，核验全部引用和原生 scope 完整性；每条记录须有非空 code 和明确布尔 blocking，PASS 不得携带阻断诊断。来源记录的真实 detail 与全部对象保留，停止人为合成第二份 `detail.objects` 副本。报告、预览和 PR 复用同一库存，Verify 的诊断只用于 Verify 阶段，不能套用到 Freeze 等其他阶段，也不能把未知状态改为 false。运行详情只使用登记证书及 publication receipt，不从旧阶段回执补回检查成功或 PR 身份。
 
@@ -890,7 +883,7 @@ closure，执行验证并提交正式决定、verification certificate 与 execu
 
 真正隔离复算须沿既有受控诊断入口绑定 `DiagnosticReplayScope`，分别记录历史生产者、
 本次工具及输入闭包，不登记正式资格，也不能由普通后继消费；不能把正式命令描述为
-只读诊断。不提供直接 check/rebuild 任意目录的第二 CLI。新 CAD/URDF 候选从 Freeze 重新接纳，仅 MJCF 转换候选走受限后继；
+只读诊断。不提供直接 check/rebuild 任意目录的第二 CLI。新 CAD 原件从 Freeze 重新接纳；已封存来源的阶段重算走统一有界后继；
 发布和恢复始终走同一 StageApplication/effect/fact 流程。
 
 <a id="publication"></a>
@@ -924,7 +917,7 @@ Git 对账只读取密封 request、plan、bundle 及候选 commit/tree/parent/s
 
 已合并 PR 的后续交付从确认包含该候选的当前 base 建立新基线，沿受管理分支 fast-forward 并创建下一评审 PR。已关闭且未合并的候选禁止自动重新开启，由目标负责人处理撤回原因。
 
-同一已登记 Publish command 的恢复可在重验原 effect 与证据后复用已确认结果。新运行按自身已验证有效载荷和固定基线发布；远端基线变化必须形成绑定新基线的新请求：CAD/URDF 重做走 Freeze，纯 MJCF 转换走受限后继并重验原始前缀。两者均不继承原 Publish 决定或外部 effect 成功。原发布收据与已发生的远端结果完整保留。
+同一已登记 Publish command 的恢复可在重验原 effect 与证据后复用已确认结果。新运行按自身已验证有效载荷和固定基线发布；远端基线变化必须形成绑定新基线的新请求。阶段后继重新核验完整必要前缀，不继承原 Publish 决定或外部 effect 成功。原发布收据与已发生的远端结果完整保留。
 
 ## 缺失引用与保存状态导出
 
@@ -940,15 +933,21 @@ Generate 的本地转换、输出表示及 Verify 的本地评估若明确抛出
 
 警告中的数值与模型文件使用同一 canonical JSON 规则，包含负零归一和非有限数拒绝；URDF 注释仅额外执行 XML 安全转义，独立验证仍核完整来源与资格，不按排版补真值。Verify 内的有效实例物性读取与 mass closure 共用一处原始测量投影，保留有效值及其独立零件对照测量；两者不混用，整记录与工程数值校验继续严格执行。
 
-## 受限 MJCF 后继与执行范围
+## 可选动力学评估
 
-`ProductionMJCFSuccessorRequest` 通过既有 attempts 入口接纳 `stage=mjcf`，使用新的不可变 request/run，固定直接引用真正持有 Generate/Capture/Verify 决定的原始来源 run。simulation 覆盖属于新请求，不改原 artifact。来源必须终态已结算且 Freeze 至 Verify 各阶段均 completed，实际字节、证书、producer/executor、规则、用途、所有者、配置及 supporting predecessors 均有效；拒绝诊断来源、未决 effect 和后继链。相同幂等键只返回同一接纳。原 MJCF/Publish 可以失败或取消，但其未知外部结果必须先结算；原下游决定不继承。原来源必须匹配当前契约、检查策略及平台配置，原生与上游 executor 身份不改写，仅新接纳本次 MJCF/Publish 工具及发布意图。
+辅助评估不属于七阶段范围。`assessment_request` 封存认证用户、工程来源 MemberRef、原证书、执行 bundle、固定运行时与执行器；`assessment_attempt` 保留每次受控执行、分发接受事实、所有权、进程身份、结果引用和资源是否归还。读侧共用 `project_attempt`：过期的执行 lease 投影为 UNKNOWN，不修改原状态或授权接管。新增 request、attempt 和上传最终登记复用同一 admission 行锁；既有请求的只读重放、取消和对账不被关闭接单阻断。
 
-原工程请求与本次转换请求是两个不可变身份域。交付中的 `input/request.json` 仍定位父 Capture 原工程来源；本次说明、simulation、来源 run 与发布基线定位到当前 admission、MJCF/Publish commands、独立证书及 sealed publication plan/effect outbound。PR 使用当前 Publish commit body，receipt 核正文摘要。不得为对齐新 request_id 而重写父输入，不新增请求副本或第二可变状态。
+维护门在同一只读一致快照读取主链、评估事实和精确辅助 DagRun/task 原始证据。辅助业务终态不代表调度已停止；已接受但不可读的调度结果仍阻塞清场。备份从封存请求展开 bundle、URDF/MJCF、原证书和结果的完整 ArtifactRef，核对 registry 与 CAS，并纳入原恢复选择集；临时工作目录不替代引用原件。
 
-所有消费者共用 `execution_stage_ids` 推导范围。`read_run_projection` 的 `execution_scope` 给出实际阶段；复用上游 `state=reused`、`in_scope=false`、`command=null`、`decision=null`，已核验原事实位于 `source`，`reuse` 绑定来源 run/command/result。运行成功仅按本次范围判定且重验来源，不能写入或伪装新的上游成功。
+## 七阶段独立重跑与执行范围
 
-Airflow 保持七任务，MJCF 的 trigger rule 为 `none_failed`，其余为 `all_success`。MJCF-only 的 Freeze 在共同范围核验后 skip，后续四上游由调度器 skip，MJCF/Publish 实际执行；误标 skipped 不授予领域资格。默认 CLI/Airflow 工厂按已登记目标装配，MJCF 无 CAD 环境可启动，Discover/Capture 缺必要端口仍拒绝。
+`ProductionStageRerunRequest` 经统一 attempts 入口接纳 `from_stage/through_stage`，使用新的不可变 request/run。七阶段均可独立选择，默认仅执行所选阶段，也可明确指定下游终点。来源可以是完整运行或前次有界执行，必要前缀须具有完整 formal 字节、command、decision、证书、producer/executor 与 supporting predecessors；不要求父无关后缀全部结束。复用前缀按其原封存合同、规则、策略和配置核验，所选阶段采用当前工具及适用策略。部署路由或 TLS 等执行 metadata 变化不冒充工程输入变化；不能只比较整份配置 digest 就强迫重做 CAD。诊断来源、未决 effect、缺失或错绑来源拒绝。原失败和原 artifact 不改写，旧所选阶段及下游决定不继承。
+
+所有消费者共用 `execution_stage_ids`。共同 `execution_scope` 给出本次实际范围；复用前缀保留 source/reuse 与真实 producer，本次 command/decision 不伪造；未执行后缀为 `out_of_scope`。独立生成的新结果可作为后续有界执行的合法来源；不能回退使用被替代的旧下游成功。`delivery_complete` 与 scope 成功分别计算。
+
+公共报告与预览同样读取原 producer command：Generate receipt 与其原 Generate command 绑定，Verify certificate 与其原 Verify command 绑定，不要求两者的合同或工具相同。原生报告的 canonical contract 对原 Capture command；raw contract 文件摘要对该 command 已绑定的 native ToolRecord 发行 inventory。MJCF 的 sealed tool/engine 须先核验与原 command 的关系，再复算文件 binding，不用当前展示进程的身份解释原证书。缺必要来源拒绝，不从 Verify 副本或当前安装补证。
+
+Airflow 保持七任务并从不可变范围确定实际执行；skipped 不授予领域资格。CLI 与生产 handler 共用同一接纳及来源复核。Freeze-only 不调用 CAD；Discover/Capture 按必要原生端口及唯一所有权执行；Generate、Verify、MJCF、Publish 不需要新 CAD 工作。Publish 重新核验两证书、完整来源与真实 Git/PR expected state；旧外部结果 UNKNOWN/CONFLICT 须先精确对账。
 
 执行中取消沿用原 claim/fence。提交事务发现取消时抛出类型化 `StageCancellationRequested`；共同 engine 保全候选 StageResult、artifact 和原失败上下文，写入 cancelled FailureEnvelope/decision 并关闭原执行权，不再竞争新 claim。重复执行返回原终态；已完成决定不改写；UNKNOWN/CONFLICT 未结算不能终态取消。该通知是进程内控制流，不新增持久状态。
 

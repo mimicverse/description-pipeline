@@ -320,7 +320,7 @@ class FakeBackend:
         self.payload = payload
 
     def discover_native(self, frozen_source: Path, settings: dict, *, on_activity=None) -> dict:
-        return support.local_native_record_payload(
+        return support.world_native_record_payload(
             copy.deepcopy(self.payload),
             default_mate_scope=True,
         )
@@ -390,7 +390,7 @@ class DiscoveryTests(unittest.TestCase):
         canonical = copy.deepcopy(payload)
         canonical["raw"] = support.native_consumer_view(payload["raw"])
         mutate(canonical)
-        payload["raw"] = support.local_native_record_payload(
+        payload["raw"] = support.world_native_record_payload(
             canonical["raw"],
             default_mate_scope=True,
         )
@@ -436,9 +436,7 @@ class DiscoveryTests(unittest.TestCase):
         result, _source, output = self._prepare()
         self.assertTrue(result.passed, result.findings)
         delivery = self._deliver(output)
-        discovery_path = (
-            delivery / "input/discovery/native-discovery.json"
-        )
+        discovery_path = delivery / "input/discovery/native-discovery.json"
         baseline = json.loads(discovery_path.read_text(encoding="utf-8"))
 
         def set_raw(key, value):
@@ -490,9 +488,7 @@ class DiscoveryTests(unittest.TestCase):
                 with self.assertRaises(CadError):
                     source_definition(
                         delivery,
-                        discovery_name=(
-                            "input/discovery/native-discovery.json"
-                        ),
+                        discovery_name="input/discovery/native-discovery.json",
                         cad_prefix="input/cad/",
                         records_prefix="input/",
                     )
@@ -524,9 +520,7 @@ class DiscoveryTests(unittest.TestCase):
                 with self.assertRaises(PipelineError):
                     source_definition(
                         delivery,
-                        discovery_name=(
-                            "input/discovery/native-discovery.json"
-                        ),
+                        discovery_name="input/discovery/native-discovery.json",
                         cad_prefix="input/cad/",
                         records_prefix="input/",
                     )
@@ -553,9 +547,7 @@ class DiscoveryTests(unittest.TestCase):
                 ):
                     source_definition(
                         delivery,
-                        discovery_name=(
-                            "input/discovery/native-discovery.json"
-                        ),
+                        discovery_name="input/discovery/native-discovery.json",
                         cad_prefix="input/cad/",
                         records_prefix="input/",
                     )
@@ -569,7 +561,7 @@ class DiscoveryTests(unittest.TestCase):
                 self.sink = on_activity
                 if on_activity is not None:
                     on_activity({"phase": "discover", "action": "read_components", "completed": 1, "total": 2})
-                return support.local_native_record_payload(
+                return support.world_native_record_payload(
                     copy.deepcopy(record()),
                     default_mate_scope=True,
                 )
@@ -637,10 +629,7 @@ class DiscoveryTests(unittest.TestCase):
         baseline, _source, output = self._prepare()
         self.assertTrue(baseline.passed, baseline.findings)
         delivery = self._deliver(output)
-        discovery_path = (
-            delivery
-            / "input/discovery/native-discovery.json"
-        )
+        discovery_path = delivery / "input/discovery/native-discovery.json"
         payload = json.loads(
             discovery_path.read_text(encoding="utf-8")
         )
@@ -1842,10 +1831,7 @@ class DiscoveryTests(unittest.TestCase):
                 result, _source, _output = self._prepare(mutate=mutate)
                 self.assertIn(code, self._codes(result))
                 if key == "dp.joint.limits_record":
-                    self.assertNotIn(
-                        "discovery.joint_default_policy",
-                        {item["code"] for item in result.findings},
-                    )
+                    self.assertNotIn("discovery.joint_default_policy", {item["code"] for item in result.findings})
                 report = self._verify_mutated_record(output, mutate)
                 self.assertFalse(report["passed"])
                 self.assertIn(code, {item["code"] for item in report["errors"]})
@@ -1853,9 +1839,9 @@ class DiscoveryTests(unittest.TestCase):
     def test_mate_author_limits_precede_engineering_default(self):
         def mutate(payload):
             payload["mates"][0]["limits"] = None
-            payload["properties"]["mates"]["shoulder_pitch_joint__coaxial"][
-                "dp.joint.limits_record"
-            ] = "joints/arm.json#limits"
+            payload["properties"]["mates"][
+                "shoulder_pitch_joint__coaxial"
+            ]["dp.joint.limits_record"] = "joints/arm.json#limits"
 
         result, _source, output = self._prepare(mutate=mutate)
         self.assertTrue(result.passed, result.findings)
@@ -1875,9 +1861,9 @@ class DiscoveryTests(unittest.TestCase):
 
         def mutate(payload):
             payload["mates"][0]["limits"] = None
-            payload["properties"]["mates"]["shoulder_pitch_joint__coaxial"][
-                "dp.joint.limits_record"
-            ] = "joints/arm.json#limits"
+            payload["properties"]["mates"][
+                "shoulder_pitch_joint__coaxial"
+            ]["dp.joint.limits_record"] = "joints/arm.json#limits"
 
         result, _source, output = self._prepare(mutate=mutate, joint_record=record_value)
         self.assertTrue(result.passed, result.findings)
@@ -1898,9 +1884,9 @@ class DiscoveryTests(unittest.TestCase):
 
         def mutate(payload):
             payload["mates"][0]["limits"] = None
-            payload["properties"]["mates"]["shoulder_pitch_joint__coaxial"][
-                "dp.joint.limits_record"
-            ] = "joints/arm.json#limits"
+            payload["properties"]["mates"][
+                "shoulder_pitch_joint__coaxial"
+            ]["dp.joint.limits_record"] = "joints/arm.json#limits"
 
         result, _source, _output = self._prepare(mutate=mutate, joint_record=record_value)
         self.assertIn("discovery.joint_limits_invalid", self._codes(result))
@@ -1919,9 +1905,9 @@ class DiscoveryTests(unittest.TestCase):
     def test_controlled_numbers_reject_boolean_string_and_nonfinite_fields(self):
         def author_limits(payload):
             payload["mates"][0]["limits"] = None
-            payload["properties"]["mates"]["shoulder_pitch_joint__coaxial"][
-                "dp.joint.limits_record"
-            ] = "joints/arm.json#limits"
+            payload["properties"]["mates"][
+                "shoulder_pitch_joint__coaxial"
+            ]["dp.joint.limits_record"] = "joints/arm.json#limits"
 
         cases = (
             ("boolean position", {"lower": False, "upper": True}, author_limits),
@@ -1951,15 +1937,9 @@ class DiscoveryTests(unittest.TestCase):
                         else {"effort": 6.0, "velocity": 2.0}
                     ),
                 }
-                result, _source, _output = self._prepare(
-                    mutate=mutate,
-                    joint_record=record_value,
-                )
+                result, _source, _output = self._prepare(mutate=mutate, joint_record=record_value)
                 self.assertFalse(result.passed)
-                self.assertNotIn(
-                    "discovery.joint_default_policy",
-                    {item["code"] for item in result.findings},
-                )
+                self.assertNotIn("discovery.joint_default_policy", {item["code"] for item in result.findings})
 
                 baseline, _source, output = self._prepare(
                     mutate=mutate,
@@ -2037,9 +2017,9 @@ class DiscoveryTests(unittest.TestCase):
                     "native_limit": None,
                 }
             )
-            payload["properties"]["mates"]["shoulder_pitch_joint__coaxial"][
-                "dp.joint.limits_record"
-            ] = "joints/arm.json#limits"
+            payload["properties"]["mates"][
+                "shoulder_pitch_joint__coaxial"
+            ]["dp.joint.limits_record"] = "joints/arm.json#limits"
 
         result, _source, output = self._prepare(
             mutate=native_with_author,
@@ -2104,9 +2084,9 @@ class DiscoveryTests(unittest.TestCase):
 
         def mutate(payload):
             payload["mates"][0]["limits"] = {"lower": -1.0, "upper": 1.0, "unit": "rad"}
-            payload["properties"]["mates"]["shoulder_pitch_joint__coaxial"][
-                "dp.joint.limits_record"
-            ] = "joints/arm.json#limits"
+            payload["properties"]["mates"][
+                "shoulder_pitch_joint__coaxial"
+            ]["dp.joint.limits_record"] = "joints/arm.json#limits"
 
         result, _source, _output = self._prepare(mutate=mutate, joint_record=record_value)
         self.assertIn("discovery.joint_limits_conflict", self._codes(result))
@@ -2118,19 +2098,12 @@ class DiscoveryTests(unittest.TestCase):
         }
 
         def mutate(payload):
-            payload["mates"][0]["limits"] = {
-                "lower": -1.0,
-                "upper": 1.0,
-                "unit": "rad",
-            }
-            payload["properties"]["mates"][
-                "shoulder_pitch_joint__coaxial"
-            ]["dp.joint.limits_record"] = "joints/arm.json#limits"
+            payload["mates"][0]["limits"] = {"lower": -1.0, "upper": 1.0, "unit": "rad"}
+            payload["properties"]["mates"]["shoulder_pitch_joint__coaxial"][
+                "dp.joint.limits_record"
+            ] = "joints/arm.json#limits"
 
-        result, _source, _output = self._prepare(
-            mutate=mutate,
-            joint_record=record_value,
-        )
+        result, _source, _output = self._prepare(mutate=mutate, joint_record=record_value)
         self.assertIn("discovery.joint_limits_conflict", self._codes(result))
 
     def test_independent_verify_rejects_native_range_over_zero_author_record(
@@ -2359,10 +2332,7 @@ class DiscoveryTests(unittest.TestCase):
             lambda payload: mutate(payload["raw"]),
         )
         self.assertFalse(report["passed"])
-        self.assertIn(
-            "discovery.joint_limits_unreadable",
-            {item["code"] for item in report["errors"]},
-        )
+        self.assertIn("discovery.joint_limits_unreadable", {item["code"] for item in report["errors"]})
 
     def test_incomplete_limited_mate_payload_is_unreadable(self):
         payload = record()
@@ -3052,9 +3022,7 @@ class DiscoveryTests(unittest.TestCase):
             self.assertTrue(result.passed, result.findings)
             report = self._verify(output)
             self.assertTrue(report["passed"], report["errors"])
-            payload = json.loads(
-                (output / "discovery/native-discovery.json").read_text(encoding="utf-8")
-            )
+            payload = json.loads((output / "discovery/native-discovery.json").read_text(encoding="utf-8"))
             raw = payload.get("raw", payload)
             joints = rebuild_joint_facts(payload, output, purpose="engineering")
             carrier = _carrier_snapshot(
@@ -3619,7 +3587,7 @@ class DiscoveryTests(unittest.TestCase):
             for item in raw.get("components") or []
             if isinstance(item, dict)
         ):
-            raw = support.local_native_record_payload(
+            raw = support.world_native_record_payload(
                 raw,
                 default_mate_scope=True,
             )
@@ -3892,64 +3860,60 @@ class DiscoveryTests(unittest.TestCase):
                 with self.assertRaises(PipelineError):
                     source_definition(
                         delivery,
-                        discovery_name=(
-                            "input/discovery/native-discovery.json"
-                        ),
+                        discovery_name="input/discovery/native-discovery.json",
                         cad_prefix="input/cad/",
                         records_prefix="input/",
                     )
 
-    def test_verifier_separates_full_upload_and_selected_closure_handoff(self) -> None:
+    def test_complete_input_survives_derivation_and_independent_byte_checks(self) -> None:
+        from description_pipeline.sources.solidworks.revision import package_inventory
+        from .selection_support import seal_fixture_open_observation
+
+        native, records = self._native()
+        support_path = native / "cad/support.SLDPRT"
+        support_path.write_bytes(b"supporting derived-part source")
+        files = package_inventory(native)
         raw = record()
-        main = "cad/robot.SLDASM"
-        selected = raw["source_selection"]["files"]
-        upload = {**selected, "cad/excluded.SLDPRT": "f" * 64}
+        raw["files"] = files
         raw["source_selection"] = sealed_selection(
-            upload,
-            main,
+            files,
+            "cad/robot.SLDASM",
             edges={
-                main: ["cad/base.SLDPRT", "cad/arm.SLDPRT"],
+                "cad/robot.SLDASM": ["cad/base.SLDPRT", "cad/arm.SLDPRT"],
                 "cad/base.SLDPRT": [],
                 "cad/arm.SLDPRT": [],
             },
         )
-        from .selection_support import seal_fixture_open_observation
-
         seal_fixture_open_observation(raw)
-        result, output = self._derive_pure(raw)
+        raw = support.world_native_record_payload(raw, default_mate_scope=True)
+        output = self.tmp / "complete-input-prepared"
+        result = derive_native_package(
+            native, output, "run-1", raw,
+            settings=DiscoverySettings(record_roots=(records,)),
+        )
         self.assertTrue(result.passed, result.findings)
         delivery = self._deliver(output)
-        request = json.loads((delivery / "input/request.json").read_text(encoding="utf-8"))
-        payload = json.loads((delivery / "input/discovery/native-discovery.json").read_text(encoding="utf-8"))
-        upload_sha256 = payload["raw"]["source_selection"]["upload_sha256"]
-        selected_sha256 = payload["raw"]["source_selection"]["handoff_sha256"]
-        self.assertNotEqual(upload_sha256, selected_sha256)
-        self.assertEqual(request["handoff_digest"], upload_sha256)
-        source_record = json.loads((delivery / "input/source.json").read_text(encoding="utf-8"))
-        self.assertEqual(source_record["identity"]["handoff_digest"], upload_sha256)
+        self.assertEqual((delivery / "input/cad/cad/support.SLDPRT").read_bytes(), support_path.read_bytes())
+        self.assertNotIn("cad/support.SLDPRT", raw["source_selection"]["closure"]["graph"])
+        self.assertTrue(verify_discovery(delivery)["passed"])
+        request = json.loads((delivery / "input/request.json").read_bytes())
+        self.assertEqual(request["handoff_digest"], digest(files))
 
-        self._tamper_delivered(
-            delivery,
-            "input/request.json",
-            lambda value: value.__setitem__("handoff_digest", selected_sha256),
-        )
-        report = verify_discovery(delivery)
-        self.assertFalse(report["passed"])
-        self.assertIn("discovery.request", [item["code"] for item in report["errors"]])
-
-        self._tamper_delivered(
-            delivery,
-            "input/request.json",
-            lambda value: value.__setitem__("handoff_digest", upload_sha256),
-        )
-        report = verify_discovery(delivery)
-        self.assertTrue(report["passed"], report["errors"])
-        self.assertEqual(
-            json.loads((delivery / "input/request.json").read_text(encoding="utf-8"))["handoff_digest"],
-            upload_sha256,
-        )
-        self.assertEqual(payload["handoff_sha256"], selected_sha256)
-
+        for fault in ("missing", "bytes", "extra"):
+            with self.subTest(fault=fault):
+                altered = self.tmp / ("altered-input-" + fault)
+                shutil.copytree(delivery, altered)
+                path = altered / "input/cad/cad/support.SLDPRT"
+                if fault == "missing":
+                    path.unlink()
+                elif fault == "bytes":
+                    path.write_bytes(b"changed supporting bytes")
+                else:
+                    (altered / "input/cad/extra.SLDPRT").write_bytes(b"unadmitted bytes")
+                support.seal_delivery(altered)
+                report = verify_discovery(altered)
+                self.assertFalse(report["passed"])
+                self.assertIn("discovery.files", [item["code"] for item in report["errors"]])
 
     def _delivery_with_frozen_request(self, *, drop: tuple[str, ...]):
         """One fallback delivery whose request record is written before any tamper."""
@@ -4104,7 +4068,7 @@ class FakeMateFeature:
             inner = self
 
             class Specific:
-                def _FlagAsMethod(self, name):  # noqa: N802
+                def _FlagAsMethod(self, name):  # noqa: N802 - mimic the win32com dynamic object
                     return None
 
                 def __getattr__(self, attr):
@@ -4248,7 +4212,7 @@ class DerivationSplitTests(unittest.TestCase):
                 source,
                 self.tmp / "derived",
                 "run-1",
-                support.local_native_record_payload(payload),
+                support.world_native_record_payload(payload),
                 settings=settings,
             )
         self.assertEqual(inventory(self.tmp / "prepared"), inventory(self.tmp / "derived"))
@@ -4314,7 +4278,7 @@ class DerivationSplitTests(unittest.TestCase):
 
         selection = payload["source_selection"]
         payload["source_selection"] = seal_closure_selection(
-            {**selection["excluded_files"], **selection["files"]},
+            dict(selection["files"]),
             selection["main_assembly"],
             selection["closure"],
             reader_sha256=selection["reader_sha256"],
@@ -4324,7 +4288,7 @@ class DerivationSplitTests(unittest.TestCase):
             source,
             output,
             "run-1",
-            support.local_native_record_payload(payload),
+            support.world_native_record_payload(payload),
             settings=DiscoverySettings(record_roots=(records,)),
         )
         self.assertTrue(result.passed, result.findings)
@@ -4343,7 +4307,7 @@ class DerivationSplitTests(unittest.TestCase):
                 source,
                 self.tmp / "derived",
                 "run-1",
-                support.local_native_record_payload(record()),
+                support.world_native_record_payload(record()),
                 settings=settings,
             )
 
@@ -4355,7 +4319,7 @@ class DerivationSplitTests(unittest.TestCase):
                 source,
                 self.tmp / "derived",
                 "run-1",
-                support.local_native_record_payload(record()),
+                support.world_native_record_payload(record()),
                 settings=DiscoverySettings(record_roots=(records,)),
             )
 
@@ -4368,7 +4332,7 @@ class DerivationSplitTests(unittest.TestCase):
             source,
             self.tmp / "derived",
             "run-1",
-            support.local_native_record_payload(record()),
+            support.world_native_record_payload(record()),
             settings=DiscoverySettings(record_roots=(records,)),
         )
         payload = json.loads((self.tmp / "derived/discovery/native-discovery.json").read_text(encoding="utf-8"))
@@ -4402,7 +4366,7 @@ class DerivationSplitTests(unittest.TestCase):
                     source,
                     output,
                     "run-1",
-                    support.local_native_record_payload(payload),
+                    support.world_native_record_payload(payload),
                     settings=settings,
                 )
             # every refused attempt must leave its output untouched
@@ -4416,7 +4380,7 @@ class DerivationSplitTests(unittest.TestCase):
                 source,
                 self.tmp / "derived-other-config",
                 "run-1",
-                support.local_native_record_payload(record()),
+                support.world_native_record_payload(record()),
                 settings=settings,
                 configuration="Other",
             )
@@ -4424,7 +4388,7 @@ class DerivationSplitTests(unittest.TestCase):
             source,
             self.tmp / "derived-matching-config",
             "run-1",
-            support.local_native_record_payload(record()),
+            support.world_native_record_payload(record()),
             settings=settings,
             configuration="Default",
         )
@@ -4443,7 +4407,7 @@ class DerivationSplitTests(unittest.TestCase):
                 source,
                 self.tmp / "derived-unbound-config",
                 "run-1",
-                support.local_native_record_payload(payload),
+                support.world_native_record_payload(payload),
                 settings=DiscoverySettings(record_roots=(records,)),
                 configuration="Default",
             )
@@ -4458,7 +4422,7 @@ class DerivationSplitTests(unittest.TestCase):
                 source,
                 self.tmp / "derived-conflicting-config",
                 "run-1",
-                support.local_native_record_payload(payload),
+                support.world_native_record_payload(payload),
                 settings=DiscoverySettings(record_roots=(records,)),
             )
 
@@ -4471,7 +4435,7 @@ class DerivationSplitTests(unittest.TestCase):
             source,
             output,
             "run-1",
-            support.local_native_record_payload(payload),
+            support.world_native_record_payload(payload),
             settings=DiscoverySettings(record_roots=(records,)),
         )
         self.assertTrue(result.passed, result.findings)

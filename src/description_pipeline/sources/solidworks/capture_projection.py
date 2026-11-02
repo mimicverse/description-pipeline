@@ -29,6 +29,7 @@ from ...schemas import (
     NATIVE_CAPTURE_OBSERVATION_KEYS,
     NATIVE_CAPTURE_OBSERVATION_SCHEMA,
     NATIVE_SCENE_RAW_KEYS,
+    NATIVE_TRANSFORM_FRAME,
 )
 from .capture_geometry import RAW_GEOMETRY_KEYS
 from .capture_package import validate_capture_plan_shape
@@ -216,6 +217,8 @@ def validate_native_capture_plan(observation: Mapping, plan: Mapping) -> None:
         or set(scene_raw) != NATIVE_SCENE_RAW_KEYS
     ):
         raise PipelineError("Native Capture raw required inventories are incomplete")
+    if scene_raw.get("transform_frame") != NATIVE_TRANSFORM_FRAME:
+        raise PipelineError("Native Capture raw scene has another transform frame")
     scene_document = str(scene_raw.get("document") or "").replace("\\", "/")
     scene_configuration = scene_raw.get("configuration")
     planned_main = str(plan["main_assembly"]).replace("\\", "/").casefold()
@@ -927,6 +930,8 @@ def _project_link_group_mass(raw):
 def _project_scene(raw_scene):
     if not isinstance(raw_scene, dict):
         raise CadError("cad_prepared_scene_facts_invalid", "scene_raw is not an object")
+    if raw_scene.get("transform_frame") != NATIVE_TRANSFORM_FRAME:
+        raise CadError("cad_prepared_scene_facts_invalid", "raw scene has no main-assembly transform frame")
     projected_by_name = {}
     occurrences = raw_scene.get("occurrences")
     components = raw_scene.get("components")
@@ -1696,7 +1701,7 @@ def project_native_capture_observation(
     observation: Mapping,
     source: Mapping,
 ) -> dict:
-    """Project the v2 raw observation while keeping the existing value shape."""
+    """Project the v3 raw observation while keeping the existing value shape."""
 
     if (
         not isinstance(observation, Mapping)

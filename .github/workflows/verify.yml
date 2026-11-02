@@ -48,7 +48,7 @@ jobs:
           python -m pip install --disable-pip-version-check -r requirements/linux-py312.lock -r requirements/build-py312.lock
           python -m pip install --no-deps --no-build-isolation -e .
       - name: Static checks
-        run: python -m ruff check src tests tools deploy
+        run: python -m ruff check src tests tools deploy scripts
       - name: Install the pinned Node.js
         uses: actions/setup-node@v4
         with:
@@ -212,6 +212,11 @@ jobs:
         run: |
           python -m pip install --disable-pip-version-check -r requirements/linux-py312.lock -r requirements/build-py312.lock
           python -m pip install --no-deps --no-build-isolation -e .
+      - name: Fetch the exact model wheels
+        uses: ./.github/actions/fetch-teleop-assets
+        with:
+          token: ${{ secrets.TELEOP_ASSETS_TOKEN }}
+          destination: ${{ runner.temp }}/model-assets
       - name: Ambient negative control binds the release identity to the source closure
         run: |
           set -eu
@@ -223,7 +228,8 @@ jobs:
           init = Path("/tmp/ambient-src/description_pipeline/__init__.py")
           init.write_text(re.sub(r'__version__ = "[^"]+"', '__version__ = "0.0.0"', init.read_text()))
           PY
-          PYTHONPATH=/tmp/ambient-src python tools/build_release.py --output "$RUNNER_TEMP/release-a" > "$RUNNER_TEMP/release-a.log"
+          PYTHONPATH=/tmp/ambient-src python tools/build_release.py --output "$RUNNER_TEMP/release-a" \
+            --teleop-wheel "$TELEOP_WHEEL" --actuator-wheel "$ACTUATOR_WHEEL" > "$RUNNER_TEMP/release-a.log"
           python - <<'PY'
           import json
           import os
@@ -238,7 +244,8 @@ jobs:
       - name: A second checkout path builds byte-identical artifacts
         run: |
           set -eu
-          (cd "$RUNNER_TEMP/build-b" && python tools/build_release.py --output "$RUNNER_TEMP/release-b" > "$RUNNER_TEMP/release-b.log")
+          (cd "$RUNNER_TEMP/build-b" && python tools/build_release.py --output "$RUNNER_TEMP/release-b" \
+            --teleop-wheel "$TELEOP_WHEEL" --actuator-wheel "$ACTUATOR_WHEEL" > "$RUNNER_TEMP/release-b.log")
           diff -r "$RUNNER_TEMP/release-a" "$RUNNER_TEMP/release-b"
       - name: The role archives resolve offline for their targets
         run: |
@@ -287,6 +294,52 @@ jobs:
             --runtime-lock deploy/airflow/requirements.lock \
             --wheelhouse /tmp/role-linux/wheels \
             --report release-verify-report.json
+      - name: Install native consumers from the verified release
+        run: |
+          set -eu
+          python -m venv "$RUNNER_TEMP/native-test-runtime"
+          native_python="$RUNNER_TEMP/native-test-runtime/bin/python"
+          "$native_python" -m pip install --no-index --require-hashes --only-binary=:all: \
+            --find-links /tmp/role-linux/wheels -r deploy/airflow/requirements.lock
+          "$native_python" -m pip install --require-hashes --only-binary=:all: -r requirements/test-py312.lock
+          wheel=( "$RUNNER_TEMP"/release-a/*.whl )
+          "$native_python" -m pip install --no-deps "${wheel[0]}"
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import shutil
+          import zipfile
+
+          root = Path(os.environ["RUNNER_TEMP"])
+          (archive,) = (root / "release-a").glob("description-*-deployment.zip")
+          with zipfile.ZipFile(archive) as source:
+              source.extractall(root / "native-deployment")
+          shutil.copyfile(root / "release-a/release.json", root / "native-deployment/release.json")
+          PY
+          installer="$RUNNER_TEMP/native-deployment/scripts/install_teleop_worker.py"
+          "$native_python" "$installer" --role pico --wheel "$TELEOP_WHEEL" \
+            --wheelhouse /tmp/role-linux/consumers/wheels --destination "$RUNNER_TEMP/teleop-pico"
+          "$native_python" "$installer" --role assessment --wheel "$TELEOP_WHEEL" \
+            --actuator-wheel "$ACTUATOR_WHEEL" --wheelhouse /tmp/role-linux/consumers/wheels \
+            --destination "$RUNNER_TEMP/teleop-assessment"
+          "$native_python" "$installer" --role pico-link --wheelhouse /tmp/role-linux/consumers/wheels \
+            --destination "$RUNNER_TEMP/pico-link"
+          echo "CI_NATIVE_PYTHON=$native_python" >> "$GITHUB_ENV"
+      - name: Real PICO sessions and protocol replay must run
+        env:
+          TELEOP_PICO_PYTHON: ${{ runner.temp }}/teleop-pico/bin/python
+          TELEOP_ASSESSMENT_PYTHON: ${{ runner.temp }}/teleop-assessment/bin/python
+          PICO_LINK_PYTHON: ${{ runner.temp }}/pico-link/bin/python
+        run: |
+          set -o pipefail
+          "$CI_NATIVE_PYTHON" -B -m tests.v1.run_pico_native \
+            --report "$RUNNER_TEMP/pico-native-ci.json" 2>&1 | tee "$RUNNER_TEMP/pico-native-ci.log"
+      - name: Real optional dynamics execution must run
+        env:
+          TELEOP_ASSESSMENT_PYTHON: ${{ runner.temp }}/teleop-assessment/bin/python
+        run: |
+          set -o pipefail
+          "$CI_NATIVE_PYTHON" -B -m tests.v1.assessment_ci 2>&1 | tee "$RUNNER_TEMP/assessment-native-ci.log"
       - name: Record the verification runtime environment
         run: |
           set -eu
@@ -310,10 +363,13 @@ jobs:
           path: |
             release-verify-report.json
             release-verify-environment.json
+            ${{ runner.temp }}/pico-native-ci.log
+            ${{ runner.temp }}/pico-native-ci.json
+            ${{ runner.temp }}/assessment-native-ci.log
 
   real-chain:
     # The isolated true-chain gate: real PostgreSQL (service container), real portal admission
-    # through the operator HTTP surface, the six scheduled tasks, and SQL settlement assertions.
+    # through the operator HTTP surface, the seven scheduled tasks, and SQL settlement assertions.
     # The mocked native endpoint is transport-only; the control fixture must be rejected by
     # verification and must never reach publication.
     runs-on: ubuntu-24.04

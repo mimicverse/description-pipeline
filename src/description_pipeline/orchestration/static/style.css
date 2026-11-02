@@ -33,7 +33,6 @@ pre { max-height: 256px; overflow: auto; margin: 12px 0 0; padding: 12px; border
 /* Application chrome and persistent delivery history. */
 .topbar { position: sticky; top: 0; z-index: 10; min-height: 60px; padding: 12px 28px; display: flex; align-items: center; justify-content: space-between; gap: 16px; background: var(--card); border-bottom: 1px solid var(--line); }
 .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
-.brand h1 { white-space: nowrap; }
 .brand-mark { width: 24px; height: 24px; flex: none; color: var(--ink); }
 .account { display: flex; align-items: center; gap: 16px; min-width: 0; font-size: 12px; color: var(--muted); }
 #account-user { min-width: 0; max-width: 32ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

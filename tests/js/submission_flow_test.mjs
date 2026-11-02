@@ -38,7 +38,7 @@ function element(id = "") {
   });
   return node;
 }
-function page() {
+function page(storage = new Map()) {
   const elements = new Map();
   const $ = (id) => {
     if (!elements.has(id)) elements.set(id, element(id));
@@ -70,11 +70,16 @@ function page() {
       clearTimeout: (id) => timeouts.delete(id), setInterval: () => ++nextTimer, clearInterval() {},
     },
     localStorage: { getItem: () => null, setItem() {} },
+    sessionStorage: {
+      getItem: (key) => storage.get(key) ?? null,
+      setItem: (key, value) => storage.set(key, value),
+      removeItem: (key) => storage.delete(key),
+    },
     requestAnimationFrame: (callback) => callback(),
     shouldRefreshRunList: () => false,
     fetch: async () => response(200, { runs: [] }),
   });
-  vm.runInContext(`${source}\nglobalThis.app = {state, wire, api, poll, selectRun, showUploadView, clearSession, stopRunRead, refreshRuns, loadMoreRuns, submitRun, retryRun, rerunFromStage, renderRerunPanel, buildRunItem, renderRun, folderPick, changeSubmission, loadTargets, renderPreviewDiagnostic};`, context);
+  vm.runInContext(`${source}\nglobalThis.app = {state, wire, api, poll, selectRun, showUploadView, clearSession, stopRunRead, refreshRuns, loadMoreRuns, submitRun, retryRun, rerunFromStage, renderRerunPanel, stageRerunDraft, buildRunItem, renderRun, folderPick, changeSubmission, loadTargets, renderPreviewDiagnostic};`, context);
   context.clearPreview = () => {};
   context.renderRun = (run) => { context.displayed = run; };
   context.loadPreview = async () => {};
@@ -83,7 +88,7 @@ function page() {
   app.state.user = "operator";
   app.state.csrf = "session-csrf";
   $("login-card").hidden = true;
-  return { context, app, $, timeouts, requests };
+  return { context, app, $, timeouts, requests, storage };
 }
 function uploadReady(p) {
   p.app.state.folderPick = { top: "robot", assemblies: ["main.SLDASM"], records: [] };
@@ -222,35 +227,66 @@ for (const failure of ["html", "missing-id", "wrong-id", "null", "network", "can
   const accepted = p.app.folderPick([{ name: "main.SLDASM", webkitRelativePath: "robot/main.SLDASM", size: 1 }]);
   assert.equal(accepted.records[0].path, "robot/main.SLDASM");
 }
-// A new Freeze user action has a new key, but unconfirmed retries keep the same key.
-{
-  const p = page(); const calls = []; let outcome = 502;
-  const run = { dag_run_id: "parent-run", main_assembly: "main.SLDASM", can_manage: true,
-    stage_reruns: [{ stage: "freeze", eligible: true, main_assembly_options: ["main.SLDASM", "other.SLDASM"] }] };
-  const selectParent = () => { p.app.state.dagRunId = run.dag_run_id; p.app.state.lastRun = run; };
-  selectParent(); p.context.poll = async () => {}; p.context.selectRun = async () => {};
-  p.context.fetch = async (_url, options) => {
-    calls.push(options);
-    return outcome === 502 ? response(502, { error: "Unconfirmed" }) : response(202, { dag_run_id: `portal-freeze-${options.headers["Idempotency-Key"]}`, resume_from: "freeze" });
-  };
-  await p.app.rerunFromStage("freeze");
-  const firstKey = calls[0].headers["Idempotency-Key"];
-  await p.app.rerunFromStage("freeze");
-  assert.equal(calls[1].headers["Idempotency-Key"], firstKey);
-  outcome = 202; await p.app.rerunFromStage("freeze");
-  assert.equal(calls[2].headers["Idempotency-Key"], firstKey);
-  selectParent(); await p.app.rerunFromStage("freeze");
-  assert.notEqual(calls[3].headers["Idempotency-Key"], firstKey);
-  outcome = 502; selectParent(); await p.app.rerunFromStage("freeze");
-  const pendingKey = p.app.state.rerunKeyByRun[run.dag_run_id];
-  p.app.state.stages = [{ id: "freeze" }]; p.app.state.selectedStage = 0;
+// All seven stages default to a single-stage scope. An unknown request keeps its
+// exact key and body across retries and a full page reload.
+for (const stage of ["freeze", "discover", "capture", "generate", "verify", "mjcf", "publish"]) {
+  const p = page(), calls = []; let outcome = 502;
+  const row = { stage, name: stage, eligible: true, main_assembly: "main.SLDASM",
+    main_assembly_options: ["main.SLDASM", "other.SLDASM"] };
+  const run = { dag_run_id: `parent-${stage}`, main_assembly: "main.SLDASM", can_manage: true, stage_reruns: [row] };
+  function prepare(view) {
+    view.app.state.dagRunId = run.dag_run_id; view.app.state.lastRun = run;
+    view.app.state.stages = [{ id: stage, name: stage }]; view.app.state.selectedStage = 0;
+    view.context.poll = async () => {}; view.context.selectRun = async () => {};
+    view.context.fetch = async (_url, options) => {
+      calls.push(options);
+      return outcome === 502 ? response(502, { error: "Unconfirmed" }) :
+        response(202, { dag_run_id: `portal-${stage}-${options.headers["Idempotency-Key"]}`, resume_from: stage });
+    };
+  }
+  prepare(p); await p.app.rerunFromStage(stage);
+  const first = calls[0];
+  assert.equal(JSON.parse(first.body).from_stage, stage);
+  assert.equal(JSON.parse(first.body).through_stage, stage);
+  await p.app.rerunFromStage(stage);
+  assert.equal(calls[1].headers["Idempotency-Key"], first.headers["Idempotency-Key"]);
+  assert.equal(calls[1].body, first.body);
   p.app.renderRerunPanel(run);
-  const mainSelect = p.$("stage-rerun").children[0].children[1];
-  mainSelect.value = "other.SLDASM"; mainSelect.handlers.change();
-  assert.equal(p.app.state.rerunKeyByRun[run.dag_run_id], undefined);
-  await p.app.rerunFromStage("freeze");
-  assert.notEqual(calls.at(-1).headers["Idempotency-Key"], pendingKey);
-  assert.equal(JSON.parse(calls.at(-1).body).main_assembly, "other.SLDASM");
+  assert.equal(p.$("stage-rerun").children[0].textContent, "Reconcile same stage request");
+  if (stage === "freeze") assert.equal(p.$("stage-rerun").children[2].children[0].disabled, true);
+  const restored = page(p.storage); prepare(restored);
+  outcome = 202; await restored.app.rerunFromStage(stage);
+  assert.equal(calls[2].headers["Idempotency-Key"], first.headers["Idempotency-Key"]);
+  assert.equal(calls[2].body, first.body);
+  assert.equal(p.storage.size, 0, "Acknowledged requests release the browser transport record");
+}
+// Storage failure happens before transport and does not freeze an unsent draft.
+{
+  const p = page(); let calls = 0;
+  const run = { dag_run_id: "storage-failure", can_manage: true,
+    stage_reruns: [{stage: "publish", name: "Publish", eligible: true}] };
+  p.app.state.dagRunId = run.dag_run_id; p.app.state.lastRun = run;
+  p.context.sessionStorage.setItem = () => { throw new Error("Storage unavailable"); };
+  p.context.fetch = async () => { calls++; return response(500, {}); };
+  await p.app.rerunFromStage("publish");
+  assert.equal(calls, 0); assert.equal(p.app.stageRerunDraft(run, run.stage_reruns[0]).key, null);
+  assert.match(p.app.state.rerunError, /No stage request was sent/);
+}
+// An explicitly selected downstream endpoint becomes part of the immutable body.
+{
+  const p = page(); let sent;
+  const run = { dag_run_id: "source-range", can_manage: true, stage_reruns: [
+    {stage: "generate", name: "Generate", eligible: true}, {stage: "verify", name: "Verify", eligible: true},
+  ]};
+  p.app.state.dagRunId = run.dag_run_id; p.app.state.lastRun = run;
+  p.app.state.stages = [{id: "generate", name: "Generate"}]; p.app.state.selectedStage = 0;
+  p.app.renderRerunPanel(run);
+  const select = p.$("stage-rerun").children[2].children[1].children[0];
+  select.value = "verify"; select.handlers.change();
+  p.context.poll = async () => {};
+  p.context.fetch = async (_url, options) => { sent = JSON.parse(options.body); return response(502, {error: "Unconfirmed"}); };
+  await p.app.rerunFromStage("generate");
+  assert.equal(sent.from_stage, "generate"); assert.equal(sent.through_stage, "verify");
 }
 // Sign out invalidates an in-flight read even if its transport later delivers a response.
 {
@@ -379,11 +415,11 @@ for (const action of ["retryRun", "rerunFromStage"]) {
   };
   await p.app.rerunFromStage("freeze");
   const key = calls[0].headers["Idempotency-Key"];
-  assert.equal(p.app.state.rerunKeyByRun[run.dag_run_id], key);
+  assert.equal(p.app.state.rerunRequests[`portal.rerun.${run.dag_run_id}.freeze`]?.key, key);
   assert.match(p.app.state.rerunError, /different request identity/);
   correct = true; await p.app.rerunFromStage("freeze");
   assert.equal(calls[1].headers["Idempotency-Key"], key);
-  assert.equal(p.app.state.rerunKeyByRun[run.dag_run_id], undefined);
+  assert.equal(p.app.state.rerunRequests[`portal.rerun.${run.dag_run_id}.freeze`]?.key, undefined);
 }
 // A fresh list read replaces the prior owner; late data or errors cannot revoke newer state.
 for (const oldStatus of [200, 502]) {
@@ -552,7 +588,7 @@ console.log("unfinished preview and activity polling OK");
     report: {stages: [{id: "freeze", name: "Freeze", state: "completed", counts: {}}]}};
   p.app.state.dagRunId = run.dag_run_id; p.app.state.lastRun = run;
   p.app.renderRun(run); const form = p.$("stage-rerun").children[0];
-  p.app.state.rerunMainByRun[run.dag_run_id] = "b.SLDASM";
+  p.app.stageRerunDraft(run, run.stage_reruns[0]).body.main_assembly = "b.SLDASM";
   p.app.renderRun(run); assert.equal(p.$("stage-rerun").children[0], form);
   run.can_manage = false; p.app.renderRun(run);
   assert.notEqual(p.$("stage-rerun").children[0], form);
@@ -565,14 +601,14 @@ console.log("unfinished preview and activity polling OK");
     report: {stages: [{id: "mjcf", name: "MJCF", state: "completed", counts: {}}]}};
   p.app.state.dagRunId = run.dag_run_id; p.app.state.lastRun = run;
   p.app.renderRun(run);
-  const policy = p.$("stage-rerun").children[2].children[1].children[0];
-  policy.value = '{"gravity":[0,0,0]}'; policy.oninput();
+  const policy = p.$("stage-rerun").children[2].children[3].children[0];
+  policy.value = '{"gravity":[0,0,0]}'; policy.handlers.input();
   p.app.renderRun(run);
-  assert.equal(p.$("stage-rerun").children[2].children[1].children[0], policy);
+  assert.equal(p.$("stage-rerun").children[2].children[3].children[0], policy);
   assert.equal(policy.value, '{"gravity":[0,0,0]}');
-  p.app.state.rerunKeyByRun[`${run.dag_run_id}:mjcf`] = "unconfirmed-key";
+  p.app.stageRerunDraft(run, run.stage_reruns[0]).key = "unconfirmed-key";
   p.app.renderRun(run);
-  assert.equal(p.$("stage-rerun").children[0].textContent, "Retry same MJCF request");
+  assert.equal(p.$("stage-rerun").children[0].textContent, "Reconcile same stage request");
   run.can_manage = false; p.app.renderRun(run);
   assert.equal(p.$("stage-rerun").children[0].disabled, true);
 }

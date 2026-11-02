@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import io
 import json
 import os
@@ -10,7 +11,8 @@ import unittest
 from datetime import UTC, datetime
 from unittest.mock import patch
 
-from description_pipeline.io import canonical, PipelineError
+from description_pipeline.io import canonical, digest, PipelineError
+from description_pipeline import mjcf_contract
 from description_pipeline.orchestration.airflow_client import native_run_id
 from description_pipeline.orchestration.feishu_oauth import build_actor_name
 from description_pipeline.orchestration.portal import (
@@ -28,6 +30,7 @@ from description_pipeline.platform.queries import read_run_projection
 from tests.v1 import test_real_six_stage_chain as chain_tests
 from description_pipeline.pipeline.contracts import DispatchConf
 from description_pipeline.schemas import AIRFLOW_DISPATCH_CONF_SCHEMA
+from description_pipeline.stages import STAGE_IDS
 
 
 class DevelopmentAirflow:
@@ -120,6 +123,10 @@ class MJCFPortalTests(unittest.TestCase):
             unsettled = projection(source_id)
             self.assertEqual("unresolved", unsettled["state"])
             self.assertEqual(unsettled["state"], chain.facts.get_admitted_run(source_id).state)
+            unsettled_options = application.stage_rerun_options(source_id, request.principal)
+            self.assertEqual(list(STAGE_IDS), [row["stage"] for row in unsettled_options])
+            self.assertTrue(all(row["eligible"] for row in unsettled_options), unsettled_options)
+            self.assertTrue(all(row["execution_authorized"] is False for row in unsettled_options))
             application.dispatch(admitted.dispatch_command.command_id, AirflowDispatchAdapter(airflow, "dev-only"))
             airflow = DevelopmentAirflow(application, request.principal)
             portal = PortalApp(
@@ -129,15 +136,11 @@ class MJCFPortalTests(unittest.TestCase):
                     run_projection_factory=projection,
                     run_control_store=chain.facts,
                     production_application=application,
-                    production_mjcf_successor_loader=lambda req: factory.admit_mjcf(application, req),
+                    production_stage_rerun_loader=lambda req: factory.admit_stage_rerun(application, req),
                     session_cookie="mjcf_development_session",
                 )
             )
-            self.assertFalse(
-                portal._mjcf_successor_row({**unsettled, "stages": {row["stage"]: row for row in unsettled["stages"]}})[
-                    "eligible"
-                ]
-            )
+            self.assertEqual(unsettled_options, portal._stage_rerun_rows(source_id, request.principal))
             session = portal.sessions.create("Development operator", "development-only", principal=request.principal)
 
             def call(method, path, body=None, key="portal-boundary"):
@@ -162,14 +165,34 @@ class MJCFPortalTests(unittest.TestCase):
             self.assertTrue(preview["verified"])
             self.assertTrue(preview["mjcf"]["verified"])
             self.assertIn(preview["mjcf"]["entry"], preview["mjcf"]["files"])
-            self.assertTrue(preview["mjcf"]["warnings"])
+            inventory = preview["mjcf"]["warning_inventory"]
+            self.assertTrue(inventory["items"])
+            self.assertEqual(inventory["shown"] + inventory["omitted"], inventory["count"])
+            self.assertLessEqual(len(canonical(inventory)), 32768)
+            encoded = {path: sha for path, sha in preview['mjcf']['files'].items()
+                       if path.startswith(mjcf_contract.MESH_ENCODING_PREFIX)}
+            self.assertTrue(encoded)
+            for path, sha in encoded.items():
+                status, content = call('GET', f'/api/runs/{dag_id}/artifacts/{path}')
+                self.assertEqual(200, status, content)
+                self.assertEqual(sha, hashlib.sha256(content).hexdigest())
+            status, certificate_bytes = call("GET", f"/api/runs/{dag_id}/artifacts/{mjcf_contract.REPORT_PATH}")
+            self.assertEqual(status, 200, certificate_bytes)
+            complete_warnings = mjcf_contract.projection_warnings(json.loads(certificate_bytes))
+            self.assertEqual(inventory["sha256"], digest(complete_warnings))
+            encoding_warnings = [warning for warning in complete_warnings
+                                 if warning.startswith(mjcf_contract.MESH_WARNING_PREFIX)]
+            self.assertTrue(encoding_warnings)
+            self.assertTrue(all(warning in chain.pull_requests.rows[0].body for warning in encoding_warnings))
             original = projection(source_id)
+            original_admission = chain.facts.load_admission(source_id)
             source_decisions = [row["decision"] for row in original["stages"]]
-            status, body = call("POST", f"/api/runs/{dag_id}/attempts", {"stage": "mjcf", "simulation": "{}\n"})
+            rerun_body = {"from_stage": "mjcf", "through_stage": "publish", "simulation": "{}\n"}
+            status, body = call("POST", f"/api/runs/{dag_id}/attempts", rerun_body)
             self.assertEqual(202, status, body)
             successor_dag = json.loads(body)["dag_run_id"]
             successor_id = native_run_id(successor_dag)
-            status, repeated = call("POST", f"/api/runs/{dag_id}/attempts", {"stage": "mjcf", "simulation": "{}\n"})
+            status, repeated = call("POST", f"/api/runs/{dag_id}/attempts", rerun_body)
             self.assertEqual((202, body), (status, repeated))
             completed = application.execute_run(successor_id)
             self.assertEqual("completed", completed.outcome)
@@ -179,7 +202,7 @@ class MJCFPortalTests(unittest.TestCase):
                 dag_id="solidworks_to_urdf",
                 dag_run_id=successor_dag,
                 canonical_run_id=successor_id,
-                mjcf_source=original,
+                source_projection=original,
                 artifacts=chain.store,
             )
             self.assertIs(current, authenticated)
@@ -234,12 +257,24 @@ class MJCFPortalTests(unittest.TestCase):
             corrupted["by_stage"]["mjcf"]["mjcf/robot.xml"]["sha256"] = "f" * 64
             with self.assertRaises(PipelineError):
                 portal._preview_from_projection(successor_id, corrupted)
+            corrupted = copy.deepcopy(expanded)
+            corrupted['by_stage']['mjcf'][next(iter(encoded))]['sha256'] = 'f' * 64
+            with self.assertRaises(PipelineError):
+                portal._preview_from_projection(successor_id, corrupted)
             status, body = call("GET", f"/api/runs/{successor_dag}")
             self.assertEqual(200, status, body)
             view = json.loads(body)
-            self.assertFalse(view["stage_reruns"][0]["eligible"])
-            self.assertFalse(portal._mjcf_successor_row(expanded, principal="cli:tenant:other")["eligible"])
-            self.assertEqual(["freeze", "mjcf"], [row["stage"] for row in view["stage_reruns"]])
+            options = view["stage_reruns"]
+            self.assertEqual(list(STAGE_IDS), [row["stage"] for row in options])
+            self.assertEqual(application.stage_rerun_options(successor_id, request.principal), options)
+            self.assertTrue(all(row["eligible"] for row in options), options)
+            self.assertTrue(all(row["execution_authorized"] is False for row in options))
+            other_options = portal._stage_rerun_rows(successor_id, principal="cli:tenant:other")
+            self.assertEqual(list(STAGE_IDS), [row["stage"] for row in other_options])
+            self.assertTrue(all(row["eligible"] is False for row in other_options), other_options)
+            self.assertTrue(all(row["reason"] == "application.source_owner_mismatch" for row in other_options))
+            self.assertEqual(original_admission, chain.facts.load_admission(source_id))
+            self.assertEqual(source_decisions, [row["decision"] for row in projection(source_id)["stages"]])
             self.assertEqual("passed", view["report"]["overall"]["state"])
             self.assertEqual(2, view["report"]["overall"]["stages_completed"])
             self.assertEqual(2, view["report"]["overall"]["stages_total"])

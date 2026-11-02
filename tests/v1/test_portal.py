@@ -62,7 +62,9 @@ from description_pipeline.sources.solidworks import discovery
 from description_pipeline.stages import CONTRACT, stage_view
 
 from .protocol_support import discovery_finding, native_discovery_record, protocol_events
-from .portal_read_support import registered_check_fixture, registered_certificate_fixture
+from .portal_read_support import (
+    registered_check_fixture, registered_certificate_fixture, native_tool_fixture, bind_source_commands_fixture,
+)
 
 AIRFLOW_TOKEN = "airflow-session-token"
 FEISHU_NAME = "崔工"
@@ -891,7 +893,8 @@ class FakeRunControl:
                         "checks": quality_record.get("checks") or preview.get("checks") or [],
                         "diagnostics": quality_record.get("diagnostics") or preview.get("warnings") or [],
                     },
-                    purpose=preview.get("purpose") or "engineering",
+                    purpose=(preview.get("purpose") or self._freeze_purpose(current.get("input/request.json"))
+                             or "engineering"),
                 )
                 certificate.update(entry.get("certificate_override") or {})
                 certificate["verification_key"] = digest({
@@ -909,6 +912,8 @@ class FakeRunControl:
                 selected["request.json"] = bytes(current["input/request.json"])
             if stage == "capture" and stage_report is not None:
                 selected["reports/native-stages.json"] = stage_report
+            if stage == "capture" and selected:
+                selected.setdefault("reports/native-tool.json", json.dumps(native_tool_fixture()).encode())
             merged_status = str((entry.get("merged") or {}).get("status") or "")
             state = "completed" if stage in (entry.get("checkpoints") or ()) else None
             if preview and stage in {"freeze", "discover", "capture", "generate"}:
@@ -1161,7 +1166,7 @@ class FakeRunControl:
             }
         )
         request_payload.setdefault("principal", admitted.get("principal", FEISHU_PRINCIPAL))
-        return {
+        return bind_source_commands_fixture({
             "run_id": run_id,
             "request_id": entry.get("request_id") or admitted.get("request_id"),
             "parent_run_id": entry.get("parent_run_id") or admitted.get("parent_run_id"),
@@ -1185,7 +1190,7 @@ class FakeRunControl:
                 "claims": [],
                 "effects": effect_states,
             },
-        }
+        }, self.projection_artifacts.objects)
 
     @staticmethod
     def _freeze_purpose(payload: object) -> str | None:
@@ -1484,7 +1489,22 @@ class FakeProductionApplication:
         self.dispatch_retry_modes = []
         self.dispatched = set()
         self.admission_requests = []
-        self.freeze_successor_requests = []
+        self.stage_rerun_requests = []
+        self.source_projection = lambda _run_id: None
+
+    def stage_rerun_options(self, source_run_id, principal):
+        # This fixture controls only the HTTP/auth/transport boundary. Real
+        # source qualification is exercised by the PostgreSQL stage-chain tests.
+        source = self.source_projection(source_run_id) or {}
+        request = source.get("request") or {}
+        options = sorted(item["path"] for item in (request.get("originals") or {}).get("members", [])
+                         if item.get("path", "").lower().endswith(".sldasm"))
+        return [{"stage": stage["id"], "name": stage["name"], "eligible": bool(source),
+                 "reason": "fixture", "message": "HTTP transport fixture",
+                 "source_run_id": source_run_id, "source_dag_run_id": source.get("request_id"),
+                 "main_assembly": request.get("main_assembly"), "main_assembly_options": options,
+                 "change_summary": request.get("change_summary"), "simulation": "{}\n"}
+                for stage in CONTRACT["stages"]]
 
     def load_admission_outcome(self, run_id: str):
         return self.outcomes.get(run_id)
@@ -1536,6 +1556,7 @@ class PortalTests(unittest.TestCase):
         self.store = PreviewStore(self.store_root)
         self.platform.fixtures = self.store
         self.production_application = FakeProductionApplication()
+        self.production_application.source_projection = self.platform.fact_projection
         self.static_dir = Path(__file__).resolve().parents[2] / "src/description_pipeline/orchestration/static"
         config = PortalConfig(
             airflow=AirflowApi(self.airflow.url),
@@ -1547,7 +1568,7 @@ class PortalTests(unittest.TestCase):
             run_projection_factory=self.platform.fact_projection,
             artifact_store=self.platform.projection_artifacts,
             production_admission_loader=self._test_admission_loader,
-            production_freeze_successor_loader=self._test_freeze_successor_loader,
+            production_stage_rerun_loader=self._test_stage_rerun_loader,
             production_application=self.production_application,
         )
         self.server = make_server(
@@ -1634,8 +1655,8 @@ class PortalTests(unittest.TestCase):
         self.production_application.register(outcome, conf)
         return outcome
 
-    def _test_freeze_successor_loader(self, request):
-        self.production_application.freeze_successor_requests.append(request)
+    def _test_stage_rerun_loader(self, request):
+        self.production_application.stage_rerun_requests.append(request)
         existing = self.production_application.load_admission_outcome(
             request.run_id
         )
@@ -1656,7 +1677,7 @@ class PortalTests(unittest.TestCase):
         conf = DispatchConf(
             schema_version=AIRFLOW_DISPATCH_CONF_SCHEMA,
             run_id=request.run_id,
-            entry_command_id="freeze:" + digest(request.run_id),
+            entry_command_id=request.from_stage + ":" + digest(request.run_id),
         )
         outcome = SimpleNamespace(
             admission=SimpleNamespace(
@@ -1706,7 +1727,7 @@ class PortalTests(unittest.TestCase):
         self,
         *,
         production_admission_loader=None,
-        production_freeze_successor_loader=None,
+        production_stage_rerun_loader=None,
         production_application=None,
     ):
         """A restarted portal process: same Airflow, brand-new (empty) session store."""
@@ -1714,9 +1735,9 @@ class PortalTests(unittest.TestCase):
             production_admission_loader
             or self._test_admission_loader
         )
-        production_freeze_successor_loader = (
-            production_freeze_successor_loader
-            or self._test_freeze_successor_loader
+        production_stage_rerun_loader = (
+            production_stage_rerun_loader
+            or self._test_stage_rerun_loader
         )
         production_application = (
             production_application
@@ -1732,7 +1753,7 @@ class PortalTests(unittest.TestCase):
             run_projection_factory=self.platform.fact_projection,
             artifact_store=self.platform.projection_artifacts,
             production_admission_loader=production_admission_loader,
-            production_freeze_successor_loader=production_freeze_successor_loader,
+            production_stage_rerun_loader=production_stage_rerun_loader,
             production_application=production_application,
         )
         server = make_server(
@@ -2117,67 +2138,42 @@ class PortalTests(unittest.TestCase):
             {"task_id": "generate", "state": "upstream_failed"},
         ]
 
-    def test_freeze_successor_creates_one_current_generation_request(self) -> None:
+    def test_stage_rerun_creates_one_immutable_single_stage_request(self) -> None:
         self._seed_retryable_run()
         self.client.login()
         body = {
-            "stage": "freeze",
-            "target_hardware": "m3.1",
-            "change_summary": "Recreate\r\ncurrent generation",
-            "main_assembly": "parts/arm.SLDASM",
+            "from_stage": "freeze", "target_hardware": "m3.1",
+            "change_summary": "Recreate\r\ncurrent generation", "main_assembly": "parts/arm.SLDASM",
         }
-        status, _, response = self.client.request(
-            "POST",
-            f"/api/runs/{DAG_RUN_ID}/attempts",
-            body,
-        )
+        status, _, response = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", body)
         self.assertEqual(status, 202, response)
         first = json.loads(response)
-        child = first["dag_run_id"]
-        self.assertTrue(child.startswith("portal-freeze-"))
+        self.assertTrue(first["dag_run_id"].startswith("portal-freeze-"))
         self.assertEqual(first["parent_dag_run_id"], DAG_RUN_ID)
         self.assertEqual(first["resume_from"], "freeze")
-        successor = self.production_application.freeze_successor_requests[-1]
-        self.assertEqual(successor.parent_run_id, native_run_id(DAG_RUN_ID))
-        self.assertEqual(successor.main_assembly, "parts/arm.SLDASM")
-        self.assertEqual(successor.target_hardware, "m3.1")
-        self.assertEqual(successor.change_summary, "Recreate\ncurrent generation")
-        self.assertEqual(successor.purpose, "engineering")
-        self.assertEqual(successor.principal, FEISHU_PRINCIPAL)
+        self.assertEqual(first["through_stage"], "freeze")
+        request = self.production_application.stage_rerun_requests[-1]
+        self.assertEqual(request.parent_run_id, native_run_id(DAG_RUN_ID))
+        self.assertEqual(request.main_assembly, "parts/arm.SLDASM")
+        self.assertEqual(request.target_hardware, "m3.1")
+        self.assertEqual(request.change_summary, "Recreate\ncurrent generation")
+        self.assertEqual(request.principal, FEISHU_PRINCIPAL)
         self.assertEqual(self.platform.admits, [])
         self.assertEqual(len(self.airflow.trigger_payloads), 1)
-        self.assertEqual(
-            self.airflow.trigger_payloads[0]["conf"]["run_id"],
-            native_run_id(child),
-        )
-
-        status, _, response = self.client.request(
-            "POST",
-            f"/api/runs/{DAG_RUN_ID}/attempts",
-            body,
-        )
-        self.assertEqual(status, 202, response)
-        self.assertEqual(json.loads(response)["dag_run_id"], child)
+        status, _, repeated = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", body)
+        self.assertEqual((status, repeated), (202, response))
         self.assertEqual(len(self.airflow.trigger_payloads), 1)
 
-    def test_attempt_rejects_non_freeze_resume_and_invalid_originals(self) -> None:
+    def test_stage_rerun_rejects_unknown_fields_and_reversed_range(self) -> None:
         self._seed_retryable_run()
         self.client.login()
-        status, _, body = self.client.request(
-            "POST",
-            f"/api/runs/{DAG_RUN_ID}/attempts",
-            {"stage": "generate"},
-        )
-        self.assertEqual(status, 400, body)
-        self.assertIn("start from Freeze", json.loads(body)["error"])
-        status, _, body = self.client.request(
-            "POST",
-            f"/api/runs/{DAG_RUN_ID}/attempts",
-            {"stage": "freeze", "main_assembly": "missing.SLDASM"},
-        )
-        self.assertEqual(status, 400, body)
+        for body in ({"stage": "generate"}, {"from_stage": "verify", "through_stage": "generate"},
+                     {"from_stage": "unknown"}, {"from_stage": "freeze", "main_assembly": []}):
+            with self.subTest(body=body):
+                status, _, response = self.client.request("POST", f"/api/runs/{DAG_RUN_ID}/attempts", body)
+                self.assertEqual(status, 400, response)
         self.assertEqual(self.airflow.trigger_payloads, [])
-        self.assertEqual(self.production_application.freeze_successor_requests, [])
+        self.assertEqual(self.production_application.stage_rerun_requests, [])
 
     def test_retry_capability_uses_current_profile_and_recorded_actor(self) -> None:
         self._seed_retryable_run()
@@ -3969,7 +3965,7 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(report["failure"]["stage"], "capture")
         self.assertEqual(report["failure"]["error_code"], "cad_link_group_payload_invalid")
         self.assertEqual(report["failure"]["title"], "Native link-group mass read rejected")
-        self.assertEqual(report["overall"]["headline"], "Capture evidence stage failed; downstream stages did not run")
+        self.assertEqual(report["overall"]["headline"], "Capture evidence stage failed")
 
     def test_run_page_refuses_a_stage_report_bound_to_another_run(self) -> None:
         self.client.login()
@@ -4282,7 +4278,6 @@ class PortalTests(unittest.TestCase):
                 return_value=(
                     lambda _request: None,
                     lambda _request: None,
-                    lambda _request: None,
                     object(),
                     object(),
                     None,
@@ -4378,7 +4373,7 @@ class PortalTests(unittest.TestCase):
             self.assertEqual(config.production_config_snapshot, snapshot.resolve())
             self.assertTrue(callable(config.production_admission_loader))
             self.assertTrue(
-                callable(config.production_freeze_successor_loader)
+                callable(config.production_stage_rerun_loader)
             )
 
     def test_airflow_redirect_never_forwards_credentials(self) -> None:
@@ -4560,32 +4555,19 @@ class PortalTests(unittest.TestCase):
                     process.stdout.close()
 
     # ------------------------------------------------------- linked reruns
-    def test_attempt_endpoint_rejects_old_downstream_resume(self) -> None:
+    def test_each_stage_reaches_the_same_rerun_adapter(self) -> None:
         self._seed_retryable_run()
         self.client.login()
-        for stage_id in ("discover", "capture", "generate", "verify", "publish"):
-            with self.subTest(stage=stage_id):
+        for stage in CONTRACT["stages"]:
+            with self.subTest(stage=stage["id"]):
                 status, _, body = self.client.request(
-                    "POST",
-                    f"/api/runs/{DAG_RUN_ID}/attempts",
-                    {"stage": stage_id},
+                    "POST", f"/api/runs/{DAG_RUN_ID}/attempts", {"from_stage": stage["id"]},
+                    headers={"Idempotency-Key": "stage-" + stage["id"]},
                 )
-                self.assertEqual(status, 400, body)
-                self.assertIn("start from Freeze", json.loads(body)["error"])
-        status, _, body = self.client.request(
-            "POST",
-            f"/api/runs/{DAG_RUN_ID}/attempts",
-            {"stage": "mjcf"},
-        )
-        self.assertEqual(status, 409, body)
-        self.assertEqual(json.loads(body)["reason"], "verified_source_unavailable")
-        self.assertEqual(json.loads(body)["earliest_required"], "freeze")
-        self.assertEqual(self.airflow.trigger_payloads, [])
-        self.assertEqual(self.platform.admits, [])
-        self.assertEqual(
-            self.production_application.freeze_successor_requests,
-            [],
-        )
+                self.assertEqual(status, 202, body)
+                request = self.production_application.stage_rerun_requests[-1]
+                self.assertEqual(request.from_stage, stage["id"])
+                self.assertEqual(request.through_stage, stage["id"])
 
     def test_list_runs_exposes_linked_attempt_lineage(self) -> None:
         self._seed_retryable_run()
@@ -4625,7 +4607,7 @@ class PortalTests(unittest.TestCase):
         self.assertIsNone(runs[DAG_RUN_ID]["parent_dag_run_id"])
         self.assertIsNone(runs[DAG_RUN_ID]["resume_from"])
 
-    def test_run_detail_exposes_only_a_freeze_successor_when_facts_exist(self) -> None:
+    def test_run_detail_exposes_the_common_stage_options_when_facts_exist(self) -> None:
         self._seed_retryable_run()
         self.client.login()
         # Airflow alone cannot supply a registered run detail.
@@ -4633,12 +4615,12 @@ class PortalTests(unittest.TestCase):
         self.platform.runs.pop(native_run_id(DAG_RUN_ID))
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
         self.assertEqual(status, 404, body)
-        # A completed Freeze exposes one new-request option derived from sealed facts.
+        # Stage options are supplied by the same application, rather than re-decided by the portal.
         self._seed_retryable_run()
         status, _, body = self.client.request("GET", f"/api/runs/{DAG_RUN_ID}")
         self.assertEqual(status, 200, body)
         rows = json.loads(body)["stage_reruns"]
-        self.assertEqual([row["stage"] for row in rows], ["freeze", "mjcf"])
+        self.assertEqual([row["stage"] for row in rows], [stage["id"] for stage in CONTRACT["stages"]])
         self.assertTrue(rows[0]["eligible"])
         self.assertEqual(
             rows[0]["main_assembly_options"],

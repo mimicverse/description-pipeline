@@ -977,7 +977,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         return command
 
     def _discover_payload(self, command: StageCommand) -> dict[str, object]:
-        files = {"cad/robot.SLDASM": self.admission_harness.originals.inventory["cad/robot.SLDASM"]}
+        files = dict(self.admission_harness.originals.inventory)
         return {
             "schema_version": DISCOVER_RESULT_SCHEMA,
             "command_id": command.command_id,
@@ -1907,7 +1907,7 @@ class RuntimeCandidatePostgresTests(unittest.TestCase):
         )
         def admit():
             return self.facts.admit_run(admission, command, dispatch, artifact, verify_result=verify_result)
-        with self.assertRaisesRegex(FactStoreError, "settled terminal"):
+        with self.assertRaisesRegex(FactConflict, "source publish command .*active or unresolved external work"):
             admit()
         services = CanonicalStageServices(
             facts=self.facts, artifacts=self.artifacts, work_root=Path(self.directory.name) / "publish-failure",

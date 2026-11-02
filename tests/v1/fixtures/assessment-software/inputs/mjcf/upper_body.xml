@@ -1,0 +1,85 @@
+<mujoco model="dynamic_benchmark_upper_body">
+  <compiler angle="radian" autolimits="true" fusestatic="false" inertiafromgeom="false"/>
+  <option timestep="0.001" integrator="RK4" gravity="0 0 -9.81" iterations="100"/>
+
+  <worldbody>
+    <body name="base_link" pos="0 0 0">
+      <inertial pos="0 0 0" mass="5.0" diaginertia="0.05 0.05 0.05"/>
+      <geom name="base_link_visual" type="box" size="0.15 0.15 0.10"
+            contype="0" conaffinity="0" density="0"/>
+
+      <body name="waist_link" pos="0 0 0.20">
+        <inertial pos="0 0 0.10" mass="1.5" diaginertia="0.02 0.02 0.02"/>
+        <joint name="waist_yaw" type="hinge" axis="0 0 1"
+               range="-1.57 1.57" damping="0.05" armature="0.002" frictionloss="0.01"/>
+        <geom name="waist_link_visual" type="box" size="0.12 0.15 0.12" pos="0 0 0.10"
+              contype="0" conaffinity="0" density="0"/>
+        <site name="waist_site" pos="0 0 0"/>
+
+        <body name="head_link" pos="0 0 0.35">
+          <inertial pos="0 0 0.08" mass="0.5" diaginertia="0.005 0.005 0.005"/>
+          <joint name="head_yaw" type="hinge" axis="0 0 1"
+                 range="-1.57 1.57" damping="0.02" armature="0.001" frictionloss="0.005"/>
+          <geom name="head_link_visual" type="box" size="0.08 0.08 0.08" pos="0 0 0.08"
+                contype="0" conaffinity="0" density="0"/>
+          <site name="head_tcp" pos="0 0 0.16"/>
+        </body>
+
+        <body name="left_upper_link" pos="0 0.18 0.20">
+          <inertial pos="0 0 -0.09" mass="0.8" diaginertia="0.01 0.01 0.01"/>
+          <joint name="left_shoulder_pitch" type="hinge" axis="0 1 0"
+                 range="-1.57 1.57" damping="0.04" armature="0.002" frictionloss="0.008"/>
+          <geom name="left_upper_link_visual" type="box" size="0.04 0.04 0.09" pos="0 0 -0.09"
+                contype="0" conaffinity="0" density="0"/>
+
+          <body name="left_forearm_link" pos="0 0 -0.18">
+            <inertial pos="0 0 -0.08" mass="0.5" diaginertia="0.005 0.005 0.005"/>
+            <joint name="left_elbow_pitch" type="hinge" axis="0 1 0"
+                   range="-1.57 1.57" damping="0.02" armature="0.001" frictionloss="0.004"/>
+            <geom name="left_forearm_link_visual" type="box" size="0.03 0.03 0.08" pos="0 0 -0.08"
+                  contype="0" conaffinity="0" density="0"/>
+            <site name="left_tcp" pos="0 0 -0.16"/>
+
+            <body name="benchmark_payload_link" pos="0 0 -0.16">
+              <inertial pos="0 0 -0.04" mass="0.4" diaginertia="0.002 0.002 0.002"/>
+              <geom name="benchmark_payload_visual" type="box" size="0.04 0.04 0.04" pos="0 0 -0.04"
+                    contype="0" conaffinity="0" density="0"/>
+            </body>
+          </body>
+        </body>
+
+        <body name="right_upper_link" pos="0 -0.18 0.20">
+          <inertial pos="0 0 -0.09" mass="0.8" diaginertia="0.01 0.01 0.01"/>
+          <joint name="right_shoulder_pitch" type="hinge" axis="0 1 0"
+                 range="-1.57 1.57" damping="0.04" armature="0.002" frictionloss="0.008"/>
+          <geom name="right_upper_link_visual" type="box" size="0.04 0.04 0.09" pos="0 0 -0.09"
+                contype="0" conaffinity="0" density="0"/>
+
+          <body name="right_forearm_link" pos="0 0 -0.18">
+            <inertial pos="0 0 -0.08" mass="0.5" diaginertia="0.005 0.005 0.005"/>
+            <joint name="right_elbow_pitch" type="hinge" axis="0 1 0"
+                   range="-1.57 1.57" damping="0.02" armature="0.001" frictionloss="0.004"/>
+            <geom name="right_forearm_link_visual" type="box" size="0.03 0.03 0.08" pos="0 0 -0.08"
+                  contype="0" conaffinity="0" density="0"/>
+            <site name="right_tcp" pos="0 0 -0.16"/>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <motor name="waist_yaw_motor" joint="waist_yaw" gear="1"
+           ctrllimited="false" ctrlrange="-20 20" forcelimited="true" forcerange="-20 20"/>
+    <motor name="head_yaw_motor" joint="head_yaw" gear="1"
+           ctrllimited="false" ctrlrange="-10 10" forcelimited="true" forcerange="-10 10"/>
+    <motor name="left_shoulder_motor" joint="left_shoulder_pitch" gear="1"
+           ctrllimited="false" ctrlrange="-20 20" forcelimited="true" forcerange="-20 20"/>
+    <motor name="left_elbow_motor" joint="left_elbow_pitch" gear="1"
+           ctrllimited="false" ctrlrange="-20 20" forcelimited="true" forcerange="-20 20"/>
+    <motor name="right_shoulder_motor" joint="right_shoulder_pitch" gear="1"
+           ctrllimited="false" ctrlrange="-20 20" forcelimited="true" forcerange="-20 20"/>
+    <motor name="right_elbow_motor" joint="right_elbow_pitch" gear="1"
+           ctrllimited="false" ctrlrange="-20 20" forcelimited="true" forcerange="-20 20"/>
+  </actuator>
+</mujoco>

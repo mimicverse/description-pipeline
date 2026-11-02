@@ -2265,10 +2265,20 @@ class RecoveryControlFlowTests(unittest.TestCase):
 
     def test_workspace_bundle_roundtrip_is_offline_and_verified(self) -> None:
         extracted, origin, manifest = self.workspace_bundle()
+        target = self.root / "workspace-targets" / ("w" * 250)
+        target.mkdir(parents=True)
+        write(target / "control", "ordinary destination control\n")
+        self.assertEqual((target / "control").read_text(), "ordinary destination control\n")
+        (target / "control").unlink()
+        target.rmdir()
+        plan_path = extracted / "reconstruct" / "workspace-plan.json"
+        plan = json.loads(plan_path.read_text())
+        plan["repositories"][0]["path"] = str(target)
+        plan_path.write_bytes(recovery.canonical_json(plan))
         origin.rename(self.root / "workspace-origin-unavailable.git")
         recovery.restore_workspaces(manifest, extracted, verify_only=False)
-        target = self.root / "workspace-targets" / "workspace-source"
         self.assertEqual((target / "tracked.txt").read_text(), "restored\n")
+        self.assertEqual(list(target.parent.iterdir()), [target])
         self.assertEqual(
             subprocess.check_output(
                 ["git", "-C", str(target), "remote", "get-url", "origin"],
@@ -2286,6 +2296,22 @@ class RecoveryControlFlowTests(unittest.TestCase):
             text=True,
         )
         self.assertEqual(before, after)
+
+    def test_workspace_clone_failure_removes_owned_staging(self) -> None:
+        extracted, _, manifest = self.workspace_bundle()
+        plan_path = extracted / "reconstruct" / "workspace-plan.json"
+        plan = json.loads(plan_path.read_text())
+        row = plan["repositories"][0]
+        bundle = extracted / row["bundle_member"]
+        bundle.write_bytes(b"invalid private fixture bundle\n")
+        row["bundle_sha256"] = recovery.sha256_file(bundle)
+        plan_path.write_bytes(recovery.canonical_json(plan))
+        with self.assertRaises(recovery.RecoveryError) as raised:
+            recovery.restore_workspaces(manifest, extracted, verify_only=False)
+        self.assertEqual(raised.exception.code, "recovery_workspace_failed")
+        self.assertFalse(Path(row["path"]).exists())
+        self.assertEqual(list(Path(row["path"]).parent.iterdir()), [])
+        self.assertEqual(bundle.read_bytes(), b"invalid private fixture bundle\n")
 
     def test_workspace_restore_refuses_a_preexisting_target(self) -> None:
         extracted, _, manifest = self.workspace_bundle()
@@ -3931,6 +3957,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
             b"",
         )
         process.transport = windows_transport.request_metadata("fixture")
+        commands: list[dict] = []
         with (
             mock.patch.object(recovery, "_transport_powershell", return_value=process),
             self.assertRaises(recovery.RecoveryError) as raised,
@@ -3939,7 +3966,7 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 ssh_host="windows-fixture",
                 script="fixture",
                 timeout=5,
-                commands=[],
+                commands=commands,
             )
         self.assertEqual(raised.exception.code, "windows_recovery_transport_unknown")
         self.assertEqual(raised.exception.detail["stream"], "stdout")
@@ -3947,6 +3974,93 @@ class RecoveryControlFlowTests(unittest.TestCase):
             raised.exception.detail["sha256"],
             hashlib.sha256(b"\xff\xfeA").hexdigest(),
         )
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0]["returncode"], process.returncode)
+        self.assertEqual(commands[0]["stdout_sha256"], raised.exception.detail["sha256"])
+
+    def test_windows_missing_result_preserves_raw_transport_evidence(self) -> None:
+        process = subprocess.run(
+            [sys.executable, "-c", "import sys; sys.stderr.buffer.write(bytes.fromhex('b2e2cad4')); sys.exit(23)"],
+            capture_output=True,
+            check=False,
+        )
+        commands: list[dict] = []
+        for recorded_commands in (commands, None):
+            with (
+                self.subTest(commands=recorded_commands),
+                mock.patch.object(recovery, "_transport_powershell", return_value=process),
+                self.assertRaises(recovery.RecoveryError) as raised,
+            ):
+                recovery._run_windows_powershell(
+                    ssh_host="windows-fixture",
+                    script="fixture",
+                    timeout=5,
+                    commands=recorded_commands,
+                )
+            self.assertEqual(raised.exception.code, "windows_recovery_transport_unknown")
+            self.assertEqual(raised.exception.detail["returncode"], 23)
+            self.assertEqual(raised.exception.detail["stderr_sha256"], hashlib.sha256(process.stderr).hexdigest())
+            self.assertEqual(raised.exception.detail["stdout_sha256"], hashlib.sha256(process.stdout).hexdigest())
+        self.assertEqual(commands, [raised.exception.detail])
+
+    def test_windows_transport_exception_preserves_partial_streams_and_request(self) -> None:
+        with self.assertRaises(subprocess.TimeoutExpired) as timeout:
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys,time; sys.stderr.buffer.write(bytes.fromhex('b2e2cad4')); "
+                    "sys.stderr.buffer.flush(); time.sleep(30)",
+                ],
+                capture_output=True,
+                check=False,
+                timeout=1,
+            )
+        with self.assertRaises(FileNotFoundError) as missing:
+            subprocess.run([str(self.root / "missing-transport")], capture_output=True, check=False)
+        self.assertEqual(timeout.exception.stderr, bytes.fromhex("b2e2cad4"))
+        for error in (timeout.exception, missing.exception):
+            for record in (True, False):
+                commands: list[dict] = []
+                with (
+                    self.subTest(error=type(error).__name__, record=record),
+                    mock.patch.object(recovery, "_transport_powershell", side_effect=error),
+                    self.assertRaises(recovery.RecoveryError) as raised,
+                ):
+                    recovery._run_windows_powershell(
+                        ssh_host="windows-fixture",
+                        script="fixture",
+                        timeout=5,
+                        commands=commands if record else None,
+                    )
+                self.assertEqual(raised.exception.code, "windows_recovery_transport_unknown")
+                detail = raised.exception.detail
+                self.assertIsNone(detail["returncode"])
+                self.assertEqual(detail["error_type"], type(error).__name__)
+                stdout, stderr = windows_transport.error_streams(error)
+                self.assertEqual(detail["stdout_sha256"], hashlib.sha256(stdout).hexdigest())
+                self.assertEqual(detail["stderr_sha256"], hashlib.sha256(stderr).hexdigest())
+                self.assertEqual(detail["transport"], windows_transport.request_metadata("fixture"))
+                self.assertEqual(commands, [detail] if record else [])
+
+    def test_windows_unencodable_request_is_classified_before_dispatch(self) -> None:
+        commands: list[dict] = []
+        with (
+            mock.patch.object(recovery, "_transport_powershell") as dispatch,
+            self.assertRaises(recovery.RecoveryError) as raised,
+        ):
+            recovery._run_windows_powershell(
+                ssh_host="windows-fixture",
+                script="\ud800",
+                timeout=5,
+                commands=commands,
+            )
+        dispatch.assert_not_called()
+        self.assertEqual(raised.exception.code, "windows_recovery_transport_unknown")
+        self.assertEqual(raised.exception.detail["error_type"], "UnicodeEncodeError")
+        self.assertIsNone(raised.exception.detail["transport"])
+        self.assertIsNone(raised.exception.detail["returncode"])
+        self.assertEqual(commands, [raised.exception.detail])
 
     def test_recovery_propagates_bytecode_suppression_to_children(self) -> None:
         self.assertEqual(os.environ.get("PYTHONDONTWRITEBYTECODE"), "1")
@@ -4449,6 +4563,78 @@ class RecoveryControlFlowTests(unittest.TestCase):
                 self.assertEqual(raised.exception.code, "recovery_target_path_unsafe")
                 self.assertEqual(list(external.iterdir()), [])
 
+    def test_exact_file_and_directory_restore_accept_valid_long_basenames(self):
+        source = self.root / "long-name-source"
+        payload = b"exact archived bytes\n"
+        archived = write(source / "secret", payload)
+        target_parent = self.root / "long-name-targets"
+        target_parent.mkdir()
+        file_target = target_parent / ("f" * 245 + ".json")
+        file_target.write_bytes(payload)
+        self.assertEqual(file_target.read_bytes(), payload)
+        file_target.unlink()
+        manifest = {"files": [{"name": "platform_config", "member": "secret",
+            "path": str(file_target), "mode": 0o600}], "secrets": []}
+        recovery.restore_exact_files(manifest, source)
+        self.assertEqual(file_target.read_bytes(), payload)
+        self.assertEqual(stat.S_IMODE(file_target.stat().st_mode), 0o600)
+
+        directory_target = target_parent / ("d" * 250)
+        directory_target.mkdir()
+        write(directory_target / "control", payload)
+        self.assertEqual((directory_target / "control").read_bytes(), payload)
+        (directory_target / "control").unlink()
+        members = [{"member": "state", "type": "directory", "mode": 0o750},
+            {"member": "state/secret", "type": "file", "mode": 0o640}]
+        recovery.copy_extracted_directory(source, directory_target, members, "state")
+        self.assertEqual((directory_target / "secret").read_bytes(), payload)
+        self.assertEqual(stat.S_IMODE(directory_target.stat().st_mode), 0o750)
+        self.assertEqual(stat.S_IMODE((directory_target / "secret").stat().st_mode), 0o640)
+        self.assertEqual(set(target_parent.iterdir()), {file_target, directory_target})
+        self.assertEqual(archived.read_bytes(), payload)
+        for action in (
+            lambda: recovery.restore_exact_files(manifest, source),
+            lambda: recovery.copy_extracted_directory(source, directory_target, members, "state"),
+        ):
+            with self.subTest(action=action):
+                with self.assertRaises(recovery.RecoveryError) as raised:
+                    action()
+                self.assertEqual(raised.exception.code, "recovery_target_not_empty")
+        self.assertEqual(file_target.read_bytes(), payload)
+        self.assertEqual((directory_target / "secret").read_bytes(), payload)
+
+    def test_failed_file_and_directory_restore_remove_owned_staging(self):
+        source = self.root / "failed-copy-source"
+        archived = write(source / "secret", b"archived bytes\n")
+        target_parent = self.root / "failed-copy-targets"
+        target_parent.mkdir()
+        file_target = target_parent / "file.json"
+        manifest = {"files": [{"name": "platform_config", "member": "secret",
+            "path": str(file_target), "mode": 0o600}], "secrets": []}
+
+        def fail_file_copy(source, partial):
+            Path(partial).write_bytes(b"incomplete file")
+            raise OSError("private fixture file copy failed")
+
+        with (
+            mock.patch.object(recovery.shutil, "copy2", side_effect=fail_file_copy),
+            self.assertRaisesRegex(OSError, "file copy failed"),
+        ):
+            recovery.restore_exact_files(manifest, source)
+        self.assertEqual(list(target_parent.iterdir()), [])
+
+        def fail_tree_copy(source, partial):
+            write(partial / "incomplete", b"incomplete directory")
+            raise OSError("private fixture directory copy failed")
+
+        with (
+            mock.patch.object(recovery, "copy_tree_strict", side_effect=fail_tree_copy),
+            self.assertRaisesRegex(OSError, "directory copy failed"),
+        ):
+            recovery.copy_extracted_directory(source, target_parent / "tree", [], "state")
+        self.assertEqual(list(target_parent.iterdir()), [])
+        self.assertEqual(archived.read_bytes(), b"archived bytes\n")
+
     def test_restore_refuses_public_or_link_keys_before_extraction(self):
         out, manifest = self.backup()
         self.isolate_source()
@@ -4524,6 +4710,120 @@ class RecoveryControlFlowTests(unittest.TestCase):
 
 
 class RecoveryFailureEvidenceTests(unittest.TestCase):
+    @contextlib.contextmanager
+    def local_scp(self, root, mode):
+        bin_dir = root / "scp-bin"
+        bin_dir.mkdir(exist_ok=True)
+        if mode != "missing":
+            write(
+                bin_dir / "scp",
+                f"#!{sys.executable}\n" + textwrap.dedent("""\
+                    import os,sys,time
+                    from pathlib import Path
+                    Path(sys.argv[-1]).write_bytes(b"partial transfer")
+                    sys.stdout.buffer.write(b"copy partial")
+                    sys.stdout.buffer.flush()
+                    sys.stderr.buffer.write(bytes.fromhex("b2e2cad4"))
+                    sys.stderr.buffer.flush()
+                    if os.environ["RECOVERY_SCP_MODE"] == "timeout":
+                        time.sleep(30)
+                    raise SystemExit(0 if os.environ["RECOVERY_SCP_MODE"] == "success" else 17)
+                    """),
+                mode=0o700,
+            )
+        with mock.patch.dict(os.environ, {"PATH": str(bin_dir), "RECOVERY_SCP_MODE": mode}):
+            yield
+
+    def test_windows_scp_preserves_actual_raw_attempts_before_classifying_results(self):
+        for mode in ("success", "nonzero", "timeout", "missing"):
+            for record in (True, False):
+                with self.subTest(mode=mode, record=record), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    commands: list[dict] = []
+                    with self.local_scp(root, mode):
+                        if mode == "success":
+                            recovery._windows_scp(
+                                ssh_host="windows-fixture", source="windows-fixture:/source with space",
+                                destination=root / "target", timeout=1, commands=commands if record else None,
+                            )
+                            if not record:
+                                continue
+                            evidence = commands[0]
+                        else:
+                            with self.assertRaises(recovery.RecoveryError) as raised:
+                                recovery._windows_scp(
+                                    ssh_host="windows-fixture", source="windows-fixture:/source with space",
+                                    destination=root / "target", timeout=1, commands=commands if record else None,
+                                )
+                            self.assertEqual("windows_recovery_transport_unknown", raised.exception.code)
+                            evidence = raised.exception.detail
+                    self.assertEqual("scp", evidence["program"])
+                    self.assertEqual(
+                        0 if mode == "success" else 17 if mode == "nonzero" else None,
+                        evidence["returncode"],
+                    )
+                    stdout = b"" if mode == "missing" else b"copy partial"
+                    stderr = b"" if mode == "missing" else bytes.fromhex("b2e2cad4")
+                    self.assertEqual(stdout, base64.b64decode(evidence["stdout_base64"]))
+                    self.assertEqual(stderr, base64.b64decode(evidence["stderr_base64"]))
+                    self.assertEqual(hashlib.sha256(stdout).hexdigest(), evidence["stdout_sha256"])
+                    self.assertEqual(hashlib.sha256(stderr).hexdigest(), evidence["stderr_sha256"])
+                    argv = evidence["transport"]["argv"]
+                    self.assertEqual(str(root / "target"), argv[-1])
+                    self.assertEqual(
+                        hashlib.sha256(json.dumps(argv, separators=(",", ":")).encode("ascii")).hexdigest(),
+                        evidence["transport"]["argv_sha256"],
+                    )
+                    if mode == "timeout":
+                        self.assertEqual(1, evidence["timeout_seconds"])
+                    self.assertEqual(commands, [evidence] if record else [])
+
+    def test_real_failed_scp_download_is_retained_by_backup_failure_cleanup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            out = root / "backup-output"
+            claim = recovery.claim_backup_output(out, "fixture")
+            windows = out / "backup" / "windows"
+            windows.mkdir(parents=True)
+            piece = windows / "partial.bin"
+            with self.local_scp(root, "nonzero"), self.assertRaises(recovery.RecoveryError) as raised:
+                recovery._windows_scp(
+                    ssh_host="windows-fixture", source="windows-fixture:/source",
+                    destination=piece, timeout=1, commands=[],
+                )
+            self.assertNotIn("download", raised.exception.detail)
+            recovery.record_backup_failure(
+                argparse.Namespace(out=out, backup_id="fixture", config=root / "platform.json"),
+                raised.exception, claim,
+            )
+            receipt = json.loads((out / "receipt.json").read_bytes())
+            self.assertEqual(b"partial transfer", piece.read_bytes())
+            self.assertFalse(receipt["private_staging_removed"])
+            self.assertEqual("partial_windows_download", receipt["staging_retained_reason"])
+            self.assertEqual(bytes.fromhex("b2e2cad4"), base64.b64decode(receipt["detail"]["stderr_base64"]))
+
+    def test_unreadable_owned_download_workspace_is_retained_without_inventing_presence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            out = root / "backup-output"
+            claim = recovery.claim_backup_output(out, "fixture")
+            staging = out / "backup"
+            windows = staging / "windows"
+            windows.mkdir(parents=True)
+            piece = write(windows / "partial.bin", b"original partial")
+            staging.chmod(0)
+            try:
+                recovery.record_backup_failure(
+                    argparse.Namespace(out=out, backup_id="fixture", config=root / "platform.json"),
+                    recovery.RecoveryError("windows_recovery_transport_unknown", "transfer failed"), claim,
+                )
+                receipt = json.loads((out / "receipt.json").read_bytes())
+                self.assertFalse(receipt["private_staging_removed"])
+                self.assertEqual("windows_download_observation_unknown", receipt["staging_retained_reason"])
+            finally:
+                staging.chmod(0o700)
+            self.assertEqual(b"original partial", piece.read_bytes())
+
     def test_failure_cleanup_keeps_referenced_sidecars_and_partial_download(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -4532,11 +4832,9 @@ class RecoveryFailureEvidenceTests(unittest.TestCase):
                 claim = recovery.claim_backup_output(out, "fixture")
                 staging = out / "backup"
                 staging.mkdir()
-                piece = write(staging / "partial.zip", "partial")
+                piece = write(staging / "windows" / "partial.zip" if partial else staging / "partial.zip", "partial")
                 sidecar = write(out / "windows-transfer-evidence" / "upload.stderr", "diagnostic")
                 detail = {"phase": "download" if partial else "upload", "stderr": {"path": str(sidecar)}}
-                if partial:
-                    detail["download"] = {"present": True, "partial": {"path": str(piece)}}
                 recovery.record_backup_failure(
                     argparse.Namespace(out=out, backup_id="fixture", config=root / "platform.json"),
                     recovery.RecoveryError("windows_recovery_transport_unknown", "transfer failed", detail),
@@ -4545,6 +4843,7 @@ class RecoveryFailureEvidenceTests(unittest.TestCase):
                 receipt = json.loads((out / "receipt.json").read_text())
                 self.assertTrue(Path(receipt["detail"]["stderr"]["path"]).is_file())
                 self.assertEqual(staging.exists(), partial)
+                self.assertEqual(piece.exists(), partial)
 
     def test_tar_reader_drains_after_archive_end_and_rejects_decrypt_failure(self):
         payload = io.BytesIO()

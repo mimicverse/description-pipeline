@@ -26,7 +26,7 @@ DATA = {
     "decoy.SLDPRT": b"unrelated native document",
     "notes.txt": b"unrelated notes",
 }
-EDGES = {MAIN: ["parts/link.SLDPRT"], "parts/link.SLDPRT": [], "decoy.SLDPRT": []}
+EDGES = {MAIN: ["parts/link.SLDPRT"], "parts/link.SLDPRT": []}
 
 
 class SelectionTransportTests(unittest.TestCase):
@@ -61,8 +61,7 @@ class SelectionTransportTests(unittest.TestCase):
         self.assertTrue(session.accept_batch(self._archive(self.root / "batch.zip", DATA)))
         self.assertFalse(session.accept_batch(self._archive(self.root / "retry.zip", DATA)))
         manifest = session.seal_closure(self._evidence())
-        self.assertEqual(set(manifest["files"]), {MAIN, "parts/link.SLDPRT"})
-        self.assertEqual(set(manifest["excluded_files"]), {"decoy.SLDPRT", "notes.txt"})
+        self.assertEqual(manifest["files"], self.upload)
         self.assertEqual(inventory(session.stage), manifest["files"])
         self.assertEqual(session.snapshot()["staged_files"], self.upload)
 
@@ -376,7 +375,7 @@ class SelectionTransportTests(unittest.TestCase):
         (session.stage / "parts").mkdir(exist_ok=True)
         (session.stage / "parts" / "~$link.SLDPRT").write_bytes(b"nested transient lock")
         manifest = session.seal_closure(self._evidence())
-        self.assertEqual(set(manifest["files"]), {MAIN, "parts/link.SLDPRT"})
+        self.assertEqual(manifest["files"], self.upload)
         self.assertEqual(
             set(inventory(session.stage)),
             set(manifest["files"]) | {"~$link.SLDPRT", "parts/~$link.SLDPRT"},

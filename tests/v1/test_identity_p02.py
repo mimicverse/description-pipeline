@@ -64,6 +64,26 @@ class SuggestionTests(unittest.TestCase):
 
 
 class PortalConfigTargetsTests(unittest.TestCase):
+    def test_simulation_loader_uses_shared_schema_without_constructing_portal_services(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            settings = {"root": str(root / "sessions"), "python": str(root / "role/bin/python"), "capacity": 2}
+            config = root / "portal.json"
+            with patch.object(
+                portal, "_production_admission_runtime", side_effect=AssertionError("Unexpected service")
+            ):
+                config.write_text(json.dumps({"portal": {"simulation": settings}}), encoding="utf-8")
+                self.assertEqual(settings, portal.load_simulation_config(config))
+                for bad in (
+                    {"portal": {"simulation": {**settings, "capacity": True}}},
+                    {"portal": {"simulation": {**settings, "root": "relative"}}},
+                    {"portal": {"simulation": settings, "unexpected": True}},
+                    {"portal": {"simulation": settings}, "unexpected": {}},
+                ):
+                    config.write_text(json.dumps(bad), encoding="utf-8")
+                    with self.subTest(config=bad), self.assertRaises(portal.AirflowApiError):
+                        portal.load_simulation_config(config)
+
     @staticmethod
     def _write_config(root: Path, *, targets: dict, repositories: dict) -> Path:
         token = root / "endpoint.token"
@@ -97,7 +117,7 @@ class PortalConfigTargetsTests(unittest.TestCase):
             with patch.object(
                 portal,
                 "_production_admission_runtime",
-                return_value=(None, None, None, None, None, None),
+                return_value=(None, None, None, None, None),
             ):
                 loaded = portal.load_portal_config(config)
             self.assertEqual(loaded.pipeline_targets["m3.0"]["base"], "main")

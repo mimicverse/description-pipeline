@@ -36,7 +36,7 @@ def native_discovery_record(
     )
     return {
         "schema_version": NATIVE_DISCOVERY_SCHEMA,
-        "contract": "native-discovery/v1",
+        "contract": "native-discovery/v2",
         "namespace": "dp",
         "run_id": run_id,
         "generator": "native-discovery",

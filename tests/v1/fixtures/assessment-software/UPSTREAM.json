@@ -1,0 +1,77 @@
+{
+  "schema": "p1-software-benchmark-origin/v1",
+  "repository": "https://github.com/mimicverse/teleop",
+  "commit": "33908ccc39ac427a178855927f43924d6bd58d6c",
+  "tree": "dcc6c458d50abaf7663c13c8800c84173b51ad40",
+  "source_archive_sha256": "e0535f6040c123df1e322c5a6e4b47849f925e8849024b67dce2af25470f80f9",
+  "qualification_scope": "software_regression_only",
+  "production_input": false,
+  "fixture_files_copied_without_changes": {
+    "SOURCE-MANIFEST.json": {
+      "source_path": "tests/evaluation/fixtures/actuator-model-offline-wheel/SOURCE-MANIFEST.json",
+      "git_blob": "66a2d3eaf4d256caf2ddc5f2c8294adacec6be1e",
+      "sha256": "669de38d0f10a7295eadcb74f02f480ab34aa5303f99972b9a60a300b0760cdc",
+      "bytes": 1874
+    },
+    "plan.template.json": {
+      "source_path": "tests/evaluation/fixtures/actuator-model-offline-wheel/plan.template.json",
+      "git_blob": "4767a64c03b5df22de6e093deb471eba658620cd",
+      "sha256": "b82d8612bf2489cee3b325f177a77bc7782e2f05db8279151be6be70c2e7a9d8",
+      "bytes": 11673
+    },
+    "inputs/urdf/upper_body.urdf": {
+      "source_path": "tests/evaluation/fixtures/actuator-model-offline-wheel/inputs/urdf/upper_body.urdf",
+      "git_blob": "b48d6598e52d1c26782abc7af9ab83f9d35aaf65",
+      "sha256": "ba53508cc23c7c3aff8115bef7f7e68f6c6b710a328b6ad4eef38ad12d9eb4d7",
+      "bytes": 5635
+    },
+    "inputs/mjcf/upper_body.xml": {
+      "source_path": "tests/evaluation/fixtures/actuator-model-offline-wheel/inputs/mjcf/upper_body.xml",
+      "git_blob": "d0ca75a7d5593b111552aa423a31202398abaf3a",
+      "sha256": "4e6d1fcad71976fe65a359524c8ec5c67d04fd17fd44f5692e8b78cc7d54c5ed",
+      "bytes": 4794
+    },
+    "inputs/sources/benchmark-sources.json": {
+      "source_path": "tests/evaluation/fixtures/actuator-model-offline-wheel/inputs/sources/benchmark-sources.json",
+      "git_blob": "57cbb1652041925d898b67b78e3622700e48cc8f",
+      "sha256": "9c7ab9a99a93d528fcad8a0a5a042e3bdbffd60fc40d9e33c828fd911cf78da5",
+      "bytes": 2607
+    },
+    "inputs/tasks/hold.json": {
+      "source_path": "tests/evaluation/fixtures/actuator-model-offline-wheel/inputs/tasks/hold.json",
+      "git_blob": "40992c2e16d855342f5254ce93d5c622d225be61",
+      "sha256": "228b866ae203ac5e8b1ef4a0bb1ee91bae95e23dfeb6beccf0b5856a21c5e2fb",
+      "bytes": 1375
+    },
+    "inputs/tasks/step.json": {
+      "source_path": "tests/evaluation/fixtures/actuator-model-offline-wheel/inputs/tasks/step.json",
+      "git_blob": "0d16cc1b5d8ad8437840a2ff9cb87593c5b35f6d",
+      "sha256": "ee7b99023eebb3fd11df0a5287df394ed71b88dadbd8a34232bdcab825aed20b",
+      "bytes": 1228
+    },
+    "inputs/tasks/round_trip.json": {
+      "source_path": "tests/evaluation/fixtures/actuator-model-offline-wheel/inputs/tasks/round_trip.json",
+      "git_blob": "978be7099901dccb035982e71bd5f0601f1476a0",
+      "sha256": "797c79413fbf673e2621b686352fe445387697a88b54e4cdfa4dca1c00ddd80d",
+      "bytes": 1262
+    },
+    "inputs/tasks/multi_group.json": {
+      "source_path": "tests/evaluation/fixtures/actuator-model-offline-wheel/inputs/tasks/multi_group.json",
+      "git_blob": "2508fd8e3baaa581a65de235d1989ce0202cffdd",
+      "sha256": "621712d743121d1d4d42c5c2f4346b85b09ad02088975cb981c469df71ba47fd",
+      "bytes": 1204
+    },
+    "inputs/tasks/load_condition.json": {
+      "source_path": "tests/evaluation/fixtures/actuator-model-offline-wheel/inputs/tasks/load_condition.json",
+      "git_blob": "58d9fb68e0800e1a296f9fc37126c35a1188ce04",
+      "sha256": "d8cb48dd258b5967114ad21ded94be9fb85606750ff59720ab235fb1246eae55",
+      "bytes": 1553
+    }
+  },
+  "license": {
+    "path": "LICENSE",
+    "source_path": "LICENSE",
+    "sha256": "2d3fd9ffffa70a4307498ec630b14a6b4731e010f8ddda92686eaf65733c2dfe"
+  },
+  "runtime_rule": "Generate a separate plan using the current approved aggregate artifact and the official Teleop identity verifier; never use this fixture as an engineering model or runtime pin"
+}

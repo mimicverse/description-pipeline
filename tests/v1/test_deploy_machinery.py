@@ -17,7 +17,7 @@ WINDOWS = ROOT / "deploy/windows"
 #: Schema ids outside the ``solidworks-to-urdf.*`` family are retired (XC-01); the two
 #: documented exceptions below intentionally keep their historical ids.
 RETIRED_SCHEMA_ID = re.compile(r"\b(?:description-pipeline|description)\.[A-Za-z][A-Za-z0-9._-]*/v[0-9]+\b")
-DOCUMENTED_ID_EXCEPTIONS = ("native-discovery/v1", "swbridge.material-assignment/v1")
+DOCUMENTED_ID_EXCEPTIONS = ("native-discovery/v2", "swbridge.material-assignment/v1")
 
 
 def endpoint_template_targets_violations(root: Path) -> list[str]:

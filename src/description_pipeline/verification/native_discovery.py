@@ -53,6 +53,7 @@ from ..schemas import (
     NATIVE_DISCOVERY_OPTIONAL_ENVELOPE_KEYS,
     NATIVE_DISCOVERY_RECORD_KEYS,
     NATIVE_DISCOVERY_SCHEMA,
+    NATIVE_TRANSFORM_FRAME,
     exporter_declaration_present,
     saved_native_reference_present,
 )
@@ -944,16 +945,17 @@ def _suppressed_exclusion_reason(component: dict, raw: dict, native: dict) -> st
     if parent:
         if len(parents) != 1 or parents[0].get("document") != defining:
             return "the excluded occurrence is not bound to its immediate parent"
-        configuration = parents[0].get("configuration")
     else:
         if defining != selection.get("main_assembly"):
             return "the excluded top-level occurrence names another defining assembly"
-        configuration = raw.get("saved_configuration")
     if (
-        reference.get("defining") != defining or not isinstance(context, dict)
-        or context.get("document") != defining or context.get("scope") != component.get("parent_occurrence")
-        or not isinstance(context.get("configuration"), str) or not context["configuration"]
-        or context["configuration"] != configuration
+        reference.get("defining") != defining
+        or not isinstance(context, dict)
+        or context.get("document") != selection.get("main_assembly")
+        or context.get("scope") != ""
+        or not isinstance(context.get("configuration"), str)
+        or not context["configuration"]
+        or context["configuration"] != raw.get("saved_configuration")
     ):
         return "the suppression exclusion differs from the native definition context"
     for row in components:
@@ -1055,8 +1057,9 @@ def _require_source_selection(payload: dict) -> None:
 
     The proof is mandatory: the one supported native capture carries
     ``raw.source_selection``, and a bundle without it is not verifiable.  The manifest
-    must recompute exactly, every selected source must be bound by the raw native file
-    inventory with a matching hash, and the raw main choice must agree.
+    must recompute exactly, all available input bytes must be bound by the raw
+    inventory, and the main choice must agree. Object observations are checked
+    separately; hashing an available file does not claim mechanical readings.
     """
 
     from ..sources.solidworks.selection import verify_selection
@@ -1082,24 +1085,15 @@ def _require_source_selection(payload: dict) -> None:
             None,
         )
     files = manifest.get("files")
-    excluded = manifest.get("excluded_files")
-    if not isinstance(files, dict) or not isinstance(excluded, dict):
-        raise _Failure("discovery.selection", "sealed selection carries no file inventories", None)
-    upload = {**excluded, **files}
+    if not isinstance(files, dict):
+        raise _Failure("discovery.selection", "sealed selection carries no input inventory", None)
     try:
-        verify_selection(manifest, upload, files, reader_sha256=manifest.get("reader_sha256"))
+        verify_selection(manifest, files, files, reader_sha256=manifest.get("reader_sha256"))
     except Exception as error:  # noqa: BLE001 - reported as a structured verifier failure
         raise _Failure("discovery.selection", f"sealed selection does not recompute: {error}", None) from error
     native_files = raw.get("files")
-    if not isinstance(native_files, dict) or not native_files:
-        raise _Failure("discovery.selection", "the raw record carries no native file inventory", None)
-    for name, checksum in files.items():
-        if native_files.get(name) != checksum:
-            raise _Failure(
-                "discovery.selection",
-                f"selected source {name!r} is not bound by the raw record",
-                {"document": name},
-            )
+    if not isinstance(native_files, dict) or native_files != files:
+        raise _Failure("discovery.selection", "the raw record does not bind the complete input inventory", None)
     raw_selection = raw.get("selection")
     if isinstance(raw_selection, dict):
         chosen = raw_selection.get("main_assembly")
@@ -1460,12 +1454,16 @@ def _verification_component_document_is_bound(
             name,
             native_files,
         )
+    carrier = record.get("source_selection")
+    closure = carrier.get("closure") if isinstance(carrier, dict) else None
+    graph = closure.get("graph") if isinstance(closure, dict) else None
+    normalized = document.replace("\\", "/")
+    node = graph.get(normalized) if isinstance(graph, dict) else None
     return (
         isinstance(native_files, dict)
-        and isinstance(
-            native_files.get(document.replace("\\", "/")),
-            str,
-        )
+        and isinstance(native_files.get(normalized), str)
+        and isinstance(node, dict)
+        and node.get("sha256") == native_files[normalized]
     )
 
 
@@ -1680,12 +1678,14 @@ def _check_inplace_observations(mate: dict) -> None:
 
 
 def project_native_verification_record(record: dict) -> dict:
-    """Materialize a verifier-only view from preserved local native facts."""
+    """Materialize a verifier-only view from preserved world native facts."""
 
     if not isinstance(record, dict):
         raise _Failure("discovery.raw", "native discovery raw record is not an object")
     if isinstance(record, _ProjectedNativeRecord):
         return copy.deepcopy(record)
+    if record.get("transform_frame") != NATIVE_TRANSFORM_FRAME:
+        raise _Failure("discovery.world_frame", "native discovery has no explicit main-assembly transform frame")
     projected = copy.deepcopy(record)
     components = projected.get("components")
     if not isinstance(components, list):
@@ -1710,7 +1710,7 @@ def project_native_verification_record(record: dict) -> dict:
         if "transform" in component or "transform_raw" not in component:
             raise _Failure(
                 "discovery.local_transform",
-                "native occurrence must carry local transform_raw, not a normalized transform",
+                "native occurrence must carry world transform_raw, not a normalized transform",
                 {"component": name},
             )
         expected_parent = name.rsplit("/", 1)[0] if "/" in name else ""
@@ -1752,15 +1752,15 @@ def project_native_verification_record(record: dict) -> dict:
             visiting.remove(name)
             frames[name] = None
             return None
-        raw_local = component.get("transform_raw")
-        if raw_local is None:
+        raw_world = component.get("transform_raw")
+        if raw_world is None:
             visiting.remove(name)
             raise _Failure(
                 "discovery.local_transform",
                 "native occurrence transform_raw is null rather than a raw value or explicit read failure",
                 {"component": name},
             )
-        if raw_local == []:
+        if raw_world == []:
             visiting.remove(name)
             frames[name] = None
             component["transform"] = []
@@ -1772,8 +1772,7 @@ def project_native_verification_record(record: dict) -> dict:
             frames[name] = None
             component["transform"] = []
             return None
-        local = _verification_frame(raw_local)
-        world = _verification_multiply(parent_frame, local)
+        world = _verification_frame(raw_world)
         visiting.remove(name)
         frames[name] = world
         component["transform"] = [value for row in world for value in row]
@@ -4183,9 +4182,9 @@ def verify_discovery(package: Path) -> dict:
             {"field": "handoff_digest"},
         )
         _require(
-            payload.get("handoff_sha256") == sealed_selection.get("handoff_sha256"),
+            payload.get("handoff_sha256") == sealed_selection.get("upload_sha256"),
             "discovery.request",
-            "the native discovery record is not bound to the selected closure handoff",
+            "the native discovery record is not bound to the complete frozen upload",
             {"field": "handoff_sha256"},
         )
         _require(
@@ -4246,14 +4245,13 @@ def verify_discovery(package: Path) -> dict:
                 "a native file differs from the recorded bytes",
                 {"file": relative},
             )
-        declared = {name for name in native if Path(name).suffix.lower() in {".sldasm", ".sldprt"}}
-        observed = {name for name in inventory if Path(name).suffix.lower() in {".sldasm", ".sldprt"}}
         _require(
-            declared == observed,
+            inventory == native and digest(inventory) == state["request"]["handoff_digest"],
             "discovery.files",
-            "the package contains CAD documents the record never read",
-            {"extra": sorted(observed - declared)},
+            "the archived input does not preserve the complete frozen upload",
+            {"missing": sorted(set(native) - set(inventory)), "extra": sorted(set(inventory) - set(native))},
         )
+        observed = {name for name in inventory if Path(name).suffix.lower() in {".sldasm", ".sldprt"}}
         raw = payload.get("raw") or {}
         for relative, checksum in sorted((raw.get("files") or {}).items()):
             _require(
@@ -4375,12 +4373,10 @@ def verify_discovery(package: Path) -> dict:
                 continue
             observed += 1
             document = component.get("document")
-            observation = component.get("solver_observation")
-            context = observation.get("context") if isinstance(observation, dict) else None
             entry = {
                 "occurrence": str(component.get("name2") or ""),
                 "document": document,
-                "containing_document": context.get("document") if isinstance(context, dict) else None,
+                "containing_document": (component.get("native_reference") or {}).get("defining"),
                 "native_path": provenance.get("native_document_path") if isinstance(provenance, dict) else None,
                 "imported_path": provenance.get("imported_path") if isinstance(provenance, dict) else None,
             }
@@ -4412,7 +4408,12 @@ def verify_discovery(package: Path) -> dict:
                 )
                 if reason is not None:
                     unbound.append(
-                        {**entry, "state": provenance.get("state"), "reason": reason, "error": provenance.get("error")}
+                        {
+                            **entry,
+                            "state": provenance.get("state"),
+                            "reason": reason,
+                            "error": provenance.get("error"),
+                        }
                     )
                 continue
             if provenance.get("state") == "embedded_virtual_component":
@@ -4421,7 +4422,12 @@ def verify_discovery(package: Path) -> dict:
                 )
                 if reason is not None:
                     unbound.append(
-                        {**entry, "state": provenance.get("state"), "reason": reason, "error": provenance.get("error")}
+                        {
+                            **entry,
+                            "state": provenance.get("state"),
+                            "reason": reason,
+                            "error": provenance.get("error"),
+                        }
                     )
                 continue
             reason = None

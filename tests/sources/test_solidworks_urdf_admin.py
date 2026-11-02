@@ -35,7 +35,7 @@ class InputSealReadinessTests(unittest.TestCase):
     def _root(self, directory, *, raw_identity, revision):
         root = Path(directory) / "delivery"
         content = b"native bytes for the admin-deferral tests"
-        raw = support.local_native_record_payload(
+        raw = support.world_native_record_payload(
             {
                 "identity": raw_identity,
                 "components": [
@@ -297,7 +297,9 @@ class HandoffHashBindingTests(unittest.TestCase):
         contents = {"a.SLDPRT": b"aaa", "b.SLDPRT": b"bbb"}
         with tempfile.TemporaryDirectory() as directory:
             hashes = {"a": hashlib.sha256(b"aaa").hexdigest(), "b": hashlib.sha256(b"bbb").hexdigest()}
-            input_root, native = self._package(directory, contents, raw_files={"a.SLDPRT": hashes["a"]})
+            input_root, native = self._package(
+                directory, contents, raw_files={"a.SLDPRT": hashes["a"], "b.SLDPRT": hashes["b"]}
+            )
             self.assertEqual(solidworks_urdf._handoff_native_hashes(input_root), set(native.values()))
 
     def test_foreign_raw_hash_cannot_widen_allowed_sources(self):

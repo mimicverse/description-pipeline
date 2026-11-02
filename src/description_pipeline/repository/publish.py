@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -49,6 +50,9 @@ REPOSITORY_SNAPSHOT_FILE = "repository.bundle"
 REPOSITORY_SNAPSHOT_METADATA = "snapshot.json"
 PROTECTED_PUBLICATION_BRANCHES = frozenset({"main", "refs/heads/main"})
 GITHUB_MAX_BLOB_BYTES = 100 * 1024**2
+# GitHub rejects PR text beyond these provider capacities; files/stdin still
+# carry all accepted UTF-8 bytes without an operating-system argv constraint.
+GITHUB_PR_BODY_MAX_CHARACTERS = 65536
 GITHUB_LARGE_FILE_DOCUMENTATION = (
     "https://docs.github.com/en/repositories/working-with-files/"
     "managing-large-files/about-large-files-on-github"
@@ -60,6 +64,14 @@ class PublicationError(PipelineError):
         super().__init__(code)
         self.code = code
         self.detail = detail
+
+
+def validate_pull_request_body(body: str) -> None:
+    if len(body) > GITHUB_PR_BODY_MAX_CHARACTERS:
+        raise PublicationError(
+            "publish.pr_text_capacity",
+            {"field": "body", "characters": len(body), "max_characters": GITHUB_PR_BODY_MAX_CHARACTERS},
+        )
 
 
 
@@ -200,13 +212,16 @@ def validate_git_remote(repository: Path, repository_slug: str) -> str:
     return validate_repository_remote(repository_slug, fetch_url, push_url)
 
 
-def _run(repository: Path, *args: str, check: bool = True, env=None) -> subprocess.CompletedProcess:
+def _run(
+    repository: Path, *args: str, check: bool = True, env=None, input_data: bytes | None = None,
+) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["git", "-C", str(repository), *args],
         check=check,
         capture_output=True,
         text=False,
         env=env,
+        input=input_data,
     )
 
 
@@ -655,20 +670,24 @@ class GitHubCliPullRequestClient:
     ) -> PullRequestObservation:
         if _OID.fullmatch(candidate_commit) is None:
             raise PublicationError("publish.candidate_commit", {"value": candidate_commit})
-        url = self._gh(
-            "pr",
-            "create",
-            "--repo",
-            repository,
-            "--base",
-            base_ref,
-            "--head",
-            head_ref,
-            "--title",
-            title,
-            "--body",
-            body,
-        )
+        validate_pull_request_body(body)
+        with tempfile.TemporaryDirectory(prefix="publish-pr-") as temporary:
+            body_path = Path(temporary) / "body.md"
+            body_path.write_text(body, encoding="utf-8")
+            url = self._gh(
+                "pr",
+                "create",
+                "--repo",
+                repository,
+                "--base",
+                base_ref,
+                "--head",
+                head_ref,
+                "--title",
+                title,
+                "--body-file",
+                str(body_path),
+            )
         return self._view(repository=repository, url=url)
 
     def update(
@@ -682,6 +701,7 @@ class GitHubCliPullRequestClient:
     ) -> PullRequestObservation:
         if _OID.fullmatch(candidate_commit) is None:
             raise PublicationError("publish.candidate_commit", {"value": candidate_commit})
+        validate_pull_request_body(body)
         self._patch(repository=repository, number=number, title=title, body=body)
         return self._view(repository=repository, url=f"https://github.com/{repository}/pull/{number}")
 
@@ -974,7 +994,10 @@ class PublicationRepository:
             _run(worktree, "add", "--all", env=env)
             if _run(worktree, "diff", "--cached", "--quiet", check=False, env=env).returncode == 0:
                 raise PublicationError("publish.no_change", {"parent": start})
-            _run(worktree, "commit", "--no-gpg-sign", "-m", commit_spec.message, env=env)
+            _run(
+                worktree, "commit", "--no-gpg-sign", "--cleanup=verbatim", "--file", "-",
+                input_data=commit_spec.message.encode("utf-8"), env=env,
+            )
             if _text_run(worktree, "status", "--porcelain"):
                 raise PublicationError("publish.commit_left_dirty")
             commit = _text_run(worktree, "rev-parse", "HEAD")

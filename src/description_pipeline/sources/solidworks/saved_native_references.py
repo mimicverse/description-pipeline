@@ -172,17 +172,17 @@ def bind_saved_native_references(record: dict, *, purpose: str) -> dict:
         observation = row.get("solver_observation")
         _require(isinstance(observation, dict), "Native solver observation is unreadable", component=name)
         context = observation.get("context")
-        defining = components[parent]["document"] if parent else main
-        defining_configuration = components[parent]["configuration"] if parent else configuration
         _require(
-            isinstance(context, dict) and context.get("scope") == parent
-            and context.get("configuration") == defining_configuration
-            and _document_key(context.get("document")) == _document_key(defining),
-            "The native occurrence has inconsistent defining context", component=name,
+            isinstance(context, dict)
+            and context.get("scope") == ""
+            and context.get("configuration") == configuration
+            and _document_key(context.get("document")) == _document_key(main),
+            "The native occurrence has inconsistent main-assembly context",
+            component=name,
         )
     for name, row in components.items():
         children = [item for item in components.values() if item["parent_occurrence"] == name]
-        if row["document"].lower().endswith(".sldasm"):
+        if row.get("document_type") == "assembly":
             observation = row["solver_observation"].get("solving")
             _require(
                 children and isinstance(observation, dict)
@@ -194,7 +194,11 @@ def bind_saved_native_references(record: dict, *, purpose: str) -> dict:
                 "A native assembly carrier lacks its context-bound rigid solve declaration", component=name,
             )
         else:
-            _require(not children, "A native part unexpectedly contains occurrence children", component=name)
+            _require(
+                row.get("document_type") == "part" and not children,
+                "A native part has an invalid type or contains occurrence children",
+                component=name,
+            )
     for name, row in roots.items():
         _require(type(row.get("fixed")) is bool and row.get("fixed_error") is None,
                  "The saved fixed-root observation is unreadable", component=name)

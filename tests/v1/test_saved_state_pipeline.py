@@ -53,7 +53,7 @@ class SavedStatePipelineTests(unittest.TestCase):
         self.assertFalse(warning["detail"]["mechanical_qualification_complete"])
         self.assertFalse(warning["detail"]["hardware_qualified"])
         self.assertEqual(
-            warning["detail"]["actual_scope"]["selected_files"],
+            warning["detail"]["actual_scope"]["input_files"],
             ["cad/arm.SLDPRT", "cad/base.SLDPRT", "cad/robot.SLDASM"],
         )
 

@@ -1,4 +1,4 @@
-"""Linux discovery projection from preserved local native facts."""
+"""Linux discovery projection from preserved main-frame native facts."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from description_pipeline.sources.solidworks.discovery import (
     _project_native_record,
 )
 from description_pipeline.sources.solidworks.errors import CadError
+from description_pipeline.sources.solidworks.selection import seal_closure_selection
 from description_pipeline.verification.native_discovery import (
     _Failure,
     _geometry,
@@ -23,11 +24,15 @@ from tests.sources import support
 from tests.sources.test_verify_imported_sources import (
     CACHED_CAPTURE_DOCUMENT,
     CACHED_OCCURRENCE,
-    cached_carrier,
     cached_component,
     cached_slot,
 )
-from tests.sources.selection_support import sealed_selection
+from tests.sources.selection_support import (
+    READER_SHA256,
+    closure_evidence,
+    seal_fixture_object_observation,
+    seal_fixture_open_observation,
+)
 
 
 def _translated(x: float, y: float, z: float) -> list[float]:
@@ -73,8 +78,10 @@ def _rotated_z_90_with_translation() -> list[float]:
 
 
 def _record() -> dict:
-    local_arm = _rotated_z_90_with_translation()
+    world_arm = _rotated_z_90_with_translation()
+    world_arm[3] += 10.0
     return {
+        "transform_frame": "main_assembly",
         "identity": {"main_assembly": "robot.SLDASM"},
         "files": {
             "robot.SLDASM": "a" * 64,
@@ -89,9 +96,8 @@ def _record() -> dict:
                 "document": "sub.SLDASM",
                 "configuration": "Sub",
                 "suppressed": False,
-                "transform_raw": support.solidworks_transform(
-                    _translated(10.0, 0.0, 0.0)
-                ),
+                "suppression_state": 2,
+                "transform_raw": support.solidworks_transform(_translated(10.0, 0.0, 0.0)),
             },
             {
                 "name2": "sub-1/arm-1",
@@ -99,7 +105,8 @@ def _record() -> dict:
                 "document": "arm.SLDPRT",
                 "configuration": "Sub",
                 "suppressed": False,
-                "transform_raw": support.solidworks_transform(local_arm),
+                "suppression_state": 2,
+                "transform_raw": support.solidworks_transform(world_arm),
             },
         ],
         "mates": [
@@ -154,19 +161,21 @@ def _record() -> dict:
                 "name": "CS_arm_link",
                 "owner": "sub-1/arm-1",
                 "configuration": "Sub",
-                "array_raw": support.solidworks_transform(
-                    _translated(0.0, 0.0, 0.5)
-                ),
+                "array_raw": support.solidworks_transform(_translated(0.0, 0.0, 0.5)),
             }
         ],
         "properties": {"document": {}, "components": {}, "mates": {}},
     }
 
 
+def _sealed_record() -> dict:
+    return seal_fixture_object_observation(_record(), main_assembly="robot.SLDASM")
+
+
 class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
     @staticmethod
     def _cached_record(*, nested: bool = False) -> dict:
-        raw = _record()
+        raw = _sealed_record()
         anchor = "sub-1" if nested else None
         occurrence = f"sub-1/{CACHED_OCCURRENCE}" if nested else CACHED_OCCURRENCE
         component = cached_component(raw["files"]["robot.SLDASM"])
@@ -188,6 +197,7 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
             raw["files"]["robot.SLDASM"], instance=occurrence, occurrence=occurrence,
             owner_anchor=anchor, defining_anchor=anchor,
         )
+        closure = copy.deepcopy(raw["source_selection"]["closure"])
         if nested:
             parent = cached_component(raw["files"]["robot.SLDASM"])
             parent_document = parent["document"].replace("imported_part.step.SLDPRT", "sub.SLDASM")
@@ -210,12 +220,21 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
                 "imported_part.step.SLDPRT", "sub.SLDASM",
             )
             slot["document"] = parent_slot["materialization"]
-            raw["source_selection"] = sealed_selection(
-                {"robot.SLDASM": raw["files"]["robot.SLDASM"]}, "robot.SLDASM",
-                edges={"robot.SLDASM": []}, imports=[slot, parent_slot],
+            closure = closure_evidence(
+                raw["files"], "robot.SLDASM",
+                edges={"robot.SLDASM": ["arm.SLDPRT"], "arm.SLDPRT": []},
+                imports=[slot, parent_slot],
+            )
+            closure["documents"]["robot.SLDASM"]["resolved_edges"][0].update(
+                name="sub-1/arm-1", instance="sub-1/arm-1", configuration="Sub",
+                owner_anchor=anchor, defining_session_document=parent_slot["materialization"],
             )
         else:
-            raw["source_selection"] = cached_carrier(raw["files"]["robot.SLDASM"], slot)
+            closure["imports"] = [slot]
+        raw["source_selection"] = seal_closure_selection(
+            raw["files"], "robot.SLDASM", closure, reader_sha256=READER_SHA256,
+        )
+        seal_fixture_open_observation(raw)
         raw["session"] = {"native_api_pid": 1001}
         raw["mates"][0].update(scope="", configuration="Default")
         raw["mates"][0]["entities"] = [{
@@ -229,6 +248,15 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
             },
         }]
         return raw
+
+    def test_file_inventory_without_a_sealed_observation_cannot_bind_mate_endpoints(self):
+        raw = _record()
+        original = copy.deepcopy(raw)
+        with self.assertRaises(CadError):
+            _project_native_record(raw)
+        with self.assertRaises(_Failure):
+            project_native_verification_record(raw)
+        self.assertEqual(raw, original)
 
     def test_cached_mate_endpoint_binds_separate_owned_sessions_and_nested_defining_document(self):
         for nested in (False, True):
@@ -295,7 +323,7 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
         for field, value in (
             ("reference_type", None), ("params", None), ("error", None), ("error", False), ("error", ""),
         ):
-            raw = _record()
+            raw = _sealed_record()
             reference = raw["mates"][0]["entities"][0]["mate_entity_reference"]
             if value is None:
                 reference.pop(field)
@@ -313,7 +341,7 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
     def test_mate_reference_requires_the_native_source_and_coordinate_space(self) -> None:
         for field in ("source", "space"):
             for value in (None, "wrong", 123):
-                raw = _record()
+                raw = _sealed_record()
                 reference = raw["mates"][0]["entities"][0]["mate_entity_reference"]
                 if value is None:
                     reference.pop(field)
@@ -331,7 +359,7 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
                     self.assertEqual(raw, original)
 
     def test_producer_and_verifier_recompute_the_same_world_facts(self) -> None:
-        raw = _record()
+        raw = _sealed_record()
         producer = _project_native_record(raw)
         verifier = project_native_verification_record(raw)
 
@@ -402,8 +430,79 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
             ):
                 self.assertAlmostEqual(actual, expected, places=12)
 
-    def test_missing_parent_is_refused_by_both_independent_projections(self) -> None:
+    def test_rotated_parent_world_contract_has_independent_numeric_oracles(self):
+        parent = [0.0, -1.0, 0.0, 10.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+        child = [-1.0, 0.0, 0.0, 11.0, 0.0, -1.0, 0.0, 2.0, 0.0, 0.0, 1.0, 3.0, 0.0, 0.0, 0.0, 1.0]
+        datum = [1.0, 0.0, 0.0, 0.5, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
         raw = _record()
+        raw["saved_configuration"] = "Robot"
+        raw["components"][0]["transform_raw"] = support.solidworks_transform(parent)
+        raw["components"][1].update(configuration="Child", transform_raw=support.solidworks_transform(child))
+        raw["mates"] = [
+            {
+                "name": "point",
+                "scope": "sub-1",
+                "configuration": "Sub",
+                "suppressed": False,
+                "entities": [
+                    {
+                        "reference_name": "arm-1",
+                        "reference_document": "arm.SLDPRT",
+                        "reference_configuration": "Child",
+                        "assembly_frame": False,
+                        "mate_entity_reference": {
+                            "source": "mate-entity-params",
+                            "reference_type": 1,
+                            "reference_type2": 3,
+                            "space": "mate-assembly",
+                            "params": [2.0, 0.0, 0.0],
+                            "error": None,
+                        },
+                    }
+                ],
+            }
+        ]
+        raw["datums"] = [
+            {
+                "name": "CS",
+                "owner": "sub-1/arm-1",
+                "array_raw": support.solidworks_transform(datum),
+                "configuration": "Child",
+                "references": [],
+            }
+        ]
+        raw = seal_fixture_object_observation(raw, main_assembly="robot.SLDASM")
+        original = copy.deepcopy(raw)
+        for project in (_project_native_record, project_native_verification_record):
+            with self.subTest(project=project.__name__):
+                result = project(raw)
+                self.assertEqual(result["components"][1]["transform"], child)
+                self.assertEqual(
+                    result["mates"][0]["entities"][0]["mate_entity_reference"]["geometry"]["point"], [1.0, 0.0, -3.0]
+                )
+                self.assertEqual([result["datums"][0]["array"][i] for i in (3, 7, 11)], [10.5, 2.0, 3.0])
+        self.assertEqual(raw, original)
+
+    def test_missing_or_foreign_world_frame_is_rejected_by_both_projections(self):
+        for raw in (None, [], "record", True, 1):
+            with self.subTest(raw=raw), self.assertRaises(CadError) as producer:
+                _project_native_record(raw)
+            self.assertEqual(producer.exception.code, "cad_native_record_invalid")
+            with self.subTest(raw=raw), self.assertRaises(_Failure) as verifier:
+                project_native_verification_record(raw)
+            self.assertEqual(verifier.exception.code, "discovery.raw")
+        for frame in (None, "child_document"):
+            raw = _sealed_record()
+            if frame is None:
+                raw.pop("transform_frame")
+            else:
+                raw["transform_frame"] = frame
+            for project in (_project_native_record, project_native_verification_record):
+                with self.subTest(frame=frame, project=project.__name__), self.assertRaises((CadError, _Failure)):
+                    project(raw)
+
+    def test_missing_parent_is_refused_by_both_independent_projections(self) -> None:
+        raw = _sealed_record()
         raw["components"][1]["parent_occurrence"] = "missing"
         with self.assertRaises(CadError):
             _project_native_record(raw)
@@ -411,7 +510,7 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
             project_native_verification_record(raw)
 
     def test_parent_cycle_is_refused_by_both_independent_projections(self) -> None:
-        raw = _record()
+        raw = _sealed_record()
         raw["components"][0]["parent_occurrence"] = "sub-1/arm-1"
         with self.assertRaises(CadError):
             _project_native_record(raw)
@@ -419,7 +518,7 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
             project_native_verification_record(raw)
 
     def test_normalized_only_component_is_not_an_accepted_raw_form(self) -> None:
-        raw = _record()
+        raw = _sealed_record()
         component = raw["components"][0]
         component["transform"] = component.pop("transform_raw")
         with self.assertRaises(CadError):
@@ -433,7 +532,7 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
             ("null", lambda component: component.update(transform_raw=None)),
         ):
             with self.subTest(name=name):
-                raw = _record()
+                raw = _sealed_record()
                 mutate(raw["components"][0])
                 with self.assertRaises(CadError):
                     _project_native_record(raw)
@@ -441,7 +540,7 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
                     project_native_verification_record(raw)
 
     def test_explicit_empty_transform_raw_remains_an_unreadable_frame(self) -> None:
-        raw = _record()
+        raw = _sealed_record()
         raw["components"][0]["transform_raw"] = []
         raw["mates"] = []
         raw["datums"] = []
@@ -456,7 +555,7 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
             self.assertEqual(component["transform"], [])
 
     def test_parent_must_match_the_scoped_native_identity(self) -> None:
-        raw = _record()
+        raw = _sealed_record()
         raw["components"][1]["parent_occurrence"] = "other"
         raw["components"].append(
             {
@@ -464,6 +563,7 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
                 "parent_occurrence": "",
                 "document": "other.SLDASM",
                 "suppressed": False,
+                "suppression_state": 2,
                 "transform_raw": support.solidworks_transform(
                     support.placement()
                 ),
@@ -475,7 +575,7 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
             project_native_verification_record(raw)
 
     def test_mate_scope_must_be_a_known_owner(self) -> None:
-        raw = _record()
+        raw = _sealed_record()
         raw["mates"][0]["scope"] = "missing"
         with self.assertRaises(CadError):
             _project_native_record(raw)
@@ -483,13 +583,14 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
             project_native_verification_record(raw)
 
     def test_document_cycle_uses_normalized_path_semantics(self) -> None:
-        raw = _record()
+        raw = _sealed_record()
         raw["components"].append(
             {
                 "name2": "robot-2",
                 "parent_occurrence": "",
                 "document": "./robot.SLDASM",
                 "suppressed": False,
+                "suppression_state": 2,
                 "transform_raw": support.solidworks_transform(
                     support.placement()
                 ),
@@ -570,7 +671,7 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
         }
         for name, reference in cases.items():
             with self.subTest(name=name):
-                raw = _record()
+                raw = _sealed_record()
                 raw["mates"][0]["entities"][0][
                     "mate_entity_reference"
                 ] = {"source": "mate-entity-params", "space": "mate-assembly", **reference}
@@ -588,7 +689,7 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
                 self.assertEqual(raw, before)
 
     def test_null_entity_params_with_native_error_remains_explicit(self) -> None:
-        raw = _record()
+        raw = _sealed_record()
         raw["mates"][0]["entities"][0]["mate_entity_reference"] = {
             "source": "mate-entity-params",
             "reference_type": None,
@@ -625,7 +726,7 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
         }
         for name, primary in primary_cases.items():
             with self.subTest(name=name):
-                raw = _record()
+                raw = _sealed_record()
                 entity = raw["mates"][0]["entities"][0]
                 entity.update(primary)
                 reference = entity["mate_entity_reference"]
@@ -689,7 +790,7 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
                     self.assertIsNotNone(direction)
 
     def test_reference_type_error_without_primary_is_still_rejected_downstream(self) -> None:
-        raw = _record()
+        raw = _sealed_record()
         raw["mates"][0]["entities"][0]["mate_entity_reference"].update(
             reference_type=None,
             params=[0.0, 0.0, 0.0],
@@ -733,7 +834,7 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
         )
 
     def test_mate_document_mismatch_is_refused(self) -> None:
-        raw = copy.deepcopy(_record())
+        raw = copy.deepcopy(_sealed_record())
         raw["mates"][0]["entities"][0]["reference_document"] = "other.SLDPRT"
         with self.assertRaises(CadError):
             _project_native_record(raw)
@@ -743,7 +844,7 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
     def test_component_document_must_belong_to_the_sealed_file_inventory(
         self,
     ) -> None:
-        raw = copy.deepcopy(_record())
+        raw = copy.deepcopy(_sealed_record())
         raw["components"][0]["document"] = "forged.SLDPRT"
         raw["mates"][0]["entities"][0]["reference_document"] = (
             "forged.SLDPRT"
@@ -778,7 +879,7 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
             ),
         ):
             with self.subTest(label=label):
-                raw = copy.deepcopy(_record())
+                raw = copy.deepcopy(_sealed_record())
                 mutate(raw["mates"][0]["entities"][0])
                 with self.assertRaises(CadError):
                     _project_native_record(raw)
@@ -817,7 +918,7 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
             ),
         ):
             with self.subTest(label=label):
-                raw = copy.deepcopy(_record())
+                raw = copy.deepcopy(_sealed_record())
                 mutate(raw["mates"][0]["entities"][0])
                 with self.assertRaises(CadError):
                     _project_native_record(raw)
@@ -844,7 +945,7 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
             ),
         ):
             with self.subTest(label=label):
-                raw = copy.deepcopy(_record())
+                raw = copy.deepcopy(_sealed_record())
                 mutate(raw["mates"][0])
                 with self.assertRaises(CadError):
                     _project_native_record(raw)
@@ -853,7 +954,7 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
 
     def test_assembly_frame_document_must_equal_its_owner_assembly(self) -> None:
         def frame_record() -> dict:
-            raw = copy.deepcopy(_record())
+            raw = copy.deepcopy(_sealed_record())
             mate = raw["mates"][0]
             mate["scope"] = ""
             mate["configuration"] = "Default"
@@ -968,8 +1069,7 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
         }
 
         def virtual_record() -> dict:
-            raw = copy.deepcopy(_record())
-            raw["files"] = {"robot.SLDASM": owner_sha256}
+            raw = copy.deepcopy(_sealed_record())
             raw["components"].append(
                 {
                     "name2": "virtual-1",
@@ -977,12 +1077,26 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
                     "document": virtual_document,
                     "configuration": "Default",
                     "suppressed": False,
+                    "suppression_state": 2,
+                    "lightweight": False,
                     "transform_raw": support.solidworks_transform(
                         _translated(0.0, 0.0, 0.0)
                     ),
                     "source_provenance": copy.deepcopy(provenance),
                 }
             )
+            closure = copy.deepcopy(raw["source_selection"]["closure"])
+            closure["virtual_components"] = [{
+                **copy.deepcopy(provenance),
+                "document": "robot.SLDASM", "binding": "owner_embedded_geometry",
+                "owner_anchor": None, "instance": "virtual-1", "configuration": "Default",
+                "suppression_state": 2,
+            }]
+            raw["source_selection"] = seal_closure_selection(
+                raw["files"], "robot.SLDASM", closure, reader_sha256=READER_SHA256,
+            )
+            seal_fixture_open_observation(raw)
+            raw["session"] = {"native_api_pid": 21040}
             mate = raw["mates"][0]
             mate["scope"] = ""
             mate["configuration"] = "Default"
@@ -1029,7 +1143,7 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
             project_native_verification_record(wrong_document)
 
     def test_prelocalized_mate_geometry_is_not_trusted_as_raw(self) -> None:
-        raw = copy.deepcopy(_record())
+        raw = copy.deepcopy(_sealed_record())
         raw["mates"][0]["entities"][0]["mate_entity_reference"][
             "geometry"
         ] = {"kind": "point", "point": [0.0, 0.0, 0.0]}
@@ -1039,7 +1153,7 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
             project_native_verification_record(raw)
 
     def test_serialized_marker_cannot_authorize_normalized_only_raw(self) -> None:
-        raw = _record()
+        raw = _sealed_record()
         raw["_verification_local_projection"] = True
         component = raw["components"][0]
         component["transform"] = component.pop("transform_raw")
@@ -1052,7 +1166,7 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
         self.assertEqual(raw, original)
 
     def test_only_the_private_typed_view_can_be_reentered(self) -> None:
-        projected = project_native_verification_record(_record())
+        projected = project_native_verification_record(_sealed_record())
         repeated = project_native_verification_record(projected)
         self.assertEqual(repeated, projected)
         with self.assertRaises(_Failure):
@@ -1077,7 +1191,7 @@ class NativeDiscoveryLocalProjectionTests(unittest.TestCase):
             ),
         ):
             with self.subTest(label=label):
-                raw = copy.deepcopy(_record())
+                raw = copy.deepcopy(_sealed_record())
                 mutate(raw)
                 with self.assertRaises(CadError):
                     _project_native_record(raw)

@@ -10,6 +10,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from .selection_support import seal_fixture_object_observation
+
 from description_pipeline.sources.solidworks.discovery import DiscoverySettings, _saved_native_carriers
 from description_pipeline.sources.solidworks.saved_native_references import (
     SavedNativeReferenceError,
@@ -26,11 +28,12 @@ def inspection_record():
             components.append({
                 "name2": occurrence, "document": f"{name}.SLDPRT" if leaf else f"{name}.SLDASM",
                 "parent_occurrence": f"{name}-1" if leaf else "", "configuration": "Default",
+                "document_type": "part" if leaf else "assembly",
                 "suppressed": False, "fixed": not leaf and name == "base", "fixed_error": None,
                 "transform": list(identity),
                 "solver_observation": {
-                    "context": {"document": f"{name}.SLDASM" if leaf else "machine.SLDASM",
-                                "configuration": "Default", "scope": f"{name}-1" if leaf else ""},
+                    "context": {"document": "machine.SLDASM",
+                                "configuration": "Default", "scope": ""},
                     "solving": {"method": "IComponent2.Solving", "family": "swComponentSolvingOption_e",
                                 "value": 0, "error": None},
                 },
@@ -159,10 +162,10 @@ class SavedNativeReferencesTests(unittest.TestCase):
     def test_nested_assembly_requires_its_own_rigid_observation(self):
         raw = inspection_record()
         inner = copy.deepcopy(raw["components"][-1])
-        inner.update(name2="moving-1/inner-1", document="inner.SLDASM")
+        inner.update(name2="moving-1/inner-1", document="inner.SLDASM", document_type="assembly")
         leaf = raw["components"][-1]
         leaf.update(name2="moving-1/inner-1/part-1", parent_occurrence=inner["name2"])
-        leaf["solver_observation"]["context"].update(document="inner.SLDASM", scope=inner["name2"])
+        leaf["solver_observation"]["context"].update(document="machine.SLDASM", scope="")
         raw["components"].append(inner)
         raw["mates"][0]["entities"][-1]["component"] = leaf["name2"]
         bind_saved_native_references(raw, purpose="inspection_preview")
@@ -196,12 +199,12 @@ class SavedNativeReferencesTests(unittest.TestCase):
         root, leaf = raw["components"][2:]
         root.update(name2="auto_link_001-1", document="auto_link_001.SLDASM")
         leaf.update(name2="auto_link_001-1/part-1", parent_occurrence=root["name2"])
-        leaf["solver_observation"]["context"].update(document=root["document"], scope=root["name2"])
+        leaf["solver_observation"]["context"].update(document="machine.SLDASM", scope="")
         raw["mates"][0]["entities"][1]["component"] = leaf["name2"]
         other_root, other_leaf = copy.deepcopy((root, leaf))
         other_root.update(name2="auto_link_002-1", document="auto_link_002.SLDASM")
         other_leaf.update(name2="auto_link_002-1/part-1", parent_occurrence=other_root["name2"])
-        other_leaf["solver_observation"]["context"].update(document=other_root["document"], scope=other_root["name2"])
+        other_leaf["solver_observation"]["context"].update(document="machine.SLDASM", scope="")
         raw["components"].extend((other_root, other_leaf))
         raw["datums"][-1]["name"] = "c_auto_link_001"
         raw["reference_axes"][-1]["selector"]["feature_name"] = "a_auto_link_001"
@@ -302,7 +305,8 @@ class SavedNativeReferencesTests(unittest.TestCase):
             raw["files"] = {name: hashlib.sha256((cad / name).read_bytes()).hexdigest() for name in names}
             for component in raw["components"]:
                 component.update(suppression_state=2, lightweight=False)
-            raw = support.local_native_record_payload(raw, default_mate_scope=True, fill_missing_parents=True)
+            raw = support.world_native_record_payload(raw, default_mate_scope=True, fill_missing_parents=True)
+            raw = seal_fixture_object_observation(raw, main_assembly="machine.SLDASM")
             package = root / "delivery"
             support.compose_delivery_inputs(
                 package, main_assembly="machine.SLDASM", configuration="Default", record=raw,
