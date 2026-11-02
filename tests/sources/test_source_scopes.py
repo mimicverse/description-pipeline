@@ -29,6 +29,7 @@ from description_pipeline.sources.solidworks.evidence import (
 from description_pipeline.schemas import (
     NATIVE_CAPTURE_OBSERVATION_SCHEMA,
     NATIVE_DISCOVERY_SCHEMA,
+    NATIVE_TRANSFORM_FRAME,
     SOURCE_RECORD_SCHEMA,
 )
 from description_pipeline.verification.capture_evidence import source_scopes
@@ -111,6 +112,7 @@ class SourceScopeTests(unittest.TestCase):
             "scene_raw": {
                 "document": r"C:\source\Part.SLDASM",
                 "configuration": "Default",
+                "transform_frame": NATIVE_TRANSFORM_FRAME,
                 "occurrences": [
                     {
                         "name": "part-1",

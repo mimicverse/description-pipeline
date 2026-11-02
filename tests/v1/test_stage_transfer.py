@@ -37,6 +37,7 @@ from description_pipeline.runtime import RUNTIME_VERSIONS, required_packages
 from description_pipeline.schemas import (
     CAPTURE_EVIDENCE_REQUESTS,
     NATIVE_CAPTURE_OBSERVATION_SCHEMA,
+    NATIVE_TRANSFORM_FRAME,
     SOURCE_RECORD_SCHEMA,
 )
 from description_pipeline import native_transfer
@@ -492,6 +493,7 @@ def capture_root(
         "scene_raw": {
             "document": str(root / "input/cad" / main),
             "configuration": "Default",
+            "transform_frame": NATIVE_TRANSFORM_FRAME,
             "occurrences": [
                 {
                     "name": main,
